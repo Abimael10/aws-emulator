@@ -11,8 +11,9 @@
 //!
 //! The rows span the three resources this service holds (connector, template, directory
 //! registration), a read and a create, the prerequisite a create resolves before it
-//! mints anything, and identifiers that are absent in three different ways: never
-//! created in this Region, named in another Region, and named in another partition.
+//! mints anything, the parent a child's own path names, and identifiers that are absent
+//! in three different ways: never created in this Region, named in another Region, and
+//! named in another partition.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -126,7 +127,7 @@ fn missing_cases() -> Vec<MissingCase> {
             target: format!("/templates/{}", encode_label(&unknown_template)),
             body: None,
             resource_type: "Template",
-            identifier: unknown_template,
+            identifier: unknown_template.clone(),
         },
         MissingCase {
             case: "GetTemplate, a template of another partition".to_string(),
@@ -135,6 +136,34 @@ fn missing_cases() -> Vec<MissingCase> {
             body: None,
             resource_type: "Template",
             identifier: other_partition_template,
+        },
+        MissingCase {
+            case: "CreateTemplateGroupAccessControlEntry, a parent template never created"
+                .to_string(),
+            method: "POST",
+            target: format!(
+                "/templates/{}/accessControlEntries",
+                encode_label(&unknown_template)
+            ),
+            body: Some(json!({
+                "GroupSecurityIdentifier": "S-1-5-21-1004336348-1177238915-682003330-1401",
+                "GroupDisplayName": "pki-enrollers",
+                "AccessRights": { "Enroll": "ALLOW", "AutoEnroll": "DENY" },
+            })),
+            resource_type: "Template",
+            identifier: unknown_template.clone(),
+        },
+        MissingCase {
+            case: "GetTemplateGroupAccessControlEntry, a parent template never created".to_string(),
+            method: "GET",
+            target: format!(
+                "/templates/{}/accessControlEntries/{}",
+                encode_label(&unknown_template),
+                encode_label("S-1-5-21-1004336348-1177238915-682003330-1401")
+            ),
+            body: None,
+            resource_type: "Template",
+            identifier: unknown_template,
         },
         MissingCase {
             case: "GetDirectoryRegistration, a registration never created".to_string(),

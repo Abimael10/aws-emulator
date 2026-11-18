@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{TemplateDefinition, TemplateRevision, VpcInformation};
+use crate::ops::types::{AccessRights, TemplateDefinition, TemplateRevision, VpcInformation};
 
 /// WHO may perform an action on a resource of this service: the identity-based decision
 /// every handler takes before it reads or writes anything.
@@ -152,6 +152,11 @@ pub const MAX_TEMPLATES_PER_CONNECTOR: usize = 200;
 /// without it an unlimited number of distinct ids could grow the store without
 /// limit.
 pub const MAX_DIRECTORY_REGISTRATIONS: usize = 100;
+/// See [`MAX_CONNECTORS`]: the same kind of store bound, for the group access
+/// control entries one template holds. An entry is keyed by the group security
+/// identifier the caller supplies, so without this bound an unlimited number of
+/// distinct identifiers could grow the store without limit.
+pub const MAX_ACCESS_CONTROL_ENTRIES_PER_TEMPLATE: usize = 200;
 
 /// How many `ClientToken` -> ARN records the store keeps. An idempotency record
 /// is a cache, not a resource: AWS honours a token for a bounded window and
@@ -169,6 +174,8 @@ pub const QUOTA_CODE_CONNECTORS_PER_STORE: &str = "ConnectorsPerStore";
 pub const QUOTA_CODE_TEMPLATES_PER_CONNECTOR: &str = "TemplatesPerConnector";
 /// See [`QUOTA_CODE_CONNECTORS_PER_STORE`].
 pub const QUOTA_CODE_DIRECTORY_REGISTRATIONS_PER_STORE: &str = "DirectoryRegistrationsPerStore";
+/// See [`QUOTA_CODE_CONNECTORS_PER_STORE`].
+pub const QUOTA_CODE_ACCESS_CONTROL_ENTRIES_PER_TEMPLATE: &str = "AccessControlEntriesPerTemplate";
 
 /// The tag every pagination cursor this service issues carries, so a token the
 /// service did not mint is refused instead of being honoured as a cursor. Four
@@ -208,6 +215,8 @@ pub const RESOURCE_TYPE_TEMPLATE: &str = "Template";
 pub const RESOURCE_TYPE_DIRECTORY_REGISTRATION: &str = "DirectoryRegistration";
 /// See [`RESOURCE_TYPE_CONNECTOR`].
 pub const RESOURCE_TYPE_SERVICE_PRINCIPAL_NAME: &str = "ServicePrincipalName";
+/// See [`RESOURCE_TYPE_CONNECTOR`].
+pub const RESOURCE_TYPE_ACCESS_CONTROL_ENTRY: &str = "AccessControlEntry";
 
 /// The expression `TemplateName` declares, as the model writes it
 /// (`smithy_query(query="shape",shape="TemplateName")`): every member of this
@@ -365,6 +374,26 @@ pub struct TemplateRecord {
     pub seq: u64,
 }
 
+/// One persisted group access control entry: which Active Directory group may
+/// enroll or autoenroll certificates with exactly one template. Mirrors the
+/// modelled `AccessControlEntry`/`AccessControlEntrySummary` members, plus the
+/// bookkeeping the wire shapes do not carry (`seq` for stable list ordering).
+///
+/// An entry has no ARN of its own: the modelled operations address it by the
+/// template it belongs to and the group's security identifier, which is the pair
+/// it is stored under.
+#[derive(Debug, Clone)]
+pub struct AccessControlEntryRecord {
+    pub template_arn: String,
+    pub group_security_identifier: String,
+    pub group_display_name: String,
+    pub access_rights: AccessRights,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// Monotonic creation sequence: the stable list order and paging cursor.
+    pub seq: u64,
+}
+
 /// One persisted service principal name: the name the connector authenticates to
 /// Active Directory with, created under exactly one directory registration for
 /// exactly one connector. Mirrors the modelled
@@ -413,6 +442,15 @@ pub struct ComAmazonawsPcaconnectoradPcaconnectoradState {
     /// [`MAX_DIRECTORY_REGISTRATIONS`] and [`MAX_CONNECTORS`], so no number of
     /// requests can grow this map past their product.
     pub service_principal_names: HashMap<(String, String), ServicePrincipalNameRecord>,
+    /// Group access control entries by the pair that identifies one: the template
+    /// the entry governs and the group security identifier it names. An entry has
+    /// no ARN of its own — the modelled operations address it by that pair — so the
+    /// pair IS the key.
+    ///
+    /// Bounded per template at [`MAX_ACCESS_CONTROL_ENTRIES_PER_TEMPLATE`], and an
+    /// entry is only recorded for a template this store already holds, so no number
+    /// of requests can grow this map past that bound times the template cap.
+    pub access_control_entries: HashMap<(String, String), AccessControlEntryRecord>,
     /// `<operation>:<ClientToken>` -> the ARN the first call with that token minted,
     /// so a retried create returns the original resource instead of a second one.
     /// Bounded at [`MAX_IDEMPOTENCY_RECORDS`]; write it through
@@ -535,6 +573,29 @@ impl ComAmazonawsPcaconnectoradPcaconnectoradState {
             .get(&(registration_arn.to_string(), connector_arn.to_string()))
     }
 
+    /// The group access control entry of `template_arn` naming the group
+    /// `group_security_identifier`, if there is one. The pair identifies at most one
+    /// entry, and is the map's own key, so this is the lookup that key exists for.
+    pub fn access_control_entry(
+        &self,
+        template_arn: &str,
+        group_security_identifier: &str,
+    ) -> Option<&AccessControlEntryRecord> {
+        self.access_control_entries.get(&(
+            template_arn.to_string(),
+            group_security_identifier.to_string(),
+        ))
+    }
+
+    /// How many group access control entries `template_arn` already carries, against
+    /// [`MAX_ACCESS_CONTROL_ENTRIES_PER_TEMPLATE`].
+    pub fn access_control_entry_count(&self, template_arn: &str) -> usize {
+        self.access_control_entries
+            .values()
+            .filter(|entry| entry.template_arn == template_arn)
+            .count()
+    }
+
     /// The template called `name` on `connector_arn`, if there is one. Template
     /// names are unique per connector.
     pub fn template_by_name(&self, connector_arn: &str, name: &str) -> Option<&TemplateRecord> {
@@ -617,6 +678,11 @@ impl ComAmazonawsPcaconnectoradPcaconnectoradState {
         for arn in &orphaned {
             self.templates.remove(arn);
         }
+        // A group access control entry exists under its template: once the template
+        // stops existing there is nothing left holding the entry, so nothing reports
+        // it any more either.
+        self.access_control_entries
+            .retain(|_, entry| !orphaned.contains(&entry.template_arn));
         let idempotency = &mut self.idempotency;
         idempotency.retain(|_, arn| arn != connector_arn && !orphaned.contains(arn));
         self.idempotency_order

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTemplateGroupAccessControlEntry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTemplateGroupAccessControlEntry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTemplateGroupAccessControlEntry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one group access control entry of a template, addressed by the template
+//! and the group's security identifier.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +152,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTemplateGroupAccessControlEntry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTemplateGroupAccessControlEntryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTemplateGroupAccessControlEntry"))
+        // IAM decides before anything is read: a caller whose policies do not allow
+        // this action is told it is not authorized rather than told anything about the
+        // template or the entry the request named — including whether either exists.
+        // The entry has no ARN of its own, so the resource the call is judged against
+        // is the template it belongs to.
+        if let Some(message) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, &input.template_arn)
+        {
+            return Err(GetTemplateGroupAccessControlEntryErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetTemplateGroupAccessControlEntryErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the pca-connector-ad state store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure read: neither a template nor an access control entry carries a
+        // clock-owed transition, so nothing here is materialised on the way.
+        let store = state.lock();
+        // The template is the entry's parent, so a request naming one this service
+        // does not hold is refused for the TEMPLATE rather than for the entry: the
+        // identifier the refusal echoes is the one that resolved to nothing.
+        if !store.templates.contains_key(&input.template_arn) {
+            return Err(
+                GetTemplateGroupAccessControlEntryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::not_found_message(
+                            crate::state::RESOURCE_TYPE_TEMPLATE,
+                            &input.template_arn,
+                        ),
+                        resource_id: input.template_arn.clone(),
+                        resource_type: crate::state::RESOURCE_TYPE_TEMPLATE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+        let Some(record) = store
+            .access_control_entry(&input.template_arn, &input.group_security_identifier)
+        else {
+            // The template exists and carries no entry for that group: the resource
+            // the request addressed is the ENTRY, named by the group security
+            // identifier it supplied.
+            return Err(
+                GetTemplateGroupAccessControlEntryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::not_found_message(
+                            crate::state::RESOURCE_TYPE_ACCESS_CONTROL_ENTRY,
+                            &input.group_security_identifier,
+                        ),
+                        resource_id: input.group_security_identifier.clone(),
+                        resource_type: crate::state::RESOURCE_TYPE_ACCESS_CONTROL_ENTRY.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetTemplateGroupAccessControlEntryOutput {
+            access_control_entry: Some(AccessControlEntry {
+                template_arn: Some(record.template_arn.clone()),
+                group_security_identifier: Some(record.group_security_identifier.clone()),
+                group_display_name: Some(record.group_display_name.clone()),
+                access_rights: Some(record.access_rights.clone()),
+                created_at: Some(::aws_smithy_types::DateTime::from(record.created_at)),
+                updated_at: Some(::aws_smithy_types::DateTime::from(record.updated_at)),
+            }),
+        })
     }
 }

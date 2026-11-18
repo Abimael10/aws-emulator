@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for the pca-connector-ad connector/template slice.
+//! End-to-end HTTP tests for the pca-connector-ad connector/template slice, down to
+//! the group access control entries a template carries.
 //!
 //! Every case drives the real wire path: a `restJson1` request through the same
 //! `MultiServiceRouter::dispatch` the production front door uses, so routing,
@@ -21,7 +22,8 @@ use super::harness::{
 // The store bounds the handlers refuse past, imported from the crate so these
 // tests cannot drift from the caps the handlers enforce.
 use service_com_amazonaws_pcaconnectorad_pcaconnectorad::state::{
-    CONNECTOR_ACTIVATION_DELAY, MAX_CONNECTORS, MAX_TEMPLATES_PER_CONNECTOR,
+    CONNECTOR_ACTIVATION_DELAY, MAX_ACCESS_CONTROL_ENTRIES_PER_TEMPLATE, MAX_CONNECTORS,
+    MAX_TEMPLATES_PER_CONNECTOR,
 };
 
 /// The Microsoft AD certificate-template OID arc a template's `ObjectIdentifier`
@@ -1020,5 +1022,542 @@ async fn the_template_store_is_bounded_per_connector_and_refuses_past_its_quota(
     assert_eq!(
         status, 200,
         "case another connector: the per-connector bound must not spill over, got {status} / {parsed}"
+    );
+}
+
+// --- The group access control entries one template carries -------------------
+//
+// An entry says whether ONE Active Directory group may enroll and autoenroll
+// certificates with ONE template, and is addressed by that pair: the template's
+// ARN and the group's security identifier. It has no ARN of its own and the
+// create's modelled output is `Unit`, so every case below reads the entry back
+// through `GetTemplateGroupAccessControlEntry` rather than off the create.
+
+/// One row of the entry table: inputs that differ along what the rule generalises
+/// over (the shape and length of the group identifier, the display name, and which
+/// of the two access rights the request carries).
+struct EntryCase {
+    name: &'static str,
+    /// `GroupSecurityIdentifier`, modelled `len 7..256` with pattern
+    /// `^S-[0-9]-([0-9]+-){1,14}[0-9]+$`
+    /// (`smithy_query(query="operation",operation="CreateTemplateGroupAccessControlEntry")`).
+    group_security_identifier: String,
+    /// `GroupDisplayName`, modelled `DisplayName` `len 0..256` with pattern
+    /// `^[\x20-\x7E]+$`.
+    group_display_name: String,
+    /// `AccessRights$Enroll` / `$AutoEnroll`, both optional, each one of the modelled
+    /// `AccessRight` enum's values (`ACCESS_RIGHT_VALUES`: `ALLOW`, `DENY`).
+    enroll: Option<&'static str>,
+    auto_enroll: Option<&'static str>,
+}
+
+impl EntryCase {
+    fn body(&self) -> Value {
+        let mut rights = json!({});
+        if let Some(enroll) = self.enroll {
+            rights["Enroll"] = json!(enroll);
+        }
+        if let Some(auto_enroll) = self.auto_enroll {
+            rights["AutoEnroll"] = json!(auto_enroll);
+        }
+        json!({
+            "GroupSecurityIdentifier": self.group_security_identifier,
+            "GroupDisplayName": self.group_display_name,
+            "AccessRights": rights,
+        })
+    }
+}
+
+/// The rows span both published bounds of the two string members — the shortest
+/// identifier the SID pattern admits (which is also its modelled minimum length of
+/// 7) and a display name at the modelled maximum of 256 characters — the maximum
+/// number of sub-authorities the pattern admits (14), and every combination of the
+/// two access rights a request can carry.
+fn entry_cases() -> Vec<EntryCase> {
+    vec![
+        EntryCase {
+            name: "the shortest SID the pattern admits, enroll allowed and autoenroll denied",
+            group_security_identifier: "S-1-5-1".to_string(),
+            group_display_name: "pki-enrollers".to_string(),
+            enroll: Some("ALLOW"),
+            auto_enroll: Some("DENY"),
+        },
+        EntryCase {
+            name: "a domain SID with a relative id, both rights allowed",
+            group_security_identifier: "S-1-5-21-1004336348-1177238915-682003330-1401".to_string(),
+            group_display_name: "Domain Computers".to_string(),
+            enroll: Some("ALLOW"),
+            auto_enroll: Some("ALLOW"),
+        },
+        EntryCase {
+            name: "the maximum 14 sub-authorities, both rights denied",
+            group_security_identifier: "S-1-5-21-1-2-3-4-5-6-7-8-9-10-11-12-13".to_string(),
+            group_display_name: "x".to_string(),
+            enroll: Some("DENY"),
+            auto_enroll: Some("DENY"),
+        },
+        EntryCase {
+            name: "only Enroll supplied, a display name at the modelled 256-character maximum",
+            group_security_identifier: "S-1-15-2-7".to_string(),
+            group_display_name: "D".repeat(256),
+            enroll: Some("ALLOW"),
+            auto_enroll: None,
+        },
+        EntryCase {
+            name: "only AutoEnroll supplied, printable punctuation in the display name",
+            group_security_identifier: "S-2-0-0".to_string(),
+            group_display_name: "Trusted Users (read-only) #1".to_string(),
+            enroll: None,
+            auto_enroll: Some("DENY"),
+        },
+    ]
+}
+
+fn entries_path(template_arn: &str) -> String {
+    format!("/templates/{}/accessControlEntries", encode_label(template_arn))
+}
+
+fn entry_path(template_arn: &str, group_security_identifier: &str) -> String {
+    format!(
+        "{}/{}",
+        entries_path(template_arn),
+        encode_label(group_security_identifier)
+    )
+}
+
+async fn create_entry(
+    router: &MultiServiceRouter,
+    template_arn: &str,
+    body: &Value,
+) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        &entries_path(template_arn),
+        Some(body),
+    )
+    .await
+}
+
+async fn get_entry(
+    router: &MultiServiceRouter,
+    template_arn: &str,
+    group_security_identifier: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "GET",
+        &entry_path(template_arn, group_security_identifier),
+        None,
+    )
+    .await
+}
+
+/// A connector with one template on it, answering the template's ARN: the parent
+/// every entry below hangs off.
+async fn template_for_entries(router: &MultiServiceRouter, name: &str) -> String {
+    let connector_arn = create_connector(router, &CONNECTOR_CASES[0].body()).await;
+    let (status, parsed) =
+        create_template(router, &connector_arn, name, &(TEMPLATE_CASES[0].definition)()).await;
+    assert_eq!(
+        status, 200,
+        "setup {name}: CreateTemplate must answer the modelled 200, got {status} / {parsed}"
+    );
+    parsed["TemplateArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("setup {name}: CreateTemplate returned no TemplateArn: {parsed}"))
+        .to_string()
+}
+
+/// A template ARN of the modelled child form under `connector_arn` that no
+/// `CreateTemplate` ever minted, so it resolves to nothing.
+fn unminted_template_arn(connector_arn: &str) -> String {
+    format!("{connector_arn}/template/dddddddd-eeee-4fff-8aaa-bbbbbbbbbbbb")
+}
+
+#[tokio::test]
+async fn create_template_group_access_control_entry_persists_it_and_get_reads_it_back() {
+    let router = router();
+    let template_arn = template_for_entries(&router, "EntryRoundTrip").await;
+
+    for case in entry_cases() {
+        let body = case.body();
+        let (status, parsed) = create_entry(&router, &template_arn, &body).await;
+        assert_eq!(
+            status, 200,
+            "case {}: CreateTemplateGroupAccessControlEntry must answer the modelled 200, \
+             got {status} / {parsed}",
+            case.name
+        );
+        // The modelled output is `Unit`, so the success carries no members.
+        assert!(
+            parsed.is_null() || parsed.as_object().is_some_and(serde_json::Map::is_empty),
+            "case {}: the modelled output is empty, got {parsed}",
+            case.name
+        );
+
+        let (status, parsed) =
+            get_entry(&router, &template_arn, &case.group_security_identifier).await;
+        assert_eq!(
+            status, 200,
+            "case {}: the created entry must read back, got {status} / {parsed}",
+            case.name
+        );
+        let entry = &parsed["AccessControlEntry"];
+        assert_eq!(
+            entry["TemplateArn"].as_str(),
+            Some(template_arn.as_str()),
+            "case {}: the entry must name the template it was created under, got {entry}",
+            case.name
+        );
+        assert_eq!(
+            entry["GroupSecurityIdentifier"].as_str(),
+            Some(case.group_security_identifier.as_str()),
+            "case {}: the entry must report the identifier it was addressed by, got {entry}",
+            case.name
+        );
+        assert_eq!(
+            entry["GroupDisplayName"].as_str(),
+            Some(case.group_display_name.as_str()),
+            "case {}: GroupDisplayName must be what the create persisted, got {entry}",
+            case.name
+        );
+        assert_eq!(
+            entry["AccessRights"], body["AccessRights"],
+            "case {}: AccessRights must round-trip exactly as supplied, got {entry}",
+            case.name
+        );
+        assert!(
+            entry["CreatedAt"].is_number(),
+            "case {}: CreatedAt must be set, got {entry}",
+            case.name
+        );
+        assert_eq!(
+            entry["CreatedAt"], entry["UpdatedAt"],
+            "case {}: an untouched entry has UpdatedAt == CreatedAt, got {entry}",
+            case.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_entry_is_addressed_by_its_template_so_two_templates_hold_their_own() {
+    let router = router();
+    let connector_arn = create_connector(&router, &CONNECTOR_CASES[0].body()).await;
+    let mut template_arns = Vec::new();
+    for name in ["EntryScopeFirst", "EntryScopeSecond"] {
+        let (_, parsed) =
+            create_template(&router, &connector_arn, name, &(TEMPLATE_CASES[0].definition)()).await;
+        template_arns.push(
+            parsed["TemplateArn"]
+                .as_str()
+                .unwrap_or_else(|| panic!("setup {name}: no TemplateArn: {parsed}"))
+                .to_string(),
+        );
+    }
+    let case = &entry_cases()[0];
+
+    let (status, parsed) = create_entry(&router, &template_arns[0], &case.body()).await;
+    assert_eq!(
+        status, 200,
+        "case the first template: the create must succeed, got {status} / {parsed}"
+    );
+
+    // The same group on the other template: a different entry, so nothing reports it
+    // until it is created there too.
+    let (status, parsed) =
+        get_entry(&router, &template_arns[1], &case.group_security_identifier).await;
+    assert_eq!(
+        status, 404,
+        "case the other template: one template's entry is not another's, got {status} / {parsed}"
+    );
+    let (status, parsed) = create_entry(&router, &template_arns[1], &case.body()).await;
+    assert_eq!(
+        status, 200,
+        "case the other template: the same group may be entered on another template, \
+         got {status} / {parsed}"
+    );
+    for template_arn in &template_arns {
+        let (status, parsed) =
+            get_entry(&router, template_arn, &case.group_security_identifier).await;
+        assert_eq!(
+            status, 200,
+            "case {template_arn}: each template must hold its own entry, got {status} / {parsed}"
+        );
+        assert_eq!(
+            parsed["AccessControlEntry"]["TemplateArn"].as_str(),
+            Some(template_arn.as_str()),
+            "case {template_arn}: the entry must name the template it belongs to, got {parsed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn creating_a_group_entry_on_a_template_that_does_not_exist_is_resource_not_found() {
+    let router = router();
+    let connector_arn = create_connector(&router, &CONNECTOR_CASES[0].body()).await;
+    let case = &entry_cases()[1];
+
+    // Two ways a well-formed `TemplateArn` resolves to nothing: a template never
+    // minted under a connector this store holds, and one under a connector it does
+    // not hold either. Both are refused for the TEMPLATE the request named.
+    let absent = [
+        (
+            "a template never created under an existing connector",
+            unminted_template_arn(&connector_arn),
+        ),
+        (
+            "a template under a connector that was never created",
+            unminted_template_arn(&format!(
+                "{}99999999-8888-4777-a666-555555555555",
+                connector_arn_prefix()
+            )),
+        ),
+    ];
+
+    for (name, template_arn) in absent {
+        let (status, parsed) = create_entry(&router, &template_arn, &case.body()).await;
+        assert_eq!(
+            status, 404,
+            "case {name}: a template that does not exist is a 404, got {status} / {parsed}"
+        );
+        assert_eq!(
+            parsed["__code"].as_str(),
+            Some("ResourceNotFoundException"),
+            "case {name}: expected ResourceNotFoundException, got {parsed}"
+        );
+        let expected = format!("Template was not found: {template_arn}.");
+        assert_eq!(
+            parsed["Message"].as_str(),
+            Some(expected.as_str()),
+            "case {name}: expected message {expected:?}, got {parsed}"
+        );
+        assert_eq!(
+            parsed["ResourceId"].as_str(),
+            Some(template_arn.as_str()),
+            "case {name}: the refusal must echo the identifier as supplied, got {parsed}"
+        );
+        assert_eq!(
+            parsed["ResourceType"].as_str(),
+            Some("Template"),
+            "case {name}: the refusal must name the resource type, got {parsed}"
+        );
+
+        // The refused create stored nothing: the same read is still a 404.
+        let (status, parsed) =
+            get_entry(&router, &template_arn, &case.group_security_identifier).await;
+        assert_eq!(
+            status, 404,
+            "case {name}: a refused create must persist nothing, got {status} / {parsed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reading_a_group_entry_a_template_does_not_carry_is_resource_not_found() {
+    let router = router();
+    let template_arn = template_for_entries(&router, "EntryMissing").await;
+    let created = &entry_cases()[0];
+    let (status, parsed) = create_entry(&router, &template_arn, &created.body()).await;
+    assert_eq!(
+        status, 200,
+        "setup: the create must succeed, got {status} / {parsed}"
+    );
+
+    // A template this store holds, and groups it carries no entry for: the resource
+    // the request addressed is the ENTRY, named by the identifier it supplied.
+    for absent in ["S-1-5-32-544", "S-1-5-21-9999999999-1-2-3"] {
+        let (status, parsed) = get_entry(&router, &template_arn, absent).await;
+        assert_eq!(
+            status, 404,
+            "case {absent}: a group with no entry is a 404, got {status} / {parsed}"
+        );
+        assert_eq!(
+            parsed["__code"].as_str(),
+            Some("ResourceNotFoundException"),
+            "case {absent}: expected ResourceNotFoundException, got {parsed}"
+        );
+        let expected = format!("AccessControlEntry was not found: {absent}.");
+        assert_eq!(
+            parsed["Message"].as_str(),
+            Some(expected.as_str()),
+            "case {absent}: expected message {expected:?}, got {parsed}"
+        );
+        assert_eq!(
+            parsed["ResourceId"].as_str(),
+            Some(absent),
+            "case {absent}: the refusal must echo the identifier as supplied, got {parsed}"
+        );
+        assert_eq!(
+            parsed["ResourceType"].as_str(),
+            Some("AccessControlEntry"),
+            "case {absent}: the refusal must name the resource type, got {parsed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_create_of_one_group_entry_answers_the_recorded_entry_unchanged() {
+    let router = router();
+    let template_arn = template_for_entries(&router, "EntryIdempotent").await;
+    let case = &entry_cases()[1];
+
+    // `@idempotent`: the template and the group identify at most one entry, so the
+    // same create repeated — with and without a `ClientToken`, and with a second,
+    // different token — is the same 200 and leaves the entry as it was.
+    let mut bodies = [case.body(), case.body(), case.body()];
+    bodies[1]["ClientToken"] = json!("entry-token-1");
+    bodies[2]["ClientToken"] = json!("entry-token-2");
+
+    let mut first_created_at = Value::Null;
+    for (attempt, body) in bodies.iter().enumerate() {
+        let (status, parsed) = create_entry(&router, &template_arn, body).await;
+        assert_eq!(
+            status, 200,
+            "case attempt {attempt}: every repeat answers the modelled 200, got {status} / {parsed}"
+        );
+        let (status, parsed) =
+            get_entry(&router, &template_arn, &case.group_security_identifier).await;
+        assert_eq!(
+            status, 200,
+            "case attempt {attempt}: the entry must still read back, got {status} / {parsed}"
+        );
+        let entry = &parsed["AccessControlEntry"];
+        if attempt == 0 {
+            first_created_at = entry["CreatedAt"].clone();
+        }
+        assert_eq!(
+            entry["CreatedAt"], first_created_at,
+            "case attempt {attempt}: a repeat must not mint a second entry, got {entry}"
+        );
+        assert_eq!(
+            entry["CreatedAt"], entry["UpdatedAt"],
+            "case attempt {attempt}: a repeat changes nothing, got {entry}"
+        );
+        assert_eq!(
+            entry["AccessRights"], case.body()["AccessRights"],
+            "case attempt {attempt}: the recorded rights must be unchanged, got {entry}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_the_connector_takes_its_templates_group_entries_with_it() {
+    let router = router();
+    let connector_arn = create_connector(&router, &CONNECTOR_CASES[0].body()).await;
+    let (_, parsed) = create_template(
+        &router,
+        &connector_arn,
+        "EntryCascade",
+        &(TEMPLATE_CASES[0].definition)(),
+    )
+    .await;
+    let template_arn = parsed["TemplateArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("setup: no TemplateArn: {parsed}"))
+        .to_string();
+    let case = &entry_cases()[0];
+    let (status, parsed) = create_entry(&router, &template_arn, &case.body()).await;
+    assert_eq!(
+        status, 200,
+        "setup: the create must succeed, got {status} / {parsed}"
+    );
+
+    let (status, parsed) = call(
+        &router,
+        "DELETE",
+        &format!("/connectors/{}", encode_label(&connector_arn)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "DeleteConnector answers the modelled 202, got {status} / {parsed}"
+    );
+
+    // The template went with the connector, so the entry it held is gone too — and
+    // the refusal is about the template, which is the identifier that now resolves
+    // to nothing.
+    let (status, parsed) = get_entry(&router, &template_arn, &case.group_security_identifier).await;
+    assert_eq!(
+        status, 404,
+        "a deleted connector's template group entries go with it, got {status} / {parsed}"
+    );
+    let expected = format!("Template was not found: {template_arn}.");
+    assert_eq!(
+        parsed["Message"].as_str(),
+        Some(expected.as_str()),
+        "expected message {expected:?}, got {parsed}"
+    );
+}
+
+#[tokio::test]
+async fn the_group_entry_store_is_bounded_per_template_and_refuses_past_its_quota() {
+    let router = router();
+    let connector_arn = create_connector(&router, &CONNECTOR_CASES[0].body()).await;
+    let mut template_arns = Vec::new();
+    for name in ["EntryBounded", "EntryBoundedOther"] {
+        let (_, parsed) =
+            create_template(&router, &connector_arn, name, &(TEMPLATE_CASES[0].definition)()).await;
+        template_arns.push(
+            parsed["TemplateArn"]
+                .as_str()
+                .unwrap_or_else(|| panic!("setup {name}: no TemplateArn: {parsed}"))
+                .to_string(),
+        );
+    }
+
+    /// A distinct group identifier per index, inside the modelled SID pattern.
+    fn group(index: usize) -> String {
+        format!("S-1-5-21-1004336348-1177238915-682003330-{}", 1000 + index)
+    }
+
+    for index in 0..MAX_ACCESS_CONTROL_ENTRIES_PER_TEMPLATE {
+        let body = json!({
+            "GroupSecurityIdentifier": group(index),
+            "GroupDisplayName": format!("group-{index}"),
+            "AccessRights": { "Enroll": "ALLOW", "AutoEnroll": "DENY" },
+        });
+        let (status, parsed) = create_entry(&router, &template_arns[0], &body).await;
+        assert_eq!(
+            status, 200,
+            "case entry {index}: every create up to the bound must succeed, got {status} / {parsed}"
+        );
+    }
+
+    let past = MAX_ACCESS_CONTROL_ENTRIES_PER_TEMPLATE;
+    let body = json!({
+        "GroupSecurityIdentifier": group(past),
+        "GroupDisplayName": "one-past-the-bound",
+        "AccessRights": { "Enroll": "ALLOW" },
+    });
+    let (status, parsed) = create_entry(&router, &template_arns[0], &body).await;
+    assert_eq!(
+        status, 402,
+        "case one past the bound: the create must be refused with the modelled quota status, \
+         got {status} / {parsed}"
+    );
+    assert_eq!(
+        parsed["__code"].as_str(),
+        Some("ServiceQuotaExceededException"),
+        "case one past the bound: expected ServiceQuotaExceededException, got {parsed}"
+    );
+    assert_eq!(
+        parsed["ResourceType"].as_str(),
+        Some("Template"),
+        "case one past the bound: the refusal names the resource holding the bound, got {parsed}"
+    );
+    let (status, parsed) = get_entry(&router, &template_arns[0], &group(past)).await;
+    assert_eq!(
+        status, 404,
+        "case one past the bound: a refused create must not have been stored, \
+         got {status} / {parsed}"
+    );
+
+    // The bound is per template, so another template is unaffected.
+    let (status, parsed) = create_entry(&router, &template_arns[1], &body).await;
+    assert_eq!(
+        status, 200,
+        "case another template: the per-template bound must not spill over, got {status} / {parsed}"
     );
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTemplateGroupAccessControlEntry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTemplateGroupAccessControlEntry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTemplateGroupAccessControlEntry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one group access control entry under a template: which Active Directory
+//! group may enroll and autoenroll certificates with it.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +187,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTemplateGroupAccessControlEntry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTemplateGroupAccessControlEntryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTemplateGroupAccessControlEntry"))
+        // IAM decides before anything is read or written. The call is judged against
+        // the template it creates the entry under — the resource the request addresses,
+        // since an access control entry has no ARN of its own; a refused call persists
+        // nothing and tells the caller nothing about the template it named.
+        if let Some(message) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, &input.template_arn)
+        {
+            return Err(
+                CreateTemplateGroupAccessControlEntryErrorModeled::AccessDeniedException(
+                    AccessDeniedException { message },
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateTemplateGroupAccessControlEntryErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the pca-connector-ad state store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The template is this entry's parent — the label of the path — so it is
+        // resolved first: a request naming a template this service does not hold is
+        // refused for that, whatever else it carries, in this service's one not-found
+        // wording.
+        if !store.templates.contains_key(&input.template_arn) {
+            return Err(
+                CreateTemplateGroupAccessControlEntryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::not_found_message(
+                            crate::state::RESOURCE_TYPE_TEMPLATE,
+                            &input.template_arn,
+                        ),
+                        resource_id: input.template_arn.clone(),
+                        resource_type: crate::state::RESOURCE_TYPE_TEMPLATE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `@idempotent`: the template and the group's security identifier identify at
+        // most one entry, so asking again for an entry already recorded for that pair
+        // changes nothing and is answered with the same 200. That is what makes the
+        // `@idempotencyToken` nothing this operation has to remember — a retry is
+        // answered by the record itself, whichever token it carries — and it is why
+        // changing an entry that exists is `UpdateTemplateGroupAccessControlEntry`
+        // rather than a second create.
+        if store
+            .access_control_entry(&input.template_arn, &input.group_security_identifier)
+            .is_some()
+        {
+            return Ok(CreateTemplateGroupAccessControlEntryOutput);
+        }
+
+        // The store is bounded per template: past the cap the create is refused with
+        // the modelled quota error rather than growing the map, so an unlimited number
+        // of distinct group identifiers cannot grow this process without limit.
+        if store.access_control_entry_count(&input.template_arn)
+            >= crate::state::MAX_ACCESS_CONTROL_ENTRIES_PER_TEMPLATE
+        {
+            return Err(
+                CreateTemplateGroupAccessControlEntryErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "template {} has reached its bound of {} group access control entries",
+                            input.template_arn,
+                            crate::state::MAX_ACCESS_CONTROL_ENTRIES_PER_TEMPLATE
+                        ),
+                        resource_id: input.template_arn.clone(),
+                        // The resource that HOLDS the exhausted bound is the template
+                        // named by `resource_id`; no entry exists to name.
+                        resource_type: crate::state::RESOURCE_TYPE_TEMPLATE.to_string(),
+                        service_code: crate::state::ARN_NAMESPACE.to_string(),
+                        quota_code: crate::state::QUOTA_CODE_ACCESS_CONTROL_ENTRIES_PER_TEMPLATE
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let seq = store.next_seq();
+        let record = crate::state::AccessControlEntryRecord {
+            template_arn: input.template_arn.clone(),
+            group_security_identifier: input.group_security_identifier.clone(),
+            group_display_name: input.group_display_name,
+            access_rights: input.access_rights,
+            created_at: now,
+            updated_at: now,
+            seq,
+        };
+        store.access_control_entries.insert(
+            (input.template_arn, input.group_security_identifier),
+            record,
+        );
+
+        // The modelled output is `Unit`: the entry is read back through
+        // `GetTemplateGroupAccessControlEntry` and
+        // `ListTemplateGroupAccessControlEntries`.
+        Ok(CreateTemplateGroupAccessControlEntryOutput)
     }
 }
