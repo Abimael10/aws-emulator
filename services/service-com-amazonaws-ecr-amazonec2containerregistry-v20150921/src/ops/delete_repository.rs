@@ -223,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(DeleteRepositoryOutput {
-            repository: Some(removed.to_repository(&crate::state::announced_registry_endpoint(ctx))),
+            repository: Some(removed.to_repository()),
         })
     }
 }

@@ -1069,25 +1069,20 @@ fn repository_arn(name: &str) -> String {
     format!("arn:aws:ecr:{REGION}:{ACCOUNT_ID}:repository/{name}")
 }
 
-/// `<endpoint>/<name>` — the URI `Fn::GetAtt <repository>.RepositoryUri` reports and
+/// `<registry host>/<name>` — the URI `Fn::GetAtt <repository>.RepositoryUri` reports and
 /// a container image reference is built on. `Repository$repositoryUri` is "The URI for the
-/// repository. You can use this URI for container image `push` and `pull` operations", so it
-/// is an ADDRESS a container client dials: the endpoint this emulator answers the caller at,
-/// followed by the repository's name. The stack's value is the one the repository's owning
-/// service reported, so this is the URI Amazon ECR itself reports for a repository of this
-/// account's registry.
+/// repository. You can use this URI for container image `push` and `pull` operations", whose
+/// format is `aws_account_id.dkr.ecr.region.amazonaws.com/repository-name`. The stack's
+/// value is the one the repository's owning service reported, so this is the URI Amazon ECR
+/// itself reports for a repository of this account's registry.
 fn repository_uri(name: &str) -> String {
-    format!("{}/{name}", registry_endpoint())
+    format!("{}/{name}", registry_host())
 }
 
-/// The endpoint this emulator answers on, which every registry address it reports is built
-/// on — this harness's router is served on no port of its own, so that is the authority of
-/// the base `smithy_server_runtime` reports for one.
-fn registry_endpoint() -> String {
-    let base = ::smithy_server_runtime::UNSERVED_URL_BASE;
-    base.split_once("://")
-        .map_or(base, |(_scheme, authority)| authority)
-        .to_string()
+/// The host of this account's Amazon ECR registry in the Region the stack is created in,
+/// which every repository URI the registry reports is built on.
+fn registry_host() -> String {
+    format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com")
 }
 
 /// `arn:aws:ecs:<region>:<account>:task-definition/<family>:1` — what `Ref` of an
@@ -1369,12 +1364,12 @@ fn cases() -> Vec<Case> {
                 // case letters"), a task definition's as its family.
                 form(
                     "RepositoryUri",
-                    "<the endpoint this emulator serves the registry at>/warehouse-registry-<id>",
+                    "<this account's registry host>/warehouse-registry-<id>",
                     |value| {
                         value
                             .strip_prefix(&format!(
                                 "{}/warehouse-registry-",
-                                registry_endpoint()
+                                registry_host()
                             ))
                             .is_some_and(|id| {
                                 !id.is_empty() && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())

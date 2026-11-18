@@ -214,7 +214,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(fault_error)?;
 
         let region = crate::state::request_region(ctx.parts());
-        let registry_endpoint = crate::state::announced_registry_endpoint(ctx);
         let store = state.lock();
 
         // Every requested name must name a repository OF THIS REGION's registry: ECR
@@ -228,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let candidates: Vec<(String, Repository)> = store
             .repositories_in(&region)
             .filter(|repo| wanted.is_empty() || wanted.contains(&repo.name))
-            .map(|repo| (repo.name.clone(), repo.to_repository(&registry_endpoint)))
+            .map(|repo| (repo.name.clone(), repo.to_repository()))
             .collect();
 
         let (repositories, next_token) = crate::state::paginate(

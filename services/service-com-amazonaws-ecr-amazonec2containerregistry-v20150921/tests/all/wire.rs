@@ -54,12 +54,37 @@ pub fn announced_registry_url() -> String {
 /// so a wrong registry id in the implementation fails these tests.
 pub const REGISTRY_ID: &str = "000000000000";
 
-/// The URI Amazon ECR reports for the repository `name`
-/// (`Repository$repositoryUri`: "The URI for the repository. You can use this URI for
-/// container image `push` and `pull` operations"): the endpoint this emulator answers the
-/// caller at ([`ANNOUNCED_REGISTRY_ENDPOINT`]), followed by the repository's own name.
+/// The host of the registry this account owns in `region`, in the registry URL format the
+/// model states (`AuthorizationData$proxyEndpoint`: "The Amazon ECR registry URL format is
+/// `https://aws_account_id.dkr.ecr.region.amazonaws.com`"), with the DNS suffix `region`'s
+/// own partition is served under — the `dnsSuffix` each partition publishes in the AWS SDK
+/// partition metadata (`endpoints.json`), spelled out here rather than imported so a wrong
+/// suffix in the implementation fails these tests.
+pub fn registry_host_in(region: &str) -> String {
+    let suffix = match region {
+        region if region.starts_with("cn-") => "amazonaws.com.cn",
+        region if region.starts_with("eusc-") => "amazonaws.eu",
+        region if region.starts_with("us-iso-") => "c2s.ic.gov",
+        region if region.starts_with("us-isob-") => "sc2s.sgov.gov",
+        region if region.starts_with("us-isof-") => "csp.hci.ic.gov",
+        region if region.starts_with("eu-isoe-") => "cloud.adc-e.uk",
+        _ => "amazonaws.com",
+    };
+    format!("{REGISTRY_ID}.dkr.ecr.{region}.{suffix}")
+}
+
+/// The URI Amazon ECR reports for the repository `name` of this account's registry in
+/// `region` (`Repository$repositoryUri`: "The URI for the repository. You can use this URI
+/// for container image `push` and `pull` operations"): that registry's host
+/// ([`registry_host_in`]) followed by the repository's own name.
+pub fn repository_uri_in(region: &str, name: &str) -> String {
+    format!("{}/{name}", registry_host_in(region))
+}
+
+/// The URI Amazon ECR reports for the repository `name` created by a call this harness
+/// signs ([`REGION`]).
 pub fn repository_uri(name: &str) -> String {
-    format!("{ANNOUNCED_REGISTRY_ENDPOINT}/{name}")
+    repository_uri_in(REGION, name)
 }
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire protocol").

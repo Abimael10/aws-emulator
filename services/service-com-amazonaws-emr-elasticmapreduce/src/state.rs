@@ -992,9 +992,9 @@ pub fn unknown_persistent_app_ui_message(persistent_app_ui_id: &str) -> String {
 /// Recorded behavior for the text: Amazon EMR names the resource — an instance group —
 /// then the id the request sent, quoted, through the same tail
 /// [`unknown_cluster_message`] uses. It is the sentence the automatic-scaling policy
-/// operations answer for a target they cannot reach, the group being what those calls act
-/// on and the cluster only the scope it is looked up in, so a cluster the account holds
-/// none of carries no such group either and is refused the same way.
+/// operations answer for a group a RESOLVED cluster does not carry; a `ClusterId` that
+/// resolves no cluster at all is refused in terms of the cluster instead
+/// ([`unknown_cluster_message`]), as it is on every other cluster-scoped operation.
 pub fn unknown_instance_group_message(instance_group_id: &str) -> String {
     format!("Instance group id {}", not_valid_message(instance_group_id))
 }

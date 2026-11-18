@@ -297,25 +297,21 @@ fn task_definition_arn(family: &str, revision: i64) -> String {
     format!("arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/{family}:{revision}")
 }
 
-/// `<endpoint>/<repository>` — the URI Amazon ECR REPORTS for `repository`, which is the
-/// ADDRESS a container client pushes and pulls it at (`Repository$repositoryUri`: "You can
-/// use this URI for container image `push` and `pull` operations"): the endpoint this
-/// emulator answers the caller at, followed by the repository's own name. This suite's router
-/// is served on no port of its own, so that endpoint is the authority of the base
-/// `smithy_server_runtime` reports for one.
+/// `<registry host>/<repository>` — the URI Amazon ECR REPORTS for `repository`, which is
+/// the address a container client pushes and pulls it at (`Repository$repositoryUri`: "You
+/// can use this URI for container image `push` and `pull` operations"): the host of the
+/// registry that holds it — this account, the `dkr` and `ecr` labels, the Region and its
+/// partition's DNS suffix, as the registry URL format the model states
+/// (`AuthorizationData$proxyEndpoint`) spells it — followed by the repository's own name.
 ///
 /// It is also the URI every row's registered image carries. A declaration that reaches the
-/// repository's `RepositoryUri` attribute resolves to it directly; one that spells the AWS
+/// repository's `RepositoryUri` attribute resolves to it directly; one that spells the
 /// registry host out of the pseudo parameters and the repository's name spells the STAND-IN
 /// CloudFormation derived for that attribute before the create answered, which the deployment
-/// re-points to the value the owning service assigned — so either way the image addresses the
-/// registry this emulator serves, which is the only address the image can be pulled from here.
+/// re-points to the value the owning service assigned — so either way the image names the
+/// registry this emulator serves that repository in, which is where the image is pulled from.
 pub(crate) fn published_repository_uri(repository: &str) -> String {
-    let base = ::smithy_server_runtime::UNSERVED_URL_BASE;
-    let endpoint = base
-        .split_once("://")
-        .map_or(base, |(_scheme, authority)| authority);
-    format!("{endpoint}/{repository}")
+    format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com/{repository}")
 }
 
 /// One deployment: the template, and what each owning service must then hold.

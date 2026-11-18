@@ -158,22 +158,18 @@ fn cluster_id_requests(cluster_id: Option<&str>) -> Vec<(&'static str, Value)> {
 /// The instance group id the policy rows below name.
 ///
 /// The automatic-scaling policy pair ACTS on an instance group — "the instance group to
-/// which the automatic scaling policy is applied" — and reaches a cluster only as the
-/// scope that group is looked up in, so a target neither resolves is blamed on THIS id
-/// rather than on the cluster id beside it ([`unresolvable_target_sentence`]).
+/// which the automatic scaling policy is applied" — and reaches a cluster as the scope that
+/// group is looked up in, so a `ClusterId` that resolves no cluster is refused in terms of
+/// the cluster, and this id is blamed only once a cluster resolved and carries no such group
+/// ([`unresolvable_target_sentence`]).
 const POLICY_GROUP_ID: &str = "ig-ABCDEFGHIJKLM";
 
-/// The sentence `operation` answers a `ClusterId` of the identifier class it resolves no
-/// target for: the cluster-id sentence, quoting the id the request sent, except where the
-/// operation's target is another resource — the automatic-scaling policy pair, which names
-/// the instance group the request asked it to act on.
-fn unresolvable_target_sentence(operation: &str, cluster_id: &str) -> String {
-    match operation {
-        "PutAutoScalingPolicy" | "RemoveAutoScalingPolicy" => {
-            format!("Instance group id '{POLICY_GROUP_ID}' is not valid.")
-        }
-        _ => format!("Cluster id '{cluster_id}' is not valid."),
-    }
+/// The sentence an operation answers a `ClusterId` of the identifier class it resolves no
+/// cluster for: the cluster-id sentence, quoting the id the request sent — the same one on
+/// every operation that resolves a cluster, the automatic-scaling policy pair included,
+/// because the value that did not resolve is the cluster id.
+fn unresolvable_target_sentence(cluster_id: &str) -> String {
+    format!("Cluster id '{cluster_id}' is not valid.")
 }
 
 /// One request per operation that resolves a `ClusterId` but models NO client error, so
@@ -278,7 +274,7 @@ async fn a_cluster_id_outside_the_identifier_class_is_refused_on_its_shape() {
         let case = format!("{operation} with an unresolvable cluster id");
         let (status, payload) = emr.call(operation, body).await;
         assert_refused(&case, status, &payload, REQUEST_VALIDATION);
-        let expected = unresolvable_target_sentence(operation, UNRESOLVABLE_CLUSTER_IDS[0]);
+        let expected = unresolvable_target_sentence(UNRESOLVABLE_CLUSTER_IDS[0]);
         assert_eq!(
             message(&case, &payload),
             expected,

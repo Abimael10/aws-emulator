@@ -9,8 +9,8 @@
 //! CloudFormation answers a reference to such an attribute with a stand-in while the owning
 //! service has not been asked yet, and the deployment re-points that stand-in once the create
 //! has answered. A re-pointing that reached only the one member the symptom was first seen on
-//! would leave every other property of the same resource holding a host nothing here answers
-//! for: the environment variable an application reads its registry from, the label an
+//! would leave every other property of the same resource holding whatever CloudFormation
+//! guessed: the environment variable an application reads its registry from, the label an
 //! operator greps for, the argument a command line passes to a pull.
 //!
 //! Amazon ECR owns the address (`Repository$repositoryUri`: "The URI for the repository. You
@@ -38,22 +38,20 @@ use super::cloudformation_registry_backed_task_definition::{
 };
 use super::query_wire::outputs_of;
 
-/// The registry host AWS itself serves a private repository at
-/// (`aws_account_id.dkr.ecr.region.amazonaws.com`, as `ContainerDefinition$image` spells it in
-/// its own examples) — what every stand-in for a `RepositoryUri` carries, and so what no value
-/// a deployed resource holds may still carry here.
+/// The label run every Amazon ECR registry host carries between the owning account's id and
+/// the registry's Region (`aws_account_id.dkr.ecr.region.amazonaws.com`, as
+/// `ContainerDefinition$image` spells it in its own examples), which is what marks a value of
+/// the registered revision as naming a registry at all.
 ///
-/// The address Amazon ECR ASSIGNS here carries neither mark: a repository URI is an ADDRESS a
-/// container client dials, so what this registry assigns is the endpoint this emulator answers
-/// on ([`published_repository_uri`]). A value still carrying both marks is therefore a
-/// stand-in the deployment never re-pointed.
-const AWS_REGISTRY_LABELS_MARK: &str = ".dkr.ecr.";
-const AWS_REGISTRY_ZONE_MARK: &str = ".amazonaws.com";
+/// Every such value must name the registry Amazon ECR ASSIGNED the repository
+/// ([`published_repository_uri`]): a value naming any other registry host is a stand-in the
+/// deployment never re-pointed — another account's registry, or another Region's — and no
+/// image pinned to it is one this registry holds.
+const REGISTRY_LABELS_MARK: &str = ".dkr.ecr.";
 
-/// Whether `text` still carries a registry host in AWS's OWN zone, which is what a stand-in
-/// left behind looks like (see [`AWS_REGISTRY_LABELS_MARK`]).
-fn names_the_aws_registry_host(text: &str) -> bool {
-    text.contains(AWS_REGISTRY_LABELS_MARK) && text.contains(AWS_REGISTRY_ZONE_MARK)
+/// Whether `text` names an Amazon ECR registry host at all (see [`REGISTRY_LABELS_MARK`]).
+fn names_a_registry_host(text: &str) -> bool {
+    text.contains(REGISTRY_LABELS_MARK)
 }
 
 /// The container every row declares, and the name of the environment variable and the docker
@@ -343,8 +341,8 @@ async fn every_property_that_consumes_the_repository_holds_the_address_ecr_assig
         assert_eq!(
             assigned,
             published_repository_uri(&repository),
-            "case {:?}: expected Amazon ECR to publish the repository at the address this \
-             emulator serves its registry at, got {reported}",
+            "case {:?}: expected Amazon ECR to publish the repository at the registry that \
+             holds it, got {reported}",
             row.case
         );
         assert_eq!(
@@ -389,20 +387,21 @@ async fn every_property_that_consumes_the_repository_holds_the_address_ecr_assig
             );
         }
 
-        // And nothing the revision holds still names the AWS registry host: a stand-in left
-        // in any position is an address no client of this emulator can reach, so the whole
-        // answer is read rather than only the members named above.
+        // And every value the revision holds that names a registry at all names the one
+        // Amazon ECR assigned: a stand-in left in any position addresses a repository this
+        // registry does not hold, so the whole answer is read rather than only the members
+        // named above.
         let mut held = Vec::new();
         strings(&answer, &mut held);
         let standing: Vec<&String> = held
             .iter()
-            .filter(|text| names_the_aws_registry_host(text))
+            .filter(|text| names_a_registry_host(text) && !text.contains(&assigned))
             .collect();
         assert!(
             standing.is_empty(),
-            "case {:?}: expected no value of the registered revision to still name a registry \
-             host in AWS's own zone ({AWS_REGISTRY_LABELS_MARK:?} under \
-             {AWS_REGISTRY_ZONE_MARK:?}), got {standing:?}",
+            "case {:?}: expected every value of the registered revision that names a registry \
+             ({REGISTRY_LABELS_MARK:?}) to name the one Amazon ECR assigned ({assigned:?}), \
+             got {standing:?}",
             row.case
         );
     }

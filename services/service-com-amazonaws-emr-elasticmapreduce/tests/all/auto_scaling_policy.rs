@@ -877,22 +877,21 @@ async fn put_auto_scaling_policy_refuses_what_it_cannot_store() {
     }
 }
 
-/// THE RULE on the WORDING of those refusals: both operations act on an instance group —
-/// "the instance group to which the automatic scaling policy is applied"
-/// (`PutAutoScalingPolicy$InstanceGroupId` doc) and "removes an automatic scaling policy
-/// from a specified instance group" (`RemoveAutoScalingPolicy` doc) — and reach a cluster
-/// only as the scope that group is looked up in, so a target neither of them can reach is
-/// refused in terms of the INSTANCE GROUP the request named, never in terms of the cluster
-/// id beside it: HTTP 400 `ValidationException` with the instance-group sentence, which
-/// quotes the `InstanceGroupId` exactly as the request sent it.
+/// THE RULE on the WORDING of those refusals: each of the two values a request carries is
+/// refused in terms of ITSELF — a `ClusterId` the account holds no cluster for is refused
+/// with the cluster-id sentence every cluster-scoped operation of this service answers an
+/// unresolved cluster id with, and only a cluster that DID resolve while carrying no such
+/// group is refused with the instance-group sentence, which quotes the `InstanceGroupId`
+/// exactly as the request sent it. Either way HTTP 400 `ValidationException`, and the two
+/// sentences differ, so a caller is told which of the two values it has to fix.
 ///
 /// The rows span what the rule generalises over: both operations, both ways the target
 /// fails to resolve (no such cluster at all, and a live cluster carrying no such group),
 /// every form of unusable cluster id and every form of unusable group id — including, for
 /// the no-such-cluster leg, a group id the LIVE cluster really does carry, which is the
-/// case that shows the sentence is not a cluster lookup wearing a group's name.
+/// case that shows the cluster id is what that refusal is about.
 #[tokio::test]
-async fn an_unreachable_policy_target_is_worded_as_the_instance_group() {
+async fn an_unreachable_policy_target_is_worded_as_the_value_that_did_not_resolve() {
     let emr = Emr::new();
     let cluster_id = emr.run_job_flow(launch("blamed")).await;
     let ids = group_ids(&emr, "blamed", &cluster_id).await;
@@ -912,10 +911,11 @@ async fn an_unreachable_policy_target_is_worded_as_the_instance_group() {
         )],
     );
 
-    // `(the case, the cluster id, the group id)`: a cluster the account holds none of,
-    // named beside each form of group id and beside a group the live cluster carries; and
-    // the live cluster named beside each form of group id it carries none of.
-    let mut targets: Vec<(String, String, String)> = Vec::new();
+    // `(the case, the cluster id, the group id, the sentence the refusal must be)`: a
+    // cluster the account holds none of, named beside each form of group id and beside a
+    // group the live cluster carries — refused as the CLUSTER; and the live cluster named
+    // beside each form of group id it carries none of — refused as the GROUP.
+    let mut targets: Vec<(String, String, String, String)> = Vec::new();
     for unknown_cluster in UNKNOWN_CLUSTER_IDS {
         for group in UNKNOWN_GROUP_IDS
             .iter()
@@ -926,6 +926,7 @@ async fn an_unreachable_policy_target_is_worded_as_the_instance_group() {
                 format!("cluster {unknown_cluster:?} with group {group:?}"),
                 (*unknown_cluster).to_string(),
                 group,
+                format!("Cluster id '{unknown_cluster}' is not valid."),
             ));
         }
     }
@@ -934,10 +935,11 @@ async fn an_unreachable_policy_target_is_worded_as_the_instance_group() {
             format!("the live cluster with group {unknown_group:?}"),
             cluster_id.clone(),
             (*unknown_group).to_string(),
+            format!("Instance group id '{unknown_group}' is not valid."),
         ));
     }
 
-    for (label, cluster, group) in &targets {
+    for (label, cluster, group, expected) in &targets {
         let requests: Vec<(&str, Value)> = vec![
             (
                 "PutAutoScalingPolicy",
@@ -957,14 +959,9 @@ async fn an_unreachable_policy_target_is_worded_as_the_instance_group() {
             let (status, payload) = emr.call(operation, request).await;
             assert_refused(&case, status, &payload, "ValidationException");
             let said = crate::input_refusals::error_message(&payload);
-            let expected = format!("Instance group id '{group}' is not valid.");
             assert_eq!(
-                said, expected,
+                said, *expected,
                 "case {case:?}: expected {expected:?}, got {payload}"
-            );
-            assert!(
-                cluster.is_empty() || group.contains(cluster.as_str()) || !said.contains(cluster),
-                "case {case:?}: the sentence names the group and not the cluster, got {said:?}"
             );
         }
     }

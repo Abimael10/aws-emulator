@@ -2,26 +2,21 @@
 
 //! The URI Amazon ECR reports for a repository, end to end over the wire.
 //!
-//! The rule under test: **`Repository$repositoryUri` is the ADDRESS a client pushes the
-//! repository to and pulls it from — the endpoint this emulator answers that client at,
-//! followed by `/` and the repository's own name.** The member's doc says what the value is
-//! for ("The URI for the repository. You can use this URI for container image `push` and
-//! `pull` operations"), so it is DIALLED rather than read: AWS reports it on its own
-//! `<account>.dkr.ecr.<region>.amazonaws.com` registry host, which resolves to nothing on
-//! the machine this emulator runs on — a URI naming it sends every push and pull out of the
-//! emulator — and a name under a zone this emulator is reached in resolves nowhere either,
-//! because this emulator answers on an ENDPOINT and not in a zone it can add names to. The
-//! endpoint the caller is already talking to is the one address it can reach, and it is
-//! where this registry's `/v2` data plane answers.
+//! The rule under test: **`Repository$repositoryUri` is the repository's address in the
+//! registry that HOLDS it — the owning account's id, the `dkr` and `ecr` labels, the
+//! Region that registry serves and that partition's DNS suffix, then `/` and the
+//! repository's own name.** The model states the registry URL format
+//! (`AuthorizationData$proxyEndpoint`: "The Amazon ECR registry URL format is
+//! `https://aws_account_id.dkr.ecr.region.amazonaws.com`") and the member says what the
+//! value is for ("The URI for the repository. You can use this URI for container image
+//! `push` and `pull` operations"), so a client both writes it into an image reference and
+//! reads the account and the Region back out of it. It is composed from the stored record,
+//! so every reader is reported the same URI.
 //!
-//! WHICH registry holds the repository is reported by the members that carry that identity:
-//! `Repository$registryId` is the owning account and `Repository$repositoryArn` carries "the
-//! region of the repository, Amazon Web Services account ID of the repository owner,
-//! repository namespace, and repository name". An Amazon ECR registry is one account's in
-//! ONE Region, so one repository name taken in two Regions is two repositories with two
-//! ARNs, served by one endpoint: a push or a pull names the repository in the path and the
-//! registry through the credential it presents, which is the registry its token was issued
-//! for.
+//! An Amazon ECR registry is one account's in ONE Region, so one repository name taken in
+//! two Regions is two repositories: two ARNs, and two URIs naming two registries. Which
+//! registry answers a push or a pull is read off the reference's own host, which is why one
+//! name in two Regions cannot collapse to one address.
 //!
 //! The class the rule generalises over is the Region the repository was created in crossed
 //! with the repository name: the rows below span Regions of five partitions crossed with the
@@ -31,16 +26,23 @@
 //! The tests that follow are the invariants that make the value more than a well-shaped
 //! string: a container client that splits the reported URI and pulls at it reaches the image
 //! the repository holds; two repositories of one name in two Regions are told apart by their
-//! ARNs and each is pulled with its own Region's credential; and the name-collision walk — a
-//! create refused in the Region that holds the name and accepted in another — leaves both
-//! readable.
+//! URIs and their ARNs and each is pulled with its own Region's credential; and the
+//! name-collision walk — a create refused in the Region that holds the name and accepted in
+//! another — leaves both readable.
+//!
+//! The last section reads the same rule on a repository no `CreateRepository` call ever
+//! named: the mirrored one the registry's own import creates when a reference under a pull
+//! through cache rule's prefix is first read ("a pull through cache rule provides a way to
+//! cache images from an upstream registry source in your Amazon ECR private registry",
+//! `CreatePullThroughCacheRule`). The value is composed from the record, so the path that
+//! MINTED the repository cannot change it.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
     at, call_in_region, emulator, given_layer_in_region, ok_in_region, registry_get,
-    repository_uri, REGISTRY_ID,
+    registry_host_in, repository_uri_in, REGISTRY_ID,
 };
 
 /// The media type a Docker v2 manifest is pushed and served under.
@@ -89,7 +91,7 @@ async fn every_operation_reports_the_address_the_repository_is_pushed_and_pulled
     for region in REGISTRY_REGIONS {
         for name in REPOSITORY_NAMES {
             let case = format!("{region}, repository {name}");
-            let expected = repository_uri(name);
+            let expected = repository_uri_in(region, name);
 
             let created = ok_in_region(
                 &router,
@@ -106,16 +108,19 @@ async fn every_operation_reports_the_address_the_repository_is_pushed_and_pulled
                  {created_uri:?}"
             );
 
-            // The two parts a container client splits the value into: the address it dials,
-            // which is never an AWS host this emulator does not answer on, and the path
-            // after the first '/', which is exactly the repository's name.
+            // The two parts a container client splits the value into: the registry host,
+            // whose first four labels are the owning account, `dkr`, `ecr` and the Region,
+            // and the path after the first '/', which is exactly the repository's name.
             let (authority, path) = created_uri
                 .split_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: {created_uri:?} names no path"));
+            let labels: Vec<&str> = authority.split('.').collect();
             assert!(
-                !authority.contains(".amazonaws.com"),
-                "case {case:?}: the authority {authority:?} of {created_uri:?} is an AWS host \
-                 this emulator does not answer on"
+                labels.len() > 4
+                    && labels[..4] == [REGISTRY_ID, "dkr", "ecr", region]
+                    && !authority.contains(':'),
+                "case {case:?}: expected the host of {created_uri:?} to name this account's \
+                 registry in {region:?} and carry no port, got {authority:?}"
             );
             assert_eq!(
                 path, *name,
@@ -178,14 +183,13 @@ async fn every_operation_reports_the_address_the_repository_is_pushed_and_pulled
 
 #[tokio::test]
 async fn one_name_in_two_registries_is_told_apart_by_its_registry_members() {
-    // One name in several Regions is several repositories. They are reached at the one
-    // address this emulator answers on, and what tells them apart is the identity each
-    // reports: its own Region's ARN. No two of those are the same value, and each Region's
-    // read reports only its own.
+    // One name in several Regions is several repositories, and what tells them apart is what
+    // each reports: its own registry's URI and its own Region's ARN. No two of those are the
+    // same value, and each Region's read reports only its own.
     let router = emulator();
     let name = "shared-name";
-    let expected = repository_uri(name);
     let mut arns: Vec<String> = Vec::new();
+    let mut uris: Vec<String> = Vec::new();
     for region in REGISTRY_REGIONS {
         let case = format!("{region}, repository {name}");
         ok_in_region(
@@ -205,10 +209,17 @@ async fn one_name_in_two_registries_is_told_apart_by_its_registry_members() {
         )
         .await;
         let uri = reported_uri(&case, &described, "/repositories/0/repositoryUri");
+        let expected = repository_uri_in(region, name);
         assert_eq!(
             uri, expected,
-            "case {case:?}: expected the address this emulator answers on, got {uri:?}"
+            "case {case:?}: expected {expected:?}, got {uri:?}"
         );
+        assert!(
+            !uris.contains(&uri),
+            "case {case:?}: expected a URI no other Region's registry reports, but {uri:?} \
+             was already reported for {uris:?}"
+        );
+        uris.push(uri);
         let arn = at(&described, "/repositories/0/repositoryArn")
             .as_str()
             .unwrap_or_default()
@@ -248,8 +259,9 @@ async fn a_pull_at_the_reported_uri_reaches_the_repository_it_names() {
         let reported = reported_uri(&case, &created, "/repository/repositoryUri");
         assert_eq!(
             reported,
-            repository_uri(name),
-            "case {case:?}: expected the address this emulator answers on, got {reported:?}"
+            repository_uri_in(region, name),
+            "case {case:?}: expected the URI of this account's registry in {region:?}, got \
+             {reported:?}"
         );
         let (reported_host, reported_path) = reported
             .split_once('/')
@@ -361,7 +373,8 @@ async fn a_name_one_registry_holds_is_free_in_another_and_both_stay_readable() {
     for pair in REGION_PAIRS {
         let router = emulator();
         let case = format!("{}, repository {}", pair.case, pair.name);
-        let expected = repository_uri(pair.name);
+        let expected_home = repository_uri_in(pair.home, pair.name);
+        let expected_other = repository_uri_in(pair.other, pair.name);
 
         let created = ok_in_region(
             &router,
@@ -377,8 +390,8 @@ async fn a_name_one_registry_holds_is_free_in_another_and_both_stay_readable() {
             .unwrap_or_default()
             .to_string();
         assert_eq!(
-            home_uri, expected,
-            "case {case:?}: expected the address this emulator answers on, got {home_uri:?}"
+            home_uri, expected_home,
+            "case {case:?}: expected {expected_home:?}, got {home_uri:?}"
         );
 
         // The same name again in the SAME registry is the collision, refused with the code
@@ -464,8 +477,13 @@ async fn a_name_one_registry_holds_is_free_in_another_and_both_stay_readable() {
             .unwrap_or_default()
             .to_string();
         assert_eq!(
-            other_uri, expected,
-            "case {case:?}: expected the address this emulator answers on, got {other_uri:?}"
+            other_uri, expected_other,
+            "case {case:?}: expected {expected_other:?}, got {other_uri:?}"
+        );
+        assert_ne!(
+            other_uri, home_uri,
+            "case {case:?}: expected two Regions' repositories to carry two URIs, got \
+             {other_uri:?} for both"
         );
         assert_ne!(
             other_arn, home_arn,
@@ -554,13 +572,20 @@ async fn a_pull_with_each_regions_credential_reaches_that_regions_own_image() {
             let (authority, path) = uri
                 .split_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: {uri:?} names no repository path"));
-            // A client logs in where it pushes: the registry URL is the URI's own authority
-            // behind a scheme.
+            // The URI names the registry that holds the repository, so its host is that
+            // Region's registry host and the path is the repository.
+            assert_eq!(
+                authority,
+                registry_host_in(region),
+                "case {case:?}: expected {uri:?} to name the {region:?} registry"
+            );
+            // The token's own registry URL is a different value: it is DIALLED with the
+            // credential, so it names the endpoint this emulator answers the caller at.
             assert_eq!(
                 proxy_endpoint,
-                format!("https://{authority}"),
-                "case {case:?}: expected the {region:?} login URL to name the address \
-                 {authority:?} the repository is pushed to, got {proxy_endpoint:?}"
+                crate::wire::announced_registry_url(),
+                "case {case:?}: expected the {region:?} login URL to name the endpoint this \
+                 emulator answers at, got {proxy_endpoint:?}"
             );
 
             let pulled = pull_manifest(&router, authority, path, &token).await;
@@ -598,4 +623,243 @@ async fn pull_manifest(
         Some(DOCKER_V2_MANIFEST),
     )
     .await
+}
+
+/// One import through a pull through cache rule: the Region it is made in, the rule's prefix
+/// and the path read under it.
+#[derive(Clone, Copy)]
+struct CachedImport {
+    case: &'static str,
+    /// The Region the rule is registered and the read is made in. Its partition decides the
+    /// DNS suffix the registry host carries (`crate::wire::registry_host_in`).
+    region: &'static str,
+    /// `ecrRepositoryPrefix` as the create request carries it.
+    prefix: &'static str,
+    /// The path under the prefix the read addresses: `<prefix>/<path>` is the repository the
+    /// import caches into.
+    path: &'static str,
+    /// The tag the read asks for.
+    tag: &'static str,
+}
+
+/// The imports the table drives, spanning the Region — and so the partition — the import is
+/// made in, how deep the cached path is, whether the prefix is nested, and the tag asked
+/// for.
+const CACHED_IMPORTS: &[CachedImport] = &[
+    CachedImport {
+        case: "a one-level path in a commercial Region",
+        region: "us-west-2",
+        prefix: "ptc-public",
+        path: "pause",
+        tag: "latest",
+    },
+    CachedImport {
+        case: "a three-level path under a plain prefix",
+        region: "ap-southeast-2",
+        prefix: "ptc-public",
+        path: "docker/library/busybox",
+        tag: "1.36.1",
+    },
+    CachedImport {
+        case: "a nested prefix in a GovCloud Region",
+        region: "us-gov-east-1",
+        prefix: "team/mirror",
+        path: "library/alpine",
+        tag: "3.20",
+    },
+    CachedImport {
+        case: "a Region of a partition with its own DNS suffix",
+        region: "cn-north-1",
+        prefix: "ptc-public",
+        path: "docker/library/hello-world",
+        tag: "latest",
+    },
+];
+
+/// The upstream these rules cache from, and the `UpstreamRegistry` value that URL belongs to
+/// (`smithy_query(query="operation", operation="CreatePullThroughCacheRule")`, member
+/// `upstreamRegistryUrl`).
+const UPSTREAM_URL: &str = "public.ecr.aws";
+const UPSTREAM_REGISTRY: &str = "ecr-public";
+
+/// The repository an import's read addresses: the rule's prefix, then the path under it.
+fn cached_repository(import: &CachedImport) -> String {
+    format!("{}/{}", import.prefix, import.path)
+}
+
+/// Register the import's rule through `CreatePullThroughCacheRule`. A rule's prefix is
+/// unique in the registry, so one call covers the reference however many Regions it is read
+/// in.
+async fn given_cache_rule(router: &MultiServiceRouter, import: &CachedImport) {
+    ok_in_region(
+        router,
+        import.case,
+        import.region,
+        "CreatePullThroughCacheRule",
+        &json!({
+            "ecrRepositoryPrefix": import.prefix,
+            "upstreamRegistry": UPSTREAM_REGISTRY,
+            "upstreamRegistryUrl": UPSTREAM_URL,
+        }),
+    )
+    .await;
+}
+
+/// Read the covered reference so the registry imports it, and answer the
+/// `DescribeRepositories` body for the repository that import created.
+async fn import_and_describe(
+    router: &MultiServiceRouter,
+    import: &CachedImport,
+    repository: &str,
+) -> Value {
+    let read = ok_in_region(
+        router,
+        import.case,
+        import.region,
+        "BatchGetImage",
+        &json!({"repositoryName": repository, "imageIds": [{"imageTag": import.tag}]}),
+    )
+    .await;
+    assert_eq!(
+        at(&read, "/failures"),
+        json!([]),
+        "case {:?}: expected the covered reference to be served by caching it, got {read}",
+        import.case
+    );
+    ok_in_region(
+        router,
+        import.case,
+        import.region,
+        "DescribeRepositories",
+        &json!({"repositoryNames": [repository]}),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_cached_repository_is_reported_at_the_registry_that_holds_it() {
+    for import in CACHED_IMPORTS {
+        let router = emulator();
+        let case = import.case;
+        let repository = cached_repository(import);
+        given_cache_rule(&router, import).await;
+        let described = import_and_describe(&router, import, &repository).await;
+
+        let reported = reported_uri(case, &described, "/repositories/0/repositoryUri");
+        let expected = repository_uri_in(import.region, &repository);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {expected:?}, got {reported:?}"
+        );
+
+        // The two parts a container client splits the value into: the host of the registry
+        // that holds the repository, and the path after the first '/', which is exactly the
+        // repository's own name — the rule's prefix and all, however many segments it
+        // carries.
+        let (host, path) = reported
+            .split_once('/')
+            .unwrap_or_else(|| panic!("case {case:?}: {reported:?} names no repository path"));
+        assert_eq!(
+            host,
+            registry_host_in(import.region),
+            "case {case:?}: expected the host of this account's registry in {:?}, got {host:?}",
+            import.region
+        );
+        assert_eq!(
+            path, repository,
+            "case {case:?}: expected the path of {reported:?} to be {repository:?}, got \
+             {path:?}"
+        );
+        assert!(
+            !host.contains(':'),
+            "case {case:?}: a registry host carries no port, got {host:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_cached_path_in_two_regions_carries_two_uris() {
+    // What the form is FOR: a client stores the reported URI as an image reference, so two
+    // Regions' registries must never collapse to one address. The same rule and the same
+    // covered path are imported in each Region of a pair, and each read reports its own
+    // registry — while the repository NAME, the path of both, is the same.
+    const PAIRS: &[(&str, &str, &str)] = &[
+        ("two commercial Regions", "us-east-1", "eu-west-1"),
+        ("two partitions", "us-west-2", "cn-north-1"),
+        (
+            "a GovCloud Region beside a commercial one",
+            "us-gov-west-1",
+            "us-east-2",
+        ),
+    ];
+    for &(case, home, other) in PAIRS {
+        let router = emulator();
+        let mut reported: Vec<(&str, String)> = Vec::new();
+        let rule = CachedImport {
+            case,
+            region: home,
+            prefix: "ptc-public",
+            path: "docker/library/busybox",
+            tag: "latest",
+        };
+        given_cache_rule(&router, &rule).await;
+        for region in [home, other] {
+            let import = CachedImport { region, ..rule };
+            let repository = cached_repository(&import);
+            let described = import_and_describe(&router, &import, &repository).await;
+            let uri = reported_uri(case, &described, "/repositories/0/repositoryUri");
+            assert_eq!(
+                uri,
+                repository_uri_in(region, &repository),
+                "case {case:?}: expected the {region:?} registry's URI, got {uri:?}"
+            );
+            assert_eq!(
+                at(&described, "/repositories/0/repositoryName"),
+                json!(repository),
+                "case {case:?}: expected the cached repository to be reported in {region:?}, \
+                 got {described}"
+            );
+            reported.push((region, uri));
+        }
+        assert_ne!(
+            reported[0].1, reported[1].1,
+            "case {case:?}: expected {:?} and {:?} to report two URIs, got {:?} for both",
+            reported[0].0, reported[1].0, reported[0].1
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cached_repository_and_a_created_one_are_reported_the_same_way() {
+    // The value follows from the stored record, so the path that MINTED the repository
+    // cannot change it: a repository a client created and one the registry imported are
+    // reported at the same registry, differing only in the name each carries.
+    let router = emulator();
+    let import = &CACHED_IMPORTS[0];
+    let cached = cached_repository(import);
+    given_cache_rule(&router, import).await;
+    let described = import_and_describe(&router, import, &cached).await;
+    let imported_uri = reported_uri(import.case, &described, "/repositories/0/repositoryUri");
+
+    let name = "created/by-a-client";
+    let created = ok_in_region(
+        &router,
+        import.case,
+        import.region,
+        "CreateRepository",
+        &json!({"repositoryName": name}),
+    )
+    .await;
+    let created_uri = reported_uri(import.case, &created, "/repository/repositoryUri");
+    for (what, uri, repository) in [
+        ("the imported repository", &imported_uri, cached.as_str()),
+        ("the created repository", &created_uri, name),
+    ] {
+        assert_eq!(
+            *uri,
+            repository_uri_in(import.region, repository),
+            "case {what:?}: expected the {:?} registry's URI for {repository:?}, got {uri:?}",
+            import.region
+        );
+    }
 }

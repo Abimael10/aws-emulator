@@ -167,12 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The TARGET of this call is the instance group ("removes an automatic scaling
         // policy from a specified instance group", this operation's doc) and the cluster is
-        // only the scope the group is looked up in, so a target that does not resolve is
-        // refused in terms of the GROUP the request named — whether the cluster carries no
-        // such group or the account holds no such cluster, which carries no group either.
+        // the scope the group is looked up in, so each of the two is refused in terms of the
+        // value that did not resolve: a `ClusterId` this account holds no cluster for is
+        // refused as the CLUSTER, the sentence every cluster-scoped operation of this
+        // service answers an unresolved cluster id with, and only a cluster that DID resolve
+        // and carries no such group is refused in terms of the group.
         let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::unknown_instance_group_message(&input.instance_group_id),
+                crate::state::unknown_cluster_message(&input.cluster_id),
             ));
         };
 

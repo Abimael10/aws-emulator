@@ -2221,20 +2221,19 @@ impl Repo {
 
     /// The `Repository` every operation that reports this repository returns.
     ///
-    /// `repositoryUri` is composed here rather than stored on the record, from the
-    /// repository's own name and the endpoint this emulator answers the caller being served
-    /// at ([`announced_registry_endpoint`], read off `registry_endpoint`, and
-    /// [`repository_uri`]): the value is an ADDRESS the client dials next, so it names the
-    /// one address that client can reach, with the repository's own name as the path (see
-    /// [`registry_address`](crate::state::registry_address)). Which registry holds the
-    /// repository is reported by the members that carry it — `registryId` and the ARN, both
-    /// read off this record — so two Regions' repositories of one name are still told apart.
-    pub fn to_repository(&self, registry_endpoint: &str) -> Repository {
+    /// `repositoryUri` is composed here rather than stored on the record, from the record
+    /// ITSELF: the account that owns the registry, the Region that registry serves and the
+    /// repository's own name ([`repository_uri`], and see
+    /// [`registry_address`](crate::state::registry_address)). The value therefore names the
+    /// registry that HOLDS the repository, so every reader is reported the same URI and two
+    /// Regions' repositories of one name carry two of them — as do the members that report
+    /// that identity on their own, `registryId` and the ARN.
+    pub fn to_repository(&self) -> Repository {
         Repository {
             repository_arn: Some(self.arn.clone()),
             registry_id: Some(self.registry_id.clone()),
             repository_name: Some(self.name.clone()),
-            repository_uri: Some(repository_uri(registry_endpoint, &self.name)),
+            repository_uri: Some(repository_uri(&self.registry_id, &self.region, &self.name)),
             created_at: Some(reported_instant(self.created_at)),
             image_tag_mutability: Some(self.image_tag_mutability.clone()),
             image_tag_mutability_exclusion_filters: if self

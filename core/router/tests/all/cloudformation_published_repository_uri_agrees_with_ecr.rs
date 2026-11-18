@@ -4,21 +4,19 @@
 //! service reports for it.
 //!
 //! The rule under test: **an attribute value a deployment publishes for a resource it
-//! created through the owning service's own API is the value that service answered with, so
-//! an ADDRESS published that way names the endpoint this emulator serves the resource at.**
+//! created through the owning service's own API is the value that service answered with.**
 //! Before a create answers, CloudFormation can only compute a stand-in for a value only the
 //! owning service can produce; the deployment replaces that stand-in with what the create
-//! really reported. A stack that published the stand-in instead would hand a client an
-//! address that resolves nowhere near this process — `aws_account_id.dkr.ecr.region
-//! .amazonaws.com` is a host AWS serves, not this emulator — so the first push or pull a
-//! client made on what the stack handed it would leave the emulated environment entirely.
+//! really reported. A stack that published its own stand-in instead would hand a client a
+//! value the owning service never minted, and the two would drift apart wherever the
+//! service's own composition differs — which is exactly what the partitions below show.
 //!
 //! Amazon ECR's `Repository$repositoryUri` is read here because it is such a value: "The URI
 //! for the repository. You can use this URI for container image `push` and `pull`
-//! operations", which is an address a client DIALS rather than a label it stores. Two crates
-//! have to agree for one of these templates to publish it — CloudFormation makes the create
-//! and Amazon ECR serves it — so the suite lives here; a crate-local test sees one side of
-//! that call only.
+//! operations", composed by that registry from the repository it holds. Two crates have to
+//! agree for one of these templates to publish it — CloudFormation makes the create and
+//! Amazon ECR serves it — so the suite lives here; a crate-local test sees one side of that
+//! call only.
 //!
 //! Each row deploys one stack and reads the repository back through Amazon ECR's own
 //! `DescribeRepositories`, then checks every value the stack published for it against that
@@ -50,27 +48,22 @@ const ECR_TARGET_PREFIX: &str = "AmazonEC2ContainerRegistry_V20150921";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const POLL_ATTEMPTS: usize = 80;
 
-/// The authority this emulator answers on when it is served on no port of its own, which is
-/// how this suite mounts it: the authority of the framework's unserved base
-/// (`smithy_server_runtime::UNSERVED_URL_BASE`). Every address a service here reports for a
-/// client to dial is built on the endpoint the emulator is reached at, so this is the
-/// authority of the published repository URI — and it is NOT a host AWS publishes.
-fn emulator_authority() -> &'static str {
-    let base = ::smithy_server_runtime::UNSERVED_URL_BASE;
-    base.split_once("://")
-        .map_or(base, |(_scheme, authority)| authority)
-}
-
 /// The account id every emulated ARN carries (`engine::emulator_account_id`).
 const ACCOUNT: &str = ::engine::EMULATOR_ACCOUNT_ID;
 
-/// The address Amazon ECR reports a repository at, which a container client DIALS: the
-/// endpoint this emulator answers on ([`emulator_authority`]) followed by the repository's
-/// own name. AWS reports it on its own `aws_account_id.dkr.ecr.region.amazonaws.com`
-/// registry host, which AWS serves and this emulator does not, so what a client here is
-/// handed is the endpoint it can reach.
-fn repository_uri(repository: &str) -> String {
-    format!("{}/{repository}", emulator_authority())
+/// The URI Amazon ECR reports a repository of this account's registry in `region` at: the
+/// registry URL format the model states (`AuthorizationData$proxyEndpoint`: "The Amazon ECR
+/// registry URL format is `https://aws_account_id.dkr.ecr.region.amazonaws.com`") with the
+/// DNS suffix that Region's partition is served under — the `dnsSuffix` each partition
+/// publishes in the AWS SDK partition metadata (`endpoints.json`) — followed by the
+/// repository's own name.
+fn repository_uri(region: &str, repository: &str) -> String {
+    let suffix = if region.starts_with("cn-") {
+        "amazonaws.com.cn"
+    } else {
+        "amazonaws.com"
+    };
+    format!("{ACCOUNT}.dkr.ecr.{region}.{suffix}/{repository}")
 }
 
 /// The emulator with the two services this suite exercises, mounted on ONE engine exactly as
@@ -325,7 +318,7 @@ const ROWS: &[Row] = &[
     Row {
         // A repository name may carry a namespace path ("A repository name must start with a
         // letter and can only contain lowercase letters, numbers, hyphens, underscores, and
-        // forward slashes"), which the URI appends to the registry endpoint as it stands.
+        // forward slashes"), which the URI appends to the registry host as it stands.
         case: "a namespaced repository in ap-southeast-2, published in YAML",
         region: "ap-southeast-2",
         stack: "namespaced-registry-uri",
@@ -479,11 +472,10 @@ async fn a_stack_publishes_the_repository_values_amazon_ecr_itself_reports() {
             row.case
         );
 
-        // The URI that service reports is the one address a container client here can push
-        // to and pull from: the endpoint this emulator answers on, followed by the
-        // repository's own name.
+        // The URI that service reports names the registry that holds the repository: this
+        // account, the Region's own registry host, and the repository's own name.
         let held_uri = held["repositoryUri"].as_str().unwrap_or_default().to_string();
-        let expected_uri = repository_uri(&repository);
+        let expected_uri = repository_uri(row.region, &repository);
         assert_eq!(
             held_uri, expected_uri,
             "case {:?}: expected Amazon ECR to report the repository URI {expected_uri:?}, got \
@@ -498,8 +490,8 @@ async fn a_stack_publishes_the_repository_values_amazon_ecr_itself_reports() {
         );
 
         // Every value the stack published for that attribute is the value the create
-        // answered, however the output composed it: the stand-in CloudFormation computed
-        // before the create — a host AWS serves — is not what any of them carries.
+        // answered, however the output composed it — not a stand-in CloudFormation spelled
+        // for itself, which in a partition of its own would name another host entirely.
         for output in URI_OUTPUTS {
             let published = outputs.get(output).cloned().unwrap_or_default();
             assert_eq!(
