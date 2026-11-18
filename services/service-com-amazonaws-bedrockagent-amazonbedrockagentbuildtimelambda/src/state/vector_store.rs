@@ -326,3 +326,65 @@ pub fn s3_vectors_index_dimension<Eng: Send + Sync + 'static>(
         .ok()
         .map(|index| index.dimension)
 }
+
+/// How far each chunk the Amazon S3 Vectors index `binding` names is from `query`'s
+/// own vector, under that index's own distance metric.
+///
+/// ONE pass of the metric over the vectors the index holds, under one hold of that
+/// store: no chunk's text and no vector is copied, so what the guard is held for is
+/// bounded by the index's own size and by nothing a request carries.
+///
+/// An index that store no longer holds is [`ChunkRanking::IndexGone`] rather than an
+/// index living elsewhere: a knowledge base is only as created as the index it writes
+/// into ([`s3_vectors_binding_problem`] resolves the binding against this very store
+/// before the knowledge base is written), so its absence NOW is a dependency that
+/// failed.
+///
+/// LOCK ORDER: as the module doc says.
+pub fn ranked_s3_vectors_chunks<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    binding: &S3VectorsBinding,
+    query: &str,
+) -> ChunkRanking {
+    use ::service_com_amazonaws_s3vectors_s3vectors::state as vectors;
+
+    let Some(state) = vectors::service_state(engine) else {
+        return ChunkRanking::StoreUnavailable;
+    };
+    let store = state.lock();
+    let Ok(index) = store.index(&binding.vector_bucket, &binding.index) else {
+        return ChunkRanking::IndexGone;
+    };
+    // The query's vector, computed the way the ingestion computed each document's, so the
+    // two are comparable under the index's own metric.
+    let query_vector = document_vector(query, index.dimension);
+    let ranked: Vec<(f32, String)> = index
+        .vectors
+        .values()
+        .map(|stored| {
+            (
+                vectors::vector_distance(&index.distance_metric, &query_vector, &stored.data),
+                stored.key.clone(),
+            )
+        })
+        .collect();
+    ChunkRanking::Held {
+        metric: index.distance_metric.clone(),
+        ranked,
+    }
+}
+
+/// The fields the chunk held under `key` in the index `binding` names carries, as the
+/// ingestion wrote them beside the vector; `None` when that index holds no such vector.
+///
+/// LOCK ORDER: as the module doc says.
+pub fn s3_vectors_chunk_fields<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    binding: &S3VectorsBinding,
+    key: &str,
+) -> Option<Document> {
+    let state = ::service_com_amazonaws_s3vectors_s3vectors::state::service_state(engine)?;
+    let store = state.lock();
+    let index = store.index(&binding.vector_bucket, &binding.index).ok()?;
+    Some(index.vectors.get(key)?.metadata.clone())
+}

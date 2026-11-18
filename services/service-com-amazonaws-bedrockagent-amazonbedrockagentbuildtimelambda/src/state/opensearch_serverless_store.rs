@@ -18,8 +18,10 @@
 //! over the very policies `aoss:CreateAccessPolicy` wrote. What lives here is which
 //! resource and which permissions a knowledge base takes on its index, the sentence this
 //! service refuses an unreachable binding with, and what an ingestion WRITES into that
-//! index — because a knowledge base bound to a collection keeps its chunks there, so that
-//! collection's own search, count and document read are what answer for them.
+//! index — and reads back out of it — because a knowledge base bound to a collection keeps
+//! its chunks there, so that collection's own search, count and document read are what answer
+//! for them, and a chunk that collection no longer holds is a chunk the knowledge base no
+//! longer holds.
 //!
 //! An ARN naming a collection that service holds no record of is not judged: nothing stored
 //! says what its policies grant, so such a binding is not refused here — the same reading
@@ -156,15 +158,178 @@ pub fn opensearch_serverless_index_dimension<Eng: Send + Sync + 'static>(
 
     let state = collections::service_state(engine)?;
     let store = state.lock();
-    let declared = store.collection_index_vector_dimension(
-        &index.collection_arn,
-        &index.index,
+    declared_vector_dimension(
+        store
+            .collection_by_arn(&index.collection_arn)?
+            .indexes
+            .get(&index.index)?,
         &index.vector_field,
-    )?;
+    )
+}
+
+/// How many values the `knn_vector` field `field` of the index `held` declares, within the
+/// bound [`MAX_WRITTEN_VECTOR_VALUES`] states; `None` when it maps no such field or declares
+/// no usable dimension for it.
+fn declared_vector_dimension(
+    held: &::service_com_amazonaws_opensearchserverless_opensearchserverless::state::IndexRecord,
+    field: &str,
+) -> Option<i32> {
+    use ::service_com_amazonaws_opensearchserverless_opensearchserverless::state as collections;
+
+    let declared = collections::index_documents::knn_vector_dimension(held, field)?;
     (1..=MAX_WRITTEN_VECTOR_VALUES)
         .contains(&declared)
         .then(|| i32::try_from(declared).ok())
         .flatten()
+}
+
+/// How far each chunk the index `index` names holds is from `query`'s own vector.
+///
+/// A collection the owning service holds no record of is [`ChunkRanking::Elsewhere`]: an
+/// ingestion writes through to a collection only where that service holds one, so a knowledge
+/// base naming a collection outside this emulator is in exactly the position of one naming a
+/// store no service here serves — nothing here wrote its index. A collection that IS held but
+/// cannot answer for the index — it no longer holds it, or it is not `ACTIVE`, so there is no
+/// cluster behind its endpoint and its own data plane answers nothing either — is the
+/// dependency the chunks lived in, gone. The transitions the clock has already made due are
+/// applied first, exactly as the write does ([`write_opensearch_serverless_chunks`]), so the
+/// read and the write cannot disagree about whether the collection is still there.
+///
+/// The distances are measured under the metric the knowledge base's own chunk vectors are
+/// compared by, which is the one the ingestion record ranks the chunks of ANY knowledge base
+/// of this emulator under ([`crate::state::ingestion_record`]): one notion of relevance
+/// across the stores, so a retrieval's ordering does not change with where the chunks live.
+/// It is deliberately NOT the `space_type` the bound index's own mapping declares: that is
+/// what a client's own `knn` query at the collection endpoint is scored under, while how
+/// Amazon Bedrock ranks the chunks it holds for a knowledge base is not published — so one
+/// stated metric is used rather than a conversion nothing documents.
+///
+/// ONE pass of that metric over the documents the index holds, under one hold of the owning
+/// store, bounded by how many documents one index holds and by nothing a request carries.
+///
+/// LOCK ORDER: as the module doc says — call with NO guard of this service's store held.
+pub fn ranked_opensearch_serverless_chunks<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    index: &OpenSearchServerlessIndex,
+    query: &str,
+    fallback_dimension: i32,
+) -> ChunkRanking {
+    use ::service_com_amazonaws_opensearchserverless_opensearchserverless::state as collections;
+    use ::service_com_amazonaws_s3vectors_s3vectors::state as vectors;
+
+    let Some(state) = collections::service_state(engine) else {
+        return ChunkRanking::Elsewhere;
+    };
+    let mut store = state.lock();
+    store.settle_due_transitions();
+    let Some(collection) = store.collection_by_arn(&index.collection_arn) else {
+        return ChunkRanking::Elsewhere;
+    };
+    if collection.status != collections::COLLECTION_ACTIVE {
+        return ChunkRanking::IndexGone;
+    }
+    let Some(held) = collection.indexes.get(&index.index) else {
+        return ChunkRanking::IndexGone;
+    };
+    // The dimension the ingestion wrote its chunks in: the index's own declared one, and the
+    // knowledge base's where the index declares none.
+    let dimension =
+        declared_vector_dimension(held, &index.vector_field).unwrap_or(fallback_dimension);
+    let query_vector = document_vector(query, dimension);
+    // In the index's own document order (its documents are keyed), so chunks at the same
+    // distance from the query are always ranked in the same order.
+    let ranked: Vec<(f32, String)> = held
+        .documents
+        .iter()
+        .filter_map(|(id, document)| {
+            let stored = stored_vector(&document.source, &index.vector_field)?;
+            Some((
+                vectors::vector_distance(
+                    vectors::DISTANCE_METRIC_COSINE,
+                    &query_vector,
+                    &stored,
+                ),
+                id.clone(),
+            ))
+        })
+        .collect();
+    ChunkRanking::Held {
+        metric: vectors::DISTANCE_METRIC_COSINE.to_string(),
+        ranked,
+    }
+}
+
+/// The fields the chunk held under `key` in the index `index` names carries: the published
+/// knowledge-base fields the ingestion wrote beside the vector, with the chunk's text read
+/// off the field the storage configuration maps it to.
+///
+/// The inverse of [`stored_document`]: the three fields that configuration MAPS are the
+/// index's own rendering of the chunk — the embedding, the raw text and the metadata
+/// document — so what is reported is the fields recorded ABOUT the chunk, and the text is
+/// taken from the mapped text field. `None` for a document carrying no text there, which is
+/// no chunk of this knowledge base.
+///
+/// LOCK ORDER: as the module doc says — call with NO guard of this service's store held.
+pub fn opensearch_serverless_chunk_fields<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    index: &OpenSearchServerlessIndex,
+    key: &str,
+) -> Option<Document> {
+    use ::service_com_amazonaws_opensearchserverless_opensearchserverless::state as collections;
+
+    let state = collections::service_state(engine)?;
+    let store = state.lock();
+    let document = store
+        .collection_by_arn(&index.collection_arn)?
+        .indexes
+        .get(&index.index)?
+        .documents
+        .get(key)?;
+    chunk_fields_of(index, &document.source)
+}
+
+/// The vector one stored document holds under the field `field`, or `None` when it holds no
+/// list of numbers there — a document a caller wrote into the index themselves, which is no
+/// chunk of a knowledge base.
+fn stored_vector(source: &Document, field: &str) -> Option<Vec<f32>> {
+    let Document::Object(members) = source else {
+        return None;
+    };
+    let Document::Array(values) = members.get(field)? else {
+        return None;
+    };
+    values
+        .iter()
+        .map(|value| match value {
+            Document::Number(number) => Some(number.to_f64_lossy() as f32),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The fields one stored document records ABOUT its chunk; see
+/// [`opensearch_serverless_chunk_fields`], whose reading this is.
+fn chunk_fields_of(index: &OpenSearchServerlessIndex, source: &Document) -> Option<Document> {
+    let Document::Object(members) = source else {
+        return None;
+    };
+    let text = match members.get(&index.text_field) {
+        Some(Document::String(text)) => text.clone(),
+        _ => return None,
+    };
+    let mut fields: HashMap<String, Document> = HashMap::new();
+    for (name, value) in members {
+        if name == &index.vector_field || name == &index.text_field || name == &index.metadata_field
+        {
+            continue;
+        }
+        fields.insert(name.clone(), value.clone());
+    }
+    fields.insert(
+        ingestion_index::CHUNK_TEXT_METADATA_KEY.to_string(),
+        Document::String(text),
+    );
+    Some(Document::Object(fields))
 }
 
 /// Write each of `chunks` into the index `index` names, as the role `role_arn`, answering

@@ -11,9 +11,9 @@
 //! OpenSearch Serverless collection index an ingestion writes through to
 //! ([`crate::state::bound_vector_index`]) — and no API here can write a vector
 //! into any of the others. So every ingestion records the chunk it read ON the
-//! document it read it from ([`IngestedChunk`]), and what a knowledge base
-//! backed by one of those other stores HOLDS is that record: real work, written
-//! by the ingestion that did it, read back here:
+//! document it read it from ([`IngestedChunk`]), and what a knowledge base whose
+//! bound index no store of this emulator holds HOLDS is that record: real work,
+//! written by the ingestion that did it, read back here:
 //!
 //! * a knowledge base that has ingested nothing records nothing, so it retrieves
 //!   nothing;
