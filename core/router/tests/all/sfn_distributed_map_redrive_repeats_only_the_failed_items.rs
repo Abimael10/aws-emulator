@@ -55,7 +55,11 @@ const SFN_JSON_VERSION: &str = "1.0";
 const S3_SIGNING_NAME: &str = "s3";
 
 /// The bucket holding every dataset read below and every marker written below.
-const BUCKET: &str = "distributed-map-work";
+///
+/// `pub(crate)`, not private: `tests/all/main.rs` is this binary's crate root, so a sibling
+/// suite that drives a Distributed Map over the same harness names the one bucket from here
+/// rather than carrying a second copy of it.
+pub(crate) const BUCKET: &str = "distributed-map-work";
 
 /// How long a poll waits for the condition it is waiting on — an execution leaving
 /// `RUNNING`. Generous: every loop stops as soon as its condition holds, so this bounds
@@ -67,12 +71,16 @@ const GLANCE: Duration = Duration::from_millis(25);
 
 /// Step Functions and S3 over ONE engine, so the dataset a `Map` state's `ItemReader`
 /// reads and the markers its items write are the objects S3's own handlers stored.
-struct Chain {
+///
+/// `pub(crate)` for the same reason as [`BUCKET`]: a sibling suite that runs a Distributed Map
+/// over an S3 dataset and counts the work its items did drives THIS harness rather than
+/// standing up a second copy of it.
+pub(crate) struct Chain {
     router: MultiServiceRouter,
 }
 
 impl Chain {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -115,7 +123,7 @@ impl Chain {
     }
 
     /// One Step Functions call that must answer 200, as its body.
-    async fn sfn(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn sfn(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -148,7 +156,7 @@ impl Chain {
     }
 
     /// The one bucket this suite reads and writes, in this Region.
-    async fn bucket(&self) {
+    pub(crate) async fn bucket(&self) {
         let configuration = format!(
             "<CreateBucketConfiguration><LocationConstraint>{REGION}</LocationConstraint>\
              </CreateBucketConfiguration>"
@@ -163,7 +171,7 @@ impl Chain {
     }
 
     /// One object, stored through S3's own `PutObject`.
-    async fn object(&self, key: &str, body: &str) {
+    pub(crate) async fn object(&self, key: &str, body: &str) {
         let (status, answered) = self
             .s3("PUT", &format!("/{BUCKET}/{key}"), body.as_bytes())
             .await;
@@ -174,7 +182,7 @@ impl Chain {
     }
 
     /// Every object key S3 holds under `prefix`, read back through its own `ListObjectsV2`.
-    async fn keys_under(&self, prefix: &str) -> Vec<String> {
+    pub(crate) async fn keys_under(&self, prefix: &str) -> Vec<String> {
         let (status, body) = self
             .s3(
                 "GET",
@@ -186,13 +194,13 @@ impl Chain {
             status, 200,
             "expected a listing of {prefix:?}, got {status} with {body}"
         );
-        let mut keys = elements(&body, "Key");
+        let mut keys = crate::query_wire::elements(&body, "Key");
         keys.sort();
         keys
     }
 
     /// Create a state machine over `definition` and return its ARN.
-    async fn machine(&self, name: &str, definition: &Value) -> String {
+    pub(crate) async fn machine(&self, name: &str, definition: &Value) -> String {
         let created = self
             .sfn(
                 "CreateStateMachine",
@@ -207,7 +215,7 @@ impl Chain {
     }
 
     /// Poll one execution until it has left `RUNNING`, and report how it settled.
-    async fn settled(&self, execution_arn: &str, case: &str) -> Value {
+    pub(crate) async fn settled(&self, execution_arn: &str, case: &str) -> Value {
         let began = Instant::now();
         loop {
             let described = self
@@ -225,7 +233,7 @@ impl Chain {
     }
 
     /// The Map Runs `execution_arn` started, as `ListMapRuns` serves them.
-    async fn map_runs(&self, execution_arn: &str) -> Vec<Value> {
+    pub(crate) async fn map_runs(&self, execution_arn: &str) -> Vec<Value> {
         let listed = self
             .sfn("ListMapRuns", &json!({ "executionArn": execution_arn }))
             .await;
@@ -238,7 +246,7 @@ impl Chain {
 
     /// The child workflow executions of one Map Run, as `DescribeExecution` reports each
     /// of them, grouped by the `id` member of the item document it was handed.
-    async fn children(&self, map_run_arn: &str) -> BTreeMap<i64, Vec<Value>> {
+    pub(crate) async fn children(&self, map_run_arn: &str) -> BTreeMap<i64, Vec<Value>> {
         let listed = self
             .sfn(
                 "ListExecutions",
@@ -272,30 +280,20 @@ impl Chain {
 }
 
 /// The text a member of a response carries.
-fn string(body: &Value, name: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`Chain`].
+pub(crate) fn string(body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("expected a string {name} in {body}"))
         .to_string()
 }
 
-/// The text of every `<tag>` element of an XML answer, in the order it carries them.
-fn elements(xml: &str, tag: &str) -> Vec<String> {
-    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
-    let mut values = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find(&open) {
-        rest = &rest[start + open.len()..];
-        let Some(end) = rest.find(&close) else { break };
-        values.push(rest[..end].to_string());
-        rest = &rest[end + close.len()..];
-    }
-    values
-}
-
 /// `count` item documents, every one of which succeeds except the indices in `failing`,
 /// each naming the `run` whose markers it writes under.
-fn items(count: usize, failing: &[usize], run: &str) -> Value {
+///
+/// `pub(crate)` for the same reason as [`Chain`].
+pub(crate) fn items(count: usize, failing: &[usize], run: &str) -> Value {
     Value::Array(
         (0..count)
             .map(|index| json!({ "id": index, "ok": !failing.contains(&index), "run": run }))
