@@ -201,6 +201,24 @@ impl Transcribe {
         .await
     }
 
+    /// [`Self::job_settled`] for the Call Analytics job family, whose members that loop
+    /// takes are its own.
+    pub(crate) async fn call_analytics_job_settled(
+        &self,
+        name: &str,
+        region: Option<&str>,
+    ) -> Value {
+        self.job_settled(
+            "GetCallAnalyticsJob",
+            "CallAnalyticsJobName",
+            "CallAnalyticsJob",
+            "CallAnalyticsJobStatus",
+            name,
+            region,
+        )
+        .await
+    }
+
     /// Stage every `s3://<bucket>/<key>` location of `uris` as an object of this
     /// emulator's own Amazon S3 — the upload a caller performs before a start names the
     /// media ("you must first upload your media file into an Amazon S3 bucket").

@@ -58,7 +58,10 @@ const REGION: &str = "us-east-1";
 /// The bucket this service's OWN files live in for [`REGION`], as
 /// `crate::state::service_managed_bucket` spells it — written out here so a change to that
 /// name has to be made deliberately in both places.
-fn service_managed_bucket() -> String {
+///
+/// `pub(crate)`: the suite over WHICH endpoint a location is published on
+/// (`crate::reported_location_endpoints`) names the same bucket, through this one spelling.
+pub(crate) fn service_managed_bucket() -> String {
     format!("aws-transcribe-{REGION}-prod")
 }
 
@@ -130,6 +133,42 @@ pub(crate) fn named_object(uri: &str) -> &str {
     }
 }
 
+/// `record` with every TEMPORARY location it reports reduced to the OBJECT that address
+/// names ([`named_object`]), at whatever depth the projection carries it; everything else
+/// is left exactly as reported.
+///
+/// `pub(crate)`: what two reads of ONE settled record must agree on is what the record
+/// reports, and a location in this service's own store is a temporary pre-signed address —
+/// each read mints a fresh signature over the same object, at the instant of that read (see
+/// this module's header). So two reads are compared through here: compared as reported, two
+/// reads of an unchanged record agree only while both fall in the same second, which makes
+/// the comparison hold or fail by nothing but how fast the host ran. The WHOLE query of such
+/// an address goes, not only its signature: the signing instant is in `X-Amz-Date` and the
+/// credential scope carries that day as well. What each of those fields must be is this
+/// suite's own subject instead, asserted on the address as reported.
+pub(crate) fn reported_objects(record: &Value) -> Value {
+    match record {
+        Value::String(text) if is_temporary_address(text) => json!(named_object(text)),
+        Value::Array(values) => Value::Array(values.iter().map(reported_objects).collect()),
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .map(|(name, value)| (name.clone(), reported_objects(value)))
+                .collect(),
+        ),
+        reported => reported.clone(),
+    }
+}
+
+/// Whether `text` is an address carrying a SigV4 query signature, which is what a temporary
+/// location into this service's own store is: it names every field of [`SIGNING_FIELDS`].
+/// An address of the caller's own bucket carries none of them and is left as reported.
+fn is_temporary_address(text: &str) -> bool {
+    SIGNING_FIELDS
+        .iter()
+        .all(|name| !field(text, name).is_empty())
+}
+
 /// The query of a reported address, or the empty string when it carries none.
 fn query_of(uri: &str) -> &str {
     uri.split_once('?').map_or("", |(_path, query)| query)
@@ -146,7 +185,12 @@ fn field(uri: &str, name: &str) -> String {
 
 /// Fetch `uri` the way a client follows a location it was handed: the address exactly as
 /// reported, the `Host` it names, and NO credential of the client's own.
-async fn fetch(router: &MultiServiceRouter, uri: &str) -> (u16, Vec<u8>) {
+///
+/// `pub(crate)`, like [`named_object`]: the suite over WHICH endpoint a location is
+/// published on (`crate::reported_location_endpoints`) follows the addresses it reads
+/// through this same one request, so the two cannot disagree about what following a
+/// reported location means.
+pub(crate) async fn fetch(router: &MultiServiceRouter, uri: &str) -> (u16, Vec<u8>) {
     let host = uri
         .split_once("://")
         .and_then(|(_scheme, rest)| rest.split('/').next())

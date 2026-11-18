@@ -34,6 +34,7 @@ use service_com_amazonaws_transcribe_transcribe::ops::types::LANGUAGE_CODE_VALUE
 use service_com_amazonaws_transcribe_transcribe::state::IDENTIFIED_LANGUAGE_SCORE;
 
 use crate::media_object_resolution::{given_object_declaring_language, BUCKET, MEDIA_BYTES};
+use crate::served_download_locations::reported_objects;
 use crate::transcription_jobs::Transcribe;
 
 /// How long to wait between two polls of a job that has not finished yet.
@@ -312,10 +313,13 @@ async fn single_language_identification_reports_the_language_its_media_evidences
         );
 
         // A read does not change what a later read sees: the identification is a
-        // function of the stored record.
+        // function of the stored record. The job is compared by the OBJECTS it reports,
+        // because its transcript's location is a temporary pre-signed address each read
+        // mints a fresh signature over (`reported_objects`).
         let again = settled_transcription_job(&transcribe, row.case, &name).await;
         assert_eq!(
-            again, job,
+            reported_objects(&again),
+            reported_objects(&job),
             "case {:?}: a second read must report the same job",
             row.case
         );

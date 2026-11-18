@@ -21,23 +21,14 @@
 //! crossed with whether the request deferred its execution, which the identification a
 //! finished job reports does not depend on.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use service_com_amazonaws_transcribe_transcribe::ops::types::LANGUAGE_CODE_VALUES;
 use service_com_amazonaws_transcribe_transcribe::state::{
     DEFAULT_IDENTIFIED_LANGUAGE, IDENTIFIED_LANGUAGE_SCORE,
 };
 
+use crate::served_download_locations::reported_objects;
 use crate::transcription_jobs::Transcribe;
-
-/// Long enough for every clock-owed transition of a job started during the test to
-/// have fallen due: a deferred job's `QUEUED -> IN_PROGRESS -> COMPLETED` is two spans
-/// of `crate::state::JOB_TRANSITION_DELAY` (500 ms each).
-///
-/// Waited out with `std::thread::sleep`: the workspace enables tokio's `macros`, `rt`
-/// and `rt-multi-thread` features only, so `tokio::time::sleep` is not available here.
-const PAST_EVERY_TRANSITION: Duration = Duration::from_millis(1_300);
 
 /// The role a deferred job names, so the row that defers execution satisfies
 /// the co-requirements `JobExecutionSettings` documents on itself.
@@ -178,17 +169,16 @@ async fn single_language_identification_reports_the_identified_code_and_its_scor
         );
     }
 
-    std::thread::sleep(PAST_EVERY_TRANSITION);
-
     for (case, name, options, _) in &rows {
         let expected = allowed_codes(options)
             .first()
             .cloned()
             .expect("at least one code is allowed");
-        let fetched = transcribe
-            .call("GetTranscriptionJob", json!({"TranscriptionJobName": name}))
-            .await;
-        let job = fetched.ok(case)["TranscriptionJob"].clone();
+        // Polled until the job has finished rather than waited out for a span: what a job
+        // reports about the language identified for it is the FINISHED job's, and the
+        // harness's loop stops as soon as the transitions the clock owed have been
+        // materialised, however fast or slow the host runs.
+        let job = transcribe.transcription_job_settled(name, None).await;
         assert_eq!(
             job["TranscriptionJobStatus"],
             json!("COMPLETED"),
@@ -238,12 +228,16 @@ async fn single_language_identification_reports_the_identified_code_and_its_scor
             summary["IdentifiedLanguageScore"]
         );
 
-        // A read does not change what a later read sees.
+        // A read does not change what a later read sees. The job is compared by the
+        // OBJECTS it reports: its transcript's location is a temporary pre-signed address,
+        // so the signature each read mints over it is not part of what two reads must
+        // agree on (`reported_objects`).
         let again = transcribe
             .call("GetTranscriptionJob", json!({"TranscriptionJobName": name}))
             .await;
         assert_eq!(
-            again.ok(case)["TranscriptionJob"], job,
+            reported_objects(&again.ok(case)["TranscriptionJob"]),
+            reported_objects(&job),
             "case {case:?}: a second read must report the same job"
         );
     }
@@ -265,14 +259,11 @@ async fn multi_language_identification_reports_one_entry_per_identified_language
         );
     }
 
-    std::thread::sleep(PAST_EVERY_TRANSITION);
-
     for (case, name, options, _) in &rows {
         let expected = allowed_codes(options);
-        let fetched = transcribe
-            .call("GetTranscriptionJob", json!({"TranscriptionJobName": name}))
-            .await;
-        let job = fetched.ok(case)["TranscriptionJob"].clone();
+        // Polled until the job has finished, for the reason the single-language test
+        // above gives.
+        let job = transcribe.transcription_job_settled(name, None).await;
         assert_eq!(
             job["TranscriptionJobStatus"],
             json!("COMPLETED"),
@@ -316,12 +307,14 @@ async fn multi_language_identification_reports_one_entry_per_identified_language
             summary["LanguageCodes"]
         );
 
-        // A read does not change what a later read sees.
+        // A read does not change what a later read sees, compared by the objects the job
+        // reports for the reason the single-language test above gives.
         let again = transcribe
             .call("GetTranscriptionJob", json!({"TranscriptionJobName": name}))
             .await;
         assert_eq!(
-            again.ok(case)["TranscriptionJob"], job,
+            reported_objects(&again.ok(case)["TranscriptionJob"]),
+            reported_objects(&job),
             "case {case:?}: a second read must report the same job"
         );
     }
@@ -353,14 +346,11 @@ async fn a_job_that_names_its_own_language_has_nothing_identified() {
             .ok(code);
     }
 
-    std::thread::sleep(PAST_EVERY_TRANSITION);
-
     for (index, code) in named.iter().enumerate() {
         let name = format!("named-{index}");
-        let fetched = transcribe
-            .call("GetTranscriptionJob", json!({"TranscriptionJobName": name}))
-            .await;
-        let job = fetched.ok(code)["TranscriptionJob"].clone();
+        // Polled until the job has finished, for the reason the single-language test
+        // above gives.
+        let job = transcribe.transcription_job_settled(&name, None).await;
         assert_eq!(
             job["LanguageCode"],
             json!(code),

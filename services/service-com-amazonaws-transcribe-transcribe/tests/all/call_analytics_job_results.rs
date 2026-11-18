@@ -28,7 +28,7 @@ use service_com_amazonaws_transcribe_transcribe::state::{
 };
 
 use crate::call_analytics_jobs::{get, job_name, list, names_of, PAST_THE_TRANSITION};
-use crate::served_download_locations::named_object;
+use crate::served_download_locations::{named_object, reported_objects};
 use crate::transcription_jobs::Transcribe;
 
 /// Every value the model's `MediaFormat` enum carries, read from the generated
@@ -250,7 +250,15 @@ async fn a_finished_job_reports_the_language_identification_was_narrowed_to() {
             .await
             .ok(case);
     }
-    std::thread::sleep(PAST_THE_TRANSITION);
+    // Every row's job is waited out FIRST, by polling until it has finished rather than
+    // waiting for a span to pass: what the listing and the reads below assert is what a
+    // FINISHED job reports, and the harness's loop stops as soon as the transition the
+    // clock owed has been materialised, however fast or slow the host runs.
+    for (_, request, _) in &rows {
+        transcribe
+            .call_analytics_job_settled(&job_name(request), None)
+            .await;
+    }
 
     let listed = list(&transcribe, json!({"MaxResults": 100})).await;
     let summaries = listed.ok("every finished job")["CallAnalyticsJobSummaries"].clone();
@@ -262,8 +270,7 @@ async fn a_finished_job_reports_the_language_identification_was_narrowed_to() {
 
     for (case, request, expected_language) in &rows {
         let name = job_name(request);
-        let fetched = get(&transcribe, &name).await;
-        let job = fetched.ok(case)["CallAnalyticsJob"].clone();
+        let job = transcribe.call_analytics_job_settled(&name, None).await;
         assert_eq!(
             &job["LanguageCode"], expected_language,
             "case {case:?}: expected LanguageCode {expected_language:?}, got {:?}",
@@ -300,10 +307,13 @@ async fn a_finished_job_reports_the_language_identification_was_narrowed_to() {
             summary["LanguageCode"]
         );
 
-        // A read does not change what a later read sees.
+        // A read does not change what a later read sees, compared by the OBJECTS the job
+        // reports: a transcript in this service's own store is reported at a temporary
+        // pre-signed address each read mints a fresh signature over (`reported_objects`).
         let again = get(&transcribe, &name).await;
         assert_eq!(
-            again.ok(case)["CallAnalyticsJob"], job,
+            reported_objects(&again.ok(case)["CallAnalyticsJob"]),
+            reported_objects(&job),
             "case {case:?}: a second read must report the same job"
         );
     }

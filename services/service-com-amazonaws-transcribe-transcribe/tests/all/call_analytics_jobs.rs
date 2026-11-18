@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::served_download_locations::named_object;
+use crate::served_download_locations::{named_object, reported_objects};
 use crate::transcription_jobs::{Reply, Transcribe};
 
 /// Long enough for the `IN_PROGRESS -> COMPLETED` transition of a job started during
@@ -375,13 +375,13 @@ async fn a_call_analytics_job_completes_once_its_processing_span_has_elapsed() {
             .ok(case);
     }
 
-    // One wait for every row, not one per row.
-    std::thread::sleep(PAST_THE_TRANSITION);
-
     for (case, request) in start_requests() {
         let name = job_name(&request);
-        let fetched = get(&transcribe, &name).await;
-        let job = fetched.ok(case)["CallAnalyticsJob"].clone();
+        // Polled until the job has finished rather than waited out for a span: what a
+        // COMPLETED job reports is what these rows assert, and the harness's loop stops
+        // as soon as the transition the clock owed has been materialised, however fast or
+        // slow the host runs.
+        let job = transcribe.call_analytics_job_settled(&name, None).await;
 
         assert_eq!(
             job["CallAnalyticsJobStatus"],
@@ -410,11 +410,15 @@ async fn a_call_analytics_job_completes_once_its_processing_span_has_elapsed() {
             job["Transcript"]
         );
 
-        // A read does not change what a later read sees.
+        // A read does not change what a later read sees. The job is compared by the
+        // OBJECTS it reports: a transcript in this service's own store is reported at a
+        // temporary pre-signed address, so the signature each read mints over it is not
+        // part of what two reads must agree on (`reported_objects`).
         let again = get(&transcribe, &name).await;
         let again = again.ok(case)["CallAnalyticsJob"].clone();
         assert_eq!(
-            again, job,
+            reported_objects(&again),
+            reported_objects(&job),
             "case {case:?}: a second read must report the same job, got {again:?}"
         );
 
@@ -518,16 +522,7 @@ async fn the_transcript_location_follows_the_documented_output_location_rule() {
     for ((case, _, expected), name) in rows.iter().zip(names) {
         // Poll until the job has finished rather than waiting out its span: the
         // location it reports is the FINISHED job's.
-        let job = transcribe
-            .job_settled(
-                "GetCallAnalyticsJob",
-                "CallAnalyticsJobName",
-                "CallAnalyticsJob",
-                "CallAnalyticsJobStatus",
-                name,
-                None,
-            )
-            .await;
+        let job = transcribe.call_analytics_job_settled(name, None).await;
         let reported = job["Transcript"]["TranscriptFileUri"]
             .as_str()
             .unwrap_or_else(|| {
