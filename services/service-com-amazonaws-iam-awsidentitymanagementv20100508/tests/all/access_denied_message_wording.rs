@@ -17,20 +17,27 @@
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
 //! operation is refused, whether the resource is an ARN, a path-scoped collection, the
-//! account-wide `*` or a named entity, which of the two refusals it is (an explicit `Deny`
-//! about the request, or no `Allow` for it), and whether the caller held any document at
-//! all.
+//! account-wide `*` or a named entity, which of the refusals it is (an explicit `Deny`
+//! about the request, or no `Allow` for it, in whichever of the documents in force), and
+//! whether the caller held any document at all — including the refusals of a caller whose
+//! credential a MINT SCOPED, where the document that withheld the call is a session policy
+//! rather than one of the identity's own.
 //!
 //! The awsQuery harness is the one `tests/all/user_lifecycle.rs` owns and the other
 //! suites in this crate share, so a request is built and read exactly one way.
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::{
+    self, RoleSessionRecord, SessionPolicies,
+};
+
 use crate::identity_policy_enforcement::{principal, statement};
+use crate::permissions_boundary_ceiling::statements;
 use crate::role_lifecycle::borrowed;
 use crate::user_lifecycle::{
     account_id, assert_access_denied_message, authorization_details_id, call, call_signed_by,
-    call_signed_in_region, element, error_code, router,
+    call_signed_in_region, element, error_code, router, router_with_engine,
 };
 
 /// The reason clause for a call no statement in force allows — the implicit deny.
@@ -882,4 +889,428 @@ async fn a_grant_not_yet_in_effect_is_withheld_and_points_at_its_details() {
              details of the request, got {message:?}"
         );
     }
+}
+
+/// The trust policy every fixture role below is created with: one statement, the shape
+/// `CreateRole`'s own modelled example carries. WHO may assume the role decides nothing
+/// about a call the session then makes, so no row varies it.
+const SESSION_TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
+
+/// How long a fixture session's credential is live for, from the instant its record is
+/// written. Generous on purpose: nothing here waits for a credential to lapse, the rows
+/// only need it to still speak for its session while they call
+/// (`tests/all/role_protection_and_refusal_messages.rs` is the table for the expiry
+/// itself).
+const SESSION_LIFETIME_SECONDS: i64 = 3_600;
+
+/// The `RoleSessionName` every fixture session is minted under, which the session's ARN
+/// carries and a refusal names the caller by.
+const SESSION_NAME: &str = "wording";
+
+/// Which document withheld or denied a session-scoped call — the fact the reason clause of
+/// the refusal states, and the one thing that differs between these refusals and the ones
+/// the tables above drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withheld {
+    /// The role's own documents allow the call and the session policies in force state no
+    /// `Allow` for it: the intersection of the two withholds it.
+    NoSessionAllow,
+    /// A statement of a session policy denies the request, which no grant overturns.
+    SessionDeny,
+    /// The session policies allow it and the role's own documents do not. A session policy
+    /// caps and never grants, so what the identity's documents do not allow stays withheld
+    /// by THEM, and the clause names them.
+    NoIdentityAllow,
+}
+
+impl Withheld {
+    /// The clause closing the message for this refusal of `iam_action`.
+    fn reason(self, iam_action: &str) -> String {
+        match self {
+            Self::NoSessionAllow => {
+                format!("because no session policy allows the {iam_action} action")
+            }
+            Self::SessionDeny => "with an explicit deny in a session policy".to_string(),
+            Self::NoIdentityAllow => no_allow(iam_action),
+        }
+    }
+}
+
+/// The FORM the mint scoped a row's credential with, both of which `AssumeRole` takes: the
+/// document itself, or a managed policy of the account named by ARN whose document is read
+/// at the instant of the request.
+enum Scoped {
+    /// The document an inline `Policy` parameter carries.
+    Inline(String),
+    /// The document of the managed policy a `PolicyArns` entry names, created in the
+    /// account by the fixture so the scope is held by ARN.
+    Managed(String),
+}
+
+/// One row: what the ROLE's own documents say, how the mint scoped the session's
+/// credential, the call that session makes, and which document the answer rests on.
+struct Scoping {
+    case: &'static str,
+    /// The inline document put on the role the session is of — the permissions a session
+    /// of it has, which its session policies are the intersection with.
+    role_policy: String,
+    /// The session policy the mint passed, in one of its two forms.
+    scope: Scoped,
+    /// The awsQuery `Action` the session calls, and the IAM action it is decided on.
+    action: &'static str,
+    iam_action: &'static str,
+    /// `None` for a call the intersection permits, which is served — the row that shows
+    /// the rest are refused by the documents and not by the fixture.
+    expect: Option<Withheld>,
+}
+
+/// The rows. They differ along what the rule generalises over: which operation the session
+/// calls, whether its resource is one role or a collection, the form the session policy
+/// took (inline or managed), whether that policy is silent on the action, scoped to another
+/// resource or denies it outright, and which of the documents in force decided the call.
+fn scopings() -> Vec<Scoping> {
+    let elsewhere = format!("arn:aws:iam::{}:role/elsewhere", account_id());
+    vec![
+        // The pair of operations the recorded session-policy refusals were observed on: a
+        // role's tag listing and its attachment listing, each withheld by a session policy
+        // that names only the other.
+        Scoping {
+            case: "a session policy naming another action, refusing a tag listing",
+            role_policy: ALLOW_EVERYTHING.to_string(),
+            scope: Scoped::Inline(statement("Allow", "iam:ListAttachedRolePolicies", "*")),
+            action: "ListRoleTags",
+            iam_action: "iam:ListRoleTags",
+            expect: Some(Withheld::NoSessionAllow),
+        },
+        Scoping {
+            case: "a session policy naming another action, refusing an attachment listing",
+            role_policy: ALLOW_EVERYTHING.to_string(),
+            scope: Scoped::Inline(statement("Allow", "iam:ListRoleTags", "*")),
+            action: "ListAttachedRolePolicies",
+            iam_action: "iam:ListAttachedRolePolicies",
+            expect: Some(Withheld::NoSessionAllow),
+        },
+        // A session policy that names the action but is scoped to a resource the request
+        // does not address: the scope states no `Allow` ABOUT this request either.
+        Scoping {
+            case: "a session policy naming the action on another role",
+            role_policy: ALLOW_EVERYTHING.to_string(),
+            scope: Scoped::Inline(statement("Allow", "iam:ListRoleTags", &elsewhere)),
+            action: "ListRoleTags",
+            iam_action: "iam:ListRoleTags",
+            expect: Some(Withheld::NoSessionAllow),
+        },
+        // A collection read, so the resource form the refusal names is not left untested:
+        // the ARN of the collection the request addressed rather than one entity.
+        Scoping {
+            case: "a session policy naming another action, refusing a user listing",
+            role_policy: ALLOW_EVERYTHING.to_string(),
+            scope: Scoped::Inline(statement("Allow", "iam:ListRoleTags", "*")),
+            action: "ListUsers",
+            iam_action: "iam:ListUsers",
+            expect: Some(Withheld::NoSessionAllow),
+        },
+        Scoping {
+            case: "a session policy naming another action, refusing a role listing",
+            role_policy: ALLOW_EVERYTHING.to_string(),
+            scope: Scoped::Inline(statement("Allow", "iam:ListRoleTags", "*")),
+            action: "ListRoles",
+            iam_action: "iam:ListRoles",
+            expect: Some(Withheld::NoSessionAllow),
+        },
+        // An explicit `Deny` in the session policy, over a scope that allows everything
+        // else: a different fact about the same decision, worded differently.
+        Scoping {
+            case: "a session policy denying the action it otherwise allows",
+            role_policy: ALLOW_EVERYTHING.to_string(),
+            scope: Scoped::Inline(statements(&[
+                ("Allow", "iam:*", "*"),
+                ("Deny", "iam:ListRoleTags", "*"),
+            ])),
+            action: "ListRoleTags",
+            iam_action: "iam:ListRoleTags",
+            expect: Some(Withheld::SessionDeny),
+        },
+        // The same withholding reached through a MANAGED session policy, so the form the
+        // mint named the scope in moves no character of the message.
+        Scoping {
+            case: "a managed session policy naming another action",
+            role_policy: ALLOW_EVERYTHING.to_string(),
+            scope: Scoped::Managed(statement("Allow", "iam:ListRolePolicies", "*")),
+            action: "ListAttachedRolePolicies",
+            iam_action: "iam:ListAttachedRolePolicies",
+            expect: Some(Withheld::NoSessionAllow),
+        },
+        // A session policy grants nothing of its own, so a call only IT allows is refused
+        // as if it had allowed nothing — and the clause names the identity's documents.
+        Scoping {
+            case: "a session policy allowing what the role's own documents do not",
+            role_policy: statement("Allow", "iam:ListRoleTags", "*"),
+            scope: Scoped::Inline(statement("Allow", "iam:*", "*")),
+            action: "ListAttachedRolePolicies",
+            iam_action: "iam:ListAttachedRolePolicies",
+            expect: Some(Withheld::NoIdentityAllow),
+        },
+        // The call both documents allow is served, so no row above is refused by the
+        // fixture rather than by the scope under test.
+        Scoping {
+            case: "a session policy naming the action the role allows",
+            role_policy: ALLOW_EVERYTHING.to_string(),
+            scope: Scoped::Inline(statement("Allow", "iam:ListRoleTags", "*")),
+            action: "ListRoleTags",
+            iam_action: "iam:ListRoleTags",
+            expect: None,
+        },
+    ]
+}
+
+/// The form parameters a session-scoped call carries: a request addressing the row's own
+/// role names it, and a collection read names nothing.
+fn session_params(action: &str, role_name: &str) -> Vec<(String, String)> {
+    match action {
+        "ListRoles" | "ListUsers" => Vec::new(),
+        _ => vec![("RoleName".to_string(), role_name.to_string())],
+    }
+}
+
+/// The resource a refusal of `action` NAMES: the role as the request named it for a call
+/// addressing one, and the ARN of the collection a list read is decided on.
+fn session_named_as(action: &str, role_name: &str) -> String {
+    match action {
+        "ListRoles" => format!("arn:aws:iam::{}:role/", account_id()),
+        "ListUsers" => format!("arn:aws:iam::{}:user/", account_id()),
+        _ => format!("role {role_name}"),
+    }
+}
+
+/// Give the account a role carrying `role_policy`, record a session of it whose credential
+/// the mint scoped the way `scope` says, and answer the access key id that credential is
+/// carried under beside the ARN `sts:GetCallerIdentity` reports for it.
+///
+/// Everything a row needs except the session itself is set up over the wire. The credential
+/// of a role session is minted by `sts:AssumeRole`, which is not this service's API, so the
+/// record of what that mint scoped is written into this service's own store exactly as the
+/// minting operation writes it — the store the gate reads the signing principal out of.
+async fn session_scoped_caller(
+    router: &MultiServiceRouter,
+    held: &engine::InMemoryEngine,
+    case: &str,
+    role_name: &str,
+    role_policy: &str,
+    scope: &Scoped,
+) -> (String, String) {
+    let (status, created) = call(
+        router,
+        "CreateRole",
+        &[
+            ("RoleName", role_name),
+            ("AssumeRolePolicyDocument", SESSION_TRUST_POLICY),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the fixture CreateRole must succeed, got {status}: {created}"
+    );
+    let role_arn = element(&created, "Arn");
+
+    let (status, put) = call(
+        router,
+        "PutRolePolicy",
+        &[
+            ("RoleName", role_name),
+            ("PolicyName", "role-grant"),
+            ("PolicyDocument", role_policy),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the fixture PutRolePolicy must succeed, got {status}: {put}"
+    );
+
+    let scoped = match scope {
+        Scoped::Inline(document) => SessionPolicies {
+            inline: Some(document.clone()),
+            managed_arns: Vec::new(),
+            none_means_no_permissions: false,
+        },
+        Scoped::Managed(document) => {
+            let policy_name = format!("{role_name}-session-scope");
+            let (status, policy) = call(
+                router,
+                "CreatePolicy",
+                &[
+                    ("PolicyName", &policy_name),
+                    ("PolicyDocument", document),
+                ],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the fixture CreatePolicy must succeed, got {status}: {policy}"
+            );
+            SessionPolicies {
+                inline: None,
+                managed_arns: vec![element(&policy, "Arn")],
+                none_means_no_permissions: false,
+            }
+        }
+    };
+
+    // The access key id the credential is carried under: an id of the form a minted session
+    // carries, one per role, so no two rows sign as the same session.
+    let access_key_id = format!("ASIA{}", role_name.to_ascii_uppercase());
+    let session_arn = format!(
+        "arn:aws:sts::{}:assumed-role/{role_name}/{SESSION_NAME}",
+        account_id()
+    );
+    let minted = state::now();
+    let store = state::service_state(held).expect("the IAM store");
+    store.lock().record_role_session(
+        &access_key_id,
+        RoleSessionRecord {
+            session_arn: session_arn.clone(),
+            role_arn,
+            expires: ::aws_smithy_types::DateTime::from_secs(
+                minted.secs() + SESSION_LIFETIME_SECONDS,
+            ),
+            scope: scoped,
+            tags: Vec::new(),
+        },
+        minted,
+    );
+    (access_key_id, session_arn)
+}
+
+/// RULE: a refusal of a call signed with a credential a mint SCOPED is worded exactly as
+/// every other refusal this gate answers — the principal that signed it (the session, not
+/// the role it is of), the action, the resource the decision was made on, the clause naming
+/// the document that withheld or denied the call, and then the pointer at the authorization
+/// details of that request, naming one id in both of its slots — whichever of the documents
+/// in force decided it and whichever form the session policy took.
+#[tokio::test]
+async fn a_session_scoped_refusal_is_worded_and_pointed_at_like_every_other() {
+    let (router, engine) = router_with_engine();
+    // The id each refused row was pointed at, so no two rows share one: the pointer names
+    // THAT request's evaluation, and these rows are different requests.
+    let mut pointed_at: Vec<(&str, String)> = Vec::new();
+
+    for (row, scoping) in scopings().into_iter().enumerate() {
+        let role_name = format!("scoped{row}");
+        let (access_key_id, session_arn) = session_scoped_caller(
+            &router,
+            &engine,
+            scoping.case,
+            &role_name,
+            &scoping.role_policy,
+            &scoping.scope,
+        )
+        .await;
+
+        let params = session_params(scoping.action, &role_name);
+        let (status, body) =
+            call_signed_by(&router, Some(&access_key_id), scoping.action, &borrowed(&params)).await;
+
+        let Some(withheld) = scoping.expect else {
+            assert_eq!(
+                status, 200,
+                "case {:?}: expected the call both documents allow to be served, got \
+                 {status}: {body}",
+                scoping.case
+            );
+            continue;
+        };
+        assert_eq!(
+            status, 403,
+            "case {:?}: expected HTTP 403, got {status}: {body}",
+            scoping.case
+        );
+        assert_eq!(
+            error_code(&body),
+            "AccessDenied",
+            "case {:?}: expected the error code AccessDenied, got {:?}",
+            scoping.case,
+            error_code(&body)
+        );
+
+        let message = element(&body, "Message");
+        // The sentence the decision is named in, and the id of the pointer that closes it.
+        let id = assert_access_denied_message(
+            scoping.case,
+            &message,
+            &session_arn,
+            scoping.iam_action,
+            &session_named_as(scoping.action, &role_name),
+            &withheld.reason(scoping.iam_action),
+        );
+        if let Some((earlier, _)) = pointed_at.iter().find(|(_, seen)| seen == &id) {
+            panic!(
+                "case {:?}: expected its own authorization id, got {id:?} — the one case \
+                 {earlier:?} was pointed at under",
+                scoping.case
+            );
+        }
+        pointed_at.push((scoping.case, id));
+    }
+}
+
+/// RULE: the page a session-scoped refusal points at is IAM's own, at its one endpoint
+/// Region whichever Region the refused call addressed, and every part of the message is a
+/// fact of the request and of the documents in force — so the same refused call, repeated
+/// and made from elsewhere, answers the identical message.
+#[tokio::test]
+async fn a_session_scoped_refusal_is_worded_identically_from_every_region() {
+    let (router, engine) = router_with_engine();
+    let role_name = "reregional";
+    let case = "a withheld session-scoped call from several Regions";
+    let (access_key_id, session_arn) = session_scoped_caller(
+        &router,
+        &engine,
+        case,
+        role_name,
+        ALLOW_EVERYTHING,
+        // A scope naming another action, so the call below is withheld by the session
+        // policy while the role's own documents allow it.
+        &Scoped::Inline(statement("Allow", "iam:ListAttachedRolePolicies", "*")),
+    )
+    .await;
+
+    let mut answered: Vec<String> = Vec::new();
+    // Repeated calls, and Regions in three of AWS's geographies including the one IAM's
+    // global endpoint lives in: a message carrying anything drawn from the request's
+    // Region, or from the attempt, would differ across these.
+    for region in ["us-east-1", "us-east-1", "eu-west-1", "ap-southeast-2"] {
+        let (status, body) = call_signed_in_region(
+            &router,
+            Some(&access_key_id),
+            region,
+            "ListRoleTags",
+            &[("RoleName", role_name)],
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "case {region:?}: expected the withheld call to be refused, got {status}: {body}"
+        );
+        let message = element(&body, "Message");
+        let pointed_at = assert_access_denied_message(
+            region,
+            &message,
+            &session_arn,
+            "iam:ListRoleTags",
+            &format!("role {role_name}"),
+            &Withheld::NoSessionAllow.reason("iam:ListRoleTags"),
+        );
+        assert!(
+            !pointed_at.is_empty(),
+            "case {region:?}: expected the refusal to name an authorization id, got \
+             {message:?}"
+        );
+        answered.push(message);
+    }
+    assert!(
+        answered.windows(2).all(|pair| pair[0] == pair[1]),
+        "expected one wording for the same refused call, got {answered:?}"
+    );
 }
