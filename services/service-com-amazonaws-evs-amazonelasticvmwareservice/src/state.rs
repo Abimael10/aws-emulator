@@ -22,7 +22,7 @@ use crate::ops::types::{
     AccountSetting, Check, ConnectivityInfo, Connector, ConnectorCheck, EipAssociation, Environment,
     EnvironmentSummary, Host, InstanceTypeEsxVersionsInfo, LicenseInfo, NetworkInterface,
     ResourceNotFoundException, ServiceAccessSecurityGroups, ValidationException, VcfHostnames,
-    VcfVersionInfo, Vlan, VmEntitlement, INSTANCE_TYPE_VALUES, VCF_VERSION_VALUES,
+    VcfVersionInfo, Vlan, VmEntitlement, INSTANCE_TYPE_VALUES,
 };
 
 /// Whether IAM lets a request to this service perform the action it asks for — the
@@ -2710,22 +2710,21 @@ pub fn account_setting_failures(
 /// version. Valid values are: `AVAILABLE` - This VCF version is available to you.
 /// `RESTRICTED` - This VCF version has limited availability."
 pub const VERSION_STATUS_AVAILABLE: &str = "AVAILABLE";
-/// See [`VERSION_STATUS_AVAILABLE`]. Reported for no version by this service: a version
-/// is `RESTRICTED` when the account's own availability of it is limited, which is a fact
-/// about an agreement with Broadcom that nothing in this emulator holds — and reporting
-/// it would contradict `CreateEnvironment`, which accepts every version of the catalog
-/// below from every caller.
+/// See [`VERSION_STATUS_AVAILABLE`]. Reported for a version whose availability is
+/// LIMITED, which version that is being a fact of the service catalogue Amazon EVS
+/// publishes per version rather than of the caller: every entry of
+/// [`PROVIDED_VCF_VERSIONS`] carries its own status, so both documented values are
+/// reportable and neither is substituted for the other.
 pub const VERSION_STATUS_RESTRICTED: &str = "RESTRICTED";
 
-/// The one `VcfVersion` value that names NO version Amazon EVS provides: "`SELF_DEPLOYED`:
+/// The one `VcfVersion` value whose VCF the CALLER installs: "`SELF_DEPLOYED`:
 /// You install VCF yourself" (`smithy_query(query="doc", shape="CreateEnvironmentRequest",
 /// member="vcfVersion")`).
 ///
-/// `GetVersions` "returns information about VCF versions … provided by Amazon EVS. For
-/// each VCF version, the response also includes the default ESX version and provided EC2
-/// instance types", so the value that means "the caller installs VCF itself" is not one of
-/// them: Amazon EVS neither provides nor installs it, and there is no default ESX version
-/// of its own to report for it.
+/// It decides the deployment MODE only ([`installs_vcf`]): Amazon EVS still provides the
+/// ESX hosts such an environment is built from, so the catalogue reports it with a status,
+/// a default ESX build and instance types exactly as it reports every other modelled
+/// version ([`PROVIDED_VCF_VERSIONS`]).
 pub const VCF_VERSION_SELF_DEPLOYED: &str = "SELF_DEPLOYED";
 
 /// Whether Amazon EVS INSTALLS VCF for `vcf_version`: every `VcfVersion` but
@@ -2754,94 +2753,150 @@ pub fn installs_vcf(vcf_version: &str) -> bool {
 pub struct EsxBuild {
     /// The build identifier itself: the value the catalogue reports for this build.
     pub esx_version: &'static str,
-    /// The prefix of every `VcfVersion` whose Bill Of Materials carries this build, so a
-    /// VCF version is offered the builds of its OWN release line and no others.
-    pub vcf_prefix: &'static str,
-    /// The `VcfVersion`s whose Bill Of Materials names this build as their DEFAULT —
-    /// usually none, because a line offers many builds and defaults to one of them per
-    /// VCF patch. Stated HERE rather than in a second table, so a version's default is
-    /// always a build this catalogue offers and the two halves of one `GetVersions`
-    /// response cannot disagree about which builds exist.
-    pub default_for: &'static [&'static str],
+    /// The RELEASE LINE this build belongs to — the prefix every build identifier of that
+    /// line carries. A VCF version's Bill Of Materials is built on ONE vSphere release, so
+    /// the line is what decides which builds a host of a given VCF version can be
+    /// installed from ([`available_esx_versions`]): a version is offered the builds of the
+    /// line its catalogue entry names ([`ProvidedVcfVersion::esx_line`]) and no others.
+    pub line: &'static str,
 }
 
-/// The prefix of the `VcfVersion` values of the VCF 5.2 release line, whose Bill Of
-/// Materials is built on VMware ESXi 8.0 Update 3. Every `VcfVersion` this model declares
-/// besides [`VCF_VERSION_SELF_DEPLOYED`] is in it
-/// (`smithy_query(query="shape", shape="VcfVersion")` reports `VCF-5.2.1` and
-/// `VCF-5.2.2`).
-const VCF_5_2_LINE: &str = "VCF-5.2.";
+/// The ESXi 8.0 Update 3 release line, the vSphere release the VCF 5.2 Bill Of Materials
+/// is built on: every build identifier of that line opens with this prefix.
+const ESX_LINE_8_0_U3: &str = "ESXi-8.0U3";
 
-/// The prefix of the `VcfVersion` values of the VCF 9 release line, whose Bill Of
-/// Materials is built on VMware ESXi 9. This model declares no `VcfVersion` of that line,
-/// so no version defaults to one of its builds — but Amazon EVS OFFERS them on the
-/// instance types it provides, and the catalogue states what the service offers.
-const VCF_9_LINE: &str = "VCF-9.";
+/// The ESXi 9 release line, the vSphere release the VCF 9 Bill Of Materials is built on.
+const ESX_LINE_9: &str = "ESXi-9.";
 
 /// The ESXi builds Amazon EVS offers, in the order its catalogue states them.
 ///
 /// Service-catalogue data: Broadcom publishes a build per release and Amazon EVS adds it
 /// to this list, so the entries change over time while their FORM does not. A build is
 /// offered on every EC2 instance type Amazon EVS provides (see
-/// [`instance_type_esx_versions`]), and a `VcfVersion` is offered the builds of its own
-/// release line ([`available_esx_versions`]), one of which its BOM makes the default
-/// ([`default_esx_version`]).
+/// [`instance_type_esx_versions`]), and a `VcfVersion` is offered the builds of the
+/// release line its own catalogue entry names ([`available_esx_versions`]), one of which
+/// its Bill Of Materials makes the default ([`default_esx_version`]).
 pub const OFFERED_ESX_BUILDS: &[EsxBuild] = &[
     EsxBuild {
         esx_version: "ESXi-8.0U3b-24280767",
-        vcf_prefix: VCF_5_2_LINE,
-        default_for: &["VCF-5.2.1"],
+        line: ESX_LINE_8_0_U3,
     },
     EsxBuild {
         esx_version: "ESXi-8.0U3g-24859861",
-        vcf_prefix: VCF_5_2_LINE,
-        default_for: &["VCF-5.2.2"],
+        line: ESX_LINE_8_0_U3,
     },
     EsxBuild {
         esx_version: "ESXi-9.0.2.0.25148076",
-        vcf_prefix: VCF_9_LINE,
-        default_for: &[],
+        line: ESX_LINE_9,
     },
     EsxBuild {
         esx_version: "ESXi-9.0.2.0100.25595025",
-        vcf_prefix: VCF_9_LINE,
-        default_for: &[],
+        line: ESX_LINE_9,
     },
     EsxBuild {
         esx_version: "ESXi-9.1.0.0100.25433460",
-        vcf_prefix: VCF_9_LINE,
-        default_for: &[],
+        line: ESX_LINE_9,
     },
     EsxBuild {
         esx_version: "ESXi-9.1.0.0200.25557999",
-        vcf_prefix: VCF_9_LINE,
-        default_for: &[],
+        line: ESX_LINE_9,
     },
     EsxBuild {
         esx_version: "ESXi-8.0U3i-25205845",
-        vcf_prefix: VCF_5_2_LINE,
-        default_for: &[],
+        line: ESX_LINE_8_0_U3,
     },
     EsxBuild {
         esx_version: "ESXi-8.0U3j-25429389",
-        vcf_prefix: VCF_5_2_LINE,
-        default_for: &[],
+        line: ESX_LINE_8_0_U3,
     },
     EsxBuild {
         esx_version: "ESXi-8.0U3k-25595708",
-        vcf_prefix: VCF_5_2_LINE,
-        default_for: &[],
+        line: ESX_LINE_8_0_U3,
     },
 ];
 
-/// The ESX build `vcf_version`'s Bill Of Materials names as its default, or `None` for a
-/// version no entry of [`OFFERED_ESX_BUILDS`] names — a version Amazon EVS provides no
-/// build for, which the catalogue then reports nothing about.
-pub fn default_esx_version(vcf_version: &str) -> Option<&'static str> {
-    OFFERED_ESX_BUILDS
+/// One VCF version Amazon EVS PROVIDES, as its version catalogue states it: everything
+/// `GetVersions` reports about that version, plus the ESX release line the rest of the
+/// service judges a host of it against.
+///
+/// One entry per `VcfVersion` the model declares, so no member of `VcfVersionInfo` is a
+/// constant substituted for every version: the status, the default build and the instance
+/// types are each a per-version fact of the catalogue.
+#[derive(Debug, Clone, Copy)]
+pub struct ProvidedVcfVersion {
+    /// The `VcfVersion` value this entry describes.
+    pub vcf_version: &'static str,
+    /// This version's availability, one of [`VERSION_STATUS_AVAILABLE`] and
+    /// [`VERSION_STATUS_RESTRICTED`] — "`AVAILABLE` - This VCF version is available to
+    /// you. `RESTRICTED` - This VCF version has limited availability"
+    /// (`VcfVersionInfo$status`).
+    pub status: &'static str,
+    /// The release line of [`OFFERED_ESX_BUILDS`] this version's Bill Of Materials is
+    /// built on ([`EsxBuild::line`]): the builds a host of this version can be installed
+    /// from, [`Self::default_esx_version`] among them.
+    pub esx_line: &'static str,
+    /// The build this version's Bill Of Materials names as its DEFAULT — "The default ESX
+    /// version for this VCF version. It is based on Broadcom's Bill Of Materials (BOM)"
+    /// (`VcfVersionInfo$defaultEsxVersion`). An entry of [`OFFERED_ESX_BUILDS`] on
+    /// [`Self::esx_line`], so a version's default is always a build this service offers
+    /// for it and the two halves of one `GetVersions` response cannot disagree.
+    pub default_esx_version: &'static str,
+    /// The EC2 instance types Amazon EVS offers this version on — "EC2 instance types
+    /// provided by Amazon EVS for this VCF version for creating environments"
+    /// (`VcfVersionInfo$instanceTypes`), stated PER version: a version is offered a subset
+    /// of the modelled `InstanceType` values, which is the whole of
+    /// [`INSTANCE_TYPE_VALUES`] for a version offered on every type Amazon EVS provides
+    /// and a narrower list for one it does not.
+    pub instance_types: &'static [&'static str],
+}
+
+/// The VCF versions Amazon EVS provides, in the order its catalogue states them (the
+/// order the `VcfVersion` enum declares them).
+///
+/// Service-catalogue data, like [`OFFERED_ESX_BUILDS`]: which version is `RESTRICTED`,
+/// which build its Bill Of Materials defaults to and which hardware it is offered on all
+/// move as Amazon EVS publishes new builds, while the FORM of an entry does not. One entry
+/// per `VcfVersion` the model declares (`smithy_query(query="shape", shape="VcfVersion")`
+/// reports `VCF-5.2.1`, `VCF-5.2.2` and `SELF_DEPLOYED`), because `GetVersions` is the
+/// discovery call that tells a caller what it may pass to `CreateEnvironment` and this
+/// service accepts every declared version there.
+pub const PROVIDED_VCF_VERSIONS: &[ProvidedVcfVersion] = &[
+    ProvidedVcfVersion {
+        vcf_version: "VCF-5.2.1",
+        status: VERSION_STATUS_RESTRICTED,
+        esx_line: ESX_LINE_8_0_U3,
+        default_esx_version: "ESXi-8.0U3b-24280767",
+        instance_types: &["i4i.metal", "i7i.metal-24xl"],
+    },
+    ProvidedVcfVersion {
+        vcf_version: "VCF-5.2.2",
+        status: VERSION_STATUS_AVAILABLE,
+        esx_line: ESX_LINE_8_0_U3,
+        default_esx_version: "ESXi-8.0U3g-24859861",
+        instance_types: INSTANCE_TYPE_VALUES,
+    },
+    ProvidedVcfVersion {
+        vcf_version: VCF_VERSION_SELF_DEPLOYED,
+        status: VERSION_STATUS_AVAILABLE,
+        esx_line: ESX_LINE_9,
+        default_esx_version: "ESXi-9.0.2.0.25148076",
+        instance_types: INSTANCE_TYPE_VALUES,
+    },
+];
+
+/// The catalogue entry for `vcf_version`, or `None` for a string that names no
+/// `VcfVersion` this service provides.
+pub fn provided_vcf_version(vcf_version: &str) -> Option<&'static ProvidedVcfVersion> {
+    PROVIDED_VCF_VERSIONS
         .iter()
-        .find(|build| build.default_for.contains(&vcf_version))
-        .map(|build| build.esx_version)
+        .find(|provided| provided.vcf_version == vcf_version)
+}
+
+/// The ESX build `vcf_version`'s Bill Of Materials names as its default, or `None` for a
+/// string no entry of [`PROVIDED_VCF_VERSIONS`] names — a version Amazon EVS provides
+/// nothing for, which the catalogue then reports nothing about.
+pub fn default_esx_version(vcf_version: &str) -> Option<&'static str> {
+    provided_vcf_version(vcf_version).map(|provided| provided.default_esx_version)
 }
 
 /// The ESX versions Amazon EVS offers for `vcf_version` — the versions a caller finds
@@ -2849,18 +2904,20 @@ pub fn default_esx_version(vcf_version: &str) -> Option<&'static str> {
 /// use the GetVersions action" (`CreateEnvironmentHost` doc).
 ///
 /// Taken from the catalogue `GetVersions` itself reports, so the two cannot disagree about
-/// which versions exist: a VCF version is offered every build of its OWN release line,
-/// among them the one its Bill Of Materials defaults to ([`default_esx_version`]). The
-/// release line alone decides it, independently of which build is the default, so adding a
-/// `VcfVersion` of a line the catalogue already carries offers that line's builds at once.
-/// EMPTY for a version of no line the catalogue carries — [`VCF_VERSION_SELF_DEPLOYED`],
-/// whose VCF the caller installs itself, is one — and the catalogue then states no versions
-/// for it, which is no evidence about any particular version rather than evidence against
-/// all of them.
+/// which versions exist: a VCF version is offered every build of the release line its own
+/// catalogue entry names ([`ProvidedVcfVersion::esx_line`]), among them the one its Bill Of
+/// Materials defaults to ([`default_esx_version`]). The line alone decides it,
+/// independently of which build is the default, so adding a `VcfVersion` of a line the
+/// build catalogue already carries offers that line's builds at once. EMPTY for a string
+/// the catalogue holds no entry for, which is no evidence about any particular version
+/// rather than evidence against all of them.
 pub fn available_esx_versions(vcf_version: &str) -> Vec<&'static str> {
+    let Some(provided) = provided_vcf_version(vcf_version) else {
+        return Vec::new();
+    };
     OFFERED_ESX_BUILDS
         .iter()
-        .filter(|build| vcf_version.starts_with(build.vcf_prefix))
+        .filter(|build| build.line == provided.esx_line)
         .map(|build| build.esx_version)
         .collect()
 }
@@ -2889,27 +2946,25 @@ pub fn unavailable_esx_version_failure(
 /// Every VCF version Amazon EVS PROVIDES, with the status, default ESX version and EC2
 /// instance types of each — what `GetVersions` reports as `vcfVersions`.
 ///
-/// The set is the `VcfVersion` enum the model declares, less
-/// [`VCF_VERSION_SELF_DEPLOYED`] and less any version [`OFFERED_ESX_BUILDS`] names no
-/// default build for, in the order the enum declares them (ascending version). The
-/// instance types are every `InstanceType` the model declares: nothing in the model
-/// narrows the types per VCF version, and this service's `CreateEnvironmentHost` accepts
-/// each of them on an environment of any version, so reporting fewer here would state a
-/// restriction the service does not apply.
+/// A projection of [`PROVIDED_VCF_VERSIONS`] in catalogue order and nothing else: every
+/// member of a reported entry is read from that version's own entry, so a version whose
+/// availability is limited reports [`VERSION_STATUS_RESTRICTED`] where an unrestricted one
+/// reports [`VERSION_STATUS_AVAILABLE`], and a version offered on a subset of the modelled
+/// instance types reports that subset. One entry per `VcfVersion` the model declares,
+/// because `GetVersions` is the discovery call for what `CreateEnvironment` takes and this
+/// service accepts every declared version there.
 pub fn provided_vcf_versions() -> Vec<VcfVersionInfo> {
-    VCF_VERSION_VALUES
+    PROVIDED_VCF_VERSIONS
         .iter()
-        .filter(|version| **version != VCF_VERSION_SELF_DEPLOYED)
-        .filter_map(|version| {
-            default_esx_version(version).map(|esx_version| VcfVersionInfo {
-                vcf_version: (*version).to_string(),
-                status: VERSION_STATUS_AVAILABLE.to_string(),
-                default_esx_version: esx_version.to_string(),
-                instance_types: INSTANCE_TYPE_VALUES
-                    .iter()
-                    .map(|instance_type| (*instance_type).to_string())
-                    .collect(),
-            })
+        .map(|provided| VcfVersionInfo {
+            vcf_version: provided.vcf_version.to_string(),
+            status: provided.status.to_string(),
+            default_esx_version: provided.default_esx_version.to_string(),
+            instance_types: provided
+                .instance_types
+                .iter()
+                .map(|instance_type| (*instance_type).to_string())
+                .collect(),
         })
         .collect()
 }
@@ -2925,9 +2980,10 @@ pub fn provided_vcf_versions() -> Vec<VcfVersionInfo> {
 /// list would state a restriction the service does not apply.
 ///
 /// Consistent with [`provided_vcf_versions`] BY CONSTRUCTION, because a version's default
-/// is an entry of that same catalogue ([`EsxBuild::default_for`]): every provided VCF
-/// version's `defaultEsxVersion` appears among the `esxVersions` of every instance type it
-/// lists, so the two halves of one response cannot disagree.
+/// is an entry of that same build catalogue, on the release line its own entry names
+/// ([`ProvidedVcfVersion::esx_line`]): every provided VCF version's `defaultEsxVersion`
+/// appears among the `esxVersions` of every instance type it lists, so the two halves of
+/// one response cannot disagree.
 pub fn instance_type_esx_versions() -> Vec<InstanceTypeEsxVersionsInfo> {
     INSTANCE_TYPE_VALUES
         .iter()

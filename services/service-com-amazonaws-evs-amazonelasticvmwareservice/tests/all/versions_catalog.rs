@@ -2,16 +2,17 @@
 
 //! `GetVersions`: the catalogue of what Amazon EVS PROVIDES, end to end over awsJson1_0.
 //!
-//! The rule under test: `GetVersions` reports every VCF version Amazon EVS provides —
-//! each `VcfVersion` the model declares except the value that means the caller installs
-//! VCF itself — with that version's availability status, the default ESX version its Bill
-//! Of Materials names and the EC2 instance types it is offered on, plus, for each of
-//! those instance types, the ESX versions offered on it; it is a read, so it reports the
-//! same catalogue however often it is called and whatever a caller has created, and the
-//! catalogue it reports is the one the rest of the service acts on. Every ESX version it
-//! reports — each `esxVersions` entry and each `defaultEsxVersion` — is an ESXi BUILD
-//! identifier, and a version's default is one of the builds every instance type it lists
-//! is offered: `tests/all/esx_build_catalogue.rs` owns that half of the rule.
+//! The rule under test: `GetVersions` reports one entry per `VcfVersion` the model
+//! declares, and every member of an entry is that version's OWN catalogue fact — its
+//! availability status (one of the two the member documents), the default ESX version its
+//! Bill Of Materials names and the EC2 instance types it is offered on, which may be a
+//! subset of the modelled instance types — plus, for each of those instance types, the ESX
+//! versions offered on it; it is a read, so it reports the same catalogue however often it
+//! is called and whatever a caller has created, and the catalogue it reports is the one the
+//! rest of the service acts on. Every ESX version it reports — each `esxVersions` entry and
+//! each `defaultEsxVersion` — is an ESXi BUILD identifier, and a version's default is one
+//! of the builds every instance type it lists is offered:
+//! `tests/all/esx_build_catalogue.rs` owns that half of the rule.
 //!
 //! Where each clause comes from (`smithy_query(query="operation",
 //! operation="GetVersions")`, `smithy_query(query="shape",
@@ -31,7 +32,8 @@
 //! * "Information about ESX versions offered for each EC2 instance type." /  "The list of
 //!   ESX versions offered for this instance type." (`InstanceTypeEsxVersionsInfo`.)
 //! * "`SELF_DEPLOYED`: You install VCF yourself." (`CreateEnvironmentRequest$vcfVersion`
-//!   doc) — so that value names no version Amazon EVS provides and installs.
+//!   doc) — that value decides who installs VCF, and it is a `VcfVersion` the create
+//!   operation takes, so the discovery call reports it like any other.
 //! * "If you don't specify an ESX version when adding hosts using CreateEnvironmentHost
 //!   action, Amazon EVS automatically uses the default ESX version for your environment's
 //!   VCF version. To find the available ESX versions for a particular VCF version, use
@@ -57,10 +59,21 @@ use crate::environment_lifecycle::{call, emulator, error_type, vlans_with_prefix
 /// `SELF_DEPLOYED`.
 const VCF_VERSIONS: [&str; 3] = ["VCF-5.2.1", "VCF-5.2.2", "SELF_DEPLOYED"];
 
-/// The one value of that enum that names NO version Amazon EVS provides: "`SELF_DEPLOYED`:
-/// You install VCF yourself" (`smithy_query(query="doc", shape="CreateEnvironmentRequest",
-/// member="vcfVersion")`).
-const SELF_DEPLOYED: &str = "SELF_DEPLOYED";
+/// A `hostName` holds letters, digits and hyphens only (`smithy_query(query="shape",
+/// shape="HostName")` reports the pattern `^([a-zA-Z0-9\-]*)$`), so a VCF version worked
+/// into a host name has its separators replaced.
+fn slug(vcf_version: &str) -> String {
+    vcf_version
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
 
 /// Every `InstanceType` value the model declares.
 ///
@@ -170,7 +183,7 @@ async fn deployed_environment(router: &Emulator, case: &str, vcf_version: &str) 
         "serviceAccessSubnetId": subnet_id,
         "vcfVersion": vcf_version,
         "termsAccepted": true,
-        "environmentName": format!("catalogue-{}", vcf_version.replace('.', "-")),
+        "environmentName": format!("catalogue-{}", slug(vcf_version)),
         "initialVlans": vlans_with_prefix(24),
     });
     let (status, body) = call(router, "CreateEnvironment", &request).await;
@@ -202,14 +215,11 @@ async fn the_catalogue_reports_every_vcf_version_amazon_evs_provides() {
     let body = get_versions(&router).await;
     let versions = reported_versions("the provided VCF versions", &body);
 
-    // The set is every modelled `VcfVersion` except the one that means the caller
-    // installs VCF itself: Amazon EVS neither provides nor installs that one, and it has
-    // no default ESX version of its own to report.
-    let expected: BTreeSet<&str> = VCF_VERSIONS
-        .iter()
-        .copied()
-        .filter(|version| *version != SELF_DEPLOYED)
-        .collect();
+    // The set is every modelled `VcfVersion`: `GetVersions` is the discovery call that
+    // tells a caller which versions it may pass to `CreateEnvironment`, and that operation
+    // takes every declared value — the one that means the caller installs VCF itself
+    // included, for which Amazon EVS still provides the ESX hosts.
+    let expected: BTreeSet<&str> = VCF_VERSIONS.iter().copied().collect();
     let actual: BTreeSet<&str> = versions
         .iter()
         .map(|version| version.vcf_version.as_str())
@@ -265,6 +275,91 @@ async fn the_catalogue_reports_every_vcf_version_amazon_evs_provides() {
             version.instance_types.len(),
             "case {case:?}: no instance type may be reported twice, got {:?}",
             version.instance_types
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_member_of_a_reported_version_is_that_versions_own_catalogue_fact() {
+    let router = emulator();
+    let body = get_versions(&router).await;
+    let versions = reported_versions("the catalogue's own entries", &body);
+
+    // Each member of `VcfVersionInfo` is a PER-VERSION fact, so the response is the
+    // service's version catalogue projected entry by entry and member by member — no
+    // member is a constant substituted for every version. The expectation is the catalogue
+    // this service holds, not a value written here: which version is restricted, which
+    // build its Bill Of Materials defaults to and which hardware it is offered on all move
+    // as Amazon EVS publishes new builds, while the projection does not.
+    let catalogue = evs::PROVIDED_VCF_VERSIONS;
+    assert_eq!(
+        versions.len(),
+        catalogue.len(),
+        "case \"the catalogue's own entries\": expected {} entries, got {:?}",
+        catalogue.len(),
+        versions
+    );
+    for (provided, reported) in catalogue.iter().zip(versions.iter()) {
+        let case = provided.vcf_version;
+        assert_eq!(
+            reported.vcf_version, provided.vcf_version,
+            "case {case:?}: expected the catalogue's entry for {:?}, got {:?}",
+            provided.vcf_version, reported.vcf_version
+        );
+        assert_eq!(
+            reported.status, provided.status,
+            "case {case:?}: expected the status the catalogue carries for it ({:?}), got \
+             {:?}",
+            provided.status, reported.status
+        );
+        assert!(
+            STATUSES.contains(&reported.status.as_str()),
+            "case {case:?}: the status must be one of {STATUSES:?}, got {:?}",
+            reported.status
+        );
+        assert_eq!(
+            reported.default_esx_version, provided.default_esx_version,
+            "case {case:?}: expected the default build the catalogue carries for it ({:?}), \
+             got {:?}",
+            provided.default_esx_version, reported.default_esx_version
+        );
+        let expected_types: Vec<&str> = provided.instance_types.to_vec();
+        let reported_types: Vec<&str> = reported
+            .instance_types
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            reported_types, expected_types,
+            "case {case:?}: expected the instance types the catalogue offers this version \
+             ({expected_types:?}), got {reported_types:?}"
+        );
+        for instance_type in &reported_types {
+            assert!(
+                INSTANCE_TYPES.contains(instance_type),
+                "case {case:?}: every offered instance type is a modelled InstanceType \
+                 {INSTANCE_TYPES:?}, got {instance_type:?}"
+            );
+        }
+    }
+
+    // Both documented values of the member are reportable: the statuses the response
+    // carries are exactly the ones the catalogue holds, so a version of limited
+    // availability is reported as limited rather than as freely usable.
+    let held: BTreeSet<&str> = catalogue.iter().map(|provided| provided.status).collect();
+    let announced: BTreeSet<&str> = versions
+        .iter()
+        .map(|version| version.status.as_str())
+        .collect();
+    assert_eq!(
+        announced, held,
+        "case \"the statuses the catalogue holds\": expected {held:?}, got {announced:?}"
+    );
+    for status in &held {
+        assert!(
+            STATUSES.contains(status),
+            "case \"the statuses the catalogue holds\": {status:?} is not one of \
+             {STATUSES:?}"
         );
     }
 }
@@ -353,7 +448,7 @@ async fn every_version_and_instance_type_the_catalogue_reports_is_one_the_servic
         let environment = deployed_environment(&router, case, case).await;
         for (index, instance_type) in version.instance_types.iter().enumerate() {
             let case = format!("{case} on {instance_type}");
-            let host_name = format!("esx-{}-{index}", case.replace(['.', ' '], "-"));
+            let host_name = format!("esx-{}-{index}", slug(&case));
             let request = json!({
                 "environmentId": environment,
                 "host": {
@@ -432,7 +527,7 @@ async fn a_host_that_names_no_esx_version_runs_the_catalogue_default_for_its_vcf
         let environment = deployed_environment(&router, vcf_version, vcf_version).await;
         for (index, (named_case, names_the_offered_version)) in named.iter().enumerate() {
             let case = format!("{vcf_version} with {named_case}");
-            let host_name = format!("esx-default-{index}-{}", vcf_version.replace('.', "-"));
+            let host_name = format!("esx-default-{index}-{}", slug(vcf_version));
             let esx_version = names_the_offered_version.then(|| version.default_esx_version.clone());
             let mut request = json!({
                 "environmentId": environment,
@@ -481,7 +576,7 @@ async fn a_host_that_names_no_esx_version_runs_the_catalogue_default_for_its_vcf
         ];
         for (index, esx_version) in outside.iter().enumerate() {
             let case = format!("{vcf_version} with the esxVersion {esx_version}");
-            let host_name = format!("esx-outside-{index}-{}", vcf_version.replace('.', "-"));
+            let host_name = format!("esx-outside-{index}-{}", slug(vcf_version));
             let request = json!({
                 "environmentId": environment,
                 "esxVersion": esx_version,

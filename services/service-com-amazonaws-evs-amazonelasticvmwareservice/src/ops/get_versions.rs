@@ -10,10 +10,15 @@
 //! answer alike and nothing a caller does changes what the next one reads.
 //!
 //! The catalogue itself lives in [`crate::state`]
-//! ([`crate::state::provided_vcf_versions`], [`crate::state::instance_type_esx_versions`])
-//! so the versions this operation reports are the SAME ones the rest of the service acts
-//! on — `CreateEnvironmentHost` resolves a host's default ESX version out of it — rather
-//! than a list only this response knows. Both halves are read from the one build catalogue
+//! ([`crate::state::PROVIDED_VCF_VERSIONS`], projected by
+//! [`crate::state::provided_vcf_versions`], and
+//! [`crate::state::instance_type_esx_versions`]) so the versions this operation reports
+//! are the SAME ones the rest of the service acts on — `CreateEnvironmentHost` resolves a
+//! host's default ESX version out of it — rather than a list only this response knows.
+//! Every member of a reported version is that version's own catalogue fact: its
+//! availability status, the build its Bill Of Materials defaults to and the EC2 instance
+//! types it is offered on, with one entry for every `VcfVersion` the model declares. Both
+//! halves are read from the one build catalogue
 //! ([`crate::state::OFFERED_ESX_BUILDS`]), so the two cannot disagree: a VCF version's
 //! `defaultEsxVersion` is an entry of that catalogue and so appears among the
 //! `esxVersions` of every instance type that version lists.

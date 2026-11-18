@@ -41,10 +41,19 @@ const BUILD_PREFIX: &str = "ESXi-";
 /// (`smithy_query(query="shape", shape="EsxVersion")`).
 const ESX_VERSION_MAX_LENGTH: usize = 128;
 
-/// The vSphere release an ESXi build identifier of the VCF 5.2 release line names: VCF
-/// 5.2's Bill Of Materials is built on VMware ESXi 8.0 Update 3, so an `ESXi-8.…` build is
-/// one a VCF 5.2 environment can be installed from and an `ESXi-9.…` build is not.
-const VCF_5_2_BUILD_PREFIX: &str = "ESXi-8.";
+/// The RELEASE LINE an ESXi build identifier names: the vSphere release it is a build of,
+/// taken as everything up to and including the first separator after the `ESXi-` prefix
+/// (`ESXi-8.0U3b-24280767` is a build of the `ESXi-8.` line). A VCF version's Bill Of
+/// Materials is built on one release, so the line of the version's default build is the
+/// line a host of it can be installed from — read from the catalogue rather than written
+/// here, because which line a version is built on is catalogue data that moves.
+fn release_line(esx_version: &str) -> &str {
+    let after_prefix = BUILD_PREFIX.len();
+    match esx_version[after_prefix..].find(['.', '-']) {
+        Some(offset) => &esx_version[..after_prefix + offset + 1],
+        None => esx_version,
+    }
+}
 
 /// Whether `esx_version` has the form of an ESXi build identifier:
 /// `ESXi-<vSphere release>-<build number>`, where the build number is the digits after
@@ -219,12 +228,15 @@ async fn a_host_is_installed_from_the_builds_of_its_environments_release_line() 
     // GetVersions action": every build the catalogue reports is tried against an
     // environment of every provided VCF version, and the ones that version's own release
     // line carries are the ones a host can be installed from — the others name no build
-    // Amazon EVS can install for it and are refused, naming `esxVersion`.
+    // Amazon EVS can install for it and are refused, naming `esxVersion`. The line is the
+    // one the version's own `defaultEsxVersion` names, so a version of any release line
+    // the catalogue carries is a row here.
     for (vcf_version, default) in &catalogue.versions {
+        let line = release_line(default);
         let environment = deployed_environment(&router, vcf_version).await;
         for (index, esx_version) in offered.iter().enumerate() {
             let case = format!("{vcf_version} with the build {esx_version}");
-            let host_name = format!("esx-{}-{index}", vcf_version.replace('.', "-"));
+            let host_name = format!("esx-{}-{index}", host_slug(vcf_version));
             let request = json!({
                 "environmentId": environment,
                 "esxVersion": esx_version,
@@ -235,7 +247,7 @@ async fn a_host_is_installed_from_the_builds_of_its_environments_release_line() 
                 },
             });
             let (status, body) = call(&router, "CreateEnvironmentHost", &request).await;
-            let installable = esx_version.starts_with(VCF_5_2_BUILD_PREFIX);
+            let installable = esx_version.starts_with(line);
             if installable {
                 assert_eq!(
                     status, 200,
@@ -272,13 +284,37 @@ async fn a_host_is_installed_from_the_builds_of_its_environments_release_line() 
         }
 
         // The default build is one of the installable ones: a host that names nothing
-        // runs it.
+        // runs it, so the line read off it has to be a line the catalogue offers builds
+        // of.
         assert!(
-            default.starts_with(VCF_5_2_BUILD_PREFIX),
+            offered
+                .iter()
+                .any(|esx_version| esx_version.starts_with(line)),
+            "case {vcf_version:?}: the default build {default:?} names the release line \
+             {line:?}, which the catalogue must offer builds of, got {offered:?}"
+        );
+        assert!(
+            default.starts_with(line),
             "case {vcf_version:?}: the default build belongs to this version's own release \
-             line, got {default:?}"
+             line {line:?}, got {default:?}"
         );
     }
+}
+
+/// A `hostName` holds letters, digits and hyphens only (`smithy_query(query="shape",
+/// shape="HostName")` reports the pattern `^([a-zA-Z0-9\-]*)$`), so a VCF version worked
+/// into a host name has its separators replaced.
+fn host_slug(vcf_version: &str) -> String {
+    vcf_version
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// Create an environment at `vcf_version` and settle the transition the clock owes it, so

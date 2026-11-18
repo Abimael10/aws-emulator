@@ -542,8 +542,19 @@ async fn an_esx_version_must_be_one_the_catalogue_offers_for_the_vcf_version() {
     for (vcf_version, offered) in &catalogue {
         let environment = emulator.deployed_environment(vcf_version, vcf_version).await;
         // Host DNS hostnames are unique ACROSS environments, so each row's name carries
-        // the VCF version its environment was created with.
-        let slug = vcf_version.replace('.', "-");
+        // the VCF version its environment was created with — spelled with the letters,
+        // digits and hyphens a `hostName` holds (`smithy_query(query="shape",
+        // shape="HostName")`).
+        let slug: String = vcf_version
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
         // Accepted: no version at all (the default is resolved for the caller), and the
         // version the catalogue offers for this VCF version.
         let accepted: Vec<(String, Option<&str>)> = vec![
@@ -617,33 +628,66 @@ async fn an_esx_version_must_be_one_the_catalogue_offers_for_the_vcf_version() {
     }
 }
 
-/// RULE (the other side of it): a VCF version the catalogue states no ESX versions for
-/// leaves nothing to judge a requested version against, so none is refused for it.
+/// RULE (the other side of it): the catalogue states the ESX versions of every VCF version
+/// it reports, so a requested version is judged for every modelled `VcfVersion` — the mode
+/// where the CALLER installs VCF included.
 ///
-/// `GetVersions` reports the versions Amazon EVS PROVIDES, and `SELF_DEPLOYED` — "You
-/// install VCF yourself" — is not one of them, so this service publishes no ESX versions
-/// for it and cannot refuse one.
+/// "`SELF_DEPLOYED`: You install VCF yourself" decides who installs VCF, not whether Amazon
+/// EVS provides the ESX hosts: that mode's environments take hosts through
+/// `CreateEnvironmentHost` ("After the environment is created, you can add hosts with
+/// CreateEnvironmentHost"), so the catalogue reports a default ESX version for it and an
+/// `esxVersion` outside the versions it offers is refused for it like for any other.
 #[tokio::test]
-async fn an_esx_version_is_not_judged_for_a_vcf_version_the_catalogue_states_none_for() {
+async fn an_esx_version_is_judged_for_the_mode_the_caller_installs_vcf_for() {
     let emulator = Emulator::new();
     let (status, body) = call(&emulator.router, "GetVersions", &json!({})).await;
     assert_eq!(status, 200, "GetVersions: got {status} {body}");
-    let provided: Vec<String> = body["vcfVersions"]
+    let offered = body["vcfVersions"]
         .as_array()
         .unwrap_or_else(|| panic!("GetVersions: no vcfVersions in {body}"))
         .iter()
-        .filter_map(|version| version["vcfVersion"].as_str().map(str::to_string))
-        .collect();
-    assert!(
-        !provided.iter().any(|version| version == "SELF_DEPLOYED"),
-        "SELF_DEPLOYED names no version Amazon EVS provides, got {provided:?}"
-    );
+        .find(|version| version["vcfVersion"] == json!("SELF_DEPLOYED"))
+        .and_then(|version| version["defaultEsxVersion"].as_str())
+        .unwrap_or_else(|| {
+            panic!("GetVersions must report every modelled VcfVersion, got {body}")
+        })
+        .to_string();
 
     let environment = emulator
         .deployed_environment("self-deployed", "SELF_DEPLOYED")
         .await;
-    for (index, esx_version) in ["9.9.9", "8.0.3"].iter().enumerate() {
-        let host_name = format!("esx-self-{index}");
+    // Accepted: nothing named at all (the catalogue's default is resolved for the caller),
+    // and the version the catalogue offers for this mode.
+    let accepted: [(&str, Option<&str>); 2] = [
+        ("no esxVersion at all", None),
+        ("the offered version", Some(offered.as_str())),
+    ];
+    for (index, (case, esx_version)) in accepted.iter().enumerate() {
+        let host_name = format!("esx-self-ok-{index}");
+        let (status, body) = emulator
+            .create_host(
+                &environment,
+                &host_request(&host_name, &json!({})),
+                *esx_version,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} ({}) {body}",
+            error_type(&body)
+        );
+    }
+
+    // Refused: a version the catalogue does not offer for it, in each form one can take.
+    let refused = [
+        "9.9.9".to_string(),
+        "8.0".to_string(),
+        "latest".to_string(),
+        format!("{offered}-1"),
+    ];
+    for (index, esx_version) in refused.iter().enumerate() {
+        let stored_before = emulator.hosts(&environment).await.len();
+        let host_name = format!("esx-self-bad-{index}");
         let (status, body) = emulator
             .create_host(
                 &environment,
@@ -652,9 +696,20 @@ async fn an_esx_version_is_not_judged_for_a_vcf_version_the_catalogue_states_non
             )
             .await;
         assert_eq!(
-            status, 200,
-            "case {esx_version:?}: expected HTTP 200, got {status} ({}) {body}",
+            status, 400,
+            "case {esx_version:?}: expected HTTP 400, got {status} ({}) {body}",
             error_type(&body)
+        );
+        let members = refused_members(&body);
+        assert!(
+            members.iter().any(|name| name == "esxVersion"),
+            "case {esx_version:?}: expected a fieldList entry for \"esxVersion\", got \
+             {members:?} in {body}"
+        );
+        assert_eq!(
+            emulator.hosts(&environment).await.len(),
+            stored_before,
+            "case {esx_version:?}: a refused request must store no host"
         );
     }
 }
