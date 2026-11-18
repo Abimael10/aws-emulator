@@ -138,6 +138,190 @@ impl UserRecord {
     }
 }
 
+/// `Setting$type` for a setting the model types as `Boolean`. `Setting$type` is
+/// "the data type of the setting value (e.g., 'boolean', 'string', 'number')".
+const SETTING_TYPE_BOOLEAN: &str = "boolean";
+
+/// `Setting$type` for a setting the model types as a string or as an enum of
+/// strings.
+const SETTING_TYPE_STRING: &str = "string";
+
+/// `ConsentPopupConfig$closeButtonLabel`: "Defaults to \"Acknowledge\" if not
+/// provided."
+pub const CONSENT_POPUP_CLOSE_BUTTON_LABEL_DEFAULT: &str = "Acknowledge";
+
+/// The `optionName` of `NetworkSettings$enableClientMetrics`.
+const OPTION_ENABLE_CLIENT_METRICS: &str = "enableClientMetrics";
+
+/// The `optionName` of `ReadReceiptConfig$status`, under the
+/// `NetworkSettings$readReceiptConfig` member that carries it: a leaf of a nested
+/// configuration is named by its path, so one flat list can report every setting.
+const OPTION_READ_RECEIPT_STATUS: &str = "readReceiptConfig.status";
+
+/// The `optionName` of `NetworkSettings$dataRetention`.
+const OPTION_DATA_RETENTION: &str = "dataRetention";
+
+/// The `optionName` of `NetworkSettings$enableTrustedDataFormat`.
+const OPTION_ENABLE_TRUSTED_DATA_FORMAT: &str = "enableTrustedDataFormat";
+
+/// The `optionName` of `ConsentPopupConfig$enabled`.
+const OPTION_CONSENT_POPUP_ENABLED: &str = "consentPopup.enabled";
+
+/// The `optionName` of `ConsentPopupConfig$header`.
+const OPTION_CONSENT_POPUP_HEADER: &str = "consentPopup.header";
+
+/// The `optionName` of `ConsentPopupConfig$content`.
+const OPTION_CONSENT_POPUP_CONTENT: &str = "consentPopup.content";
+
+/// The `optionName` of `ConsentPopupConfig$closeButtonLabel`.
+const OPTION_CONSENT_POPUP_CLOSE_BUTTON_LABEL: &str = "consentPopup.closeButtonLabel";
+
+/// One network's network-level settings — every leaf of the modelled
+/// `NetworkSettings` shape, flattened, so the operation that writes them and the
+/// one that reports them share a single record.
+///
+/// Every leaf is optional: a setting has a value once something gives it one, and
+/// a setting nothing has given a value is not part of the network's settings at
+/// all. [`Default`] is what a network is created with.
+#[derive(Debug, Clone)]
+pub struct NetworkSettingsRecord {
+    pub enable_client_metrics: Option<bool>,
+    pub read_receipt_status: Option<String>,
+    pub data_retention: Option<bool>,
+    pub enable_trusted_data_format: Option<bool>,
+    pub consent_popup_enabled: Option<bool>,
+    pub consent_popup_header: Option<String>,
+    pub consent_popup_content: Option<String>,
+    pub consent_popup_close_button_label: Option<String>,
+}
+
+/// The network-level settings a network is created with: sending anonymized
+/// client metrics "for service improvement and troubleshooting" is on, and an
+/// administrator turns it off.
+///
+/// Nothing else is set. Each remaining setting belongs to a feature that is
+/// configured per network — a retention bot, an OpenTDF configuration, a read
+/// receipt mode, a consent popup — so until one is configured the network has no
+/// value for it to report.
+impl Default for NetworkSettingsRecord {
+    fn default() -> Self {
+        Self {
+            enable_client_metrics: Some(true),
+            read_receipt_status: None,
+            data_retention: None,
+            enable_trusted_data_format: None,
+            consent_popup_enabled: None,
+            consent_popup_header: None,
+            consent_popup_content: None,
+            consent_popup_close_button_label: None,
+        }
+    }
+}
+
+impl NetworkSettingsRecord {
+    /// Apply the settings a request carries to this record, member by member.
+    ///
+    /// Every member of `NetworkSettings` is optional, so a request names only the
+    /// settings it wants changed: a member it leaves out — at any depth — keeps
+    /// the value already stored, and a setting it has never named stays unset.
+    /// `ConsentPopupConfig$enabled` is the one required member, so a request that
+    /// carries the popup at all states whether it is displayed.
+    pub fn merge(&mut self, requested: &crate::ops::types::NetworkSettings) {
+        if let Some(enabled) = requested.enable_client_metrics {
+            self.enable_client_metrics = Some(enabled);
+        }
+        if let Some(status) = requested
+            .read_receipt_config
+            .as_ref()
+            .and_then(|config| config.status.as_ref())
+        {
+            self.read_receipt_status = Some(status.clone());
+        }
+        if let Some(retention) = requested.data_retention {
+            self.data_retention = Some(retention);
+        }
+        if let Some(trusted) = requested.enable_trusted_data_format {
+            self.enable_trusted_data_format = Some(trusted);
+        }
+        let Some(popup) = requested.consent_popup.as_ref() else {
+            return;
+        };
+        self.consent_popup_enabled = Some(popup.enabled);
+        if let Some(header) = popup.header.as_ref() {
+            self.consent_popup_header = Some(header.clone());
+        }
+        if let Some(content) = popup.content.as_ref() {
+            self.consent_popup_content = Some(content.clone());
+        }
+        match popup.close_button_label.as_ref() {
+            Some(label) => self.consent_popup_close_button_label = Some(label.clone()),
+            // A popup configured without a label is displayed with the one
+            // `ConsentPopupConfig$closeButtonLabel` documents as its default, so
+            // that is the value the setting takes.
+            None => {
+                self.consent_popup_close_button_label
+                    .get_or_insert_with(|| CONSENT_POPUP_CLOSE_BUTTON_LABEL_DEFAULT.to_string());
+            }
+        }
+    }
+
+    /// This record as the modelled `SettingsList`: one `Setting` per leaf that has
+    /// a value, named by its path through `NetworkSettings`, in the order the model
+    /// declares the members.
+    ///
+    /// `Setting$value` is a string whatever the setting's type, and "boolean values
+    /// are represented as 'true' or 'false'" (`Setting$value` documentation).
+    pub fn settings_view(&self) -> Vec<crate::ops::types::Setting> {
+        let mut settings = Vec::new();
+        if let Some(metrics) = self.enable_client_metrics {
+            settings.push(boolean_setting(OPTION_ENABLE_CLIENT_METRICS, metrics));
+        }
+        if let Some(status) = self.read_receipt_status.as_deref() {
+            settings.push(string_setting(OPTION_READ_RECEIPT_STATUS, status));
+        }
+        if let Some(retention) = self.data_retention {
+            settings.push(boolean_setting(OPTION_DATA_RETENTION, retention));
+        }
+        if let Some(trusted) = self.enable_trusted_data_format {
+            settings.push(boolean_setting(OPTION_ENABLE_TRUSTED_DATA_FORMAT, trusted));
+        }
+        if let Some(enabled) = self.consent_popup_enabled {
+            settings.push(boolean_setting(OPTION_CONSENT_POPUP_ENABLED, enabled));
+        }
+        if let Some(header) = self.consent_popup_header.as_deref() {
+            settings.push(string_setting(OPTION_CONSENT_POPUP_HEADER, header));
+        }
+        if let Some(content) = self.consent_popup_content.as_deref() {
+            settings.push(string_setting(OPTION_CONSENT_POPUP_CONTENT, content));
+        }
+        if let Some(label) = self.consent_popup_close_button_label.as_deref() {
+            settings.push(string_setting(
+                OPTION_CONSENT_POPUP_CLOSE_BUTTON_LABEL,
+                label,
+            ));
+        }
+        settings
+    }
+}
+
+/// One boolean setting, rendered as the modelled `Setting`.
+fn boolean_setting(option_name: &str, value: bool) -> crate::ops::types::Setting {
+    crate::ops::types::Setting {
+        option_name: option_name.to_string(),
+        value: value.to_string(),
+        r#type: SETTING_TYPE_BOOLEAN.to_string(),
+    }
+}
+
+/// One string setting, rendered as the modelled `Setting`.
+fn string_setting(option_name: &str, value: &str) -> crate::ops::types::Setting {
+    crate::ops::types::Setting {
+        option_name: option_name.to_string(),
+        value: value.to_string(),
+        r#type: SETTING_TYPE_STRING.to_string(),
+    }
+}
+
 /// One stored security group of one network.
 #[derive(Debug, Clone)]
 pub struct SecurityGroupRecord {
@@ -156,6 +340,11 @@ pub struct ComAmazonawsWickrWickradminapiState {
     pub users: BTreeMap<String, BTreeMap<String, UserRecord>>,
     /// Security groups by `networkId`, then by group id.
     pub security_groups: BTreeMap<String, BTreeMap<String, SecurityGroupRecord>>,
+    /// Network-level settings by `networkId`, for the networks something has been
+    /// set on. A network with no entry here has every setting at the default a new
+    /// network carries, which is why reporting its settings never has to create an
+    /// entry.
+    pub network_settings: BTreeMap<String, NetworkSettingsRecord>,
     /// `userId` by `networkId` then by `username`, so checking that a username is
     /// free is a lookup on borrowed keys rather than a scan of the network's users.
     /// Maintained only by [`Self::insert_user`] and [`Self::remove_network`], which
@@ -188,6 +377,18 @@ impl ComAmazonawsWickrWickradminapiState {
         }
         self.minted_users = next;
         Some(next.to_string())
+    }
+
+    /// The network-level settings of `network_id` — what has been set on it, or
+    /// the defaults it was created with.
+    ///
+    /// Reporting only: an unconfigured network stores no settings record, and a
+    /// read does not create one.
+    pub fn settings_of(&self, network_id: &str) -> NetworkSettingsRecord {
+        self.network_settings
+            .get(network_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// The users of `network_id`, in `userId` order.
@@ -230,6 +431,7 @@ impl ComAmazonawsWickrWickradminapiState {
         self.networks.remove(network_id)?;
         let removed_users = self.users.remove(network_id).unwrap_or_default();
         self.security_groups.remove(network_id);
+        self.network_settings.remove(network_id);
         self.username_index.remove(network_id);
         Some(removed_users.len())
     }

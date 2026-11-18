@@ -21,8 +21,14 @@
 //!   plus its `nextToken` must walk every stored item exactly once.
 //! * A network, user, bot or security group "that doesn't exist or has been deleted"
 //!   answers `ResourceNotFoundError` (HTTP 404).
+//! * `UpdateNetworkSettings` "can modify settings such as client metrics, data
+//!   retention, and other network-wide options", and every `NetworkSettings` member
+//!   is optional, so a member the request leaves out keeps its stored value;
+//!   `GetNetworkSettings` "retrieves all network-level settings" as
+//!   `Setting{optionName, value, type}`, with a boolean "represented as 'true' or
+//!   'false'" (`Setting$value` documentation).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -105,6 +111,50 @@ fn error_code(body: &Value) -> String {
 /// The items of a list response member, or an empty slice.
 fn items(body: &Value, member: &str) -> Vec<Value> {
     body[member].as_array().cloned().unwrap_or_default()
+}
+
+/// One row of the settings-merge table: what the case is called, the `settings`
+/// the request carries, and the settings it is expected to change, each as
+/// (`optionName`, `value`, `type`).
+type SettingsCase = (
+    &'static str,
+    Value,
+    Vec<(&'static str, &'static str, &'static str)>,
+);
+
+/// The `settings` of a network-settings response as `optionName -> (value, type)`.
+///
+/// Every member of `Setting` is `@required`, so a missing one fails the case; and
+/// an `optionName` reported twice would make the list ambiguous, so that fails too.
+fn settings_map(case: &str, body: &Value) -> BTreeMap<String, (String, String)> {
+    let mut reported = BTreeMap::new();
+    for setting in items(body, "settings") {
+        let member = |name: &str| {
+            setting[name]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: a setting with no {name} in {setting}")
+                })
+                .to_string()
+        };
+        let option_name = member("optionName");
+        let value = member("value");
+        let kind = member("type");
+        if kind == "boolean" {
+            assert!(
+                value == "true" || value == "false",
+                "case {case:?}: a boolean setting must report 'true' or 'false', \
+                 got {option_name}={value:?}"
+            );
+        }
+        assert!(
+            reported
+                .insert(option_name.clone(), (value, kind))
+                .is_none(),
+            "case {case:?}: {option_name} is reported twice in {body}"
+        );
+    }
+    reported
 }
 
 /// Whether `id` satisfies `NetworkId` (`^[0-9]{8}$`).
@@ -1109,6 +1159,304 @@ async fn caller_driven_work_is_bounded_by_the_server() {
             rest["nextToken"].as_str().is_none(),
             "case {case:?}: the last page must carry no nextToken, got {rest}"
         );
+    }
+}
+
+#[tokio::test]
+async fn network_settings_merge_member_by_member_and_read_back_as_stored() {
+    let router = emulator();
+    let network_id = create_network(&router, "settings-net", "PREMIUM").await;
+    let uri = format!("/networks/{network_id}/settings");
+
+    // What a network carries before anything is set on it: client metrics are on
+    // for a new network, and every other setting belongs to a feature nothing has
+    // configured yet, so the network has no value to report for it.
+    let mut expected: BTreeMap<String, (String, String)> =
+        [("enableClientMetrics", "true", "boolean")]
+            .into_iter()
+            .map(|(name, value, kind)| (name.to_string(), (value.to_string(), kind.to_string())))
+            .collect();
+
+    let (status, fresh) = call(&router, "GET", &uri, None).await;
+    assert_eq!(
+        status, 200,
+        "case \"a network nobody has configured\": expected 200, got {status} with {fresh}"
+    );
+    assert_eq!(
+        settings_map("a network nobody has configured", &fresh),
+        expected,
+        "case \"a network nobody has configured\": expected the defaults, got {fresh}"
+    );
+
+    // Reporting must not change what a later caller sees.
+    let (status, again) = call(&router, "GET", &uri, None).await;
+    assert_eq!(
+        status, 200,
+        "case \"read twice\": expected 200, got {status} with {again}"
+    );
+    assert_eq!(
+        settings_map("read twice", &again),
+        expected,
+        "case \"read twice\": a read must leave the settings as they were, got {again}"
+    );
+
+    // One row per shape a request can take: a boolean on, a boolean off, a nested
+    // enum, a nested structure with text, a nested structure naming one leaf only,
+    // a nested structure naming none, and no settings at all. Every row carries
+    // only the settings it is expected to CHANGE; everything already set must
+    // survive it. The three read-receipt modes are the values the model's `Status`
+    // enum declares (DISABLED, ENABLED, FORCE_ENABLED).
+    let cases: Vec<SettingsCase> = vec![
+        (
+            "client metrics off",
+            json!({ "enableClientMetrics": false }),
+            vec![("enableClientMetrics", "false", "boolean")],
+        ),
+        (
+            "data retention on, metrics untouched",
+            json!({ "dataRetention": true }),
+            vec![("dataRetention", "true", "boolean")],
+        ),
+        (
+            "a nested read-receipt mode",
+            json!({ "readReceiptConfig": { "status": "FORCE_ENABLED" } }),
+            vec![("readReceiptConfig.status", "FORCE_ENABLED", "string")],
+        ),
+        (
+            "trusted data format on",
+            json!({ "enableTrustedDataFormat": true }),
+            vec![("enableTrustedDataFormat", "true", "boolean")],
+        ),
+        (
+            "a consent popup with text",
+            json!({
+                "consentPopup": {
+                    "enabled": true,
+                    "header": "Terms of use",
+                    "content": "**Read this first**",
+                }
+            }),
+            vec![
+                ("consentPopup.enabled", "true", "boolean"),
+                ("consentPopup.header", "Terms of use", "string"),
+                ("consentPopup.content", "**Read this first**", "string"),
+                // The popup names no close-button label, and
+                // `ConsentPopupConfig$closeButtonLabel` "defaults to
+                // \"Acknowledge\" if not provided".
+                ("consentPopup.closeButtonLabel", "Acknowledge", "string"),
+            ],
+        ),
+        (
+            "only the popup's button label",
+            json!({ "consentPopup": { "enabled": true, "closeButtonLabel": "I agree" } }),
+            vec![("consentPopup.closeButtonLabel", "I agree", "string")],
+        ),
+        (
+            "a popup disabled with an empty header",
+            json!({ "consentPopup": { "enabled": false, "header": "" } }),
+            vec![
+                ("consentPopup.enabled", "false", "boolean"),
+                ("consentPopup.header", "", "string"),
+            ],
+        ),
+        (
+            "a read-receipt config naming no mode",
+            json!({ "readReceiptConfig": {} }),
+            vec![],
+        ),
+        (
+            "another read-receipt mode",
+            json!({ "readReceiptConfig": { "status": "ENABLED" } }),
+            vec![("readReceiptConfig.status", "ENABLED", "string")],
+        ),
+        (
+            "the third read-receipt mode",
+            json!({ "readReceiptConfig": { "status": "DISABLED" } }),
+            vec![("readReceiptConfig.status", "DISABLED", "string")],
+        ),
+        (
+            "client metrics on again",
+            json!({ "enableClientMetrics": true }),
+            vec![("enableClientMetrics", "true", "boolean")],
+        ),
+        ("no settings at all", json!({}), vec![]),
+    ];
+
+    for (case, settings, changed) in cases {
+        let (status, updated) =
+            call(&router, "PATCH", &uri, Some(json!({ "settings": settings }))).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {updated}"
+        );
+        for (name, value, kind) in changed {
+            expected.insert(name.to_string(), (value.to_string(), kind.to_string()));
+        }
+        assert_eq!(
+            settings_map(case, &updated),
+            expected,
+            "case {case:?}: the update must report the merged settings, got {updated}"
+        );
+
+        let (status, fetched) = call(&router, "GET", &uri, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 reading back, got {status} with {fetched}"
+        );
+        assert_eq!(
+            settings_map(case, &fetched),
+            expected,
+            "case {case:?}: the stored settings must read back as the update \
+             reported them, got {fetched}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_network_s_settings_are_invisible_to_another() {
+    let router = emulator();
+    let configured = create_network(&router, "configured-net", "STANDARD").await;
+    let untouched = create_network(&router, "untouched-net", "STANDARD").await;
+
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/networks/{configured}/settings"),
+        Some(json!({ "settings": { "dataRetention": true, "enableClientMetrics": true } })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "UpdateNetworkSettings: expected 200, got {status} with {body}"
+    );
+
+    for (case, network_id, data_retention) in [
+        ("the configured network", &configured, Some("true")),
+        ("the untouched network", &untouched, None),
+    ] {
+        let (status, body) = call(
+            &router,
+            "GET",
+            &format!("/networks/{network_id}/settings"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            settings_map(case, &body).get("dataRetention").cloned(),
+            data_retention.map(|value| (value.to_string(), "boolean".to_string())),
+            "case {case:?}: expected dataRetention {data_retention:?}, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_read_receipt_mode_outside_the_modelled_enum_is_refused_and_writes_nothing() {
+    let router = emulator();
+    let network_id = create_network(&router, "catalog-settings", "STANDARD").await;
+    let uri = format!("/networks/{network_id}/settings");
+
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &uri,
+        Some(json!({ "settings": { "readReceiptConfig": { "status": "ENABLED" } } })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"a modelled mode\": expected 200, got {status} with {body}"
+    );
+
+    // `Status` declares DISABLED, ENABLED and FORCE_ENABLED: anything else is not a
+    // mode this service can store.
+    for off_catalog in ["enabled", "FORCE_DISABLED", ""] {
+        let (status, body) = call(
+            &router,
+            "PATCH",
+            &uri,
+            Some(json!({ "settings": { "readReceiptConfig": { "status": off_catalog } } })),
+        )
+        .await;
+        assert_ne!(
+            status, 200,
+            "case {off_catalog:?}: a value outside Status must be refused, got \
+             {status} with {body}"
+        );
+        assert_ne!(
+            status, 501,
+            "case {off_catalog:?}: a bad value is a refusal, not an unimplemented \
+             operation, got {status} with {body}"
+        );
+    }
+
+    let (status, body) = call(&router, "GET", &uri, None).await;
+    assert_eq!(
+        status, 200,
+        "case \"after the refusals\": expected 200, got {status} with {body}"
+    );
+    assert_eq!(
+        settings_map("after the refusals", &body).get("readReceiptConfig.status"),
+        Some(&("ENABLED".to_string(), "string".to_string())),
+        "case \"after the refusals\": a refused request must not change the stored \
+         settings, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn settings_of_a_network_that_does_not_exist_are_not_found() {
+    let router = emulator();
+    let deleted = create_network(&router, "doomed-net", "STANDARD").await;
+    let (status, body) = call(
+        &router,
+        "PATCH",
+        &format!("/networks/{deleted}/settings"),
+        Some(json!({ "settings": { "dataRetention": true } })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "UpdateNetworkSettings: expected 200, got {status} with {body}"
+    );
+    let (status, body) = call(&router, "DELETE", &format!("/networks/{deleted}"), None).await;
+    assert_eq!(
+        status, 200,
+        "DeleteNetwork: expected 200, got {status} with {body}"
+    );
+
+    // A well-formed id nobody minted, and one whose network has been deleted.
+    for (case, network_id) in [
+        ("never minted", "99999999".to_string()),
+        ("deleted", deleted.clone()),
+    ] {
+        for (operation, method, body) in [
+            ("GetNetworkSettings", "GET", None),
+            (
+                "UpdateNetworkSettings",
+                "PATCH",
+                Some(json!({ "settings": { "dataRetention": true } })),
+            ),
+        ] {
+            let (status, answer) = call(
+                &router,
+                method,
+                &format!("/networks/{network_id}/settings"),
+                body,
+            )
+            .await;
+            assert_eq!(
+                status, 404,
+                "case {operation}/{case:?}: expected 404, got {status} with {answer}"
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ResourceNotFoundError",
+                "case {operation}/{case:?}: expected ResourceNotFoundError, got {answer}"
+            );
+        }
     }
 }
 
