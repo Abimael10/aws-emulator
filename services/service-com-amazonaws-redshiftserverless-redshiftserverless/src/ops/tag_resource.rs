@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the submitted tag set to the tags STORED for the resource
+//! `resourceArn` resolves to — a key the resource already carries takes the submitted
+//! value, a key it does not carry is added, and every other key is left alone — so a
+//! later `ListTagsForResource` reports the merged set. An ARN that names no resource of
+//! this account in this Region is refused with the modelled `ResourceNotFoundException`
+//! ([`crate::state::tagged_resource_not_found`]), and a call that would leave a resource
+//! holding more than [`crate::state::MAX_TAGS_PER_RESOURCE`] tags with
+//! `TooManyTagsException`; a refused call stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +143,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        let resource_arn = input.resource_arn;
+        // The write reaches the record the ARN resolves to, which is the record every
+        // later read projects from; an ARN of another account, Region or partition
+        // resolves to nothing here exactly as it does for a read.
+        let Some(stored) = state.tags_for_resource_arn_mut(&resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::tagged_resource_not_found(&resource_arn),
+                    resource_name: Some(resource_arn),
+                },
+            )
+            .into());
+        };
+
+        // Counted BEFORE anything is stored, so a call past the cap leaves the resource's
+        // tag set exactly as it was. Re-tagging keys the resource already carries grows
+        // the set by nothing, so it is never refused this way.
+        if crate::state::tag_count_after(stored, &input.tags) > crate::state::MAX_TAGS_PER_RESOURCE
+        {
+            return Err(TagResourceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(crate::state::TOO_MANY_TAGS.to_string()),
+                    resource_name: Some(resource_arn),
+                },
+            )
+            .into());
+        }
+
+        crate::state::upsert_tags(stored, input.tags);
+
+        Ok(TagResourceOutput {})
     }
 }

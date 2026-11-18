@@ -339,6 +339,55 @@ pub fn tagged_resource_not_found(arn: &str) -> String {
     format!("Resource {arn} not found.")
 }
 
+/// The most tags one resource of this service holds.
+///
+/// Published by the model rather than chosen here: `TagList`
+/// (`smithy_query(query="shape", shape="TagList")`) carries `@length(max: 200)`, and that
+/// is the shape both the tag set a call submits and the `tags` member
+/// `ListTagsForResource` reports a resource's whole set in target — so a resource holds at
+/// most this many tags, and a call that would leave it holding more is refused with the
+/// modelled `TooManyTagsException`.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// How this service states that a tagging call would leave a resource holding more tags
+/// than it may.
+///
+/// The sentence is entirely FIXED — it is the `TooManyTagsException` shape's own statement
+/// of the condition — because the resource the refusal is about travels in the modelled
+/// `TooManyTagsException$resourceName` member ("the name of the resource that exceeded the
+/// number of tags allowed for a resource") rather than inside the message, the same way
+/// [`NAMESPACE_HAS_NO_WORKGROUP`] names its resource nowhere in its own sentence.
+pub const TOO_MANY_TAGS: &str = "The request exceeded the number of tags allowed for a resource.";
+
+/// How many tags `stored` would hold once `submitted` is applied to it.
+///
+/// Only a key the resource does not already carry grows its set — a submitted key it
+/// already carries replaces that key's value in place — and a key one request repeats is
+/// counted once, because the submitted set is "the map of the key-value pairs used to tag
+/// the resource" (`TagResourceRequest$tags`) and a map holds one entry per key.
+pub fn tag_count_after(stored: &[Tag], submitted: &[Tag]) -> usize {
+    let added: std::collections::BTreeSet<&str> = submitted
+        .iter()
+        .map(|tag| tag.key.as_str())
+        .filter(|key| !stored.iter().any(|tag| tag.key == *key))
+        .collect();
+    stored.len() + added.len()
+}
+
+/// Apply `submitted` to `stored`: a key `stored` already carries takes the submitted
+/// value, keeping its place, and a key it does not carry is appended. Every other key is
+/// left exactly as it was, because a tagging call says nothing about the keys it does not
+/// carry. A key `submitted` repeats ends at the LAST value it gave that key, for the same
+/// map reading as [`tag_count_after`].
+pub fn upsert_tags(stored: &mut Vec<Tag>, submitted: Vec<Tag>) {
+    for tag in submitted {
+        match stored.iter().position(|held| held.key == tag.key) {
+            Some(position) => stored[position].value = tag.value,
+            None => stored.push(tag),
+        }
+    }
+}
+
 /// `arn:aws:redshift-serverless:<region>:<account>:namespace/<namespaceId>`.
 pub fn namespace_arn(region: &str, namespace_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("namespace/{namespace_id}"))
@@ -703,6 +752,31 @@ impl ComAmazonawsRedshiftserverlessRedshiftserverlessState {
                     .find(|record| record.snapshot.snapshot_arn.as_deref() == Some(arn))
                     .map(|record| record.tags.as_slice())
             })
+    }
+
+    /// The tags stored for the resource `arn` names, to WRITE: the same lookup
+    /// [`tags_for_resource_arn`](Self::tags_for_resource_arn) reads through, so a tagging
+    /// call reaches exactly the record a later read projects from and an ARN that resolves
+    /// to nothing is `None` for a write as well as for a read.
+    pub fn tags_for_resource_arn_mut(&mut self, arn: &str) -> Option<&mut Vec<Tag>> {
+        if let Some(record) = self
+            .namespaces
+            .values_mut()
+            .find(|record| record.namespace.namespace_arn.as_deref() == Some(arn))
+        {
+            return Some(&mut record.tags);
+        }
+        if let Some(record) = self
+            .workgroups
+            .values_mut()
+            .find(|record| record.workgroup.workgroup_arn.as_deref() == Some(arn))
+        {
+            return Some(&mut record.tags);
+        }
+        self.snapshots
+            .values_mut()
+            .find(|record| record.snapshot.snapshot_arn.as_deref() == Some(arn))
+            .map(|record| &mut record.tags)
     }
 
     /// The id of the usage limit already covering (`resource_arn`, `usage_type`,
