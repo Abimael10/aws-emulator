@@ -13,6 +13,12 @@
 //! modelled 409, because the name is what the endpoint's route and its ARN address it
 //! by. A request naming no version pins the version the runtime holds now.
 //!
+//! A served create also VENDS the endpoint's logs: an invocation is addressed to an
+//! endpoint, so the CloudWatch Logs group derived from the runtime's id and this
+//! endpoint's name exists from then on, with no retention and so with no expiry, and it
+//! belongs to the account rather than to the endpoint — see
+//! [`crate::state::runtime_logs`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -193,129 +199,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
 
-        // A replayed request carrying the same `clientToken` answers with the endpoint
-        // that token first produced, rather than adding a second one.
-        if let Some((agent_runtime_id, endpoint_name)) =
-            store.replayed_runtime_endpoint_result(Self::NAME, input.client_token.as_deref())
-        {
-            if let Some(runtime) = store.agent_runtimes.get(&agent_runtime_id) {
-                if let Some(endpoint) = runtime.endpoints.get(&endpoint_name) {
-                    return Ok(created_output(runtime, endpoint, now));
+        // Everything this request decides and writes happens under ONE guard, which
+        // lives only in this block: it is released before the cross-service call below,
+        // because a lock is not held across an await.
+        let output = {
+            let mut store = state.lock();
+
+            // A replayed request carrying the same `clientToken` answers with the
+            // endpoint that token first produced, rather than adding a second one.
+            if let Some((agent_runtime_id, endpoint_name)) =
+                store.replayed_runtime_endpoint_result(Self::NAME, input.client_token.as_deref())
+            {
+                if let Some(runtime) = store.agent_runtimes.get(&agent_runtime_id) {
+                    if let Some(endpoint) = runtime.endpoints.get(&endpoint_name) {
+                        return Ok(created_output(runtime, endpoint, now));
+                    }
                 }
             }
-        }
 
-        // The lookup that fails is the agent's — the runtime the endpoint would be
-        // put on, at the version it would pin — so the refusal names that agent.
-        let not_found = || {
-            CreateAgentRuntimeEndpointErrorModeled::ResourceNotFoundException(
-                crate::state::agent_not_found_for_endpoint(&input.agent_runtime_id),
-            )
-        };
-        let runtime = store
-            .agent_runtimes
-            .get(&input.agent_runtime_id)
-            .ok_or_else(not_found)?;
+            // The lookup that fails is the agent's — the runtime the endpoint would be
+            // put on, at the version it would pin — so the refusal names that agent.
+            let not_found = || {
+                CreateAgentRuntimeEndpointErrorModeled::ResourceNotFoundException(
+                    crate::state::agent_not_found_for_endpoint(&input.agent_runtime_id),
+                )
+            };
+            let runtime = store
+                .agent_runtimes
+                .get(&input.agent_runtime_id)
+                .ok_or_else(not_found)?;
 
-        // `agentRuntimeVersion` names the runtime version the endpoint serves
-        // invocations from, so it has to be one the runtime actually published: one it
-        // never published is as absent as an unknown runtime. Naming none pins the
-        // version the runtime holds now.
-        let version = runtime
-            .version_for(input.agent_runtime_version.as_deref())
-            .ok_or_else(not_found)?;
-        let target_version = version.version;
-        // The endpoint fronts that version, so it cannot be ready before the version it
-        // serves is: its own span runs from the version's settle instant when that is
-        // still ahead.
-        let version_settles_at = version.settles_at;
-        let agent_runtime_arn = runtime.agent_runtime_arn.clone();
+            // `agentRuntimeVersion` names the runtime version the endpoint serves
+            // invocations from, so it has to be one the runtime actually published: one
+            // it never published is as absent as an unknown runtime. Naming none pins
+            // the version the runtime holds now.
+            let version = runtime
+                .version_for(input.agent_runtime_version.as_deref())
+                .ok_or_else(not_found)?;
+            let target_version = version.version;
+            // The endpoint fronts that version, so it cannot be ready before the version
+            // it serves is: its own span runs from the version's settle instant when
+            // that is still ahead.
+            let version_settles_at = version.settles_at;
+            let agent_runtime_arn = runtime.agent_runtime_arn.clone();
 
-        // One endpoint per name on one runtime — the name is what the endpoint's route
-        // and its ARN address it by — so a repeated name is a conflict, not a second
-        // endpoint later reads cannot tell apart.
-        if runtime.endpoints.contains_key(&input.name) {
-            return Err(CreateAgentRuntimeEndpointErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(
-                        crate::state::AGENT_RUNTIME_ENDPOINT_NAME_TAKEN.to_string(),
-                    ),
-                },
-            )
-            .into());
-        }
-
-        // The endpoints one runtime holds are bounded, so a caller looping on create
-        // meets the modelled quota instead of this process's memory limit.
-        if runtime.endpoints.len() >= crate::state::MAX_ENDPOINTS_PER_AGENT_RUNTIME {
-            return Err(
-                CreateAgentRuntimeEndpointErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(crate::state::agent_runtime_endpoint_quota_met(
-                            &input.agent_runtime_id,
-                        )),
+            // One endpoint per name on one runtime — the name is what the endpoint's
+            // route and its ARN address it by — so a repeated name is a conflict, not a
+            // second endpoint later reads cannot tell apart.
+            if runtime.endpoints.contains_key(&input.name) {
+                return Err(CreateAgentRuntimeEndpointErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(
+                            crate::state::AGENT_RUNTIME_ENDPOINT_NAME_TAKEN.to_string(),
+                        ),
                     },
                 )
-                .into(),
-            );
-        }
+                .into());
+            }
 
-        let endpoint_id = store.mint_runtime_endpoint_id(&input.agent_runtime_id, &input.name, now);
-        let record = crate::state::AgentRuntimeEndpointRecord {
-            endpoint_id,
-            endpoint_arn: crate::state::runtime_endpoint_arn(
-                &region,
+            // The endpoints one runtime holds are bounded, so a caller looping on create
+            // meets the modelled quota instead of this process's memory limit.
+            if runtime.endpoints.len() >= crate::state::MAX_ENDPOINTS_PER_AGENT_RUNTIME {
+                return Err(
+                    CreateAgentRuntimeEndpointErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(crate::state::agent_runtime_endpoint_quota_met(
+                                &input.agent_runtime_id,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            let endpoint_id =
+                store.mint_runtime_endpoint_id(&input.agent_runtime_id, &input.name, now);
+            let record = crate::state::AgentRuntimeEndpointRecord {
+                endpoint_id,
+                endpoint_arn: crate::state::runtime_endpoint_arn(
+                    &region,
+                    &input.agent_runtime_id,
+                    &input.name,
+                ),
+                endpoint_name: input.name.clone(),
+                description: input.description,
+                target_version,
+                // Nothing is served behind the name until the endpoint finishes
+                // transitioning onto the version it pins.
+                live_version: None,
+                created_at: now,
+                last_updated_at: now,
+                // A new endpoint is created, not ready: the transition to READY is owed
+                // by the clock, not by this call. `AgentRuntimeEndpointStatus` declares
+                // the same members `AgentRuntimeStatus` does, so the two resources share
+                // these constants.
+                transient_status: crate::state::STATUS_CREATING.to_string(),
+                settled_status: crate::state::STATUS_READY.to_string(),
+                settles_at: version_settles_at.max(now)
+                    + crate::state::AGENT_RUNTIME_ENDPOINT_SETTLE_DELAY,
+                tags: crate::state::sorted_map(input.tags),
+                // Reported only for an endpoint whose create or update failed; one the
+                // clock drives to READY has no failure to report.
+                failure_reason: None,
+            };
+
+            // The runtime is taken MUTABLY only here, the one borrow this call writes
+            // through, so the record below cannot be reported as created without being
+            // stored.
+            let runtime = store
+                .agent_runtimes
+                .get_mut(&input.agent_runtime_id)
+                .ok_or_else(not_found)?;
+            let output = CreateAgentRuntimeEndpointOutput {
+                target_version: record.target_version_string(),
+                agent_runtime_endpoint_arn: record.endpoint_arn.clone(),
+                agent_runtime_arn,
+                agent_runtime_id: Some(input.agent_runtime_id.clone()),
+                endpoint_name: Some(record.endpoint_name.clone()),
+                status: record.status_at(now).to_string(),
+                created_at: crate::state::timestamp(record.created_at),
+            };
+            runtime.endpoints.insert(input.name.clone(), record);
+
+            store.remember_runtime_endpoint_client_token(
+                Self::NAME,
+                input.client_token,
                 &input.agent_runtime_id,
                 &input.name,
-            ),
-            endpoint_name: input.name.clone(),
-            description: input.description,
-            target_version,
-            // Nothing is served behind the name until the endpoint finishes
-            // transitioning onto the version it pins.
-            live_version: None,
-            created_at: now,
-            last_updated_at: now,
-            // A new endpoint is created, not ready: the transition to READY is owed by
-            // the clock, not by this call. `AgentRuntimeEndpointStatus` declares the
-            // same members `AgentRuntimeStatus` does, so the two resources share these
-            // constants.
-            transient_status: crate::state::STATUS_CREATING.to_string(),
-            settled_status: crate::state::STATUS_READY.to_string(),
-            settles_at: version_settles_at.max(now)
-                + crate::state::AGENT_RUNTIME_ENDPOINT_SETTLE_DELAY,
-            tags: crate::state::sorted_map(input.tags),
-            // Reported only for an endpoint whose create or update failed; one the
-            // clock drives to READY has no failure to report.
-            failure_reason: None,
+            );
+            output
         };
 
-        // The runtime is taken MUTABLY only here, the one borrow this call writes
-        // through, so the record below cannot be reported as created without being
-        // stored.
-        let runtime = store
-            .agent_runtimes
-            .get_mut(&input.agent_runtime_id)
-            .ok_or_else(not_found)?;
-        let output = CreateAgentRuntimeEndpointOutput {
-            target_version: record.target_version_string(),
-            agent_runtime_endpoint_arn: record.endpoint_arn.clone(),
-            agent_runtime_arn,
-            agent_runtime_id: Some(input.agent_runtime_id.clone()),
-            endpoint_name: Some(record.endpoint_name.clone()),
-            status: record.status_at(now).to_string(),
-            created_at: crate::state::timestamp(record.created_at),
-        };
-        runtime.endpoints.insert(input.name.clone(), record);
-
-        store.remember_runtime_endpoint_client_token(
-            Self::NAME,
-            input.client_token,
-            &input.agent_runtime_id,
-            &input.name,
-        );
+        // Every refusal this create can answer has been decided and the endpoint is
+        // stored, so what follows vends the logs of an endpoint that EXISTS. An
+        // invocation is addressed to an endpoint, so the group its logs land in — the one
+        // a client derives from the runtime's id and this endpoint's name — exists from
+        // this create onward, and it is the account's from then on: nothing in this
+        // service deletes it.
+        crate::state::vend_runtime_log_group(ctx, &region, &input.agent_runtime_id, &input.name)
+            .await;
 
         Ok(output)
     }

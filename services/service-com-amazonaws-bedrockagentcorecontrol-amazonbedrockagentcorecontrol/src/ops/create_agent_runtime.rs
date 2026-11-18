@@ -14,10 +14,10 @@
 //! account, or whose trust policy does not let this service assume it, is refused the
 //! same way.
 //!
-//! A served create also VENDS the runtime's logs: the CloudWatch Logs group derived from
-//! the `agentRuntimeId` it mints exists from then on, with no retention and so with no
-//! expiry, and it belongs to the account rather than to the runtime — see
-//! [`crate::state::runtime_logs`].
+//! A served create also VENDS the logs of the default endpoint it establishes: the
+//! CloudWatch Logs group derived from the `agentRuntimeId` it mints and that endpoint's
+//! name exists from then on, with no retention and so with no expiry, and it belongs to the
+//! account rather than to the runtime — see [`crate::state::runtime_logs`].
 //!
 //! ## Shape of an operation
 //!
@@ -357,11 +357,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every refusal this create can answer has been decided and the name, the id
         // and the record are all written, so what follows vends the logs of a runtime
-        // that EXISTS. A runtime's logs are this service's to vend, so the group they
-        // land in — the one a client derives from the `agentRuntimeId` this call
-        // answers with — exists from the create onward, and it is the account's from
-        // then on: nothing in this service deletes it.
-        crate::state::vend_runtime_log_group(ctx, &region, &output.agent_runtime_id).await;
+        // that EXISTS. A runtime's logs are this service's to vend, so the group the
+        // invocations of the DEFAULT endpoint this create establishes land in — the one
+        // a client derives from the `agentRuntimeId` this call answers with — exists
+        // from the create onward, and it is the account's from then on: nothing in this
+        // service deletes it. An endpoint the caller adds later vends its own group.
+        crate::state::vend_runtime_log_group(
+            ctx,
+            &region,
+            &output.agent_runtime_id,
+            crate::state::DEFAULT_RUNTIME_ENDPOINT,
+        )
+        .await;
 
         Ok(output)
     }
