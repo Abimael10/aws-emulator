@@ -720,9 +720,30 @@ pub(crate) fn xml_member_structures(
     document: &str,
     parent: &str,
 ) -> Vec<::serde_json::Map<String, Value>> {
+    xml_entry_structures(document, parent, MEMBER_ELEMENT)
+}
+
+/// The element name the query protocol gives a list entry that fixes none of its own: what
+/// [`xml_member_structures`] and [`xml_member_list`] read a list's entries under.
+const MEMBER_ELEMENT: &str = "member";
+
+/// The ENTRIES of one list member whose entries are structures carried under an element of
+/// the list's OWN naming: the scalar children of every `<entry>` element directly inside the
+/// first `<parent>`, in document order, one map per entry.
+///
+/// [`xml_member_structures`] is this read of a list whose entries are the protocol's default
+/// `<member>`; a list shape whose member fixes an `@xmlName` carries them under THAT name
+/// instead — Amazon RDS reports a DB instance's role associations as
+/// `<AssociatedRoles><DBInstanceRole><RoleArn/><FeatureName/>…` — so the entry element is a
+/// parameter here and the one walk serves both.
+pub(crate) fn xml_entry_structures(
+    document: &str,
+    parent: &str,
+    entry_element: &str,
+) -> Vec<::serde_json::Map<String, Value>> {
     use ::quick_xml::events::Event;
 
-    const MEMBER: &[u8] = b"member";
+    let entry_bytes = entry_element.as_bytes();
 
     let mut reader = ::quick_xml::Reader::from_str(document);
     reader.config_mut().trim_text(false);
@@ -744,7 +765,9 @@ pub(crate) fn xml_member_structures(
                     continue;
                 }
                 match depth {
-                    0 if name.as_bytes() == MEMBER => entry = Some(::serde_json::Map::new()),
+                    0 if name.as_bytes() == entry_bytes => {
+                        entry = Some(::serde_json::Map::new())
+                    }
                     1 if entry.is_some() => {
                         member = Some(name);
                         text.clear();
@@ -764,7 +787,9 @@ pub(crate) fn xml_member_structures(
                 let name = String::from_utf8_lossy(empty.local_name().as_ref()).into_owned();
                 match depth {
                     // An empty entry (`<member/>`) carries no member at all.
-                    0 if name.as_bytes() == MEMBER => entries.push(::serde_json::Map::new()),
+                    0 if name.as_bytes() == entry_bytes => {
+                        entries.push(::serde_json::Map::new())
+                    }
                     // An empty element (`<OutputValue/>`) is the empty value of that member.
                     1 => {
                         if let Some(held) = entry.as_mut() {
@@ -784,7 +809,7 @@ pub(crate) fn xml_member_structures(
                 }
                 depth -= 1;
                 if depth == 0 {
-                    if name.as_bytes() == MEMBER {
+                    if name.as_bytes() == entry_bytes {
                         if let Some(held) = entry.take() {
                             entries.push(held);
                         }

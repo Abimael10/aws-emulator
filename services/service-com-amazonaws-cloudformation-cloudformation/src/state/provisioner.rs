@@ -466,7 +466,8 @@ pub(super) use super::{
 use super::provisioning::{
     call_json_rpc, call_query, call_rest_json, call_rest_json_named, call_rest_xml,
     percent_encoded, xml_element, xml_elements,
-    xml_entry_map, xml_leaf, xml_member_structures, xml_scalar_children, Created, Readiness,
+    xml_entry_map, xml_entry_structures, xml_leaf, xml_member_structures, xml_scalar_children,
+    Created, Readiness,
     Refusal, Removal,
     AWS_JSON_1_0, AWS_JSON_1_1,
 };
@@ -2473,14 +2474,26 @@ impl Provisioner {
             // creation is finished once Amazon RDS reports it `available` — which is also
             // what the rest of a stack needs before it can use the database.
             Self::RdsDbInstance => {
-                Box::pin(db_instance_readiness(ctx, region, physical_resource_id)).await
+                Box::pin(db_instance_readiness(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    declared,
+                ))
+                .await
             }
             // `CreateDBCluster` answers the cluster `creating`, in which it serves no
             // connection and publishes no endpoint a client can reach, so the resource's
             // creation is finished once Amazon RDS reports it `available` — which is also
             // what a member DB instance of the same stack needs before it can join it.
             Self::RdsDbCluster => {
-                Box::pin(db_cluster_readiness(ctx, region, physical_resource_id)).await
+                Box::pin(db_cluster_readiness(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                    declared,
+                ))
+                .await
             }
             // "When you create a new cluster, the Amazon EKS API server endpoint is private
             // to your VPC" only once the control plane is up: a created cluster is reported
@@ -4895,6 +4908,13 @@ pub(super) mod elasticache_caches;
 /// The Amazon RDS DB CLUSTER arm: the cluster an `AWS::RDS::DBCluster` declares, created in
 /// the service that owns it so a member DB instance of that cluster resolves it.
 pub(super) mod rds_db_clusters;
+/// The IAM role associations an `AWS::RDS::DBInstance` or an `AWS::RDS::DBCluster` declares,
+/// which are calls of their own on the resource the type's own arms create.
+mod rds_role_associations;
+/// `AWS::RDS::DBInstance`'s half of the role-association record, beside the walk that takes
+/// it: the DB instance is the type whose create and modify carry no `AssociatedRoles` member
+/// at all.
+mod rds_db_instance_roles;
 pub(super) mod redshift_parameter_groups;
 /// The Amazon Redshift SNAPSHOT COPY GRANT arm: the grant an
 /// `AWS::Redshift::SnapshotCopyGrant` declares, created in the service that owns it so a

@@ -1152,6 +1152,11 @@ pub(crate) const DB_INSTANCE_RENAMED_PROPERTIES: &[(&str, &str)] = &[
 /// into a `CreateDBInstance` member, each for a reason of its own. Every other property
 /// the catalogue does not carry is refused rather than dropped ([`query_members`]).
 pub(crate) const DB_INSTANCE_PROPERTIES_NOT_SENT: &[&str] = &[
+    // The IAM role associations, which are no member of the create at all: Amazon RDS
+    // associates a role with a DB instance through `AddRoleToDBInstance`, and only once the
+    // instance is available, so the property is carried by the calls the readiness arm makes
+    // ([`super::super::rds_role_associations`]) rather than by this request.
+    "AssociatedRoles",
     // The identifier CloudFormation decides, which is this resource's physical id ("Ref
     // returns the DBInstanceIdentifier"): the arm sets the member from that id, so the
     // walk must not also push the declared spelling of it.
@@ -1939,6 +1944,9 @@ const MODIFY_DB_INSTANCE_MEMBERS: &[(&str, QueryMember)] = &[
 /// is not a member of `ModifyDBInstance` at all — where the instance was placed, what it was
 /// created from and the cluster it joined, none of which that call can change.
 const DB_INSTANCE_UPDATE_PROPERTIES_NOT_SENT: &[&str] = &[
+    // The role associations a CHANGED declaration asks for are made the same way the create's
+    // are, by the readiness arm, so the modification does not carry them either.
+    "AssociatedRoles",
     "DBInstanceIdentifier",
     "Tags",
     "AvailabilityZone",
@@ -1994,17 +2002,27 @@ pub(crate) const DB_INSTANCE_STATUSES_COMING_UP: &[&str] = &[
     "upgrading",
 ];
 
-/// Whether Amazon RDS reports the DB instance a stack created UP.
+/// Whether Amazon RDS reports the DB instance a stack created UP, and the role associations
+/// the declaration asks for MADE.
 ///
 /// `CreateDBInstance` answers the instance `creating`, in which it serves no connection, so
 /// the resource's creation is held open until that service reports it `available` — which is
 /// what makes a stack that declares a database and something that uses it complete only once
 /// the database is really there. A status no new instance comes out of, and an instance
 /// Amazon RDS no longer holds, is a failure, because nothing is going to bring it up.
+///
+/// An instance that IS available then takes the `AssociatedRoles` its declaration carries
+/// ([`super::super::rds_role_associations`], with this type's own calls in
+/// [`super::super::rds_db_instance_roles`]): the property is no member of the create, the
+/// association is a call of its own, and "to add a role to a DB instance, the status of the DB
+/// instance must be available" — so it is made here, and an association Amazon RDS refuses is
+/// the resource's own failure in that service's words rather than an instance the stack
+/// reports created without the role its template declared.
 pub(crate) async fn db_instance_readiness(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     physical_resource_id: &str,
+    declared: Option<&Value>,
 ) -> Result<Readiness, Refusal> {
     let Some(reported) = describe_db_instance(ctx, region, physical_resource_id).await? else {
         return Ok(Readiness::Failed(format!(
@@ -2016,6 +2034,17 @@ pub(crate) async fn db_instance_readiness(
         .and_then(scalar_text)
         .unwrap_or_default();
     if status == DB_INSTANCE_STATUS_AVAILABLE {
+        if let Some(reason) = super::super::rds_role_associations::associate_declared_roles(
+            ctx,
+            region,
+            physical_resource_id,
+            declared,
+            super::super::rds_db_instance_roles::DB_INSTANCE_ROLE_CALLS,
+        )
+        .await?
+        {
+            return Ok(Readiness::Failed(reason));
+        }
         return Ok(Readiness::Ready);
     }
     if DB_INSTANCE_STATUSES_COMING_UP.contains(&status.as_str()) {

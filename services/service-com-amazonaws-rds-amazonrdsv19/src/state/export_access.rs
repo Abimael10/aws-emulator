@@ -33,8 +33,10 @@ pub const EXPORT_OBJECT_WRITE_ACTION: &str = "s3:PutObject";
 /// What is wrong with the role an export was asked to run under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportRoleDefect {
-    /// IAM answered that this account holds NO role under the name the value carries. The
-    /// export's KMS grant is created FOR that role, so a principal that cannot be resolved
+    /// IAM answered that this account holds NO role under the value — it reported none under
+    /// that name, or the value is an IAM role ARN of ANOTHER account, whose roles this
+    /// emulator's IAM cannot resolve at all. The export's KMS grant is created FOR that role,
+    /// so a principal that cannot be resolved
     /// is a grant that cannot be created, and the request is refused as the key fault that
     /// failed grant carries ([`super::export_key_grant_not_created_message`], which records
     /// the answer) rather than as a statement about the role.
@@ -75,7 +77,15 @@ pub async fn export_role_defect<Eng: Send + Sync + 'static>(
     // the export's KMS grant cannot be created for, while a role it HOLDS that does not
     // trust the export principal is the role's own fault
     // ([`::service_common::iam_role::role_is_absent`] is stated for exactly this pair).
-    if ::service_common::iam_role::role_is_absent(ctx, region, role_arn).await {
+    if ::service_common::iam_role::role_is_absent(ctx, region, role_arn).await
+        // A value that is an IAM role ARN of ANOTHER account is the SAME condition: the only
+        // IAM this emulator can resolve a role in is this account's, and the export acts
+        // under the role the request names rather than under the caller, so no grant can be
+        // created for it here either. Answering it identically is also what keeps the KEY's
+        // own policy from deciding a request whose principal was never resolved at all.
+        || (super::is_iam_role_arn(role_arn)
+            && ::service_common::iam_role::role_name(role_arn).is_none())
+    {
         return Some(ExportRoleDefect::Absent);
     }
     if ::service_common::iam_role::held_role_is_unassumable(

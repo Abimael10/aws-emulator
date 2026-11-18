@@ -460,7 +460,7 @@ pub(super) fn handler_error_code(code: &str) -> &'static str {
 /// provider that names the resource in its own report of a refusal — a bucket whose name is
 /// already taken ([`s3_bucket::handler_message`]) — states it from here, so the event says
 /// WHICH resource the refusal was about.
-pub(super) fn handler_failure_reason(owner: Option<Owner>, refusal: &Refusal, identifier: &str) -> String {
+pub(in crate::state) fn handler_failure_reason(owner: Option<Owner>, refusal: &Refusal, identifier: &str) -> String {
     // A service that worded no message at all still named the error, and the code is then
     // all there is to report.
     let message = if refusal.message.is_empty() {

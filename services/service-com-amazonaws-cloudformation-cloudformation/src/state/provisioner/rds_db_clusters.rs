@@ -35,6 +35,24 @@ pub(crate) const RDS_DB_CLUSTER: &str = "AWS::RDS::DBCluster";
 /// awsQuery client branches on.
 pub(crate) const DB_CLUSTER_NOT_FOUND: &str = "DBClusterNotFoundFault";
 
+/// How a DB cluster's associations are made and read: `AddRoleToDBCluster` makes one, and
+/// `DescribeDBClusters` reports the ones in place under the element
+/// `DBCluster$AssociatedRoles`' own member fixes (`smithy_query(query="shape",
+/// shape="DBClusterRoles")`).
+///
+/// The cluster's CREATE carries the list too ([`CREATE_DB_CLUSTER_MEMBERS`]), so these calls
+/// add the associations a CHANGED declaration asks for — `ModifyDBCluster` takes no such
+/// member. The DB instance's record sits beside its own walk
+/// ([`super::rds_db_instance_roles::DB_INSTANCE_ROLE_CALLS`]).
+pub(crate) const DB_CLUSTER_ROLE_CALLS: super::rds_role_associations::RoleAssociationCalls =
+    super::rds_role_associations::RoleAssociationCalls {
+        identifier_member: "DBClusterIdentifier",
+        associate: "AddRoleToDBCluster",
+        describe: "DescribeDBClusters",
+        entry_element: "DBClusterRole",
+        not_found: DB_CLUSTER_NOT_FOUND,
+    };
+
 /// The `DBCluster$Status` a cluster SERVES in, and the ones a new cluster is still coming up
 /// out of (Amazon Aurora User Guide, "Viewing Amazon Aurora DB cluster status": `available`,
 /// `backing-up`, `creating`, `deleting`, `failing-over`, `maintenance`, `migrating`,
@@ -60,7 +78,13 @@ const DB_CLUSTER_STATUSES_COMING_UP: &[&str] =
 /// ([`super::application_services::databases_and_networks::query_members`]).
 pub(crate) const CREATE_DB_CLUSTER_MEMBERS: &[(&str, QueryMember)] = &[
     ("AllocatedStorage", QueryMember::Scalar),
-    ("AssociatedRoles", QueryMember::List("member")),
+    (
+        // The list's element is the `@xmlName` its member fixes
+        // (`smithy_query(query="shape", shape="DBClusterAssociatedRoles")`), which is the
+        // spelling the called operation reads its entries under.
+        "AssociatedRoles",
+        QueryMember::List("DBClusterAssociatedRole"),
+    ),
     ("AutoMinorVersionUpgrade", QueryMember::Scalar),
     ("AvailabilityZones", QueryMember::List("AvailabilityZone")),
     ("BacktrackWindow", QueryMember::Scalar),
@@ -255,16 +279,25 @@ pub(crate) fn push_master_user_secret_attribute(
     }
 }
 
-/// Whether Amazon RDS reports the DB cluster a stack created UP.
+/// Whether Amazon RDS reports the DB cluster a stack created UP, and the role associations a
+/// CHANGED declaration asks for MADE.
 ///
 /// `CreateDBCluster` answers the cluster `creating`, in which it serves no connection, so
 /// the resource's creation is held open until that service reports it `available`. A status
 /// no new cluster comes out of, and a cluster Amazon RDS no longer holds, is a failure,
 /// because nothing is going to bring it up.
+///
+/// A cluster that IS available then takes the `AssociatedRoles` its declaration carries that
+/// it is not already acting under ([`super::rds_role_associations`]): the create carries the
+/// list, so a cluster is created with the roles its first declaration asked for and nothing is
+/// added then — but `ModifyDBCluster` takes no such member, so an association a CHANGED
+/// declaration adds is made here rather than dropped, and one Amazon RDS refuses is the
+/// resource's own failure in that service's words.
 pub(crate) async fn db_cluster_readiness(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     physical_resource_id: &str,
+    declared: Option<&Value>,
 ) -> Result<Readiness, Refusal> {
     let Some(reported) = read_db_cluster(ctx, region, physical_resource_id).await? else {
         return Ok(Readiness::Failed(format!(
@@ -276,6 +309,17 @@ pub(crate) async fn db_cluster_readiness(
         .and_then(scalar_text)
         .unwrap_or_default();
     if status == DB_CLUSTER_STATUS_AVAILABLE {
+        if let Some(reason) = super::rds_role_associations::associate_declared_roles(
+            ctx,
+            region,
+            physical_resource_id,
+            declared,
+            DB_CLUSTER_ROLE_CALLS,
+        )
+        .await?
+        {
+            return Ok(Readiness::Failed(reason));
+        }
         return Ok(Readiness::Ready);
     }
     if DB_CLUSTER_STATUSES_COMING_UP.contains(&status.as_str()) {
@@ -390,6 +434,9 @@ const DB_CLUSTER_UPDATE_PROPERTIES_NOT_SENT: &[&str] = &[
     "SourceRegion",
     "StorageEncrypted",
     "UseLatestRestorableTime",
+    // The role associations, which `ModifyDBCluster` takes no member for: an association a
+    // changed declaration adds is made by the call that DOES associate one, where the
+    // readiness arm makes it ([`super::rds_role_associations`]).
     "AssociatedRoles",
 ];
 
