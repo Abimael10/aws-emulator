@@ -649,6 +649,23 @@ pub struct StackProvenance {
     /// which no re-resolution could produce — so nothing is withheld for one of those: a
     /// resource withheld there would be a resource nothing ever deploys.
     pub declarations_resolve_again: bool,
+    /// The resources of this deployment whose DECLARATION reads an attribute nothing publishes
+    /// yet ([`super::StoredStack::declarations_reading_unpublished_attributes`]).
+    ///
+    /// A declaration is resolved into the document the owning service is asked for BEFORE the
+    /// walk starts, and a read with nothing to resolve against leaves no member at all
+    /// ([`super::template::resolve_properties`] drops a value it cannot evaluate). The value is
+    /// not missing, though — it is the one a resource this same deployment creates goes on to
+    /// publish — so creating the reader in the pass that publishes it would ask its service for
+    /// a resource configured with less than the declaration states. Such a resource is
+    /// therefore WITHHELD exactly as one waiting on a dependency still coming up is
+    /// ([`awaits_a_dependency`]) and created by the pass that resolves the declarations again
+    /// ([`deferred::resume`]).
+    ///
+    /// EMPTY for a deployment that deploys RECORDS rather than declarations — a rollback, a
+    /// resumption, a revert — which has no declaration to resolve a second time, so nothing is
+    /// withheld for one of those.
+    pub reads_unpublished_attributes: BTreeSet<String>,
 }
 
 /// How a deployment puts back a resource whose change it could not carry through
@@ -2171,7 +2188,19 @@ pub async fn reconcile(
         // those waits release ([`deferred::resume`]) — which is the order CloudFormation
         // deploys a stack's resources in: "a resource that depends on another is scheduled only
         // once that one has finished".
-        if awaits_a_dependency(&resource.logical_id, &stack.dependencies, &unpublished) {
+        //
+        // The same hold covers a declaration whose read had nothing to resolve against when
+        // this deployment's documents were computed — an attribute a resource of this same
+        // deployment only publishes once its owning service has created it, which the resolved
+        // document therefore carries no member for at all
+        // ([`StackProvenance::reads_unpublished_attributes`]). Such a resource is withheld even
+        // where the resource it reads is up already, because what the walk holds for it is a
+        // document resolved before that value existed.
+        if awaits_a_dependency(&resource.logical_id, &stack.dependencies, &unpublished)
+            || stack
+                .reads_unpublished_attributes
+                .contains(&resource.logical_id)
+        {
             unpublished.insert(resource.logical_id.clone());
             // The record the stack already has, so a withheld resource keeps its identity and
             // what its owning service reported about it while it waits; the declaration it is

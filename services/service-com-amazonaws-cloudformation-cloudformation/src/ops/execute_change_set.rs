@@ -820,6 +820,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // after this deployment's own changes
                 // ([`crate::state::provisioning::StackProvenance::declarations_resolve_again`]).
                 declarations_resolve_again: true,
+                // ...and one whose read had nothing to resolve against at all is withheld
+                // until it has
+                // ([`crate::state::provisioning::StackProvenance::reads_unpublished_attributes`]).
+                reads_unpublished_attributes: stack
+                    .declarations_reading_unpublished_attributes(),
                 ..stack.provenance()
             };
 

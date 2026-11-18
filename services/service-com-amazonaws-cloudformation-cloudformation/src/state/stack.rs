@@ -982,38 +982,7 @@ impl StoredStack {
     /// members the declaration carries.
     pub fn declarations_to_validate(&self) -> Vec<StoredResource> {
         let mut records = self.current_resources();
-        let Some((declared, parameters)) = self.template_scope() else {
-            return records;
-        };
-        let (imports, stack_outputs) = match &self.pending_deployment {
-            Some(deployment) => (deployment.imports.clone(), deployment.stack_outputs.clone()),
-            None => (self.imports.clone(), super::stack_outputs::Values::new()),
-        };
-        let in_force: BTreeMap<String, StoredResource> = records
-            .iter()
-            .map(|resource| (resource.logical_id.clone(), resource.clone()))
-            .collect();
-        let parameter_types = ssm_parameters::parameter_types_in_force(&declared);
-        let mut budget = template::Budget::new();
-        let deferred = template::deferred_property_reads(
-            &declared,
-            &template::Scope {
-                stack: template::StackScope {
-                    region: &self.region,
-                    stack_name: &self.stack_name,
-                    stack_id: &self.stack_id,
-                    notification_arns: &self.notification_arns,
-                },
-                parameters: &parameters,
-                parameter_types: &parameter_types,
-                resources: &in_force,
-                mappings: &declared.mappings,
-                conditions: &declared.conditions,
-                imports: &imports,
-                stack_outputs: &stack_outputs,
-            },
-            &mut budget,
-        );
+        let deferred = self.deferred_property_reads();
         for record in records.iter_mut() {
             let Some(names) = deferred.get(&record.logical_id) else {
                 continue;
@@ -1031,6 +1000,60 @@ impl StoredStack {
             }
         }
         records
+    }
+
+    /// Which PROPERTIES of each declaration of the deployment in flight read an attribute
+    /// nothing publishes YET, keyed by logical id
+    /// ([`template::deferred_property_reads`] states the relation).
+    ///
+    /// Read against the records as they stand, so a read whose value has already landed is not
+    /// in the answer. Empty for a stack with no template to read declarations out of.
+    fn deferred_property_reads(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let records = self.current_resources();
+        let Some((declared, parameters)) = self.template_scope() else {
+            return BTreeMap::new();
+        };
+        let (imports, stack_outputs) = match &self.pending_deployment {
+            Some(deployment) => (deployment.imports.clone(), deployment.stack_outputs.clone()),
+            None => (self.imports.clone(), super::stack_outputs::Values::new()),
+        };
+        let in_force: BTreeMap<String, StoredResource> = records
+            .iter()
+            .map(|resource| (resource.logical_id.clone(), resource.clone()))
+            .collect();
+        let parameter_types = ssm_parameters::parameter_types_in_force(&declared);
+        let mut budget = template::Budget::new();
+        template::deferred_property_reads(
+            &declared,
+            &template::Scope {
+                stack: template::StackScope {
+                    region: &self.region,
+                    stack_name: &self.stack_name,
+                    stack_id: &self.stack_id,
+                    notification_arns: &self.notification_arns,
+                },
+                parameters: &parameters,
+                parameter_types: &parameter_types,
+                resources: &in_force,
+                mappings: &declared.mappings,
+                conditions: &declared.conditions,
+                imports: &imports,
+                stack_outputs: &stack_outputs,
+            },
+            &mut budget,
+        )
+    }
+
+    /// The resources of the deployment in flight whose DECLARATION reads an attribute nothing
+    /// publishes yet — the set the walk may not create in the pass that publishes it
+    /// ([`provisioning::StackProvenance::reads_unpublished_attributes`]).
+    ///
+    /// The same relation [`Self::declarations_to_validate`] reads, asked for the logical ids
+    /// rather than the property names: a declaration one of whose properties reads such an
+    /// attribute resolves to a document with no member for it at all, so the resource has to be
+    /// resolved again — against the value its dependency publishes — before it is created.
+    pub fn declarations_reading_unpublished_attributes(&self) -> BTreeSet<String> {
+        self.deferred_property_reads().into_keys().collect()
     }
 
     /// The stack's `Description`: the template's own `Description`, which is where
@@ -3228,6 +3251,11 @@ impl StoredStack {
             // says whether a resource can be created yet
             // ([`provisioning::StackProvenance::dependencies`]).
             dependencies: provisioning::dependencies_in_flight(self),
+            // A deployment that deploys RECORDS rather than declarations withholds nothing for
+            // an unresolved read either, for the reason `declarations_resolve_again` records;
+            // the operation deploying a template fills this in
+            // ([`Self::declarations_reading_unpublished_attributes`]).
+            reads_unpublished_attributes: BTreeSet::new(),
         }
     }
 

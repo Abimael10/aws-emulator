@@ -1092,6 +1092,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ([`crate::state::physical_name`]).
             let provenance = crate::state::provisioning::StackProvenance {
                 managed_names: store.managed_physical_names(&region),
+                // ...and which of those declarations reads an attribute nothing publishes yet,
+                // so the walk does not create one of them with the member that read left out
+                // ([`crate::state::provisioning::StackProvenance::reads_unpublished_attributes`]).
+                reads_unpublished_attributes: stack
+                    .declarations_reading_unpublished_attributes(),
                 ..stack.provenance()
             };
             store.stacks.push(stack);

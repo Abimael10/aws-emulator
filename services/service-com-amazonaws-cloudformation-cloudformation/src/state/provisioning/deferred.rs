@@ -333,7 +333,15 @@ fn resumption_of(
     }
     Some(Resumption {
         stack_id: stack.stack_id.clone(),
-        provenance: stack.provenance(),
+        provenance: super::StackProvenance {
+            // What is STILL unresolved after the re-resolution just above: a resource whose
+            // read has landed is created by this pass, and one whose dependency has not
+            // published it yet is withheld again rather than created without the member that
+            // reads it ([`super::StackProvenance::reads_unpublished_attributes`]).
+            reads_unpublished_attributes: stack
+                .declarations_reading_unpublished_attributes(),
+            ..stack.provenance()
+        },
         create,
         resumed,
         failed,
