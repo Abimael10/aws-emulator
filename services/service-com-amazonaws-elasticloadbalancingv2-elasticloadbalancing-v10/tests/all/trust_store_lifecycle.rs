@@ -23,9 +23,9 @@
 //!    `DuplicateTrustStoreName` and the trust store holding it is untouched;
 //! 4. a modification rotates the bundle: the stored certificate count becomes the new
 //!    bundle's, and the trust store's identity does not move;
-//! 5. a trust store is ASSOCIATED with the listeners that authenticate client certificates
-//!    against it, which is what `DescribeTrustStoreAssociations` reports (paginated) and
-//!    what makes a delete `TrustStoreInUse`;
+//! 5. a trust store is ASSOCIATED with the LOAD BALANCERS whose listeners authenticate
+//!    client certificates against it, which is what `DescribeTrustStoreAssociations`
+//!    reports (paginated) and what makes a delete `TrustStoreInUse`;
 //! 6. every call that addresses a trust store by an ARN this account holds none under is
 //!    `TrustStoreNotFound` naming that ARN, and a read by a name it holds none under names
 //!    the NAME;
@@ -795,8 +795,37 @@ async fn create_mtls_listener(
         .unwrap_or_else(|| panic!("no ListenerArn in {}", created.body))
 }
 
+/// Turn mutual authentication OFF on `listener`, which is how a caller takes an
+/// association off a load balancer without deleting the listener that made it.
+async fn turn_mutual_authentication_off(emulator: &Emulator, listener: &str) {
+    let mut form = action("ModifyListener");
+    form.push(p("ListenerArn", listener));
+    form.push(p("MutualAuthentication.Mode", "off"));
+    let modified = call(&emulator.router, &form).await;
+    assert_eq!(
+        modified.status, 200,
+        "case turn mutual authentication off on {listener}: expected 200, got {} body {}",
+        modified.status, modified.body
+    );
+}
+
+/// The sentence Elastic Load Balancing refuses a `DeleteTrustStore` of a trust store some
+/// resource is still associated with, as AWS words it: fixed text with the request's own
+/// `TrustStoreArn` quoted into it as the only variable part.
+///
+/// Written out here, beside the assertions, so the suite pins the wording independently of
+/// the handler that produces it.
+fn in_use_message(trust_store_arn: &str) -> String {
+    format!("Trust store with ARN '{trust_store_arn}' is currently associated")
+}
+
+/// The resource segment of an ARN: everything after the sixth colon-separated field.
+fn resource_segment(arn: &str) -> String {
+    arn.splitn(6, ':').nth(5).unwrap_or_default().to_string()
+}
+
 #[tokio::test]
-async fn the_associations_of_a_trust_store_are_the_listeners_that_authenticate_against_it() {
+async fn the_associations_of_a_trust_store_are_the_load_balancers_that_authenticate_against_it() {
     let emulator = emulator_with_bundles().await;
     emulator.stage("associated.pem", &ca_bundle(1)).await;
     let created = create_trust_store(
@@ -821,21 +850,57 @@ async fn the_associations_of_a_trust_store_are_the_listeners_that_authenticate_a
         none.body
     );
 
-    // The rule generalises over the NUMBER of associated resources, so listeners are added
-    // one at a time and every count is asserted.
-    let load_balancer = create_load_balancer(&emulator.router, "lb-mtls").await;
+    // The rule generalises over the number of associated LOAD BALANCERS and over how many
+    // mTLS listeners each one carries, so a load balancer is added at a time and the first
+    // of them carries TWO mTLS listeners — still ONE association, because the association
+    // is with the load balancer and not with each listener that configured it.
     let mut expected: Vec<String> = Vec::new();
-    for (index, port) in [40_001, 40_002, 40_003].into_iter().enumerate() {
-        expected.push(create_mtls_listener(&emulator, &load_balancer, &arn, port).await);
+    // (owning load balancer, listener) for every mTLS listener created, in creation order.
+    let mut listeners: Vec<(String, String)> = Vec::new();
+    for (index, name) in ["lb-mtls-a", "lb-mtls-b", "lb-mtls-c"]
+        .into_iter()
+        .enumerate()
+    {
+        let load_balancer = create_load_balancer(&emulator.router, name).await;
+        let ports: &[i32] = if index == 0 {
+            &[40_001, 40_002]
+        } else {
+            &[40_001]
+        };
+        for port in ports {
+            let listener = create_mtls_listener(&emulator, &load_balancer, &arn, *port).await;
+            listeners.push((load_balancer.clone(), listener));
+        }
+        expected.push(load_balancer);
         expected.sort();
-        let case = format!("{} associated listener(s)", index + 1);
+        let case = format!("{} associated load balancer(s)", index + 1);
         let reported = describe_associations(&emulator, &arn, &[]).await;
         assert_eq!(
             (reported.status, reported_associations(&reported)),
             (200, expected.clone()),
-            "case {case:?}: expected the associated listeners, got {}",
+            "case {case:?}: expected the associated load balancers, got {}",
             reported.body
         );
+        // The ARN reported names a LOAD BALANCER, so its resource segment is the load
+        // balancer's own and never a listener's.
+        for resource in reported_associations(&reported) {
+            let segment = resource_segment(&resource);
+            assert!(
+                segment.starts_with("loadbalancer/"),
+                "case {case:?}: expected a loadbalancer/... resource segment, got {segment:?}"
+            );
+        }
+        // And it is an ARN a read of the load balancer itself resolves.
+        for resource in reported_associations(&reported) {
+            let mut form = action("DescribeLoadBalancers");
+            form.push(p("LoadBalancerArns.member.1", &resource));
+            let described = call(&emulator.router, &form).await;
+            assert_eq!(
+                described.status, 200,
+                "case {case:?}: expected the reported ARN {resource} to resolve, got {} body {}",
+                described.status, described.body
+            );
+        }
 
         // Paging is the SAME sequence in any page size.
         for page_size in [1usize, 2, 4] {
@@ -880,6 +945,12 @@ async fn the_associations_of_a_trust_store_are_the_listeners_that_authenticate_a
             refused.status,
             refused.body
         );
+        assert_eq!(
+            message(&refused),
+            in_use_message(&arn),
+            "case {case:?}: unexpected wording in {}",
+            refused.body
+        );
     }
 
     // A marker this collection did not issue names no position in it.
@@ -897,32 +968,63 @@ async fn the_associations_of_a_trust_store_are_the_listeners_that_authenticate_a
         );
     }
 
-    // Taking the listeners away takes the associations with them, and then the trust store
-    // is released.
-    for listener in &expected {
-        let mut form = action("DeleteListener");
-        form.push(p("ListenerArn", listener));
-        let deleted = call(&emulator.router, &form).await;
+    // Taking the mutual authentication off a listener, or deleting the listener, takes its
+    // load balancer's association away only once NO listener of that load balancer still
+    // authenticates against the trust store — and only then is the trust store released.
+    let mut remaining = listeners.clone();
+    while let Some((load_balancer, listener)) = remaining.pop() {
+        // Both ways a listener stops authenticating against the trust store are exercised.
+        if remaining.len().is_multiple_of(2) {
+            turn_mutual_authentication_off(&emulator, &listener).await;
+        } else {
+            // The other way a load balancer stops authenticating against the trust store:
+            // the listener that configured it goes away.
+            let mut form = action("DeleteListener");
+            form.push(p("ListenerArn", &listener));
+            let deleted = call(&emulator.router, &form).await;
+            assert_eq!(
+                deleted.status, 200,
+                "case delete listener {listener}: expected 200, got {} body {}",
+                deleted.status, deleted.body
+            );
+        }
+        let mut expected: Vec<String> = remaining.iter().map(|(lb, _)| lb.clone()).collect();
+        expected.sort();
+        expected.dedup();
+        let case = format!("{} mTLS listener(s) left", remaining.len());
+        let reported = describe_associations(&emulator, &arn, &[]).await;
         assert_eq!(
-            deleted.status, 200,
-            "case delete listener: expected 200, got {} body {}",
-            deleted.status, deleted.body
+            (reported.status, reported_associations(&reported)),
+            (200, expected.clone()),
+            "case {case:?}: after a listener of {load_balancer} stopped authenticating, \
+             expected {expected:?}, got {}",
+            reported.body
         );
+
+        // The trust store is released exactly when nothing is associated with it.
+        let deleted = delete_trust_store(&emulator, &arn).await;
+        if expected.is_empty() {
+            assert_eq!(
+                deleted.status, 200,
+                "case {case:?}: expected 200 from DeleteTrustStore, got {} body {}",
+                deleted.status, deleted.body
+            );
+        } else {
+            assert_eq!(
+                (deleted.status, deleted.error_code().as_str()),
+                (400, TRUST_STORE_IN_USE),
+                "case {case:?}: expected 400 {TRUST_STORE_IN_USE}, got {} body {}",
+                deleted.status,
+                deleted.body
+            );
+            assert_eq!(
+                message(&deleted),
+                in_use_message(&arn),
+                "case {case:?}: unexpected wording in {}",
+                deleted.body
+            );
+        }
     }
-    let emptied = describe_associations(&emulator, &arn, &[]).await;
-    assert_eq!(
-        reported_associations(&emptied),
-        Vec::<String>::new(),
-        "case {:?}: expected no association left, got {}",
-        "every associated listener deleted",
-        emptied.body
-    );
-    let deleted = delete_trust_store(&emulator, &arn).await;
-    assert_eq!(
-        deleted.status, 200,
-        "case {:?}: expected 200 from DeleteTrustStore, got {} body {}",
-        "the last association gone", deleted.status, deleted.body
-    );
 
     // Released: the ARN and the name resolve to nothing, and a repeat of the delete says
     // so rather than answering success twice.

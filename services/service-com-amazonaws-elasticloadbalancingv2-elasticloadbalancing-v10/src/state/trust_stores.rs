@@ -59,11 +59,15 @@ pub fn duplicate_trust_store_name_message(name: &str) -> String {
 /// The message a delete of a trust store some resource is still associated with is refused
 /// with, under the modelled `TrustStoreInUse`.
 ///
-/// Built from the request and the store: the trust store the caller named, and the rule it
-/// broke — what has to change before the delete can be served is the association, so the
-/// refusal says that an association exists.
+/// Built from the request: Elastic Load Balancing states the rule the caller broke as a
+/// fixed sentence about the trust store the request named — it IS currently associated, so
+/// what has to change before the delete can be served is that association — with that ARN
+/// as the sentence's only variable part. The model carries only the exception's summary
+/// ("The specified trust store is currently in use"), so the sentence is the service's own
+/// wording and is pinned by this crate's trust-store suite beside the refusal it belongs
+/// to.
 pub fn trust_store_in_use_message(arn: &str) -> String {
-    format!("Trust store '{arn}' is associated with one or more resources")
+    format!("Trust store with ARN '{arn}' is currently associated")
 }
 
 /// The message a `DeleteSharedTrustStoreAssociation` naming a resource of the trust
@@ -136,21 +140,30 @@ impl State {
     /// order).
     ///
     /// A trust store is associated with a resource by being the trust store that resource
-    /// authenticates client certificates against, which in this model is an HTTPS
-    /// LISTENER's mutual authentication configuration
-    /// (`MutualAuthenticationAttributes$TrustStoreArn`, set by `CreateListener` and
-    /// `ModifyListener`). So the associations are derived from the listeners this store
-    /// holds — a listener that moves off that trust store, and one that goes away with its
-    /// load balancer, is no longer associated with it — rather than from a list kept beside
-    /// them that nothing would retract.
+    /// authenticates client certificates against, which in this model is configured on an
+    /// HTTPS LISTENER (`MutualAuthenticationAttributes$TrustStoreArn`, set by
+    /// `CreateListener` and `ModifyListener`). So the associations are derived from the
+    /// listeners this store holds — a listener that moves off that trust store, and one
+    /// that goes away with its load balancer, is no longer associated with it — rather
+    /// than from a list kept beside them that nothing would retract.
+    ///
+    /// The resource REPORTED for such a listener is the LOAD BALANCER that owns it: the
+    /// association a client joins back to its infrastructure, and deletion-safety logic
+    /// filters on, is with the load balancer whose traffic the trust store authenticates,
+    /// so a listener contributes its `ListenerRecord::load_balancer_arn` and several
+    /// mTLS listeners of one load balancer are ONE association rather than several.
     pub fn trust_store_associations(&self, arn: &str) -> Vec<String> {
         let mut associated: Vec<String> = self
             .listeners
             .values()
             .filter(|listener| listener_authenticates_against(listener, arn))
-            .map(|listener| listener.arn.clone())
+            // Reported only where the load balancer is one this store really holds, so no
+            // association names an ARN a read of it would not resolve.
+            .filter(|listener| self.load_balancers.contains_key(&listener.load_balancer_arn))
+            .map(|listener| listener.load_balancer_arn.clone())
             .collect();
         associated.sort();
+        associated.dedup();
         associated
     }
 

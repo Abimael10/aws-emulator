@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTrustStoreAssociations
-//! Reports the resources associated with one trust store: the listeners of this account
-//! that authenticate client certificates against it, derived from the listeners
-//! `crate::state` holds and paginated with `Marker`/`PageSize`.
+//! Reports the resources associated with one trust store: the load balancers of this
+//! account whose listeners authenticate client certificates against it, derived from the
+//! listeners `crate::state` holds and paginated with `Marker`/`PageSize`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,10 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // "Describes all resources associated with the specified trust store" — derived
-        // from the listeners this store holds, which is where the association LIVES
-        // (`MutualAuthenticationAttributes$TrustStoreArn`), so a listener that moved off
-        // this trust store or went away is not reported as associated with it.
+        // "Describes all resources associated with the specified trust store" — the LOAD
+        // BALANCERS whose listeners authenticate client certificates against it, derived
+        // from the listeners this store holds, which is where the configuration LIVES
+        // (`MutualAuthenticationAttributes$TrustStoreArn`), so a load balancer whose
+        // listeners moved off this trust store or went away is not reported as associated
+        // with it.
         let associated = guard.trust_store_associations(&input.trust_store_arn);
         let (page, next_marker) = crate::state::paginate(
             associated,
