@@ -21,7 +21,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921 as ecr;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{at, call, emulator, given_layer, ok, refused, REGISTRY_ID};
+use crate::wire::{
+    at, call, cross_account_refusal_here, emulator, given_layer, ok, refused, REGISTRY_ID,
+};
 
 use ecr::state;
 
@@ -384,21 +386,28 @@ async fn an_unresolvable_request_is_refused_and_changes_nothing() {
                 "imageId": {"imageDigest": digest},
                 "targetStorageClass": ARCHIVE,
             }),
-            "InvalidParameterException",
-            format!(
-                "registryId '{another_registry}' is not this registry; the only registry \
-                 served here is '{REGISTRY_ID}'"
+            // Another account's registry shares nothing with this caller, so the call is an
+            // authorization failure naming the resource in THAT registry.
+            "AccessDeniedException",
+            cross_account_refusal_here(
+                "UpdateImageStorageClass",
+                another_registry,
+                Some(repository),
             ),
         ),
     ];
 
     for (row, request, code, message) in rows {
         let body = refused(&router, row, "UpdateImageStorageClass", &request, code).await;
+        // A MODELLED refusal carries its sentence under the lowercase member its shape
+        // declares; an AWS COMMON one under the capitalised `Message` of that envelope.
+        let carried = body["message"]
+            .as_str()
+            .or_else(|| body["Message"].as_str())
+            .unwrap_or_default();
         assert_eq!(
-            body["message"].as_str().unwrap_or_default(),
-            message,
-            "case {row:?}: expected the message {message:?}, got {:?}",
-            body["message"]
+            carried, message,
+            "case {row:?}: expected the message {message:?}, got {body:?}"
         );
     }
 

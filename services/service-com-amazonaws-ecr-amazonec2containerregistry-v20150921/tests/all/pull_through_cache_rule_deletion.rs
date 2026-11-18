@@ -408,14 +408,17 @@ async fn another_accounts_registry_is_refused() {
     .await;
 
     // `registryId` is modelled `^[0-9]{12}$`, so each of these is a well-formed account
-    // id that is simply not this registry's.
+    // id that is simply not this registry's — which makes the call an authorization
+    // failure about that account's registry, decided before anything is removed. The rule
+    // names no repository, so the resource the refusal names is the wildcard.
     for other in ["123456789012", "999999999999", "000000000001"] {
-        refused(
+        crate::wire::refused_cross_account(
             &router,
             other,
             "DeletePullThroughCacheRule",
             &json!({"ecrRepositoryPrefix": "own-cache", "registryId": other}),
-            "InvalidParameterException",
+            other,
+            None,
         )
         .await;
     }

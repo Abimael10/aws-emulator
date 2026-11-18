@@ -181,11 +181,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
-
         // A read scoped to named repositories reports exactly those, so it may not also
         // be paged: the combination is refused before anything is read.
         let wanted = input.repository_names.unwrap_or_default();
+
+        // `registryId` names the registry whose repositories this read reports, and a
+        // registry belongs to ONE account: naming another account's is an authorization
+        // question about that account's resources rather than a malformed parameter
+        // (`crate::state::authorization`).
+        //
+        // An authorization decision is taken per RESOURCE, and this read may name several:
+        // the whole call is refused as soon as one of them is refused, and the refusal names
+        // the resource it was refused on — the FIRST repository the request lists, which is
+        // the first one a decision is taken about. A read naming none is registry-scoped, so
+        // the decision is taken about the registry itself. Nothing about the other names is
+        // withheld by that: every name in the list is in the same foreign registry, so the
+        // decision on each is the same one, reported on the first.
+        crate::state::authorization::authorize_registry(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            input.registry_id.as_ref(),
+            wanted.first().map(String::as_str),
+        )?;
+
         crate::state::check_pagination_excluded(
             crate::state::REPOSITORY_NAMES_PARAMETER,
             !wanted.is_empty(),

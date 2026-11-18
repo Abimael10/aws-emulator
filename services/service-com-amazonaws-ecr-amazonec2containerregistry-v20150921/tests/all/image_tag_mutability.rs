@@ -408,7 +408,9 @@ async fn a_put_the_registry_cannot_honour_is_refused() {
                 "registryId": "123456789012",
                 "imageTagMutability": "IMMUTABLE",
             }),
-            "InvalidParameterException",
+            // Another account's registry shares nothing with this caller: an authorization
+            // outcome, not a bad parameter.
+            "AccessDeniedException",
         ),
         (
             // The boundary validator refuses a value outside `ImageTagMutability`'s enum

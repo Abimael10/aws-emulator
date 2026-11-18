@@ -722,7 +722,9 @@ async fn a_check_against_a_repository_this_registry_has_not_got_is_refused() {
                 "registryId": "123456789012",
                 "layerDigests": [digest],
             }),
-            "InvalidParameterException",
+            // Another account's registry shares nothing with this caller: an authorization
+            // outcome, not a bad parameter.
+            "AccessDeniedException",
         ),
     ];
 

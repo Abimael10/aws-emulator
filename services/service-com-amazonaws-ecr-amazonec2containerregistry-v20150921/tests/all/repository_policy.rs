@@ -515,8 +515,8 @@ async fn a_registry_other_than_this_one_is_refused_and_this_one_is_served() {
     )
     .await;
 
-    // A registry that is not this one is refused, whichever operation names it, and
-    // the stored policy is untouched by the refusal.
+    // A registry of another account shares nothing with this caller, whichever operation
+    // names it, and the stored policy is untouched by the refusal.
     for operation in POLICY_OPERATIONS {
         let case = format!("{operation} naming another registry");
         let mut body = if operation == "SetRepositoryPolicy" {
@@ -525,12 +525,13 @@ async fn a_registry_other_than_this_one_is_refused_and_this_one_is_served() {
             name_request(name)
         };
         body["registryId"] = json!(OTHER_REGISTRY_ID);
-        refused(
+        crate::wire::refused_cross_account(
             &router,
             &case,
             operation,
             &body,
-            "InvalidParameterException",
+            OTHER_REGISTRY_ID,
+            Some(name),
         )
         .await;
         let got = ok(&router, &case, "GetRepositoryPolicy", &name_request(name)).await;

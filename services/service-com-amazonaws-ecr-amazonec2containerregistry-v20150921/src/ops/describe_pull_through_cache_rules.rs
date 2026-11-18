@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DescribePullThroughCacheRulesErrorModeled::ServerException(
@@ -183,7 +183,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        crate::state::check_registry(input.registry_id.as_ref()).map_err(invalid_parameter)?;
+        // `registryId` names the registry whose rules this read reports, and a registry
+        // belongs to ONE account: naming another account's is an authorization question
+        // about that account's registry rather than a malformed parameter. This read names
+        // no repository, so the decision is taken about the registry itself
+        // (`crate::state::authorization`).
+        crate::state::authorization::authorize_registry(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            input.registry_id.as_ref(),
+            None,
+        )?;
 
         let store = state.lock();
 

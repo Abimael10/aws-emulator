@@ -614,7 +614,9 @@ async fn the_whole_call_fails_only_on_the_repository_or_the_registry() {
                 "repositoryName": "whole-call",
                 "imageIds": [{"imageTag": "v1"}]
             }),
-            "InvalidParameterException",
+            // Another account's registry shares nothing with this caller, so the whole call
+            // is an authorization failure rather than a bad parameter.
+            "AccessDeniedException",
         ),
     ];
 

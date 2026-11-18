@@ -3745,9 +3745,22 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// `arn:aws:ecr:<region>:<registry id>:repository/<name>`.
+/// `arn:aws:ecr:<region>:<registry id>:repository/<name>` for a repository of THIS
+/// account's registry — the ARN every repository of this registry reports.
 pub fn repository_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn("ecr", region, &format!("repository/{name}"))
+    repository_arn_in(region, registry_id(), name)
+}
+
+/// The ARN a repository of the registry `registry_id` owns carries:
+/// `arn:aws:ecr:<region>:<registry id>:repository/<name>`.
+///
+/// The ONE layout of an ECR repository ARN in this service, whichever account holds the
+/// registry: [`repository_arn`] is this account's case of it, and a foreign account's is
+/// what a call addressed to another account's registry is decided against
+/// ([`authorization::registry_refusal`]). Only [`repository_arn`] is reported, so no ARN
+/// this registry hands back can carry a foreign account.
+pub fn repository_arn_in(region: &str, registry_id: &str, name: &str) -> String {
+    format!("arn:aws:ecr:{region}:{registry_id}:repository/{name}")
 }
 
 /// How the store keys one repository: the Region of the registry holding it, then its
@@ -3772,18 +3785,6 @@ const LAYER_DOWNLOAD_TOKEN_BYTES: usize = 32;
 /// this emulator could read: a loopback literal, because this emulator is what serves the
 /// download.
 const LOOPBACK_HOST: &str = "127.0.0.1";
-
-/// Refuse a request that names a registry other than this emulator's: there is exactly
-/// one registry here, and a repository in another account's registry is not ours to serve.
-pub fn check_registry(registry_id_input: Option<&String>) -> Result<(), Fault> {
-    match registry_id_input {
-        Some(id) if id != registry_id() => Err(Fault::InvalidParameter(format!(
-            "registryId '{id}' is not this registry; the only registry served here is '{}'",
-            registry_id()
-        ))),
-        _ => Ok(()),
-    }
-}
 
 /// The policy-language versions an IAM JSON policy document may declare. The IAM JSON
 /// policy reference documents exactly two `Version` values: `2012-10-17`, the current
@@ -4157,8 +4158,9 @@ pub const REPOSITORY_RESOURCE_PREFIX: &str = "repository/";
 /// supported resource is an Amazon ECR repository" (`resourceArn`'s own documentation),
 /// so a usable value is an `arn:<partition>:ecr:<region>:<account>:repository/<name>`
 /// of THIS registry: anything else — a malformed ARN, another service, another resource
-/// type — is [`Fault::InvalidParameter`], and another account's registry is refused the
-/// way [`check_registry`] refuses it. Whether the named repository exists is the
+/// type, an account that is not this registry's — is [`Fault::InvalidParameter`], because
+/// ECR's tagging operations address a resource of the registry the call is made against
+/// and take no `registryId` to address another one by. Whether the named repository exists is the
 /// caller's lookup, so a well-formed ARN for an absent repository is reported as
 /// [`Fault::RepositoryNotFound`] by the store rather than as an invalid parameter.
 pub fn repository_name_from_arn(arn: &str) -> Result<String, Fault> {

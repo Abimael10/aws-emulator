@@ -321,8 +321,8 @@ async fn a_part_whose_range_does_not_describe_its_blob_is_refused() {
 /// A part is only accepted for an upload this registry issued for the repository the
 /// request names: an unknown repository is `RepositoryNotFoundException`, an upload id
 /// this registry never issued — or one issued for another repository — is
-/// `UploadNotFoundException`, and another account's registry is
-/// `InvalidParameterException`. None of them keeps a byte.
+/// `UploadNotFoundException`, and another account's registry is refused as unauthorized.
+/// None of them keeps a byte.
 #[tokio::test]
 async fn a_part_is_accepted_only_for_an_upload_of_the_named_repository() {
     let (router, engine) = emulator_with_engine();
@@ -379,7 +379,9 @@ async fn a_part_is_accepted_only_for_an_upload_of_the_named_repository() {
                 "layerPartBlob": blob(&bytes),
             }),
             400,
-            "InvalidParameterException",
+            // Another account's registry shares nothing with this caller: an authorization
+            // outcome, not a bad parameter.
+            "AccessDeniedException",
         ),
     ];
 

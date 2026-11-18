@@ -705,13 +705,14 @@ async fn a_lifecycle_policy_call_naming_an_unknown_repository_or_registry_is_ref
         .await;
     }
 
-    // Another account's registry is not this one's to serve, whichever operation asks.
+    // Another account's registry shares nothing with this caller, whichever operation asks:
+    // an authorization outcome naming the resource in THAT registry.
     for operation in [
         "PutLifecyclePolicy",
         "GetLifecyclePolicy",
         "DeleteLifecyclePolicy",
     ] {
-        refused(
+        crate::wire::refused_cross_account(
             &router,
             "another registry",
             operation,
@@ -720,7 +721,8 @@ async fn a_lifecycle_policy_call_naming_an_unknown_repository_or_registry_is_ref
                 "repositoryName": known,
                 "lifecyclePolicyText": text,
             }),
-            "InvalidParameterException",
+            "210987654321",
+            Some(known),
         )
         .await;
     }

@@ -185,9 +185,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // `registryId` names the registry holding the repository; this emulator serves
-        // exactly one registry — its own account's.
-        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+        // `registryId` names the registry holding the repository, and a registry belongs to
+        // ONE account: naming another account's is an authorization question about that
+        // account's resources rather than a malformed parameter
+        // (`crate::state::authorization`).
+        crate::state::authorization::authorize_registry(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            input.registry_id.as_ref(),
+            Some(input.repository_name.as_str()),
+        )?;
 
         // A value outside `ImageTagMutability`, and a filter list outside
         // `@length(1..5)` or the filter alphabet, were already refused at the boundary.

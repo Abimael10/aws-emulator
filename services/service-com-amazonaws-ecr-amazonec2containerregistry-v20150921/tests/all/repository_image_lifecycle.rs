@@ -1401,33 +1401,40 @@ async fn an_unknown_repository_is_refused_by_every_operation_that_names_one() {
     }
 }
 
-/// A request naming a registry other than this emulator's is refused: there is one
-/// registry here, and a repository in another account's registry is not this one's.
+/// A request naming the registry of an account other than this emulator's is refused as
+/// unauthorized: an Amazon ECR registry belongs to one account, and another account's shares
+/// its resources only through its own resource-based policy.
 #[tokio::test]
 async fn a_request_naming_another_registry_is_refused() {
     let router = emulator();
     given_repository(&router, "present", json!({})).await;
 
-    let cases: Vec<(&str, Value)> = vec![
+    // (operation, the request, the repository the refusal must name there)
+    let cases: Vec<(&str, Value, Option<&str>)> = vec![
         (
             "CreateRepository",
             json!({"repositoryName": "elsewhere", "registryId": "123456789012"}),
+            Some("elsewhere"),
         ),
         (
             "DescribeRepositories",
             json!({"registryId": "123456789012"}),
+            None,
         ),
         (
             "ListImages",
             json!({"repositoryName": "present", "registryId": "123456789012"}),
+            Some("present"),
         ),
         (
             "DescribeImages",
             json!({"repositoryName": "present", "registryId": "123456789012"}),
+            Some("present"),
         ),
         (
             "DeleteRepository",
             json!({"repositoryName": "present", "registryId": "123456789012"}),
+            Some("present"),
         ),
         (
             "PutImageScanningConfiguration",
@@ -1436,22 +1443,20 @@ async fn a_request_naming_another_registry_is_refused() {
                 "registryId": "123456789012",
                 "imageScanningConfiguration": {"scanOnPush": true},
             }),
+            Some("present"),
         ),
     ];
 
-    for (operation, request) in cases {
-        let answer = call(&router, operation, &request).await;
-        assert_eq!(
-            answer.status, 400,
-            "case {operation:?}: expected HTTP 400, got {} with {:?}",
-            answer.status, answer.body
-        );
-        assert_eq!(
-            answer.error_code(),
-            "InvalidParameterException",
-            "case {operation:?}: expected InvalidParameterException, got {:?}",
-            answer.body
-        );
+    for (operation, request, repository) in cases {
+        crate::wire::refused_cross_account(
+            &router,
+            operation,
+            operation,
+            &request,
+            "123456789012",
+            repository,
+        )
+        .await;
     }
 }
 

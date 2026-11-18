@@ -57,6 +57,19 @@
 //! decision never depends on whether that repository exists, which is what keeps a refused
 //! caller from learning what this registry holds.
 //!
+//! ## A call addressed to ANOTHER account's registry
+//!
+//! `registryId` is how a request names the registry it addresses, and an Amazon ECR registry
+//! belongs to ONE account: a call naming an account other than this one's reaches into a
+//! registry whose contents that account shares only through its own resource-based policy,
+//! which no identity-based policy written by the caller's account can substitute for. So that
+//! too is an authorization question — a well-formed account id is not a malformed parameter —
+//! and it is refused with the same common error, naming the action asked for and the resource
+//! in the registry that was ADDRESSED: the repository's ARN there, or the wildcard for a
+//! registry-scoped call that names no repository ([`registry_refusal`]). This emulator serves
+//! exactly one account, so no other account's registry is here to carry a policy that could
+//! allow such a call.
+//!
 //! ## The two callers the identity decision cannot refuse
 //!
 //! * **The account's own published credential.** A request whose access key id neither STS
@@ -88,6 +101,12 @@ use std::time::SystemTime;
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
 use ::service_common::iam_authorization::{self as iam, Decision};
+
+/// The decision about WHOSE registry a request addresses, in
+/// `state/authorization/registry_account.rs`: re-exported here, so a handler reaches it as
+/// `crate::state::authorization::…` like the rest of this gate.
+mod registry_account;
+pub use registry_account::*;
 
 /// This service's IAM action prefix: an action is `ecr:<OperationName>` ("Actions defined by
 /// Amazon Elastic Container Registry", IAM Service Authorization Reference), which is also

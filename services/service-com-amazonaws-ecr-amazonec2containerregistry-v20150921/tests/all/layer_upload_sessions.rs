@@ -172,8 +172,8 @@ async fn initiating_an_upload_mints_one_persisted_upload_per_call() {
 }
 
 /// An upload is opened in the registry the request names, which can only be this one:
-/// omitting `registryId` and naming this registry both work, and naming another
-/// registry is refused with the modelled `InvalidParameterException` and opens nothing.
+/// omitting `registryId` and naming this registry both work, and naming another account's
+/// registry is refused as unauthorized and opens nothing.
 #[tokio::test]
 async fn an_upload_is_opened_only_in_this_registry() {
     let (router, engine) = emulator_with_engine();
@@ -193,12 +193,12 @@ async fn an_upload_is_opened_only_in_this_registry() {
         (
             "another account's registry",
             json!({"repositoryName": "scoped", "registryId": "123456789012"}),
-            Some("InvalidParameterException"),
+            Some("AccessDeniedException"),
         ),
         (
             "another account's registry, repository unknown there too",
             json!({"repositoryName": "elsewhere", "registryId": "123456789012"}),
-            Some("InvalidParameterException"),
+            Some("AccessDeniedException"),
         ),
     ];
 

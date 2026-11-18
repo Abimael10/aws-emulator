@@ -190,7 +190,9 @@ async fn image_status_reads_resolve_the_repository_then_the_image() {
                 "imageId": {"imageTag": "v1"},
                 "registryId": OTHER_REGISTRY_ID,
             }),
-            "InvalidParameterException",
+            // Another account's registry shares nothing with this caller, so the read is
+            // refused as unauthorized before any name is resolved.
+            "AccessDeniedException",
         ),
     ];
 

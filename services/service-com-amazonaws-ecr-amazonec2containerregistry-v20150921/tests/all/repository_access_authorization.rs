@@ -28,6 +28,12 @@
 //! principal, an explicit `Deny`), where a grant LIVES (inline on the principal, in an
 //! attached managed policy) and which kind of principal signs (the account's own published
 //! credential, an access key id no store holds, an IAM user, an assumed-role session).
+//!
+//! The second rule, at the end of the file: a call whose `registryId` names an account other
+//! than the one this registry serves addresses ANOTHER account's registry, whose resources
+//! are shared only by that account's own resource-based policy — so such a call is an
+//! authorization failure too, refused with the same common error naming the action asked for
+//! and the resource in the registry addressed, rather than as a malformed parameter.
 
 use std::sync::Arc;
 
@@ -35,11 +41,10 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call, call_as, ok, ACCOUNT_ACCESS_KEY_ID, REGION, REGISTRY_ID};
-
-/// The status and the wire error code an authorization refusal carries: the AWS "Common
-/// Errors" table's `AccessDeniedException`, which this service's model does not declare.
-const ACCESS_DENIED: (u16, &str) = (400, "AccessDeniedException");
+use crate::wire::{
+    call, call_as, cross_account_refusal_here, ok, ACCESS_DENIED, ACCOUNT_ACCESS_KEY_ID,
+    COMMON_ERROR_DETAIL, REGION, REGISTRY_ID,
+};
 
 /// The repository every row of the tables addresses.
 const REPOSITORY: &str = "probe-repo";
@@ -989,4 +994,260 @@ async fn the_decision_does_not_depend_on_the_repository_existing() {
          reported to a caller nothing refuses, got {:?}",
         answer.body
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// A call addressed to ANOTHER account's registry
+// ---------------------------------------------------------------------------------------
+
+/// Account ids that are NOT this registry's, each inside the modelled `^[0-9]{12}$`
+/// (`smithy_query(query="operation",operation="DescribeRepositories")`: `registryId` pattern
+/// `^[0-9]{12}$`) — so every one of them is a WELL-FORMED account and what the request got
+/// wrong can only be whose registry it addressed.
+const FOREIGN_REGISTRY_IDS: [&str; 3] = ["111111111111", "123456789012", "000000000001"];
+
+/// Every call that addresses a registry by `registryId`, with a request the boundary validator
+/// passes and WITHOUT that member — each case adds the registry it addresses — and the
+/// repository the refusal must name in the registry addressed, or `None` for a call that names
+/// no repository at all.
+fn registry_addressed_calls() -> Vec<(&'static str, Value, Option<&'static str>)> {
+    let mut rows: Vec<(&'static str, Value, Option<&'static str>)> = image_operations()
+        .into_iter()
+        .map(|(operation, body)| (operation, body, Some(REPOSITORY)))
+        .collect();
+    rows.extend([
+        (
+            "CreateRepository",
+            json!({ "repositoryName": "made-elsewhere" }),
+            Some("made-elsewhere"),
+        ),
+        (
+            "DeleteRepository",
+            json!({ "repositoryName": REPOSITORY }),
+            Some(REPOSITORY),
+        ),
+        // A read naming several repositories is decided about the first one it names.
+        (
+            "DescribeRepositories",
+            json!({ "repositoryNames": [REPOSITORY, OTHER_REPOSITORY] }),
+            Some(REPOSITORY),
+        ),
+        // The same read naming NO repository is registry-scoped.
+        ("DescribeRepositories", json!({}), None),
+        (
+            "GetRepositoryPolicy",
+            json!({ "repositoryName": REPOSITORY }),
+            Some(REPOSITORY),
+        ),
+        (
+            "DeleteRepositoryPolicy",
+            json!({ "repositoryName": REPOSITORY }),
+            Some(REPOSITORY),
+        ),
+        (
+            "GetLifecyclePolicy",
+            json!({ "repositoryName": REPOSITORY }),
+            Some(REPOSITORY),
+        ),
+        (
+            "PutImageTagMutability",
+            json!({ "repositoryName": REPOSITORY, "imageTagMutability": "IMMUTABLE" }),
+            Some(REPOSITORY),
+        ),
+        // Registry-level resources: the rules a registry caches through name no repository.
+        ("DescribePullThroughCacheRules", json!({}), None),
+        (
+            "DeletePullThroughCacheRule",
+            json!({ "ecrRepositoryPrefix": "some-prefix" }),
+            None,
+        ),
+    ]);
+    rows
+}
+
+/// RULE: a call whose `registryId` names an account other than the one this registry serves
+/// addresses another account's registry, which shares its resources only through its own
+/// resource-based policy — so the call is an authorization failure, refused with the
+/// AWS-common `AccessDeniedException` naming the caller, the `ecr:<OperationName>` action and
+/// the resource in the registry ADDRESSED, and never a malformed-parameter refusal.
+///
+/// Asserted over a table spanning what the rule generalises over: the OPERATION (every one
+/// carrying `registryId`, read and write, repository-scoped and registry-scoped) and the
+/// foreign account id.
+#[tokio::test]
+async fn a_call_addressed_to_another_accounts_registry_is_refused_as_unauthorized() {
+    let emulator = seeded().await;
+    for registry_id in FOREIGN_REGISTRY_IDS {
+        for (operation, body, repository) in registry_addressed_calls() {
+            let case = format!("{operation} addressed to the registry {registry_id}");
+            let mut request = body;
+            request["registryId"] = json!(registry_id);
+            let answer = call(&emulator.router, operation, &request).await;
+            let (status, code) = ACCESS_DENIED;
+            assert_eq!(
+                (answer.status, answer.error_code()),
+                (status, code),
+                "case {case:?}: expected {status} {code}, got {} with {:?}",
+                answer.status,
+                answer.body
+            );
+            let expected = cross_account_refusal_here(operation, registry_id, repository);
+            let carried = answer.body[COMMON_ERROR_DETAIL].as_str().unwrap_or_default();
+            assert_eq!(
+                carried, expected,
+                "case {case:?}: expected the refusal {expected:?} under {COMMON_ERROR_DETAIL}, \
+                 got {:?}",
+                answer.body
+            );
+        }
+    }
+}
+
+/// RULE (the same one, on the two things the refusal's resource is built from): the resource
+/// named is the repository the REQUEST names in the registry it ADDRESSED, in the Region the
+/// call was signed for — so the decision never depends on what this registry holds, and a
+/// repository nobody created here is refused exactly like one that exists.
+#[tokio::test]
+async fn the_refused_resource_comes_from_the_request_and_not_from_this_registry() {
+    let emulator = seeded().await;
+    let registry_id = FOREIGN_REGISTRY_IDS[0];
+    // (case, the repository the request names)
+    let rows: [(&str, &str); 3] = [
+        ("a repository this registry holds", REPOSITORY),
+        ("another repository this registry holds", OTHER_REPOSITORY),
+        ("a repository nobody created here", "never-created"),
+    ];
+    for (case, repository) in rows {
+        let answer = call(
+            &emulator.router,
+            "GetRepositoryPolicy",
+            &json!({ "repositoryName": repository, "registryId": registry_id }),
+        )
+        .await;
+        let expected =
+            cross_account_refusal_here("GetRepositoryPolicy", registry_id, Some(repository));
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            ACCESS_DENIED,
+            "case {case:?}: expected the authorization refusal, got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+        assert_eq!(
+            answer.body[COMMON_ERROR_DETAIL].as_str().unwrap_or_default(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answer.body
+        );
+    }
+
+    // The Region the request is signed for is the Region of the registry it addresses, so it
+    // is the Region the refused resource carries.
+    for region in ["us-west-2", "ap-southeast-1"] {
+        let case = format!("a read signed for {region}");
+        let answer = crate::wire::call_in_region(
+            &emulator.router,
+            region,
+            "BatchGetImage",
+            &json!({
+                "repositoryName": REPOSITORY,
+                "imageIds": [{ "imageTag": TAG }],
+                "registryId": registry_id,
+            }),
+        )
+        .await;
+        let expected = crate::wire::cross_account_refusal(
+            region,
+            "BatchGetImage",
+            registry_id,
+            Some(REPOSITORY),
+        );
+        assert_eq!(
+            answer.body[COMMON_ERROR_DETAIL].as_str().unwrap_or_default(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answer.body
+        );
+    }
+}
+
+/// RULE (the wire form of the refusal): the authorization failure is one of the AWS COMMON
+/// errors, so its body carries the error code under `__type` and its sentence under the
+/// capitalised `Message` — not under the lowercase `message` this service's own modelled
+/// errors use, which is what a client reading only `message` would find empty.
+#[tokio::test]
+async fn the_cross_account_refusal_carries_its_sentence_under_the_common_error_member() {
+    let emulator = seeded().await;
+    let registry_id = FOREIGN_REGISTRY_IDS[1];
+    let denied = call(
+        &emulator.router,
+        "DescribeRepositories",
+        &json!({ "repositoryNames": [REPOSITORY], "registryId": registry_id }),
+    )
+    .await;
+    let expected =
+        cross_account_refusal_here("DescribeRepositories", registry_id, Some(REPOSITORY));
+    assert_eq!(
+        denied.body[COMMON_ERROR_DETAIL].as_str(),
+        Some(expected.as_str()),
+        "case \"the common error's body\": expected the sentence under \
+         {COMMON_ERROR_DETAIL}, got {:?}",
+        denied.body
+    );
+    assert!(
+        denied.body.get("message").is_none(),
+        "case \"the common error's body\": the lowercase member is this service's MODELLED \
+         errors', so a common error must not carry it, got {:?}",
+        denied.body
+    );
+
+    // A MODELLED refusal of the same operation still reports under the lowercase member, so
+    // the two classes stay distinguishable on the wire.
+    let modelled = call(
+        &emulator.router,
+        "DescribeRepositories",
+        &json!({ "repositoryNames": ["never-created"] }),
+    )
+    .await;
+    assert_eq!(
+        modelled.error_code(),
+        "RepositoryNotFoundException",
+        "case \"a modelled refusal\": expected the not-found error, got {:?}",
+        modelled.body
+    );
+    assert!(
+        modelled.body.get("message").is_some() && modelled.body.get("Message").is_none(),
+        "case \"a modelled refusal\": expected the lowercase member the model declares, got \
+         {:?}",
+        modelled.body
+    );
+}
+
+/// RULE (the other side of it): the registry a request may address is the one this account
+/// owns, so naming it explicitly is exactly as served as leaving it out — the refusal is about
+/// WHOSE registry was addressed and nothing else.
+#[tokio::test]
+async fn naming_this_accounts_own_registry_is_as_served_as_naming_none() {
+    let emulator = seeded().await;
+    // (case, the registryId the request carries)
+    let rows: [(&str, Option<&str>); 2] = [
+        ("no registryId: the default registry is assumed", None),
+        ("this account's own registry id", Some(REGISTRY_ID)),
+    ];
+    for (case, registry_id) in rows {
+        for (operation, body, _) in registry_addressed_calls() {
+            let case = format!("{operation} with {case}");
+            let mut request = body;
+            if let Some(registry_id) = registry_id {
+                request["registryId"] = json!(registry_id);
+            }
+            let answer = call(&emulator.router, operation, &request).await;
+            assert_ne!(
+                answer.error_code(),
+                ACCESS_DENIED.1,
+                "case {case:?}: expected the call to be authorized, got {:?}",
+                answer.body
+            );
+        }
+    }
 }

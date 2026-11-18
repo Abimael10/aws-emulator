@@ -208,9 +208,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `registryId` names the registry to create the repository in; this emulator
-        // serves exactly one registry — its own account's.
-        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+        // `registryId` names the registry to create the repository in, and a registry
+        // belongs to ONE account: naming another account's is an authorization question
+        // about that account's resources rather than a malformed parameter
+        // (`crate::state::authorization`).
+        crate::state::authorization::authorize_registry(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            input.registry_id.as_ref(),
+            Some(input.repository_name.as_str()),
+        )?;
 
         // "If this parameter is omitted, the default setting of MUTABLE will be used."
         // A value outside `ImageTagMutability` was already refused at the boundary.

@@ -173,14 +173,6 @@ impl From<CreatePullThroughCacheRuleErrorModeled> for CreatePullThroughCacheRule
     }
 }
 
-/// The rule this operation persists comes from [`crate::state`], so the shared failures
-/// those helpers raise are mapped onto this operation's own modelled error here.
-fn invalid_parameter(fault: crate::state::Fault) -> CreatePullThroughCacheRuleErrorModeled {
-    CreatePullThroughCacheRuleErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(fault.message().to_string()),
-    })
-}
-
 /// The `CreatePullThroughCacheRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -215,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreatePullThroughCacheRuleErrorModeled::ServerException(
@@ -226,9 +218,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `registryId` names the registry to create the rule for; this emulator serves
-        // exactly one registry — its own account's.
-        crate::state::check_registry(input.registry_id.as_ref()).map_err(invalid_parameter)?;
+        // `registryId` names the registry to create the rule for, and a registry belongs to
+        // ONE account: naming another account's is an authorization question about that
+        // account's registry rather than a malformed parameter. The call names no
+        // repository, so the decision is taken about the registry itself
+        // (`crate::state::authorization`).
+        crate::state::authorization::authorize_registry(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            input.registry_id.as_ref(),
+            None,
+        )?;
 
         // The upstream source: named by the request, or resolved from the URL syntax the
         // `upstreamRegistryUrl` member documents per registry. A URL that names none of

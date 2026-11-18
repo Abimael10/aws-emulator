@@ -370,7 +370,9 @@ async fn a_completion_the_registry_cannot_honour_is_refused() {
                 "uploadId": upload_id,
                 "layerDigests": [digest.clone()],
             }),
-            "InvalidParameterException",
+            // Another account's registry shares nothing with this caller: an authorization
+            // outcome, not a bad parameter.
+            "AccessDeniedException",
         ),
         (
             "an upload id this registry never issued",

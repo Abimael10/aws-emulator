@@ -681,8 +681,14 @@ async fn a_layer_the_repository_does_not_hold_has_no_download_url() {
                 "repositoryName": "mine",
                 "layerDigest": held,
             }),
-            "InvalidParameterException",
-            None,
+            // Another account's registry shares nothing with this caller: an authorization
+            // outcome, not a bad parameter.
+            "AccessDeniedException",
+            Some(crate::wire::cross_account_refusal_here(
+                "GetDownloadUrlForLayer",
+                "123456789012",
+                Some("mine"),
+            )),
         ),
     ];
 

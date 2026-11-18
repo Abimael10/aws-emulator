@@ -99,8 +99,16 @@ impl Answer {
     }
 
     /// The error message, or the empty string when the answer carries none.
+    ///
+    /// Read from whichever member the body carries it in: this service's MODELLED errors
+    /// report it under the lowercase `message` their shapes declare, while an AWS COMMON
+    /// error — the authorization refusal, rendered in front of the service's own code —
+    /// reports it under the capitalised `Message` of that envelope.
     pub fn message(&self) -> &str {
-        self.body["message"].as_str().unwrap_or_default()
+        self.body["message"]
+            .as_str()
+            .or_else(|| self.body["Message"].as_str())
+            .unwrap_or_default()
     }
 }
 
@@ -235,6 +243,81 @@ pub async fn ok_until(
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// The wire error code and HTTP status an authorization refusal carries: the AWS "Common
+/// Errors" table's `AccessDeniedException`, which this service's model does not declare.
+pub const ACCESS_DENIED: (u16, &str) = (400, "AccessDeniedException");
+
+/// The member an AWS COMMON error carries its sentence in: capitalised `Message`, the member
+/// of that envelope — unlike the lowercase `message` this service's own modelled errors
+/// declare.
+pub const COMMON_ERROR_DETAIL: &str = "Message";
+
+/// The principal every call made through [`call`] speaks for: the IAM user this emulator
+/// publishes a long-term key for, as `sts:GetCallerIdentity` reports it. Spelled out here
+/// rather than imported, so a refusal blaming any other principal fails these suites.
+pub const ACCOUNT_PRINCIPAL: &str = "arn:aws:iam::000000000000:user/emulator";
+
+/// The refusal a call addressed to the registry of ANOTHER account is answered with: an
+/// Amazon ECR registry belongs to one account, which shares its resources only through its
+/// own resource-based policy, so such a call is an authorization failure naming the caller,
+/// the action asked for and the resource in the registry ADDRESSED — the repository's ARN
+/// there, or the wildcard for a call that names no repository.
+pub fn cross_account_refusal(
+    region: &str,
+    operation: &str,
+    registry_id: &str,
+    repository_name: Option<&str>,
+) -> String {
+    let resource = repository_name.map_or_else(
+        || "*".to_string(),
+        |name| format!("arn:aws:ecr:{region}:{registry_id}:repository/{name}"),
+    );
+    format!(
+        "User: {ACCOUNT_PRINCIPAL} is not authorized to perform: ecr:{operation} on resource: \
+         {resource} because no resource-based policy allows the ecr:{operation} action"
+    )
+}
+
+/// [`cross_account_refusal`] for a call signed for the Region these suites sign for
+/// ([`REGION`]).
+pub fn cross_account_refusal_here(
+    operation: &str,
+    registry_id: &str,
+    repository_name: Option<&str>,
+) -> String {
+    cross_account_refusal(REGION, operation, registry_id, repository_name)
+}
+
+/// Assert `operation` was refused as unauthorized because it addressed the registry
+/// `registry_id`, which is not this account's: the status, the common error's code and the
+/// sentence it carries, as [`cross_account_refusal_here`] words it.
+pub async fn refused_cross_account(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+    registry_id: &str,
+    repository_name: Option<&str>,
+) {
+    let answer = call(router, operation, body).await;
+    let (status, code) = ACCESS_DENIED;
+    assert_eq!(
+        (answer.status, answer.error_code()),
+        (status, code),
+        "case {case:?}: expected {status} {code} from {operation}, got {} with {:?}",
+        answer.status,
+        answer.body
+    );
+    let expected = cross_account_refusal_here(operation, registry_id, repository_name);
+    assert_eq!(
+        answer.body[COMMON_ERROR_DETAIL].as_str().unwrap_or_default(),
+        expected,
+        "case {case:?}: expected the refusal {expected:?} under {COMMON_ERROR_DETAIL} from \
+         {operation}, got {:?}",
+        answer.body
+    );
 }
 
 /// The same poll as [`ok_until`], made against `region` and over the WHOLE answer — the

@@ -597,7 +597,9 @@ async fn a_scan_call_the_registry_cannot_resolve_is_refused() {
                 "registryId": "123456789012",
                 "imageId": {"imageDigest": scanned},
             }),
-            "InvalidParameterException",
+            // Another account's registry shares nothing with this caller: an authorization
+            // outcome, not a bad parameter.
+            "AccessDeniedException",
         ),
         (
             "a digest this repository holds no image for",

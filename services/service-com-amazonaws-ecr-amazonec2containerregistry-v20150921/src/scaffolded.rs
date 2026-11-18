@@ -177,15 +177,22 @@ impl SerializableStruct for ValidationException {
     }
 }
 
-/// The `message` member of the synthetic `AccessDeniedException` error shape.
+/// The member an `AccessDeniedException` carries its sentence in.
+///
+/// `Message`, capitalised, on every protocol: the AWS COMMON errors are rendered by the
+/// authorization layer in front of a service rather than from the service's own model, and
+/// that envelope names this member `Message` — which is also what the recorded ECR refusals
+/// carry, beside the lowercase `message` this service's MODELLED errors use. So the member
+/// name is the wire name here, not a `@jsonName` override: the awsJson protocols write a
+/// member under its Smithy name.
 static ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
-        "smithy.framework#AccessDeniedException$message",
+        "smithy.framework#AccessDeniedException$Message",
         "smithy.framework",
-        "message",
+        "Message",
     ),
     ShapeType::String,
-    "message",
+    "Message",
     0,
 )
 .with_xml_name("Message");

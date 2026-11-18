@@ -225,6 +225,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
 
+        // `registryId` names the registry this call addresses ("If you do not specify a
+        // registry, the default registry is assumed"), and a registry belongs to ONE
+        // account: naming another account's is an authorization question about that
+        // account's resources, decided ahead of this account's own documents
+        // (`crate::state::authorization`), which answers it with the audit record every
+        // refusal of that gate leaves.
+        crate::state::authorization::authorize_registry(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            input.registry_id.as_ref(),
+            Some(input.repository_name.as_str()),
+        )?;
+
         // A private registry's layers are private: whether any policy in force lets this
         // caller reach this repository is decided before a download URL is minted
         // (`crate::state::authorization`).
@@ -236,11 +250,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(denied);
         }
-
-        // "If you do not specify a registry, the default registry is assumed" — and the
-        // only registry served here is this emulator's own.
-        crate::state::check_registry(input.registry_id.as_ref())
-            .map_err(|fault| refusal("another registry", &caller_akid, fault_error(fault)))?;
 
         // The URL names the endpoint the CALLER reached this emulator on, because this
         // emulator is what serves the download; read off the request before the store is

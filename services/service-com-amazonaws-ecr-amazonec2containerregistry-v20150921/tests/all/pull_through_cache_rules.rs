@@ -613,18 +613,9 @@ async fn another_accounts_registry_is_refused_by_both_operations() {
             json!({"registryId": other}),
         ),
     ] {
-        let answer = call(&router, operation, &body).await;
-        assert_eq!(
-            answer.status, 400,
-            "case {case:?}: another account's registry is refused with HTTP 400, got {} \
-             with {:?}",
-            answer.status, answer.body
-        );
-        assert!(
-            answer.error_code().ends_with("InvalidParameterException"),
-            "case {case:?}: expected InvalidParameterException, got {:?}",
-            answer.error_code()
-        );
+        // Another account's registry shares nothing with this caller, and a rule names no
+        // repository, so the refusal names the wildcard resource.
+        crate::wire::refused_cross_account(&router, case, operation, &body, other, None).await;
     }
 
     // This registry's own id is accepted, and the refusals persisted nothing.

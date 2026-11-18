@@ -231,6 +231,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+        // `registryId` names the registry this call addresses, and a registry belongs to one
+        // account: naming another account's is an authorization question, decided ahead of
+        // this account's own documents (`crate::state::authorization`).
+        crate::state::authorization::authorize_registry(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            input.registry_id.as_ref(),
+            Some(input.repository_name.as_str()),
+        )?;
         // A private registry's images are private: whether any policy in force lets this
         // caller reach this repository is decided before anything is read
         // (`crate::state::authorization`).
@@ -242,8 +252,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(denied);
         }
-
-        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
         // `acceptedMediaTypes` tells the registry which manifest schemas the client
         // understands, and the registry serves each image in one of them: see

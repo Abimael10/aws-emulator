@@ -908,7 +908,9 @@ async fn a_preview_of_what_the_registry_cannot_evaluate_is_refused() {
                 "registryId": "210987654321",
                 "lifecyclePolicyText": valid,
             }),
-            "InvalidParameterException",
+            // Another account's registry shares nothing with this caller: an authorization
+            // outcome, not a bad parameter.
+            "AccessDeniedException",
         ),
         (
             "no policy named and none set on the repository",

@@ -138,13 +138,6 @@ impl From<ValidatePullThroughCacheRuleErrorModeled> for ValidatePullThroughCache
     }
 }
 
-/// Map a shared-state failure onto this operation's own modelled errors.
-fn fault_error(fault: crate::state::Fault) -> ValidatePullThroughCacheRuleErrorModeled {
-    ValidatePullThroughCacheRuleErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(fault.message().to_string()),
-    })
-}
-
 /// The `ValidatePullThroughCacheRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -189,9 +182,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
-
-        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+        // `registryId` names the registry holding the rule, and a registry belongs to ONE
+        // account: naming another account's is an authorization question about that
+        // account's registry rather than a malformed parameter. The call names no
+        // repository, so the decision is taken about the registry itself
+        // (`crate::state::authorization`).
+        crate::state::authorization::authorize_registry(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            input.registry_id.as_ref(),
+            None,
+        )?;
 
         let store = state.lock();
         // Validation is about an EXISTING rule, so a prefix no rule answers to is refused
