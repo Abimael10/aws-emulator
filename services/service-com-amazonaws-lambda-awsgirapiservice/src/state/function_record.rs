@@ -44,6 +44,22 @@ use super::{
     VERSION_LATEST_PUBLISHED,
 };
 
+/// The deployment a code update replaced, kept while that update is still being applied.
+///
+/// A code update opens a window — `LastUpdateStatus` is `InProgress` until the clock makes
+/// its completion due — and "During this time, you can't modify the function, but you can
+/// still invoke it": an invocation inside the window is served by the deployment that was
+/// already in place. So the package it runs is kept here, beside the revision it was
+/// deployed at, which is what says which execution environments may serve it
+/// ([`FunctionRecord::serving_code_of`], [`FunctionRecord::serving_revision_of`]).
+#[derive(Debug, Clone)]
+pub struct ServingDeployment {
+    /// The deployment package that keeps serving until the update completes.
+    pub code: CodeRecord,
+    /// The `RevisionId` the function was at when that package was deployed.
+    pub revision_id: String,
+}
+
 /// One Lambda function: its unpublished (`$LATEST`) configuration, its code, its
 /// lifecycle state, its tags and its published versions.
 #[derive(Debug, Clone)]
@@ -57,6 +73,19 @@ pub struct FunctionRecord {
     pub config: FunctionConfig,
     /// Where the code came from.
     pub code: CodeRecord,
+    /// The deployment that KEEPS SERVING invocations while a code update is still being
+    /// applied: "During this time, you can't modify the function, but you can still invoke
+    /// it" — and what those invocations run is the deployment the function was already
+    /// serving, because the new one is not in place until the update completes.
+    ///
+    /// [`Self::code`] is the package the function has been GIVEN, which every report of the
+    /// function (its `CodeSha256`, its `CodeSize`, its code location, and a version it
+    /// publishes) names from the instant the update is accepted. This holds the one it
+    /// replaced until the clock makes the update's completion due, when
+    /// [`FunctionRecord::materialize`] drops it and the two become one again; a function with
+    /// no code update in flight holds none at all. Read it through
+    /// [`Self::serving_code_of`].
+    pub serving_code: Option<ServingDeployment>,
     /// The model's `State` of the function.
     pub state: String,
     /// The model's `StateReason`, while there is one.
@@ -211,6 +240,13 @@ impl FunctionRecord {
             self.last_update_status = Some(LAST_UPDATE_STATUS_SUCCESSFUL.to_string());
             self.last_update_due = None;
         }
+        // A replaced deployment keeps serving only while an update is in flight, so it is
+        // dropped whenever the window is CLOSED rather than only where this reader closed it:
+        // the update just applied, and any other way the window ends, leave the package the
+        // function was given as the one that serves ([`Self::serving_code`]).
+        if self.last_update_due.is_none() {
+            self.serving_code = None;
+        }
         // The same rule for the asynchronous event queue: a queued event whose delivery
         // attempt the clock has already made due and which NO ATTEMPT IS PENDING for has had
         // no attempt at all, so it was never executed. The outcome would have been owed at
@@ -265,6 +301,28 @@ impl FunctionRecord {
     pub fn begin_update(&mut self, now: SystemTime) {
         self.last_update_status = Some(LAST_UPDATE_STATUS_IN_PROGRESS.to_string());
         self.last_update_due = Some(now + UPDATE_DELAY);
+    }
+
+    /// Store `code` as this function's deployment package, keeping the one it replaces
+    /// SERVING until the update that is starting completes.
+    ///
+    /// "During this time, you can't modify the function, but you can still invoke it": an
+    /// invocation that arrives inside the update window is served, and what it runs is the
+    /// package the function was already serving — the new one takes over when the clock makes
+    /// the update's completion due ([`Self::materialize`]). Every REPORT of the function
+    /// names the new package at once, which is why it is this field that moves and
+    /// [`Self::serving_code`] that remembers.
+    pub fn deploy_code(&mut self, code: CodeRecord) {
+        let replaced = ServingDeployment {
+            revision_id: self.config.revision_id.clone(),
+            code: ::std::mem::replace(&mut self.code, code),
+        };
+        // The window is exclusive — a second deployment inside it is refused with the
+        // modelled conflict — so the deployment that was serving when this one arrived is
+        // the one just replaced, unless one is already waiting to take over.
+        if self.serving_code.is_none() {
+            self.serving_code = Some(replaced);
+        }
     }
 
     /// Freeze `config` as this function's next published version, answering the number
@@ -1075,20 +1133,63 @@ impl FunctionRecord {
             .unwrap_or_else(|| qualifier.to_string())
     }
 
+    /// The deployment package an INVOCATION of `version` runs.
+    ///
+    /// It is the package of that version ([`Self::code_of`]) except inside a code update's
+    /// window on the unpublished version, where the previous deployment keeps serving:
+    /// "During this time, you can't modify the function, but you can still invoke it" (see
+    /// [`Self::serving_code`]). A published version froze its own package, so no update of
+    /// the unpublished version changes what one runs.
+    ///
+    /// Read it only after [`Self::materialize`], so an update the clock has already settled
+    /// is not still serving the package it replaced.
+    #[must_use]
+    pub fn serving_code_of(&self, version: &str) -> &CodeRecord {
+        match (self.published_code_of(version), &self.serving_code) {
+            (Some(published), _) => published,
+            (None, Some(serving)) => &serving.code,
+            (None, None) => &self.code,
+        }
+    }
+
+    /// The REVISION an invocation of `version` runs at, given the revision its resolved
+    /// configuration is at.
+    ///
+    /// It is that revision, except inside a code update's window on the unpublished version:
+    /// what serves there is the deployment the update replaced, so the invocation runs at the
+    /// revision THAT deployment was made at. The revision is what says which execution
+    /// environments may serve an invocation
+    /// ([`crate::state::execution::warm_pool::EnvironmentKey`]), so naming the new one for a
+    /// run of the old package would let an environment built from the old package serve
+    /// invocations once the new one has taken over.
+    #[must_use]
+    pub fn serving_revision_of(&self, version: &str, resolved_revision: &str) -> String {
+        match (self.published_code_of(version), &self.serving_code) {
+            (None, Some(serving)) => serving.revision_id.clone(),
+            _ => resolved_revision.to_string(),
+        }
+    }
+
     /// The deployment package of `version`: the one a published version froze, and the
     /// current one for the unpublished version. An alias reads the package of the version
     /// it invokes, because the package belongs to the version.
     #[must_use]
     pub fn code_of(&self, version: &str) -> &CodeRecord {
+        self.published_code_of(version).unwrap_or(&self.code)
+    }
+
+    /// The package a PUBLISHED version froze, or `None` when `version` resolves to the
+    /// unpublished one — whose package is the function's own current holding.
+    ///
+    /// One resolution, shared by [`Self::code_of`] and [`Self::serving_code_of`], so the two
+    /// cannot disagree about which qualifiers an in-flight update can change.
+    fn published_code_of(&self, version: &str) -> Option<&CodeRecord> {
         let resolved = self.resolved_version(version);
-        let published = resolved
+        resolved
             .filter(|resolved| resolved != VERSION_LATEST)
             .and_then(|resolved| resolved.parse::<u64>().ok())
-            .and_then(|number| self.versions.get(&number));
-        match published {
-            Some(published) => &published.code,
-            None => &self.code,
-        }
+            .and_then(|number| self.versions.get(&number))
+            .map(|published| &published.code)
     }
 
     /// The `FunctionCodeLocation` `GetFunction` reports for the package of `version`.

@@ -339,8 +339,9 @@ async fn a_pair_that_names_no_function_is_the_modelled_not_found() {
     // Each row names something the store does not hold, through a different name form, and
     // for each of the two invocation types — the refusal is about resolution, so it does
     // not depend on what the caller asked to be done once resolved. The expected message
-    // names the resource the invocation addressed: the function AT the version it would
-    // have run, which is `$LATEST` when the request names no qualifier. A name of ANOTHER
+    // names the resource the invocation addressed, spelled the way this service spells a
+    // function at a version: the unqualified ARN when the request named no qualifier, and
+    // the `:<qualifier>`-suffixed one when it named one. A name of ANOTHER
     // Region resolves no version at all — the Region is settled first — so its refusal
     // states the two Regions that disagree instead of naming a resolved ARN.
     let not_found = |arn: &str| format!("Function not found: {arn}");
@@ -350,7 +351,7 @@ async fn a_pair_that_names_no_function_is_the_modelled_not_found() {
             "stream-absent".to_string(),
             None,
             not_found(&format!(
-                "arn:aws:lambda:{REGION}:{ACCOUNT}:function:stream-absent:{LATEST}"
+                "arn:aws:lambda:{REGION}:{ACCOUNT}:function:stream-absent"
             )),
         ),
         (
@@ -358,7 +359,7 @@ async fn a_pair_that_names_no_function_is_the_modelled_not_found() {
             format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:stream-absent"),
             None,
             not_found(&format!(
-                "arn:aws:lambda:{REGION}:{ACCOUNT}:function:stream-absent:{LATEST}"
+                "arn:aws:lambda:{REGION}:{ACCOUNT}:function:stream-absent"
             )),
         ),
         (
@@ -366,7 +367,7 @@ async fn a_pair_that_names_no_function_is_the_modelled_not_found() {
             format!("{ACCOUNT}:function:stream-absent"),
             None,
             not_found(&format!(
-                "arn:aws:lambda:{REGION}:{ACCOUNT}:function:stream-absent:{LATEST}"
+                "arn:aws:lambda:{REGION}:{ACCOUNT}:function:stream-absent"
             )),
         ),
         (

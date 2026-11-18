@@ -603,7 +603,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The update itself: the stored package, the size and digest computed from it,
         // the architecture when the caller named one, and a fresh revision — "The latest
         // updated revision of the function or alias" changes with every change made.
-        record.code = code;
+        //
+        // The package the function SERVES does not change here: "During this time, you
+        // can't modify the function, but you can still invoke it", and an invocation that
+        // arrives inside the window runs the deployment that was already in place until the
+        // clock makes this update's completion due
+        // (`crate::state::FunctionRecord::deploy_code`). What this call reports — the size,
+        // the digest, the code location and a version it publishes — is the new package
+        // from this instant.
+        record.deploy_code(code);
         record.config.code_size = code_size;
         record.config.code_sha256 = code_sha256;
         if let Some(architectures) = input.architectures.clone() {

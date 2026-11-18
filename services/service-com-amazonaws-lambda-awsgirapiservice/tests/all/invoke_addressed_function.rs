@@ -5,25 +5,27 @@
 //!
 //! The rule under test: **the resource an INVOCATION addresses is a function AT a version —
 //! `Qualifier` "specif[ies] a version or alias to invoke a published version of the
-//! function", and an invocation naming none runs the unpublished version, which the answer
-//! reports as `$LATEST` — so the `ResourceNotFoundException` for a request that resolves to
-//! nothing names the ARN the invocation RESOLVED, qualifier included:
-//! `Function not found: arn:aws:lambda:<region>:<account>:function:<name>:<qualifier>`.** The
+//! function", and an invocation naming none runs the unpublished version — so the
+//! `ResourceNotFoundException` for a request that resolves to nothing names the ARN the
+//! invocation ADDRESSED, spelled the way this service spells a function at a version:
+//! `Function not found: arn:aws:lambda:<region>:<account>:function:<name>[:<qualifier>]`,
+//! with the qualifier carried only when the request named one.** The
 //! fixed text is `Function not found: `; the variable part is built from the request — the
 //! function the name addresses, the Region the name named when it carried one, and the
-//! qualifier it resolved, whether that qualifier was named in the name, in the `Qualifier`
-//! parameter, or by neither.
+//! qualifier it resolved, whether that qualifier was named in the name or in the `Qualifier`
+//! parameter; a request that named neither is answered about the unqualified identifier it
+//! sent.
 //!
 //! The rows differ along what the rule generalises over: the documented `FunctionName` form
 //! the request addresses the function by (the bare name, the full ARN, the partial ARN, the
 //! `function:` prefix form, a name carrying its own qualifier), where the qualifier is named
-//! (the name, the `Qualifier` parameter, nowhere), which qualifier it is (the unpublished
-//! version, a published version number, an alias name), what is missing (the function
+//! (the name, the `Qualifier` parameter, nowhere), which qualifier it is (none, a published
+//! version number, an alias name), what is missing (the function
 //! itself, a version of a function that does exist, a Region this endpoint does not serve),
 //! and the `InvocationType` the request carries — the resolution happens before any of the
 //! three is acted on, so each row is driven through all of them. Two controls keep the table
 //! honest: a request that resolves is NOT refused, and the refusal for a function that
-//! exists under a version that does not carries that version rather than `$LATEST`. A Region
+//! exists under a version that does not carries that version. A Region
 //! this endpoint does not serve is settled BEFORE a version is, so its refusal resolves no
 //! version to name and states the two Regions that disagree instead:
 //! `Functions from '<named region>' are not reachable in this region ('<endpoint region>')`.
@@ -225,10 +227,14 @@ struct NotFoundRow {
     reference: fn(&str) -> String,
     /// The `Qualifier` query parameter the request carries, if any.
     qualifier: Option<&'static str>,
-    /// The qualifier the invocation resolves, which the refused ARN must carry — absent
-    /// for a name no version is resolved for at all, which is an ARN of another Region:
-    /// that is refused on the Region, before a version is resolved.
+    /// The qualifier the refused ARN must carry — the one the request named, in the name or
+    /// in the `Qualifier` parameter — absent for a request that named none, which is
+    /// answered about the unqualified identifier it sent.
     resolved_qualifier: Option<&'static str>,
+    /// Whether the reference names a Region this endpoint does not serve, which is settled
+    /// BEFORE a version is: those rows resolve no resource to name and are refused on the
+    /// two Regions that disagree instead.
+    unreachable_region: bool,
     /// The Region the refusal must name: the one the reference itself named when it
     /// carried one, else this endpoint's.
     addressed_region: &'static str,
@@ -251,7 +257,8 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             case: "a function that does not exist, addressed by the bare name",
             reference: |_| ABSENT.to_string(),
             qualifier: None,
-            resolved_qualifier: Some(LATEST),
+            resolved_qualifier: None,
+            unreachable_region: false,
             addressed_region: REGION,
             function: ABSENT,
         },
@@ -259,7 +266,8 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             case: "a function arn that names no function",
             reference: |_| format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{ABSENT}"),
             qualifier: None,
-            resolved_qualifier: Some(LATEST),
+            resolved_qualifier: None,
+            unreachable_region: false,
             addressed_region: REGION,
             function: ABSENT,
         },
@@ -267,7 +275,8 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             case: "a partial arn that names no function",
             reference: |_| format!("{ACCOUNT}:function:{ABSENT}"),
             qualifier: None,
-            resolved_qualifier: Some(LATEST),
+            resolved_qualifier: None,
+            unreachable_region: false,
             addressed_region: REGION,
             function: ABSENT,
         },
@@ -275,7 +284,17 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             case: "the function: prefix form naming no function",
             reference: |_| format!("function:{ABSENT}"),
             qualifier: None,
-            resolved_qualifier: Some(LATEST),
+            resolved_qualifier: None,
+            unreachable_region: false,
+            addressed_region: REGION,
+            function: ABSENT,
+        },
+        NotFoundRow {
+            case: "a missing function whose name names the unpublished version",
+            reference: |_| format!("{ABSENT}:{LATEST}"),
+            qualifier: None,
+            resolved_qualifier: None,
+            unreachable_region: false,
             addressed_region: REGION,
             function: ABSENT,
         },
@@ -284,6 +303,7 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             reference: |_| ABSENT.to_string(),
             qualifier: Some("7"),
             resolved_qualifier: Some("7"),
+            unreachable_region: false,
             addressed_region: REGION,
             function: ABSENT,
         },
@@ -292,6 +312,7 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             reference: |_| format!("{ABSENT}:live"),
             qualifier: None,
             resolved_qualifier: Some("live"),
+            unreachable_region: false,
             addressed_region: REGION,
             function: ABSENT,
         },
@@ -300,6 +321,7 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             reference: |held| held.to_string(),
             qualifier: Some("9"),
             resolved_qualifier: Some("9"),
+            unreachable_region: false,
             addressed_region: REGION,
             function: HELD,
         },
@@ -308,6 +330,7 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             reference: |held| held.to_string(),
             qualifier: Some("absent-alias"),
             resolved_qualifier: Some("absent-alias"),
+            unreachable_region: false,
             addressed_region: REGION,
             function: HELD,
         },
@@ -316,6 +339,7 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             reference: |held| format!("{held}:9"),
             qualifier: None,
             resolved_qualifier: Some("9"),
+            unreachable_region: false,
             addressed_region: REGION,
             function: HELD,
         },
@@ -328,6 +352,7 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             reference: |held| format!("arn:aws:lambda:{OTHER_REGION}:{ACCOUNT}:function:{held}"),
             qualifier: None,
             resolved_qualifier: None,
+            unreachable_region: true,
             addressed_region: OTHER_REGION,
             function: HELD,
         },
@@ -338,14 +363,15 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             },
             qualifier: None,
             resolved_qualifier: None,
+            unreachable_region: true,
             addressed_region: OTHER_REGION,
             function: HELD,
         },
     ]
 }
 
-/// RULE: `Invoke`'s `ResourceNotFoundException` names the ARN the invocation resolved,
-/// qualifier included.
+/// RULE: `Invoke`'s `ResourceNotFoundException` names the ARN the invocation addressed,
+/// carrying a qualifier only when the request named one.
 #[tokio::test]
 async fn the_invoke_refusal_names_the_qualified_arn_the_invocation_resolved() {
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -356,17 +382,22 @@ async fn the_invoke_refusal_names_the_qualified_arn_the_invocation_resolved() {
         let case = row.case;
         let reference = (row.reference)(HELD);
         // A reference naming another Region is refused on the Region before any version is
-        // resolved, so there is no resolved ARN to name: those rows resolve no qualifier
-        // and are refused on the two Regions that disagree instead.
-        let expected = match row.resolved_qualifier {
-            Some(qualifier) => format!(
-                "Function not found: arn:aws:lambda:{}:{ACCOUNT}:function:{}:{qualifier}",
-                row.addressed_region, row.function
-            ),
-            None => format!(
+        // resolved, so there is no resource to name: those rows are refused on the two
+        // Regions that disagree instead.
+        let expected = if row.unreachable_region {
+            format!(
                 "Functions from '{}' are not reachable in this region ('{REGION}')",
                 row.addressed_region
-            ),
+            )
+        } else {
+            let arn = format!(
+                "arn:aws:lambda:{}:{ACCOUNT}:function:{}",
+                row.addressed_region, row.function
+            );
+            match row.resolved_qualifier {
+                Some(qualifier) => format!("Function not found: {arn}:{qualifier}"),
+                None => format!("Function not found: {arn}"),
+            }
         };
         // The resolution happens before the invocation type is acted on, so every type is
         // refused the same way — including the asynchronous one, which never queues an

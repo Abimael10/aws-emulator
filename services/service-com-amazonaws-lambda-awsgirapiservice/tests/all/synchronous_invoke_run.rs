@@ -557,15 +557,16 @@ async fn an_invocation_that_resolves_to_nothing_names_the_qualified_resource() {
     )
     .await;
     // The third column is the whole expected message: a pair that resolved an ARN is
-    // refused naming that ARN, and a name of another Region resolves none — the Region is
-    // settled first — so it is refused on the two Regions that disagree.
+    // refused naming that ARN — spelled the way this service spells a function at a
+    // version, so a request that named no qualifier is answered about the unqualified
+    // identifier it sent — and a name of another Region resolves none, the Region being
+    // settled first, so it is refused on the two Regions that disagree.
     let cases: &[(&str, &str, String)] = &[
         (
             "a function that does not exist",
             "absent-function",
             format!(
-                "Function not found: arn:aws:lambda:us-east-1:{ACCOUNT}:function:\
-                 absent-function:$LATEST"
+                "Function not found: arn:aws:lambda:us-east-1:{ACCOUNT}:function:absent-function"
             ),
         ),
         (

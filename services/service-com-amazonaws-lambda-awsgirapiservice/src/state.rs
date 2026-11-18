@@ -2522,7 +2522,7 @@ pub use execution_slot::{
 /// HOLDS the records ([`ComAmazonawsLambdaAwsgirapiserviceState::functions`]) stays here,
 /// as do the records one function carries and the ARN and message helpers it reads.
 pub mod function_record;
-pub use function_record::FunctionRecord;
+pub use function_record::{FunctionRecord, ServingDeployment};
 
 /// `CapacityProviderState` values this slice moves a capacity provider through, from
 /// the model's `CapacityProviderState` enum (`Pending | Active | Failed | Deleting`).
@@ -4272,6 +4272,12 @@ pub fn resolve_durable_execution<'a>(
 /// the resource they address is the same one: a refusal naming no single resolved ARN is
 /// what a client comparing it against the ARN it invoked cannot match.
 ///
+/// The ARN is spelled the way this service spells a function AT a version everywhere else
+/// ([`qualified_arn`]): the unqualified ARN for the unpublished version, and the
+/// `:<qualifier>`-suffixed one for a published version or an alias. So a request that named
+/// no qualifier is answered about the identifier it sent, with no qualifier appended that
+/// the caller never asked about.
+///
 /// `None` is a `FunctionName` this operation resolves NO version for, so there is no
 /// resolved ARN to name and the refusal is the resolution's own: a value that names no
 /// function at all (which the resolution refuses as malformed), and an ARN of another
@@ -4308,9 +4314,9 @@ pub fn addressed_arn_of(
         .as_deref()
         .or(qualifier)
         .unwrap_or(VERSION_LATEST);
-    Some(format!(
-        "{}:{addressed}",
-        function_arn(region, &reference.name)
+    Some(qualified_arn(
+        &function_arn(region, &reference.name),
+        addressed,
     ))
 }
 

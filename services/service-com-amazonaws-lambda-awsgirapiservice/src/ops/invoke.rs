@@ -715,7 +715,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     region: region.clone(),
                     runtime: resolved_config.runtime.clone(),
                     handler: resolved_config.handler.clone(),
-                    code_revision: resolved_config.revision_id.clone(),
+                    code_revision: record
+                        .serving_revision_of(&executed_version, &resolved_config.revision_id),
                     variables: resolved_config.environment.clone(),
                     memory_size: resolved_config.memory_size,
                     timeout: resolved_config.timeout,
@@ -724,7 +725,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .first()
                         .cloned()
                         .unwrap_or_default(),
-                    zip_bytes: record.code_of(&executed_version).zip_bytes.clone(),
+                    zip_bytes: record
+                        .serving_code_of(&executed_version)
+                        .zip_bytes
+                        .clone(),
                     layer_zips: crate::state::layer_archives(&resolved_config.layers),
                     payload: payload.clone(),
                     client_context: client_context.clone(),
@@ -837,8 +841,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // happens with no store guard held: one caller's handler cannot stall another
         // caller's request.
         // The package the run reads is the one of the version this invocation resolved to,
-        // so a weighted alias runs the code of the version it reports.
-        let zip_bytes = record.code_of(&executed_version).zip_bytes.clone();
+        // so a weighted alias runs the code of the version it reports — and, inside a code
+        // update's window, the deployment that is STILL SERVING rather than the one being
+        // applied (`crate::state::FunctionRecord::serving_code_of`).
+        let zip_bytes = record
+            .serving_code_of(&executed_version)
+            .zip_bytes
+            .clone();
+        // ... and the revision that deployment was made at, which is what says which
+        // execution environments may serve this invocation
+        // (`crate::state::FunctionRecord::serving_revision_of`).
+        let code_revision =
+            record.serving_revision_of(&executed_version, &resolved_config.revision_id);
         // The interfaces Lambda stood up for the function's `VpcConfig`, which ATTACH the run
         // to a VPC (`crate::state::vpc_interfaces`): copied out with the rest, because the run
         // happens with no store guard held.
@@ -881,7 +895,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region: region.clone(),
             runtime: resolved_config.runtime.clone(),
             handler: resolved_config.handler.clone(),
-            code_revision: resolved_config.revision_id.clone(),
+            code_revision,
             variables: resolved_config.environment.clone(),
             memory_size: resolved_config.memory_size,
             timeout: resolved_config.timeout,

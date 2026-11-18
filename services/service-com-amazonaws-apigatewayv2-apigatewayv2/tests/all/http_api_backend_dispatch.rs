@@ -370,14 +370,22 @@ async fn update_function_code(
     activate(engine);
 }
 
-/// Bring every function's activation forward: the transition is owed by the CLOCK, so
-/// nothing here sleeps on the emulator's behalf.
+/// Bring every function's activation forward, and settle any update still in flight: both
+/// transitions are owed by the CLOCK, so nothing here sleeps on the emulator's behalf.
+///
+/// An accepted `UpdateFunctionCode` opens the window `UpdateFunctionConfiguration` documents
+/// — "During this time, you can't modify the function, but you can still invoke it" — in which
+/// the package already in place keeps serving, so a caller that wants the uploaded handler to
+/// run has to be past it.
 fn activate(engine: &Arc<engine::InMemoryEngine>) {
     let state = engine.state::<ComAmazonawsLambdaAwsgirapiserviceState>();
     let mut store = state.lock();
     let past = SystemTime::now() - Duration::from_secs(1);
     for function in store.functions.values_mut() {
         function.active_due = past;
+        if function.last_update_due.is_some() {
+            function.last_update_due = Some(past);
+        }
     }
 }
 

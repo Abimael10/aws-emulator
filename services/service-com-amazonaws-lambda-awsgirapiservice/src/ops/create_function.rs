@@ -804,6 +804,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region,
             config,
             code,
+            // Nothing is being deployed to a function that is still being created, so the
+            // package it serves is the one it was created with.
+            serving_code: None,
             // "When you create a function, Lambda provisions an instance of the
             // function and its supporting resources. [...] During this time, you can't
             // invoke or modify the function." The move to `Active` is owed by the clock

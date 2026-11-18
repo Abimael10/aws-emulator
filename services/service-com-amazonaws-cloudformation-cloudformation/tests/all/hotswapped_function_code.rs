@@ -6,8 +6,9 @@
 //!
 //! The rule every row here holds the emulator to: **a data-plane write to a resource a stack
 //! provisioned is applied by the service that OWNS the resource and changes nothing about the
-//! stack that provisioned it — so the next read and the next run of the function see the
-//! package `UpdateFunctionCode` stored, while the stack keeps its status, its template, its
+//! stack that provisioned it — so the next read reports the package `UpdateFunctionCode`
+//! stored and the run that arrives once that upload has been applied executes it, while the
+//! stack keeps its status, its template, its
 //! resource records and its event timeline — and a later `UpdateStack` whose template states a
 //! different value for a property of that same resource applies it through the owning
 //! service's own update API and reaches `UPDATE_COMPLETE`, with the resource keeping its
@@ -178,6 +179,39 @@ async fn reported_digest(router: &MultiServiceRouter, case: &str, name: &str) ->
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// Poll `GetFunctionConfiguration` until the function reports no update still in flight.
+///
+/// "During this time, you can't modify the function, but you can still invoke it": an
+/// accepted `UpdateFunctionCode` opens a window, and the package it uploaded is the one that
+/// RUNS once that window closes. So this waits for the CONDITION — `LastUpdateStatus` is no
+/// longer `InProgress` — rather than for a span, with a deadline generous enough that a
+/// loaded host does not change the outcome.
+async fn wait_until_the_upload_is_applied(router: &MultiServiceRouter, case: &str, name: &str) {
+    /// How long to keep looking before calling it a failure.
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+    /// How often to look again.
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let giving_up = std::time::Instant::now() + DEADLINE;
+    loop {
+        let reported = reported_configuration(router, case, name).await;
+        let status = reported
+            .get("LastUpdateStatus")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if status != "InProgress" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < giving_up,
+            "case {case:?}: expected the upload to {name:?} to be applied, but \
+             LastUpdateStatus is still {status:?}"
+        );
+        tokio::time::sleep(INTERVAL).await;
+    }
 }
 
 /// Invoke `name` synchronously with [`event`], asserting only that the invocation was SERVED,
@@ -541,7 +575,10 @@ async fn a_hotswapped_package_runs_and_a_non_code_change_falls_back_to_a_stack_u
             "case {case:?}: expected the function to hold the uploaded package \
              ({reported_after_upload:?}), got {digest_after:?}"
         );
-        // ...and the NEXT invocation runs it.
+        // ...and the invocation that arrives once the upload has been APPLIED runs it: the
+        // accepted upload opens the window `UpdateFunctionConfiguration` documents, in which
+        // the function is still invocable and the package already in place keeps serving.
+        wait_until_the_upload_is_applied(&router, case, &function).await;
         let answered = invoked(&router, case, &function).await;
         let expected: Value = serde_json::from_str(row.hotswapped_answer)
             .expect("the row's hotswapped answer is JSON");

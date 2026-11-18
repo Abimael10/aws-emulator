@@ -399,7 +399,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 region: region.clone(),
                 runtime: resolved_config.runtime.clone(),
                 handler: resolved_config.handler.clone(),
-                code_revision: resolved_config.revision_id.clone(),
+                code_revision: record
+                    .serving_revision_of(&executed_version, &resolved_config.revision_id),
                 variables: resolved_config.environment.clone(),
                 memory_size: resolved_config.memory_size,
                 timeout: resolved_config.timeout,
@@ -408,7 +409,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .first()
                     .cloned()
                     .unwrap_or_default(),
-                zip_bytes: record.code_of(&executed_version).zip_bytes.clone(),
+                zip_bytes: record
+                    .serving_code_of(&executed_version)
+                    .zip_bytes
+                    .clone(),
                 layer_zips: crate::state::layer_archives(&resolved_config.layers),
                 payload: input.invoke_args.clone(),
                 // This operation carries neither member, so the run is given neither: a
