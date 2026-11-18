@@ -4540,10 +4540,11 @@ fn disposed_resources(
 /// next deployment that declares it creates it and reports it as created.
 ///
 /// The ONE place that question is answered for a stack's own records, so what a resource
-/// reports while the operation is under way ([`StoredStack::in_progress_status_of`]) and what
-/// it reports once the operation finished ([`installed_resources`]) cannot disagree, and
-/// neither can disagree with what the deployment walk really did.
-fn holds_the_resource(record: &DeployedResource) -> bool {
+/// reports while the operation is under way ([`StoredStack::in_progress_status_of`]), what it
+/// reports once the operation finished ([`installed_resources`]) and what a PLAN over the
+/// stack says about it ([`super::change_plan`]) cannot disagree, and none of them can
+/// disagree with what the deployment walk really did.
+pub(super) fn holds_the_resource(record: &DeployedResource) -> bool {
     record.status != resource_status::DELETE_COMPLETE
         && provisioning::already_deployed(&record.resource)
 }

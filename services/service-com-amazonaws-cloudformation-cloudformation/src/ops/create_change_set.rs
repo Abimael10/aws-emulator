@@ -1068,9 +1068,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(stated) => crate::state::stored_tags(stated),
             None => previous_tags.clone(),
         };
-        // What a change to the STACK's own tags adds to that plan: the stack's tags are the
-        // tags of the resources it manages, so a revision stating them differently changes
-        // every resource the stack holds under the `Tags` attribute
+        // What the stack's own tag set adds to that plan: the stack's tags are the tags of
+        // the resources it manages, so applying a set the stack's resources do not already
+        // carry changes every resource the stack holds under the `Tags` attribute — which a
+        // revision stating them differently asks for, and so does one restating the set in
+        // force on a stack whose last operation left the application of it outstanding
         // ([`crate::state::change_plan::tag_changes`]). An IMPORT change set adopts exactly
         // the resources it names and plans nothing else.
         if !imports_resources {
@@ -1079,6 +1081,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &previous_tags,
                 &tags,
                 &deployed,
+                &previous_status,
             );
         }
 

@@ -475,10 +475,20 @@ pub fn computed_changes(
     // What those resources CARRY where the template in force does not declare it: the
     // comparison's `before` side for each of them ([`carried_configurations`]).
     let carried = carried_configurations(&current);
+    // The physical resource a change acts on: the identifier of the resource the stack really
+    // HOLDS under that logical id ([`super::stack::holds_the_resource`]). A record of a
+    // resource whose create the owning service refused, or one an operation took away,
+    // describes no physical resource — nothing was ever made, or it is gone — so a change on
+    // that logical id reports none, and reports no action on one either
+    // ([`modification`], [`removal`]).
     let physical_id = |logical_id: &str| {
-        deployed
-            .get(logical_id)
-            .map(|resource| resource.physical_resource_id.clone())
+        current
+            .deployed
+            .iter()
+            .find(|deployed| deployed.resource.logical_id == logical_id)
+            .filter(|deployed| super::stack::holds_the_resource(deployed))
+            .map(|deployed| deployed.resource.physical_resource_id.clone())
+            .filter(|physical_resource_id| !physical_resource_id.is_empty())
     };
     // Both sides resolve against the resources the stack has DEPLOYED: a reference to
     // another resource therefore resolves to the same value on both sides, so what such a
@@ -1195,11 +1205,14 @@ fn addition(resource: &template::DeclaredResource) -> StoredResourceChange {
 /// "The action that will be taken on the physical resource when the change set is executed"
 /// is what the resource's own `DeletionPolicy` says ([`delete_action`]): the resource the
 /// change takes out of the stack is deleted, retained or snapshotted, and the change reports
-/// which.
+/// which — unless the stack holds no physical resource under that logical id at all
+/// ([`acts_on_a_physical_resource`]), where the change set's execution does nothing to a
+/// physical resource and so reports no action on one.
 fn removal(
     resource: &template::DeclaredResource,
     physical_resource_id: Option<String>,
 ) -> StoredResourceChange {
+    let acts = acts_on_a_physical_resource(&physical_resource_id);
     StoredResourceChange {
         action: change_action::REMOVE.to_string(),
         logical_resource_id: resource.logical_id.clone(),
@@ -1208,12 +1221,28 @@ fn removal(
         scope: Vec::new(),
         replacement: None,
         details: Vec::new(),
-        policy_action: Some(delete_action(resource).to_string()),
+        policy_action: acts.then(|| delete_action(resource).to_string()),
         resource_drift_status: None,
         nested_change_set_id: None,
         before_context: None,
         after_context: None,
     }
+}
+
+/// Whether a change ACTS on a physical resource: whether the stack holds one under the
+/// change's logical id ([`computed_changes`]).
+///
+/// `ResourceChange$PolicyAction` is "the action that will be taken on the physical resource
+/// when the change set is executed", so it is reported only where there IS one to act on. A
+/// logical id the stack holds no physical resource for — the create of that resource was
+/// refused, so nothing was ever made — has nothing for the execution to replace, delete,
+/// retain or snapshot: the resource is CREATED instead
+/// ([`super::provisioning::already_deployed`]), and a plan that announced an action on a
+/// physical resource would be announcing one on a resource that does not exist.
+fn acts_on_a_physical_resource(physical_resource_id: &Option<String>) -> bool {
+    physical_resource_id
+        .as_deref()
+        .is_some_and(|physical_resource_id| !physical_resource_id.is_empty())
 }
 
 /// The `Modify` of a resource both templates declare, with its scope, its replacement and
@@ -1224,6 +1253,7 @@ fn modification(
     details: Vec<StoredChangeDetail>,
 ) -> StoredResourceChange {
     let replaces = replacement_of(&details);
+    let acts = acts_on_a_physical_resource(&physical_resource_id);
     StoredResourceChange {
         action: change_action::MODIFY.to_string(),
         logical_resource_id: resource.logical_id.clone(),
@@ -1234,8 +1264,9 @@ fn modification(
         details,
         // Only a change that recreates the resource does anything to the physical resource
         // that is already there, and what it does is that resource's
-        // `UpdateReplacePolicy`.
-        policy_action: (replaces != replacement::FALSE)
+        // `UpdateReplacePolicy` — where there is one there at all
+        // ([`acts_on_a_physical_resource`]).
+        policy_action: (replaces != replacement::FALSE && acts)
             .then(|| replace_action(resource).to_string()),
         resource_drift_status: None,
         nested_change_set_id: None,
@@ -1356,38 +1387,58 @@ fn delete_action(resource: &template::DeclaredResource) -> &'static str {
 /// a change in the resource attribute's `Metadata`, `Properties`, or `Tags`".
 const TAGS_ATTRIBUTE: &str = "Tags";
 
-/// Add what a change to the stack's own TAG SET does to a plan: the stack's tags are the
-/// tags of the resources it manages — "key-value pairs to associate with this stack.
-/// CloudFormation also propagates these tags to resources in the stack" — so a revision that
-/// states them differently changes every resource the stack holds, under the `Tags` attribute
-/// rather than under `Properties`.
+/// Add what the stack's own TAG SET does to a plan: the stack's tags are the tags of the
+/// resources it manages — "key-value pairs to associate with this stack. CloudFormation also
+/// propagates these tags to resources in the stack" — so applying a tag set to the stack is
+/// applying it to every resource the stack holds, under the `Tags` attribute rather than
+/// under `Properties`.
 ///
-/// One `Modify` per resource the stack has DEPLOYED whose tags CloudFormation really holds
-/// and the plan does not already take away or bring into being: a resource the plan removes
-/// is gone (nothing re-tags it) and one it adds is created with the new set, so neither
-/// carries a tag change, while a resource the plan already reports a change for gains the
-/// `Tags` attribute beside the ones it carries — its `Scope` is read off its details, so the
-/// two can never disagree ([`scope_of`]).
+/// There is work to plan whenever the submitted revision would apply a set the stack's
+/// resources do not already carry, which is either of two cases:
 ///
-/// Which resources those are is which of them a service TAGS: CloudFormation propagates a
-/// stack's tags to the resources in it through each type's own tagging, so a resource of a
-/// type no service here holds — one this emulator leaves declared-only
-/// ([`super::provisioning::owner_for`]) — holds no tags for a tag change to change, and the
-/// execution of the change set would ask nobody anything about it.
+/// * the revision states the tags DIFFERENTLY from the ones in force, so the resources carry
+///   the old set; or
+/// * the stack's last operation FAILED and was left standing
+///   ([`super::status_preserved_a_failure`]), so that operation never finished applying the
+///   set in force and the application is still outstanding — the same reason such a stack's
+///   resources are compared against the configuration they CARRY rather than the one its
+///   template declares ([`carried_configurations`]), and the reason resubmitting the revision
+///   in force on it is a retry rather than a no-op. A revision with no tags at all has
+///   nothing to apply, so even there it plans nothing.
+///
+/// A stack whose last operation COMPLETED carries the set in force on every resource it
+/// holds, so a revision restating it plans nothing here.
+///
+/// One `Modify` per resource the stack HOLDS whose tags CloudFormation really keeps and the
+/// plan does not already take away or bring into being: a resource the plan removes is gone
+/// (nothing re-tags it) and one it adds is created with the new set, so neither carries a tag
+/// change, while a resource the plan already reports a change for gains the `Tags` attribute
+/// beside the ones it carries — its `Scope` is read off its details, so the two can never
+/// disagree ([`scope_of`]).
+///
+/// Which resources those are is which of them the stack holds a physical resource for
+/// ([`super::stack::holds_the_resource`]) and which of them a service TAGS: CloudFormation
+/// propagates a stack's tags to the resources in it through each type's own tagging, so a
+/// resource an operation took away or whose create the owning service refused is not there to
+/// be tagged, and a resource of a type no service here holds — one this emulator leaves
+/// declared-only ([`super::provisioning::owner_for`]) — holds no tags for a tag change to
+/// change, so the execution of the change set would ask nobody anything about either.
 ///
 /// Re-tagging never recreates a resource (`RequiresRecreation` `Never`), the two tag sets are
 /// both read so the change and its value are determined (`Static`), and it is the revision
 /// itself that states them, which is what `DirectModification` is.
 ///
-/// `in_force` is the stack's tag set and `submitted` the one the revision would put in force;
-/// a revision that states the same set changes nothing here ([`super::same_tags`]).
+/// `in_force` is the stack's tag set, `submitted` the one the revision would put in force and
+/// `status` the status the stack's last operation left it in.
 pub fn tag_changes(
     changes: &mut Vec<StoredResourceChange>,
     in_force: &[super::StoredTag],
     submitted: &[super::StoredTag],
     deployed: &[DeployedResource],
+    status: &str,
 ) {
-    if super::same_tags(in_force, submitted) {
+    let outstanding = super::status_preserved_a_failure(status) && !submitted.is_empty();
+    if super::same_tags(in_force, submitted) && !outstanding {
         return;
     }
     let detail = StoredChangeDetail {
@@ -1412,9 +1463,11 @@ pub fn tag_changes(
         )),
     };
     for held in deployed {
-        // A record the stack kept at `DELETE_COMPLETE` is not a resource the stack holds:
-        // the operation that disposed of it took it away, so there is nothing to re-tag.
-        if held.status == super::resource_status::DELETE_COMPLETE {
+        // A resource the stack does not really hold is not a resource to re-tag: a record it
+        // kept at `DELETE_COMPLETE` is one the operation that disposed of it took away, and
+        // one whose create the owning service refused describes a resource that was never
+        // made ([`super::stack::holds_the_resource`]).
+        if !super::stack::holds_the_resource(held) {
             continue;
         }
         // ...and neither is a resource no service of this emulator holds: nothing tags it.
