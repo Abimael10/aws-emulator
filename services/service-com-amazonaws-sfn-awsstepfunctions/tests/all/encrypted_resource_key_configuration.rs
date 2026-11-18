@@ -15,6 +15,12 @@
 //! sealed data (`includedData = METADATA_ONLY`) uses the key for nothing and is served
 //! whatever the key's state and policy say.
 //!
+//! And the other half of CONFIGURING a key: `encryptionConfiguration` is a whole-value
+//! member, so an accepted create or update stores the structure the request carried in
+//! place of the one the resource had — the key reference resolved to the key's ARN and
+//! nothing else of it changed — and a read reports exactly that structure, while an
+//! update the service refuses stores no part of what it carried.
+//!
 //! The rows span the operations that CONFIGURE a key (a state machine, an activity, an
 //! update), the key states a key can be unusable in, the identities a call is decided
 //! for (the account's own published credential, a bounded IAM user and a state machine's
@@ -30,6 +36,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::asl::RUNTIME_ERROR;
+use service_com_amazonaws_sfn_awsstepfunctions::state::{
+    ENCRYPTION_TYPE_AWS_OWNED_KEY, ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+    MAX_KMS_DATA_KEY_REUSE_PERIOD_SECONDS, MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS,
+};
 
 use crate::activity_tasks::activity_definition;
 use crate::encrypted_execution_writes::message;
@@ -39,7 +49,8 @@ use crate::execution_data_encryption::{
 };
 use crate::role_log_and_key_authorization::{data_key_policy, role};
 use crate::state_machine_lifecycle::{
-    error_code, string, ACCOUNT, HELLO_DEFINITION, PAST_THE_EXECUTION_DELAY, ROLE_ARN,
+    discriminated, error_code, string, ACCOUNT, HELLO_DEFINITION, PAST_THE_EXECUTION_DELAY,
+    ROLE_ARN,
 };
 
 /// The terminal status a run that finished its own work reaches.
@@ -1177,6 +1188,318 @@ async fn a_task_starting_an_encrypted_child_follows_the_childs_key() {
             started,
             usize::from(permitted),
             "case {case:?}: the child's executions, got {children:?}"
+        );
+    }
+}
+
+/// The bare key id of a key ARN, which is one of the four reference forms `kmsKeyId`
+/// accepts ("an alias, alias ARN, key ID, or key ARN").
+fn key_id(key_arn: &str) -> String {
+    key_arn
+        .split_once("key/")
+        .unwrap_or_else(|| panic!("a key ARN carries a key/<id> resource, got {key_arn}"))
+        .1
+        .to_string()
+}
+
+/// An `encryptionConfiguration` whose members are exactly the ones given: the whole
+/// value a request carries, so a row can leave `kmsDataKeyReusePeriodSeconds` out.
+fn configuration(encryption_type: &str, key: Option<&str>, period: Option<i32>) -> Value {
+    let mut value = json!({ "type": encryption_type });
+    if let Some(key) = key {
+        value["kmsKeyId"] = json!(key);
+    }
+    if let Some(period) = period {
+        value["kmsDataKeyReusePeriodSeconds"] = json!(period);
+    }
+    value
+}
+
+/// The same structure as a READ reports it: the members, plus the type discriminator
+/// every nested structure of this API carries on the wire (`crate::state_machine_lifecycle`
+/// holds that one spelling; `tests/all/nested_type_discriminator.rs` holds the rule).
+fn reported(encryption_type: &str, key: Option<&str>, period: Option<i32>) -> Value {
+    discriminated(
+        "EncryptionConfiguration",
+        configuration(encryption_type, key, period),
+    )
+}
+
+/// `encryptionConfiguration` is a WHOLE-VALUE member: an accepted update stores the
+/// structure the request carried in place of the one the resource had — with the key
+/// reference resolved to the key's ARN and nothing else of it changed — so the next read
+/// reports exactly that structure, member for member, and no member of the previous
+/// configuration survives it. A member the request leaves out is not a change at all, so
+/// the stored configuration stays as it was.
+///
+/// The rows walk ONE state machine through the class: the owned key it is created on,
+/// a customer managed key named by key id, a swap to another key by key ARN, the same
+/// key named by alias, the reuse period left out, back to the Amazon Web Services owned
+/// key, a customer key again beside a definition, and an update that names no encryption
+/// configuration. The reuse period is driven at each published bound of the modelled
+/// 60..900 range (`smithy_query(query="shape",shape="EncryptionConfiguration")`) and at
+/// a value inside it; `a_refused_update_replaces_no_part_of_the_configuration` drives one
+/// past each bound.
+#[tokio::test]
+async fn an_update_replaces_the_whole_encryption_configuration() {
+    let chain = Chain::new();
+    let first = chain.create_key(&granting_policy()).await;
+    let second = chain.create_key(&granting_policy()).await;
+    let alias = "alias/encryption-replacement-suite";
+    chain
+        .kms(
+            "CreateAlias",
+            &json!({ "AliasName": alias, "TargetKeyId": second }),
+        )
+        .await;
+
+    let machine = string(
+        &chain
+            .sfn(
+                "CreateStateMachine",
+                &create_machine_request("encryption-replacement", None),
+            )
+            .await,
+        "stateMachineArn",
+    );
+    let described = chain
+        .sfn("DescribeStateMachine", &json!({ "stateMachineArn": machine }))
+        .await;
+    assert_eq!(
+        described["encryptionConfiguration"],
+        reported(ENCRYPTION_TYPE_AWS_OWNED_KEY, None, None),
+        "case the create: a state machine created with no encryptionConfiguration is on \
+         the owned key with neither KMS member, got {described:?}"
+    );
+    let mut revision = described["revisionId"].as_str().map(str::to_string);
+
+    // Each row: the members the update carries beside `stateMachineArn`, and the WHOLE
+    // configuration the read that follows it must report.
+    let rows: Vec<(&str, Value, Value)> = vec![
+        (
+            "a customer managed key named by key id, inside the reuse range",
+            json!({
+                "encryptionConfiguration": configuration(
+                    ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                    Some(&key_id(&first)),
+                    Some(300),
+                )
+            }),
+            reported(
+                ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                Some(&first),
+                Some(300),
+            ),
+        ),
+        (
+            "a swap to another key by key ARN, at the published upper reuse bound",
+            json!({
+                "encryptionConfiguration": configuration(
+                    ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                    Some(&second),
+                    Some(MAX_KMS_DATA_KEY_REUSE_PERIOD_SECONDS),
+                )
+            }),
+            reported(
+                ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                Some(&second),
+                Some(MAX_KMS_DATA_KEY_REUSE_PERIOD_SECONDS),
+            ),
+        ),
+        (
+            "the same key named by alias, at the published lower reuse bound",
+            json!({
+                "encryptionConfiguration": configuration(
+                    ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                    Some(alias),
+                    Some(MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS),
+                )
+            }),
+            reported(
+                ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                Some(&second),
+                Some(MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS),
+            ),
+        ),
+        (
+            "the same key with the reuse period left out",
+            json!({
+                "encryptionConfiguration": configuration(
+                    ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                    Some(&second),
+                    None,
+                )
+            }),
+            reported(
+                ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                Some(&second),
+                None,
+            ),
+        ),
+        (
+            "back to the Amazon Web Services owned key",
+            json!({
+                "encryptionConfiguration": configuration(ENCRYPTION_TYPE_AWS_OWNED_KEY, None, None)
+            }),
+            reported(ENCRYPTION_TYPE_AWS_OWNED_KEY, None, None),
+        ),
+        (
+            "a customer managed key again, beside a definition in the same request",
+            json!({
+                "definition": HELLO_DEFINITION,
+                "encryptionConfiguration": configuration(
+                    ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                    Some(&first),
+                    Some(600),
+                ),
+            }),
+            reported(
+                ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                Some(&first),
+                Some(600),
+            ),
+        ),
+        (
+            "an update naming no encryption configuration at all",
+            json!({ "definition": HELLO_DEFINITION }),
+            reported(
+                ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                Some(&first),
+                Some(600),
+            ),
+        ),
+    ];
+
+    for (case, update, expected) in rows {
+        let mut request = json!({ "stateMachineArn": machine });
+        for (member, value) in update.as_object().expect("the row's members") {
+            request[member] = value.clone();
+        }
+        let answered = chain.sfn("UpdateStateMachine", &request).await;
+        let answered_revision = string(&answered, "revisionId");
+        assert_ne!(
+            Some(answered_revision.as_str()),
+            revision.as_deref(),
+            "case {case:?}: each accepted update moves the state machine to a fresh \
+             revisionId, got {answered_revision} again"
+        );
+        let described = chain
+            .sfn("DescribeStateMachine", &json!({ "stateMachineArn": machine }))
+            .await;
+        assert_eq!(
+            described["encryptionConfiguration"], expected,
+            "case {case:?}: the read must report the whole configuration the update \
+             stored, got {:?}",
+            described["encryptionConfiguration"]
+        );
+        assert_eq!(
+            string(&described, "revisionId"),
+            answered_revision,
+            "case {case:?}: the read reports the revision the update answered, got \
+             {described:?}"
+        );
+        revision = Some(answered_revision);
+    }
+}
+
+/// The other half of the same rule: an update the service does not accept stores no part
+/// of the configuration it carried, so the state machine keeps the whole structure it
+/// had.
+///
+/// The rows are the conditions `InvalidEncryptionConfiguration` covers — "if type is set
+/// to CUSTOMER_MANAGED_KMS_KEY, but kmsKeyId is null, or kmsDataKeyReusePeriodSeconds is
+/// not between 60 and 900" — one second past each published bound of that range, and each
+/// KMS member under the owned type, which "only applies to customer managed keys".
+#[tokio::test]
+async fn a_refused_update_replaces_no_part_of_the_configuration() {
+    let chain = Chain::new();
+    let configured = chain.create_key(&granting_policy()).await;
+    let other = chain.create_key(&granting_policy()).await;
+    let kept = configuration(
+        ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+        Some(&configured),
+        Some(300),
+    );
+    let kept_as_read = reported(
+        ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+        Some(&configured),
+        Some(300),
+    );
+    let machine = string(
+        &chain
+            .sfn(
+                "CreateStateMachine",
+                &create_machine_request("encryption-refused", Some(kept.clone())),
+            )
+            .await,
+        "stateMachineArn",
+    );
+
+    // Each row: the configuration the refused update carries, and the error classes that
+    // may answer it. The RANGE is modelled, so the centralized request walk may refuse a
+    // value outside it before the handler runs; the conditions the model does not carry
+    // have one correct class, the operation's own `InvalidEncryptionConfiguration`.
+    let rows: Vec<(&str, Value, &[&str])> = vec![
+        (
+            "a reuse period one second below the published lower bound",
+            configuration(
+                ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                Some(&other),
+                Some(MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS - 1),
+            ),
+            &[INVALID_ENCRYPTION_CONFIGURATION, "ValidationException"],
+        ),
+        (
+            "a reuse period one second above the published upper bound",
+            configuration(
+                ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+                Some(&other),
+                Some(MAX_KMS_DATA_KEY_REUSE_PERIOD_SECONDS + 1),
+            ),
+            &[INVALID_ENCRYPTION_CONFIGURATION, "ValidationException"],
+        ),
+        (
+            "the customer managed type with no kmsKeyId",
+            configuration(ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY, None, None),
+            &[INVALID_ENCRYPTION_CONFIGURATION],
+        ),
+        (
+            "a kmsKeyId under the Amazon Web Services owned type",
+            configuration(ENCRYPTION_TYPE_AWS_OWNED_KEY, Some(&other), None),
+            &[INVALID_ENCRYPTION_CONFIGURATION],
+        ),
+        (
+            "a reuse period under the Amazon Web Services owned type",
+            configuration(ENCRYPTION_TYPE_AWS_OWNED_KEY, None, Some(300)),
+            &[INVALID_ENCRYPTION_CONFIGURATION],
+        ),
+    ];
+
+    for (case, encryption, expected_codes) in rows {
+        let (status, answer) = chain
+            .call(
+                &SFN,
+                "UpdateStateMachine",
+                &json!({ "stateMachineArn": machine, "encryptionConfiguration": encryption }),
+            )
+            .await;
+        assert_eq!(
+            status, REFUSAL_STATUS,
+            "case {case:?}: the update must be refused, got {status} with {answer:?}"
+        );
+        let code = error_code(&answer);
+        assert!(
+            expected_codes.contains(&code.as_str()),
+            "case {case:?}: expected one of {expected_codes:?}, got {code} with {answer:?}"
+        );
+        let described = chain
+            .sfn("DescribeStateMachine", &json!({ "stateMachineArn": machine }))
+            .await;
+        assert_eq!(
+            described["encryptionConfiguration"], kept_as_read,
+            "case {case:?}: the refused update left the whole configuration as it was, got \
+             {:?}",
+            described["encryptionConfiguration"]
         );
     }
 }

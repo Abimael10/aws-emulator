@@ -802,6 +802,15 @@ fn configuration_refusal<Eng: Send + Sync + 'static>(
 /// account in this Region: there is no ARN to report instead, and a configuration on an
 /// Amazon Web Services owned key names no key at all.
 ///
+/// Resolving that reference is the ONLY thing this does. What a create or an update
+/// carries is the resource's WHOLE encryption configuration, so the structure comes back
+/// member for member with nothing of it dropped: a configuration that names no customer
+/// managed key, and one whose key no store here resolves, are returned exactly as given
+/// rather than as "no configuration at all". A resource an update moves onto an Amazon
+/// Web Services owned key has to be STORED on that configuration for a later read to
+/// report that type with neither KMS member, instead of the customer key it was on
+/// before.
+///
 /// Call it with no store of this service locked: it takes KMS's own.
 pub fn with_resolved_key<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -809,15 +818,16 @@ pub fn with_resolved_key<Eng: Send + Sync + 'static>(
     configuration: Option<crate::ops::types::EncryptionConfiguration>,
 ) -> Option<crate::ops::types::EncryptionConfiguration> {
     let mut configuration = configuration?;
-    let key = customer_managed_key(Some(&configuration))?.to_string();
-    let kms = kms_store::service_state(engine)?;
-    let resolved = {
+    let Some(key) = customer_managed_key(Some(&configuration)).map(str::to_string) else {
+        return Some(configuration);
+    };
+    let resolved = kms_store::service_state(engine).and_then(|kms| {
         let store = kms.lock();
         match store.resolve(region, &key) {
             kms_store::KeyRef::Found(found) => Some(found.arn.clone()),
             _ => None,
         }
-    };
+    });
     if let Some(arn) = resolved {
         configuration.kms_key_id = Some(arn);
     }
