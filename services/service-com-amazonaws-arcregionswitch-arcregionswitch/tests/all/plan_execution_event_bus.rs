@@ -12,6 +12,13 @@
 //! or a replay of a `clientToken`, which answers with the execution the FIRST use
 //! started) publishes nothing at all.
 //!
+//! The published event is a plain EventBridge event, so it is WHAT A RULE'S PATTERN SAYS
+//! that decides delivery, not the form the pattern happens to take: a pattern naming only
+//! the source, only the detail-type, both, the plan in `resources` or a member of `detail`
+//! all match it, and one naming another service, another plan or a value the execution does
+//! not carry does not — nor does an enabled matching rule that sits on another bus, nor a
+//! matching rule that is disabled.
+//!
 //! Everything is driven over the real wire path: this service, EventBridge and Amazon SQS
 //! are mounted on ONE shared engine, each Region's rule and target are created through
 //! EventBridge's and SQS's own APIs, and the delivered message is read back through SQS's.
@@ -22,8 +29,8 @@ use service_com_amazonaws_arcregionswitch_arcregionswitch::state::execution_even
 };
 
 use crate::switch_support::{
-    approval_step, error_code, lambda_step, plan_with_steps, Emulator, ACCOUNT, DELIVERY_DEADLINE,
-    POLL_INTERVAL,
+    approval_step, error_code, lambda_step, plan_with_steps, start_execution, Emulator, ACCOUNT,
+    DELIVERY_DEADLINE, POLL_INTERVAL,
 };
 
 /// The two Regions every plan below covers, which are the two Regions an execution of one
@@ -86,34 +93,29 @@ async fn grant_delivery(
     assert_eq!(status, 200, "SetQueueAttributes answered {status} {body}");
 }
 
-/// Put the rule `name` with `pattern` on the bus of `region` and point it at `queue_arn`;
-/// answers the rule's ARN.
+/// Put the rule `name` with `pattern` in `state` on the `bus` of `region` (`None` being the
+/// account's default bus) and point it at `queue_arn`; answers the rule's ARN.
 async fn given_rule(
     emulator: &Emulator,
     region: &str,
     name: &str,
     pattern: Value,
     queue_arn: &str,
+    rule: RuleOf,
 ) -> String {
-    let (status, body) = emulator
-        .events(
-            region,
-            "PutRule",
-            &json!({ "Name": name, "EventPattern": pattern.to_string(), "State": "ENABLED" }),
-        )
-        .await;
+    let mut put_rule = json!({ "Name": name, "EventPattern": pattern.to_string(), "State": rule.state });
+    let mut put_targets = json!({ "Rule": name, "Targets": [{ "Id": "sqs-target", "Arn": queue_arn }] });
+    if let Some(bus) = rule.bus {
+        put_rule["EventBusName"] = json!(bus);
+        put_targets["EventBusName"] = json!(bus);
+    }
+    let (status, body) = emulator.events(region, "PutRule", &put_rule).await;
     assert_eq!(status, 200, "PutRule answered {status} {body}");
     let rule_arn = body["RuleArn"]
         .as_str()
         .unwrap_or_else(|| panic!("no RuleArn in {body}"))
         .to_string();
-    let (status, body) = emulator
-        .events(
-            region,
-            "PutTargets",
-            &json!({ "Rule": name, "Targets": [{ "Id": "sqs-target", "Arn": queue_arn }] }),
-        )
-        .await;
+    let (status, body) = emulator.events(region, "PutTargets", &put_targets).await;
     assert_eq!(status, 200, "PutTargets answered {status} {body}");
     assert_eq!(
         body["FailedEntryCount"],
@@ -123,11 +125,38 @@ async fn given_rule(
     rule_arn
 }
 
-/// A queue in `region` behind a rule of that Region's bus matching `pattern`; answers the
-/// queue's url.
+/// WHICH rule a case puts the pattern on: the `State` it is created in, and the bus it sits
+/// on — `None` being the account's default bus, the bus a rule carrying no `EventBusName`
+/// is created on.
+#[derive(Debug, Clone, Copy)]
+struct RuleOf {
+    state: &'static str,
+    bus: Option<&'static str>,
+}
+
+/// An enabled rule on the account's default bus: what a client watching a service's events
+/// creates.
+const ENABLED_DEFAULT_BUS: RuleOf = RuleOf {
+    state: "ENABLED",
+    bus: None,
+};
+
+/// A queue in `region` behind an enabled rule of that Region's default bus matching
+/// `pattern`; answers the queue's url.
 async fn given_target(emulator: &Emulator, region: &str, name: &str, pattern: Value) -> String {
+    given_target_of(emulator, region, name, pattern, ENABLED_DEFAULT_BUS).await
+}
+
+/// The same, with the rule put in the `state` and on the bus `rule` names.
+async fn given_target_of(
+    emulator: &Emulator,
+    region: &str,
+    name: &str,
+    pattern: Value,
+    rule: RuleOf,
+) -> String {
     let (url, queue_arn) = given_queue(emulator, region, name).await;
-    let rule_arn = given_rule(emulator, region, name, pattern, &queue_arn).await;
+    let rule_arn = given_rule(emulator, region, name, pattern, &queue_arn, rule).await;
     grant_delivery(emulator, region, &url, &queue_arn, &rule_arn).await;
     url
 }
@@ -429,4 +458,184 @@ async fn a_client_token_replay_publishes_nothing_more() {
         1,
         "case {case:?}: expected exactly one event for the one execution, got {envelopes:?}"
     );
+}
+
+/// A bus of the account beside its default one: a rule on it carries the very pattern the
+/// matching rules below carry, and the events a service generates are not put on it.
+const OTHER_BUS: &str = "switch-observers";
+
+/// One rule a client watching this service's events could create, and whether the event of
+/// a started execution has to reach the queue behind it.
+struct Match {
+    case: &'static str,
+    /// The rule's `EventPattern`, built from the ARN of the plan the case executes and the
+    /// ARN of another plan it leaves alone.
+    pattern: fn(&str, &str) -> Value,
+    /// WHICH rule the pattern goes on.
+    rule: RuleOf,
+    /// Whether that rule's target has to receive the event.
+    delivered: bool,
+}
+
+#[tokio::test]
+async fn a_rule_delivers_exactly_when_its_pattern_and_its_bus_match_the_published_event() {
+    let emulator = Emulator::with_events();
+    let region = REGIONS[0];
+    let (status, body) = emulator
+        .events(region, "CreateEventBus", &json!({ "Name": OTHER_BUS }))
+        .await;
+    assert_eq!(status, 200, "CreateEventBus answered {status} {body}");
+
+    let case = "the event of a started execution, against every form of rule";
+    let executed = plan_with_steps(&emulator, case, "watched", vec![approval_step("Approve")]).await;
+    // A second plan, never executed: what a pattern names to ask for somebody else's
+    // switch.
+    let other_plan =
+        plan_with_steps(&emulator, case, "unwatched", vec![approval_step("Approve")]).await;
+
+    // The rows differ along what decides delivery: which envelope members the pattern names
+    // (`source`, `detail-type`, `resources`, a member of `detail`), whether it names them by
+    // value or through a content filter, whether the values are this event's, and which rule
+    // on which bus carries it. The member names and the `prefix` filter are EventBridge's
+    // own event-pattern syntax, which this emulator's EventBridge implements in
+    // `services/service-com-amazonaws-eventbridge-awsevents/src/state/event_pattern.rs`.
+    let rows: [Match; 11] = [
+        Match {
+            case: "the source alone",
+            pattern: |_, _| json!({ "source": [EVENT_SOURCE] }),
+            rule: ENABLED_DEFAULT_BUS,
+            delivered: true,
+        },
+        Match {
+            case: "the detail-type alone",
+            pattern: |_, _| json!({ "detail-type": [PLAN_EXECUTION_DETAIL_TYPE] }),
+            rule: ENABLED_DEFAULT_BUS,
+            delivered: true,
+        },
+        Match {
+            case: "the source and the detail-type together",
+            pattern: |_, _| plan_execution_pattern(),
+            rule: ENABLED_DEFAULT_BUS,
+            delivered: true,
+        },
+        Match {
+            case: "the executed plan named in resources",
+            pattern: |executed, _| json!({ "source": [EVENT_SOURCE], "resources": [executed] }),
+            rule: ENABLED_DEFAULT_BUS,
+            delivered: true,
+        },
+        Match {
+            case: "a prefix of this service's source",
+            pattern: |_, _| json!({ "source": [{ "prefix": "aws.arc-" }] }),
+            rule: ENABLED_DEFAULT_BUS,
+            delivered: true,
+        },
+        Match {
+            case: "the action the execution performs, read out of the detail",
+            pattern: |_, _| {
+                json!({ "source": [EVENT_SOURCE], "detail": { "action": ["activate"] } })
+            },
+            rule: ENABLED_DEFAULT_BUS,
+            delivered: true,
+        },
+        Match {
+            case: "another service's events",
+            pattern: |_, _| {
+                json!({ "source": ["aws.ecs"], "detail-type": ["ECS Task State Change"] })
+            },
+            rule: ENABLED_DEFAULT_BUS,
+            delivered: false,
+        },
+        Match {
+            case: "the action the execution does not perform",
+            pattern: |_, _| {
+                json!({ "source": [EVENT_SOURCE], "detail": { "action": ["deactivate"] } })
+            },
+            rule: ENABLED_DEFAULT_BUS,
+            delivered: false,
+        },
+        Match {
+            case: "another plan named in resources",
+            pattern: |_, other| json!({ "source": [EVENT_SOURCE], "resources": [other] }),
+            rule: ENABLED_DEFAULT_BUS,
+            delivered: false,
+        },
+        Match {
+            case: "a matching pattern on a rule that is disabled",
+            pattern: |_, _| plan_execution_pattern(),
+            rule: RuleOf {
+                state: "DISABLED",
+                bus: None,
+            },
+            delivered: false,
+        },
+        Match {
+            case: "a matching pattern on a rule of another bus",
+            pattern: |_, _| plan_execution_pattern(),
+            rule: RuleOf {
+                state: "ENABLED",
+                bus: Some(OTHER_BUS),
+            },
+            delivered: false,
+        },
+    ];
+
+    // Every rule is in place BEFORE anything is started, so each one sees the publication.
+    let mut queues: Vec<String> = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        queues.push(
+            given_target_of(
+                &emulator,
+                region,
+                &format!("plan-execution-rule-{index}"),
+                (row.pattern)(&executed, &other_plan),
+                row.rule,
+            )
+            .await,
+        );
+    }
+
+    let execution_id = start_execution(&emulator, case, &executed, region).await;
+
+    // The matching rules first: once each of them has delivered, the publication is over,
+    // so a queue that is still empty afterwards was not meant to receive anything.
+    for (row, url) in rows.iter().zip(&queues).filter(|(row, _)| row.delivered) {
+        let case = row.case;
+        let envelopes = delivered(&emulator, region, url, 1).await;
+        let mine: Vec<&Value> = envelopes
+            .iter()
+            .filter(|event| event["detail"]["executionId"] == json!(execution_id))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "case {case:?}: expected one event for execution {execution_id}, got {envelopes:?}"
+        );
+        let event = mine[0];
+        assert_eq!(
+            event["source"],
+            json!(EVENT_SOURCE),
+            "case {case:?}: expected the source {EVENT_SOURCE}, got {event}"
+        );
+        assert_eq!(
+            event["detail-type"],
+            json!(PLAN_EXECUTION_DETAIL_TYPE),
+            "case {case:?}: expected the detail-type {PLAN_EXECUTION_DETAIL_TYPE}, got {event}"
+        );
+        assert!(
+            event["resources"]
+                .as_array()
+                .is_some_and(|resources| resources.contains(&json!(executed))),
+            "case {case:?}: expected the plan {executed} in resources, got {event}"
+        );
+    }
+
+    for (row, url) in rows.iter().zip(&queues).filter(|(row, _)| !row.delivered) {
+        let case = row.case;
+        let envelopes = drain(&emulator, region, url).await;
+        assert!(
+            envelopes.is_empty(),
+            "case {case:?}: expected no delivery, got {envelopes:?}"
+        );
+    }
 }
