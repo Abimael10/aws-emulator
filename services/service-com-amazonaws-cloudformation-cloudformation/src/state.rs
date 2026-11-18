@@ -455,6 +455,10 @@ pub mod handle_signals;
 /// still has to publish — without waiting for the next client call.
 pub mod provider_driver;
 
+/// Carrying a STARTED stack operation through the transitions it still owes — and publishing
+/// what each one owes — without waiting for the next client call.
+pub mod stack_progress;
+
 /// The permissions a stack operation runs under: the identity policies of the stack's
 /// service role, which decide the calls a deployment makes in the services that own the
 /// stack's resources.

@@ -1474,8 +1474,27 @@ impl StoredStack {
         // for a resource the operation DELETED gates no event — the stack stopped recording
         // that physical resource — so it finishes nothing here.
         for barrier in self.coming_up() {
-            if let Some(at) = barrier.released_at {
-                released.insert(barrier.logical_id.clone(), at);
+            let Some(ready_at) = barrier.released_at else {
+                continue;
+            };
+            // A resource that waits for SIGNALS as well has not finished until both gates are
+            // in: "CloudFormation doesn't proceed with a stack creation or update until
+            // resources receive the required number of signals or the timeout period is
+            // exceeded" (`SignalResource`), so the service that owns it reporting it ready
+            // releases nothing while its wait is short of its `Count` — and a wait already
+            // satisfied does not finish it before that service reports it either.
+            let waits_for_signals = self
+                .wait_conditions
+                .iter()
+                .any(|wait| wait.logical_id() == barrier.logical_id);
+            match released.get(&barrier.logical_id).copied() {
+                Some(signalled_at) => {
+                    released.insert(barrier.logical_id.clone(), signalled_at.max(ready_at));
+                }
+                None if !waits_for_signals => {
+                    released.insert(barrier.logical_id.clone(), ready_at);
+                }
+                None => {}
             }
         }
         released

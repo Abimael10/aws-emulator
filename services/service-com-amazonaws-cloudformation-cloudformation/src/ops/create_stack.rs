@@ -1363,6 +1363,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The transitions this create still owes — the conclusion the clock makes due now that
+        // this call has answered, a wait that runs out, the rollback a failure owes — and the
+        // status-change events each of them owes the account's default event bus: carried out
+        // by this service itself, since the client these events are for never reads the stack
+        // ([`crate::state::stack_progress`]).
+        crate::state::stack_progress::drive_started_operation(
+            ctx,
+            &self.engine,
+            &region,
+            &stack_id,
+        );
+
         Ok(output)
     }
 }

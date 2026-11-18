@@ -293,6 +293,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rollback's own terminal status falls due.
         crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
 
+        // The transitions the rollback this cancellation opened still owes — its terminal
+        // status once what it put back has settled — and the status-change events each of them
+        // owes the account's default event bus: carried out by this service itself, since the
+        // client these events are for never reads the stack
+        // ([`crate::state::stack_progress`]). The stack is addressed the way this request
+        // addressed it, which is what a read of this store resolves.
+        crate::state::stack_progress::drive_started_operation(
+            ctx,
+            &self.engine,
+            &request_region,
+            &input.stack_name,
+        );
+
         Ok(CancelUpdateStackOutput)
     }
 }

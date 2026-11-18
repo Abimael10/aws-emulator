@@ -635,6 +635,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The store's lock is released before the task below is started: it holds nothing of
+        // this call.
+        drop(store);
+
+        // The transitions this deletion still owes — its terminal status once the resources it
+        // asked the owning services to remove are gone — and the status-change events each of
+        // them owes the account's default event bus: carried out by this service itself, since
+        // the client these events are for never reads the stack
+        // ([`crate::state::stack_progress`]).
+        crate::state::stack_progress::drive_started_operation(
+            ctx,
+            &self.engine,
+            &region,
+            &stack_id,
+        );
+
         Ok(DeleteStackOutput)
     }
 }

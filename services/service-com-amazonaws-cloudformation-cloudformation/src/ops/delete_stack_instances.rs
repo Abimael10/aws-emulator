@@ -558,11 +558,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &self.engine,
             ctx.callback(),
             crate::state::stack_set_events::SettlingOperation {
-                region,
+                region: region.clone(),
                 stack_set_id,
                 operation_id: operation_id.clone(),
             },
         );
+        // ...and what the instance STACKS this deletion removes owe that same bus: a stack
+        // instance is a stack of this store like any other, so its own status changes are
+        // published without a read of it ([`crate::state::stack_progress`]).
+        crate::state::stack_progress::drive_started_operations_in(ctx, &self.engine, &region);
 
         Ok(DeleteStackInstancesOutput {
             operation_id: Some(operation_id),

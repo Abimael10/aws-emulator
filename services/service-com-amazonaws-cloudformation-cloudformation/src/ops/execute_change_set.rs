@@ -1157,6 +1157,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store unlocked, before the rollback's own terminal status falls due.
         crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
 
+        // The transitions the stack operation this execution started still owes — its
+        // conclusion, a wait that runs out, the rollback a failure owes — and the
+        // status-change events each of them owes the account's default event bus: carried out
+        // by this service itself, since the client these events are for never reads the stack
+        // ([`crate::state::stack_progress`]).
+        crate::state::stack_progress::drive_started_operation(
+            ctx,
+            &self.engine,
+            &region,
+            &stack_id,
+        );
+
         Ok(ExecuteChangeSetOutput {})
     }
 }
