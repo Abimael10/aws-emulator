@@ -148,6 +148,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             thing_name: input.thing_name.as_deref(),
         };
 
+        // The secret this store authenticates its page cursors under, which is
+        // what tells a `nextToken` this listing issued from one a caller built.
+        // `PageTokenKey` is `Copy`, so the guard is released at the end of this
+        // statement and the listing below takes the store's lock once, for the
+        // records it reports.
+        let token_key = state.lock().page_token_key();
+
         // A page token names a position in ONE listing. A token this service did
         // not mint names none at all, and a token another listing minted names
         // one only there — applying it here would silently restart the listing
@@ -155,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are refused as invalid input.
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_next_token(token, listing) {
+            Some(token) => match crate::state::decode_next_token(&token_key, token, listing) {
                 crate::state::PagePosition::ResumeAfter(seq) => Some(seq),
                 crate::state::PagePosition::OtherListing => {
                     return Err(crate::scaffolded::Scaffolded::validation(
@@ -164,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 crate::state::PagePosition::Unissued => {
                     return Err(crate::scaffolded::Scaffolded::validation(
-                        "nextToken is not a token this service issued",
+                        crate::state::NEXT_TOKEN_UNISSUED_MESSAGE,
                     ))
                 }
             },
@@ -216,7 +223,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = if has_more {
             ordered
                 .last()
-                .map(|(creation_seq, _)| crate::state::encode_next_token(listing, *creation_seq))
+                .map(|(creation_seq, _)| {
+                    crate::state::encode_next_token(&token_key, listing, *creation_seq)
+                })
         } else {
             None
         };

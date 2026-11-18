@@ -24,6 +24,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{DestinationConfig, Tag};
 
+/// The workspace's ONE way a paginated read tells a continuation token it ISSUED
+/// from one a caller built: the secret a store authenticates its page tokens
+/// under, and the width of the authenticator a minted token carries.
+///
+/// Re-exported here because this is where this service's tokens are minted and
+/// read ([`encode_next_token`], [`decode_next_token`]), so a test can build a
+/// value with the SHAPE of a minted token without restating either.
+pub use ::service_common::page_tokens::{AUTHENTICATOR_BYTES, PageTokenKey};
+
 /// `TimeoutConfig$maxLifetimeTimeoutMinutes`: "The maximum amount of time (in
 /// minutes) a tunnel can remain open. If not specified,
 /// maxLifetimeTimeoutMinutes defaults to 720 minutes." (Smithy model doc for
@@ -213,9 +222,11 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// the internal service name, not the namespace AWS publishes for a tunnel ARN.
 pub const TUNNEL_ARN_SERVICE: &str = "iot";
 
-/// The prefix that marks a `ListTunnels` page token as one this service minted.
-/// The whole token stays inside `NextToken`'s modelled pattern
-/// `^[a-zA-Z0-9_=-]{1,4096}$`.
+/// The prefix every `ListTunnels` page token is rendered with, so a value that is
+/// not this service's spelling of one is recognised before anything else is read
+/// off it. What tells a token this service ISSUED from one a caller built is the
+/// authenticator inside it, not this prefix ([`decode_next_token`]). The whole
+/// token stays inside `NextToken`'s modelled pattern `^[a-zA-Z0-9_=-]{1,4096}$`.
 const NEXT_TOKEN_PREFIX: &str = "tnl-";
 
 /// `TunnelStatus`, whose modelled values are `OPEN` and `CLOSED`.
@@ -384,6 +395,14 @@ pub struct ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
     earliest_open_expiry: Option<SystemTime>,
     /// The next creation sequence number handed to a tunnel.
     next_creation_seq: u64,
+    /// The secret THIS store's `ListTunnels` page tokens are authenticated under,
+    /// drawn from the system's randomness when the store is created and never
+    /// reported ([`PageTokenKey`]).
+    ///
+    /// The position a token names travels INSIDE it, so what tells a cursor this
+    /// service issued from one a caller wrote is that no caller can produce the
+    /// authenticator over it. Reach it through [`Self::page_token_key`].
+    page_token_key: PageTokenKey,
 }
 
 impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
@@ -450,6 +469,15 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
             .remove(&tunnel_key(region, &tunnel.tunnel_arn));
         self.tags.remove(&tunnel.tunnel_arn);
         Some(tunnel)
+    }
+
+    /// The secret this store authenticates its `ListTunnels` page tokens under.
+    ///
+    /// Handed out by value — [`PageTokenKey`] is `Copy` — so a listing takes the
+    /// key off the store and goes on to borrow the records it is about to report
+    /// in the same call.
+    pub fn page_token_key(&self) -> PageTokenKey {
+        self.page_token_key
     }
 
     /// Claim the next creation sequence number.
@@ -940,8 +968,8 @@ pub fn mint_access_token() -> String {
 /// A creation sequence is a position in ONE listing and in no other, because
 /// what a listing reports is decided by the Region whose endpoint serves it —
 /// the only Region whose tunnels that endpoint holds at all — and by the
-/// `thingName` it is filtered by. Both go into every token the listing mints
-/// ([`encode_next_token`]) and are checked when a token comes back
+/// `thingName` it is filtered by. Both go into the cursor of every token the
+/// listing mints ([`encode_next_token`]) and are checked when a token comes back
 /// ([`decode_next_token`]), so a cursor replayed against a different listing is
 /// recognised as naming no position in it instead of being applied to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -955,56 +983,54 @@ pub struct TunnelListing<'a> {
 }
 
 impl TunnelListing<'_> {
-    /// The 64 bits that identify this listing, carried by every token it mints.
+    /// The scope every token this listing mints carries: the Region whose endpoint
+    /// serves the listing, and the `thingName` it is filtered by.
     ///
-    /// The leading 64 bits of SHA-256 over the listing's scope: a token stays
-    /// short and opaque, while two different listings do not share a
-    /// fingerprint in any store this emulator can hold. The Region is
-    /// terminated by a NUL byte, which neither a Region label nor a `ThingName`
-    /// (modelled `^[a-zA-Z0-9:_-]+$`) can contain, so no two distinct scopes
-    /// hash the same bytes; the marker byte after it distinguishes "filtered by
-    /// this name" from "not filtered at all".
-    fn fingerprint(&self) -> u64 {
-        use sha2::{Digest, Sha256};
-
-        let mut digest = Sha256::new();
-        digest.update(self.region.as_bytes());
-        digest.update([0]);
+    /// The fields are separated by [`NEXT_TOKEN_FIELD_SEPARATOR`], which neither a
+    /// Region label nor a `ThingName` (modelled `^[a-zA-Z0-9:_-]+$`) can contain,
+    /// so no two distinct listings render the same scope; the marker ahead of the
+    /// name distinguishes "filtered by this name" from "not filtered at all".
+    fn scope(&self) -> String {
+        let region = self.region;
         match self.thing_name {
-            Some(thing_name) => {
-                digest.update([1]);
-                digest.update(thing_name.as_bytes());
-            }
-            None => digest.update([0]),
+            Some(thing_name) => format!(
+                "{region}{sep}1{sep}{thing_name}",
+                sep = NEXT_TOKEN_FIELD_SEPARATOR
+            ),
+            None => format!("{region}{sep}0", sep = NEXT_TOKEN_FIELD_SEPARATOR),
         }
-        let digest = digest.finalize();
-        // SHA-256's output is 32 bytes, so these 8 always exist.
-        let mut leading = [0u8; 8];
-        leading.copy_from_slice(&digest[..8]);
-        u64::from_be_bytes(leading)
     }
 }
 
-/// The hex digits one field of a page token is rendered in. A `u64` written in
-/// full, so the rendering is fixed-width and is its own canonical form.
-const NEXT_TOKEN_FIELD_DIGITS: usize = 16;
+/// The separator between the fields of the cursor a page token carries: a unit
+/// separator, which no Region label, no `ThingName` and no decimal creation
+/// sequence can contain, so the fields are read back exactly as written.
+const NEXT_TOKEN_FIELD_SEPARATOR: char = '\u{1f}';
 
-/// The ONE rendering of a page token: the prefix, then the creation sequence the
-/// previous page stopped at, then the fingerprint of the listing that minted it,
-/// each zero-padded to [`NEXT_TOKEN_FIELD_DIGITS`] lowercase hex digits. The
-/// whole token stays inside `NextToken`'s modelled pattern
+/// The ONE rendering of a page token: the prefix, then `cursor` behind the
+/// authenticator this store holds the secret for ([`PageTokenKey::mint`]), in
+/// lowercase hex. The whole token stays inside `NextToken`'s modelled pattern
 /// `^[a-zA-Z0-9_=-]{1,4096}$`.
-fn render_next_token(seq: u64, fingerprint: u64) -> String {
-    format!(
-        "{NEXT_TOKEN_PREFIX}{seq:0width$x}{fingerprint:0width$x}",
-        width = NEXT_TOKEN_FIELD_DIGITS
-    )
+fn render_next_token(key: &PageTokenKey, cursor: &str) -> String {
+    format!("{NEXT_TOKEN_PREFIX}{}", ::hex::encode(key.mint(cursor)))
 }
 
 /// The `nextToken` that resumes `listing` after the tunnel whose creation
 /// sequence is `seq`.
-pub fn encode_next_token(listing: TunnelListing<'_>, seq: u64) -> String {
-    render_next_token(seq, listing.fingerprint())
+///
+/// The position travels INSIDE the token — there is no page kept on the side to
+/// look up — so what stops a caller naming a position this listing never offered
+/// is that it cannot produce the authenticator over the cursor: `key` is the
+/// store's own secret, which is never reported.
+pub fn encode_next_token(key: &PageTokenKey, listing: TunnelListing<'_>, seq: u64) -> String {
+    render_next_token(
+        key,
+        &format!(
+            "{scope}{sep}{seq}",
+            scope = listing.scope(),
+            sep = NEXT_TOKEN_FIELD_SEPARATOR
+        ),
+    )
 }
 
 /// What a `nextToken` names when it is read against the listing being served.
@@ -1022,41 +1048,58 @@ pub enum PagePosition {
 
 /// Read `token` as a position in `listing`.
 ///
-/// Parsing the fields is not enough to accept one: `u64::from_str_radix` also
-/// accepts a digit count, a sign and a letter case that [`render_next_token`]
-/// never emits, so the parsed fields are re-rendered and the result compared
-/// with what arrived — only a token identical to its own canonical rendering
-/// was minted here, and every other string (truncated, re-cased, over-padded or
-/// hand-written) is [`PagePosition::Unissued`]. A token that IS canonical still
-/// names a position only in the listing whose fingerprint it carries.
-pub fn decode_next_token(token: &str, listing: TunnelListing<'_>) -> PagePosition {
+/// Only a token this store MINTED names a position at all. The cursor travels
+/// inside the token behind an authenticator computed under a secret the store
+/// drew from the system's randomness and never reveals, so every other string is
+/// [`PagePosition::Unissued`] — one that is not this rendering at all, one that
+/// merely has a minted token's shape, one whose cursor field was rewritten under
+/// an authenticator that was not recomputed, and one another store minted. A
+/// token this store minted still names a position only in the listing whose
+/// scope it carries.
+pub fn decode_next_token(
+    key: &PageTokenKey,
+    token: &str,
+    listing: TunnelListing<'_>,
+) -> PagePosition {
     let Some(digits) = token.strip_prefix(NEXT_TOKEN_PREFIX) else {
         return PagePosition::Unissued;
     };
-    if digits.len() != 2 * NEXT_TOKEN_FIELD_DIGITS {
-        return PagePosition::Unissued;
-    }
-    let (Some(sequence_digits), Some(fingerprint_digits)) = (
-        digits.get(..NEXT_TOKEN_FIELD_DIGITS),
-        digits.get(NEXT_TOKEN_FIELD_DIGITS..),
-    ) else {
+    let Ok(bytes) = ::hex::decode(digits) else {
         return PagePosition::Unissued;
     };
-    let (Ok(seq), Ok(fingerprint)) = (
-        u64::from_str_radix(sequence_digits, 16),
-        u64::from_str_radix(fingerprint_digits, 16),
-    ) else {
-        return PagePosition::Unissued;
-    };
-    if render_next_token(seq, fingerprint) != token {
+    // `hex::decode` also reads the UPPER-case spelling of the same bytes, which
+    // [`render_next_token`] never emits: a token is accepted only as its own
+    // canonical rendering.
+    if ::hex::encode(&bytes) != digits {
         return PagePosition::Unissued;
     }
-    if fingerprint == listing.fingerprint() {
+    let Some(cursor) = key.cursor_of(&bytes) else {
+        return PagePosition::Unissued;
+    };
+    // Nothing but a cursor [`encode_next_token`] wrote reaches this point, so the
+    // fields are the ones it wrote: the scope of the listing that minted the
+    // token, then the creation sequence that listing's page stopped at.
+    let Some((scope, sequence)) = cursor.rsplit_once(NEXT_TOKEN_FIELD_SEPARATOR) else {
+        return PagePosition::Unissued;
+    };
+    let Ok(seq) = sequence.parse::<u64>() else {
+        return PagePosition::Unissued;
+    };
+    if scope == listing.scope() {
         PagePosition::ResumeAfter(seq)
     } else {
         PagePosition::OtherListing
     }
 }
+
+/// The refusal for a `nextToken` this service did not ISSUE.
+///
+/// Such a string names no position anywhere: the cursor a token carries is
+/// authenticated under a secret only this store holds ([`decode_next_token`]), so
+/// a value that is not one this store minted is a fault in the request's own
+/// input rather than a position to apply. The text names the member to fix and
+/// reproduces nothing of what arrived.
+pub const NEXT_TOKEN_UNISSUED_MESSAGE: &str = "nextToken is not a token this service issued";
 
 /// The refusal for a `nextToken` that was minted by a DIFFERENT listing than
 /// the one being served.
