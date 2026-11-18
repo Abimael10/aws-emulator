@@ -88,3 +88,32 @@ Model citations: smithy_query operation=DescribeAlarmContributors,ListDashboards
 5. Cause 3: fixture monitoring-dashboard-put-get-delete-lifecycle step task#3 — same check on a second dashboard body.
 6. Cause 4: fixture cloudwatch-mstx-traj-rebuild-exclude-stream-refusals step task#2 — PutMetricStream with OutputFormat omitted must answer the Coral ValidationException (400, __type 'com.amazon.coral.validate#ValidationException', x-amzn-query-error 'ValidationError;Sender', message "1 validation error detected: Value null at 'outputFormat' failed to satisfy constraint: Member must not be null").
 7. Re-replay all four fixture#step bindings after the fix; every one must pass.
+
+## Disposition
+
+Causes 1 and 4 hold in the current checkout and are now pinned by tests; causes 2 and 3 are
+DECLINED, because the recorded `Size` is not a function of the request the replay carries or of
+anything this store holds.
+
+* Cause 1 — FIXED (the checkout drifted since the report): `DescribeAlarmContributors` gates on
+  the alarm's type before projecting contributors and refuses an alarm graded on ONE series with
+  the request-validation class (`src/ops/describe_alarm_contributors.rs`), which
+  `tests/all/alarm_contributors.rs` asserts over every alarm kind this service stores. The four
+  replay keys for it pass.
+* Cause 4 — FIXED (same drift): a required member no value arrived for is refused by the
+  request-validation layer in front of the service, with the numbered clause naming the member in
+  lower camel case. `tests/all/metric_stream_omitted_member_class.rs` now walks all four members
+  `PutMetricStream` requires, not only the recorded one. Its replay keys pass.
+* Causes 2 and 3 — DECLINED. `DashboardEntry$Size` is "The size of the dashboard, in bytes", and
+  the listing reports the byte length of the document `PutDashboard` stored, which `GetDashboard`
+  answers byte for byte (`tests/all/opaque_document_fidelity.rs`,
+  `tests/all/dashboard_body_byte_fidelity.rs`, and `tests/all/dashboard_size_terms.rs` for the
+  terms it must NOT carry). The recorded numbers exceed the document the replayed `PutDashboard`
+  carries by 24 bytes for the two dashboards of causes 2 and 3, and by some other amount for a
+  third dashboard whose document has the SAME shape (one text widget, 106 bytes, one tag):
+  measured by replay, adding 24 bytes makes the first four units pass and leaves the third
+  diverging, while the document's compact rendering does not match it either. An excess that
+  differs between two documents of identical shape is not a function of the document, the
+  dashboard's name or its tags, so no rule over the request or the stored state yields the
+  recorded values — only writing those values into the handler would, which would also break the
+  byte-fidelity tests above.
