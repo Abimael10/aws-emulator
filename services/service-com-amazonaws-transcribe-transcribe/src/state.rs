@@ -48,7 +48,11 @@
 //! `SubtitlesOutput.SubtitleFileUris`, in this emulator's own object store over the
 //! in-process callback, so the canonical workflow — start a job, poll it until it is
 //! finished, then fetch the location it reports — completes (see
-//! [`store_job_outputs`]). What that document holds is the envelope the service itself
+//! [`store_job_outputs`]). WHAT a caller is handed for a location in the service-managed
+//! store is the temporary pre-signed address of that very object, because a client
+//! follows it with no credential of its own (see
+//! [`report_transcription_job_locations`]). What that
+//! document holds is the envelope the service itself
 //! owns (the job, the account, the status) with an EMPTY transcript and no caption,
 //! because no engine read the audio: a transcription that produced no words, never
 //! invented speech ([`transcript_document`], [`subtitle_document`]).
@@ -80,7 +84,9 @@
 //! supplied is written to the service-managed object store that URI names, over the
 //! in-process callback into this same emulator, so a client that fetches the reported
 //! location reads back the terms it stored and a later update replaces them (see
-//! [`store_vocabulary_content`] and [`vocabulary_download_uri`]). A vocabulary whose
+//! [`store_vocabulary_content`] and [`vocabulary_download_uri`], which is the same
+//! temporary pre-signed address every service-managed location is reported as). A
+//! vocabulary whose
 //! terms come from a FILE instead of from the request is built from the very same
 //! seam, in the other direction: the caller uploaded that file to Amazon S3 before
 //! calling, this emulator holds an Amazon S3 of its own, so the file is READ from it in
@@ -165,6 +171,8 @@ use crate::ops::types::{
     TranscriptionJobSummary, VocabularyFilterInfo, VocabularyInfo, MEDIA_FORMAT_VALUES,
     MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES, REDACTION_OUTPUT_VALUES, SUBTITLE_FORMAT_VALUES,
 };
+mod download_locations;
+pub use download_locations::*;
 mod jobs;
 pub use jobs::*;
 mod language_identification;
@@ -2613,9 +2621,13 @@ impl VocabularyRecord {
     /// reaches `READY` ([`Self::advance_clock`]). The medical
     /// family gates the same member on the same state
     /// ([`MedicalVocabularyRecord::download_uri`]). See [`vocabulary_download_uri`].
-    pub fn download_uri(&self) -> Option<String> {
-        (self.state == VOCABULARY_STATE_READY)
-            .then(|| vocabulary_download_uri(RESOURCE_TYPE_VOCABULARY, &self.name, &self.region))
+    pub fn download_uri(
+        &self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Option<String> {
+        (self.state == VOCABULARY_STATE_READY).then(|| {
+            vocabulary_download_uri(ctx, RESOURCE_TYPE_VOCABULARY, &self.name, &self.region)
+        })
     }
 }
 
@@ -2751,9 +2763,12 @@ impl MedicalVocabularyRecord {
     /// loaded no terms at all, so the member stays absent rather than naming a location
     /// holding nothing. The non-medical family gates the same member on the same state
     /// ([`VocabularyRecord::download_uri`]). See [`vocabulary_download_uri`].
-    pub fn download_uri(&self) -> Option<String> {
+    pub fn download_uri(
+        &self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Option<String> {
         (self.state == VOCABULARY_STATE_READY).then(|| {
-            vocabulary_download_uri(RESOURCE_TYPE_MEDICAL_VOCABULARY, &self.name, &self.region)
+            vocabulary_download_uri(ctx, RESOURCE_TYPE_MEDICAL_VOCABULARY, &self.name, &self.region)
         })
     }
 }
@@ -3488,9 +3503,12 @@ impl VocabularyFilterRecord {
     /// vocabulary family ([`VocabularyRecord::download_uri`]). This family models no
     /// processing state at all, so the words the record holds are what says whether
     /// there is a built file at that location. See [`vocabulary_download_uri`].
-    pub fn download_uri(&self) -> Option<String> {
+    pub fn download_uri(
+        &self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Option<String> {
         (!self.words.is_empty()).then(|| {
-            vocabulary_download_uri(RESOURCE_TYPE_VOCABULARY_FILTER, &self.name, &self.region)
+            vocabulary_download_uri(ctx, RESOURCE_TYPE_VOCABULARY_FILTER, &self.name, &self.region)
         })
     }
 }
@@ -4024,22 +4042,32 @@ pub fn content_source<'a>(
     }
 }
 
-/// The `DownloadUri` of a custom vocabulary or vocabulary filter: the service-managed
-/// S3 location its text file is stored at.
+/// The `DownloadUri` of a custom vocabulary or vocabulary filter: the temporary address
+/// the text file this service built for it is fetched from.
 ///
-/// REPORTED AND SERVED: the file of terms is written to that very bucket and key when
-/// a create or an update supplies them ([`store_vocabulary_content`]), so "use this
-/// URI to view or download the custom vocabulary filter" holds — a client that fetches
-/// the location reads the terms back. The URI is built from the same two pieces the
-/// write addresses ([`service_managed_bucket`], [`vocabulary_content_key`]), so the
-/// reported location and the stored object cannot drift apart. The bucket is
-/// [`service_managed_bucket`], the one [`output_uri`]'s service-managed branch names as
-/// well, so both URIs this service reports really do name the same bucket.
-pub fn vocabulary_download_uri(resource_type: &str, name: &str, region: &str) -> String {
-    format!(
-        "https://s3.{region}.amazonaws.com/{bucket}/{key}",
-        bucket = service_managed_bucket(region),
-        key = vocabulary_content_key(resource_type, name),
+/// REPORTED AND SERVED: the file of terms is written to the very bucket and key this
+/// address names when a create or an update supplies them
+/// ([`store_vocabulary_content`]), so "use this URI to view or download the custom
+/// vocabulary filter" holds — a client that fetches the location reads the terms back.
+/// The address is built from the same two pieces the write addresses
+/// ([`service_managed_bucket`], [`vocabulary_content_key`]), so the reported location and
+/// the stored object cannot drift apart. The bucket is [`service_managed_bucket`], the
+/// one [`output_uri`]'s service-managed branch names as well, so both locations this
+/// service reports out of its own store really do name the same bucket.
+///
+/// It is a file in a SERVICE-MANAGED bucket, which a caller reaches with no credential of
+/// its own, so the address is the temporary pre-signed one every such location is reported
+/// as ([`service_managed_uri`], which says why).
+pub fn vocabulary_download_uri(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    resource_type: &str,
+    name: &str,
+    region: &str,
+) -> String {
+    service_managed_uri(
+        ctx,
+        &service_managed_bucket(region),
+        &vocabulary_content_key(resource_type, name),
     )
 }
 

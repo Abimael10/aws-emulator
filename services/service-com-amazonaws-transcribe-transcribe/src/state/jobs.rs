@@ -228,6 +228,19 @@ impl TranscriptionJobRecord {
         )
     }
 
+    /// The Region whose SERVICE-MANAGED store this job's output files live in, or `None`
+    /// for a job whose start named an output bucket of its OWN.
+    ///
+    /// Read off the stored request, not off the addresses the record projects: WHOSE
+    /// bucket a job's output is in was decided when the job was started
+    /// (`OutputBucketName`), so a reader asks the record rather than inspecting a value a
+    /// request may have supplied (`crate::state::report_transcription_job_locations`).
+    pub fn service_managed_output_region(&self) -> Option<String> {
+        self.output_bucket_name
+            .is_none()
+            .then(|| self.region.clone())
+    }
+
     /// This record as the modelled `TranscriptionJob` shape.
     pub fn to_job(&self) -> TranscriptionJob {
         TranscriptionJob {
@@ -1373,6 +1386,14 @@ impl CallAnalyticsJobRecord {
         }
     }
 
+    /// The Region whose SERVICE-MANAGED store this job's transcript lives in, or `None`
+    /// for a job whose start named an `OutputLocation` of its own, exactly as the
+    /// transcription-job family answers it
+    /// ([`TranscriptionJobRecord::service_managed_output_region`]).
+    pub fn service_managed_output_region(&self) -> Option<String> {
+        self.output_location.is_none().then(|| self.region.clone())
+    }
+
     /// This record as the modelled `CallAnalyticsJobSummary` shape, which is what
     /// `ListCallAnalyticsJobs` reports for each result.
     ///
@@ -1461,7 +1482,7 @@ pub fn output_object_key(output_key: Option<&str>, job_name: &str, extension: &s
 ///
 /// The service-managed branch names [`service_managed_bucket`], the one bucket this
 /// service's own files live in — the same one a custom vocabulary's `DownloadUri`
-/// names ([`vocabulary_download_uri`]).
+/// names — through [`service_managed_address_prefix`], the ONE home for that form.
 pub fn output_uri(
     output_bucket_name: Option<&str>,
     output_key: Option<&str>,
@@ -1473,11 +1494,27 @@ pub fn output_uri(
     match output_bucket_name {
         Some(bucket) => format!("s3://{bucket}/{key}"),
         None => format!(
-            "https://s3.{region}.amazonaws.com/{bucket}/{account}/{key}",
-            bucket = service_managed_bucket(region),
+            "{prefix}{account}/{key}",
+            prefix = service_managed_address_prefix(region),
             account = ::engine::emulator_account_id(),
         ),
     }
+}
+
+/// Everything before the KEY in the address of an object in this service's own store for
+/// `region`: the path-style Amazon S3 host of that Region and that Region's
+/// service-managed bucket, with the trailing separator.
+///
+/// ONE home for the form, written from `region` and from this service's own constant and
+/// read from nothing: [`output_uri`]'s service-managed branch builds an address with it,
+/// and `crate::state::reported_own_location` recognises an address of this store by that
+/// exact prefix — so what this service signs for a caller cannot be decided by anything a
+/// request supplied.
+pub fn service_managed_address_prefix(region: &str) -> String {
+    format!(
+        "https://s3.{region}.amazonaws.com/{bucket}/",
+        bucket = service_managed_bucket(region),
+    )
 }
 
 /// One object a finished job's reported output location names: the address it is
@@ -1526,14 +1563,26 @@ pub(super) fn output_object_address(uri: &str) -> Option<(&str, &str)> {
     (!bucket.is_empty() && !key.is_empty()).then_some((bucket, key))
 }
 
-/// Whether `host` is the path-style Amazon S3 endpoint this service reports a
-/// service-managed location at: `s3.REGION.amazonaws.com` for a Region-shaped REGION
-/// ([`is_region_like`]), which is the authority [`output_uri`] and
-/// [`vocabulary_download_uri`] build such a URI with.
+/// Whether `host` is the path-style Amazon S3 endpoint this service ADDRESSES its own
+/// store at: `s3.REGION.amazonaws.com` for a Region-shaped REGION
+/// ([`path_style_s3_region`]), which is the authority [`service_managed_address_prefix`]
+/// builds such an address with. What a caller is told to FETCH that object from is the
+/// temporary pre-signed address of the same bucket and key
+/// (`crate::state::report_transcription_job_locations`).
 pub(super) fn is_path_style_s3_host(host: &str) -> bool {
-    host.strip_prefix("s3.")
-        .and_then(|rest| rest.strip_suffix(".amazonaws.com"))
-        .is_some_and(is_region_like)
+    path_style_s3_region(host).is_some()
+}
+
+/// The Region a path-style Amazon S3 host names — `s3.REGION.amazonaws.com` for a
+/// Region-shaped REGION ([`is_region_like`]) — and `None` for any other host.
+///
+/// ONE home for that host form, beside the two places that use it: the authority
+/// [`service_managed_address_prefix`] addresses this service's own store at, and the one
+/// [`is_path_style_s3_host`] admits a write to.
+pub(super) fn path_style_s3_region(host: &str) -> Option<&str> {
+    host.strip_prefix("s3.")?
+        .strip_suffix(".amazonaws.com")
+        .filter(|region| is_region_like(region))
 }
 
 /// The `Content-Type` a JSON output document is stored with.

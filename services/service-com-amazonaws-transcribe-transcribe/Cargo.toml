@@ -33,6 +33,9 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so the single integration-test target
+# at `tests/all/main.rs` picks up every suite with nothing to declare by hand.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The media-resolution, training-data and download-content suites mount the Amazon S3

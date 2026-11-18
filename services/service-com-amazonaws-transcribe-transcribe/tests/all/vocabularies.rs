@@ -18,6 +18,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::medical_vocabularies::is_absent;
+use crate::served_download_locations::named_object;
 use crate::transcription_jobs::{dispatch, Reply, Transcribe};
 
 /// Long enough for the `PENDING -> READY` transition of a vocabulary created during
@@ -176,24 +177,24 @@ async fn a_created_vocabulary_is_pending_then_ready_and_reads_back() {
         }
     }
 
-    // The transition the clock owed every one of them has now fallen due.
-    std::thread::sleep(PAST_THE_TRANSITION);
+    // The transition the clock owes every one of them is waited for by POLLING the
+    // reader, not by waiting out its span.
     for (case, request) in vocabulary_rows() {
         let name = request["VocabularyName"].as_str().expect("a name").to_string();
+        let state = transcribe.vocabulary_settled(&name, None).await;
+        assert_eq!(
+            state, "READY",
+            "case {case:?}: the vocabulary must be READY once its processing fell due, \
+             got {state:?}"
+        );
         let read = transcribe
             .call("GetVocabulary", json!({"VocabularyName": name}))
             .await;
         read.ok(case);
-        assert_eq!(
-            read.member(case, "VocabularyState"),
-            "READY",
-            "case {case:?}: the vocabulary must be READY once its processing fell due, \
-             got {:?}",
-            read.body
-        );
         let download_uri = read.member(case, "DownloadUri");
         assert!(
-            download_uri.starts_with("https://") && download_uri.ends_with(&name),
+            download_uri.starts_with("https://")
+                && named_object(&download_uri).ends_with(&name),
             "case {case:?}: a built vocabulary's DownloadUri must name its own \
              location, got {download_uri:?}"
         );
@@ -730,7 +731,8 @@ async fn the_vocabulary_filter_family_round_trips() {
         );
         let download_uri = read.member(case, "DownloadUri");
         assert!(
-            download_uri.starts_with("https://") && download_uri.ends_with(&name),
+            download_uri.starts_with("https://")
+                && named_object(&download_uri).ends_with(&name),
             "case {case:?}: DownloadUri must name this filter's own location, got \
              {download_uri:?}"
         );

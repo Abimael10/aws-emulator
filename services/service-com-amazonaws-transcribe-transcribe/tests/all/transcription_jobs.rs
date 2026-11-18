@@ -14,6 +14,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::served_download_locations::named_object;
+
 /// Long enough for every clock-owed transition of a job started during the test to
 /// have fallen due: a queued job's `QUEUED -> IN_PROGRESS -> COMPLETED` is two spans
 /// of `crate::state::JOB_TRANSITION_DELAY` (500 ms each).
@@ -30,6 +32,12 @@ const PAST_EVERY_TRANSITION: Duration = Duration::from_millis(1_300);
 /// (500 ms each) even on a slow machine.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const POLLS_FOR_READY: usize = 40;
+
+/// How many times [`Transcribe::job_settled`] looks for a job to have finished before it
+/// gives up, [`POLL_INTERVAL`] apart. Generous on purpose: what it waits for is a
+/// transition this service owes in under a second, and the loop stops as soon as the
+/// status says so, so a long deadline costs a slow machine nothing and a fast one nothing.
+const POLLS_FOR_FINISHED: usize = 600;
 
 /// The bucket the table files [`Transcribe::medical_vocabulary_ready`] stages live in —
 /// the CALLER's own bucket, the one a caller uploads its vocabulary table to before
@@ -139,6 +147,58 @@ impl Transcribe {
     pub(crate) async fn vocabulary_settled(&self, name: &str, region: Option<&str>) -> String {
         self.vocabulary_state_settled("GetVocabulary", name, region)
             .await
+    }
+
+    /// Poll the reader `get` of a JOB family until the job `name`, started in `region`,
+    /// has FINISHED, and answer the job the reader reported.
+    ///
+    /// `status_member` is the member that family's job carries its status in and
+    /// `job_member` the member of the answer that holds the job; the name member is the
+    /// family's own. A job is finished once its status is neither of the two the model
+    /// gives work still to do (`QUEUED`, `IN_PROGRESS`), so this waits for the CONDITION
+    /// rather than for a span: the loop stops as soon as the transition the clock owed has
+    /// been materialised, and [`POLLS_FOR_FINISHED`] leaves a slow machine room.
+    ///
+    /// `pub(crate)`: every suite that reads what a FINISHED job reports waits through
+    /// this one loop rather than keeping a copy of it.
+    pub(crate) async fn job_settled(
+        &self,
+        get: &str,
+        name_member: &str,
+        job_member: &str,
+        status_member: &str,
+        name: &str,
+        region: Option<&str>,
+    ) -> Value {
+        let case = format!("{get} {name:?}");
+        for _ in 0..POLLS_FOR_FINISHED {
+            let reply = self
+                .call_in_region(get, json!({name_member: name}), region)
+                .await;
+            let job = reply.ok(&case)[job_member].clone();
+            let status = job[status_member]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: a read reports a status"))
+                .to_string();
+            if !["QUEUED", "IN_PROGRESS"].contains(&status.as_str()) {
+                return job;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        panic!("case {case:?}: the job never finished");
+    }
+
+    /// [`Self::job_settled`] for the transcription-job family.
+    pub(crate) async fn transcription_job_settled(&self, name: &str, region: Option<&str>) -> Value {
+        self.job_settled(
+            "GetTranscriptionJob",
+            "TranscriptionJobName",
+            "TranscriptionJob",
+            "TranscriptionJobStatus",
+            name,
+            region,
+        )
+        .await
     }
 
     /// Stage every `s3://<bucket>/<key>` location of `uris` as an object of this
@@ -780,9 +840,11 @@ async fn the_output_location_follows_the_documented_output_key_rule() {
             name: "service-managed-job",
             bucket: None,
             key: None,
-            uri: format!(
-                "https://s3.us-east-1.amazonaws.com/aws-transcribe-us-east-1-prod/{account}/service-managed-job.json"
-            ),
+            // The OBJECT the reported location names: a service-managed location is a
+            // temporary address into this emulator's own store, so its object is the
+            // path it carries (`crate::served_download_locations` pins what that
+            // address IS).
+            uri: format!("/aws-transcribe-us-east-1-prod/{account}/service-managed-job.json"),
             location: "SERVICE_BUCKET",
         },
     ];
@@ -805,20 +867,25 @@ async fn the_output_location_follows_the_documented_output_key_rule() {
             .ok(case.name);
     }
 
-    std::thread::sleep(PAST_EVERY_TRANSITION);
-
     for case in &cases {
         let name = case.name;
-        let fetched = transcribe
-            .call("GetTranscriptionJob", json!({"TranscriptionJobName": name}))
-            .await;
-        let job = fetched.ok(name)["TranscriptionJob"].clone();
+        // Poll until the job has finished rather than waiting out its span: what the
+        // transcript location follows from is the FINISHED job.
+        let job = transcribe.transcription_job_settled(name, None).await;
+        let reported = job["Transcript"]["TranscriptFileUri"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {name:?}: a completed job reports a transcript location, got {:?}",
+                    job["Transcript"]
+                )
+            })
+            .to_string();
         assert_eq!(
-            job["Transcript"]["TranscriptFileUri"],
-            json!(case.uri),
-            "case {name:?}: expected transcript at {}, got {:?}",
-            case.uri,
-            job["Transcript"]["TranscriptFileUri"]
+            named_object(&reported),
+            case.uri.as_str(),
+            "case {name:?}: expected transcript at {}, got {reported:?}",
+            case.uri
         );
     }
 
@@ -1044,28 +1111,31 @@ async fn the_service_managed_transcript_uri_is_in_the_signed_region() {
             .ok(scope_region);
     }
 
-    // One wait for every row, not one per row.
-    std::thread::sleep(PAST_EVERY_TRANSITION);
-
     for (index, (scope_region, expected_region)) in cases.iter().enumerate() {
         let name = format!("region-job-{index}");
-        // Read back through the SAME Region's endpoint the job was started through:
-        // the resources a regional endpoint serves are the ones created through it.
-        let fetched = transcribe
-            .call_in_region(
-                "GetTranscriptionJob",
-                json!({"TranscriptionJobName": name.clone()}),
-                Some(scope_region),
-            )
+        // Read back through the SAME Region's endpoint the job was started through —
+        // the resources a regional endpoint serves are the ones created through it —
+        // polling until the job has finished rather than waiting out its span.
+        let job = transcribe
+            .transcription_job_settled(&name, Some(scope_region))
             .await;
-        let job = fetched.ok(scope_region)["TranscriptionJob"].clone();
+        let reported = job["Transcript"]["TranscriptFileUri"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {scope_region:?}: a completed job reports a transcript \
+                     location, got {:?}",
+                    job["Transcript"]
+                )
+            })
+            .to_string();
+        // The Region reaches the service-managed bucket the transcript is stored in,
+        // which is the object the reported temporary address names (`named_object`).
         assert_eq!(
-            job["Transcript"]["TranscriptFileUri"],
-            json!(format!(
-                "https://s3.{expected_region}.amazonaws.com/aws-transcribe-{expected_region}-prod/{account}/{name}.json"
-            )),
-            "case {scope_region:?}: expected a transcript URI in {expected_region}, got {:?}",
-            job["Transcript"]["TranscriptFileUri"]
+            named_object(&reported),
+            format!("/aws-transcribe-{expected_region}-prod/{account}/{name}.json"),
+            "case {scope_region:?}: expected a transcript URI in {expected_region}, got \
+             {reported:?}"
         );
     }
 }

@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the record reports — the transcript, its redacted twin, and one subtitle file
         // per modelled subtitle format — taken once per job, so neither the number of
         // writes nor the size of one grows with what a request sent.
-        let (outputs, job) = {
+        let (outputs, mut job, own_output_region) = {
             let mut store = state.lock();
             // Reporting only: the lookup's sole write is the status transition the clock
             // already owed this job, which was due at its stored instant whether or not
@@ -211,7 +211,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            (crate::state::due_output_objects(record), record.to_job())
+            (
+                crate::state::due_output_objects(record),
+                record.to_job(),
+                // WHOSE bucket this job's output is in, read off the stored request: the
+                // Region of this service's own store for a job that named no bucket of
+                // its own, and `None` for one that did.
+                record.service_managed_output_region(),
+            )
         };
         if !crate::state::store_job_outputs(ctx, &region, &outputs).await {
             // A write the object store did not take leaves the job still owing it, so
@@ -223,7 +230,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        if let Some(region) = own_output_region.as_deref() {
+            crate::state::report_transcription_job_locations(ctx, region, &mut job);
+        }
+
         Ok(GetTranscriptionJobOutput {
+            // Each location this job reports is REPORTED as a caller can fetch it: a
+            // service-managed one as the temporary pre-signed address of the document
+            // just stored there, and one in a bucket the request named as the caller's
+            // own address (`crate::state::report_transcription_job_locations`).
             transcription_job: Some(job),
         })
     }

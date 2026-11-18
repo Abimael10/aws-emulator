@@ -204,8 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // words the object store did not serve, which has no file of its
             // own (`crate::state::VocabularyFilterRecord::download_uri`). This answer
             // itself carries no words: `GetVocabularyFilterResponse` has no member for
-            // them, so the location is how the filter's content is reported.
-            download_uri: record.download_uri(),
+            // them, so the location is how the filter's content is reported. It is a
+            // TEMPORARY pre-signed address a client fetches with no credential of its
+            // own (`crate::state::service_managed_uri`).
+            download_uri: record.download_uri(ctx),
             data_access_role_arn: record.data_access_role_arn.clone(),
             encryption_configuration: record.encryption_configuration.clone(),
         })

@@ -28,6 +28,7 @@ use service_com_amazonaws_transcribe_transcribe::state::{
 };
 
 use crate::call_analytics_jobs::{get, job_name, list, names_of, PAST_THE_TRANSITION};
+use crate::served_download_locations::named_object;
 use crate::transcription_jobs::Transcribe;
 
 /// Every value the model's `MediaFormat` enum carries, read from the generated
@@ -412,9 +413,11 @@ async fn a_finished_job_reports_the_transcripts_its_redaction_settings_asked_for
             .unwrap_or_else(|| panic!("case {case:?}: a redacted location, got {transcript:?}"))
             .to_string();
         // Two separate files: the redacted one is a location of its own, in the same
-        // folder the unredacted output goes to, under the job's own output name.
+        // folder the unredacted output goes to, under the job's own output name. A
+        // service-managed location is a temporary address, so the OBJECT it names is
+        // what carries the file name and the folder (`object_path`).
         assert!(
-            redacted_uri.ends_with(".json"),
+            named_object(&redacted_uri).ends_with(".json"),
             "case {case:?}: the redacted transcript is a transcript file, got \
              {redacted_uri:?}"
         );
@@ -424,10 +427,10 @@ async fn a_finished_job_reports_the_transcripts_its_redaction_settings_asked_for
                 "case {case:?}: the two transcripts are separate files, got \
                  {redacted_uri:?} for both"
             );
-            let (redacted_folder, _) = redacted_uri
+            let (redacted_folder, _) = named_object(&redacted_uri)
                 .rsplit_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: an S3 URI has a folder"));
-            let (unredacted_folder, _) = unredacted_uri
+            let (unredacted_folder, _) = named_object(unredacted_uri)
                 .rsplit_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: an S3 URI has a folder"));
             assert_eq!(

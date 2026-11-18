@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_transcribe_transcribe::ops::types::REDACTION_OUTPUT_VALUES;
 use service_com_amazonaws_transcribe_transcribe::state::DEFAULT_REGION;
 
+use crate::served_download_locations::named_object;
 use crate::transcription_jobs::Transcribe;
 
 /// Long enough for every clock-owed transition of a job started during the test to
@@ -225,7 +226,7 @@ async fn a_completed_job_reports_the_transcripts_its_redaction_settings_asked_fo
                     "case {case:?}: {member} must be a modelled Uri, got {uri:?}"
                 );
                 assert!(
-                    uri.ends_with(".json"),
+                    named_object(uri).ends_with(".json"),
                     "case {case:?}: {member} names a transcript file, got {uri:?}"
                 );
             }
@@ -242,10 +243,10 @@ async fn a_completed_job_reports_the_transcripts_its_redaction_settings_asked_fo
                 "case {case:?}: the two transcripts are separate files, got \
                  {redacted_uri:?} for both"
             );
-            let (redacted_folder, _) = redacted_uri
+            let (redacted_folder, _) = named_object(redacted_uri)
                 .rsplit_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: an output URI has a folder"));
-            let (unredacted_folder, _) = unredacted_uri
+            let (unredacted_folder, _) = named_object(unredacted_uri)
                 .rsplit_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: an output URI has a folder"));
             assert_eq!(
@@ -255,18 +256,51 @@ async fn a_completed_job_reports_the_transcripts_its_redaction_settings_asked_fo
             );
         }
 
-        // A read does not change what a later read sees.
+        // A read does not change what a later read sees: the same job, and the same
+        // OBJECTS at the locations it reports. A service-managed location is a
+        // temporary address, so the signature each read mints over it is not part of
+        // what two reads must agree on (`crate::served_download_locations`).
         let again = transcribe
             .call(
                 "GetTranscriptionJob",
                 json!({"TranscriptionJobName": job_name(&row.request)}),
             )
             .await;
+        let second = again.ok(case)["TranscriptionJob"].clone();
         assert_eq!(
-            again.ok(case)["TranscriptionJob"], *job,
+            transcript_objects(&second["Transcript"]),
+            transcript_objects(&transcript),
+            "case {case:?}: a second read must report the same transcript objects"
+        );
+        let (mut first_rest, mut second_rest) = (job.clone(), second);
+        for rest in [&mut first_rest, &mut second_rest] {
+            if let Some(members) = rest.as_object_mut() {
+                members.remove("Transcript");
+            }
+        }
+        assert_eq!(
+            second_rest, first_rest,
             "case {case:?}: a second read must report the same job"
         );
     }
+}
+
+/// The OBJECT each location of a projected `Transcript` names: a location in the
+/// caller's own bucket is that very address, and a service-managed one is a temporary
+/// address whose object is the path it carries ([`named_object`]).
+fn transcript_objects(transcript: &Value) -> Value {
+    let members = transcript.as_object().cloned().unwrap_or_default();
+    Value::Object(
+        members
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    json!(value.as_str().map(named_object).unwrap_or_default()),
+                )
+            })
+            .collect(),
+    )
 }
 
 #[tokio::test]
@@ -345,8 +379,7 @@ async fn the_redacted_transcript_sits_beside_the_unredacted_one_in_the_requested
             }),
             json!({
                 "RedactedTranscriptFileUri": format!(
-                    "https://s3.{DEFAULT_REGION}.amazonaws.com/\
-                     aws-transcribe-{DEFAULT_REGION}-prod/{account}/redacted-redacted-only.json"
+                    "/aws-transcribe-{DEFAULT_REGION}-prod/{account}/redacted-redacted-only.json"
                 )
             }),
         ),
@@ -358,18 +391,15 @@ async fn the_redacted_transcript_sits_beside_the_unredacted_one_in_the_requested
             .await
             .ok(case);
     }
-    std::thread::sleep(PAST_EVERY_TRANSITION);
-
     for (case, request, expected) in &rows {
-        let fetched = transcribe
-            .call(
-                "GetTranscriptionJob",
-                json!({"TranscriptionJobName": job_name(request)}),
-            )
+        // Poll until the job has finished rather than waiting out its span: the
+        // locations a job reports are the FINISHED job's.
+        let job = transcribe
+            .transcription_job_settled(&job_name(request), None)
             .await;
-        let job = fetched.ok(case)["TranscriptionJob"].clone();
         assert_eq!(
-            &job["Transcript"], expected,
+            &transcript_objects(&job["Transcript"]),
+            expected,
             "case {case:?}: expected the transcript locations {expected:?}, got {:?}",
             job["Transcript"]
         );

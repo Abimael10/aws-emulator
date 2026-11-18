@@ -366,9 +366,16 @@ pub(crate) fn start_request(row: &Row) -> Value {
 }
 
 /// The path a client resolves a reported output URI to: everything from the bucket on,
-/// whether the URI is the `s3://BUCKET/KEY` of a caller-named location or the
-/// path-style `https://s3.REGION.amazonaws.com/BUCKET/KEY` of a service-managed one.
+/// whether the URI is the `s3://BUCKET/KEY` of a caller-named location or the temporary
+/// pre-signed address of a service-managed one (`crate::served_download_locations` pins
+/// what that address IS).
+///
+/// The query a temporary address carries its signature in is NOT part of which object it
+/// names, so it is dropped here: the suites around this helper address the store with a
+/// credential scope of their own, since what they are about is the object, not the
+/// authority a fetch presents.
 pub(crate) fn object_path(case: &str, uri: &str) -> String {
+    let uri = uri.split('?').next().unwrap_or(uri);
     if let Some(rest) = uri.strip_prefix("s3://") {
         return format!("/{rest}");
     }

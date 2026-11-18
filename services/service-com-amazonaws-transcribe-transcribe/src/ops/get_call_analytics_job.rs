@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // callback, one small document per distinct location the record reports, taken
         // once per job. Collected while the store is locked and written after the guard
         // is dropped, so no lock is held across the call into object storage.
-        let (outputs, job) = {
+        let (outputs, mut job, own_output_region) = {
             let mut store = state.lock();
             // The family's single lookup, so every reader sees the status the clock
             // already owed this job — the only write a read performs.
@@ -197,7 +197,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            (crate::state::due_output_objects(record), record.to_job())
+            (
+                crate::state::due_output_objects(record),
+                record.to_job(),
+                // WHOSE bucket this job's transcript is in, read off the stored request:
+                // the Region of this service's own store for a job that named no output
+                // location of its own, and `None` for one that did.
+                record.service_managed_output_region(),
+            )
         };
         if !crate::state::store_job_outputs(ctx, &region, &outputs).await {
             // A write the object store did not take leaves the job still owing it, so
@@ -209,7 +216,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        if let Some(region) = own_output_region.as_deref() {
+            crate::state::report_call_analytics_job_locations(ctx, region, &mut job);
+        }
+
         Ok(GetCallAnalyticsJobOutput {
+            // Each location this job reports is REPORTED as a caller can fetch it: a
+            // service-managed one as the temporary pre-signed address of the document
+            // just stored there, and an output location the request named as the
+            // caller's own address (`crate::state::report_call_analytics_job_locations`).
             call_analytics_job: Some(job),
         })
     }

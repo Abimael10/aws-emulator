@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::served_download_locations::named_object;
 use crate::transcription_jobs::{Reply, Transcribe};
 
 /// Long enough for the `IN_PROGRESS -> COMPLETED` transition of a job started during
@@ -460,15 +461,16 @@ async fn the_transcript_location_follows_the_documented_output_location_rule() {
     // (`s3://BUCKET`, `s3://BUCKET/my-output-folder/`,
     // `s3://BUCKET/my-output-folder/my-call-analytics-job.json`), a folder spelled
     // without its trailing slash, and the service-managed location a request that
-    // names none gets.
+    // names none gets. Each row is the OBJECT the reported location names
+    // (`object_path`): a location in the caller's own bucket is reported as that
+    // address, while a service-managed one is a temporary address into this emulator's
+    // own store, whose object is the path it carries (`crate::served_download_locations`
+    // pins what that address IS).
     let rows: Vec<(&str, Option<&str>, String)> = vec![
         (
             "no output location: the service-managed location",
             None,
-            format!(
-                "https://s3.us-east-1.amazonaws.com/aws-transcribe-us-east-1-prod/\
-                 {account}/output-none.json"
-            ),
+            format!("/aws-transcribe-us-east-1-prod/{account}/output-none.json"),
         ),
         (
             "a bucket alone",
@@ -513,16 +515,32 @@ async fn the_transcript_location_follows_the_documented_output_location_rule() {
             .ok(case);
     }
 
-    std::thread::sleep(PAST_THE_TRANSITION);
-
     for ((case, _, expected), name) in rows.iter().zip(names) {
-        let fetched = get(&transcribe, name).await;
-        let job = fetched.ok(case)["CallAnalyticsJob"].clone();
+        // Poll until the job has finished rather than waiting out its span: the
+        // location it reports is the FINISHED job's.
+        let job = transcribe
+            .job_settled(
+                "GetCallAnalyticsJob",
+                "CallAnalyticsJobName",
+                "CallAnalyticsJob",
+                "CallAnalyticsJobStatus",
+                name,
+                None,
+            )
+            .await;
+        let reported = job["Transcript"]["TranscriptFileUri"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: a finished job reports a transcript location, got {:?}",
+                    job["Transcript"]
+                )
+            })
+            .to_string();
         assert_eq!(
-            job["Transcript"]["TranscriptFileUri"],
-            json!(expected),
-            "case {case:?}: expected the transcript at {expected}, got {:?}",
-            job["Transcript"]["TranscriptFileUri"]
+            named_object(&reported),
+            expected.as_str(),
+            "case {case:?}: expected the transcript at {expected}, got {reported:?}"
         );
     }
 }

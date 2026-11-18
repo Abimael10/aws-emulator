@@ -217,8 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // them as the text file there (`crate::state::store_vocabulary_content`),
             // so a client reads the terms back by fetching it. This answer itself
             // carries no terms: `GetVocabularyResponse` has no member for them, so the
-            // location is how the vocabulary's content is reported.
-            download_uri: record.download_uri(),
+            // location is how the vocabulary's content is reported. It is a TEMPORARY
+            // pre-signed address a client fetches with no credential of its own
+            // (`crate::state::service_managed_uri`).
+            download_uri: record.download_uri(ctx),
             data_access_role_arn: record.data_access_role_arn.clone(),
             encryption_configuration: record.encryption_configuration.clone(),
         })

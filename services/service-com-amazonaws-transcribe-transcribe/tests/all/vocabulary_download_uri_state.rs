@@ -28,20 +28,11 @@
 //! assertions are the transcription-job suite's harness
 //! (`crate::transcription_jobs`), reused rather than stood up a second time.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 use crate::medical_vocabularies::is_absent;
+use crate::served_download_locations::named_object;
 use crate::transcription_jobs::{Reply, Transcribe};
-
-/// Long enough for the one clock-owed transition of a vocabulary created or updated
-/// during the test to have fallen due: one span of
-/// `crate::state::VOCABULARY_TRANSITION_DELAY` (500 ms), with room for a slow machine.
-///
-/// Waited out with `std::thread::sleep`: the workspace enables tokio's `macros`, `rt`
-/// and `rt-multi-thread` features only, so `tokio::time::sleep` is not available here.
-const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
 
 /// The state whose documentation makes the vocabulary usable, and the only one a
 /// `DownloadUri` belongs to.
@@ -172,7 +163,8 @@ fn assert_download_uri_matches_state(reply: &Reply, case: &str, name: &str) {
     );
     if let Some(uri) = reported.and_then(Value::as_str) {
         assert!(
-            (uri.starts_with("s3://") || uri.starts_with("http")) && uri.ends_with(name),
+            (uri.starts_with("s3://") || uri.starts_with("http"))
+                && named_object(uri).ends_with(name),
             "case {case:?}: a reported DownloadUri must name this vocabulary's own \
              location, got {uri:?}"
         );
@@ -221,29 +213,36 @@ async fn a_download_uri_is_reported_only_once_the_build_has_finished() {
         assert_download_uri_matches_state(&pending, row.case, &name);
     }
 
-    // The transition the clock owed every one of these builds has now fallen due.
-    std::thread::sleep(PAST_THE_TRANSITION);
-
     for row in &rows {
         let name = name_of(&row.request);
+        // The transition the clock owes each build is waited for by POLLING the family's
+        // reader, not by waiting out its span.
+        let state = transcribe
+            .vocabulary_state_settled(row.get, &name, None)
+            .await;
+        assert_eq!(
+            state, row.settled_state,
+            "case {:?}: the build must settle in {}, got {state:?}",
+            row.case, row.settled_state,
+        );
         let settled = transcribe.call(row.get, json!({"VocabularyName": &name})).await;
         settled.ok(row.case);
-        assert_eq!(
-            settled.member(row.case, "VocabularyState"),
-            row.settled_state,
-            "case {:?}: the build must settle in {}, got {:?}",
-            row.case,
-            row.settled_state,
-            settled.body
-        );
         assert_download_uri_matches_state(&settled, row.case, &name);
 
-        // A read changes nothing, so a second one answers the same.
+        // A read changes nothing, so a second one reports the same OBJECT: the address
+        // is temporary, so what two reads must agree on is which object it names.
         let again = transcribe.call(row.get, json!({"VocabularyName": &name})).await;
         again.ok(row.case);
+        let reported_object = |reply: &Reply| {
+            reply
+                .body
+                .get("DownloadUri")
+                .and_then(Value::as_str)
+                .map(|uri| named_object(uri).to_string())
+        };
         assert_eq!(
-            again.body.get("DownloadUri"),
-            settled.body.get("DownloadUri"),
+            reported_object(&again),
+            reported_object(&settled),
             "case {:?}: reading a vocabulary twice must report the same location",
             row.case
         );
@@ -268,7 +267,11 @@ async fn a_rebuild_withdraws_the_download_uri_until_it_finishes() {
         )
         .await
         .ok("create the vocabulary to rebuild");
-    std::thread::sleep(PAST_THE_TRANSITION);
+    let state = transcribe.vocabulary_settled(name, None).await;
+    assert_eq!(
+        state, READY,
+        "the vocabulary to rebuild must settle {READY}, got {state:?}"
+    );
 
     let built = transcribe
         .call("GetVocabulary", json!({"VocabularyName": name}))
@@ -346,7 +349,11 @@ async fn a_rebuild_withdraws_the_download_uri_until_it_finishes() {
         );
         assert_download_uri_matches_state(&rebuilding, case, name);
 
-        std::thread::sleep(PAST_THE_TRANSITION);
+        let state = transcribe.vocabulary_settled(name, None).await;
+        assert_eq!(
+            state, settled_state,
+            "case {case:?}: the rebuild must settle in {settled_state}, got {state:?}"
+        );
         let settled = transcribe
             .call("GetVocabulary", json!({"VocabularyName": name}))
             .await;
@@ -360,8 +367,8 @@ async fn a_rebuild_withdraws_the_download_uri_until_it_finishes() {
         assert_download_uri_matches_state(&settled, case, name);
         if settled_state == READY {
             assert_eq!(
-                settled.member(case, "DownloadUri"),
-                first_uri,
+                named_object(&settled.member(case, "DownloadUri")),
+                named_object(&first_uri),
                 "case {case:?}: a rebuilt vocabulary is stored in the same place as \
                  before, got {:?}",
                 settled.body

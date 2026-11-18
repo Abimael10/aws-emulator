@@ -212,8 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the member stays absent while the build is still running, and for one
             // whose table file the object store did not serve, rather than naming a
             // location that holds nothing. See
-            // `crate::state::MedicalVocabularyRecord::download_uri`.
-            download_uri: record.download_uri(),
+            // `crate::state::MedicalVocabularyRecord::download_uri`. It is a TEMPORARY
+            // pre-signed address a client fetches with no credential of its own
+            // (`crate::state::service_managed_uri`).
+            download_uri: record.download_uri(ctx),
         })
     }
 }

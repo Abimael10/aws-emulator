@@ -424,10 +424,18 @@ async fn a_delete_withdraws_only_the_documents_of_its_own_job() {
     }
 
     // The name is free again, and the job started under it owes the same location its
-    // own document.
+    // own document. A service-managed location is a temporary address, so what the two
+    // runs must agree on is the OBJECT each one names.
     let restarted = served_locations(&router, &deleted).await;
+    let objects = |locations: &[String]| -> Vec<String> {
+        locations
+            .iter()
+            .map(|location| object_path(deleted.case, location))
+            .collect()
+    };
     assert_eq!(
-        restarted, deleted_locations,
+        objects(&restarted),
+        objects(&deleted_locations),
         "case {:?}: a job restarted under the freed name reports the same location, got \
          {restarted:?}",
         deleted.case

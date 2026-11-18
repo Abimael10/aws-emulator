@@ -31,6 +31,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::served_download_locations::named_object;
 use crate::transcription_jobs::{dispatch, Reply};
 
 /// How long [`Transcribe::settled_state`] waits between two polls, and how many polls
@@ -79,10 +80,14 @@ impl Emulator {
     /// Fetch `uri` — a `DownloadUri` as a reader reported it — from the emulator's
     /// Amazon S3 front door, answering the HTTP status and the raw body.
     ///
-    /// The URI is path-style (`https://s3.<region>.amazonaws.com/<bucket>/<key>`), so
-    /// what a client resolves to a request line is everything from the host's first
-    /// slash. S3 is a REST service: the bucket and the key live in the URI, which is
-    /// why this is a raw request rather than an `x-amz-target` call.
+    /// A reported location is a temporary pre-signed address into the service-managed
+    /// store (`crate::served_download_locations` pins what one IS), so what a client
+    /// resolves to a request line is everything from the host's first slash, the query
+    /// its signature travels in included. S3 is a REST service: the bucket and the key
+    /// live in the URI, which is why this is a raw request rather than an
+    /// `x-amz-target` call. WHAT is served there is this suite's subject, so the
+    /// request also carries a credential scope naming the store, rather than resting on
+    /// the address's own signature.
     pub(crate) async fn fetch(&self, uri: &str, region: &str) -> (u16, Vec<u8>) {
         let path = uri
             .split_once("://")
@@ -346,7 +351,7 @@ async fn assert_location_serves(emulator: &Emulator, row: &Row, expected: &[Stri
             panic!("case {case:?}: a built resource must report a DownloadUri, got none")
         });
     assert!(
-        uri.contains(row.region) && uri.ends_with(row.name),
+        uri.contains(row.region) && named_object(&uri).ends_with(row.name),
         "case {case:?}: a reported DownloadUri names this resource's own location, got \
          {uri:?}"
     );

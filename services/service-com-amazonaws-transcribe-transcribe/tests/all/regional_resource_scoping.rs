@@ -39,6 +39,7 @@ use service_com_amazonaws_transcribe_transcribe::state::{
     DEFAULT_REGION, MAX_REGIONS, MAX_VOCABULARIES,
 };
 
+use crate::served_download_locations::named_object;
 use crate::transcription_jobs::Transcribe;
 
 /// Long enough for every clock-owed transition of a resource created during the test to
@@ -599,7 +600,8 @@ async fn an_update_reaches_only_its_own_regions_resource() {
         )
         .await
         .ok("vocabulary: create");
-    std::thread::sleep(PAST_EVERY_TRANSITION);
+    // Wait for the build by POLLING the reader, not by waiting out its span.
+    transcribe.vocabulary_ready("stays-put", Some(HOME)).await;
 
     let before = transcribe
         .call_in_region(
@@ -642,8 +644,8 @@ async fn an_update_reaches_only_its_own_regions_resource() {
         .await;
     let case = format!("vocabulary: after the refused update in {elsewhere}");
     assert_eq!(
-        after.member(&case, "DownloadUri"),
-        download_uri,
+        named_object(&after.member(&case, "DownloadUri")),
+        named_object(&download_uri),
         "case {case:?}: the refused update must leave the reported DownloadUri where it was"
     );
     assert_eq!(
@@ -716,7 +718,7 @@ async fn an_update_reaches_only_its_own_regions_resource() {
         )
         .await;
     served.ok(&format!("vocabulary: update in {HOME}"));
-    std::thread::sleep(PAST_EVERY_TRANSITION);
+    transcribe.vocabulary_ready("stays-put", Some(HOME)).await;
     let case = format!("vocabulary: after the served update in {HOME}");
     let reread = transcribe
         .call_in_region(
@@ -726,8 +728,8 @@ async fn an_update_reaches_only_its_own_regions_resource() {
         )
         .await;
     assert_eq!(
-        reread.member(&case, "DownloadUri"),
-        download_uri,
+        named_object(&reread.member(&case, "DownloadUri")),
+        named_object(&download_uri),
         "case {case:?}: an update does not move the Region a resource lives in"
     );
 }
