@@ -13,13 +13,15 @@
 //! lifetime hangs off ([`ClusterEndpoint`]) together with the state the protocol
 //! answers from.
 //!
-//! ONE socket per cluster serves every access path that cluster enables. A Kafka
+//! ONE socket per access path a cluster enables. A Kafka
 //! request frame begins with its length, so its first byte is never the `0x16` a TLS
 //! record opens with: the connection's first byte says whether the client dialled the
 //! encrypted half or the plaintext one ([`::service_common::in_band_tls`]), which is
 //! how one announced address serves the plaintext, TLS and SASL ports MSK publishes
 //! separately. What a connection may do once it is open is the cluster's own
-//! client-authentication configuration ([`wire`] and [`sasl`]).
+//! client-authentication configuration ([`wire`] and [`sasl`]) and, for a connection
+//! authenticated with IAM, the policies of the principal that signed it
+//! ([`iam_access`]).
 //!
 //! The log itself is this state's: a produced record is kept here and handed back to a
 //! fetch from the offset it was written at, and a record older than the topic's
@@ -31,14 +33,17 @@ use std::collections::{BTreeMap, VecDeque};
 use super::*;
 
 pub mod acls;
+pub mod broker_config;
 pub mod groups;
+pub mod iam_access;
 pub mod sasl;
 pub mod topics;
 pub mod wire;
 
-/// The broker node id the endpoint reports itself under in `Metadata`, and the leader
-/// of every partition it serves: one socket serves the cluster, so the client is told
-/// about the one broker that answers it.
+/// The broker node id a cluster with no broker nodes of its own reports itself under in
+/// `Metadata`: an Amazon MSK Serverless cluster publishes no brokers, so the one endpoint
+/// its clients reach is one broker to them. It is also the node a group's coordinator is
+/// reported as.
 pub const BROKER_NODE_ID: i32 = 1;
 
 /// The most bytes one request frame on a broker connection may carry. Apache Kafka's
@@ -299,11 +304,17 @@ impl ClusterEndpoint {
 /// The `host:port` the cluster `cluster_arn` names answers `path` connections on,
 /// opening the socket on first use.
 ///
+/// `None` when this service was mounted on an engine with no listener surface or no
+/// store, when the store holds no cluster under that ARN in this Region, when this
+/// emulator already holds [`MAX_CLUSTER_ENDPOINTS`] endpoints, or when the core could not
+/// bind — the caller then answers with a modelled error rather than announcing an address
+/// nothing serves. A socket is opened only for a cluster the store HOLDS, so no request
+/// can make the process bind one for an ARN it invented.
+///
 /// Idempotent: the first socket opened for a cluster's path is kept, so every later
 /// `GetBootstrapBrokers` answers the same address and a client may key a connection
-/// on it. `None` when this service was mounted on an engine with no listener surface
-/// or no store, or when the core could not bind — the caller then answers with a
-/// modelled error rather than announcing an address nothing serves.
+/// on it. It is released when the cluster leaves the registry
+/// ([`ComAmazonawsKafkaKafkaState::unregister_cluster`]), which closes the port.
 pub async fn ensure_cluster_endpoint<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -313,15 +324,21 @@ pub async fn ensure_cluster_endpoint<Eng: Send + Sync + 'static>(
 ) -> Option<String> {
     let state = super::service_state(engine)?;
     let key = (cluster_arn.to_string(), path);
-    // The guard is taken and dropped before the await below: a lock held across an
-    // await would make this future non-`Send`.
-    if let Some(authority) = state
-        .lock()
-        .cluster_endpoints
-        .get(&key)
-        .map(|endpoint| endpoint.authority().to_string())
-    {
-        return Some(authority);
+    // Everything read off the store is read under ONE guard, taken and dropped before
+    // the awaits below: a lock held across an await would make this future non-`Send`.
+    let held = {
+        let store = state.lock();
+        if let Some(endpoint) = store.cluster_endpoints.get(&key) {
+            return Some(endpoint.authority().to_string());
+        }
+        // A socket is bound for a cluster this endpoint HOLDS, and for no other ARN: the
+        // key comes from the request, so binding on a name nothing resolves would let one
+        // caller grow the process's port and descriptor use without end.
+        store.cluster_in(region, cluster_arn).is_some()
+            && store.cluster_endpoints.len() < MAX_CLUSTER_ENDPOINTS
+    };
+    if !held {
+        return None;
     }
 
     let listeners = (engine as &dyn ::std::any::Any)
@@ -339,6 +356,10 @@ pub async fn ensure_cluster_endpoint<Eng: Send + Sync + 'static>(
             // the clear.
             listeners.tls_upgrader().ok(),
             ctx.callback().clone(),
+            // Where a connection's IAM permissions are read from: the stores
+            // themselves, so a policy written after this socket was opened is in force
+            // on the next connection ([`iam_access`]).
+            iam_access::PolicySource::of_engine(engine),
         ))
         .await
         .ok()?;
@@ -349,6 +370,11 @@ pub async fn ensure_cluster_endpoint<Eng: Send + Sync + 'static>(
     // announced address never moves under a client. Dropping the loser closes its port.
     if let Some(held) = store.cluster_endpoints.get(&key) {
         return Some(held.authority().to_string());
+    }
+    // The ceiling is re-read under the write lock, so concurrent calls cannot carry the
+    // registry past it between the check above and this insert.
+    if store.cluster_endpoints.len() >= MAX_CLUSTER_ENDPOINTS {
+        return None;
     }
     let endpoint = ClusterEndpoint {
         authority: authority.clone(),
@@ -362,6 +388,34 @@ pub async fn ensure_cluster_endpoint<Eng: Send + Sync + 'static>(
         "opened a cluster's Apache Kafka endpoint"
     );
     Some(authority)
+}
+
+/// The most Apache Kafka endpoints this emulator holds open at once, across every
+/// cluster and access path.
+///
+/// CHOSEN as a process-safety bound, not an Amazon MSK limit: each endpoint owns a
+/// listening socket and its file descriptor for as long as its cluster is in the
+/// registry, and how many clusters a caller creates is the caller's choice. Sized well
+/// above the four paths of the clusters an emulator is driven with
+/// ([`super::MAX_CLUSTERS_PER_REGION`] clusters times four paths would be the ceiling of
+/// a run that bootstrapped every path of every cluster).
+pub const MAX_CLUSTER_ENDPOINTS: usize = 512;
+
+impl ComAmazonawsKafkaKafkaState {
+    /// The broker node ids the cluster `cluster_arn` reports to a client, in id order:
+    /// its own broker nodes, and the one node a cluster that publishes none stands
+    /// behind ([`BROKER_NODE_ID`]).
+    pub fn broker_node_ids(&self, region: &str, cluster_arn: &str) -> Vec<i32> {
+        let mut held: Vec<i32> = self
+            .cluster_in(region, cluster_arn)
+            .map(|cluster| cluster.brokers.iter().map(|broker| broker.id).collect())
+            .unwrap_or_default();
+        held.sort_unstable();
+        match held.is_empty() {
+            true => vec![BROKER_NODE_ID],
+            false => held,
+        }
+    }
 }
 
 /// A topic's configuration as the data plane reads it: the entries the topic SETS, and
@@ -473,6 +527,19 @@ impl PartitionRefusal {
     }
 }
 
+/// One topic of a cluster as the data plane reports it: its name, the partitions this
+/// endpoint serves for it, and how many brokers each of those partitions is placed on.
+#[derive(Debug, Clone)]
+pub struct DataPlaneTopic {
+    /// The topic's name.
+    pub name: String,
+    /// How many partitions it has.
+    pub partitions: i32,
+    /// How many replicas each partition is placed on: the topic's replication factor,
+    /// which is what a client reads back as the partition's replica set.
+    pub replication_factor: i32,
+}
+
 /// What a fetch of one partition answers: the records it read and where the log
 /// begins and ends.
 #[derive(Debug, Clone)]
@@ -495,16 +562,21 @@ impl ComAmazonawsKafkaKafkaState {
     }
 
     /// The topics of the cluster `cluster_arn` a client's `Metadata` reports, each with
-    /// the number of partitions this endpoint serves for it: the topic's own count,
-    /// bounded by [`MAX_PARTITIONS_PER_TOPIC`] so one topic cannot size the answer.
-    pub fn data_plane_topics(&mut self, cluster_arn: &str, now: SystemTime) -> Vec<(String, i32)> {
+    /// the number of partitions this endpoint serves for it — the topic's own count,
+    /// bounded by [`MAX_PARTITIONS_PER_TOPIC`] so one topic cannot size the answer — and
+    /// the number of replicas each of those partitions is placed on, which is the
+    /// topic's own replication factor.
+    pub fn data_plane_topics(
+        &mut self,
+        cluster_arn: &str,
+        now: SystemTime,
+    ) -> Vec<DataPlaneTopic> {
         self.observable_topics_in(cluster_arn, now)
             .into_iter()
-            .map(|(name, topic)| {
-                (
-                    name,
-                    topic.partition_count.clamp(1, MAX_PARTITIONS_PER_TOPIC),
-                )
+            .map(|(name, topic)| DataPlaneTopic {
+                name,
+                partitions: topic.partition_count.clamp(1, MAX_PARTITIONS_PER_TOPIC),
+                replication_factor: topic.replication_factor.max(1),
             })
             .collect()
     }

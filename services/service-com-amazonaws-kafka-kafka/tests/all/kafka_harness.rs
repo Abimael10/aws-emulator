@@ -46,6 +46,14 @@ pub const ACCOUNT: &str = "000000000000";
 /// authorization one drives the service as.
 pub const DEFAULT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
 
+/// How long [`Emulator::published_bootstrap`] waits for a cluster to publish an address
+/// before a suite calls it a failure, and how often it looks again. Generous against the
+/// span the service owes that transition, so neither says anything about how fast the
+/// host runs.
+pub const BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(60);
+/// See [`BOOTSTRAP_DEADLINE`].
+pub const BOOTSTRAP_PROBE_INTERVAL: Duration = Duration::from_millis(50);
+
 /// The kafka service mounted in a router, driven over HTTP exactly as the emulator
 /// serves it.
 pub struct Emulator {
@@ -296,6 +304,30 @@ impl Emulator {
             None,
         )
         .await
+    }
+
+    /// The address the cluster `arn` publishes under the bootstrap member `member`, once
+    /// it publishes one.
+    ///
+    /// `GetBootstrapBrokers` refuses while the cluster is still `CREATING`, so this LOOKS
+    /// AGAIN until the address is published rather than waiting out a span — the one
+    /// reading every data-plane suite of this crate dials its socket from, so no suite
+    /// keeps a probing loop of its own.
+    pub async fn published_bootstrap(&self, arn: &str, member: &str, case: &str) -> String {
+        let deadline = Instant::now() + BOOTSTRAP_DEADLINE;
+        loop {
+            let reply = self.bootstrap_brokers(arn).await;
+            if let Some(address) = reply.body.get(member).and_then(Value::as_str) {
+                return address.to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: the cluster never published {member}, last read {} {}",
+                reply.status,
+                reply.body
+            );
+            tokio::time::sleep(BOOTSTRAP_PROBE_INTERVAL).await;
+        }
     }
 
     /// `CreateChannel` under `cluster_arn`, signed for `region`. The channel

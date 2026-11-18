@@ -69,7 +69,7 @@ use ::smithy_server_runtime::EmbeddedEmulator;
 use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::sasl::{self, Authenticated, Mechanism};
-use super::{acls, groups, topics, AccessPath, BROKER_NODE_ID, MAX_FRAME_BYTES};
+use super::{acls, groups, iam_access, topics, AccessPath, BROKER_NODE_ID, MAX_FRAME_BYTES};
 
 /// The resource type a `DescribeConfigs` request names a TOPIC by, and the one it
 /// names a BROKER by (`ConfigResource.Type`, Apache Kafka protocol).
@@ -84,6 +84,10 @@ const RESOURCE_TYPE_BROKER: i8 = 4;
 const CONFIG_SOURCE_SET_BY_RESOURCE: i8 = 1;
 /// See [`CONFIG_SOURCE_SET_BY_RESOURCE`].
 const CONFIG_SOURCE_DEFAULT: i8 = 5;
+/// See [`CONFIG_SOURCE_SET_BY_RESOURCE`]: the source a BROKER value that comes from the
+/// `server.properties` the broker was started with is reported under
+/// (`STATIC_BROKER_CONFIG`).
+const CONFIG_SOURCE_STATIC_BROKER_CONFIG: i8 = 4;
 
 /// The timestamp a `ListOffsets` request names to ask for the EARLIEST offset still
 /// readable, and the one it names to ask for the offset the next produced record will
@@ -108,9 +112,37 @@ const MAX_FETCHED_RECORDS_PER_REQUEST: usize = 4096;
 /// size both the work and the response. Entries past it are not answered.
 const MAX_REQUEST_ENTRIES: usize = 1024;
 
+/// How often a call this endpoint HOLDS looks again at the state it is waiting on: a
+/// `JoinGroup` waiting for the group's other members, a `SyncGroup` waiting for the
+/// leader's assignment, and a `Fetch` waiting for records to arrive. The wait is on the
+/// condition, never on a fixed time, and nothing sleeps for the whole of a client's
+/// timeout: each pass re-reads the store, so the answer goes out as soon as it is there.
+const GROUP_POLL_INTERVAL: ::std::time::Duration = ::std::time::Duration::from_millis(20);
+
+/// The longest a `Fetch` is held while its partitions hold less than the request asked
+/// for. A client states its own `MaxWaitMs`, which this bounds: a wait longer than this
+/// would hold a connection — and one of the core's connection permits — for a client's
+/// whole poll interval. Apache Kafka's own `fetch.max.wait.ms` default is 500 ms, so a
+/// client's stated wait is normally far below it.
+const MAX_FETCH_WAIT: ::std::time::Duration = ::std::time::Duration::from_secs(5);
+
 /// The record batch version this endpoint writes: the format Apache Kafka has used
 /// since 0.11, which is what every client this endpoint can negotiate with reads.
 const RECORD_BATCH_VERSION: i8 = 2;
+
+/// What a fetch answer states when the leader has no replica it would rather the client
+/// read from (Apache Kafka protocol, `Fetch`: `PreferredReadReplica` is `-1` for no
+/// preference). Every broker of a cluster here reads the same log, so a client gains
+/// nothing by being sent elsewhere.
+const NO_PREFERRED_READ_REPLICA: i32 = -1;
+
+/// The leader epoch every partition of this cluster is at: a partition's leadership never
+/// moves here, so the first epoch is the current one.
+const CURRENT_LEADER_EPOCH: i32 = 0;
+
+/// The state a coordinator reports for a group it holds no record of (Apache Kafka's
+/// `DescribeGroups`).
+const DEAD_GROUP_STATE: &str = "Dead";
 
 /// The APIs this endpoint serves, and the versions of each: what `ApiVersions`
 /// advertises and what every other frame is admitted against, so a client negotiates
@@ -216,6 +248,39 @@ fn served_apis() -> Vec<(ApiKey, i16, i16)> {
         ApiKey::DeleteTopics,
         carried::<DeleteTopicsRequest, ::kafka_protocol::messages::DeleteTopicsResponse>(0, 5),
     );
+    // The API a consumer validates a position it resumed from with: a client that holds a
+    // committed offset and the leader epoch it was committed at asks the broker where
+    // that epoch ends before it fetches. Advertised because this endpoint answers it —
+    // and a client that sends an API a broker does not serve is disconnected, which
+    // leaves it reconnecting with no error it can report.
+    serve(
+        ApiKey::OffsetForLeaderEpoch,
+        carried::<
+            ::kafka_protocol::messages::OffsetForLeaderEpochRequest,
+            ::kafka_protocol::messages::OffsetForLeaderEpochResponse,
+        >(0, 4),
+    );
+    serve(
+        ApiKey::DescribeGroups,
+        carried::<
+            ::kafka_protocol::messages::DescribeGroupsRequest,
+            ::kafka_protocol::messages::DescribeGroupsResponse,
+        >(0, 5),
+    );
+    serve(
+        ApiKey::ListGroups,
+        carried::<
+            ::kafka_protocol::messages::ListGroupsRequest,
+            ::kafka_protocol::messages::ListGroupsResponse,
+        >(0, 4),
+    );
+    serve(
+        ApiKey::DeleteGroups,
+        carried::<
+            ::kafka_protocol::messages::DeleteGroupsRequest,
+            ::kafka_protocol::messages::DeleteGroupsResponse,
+        >(0, 2),
+    );
     apis
 }
 
@@ -248,6 +313,9 @@ pub struct ClusterBroker {
     /// IN-PROCESS handle, used to read a SASL/SCRAM credential out of the Secrets
     /// Manager secret the cluster associated. Nothing here dials out.
     emulator: EmbeddedEmulator,
+    /// Where a connection's IAM permissions are read from, for the IAM access control
+    /// this endpoint enforces on an IAM-authenticated connection.
+    policies: iam_access::PolicySource,
 }
 
 impl ClusterBroker {
@@ -260,6 +328,7 @@ impl ClusterBroker {
         state: ::engine::ServiceState<crate::state::ComAmazonawsKafkaKafkaState>,
         upgrader: Option<TlsUpgrader>,
         emulator: EmbeddedEmulator,
+        policies: iam_access::PolicySource,
     ) -> Self {
         Self {
             cluster_arn,
@@ -268,6 +337,7 @@ impl ClusterBroker {
             state,
             upgrader,
             emulator,
+            policies,
         }
     }
 }
@@ -282,6 +352,7 @@ impl NativeHandler for ClusterBroker {
             path: self.path,
             state: self.state.clone(),
             emulator: self.emulator.clone(),
+            policies: self.policies.clone(),
         };
         let upgrader = self.upgrader.clone();
         Box::pin(async move {
@@ -306,6 +377,7 @@ struct Broker {
     path: AccessPath,
     state: ::engine::ServiceState<crate::state::ComAmazonawsKafkaKafkaState>,
     emulator: EmbeddedEmulator,
+    policies: iam_access::PolicySource,
 }
 
 /// What one connection has established: which SASL mechanism it chose, how its tokens
@@ -327,6 +399,10 @@ struct Session {
     scram: Option<sasl::ScramExchange>,
     /// Who the connection is authenticated as, once the exchange has succeeded.
     identity: Option<Authenticated>,
+    /// What Amazon MSK's IAM access control lets this connection do, for a connection
+    /// authenticated with IAM. `None` for every other connection: what a SASL/SCRAM,
+    /// TLS or plaintext client may do is the cluster's ACL bindings, not an IAM policy.
+    permissions: Option<iam_access::Permissions>,
 }
 
 impl Session {
@@ -392,11 +468,30 @@ impl Broker {
         match self.sasl_leg(session, token.as_ref()).await {
             Ok(sasl::Leg::Continue(challenge)) => Some(challenge.to_vec()),
             Ok(sasl::Leg::Done { response, identity }) => {
-                session.identity = Some(identity);
+                self.authenticated(session, identity);
                 Some(response.to_vec())
             }
             Err(_) => None,
         }
+    }
+
+    /// Record who a completed exchange authenticated the connection as, together with
+    /// what it may do.
+    ///
+    /// For an IAM exchange that is the permission set of the identity the signing access
+    /// key speaks for, read once per connection: a connection authenticated with IAM is
+    /// allowed what that principal's policies allow and nothing else
+    /// ([`iam_access`]). An exchange of any other mechanism establishes a principal the
+    /// cluster's ACL bindings decide, so it carries no permission set.
+    fn authenticated(&self, session: &mut Session, identity: Authenticated) {
+        session.permissions = match session.mechanism {
+            Some(Mechanism::AwsMskIam | Mechanism::OAuthBearer) => Some(
+                self.policies
+                    .permissions(&identity.principal, SystemTime::now()),
+            ),
+            _ => None,
+        };
+        session.identity = Some(identity);
     }
 
     /// Answer one request frame, or `None` when the connection cannot be served any
@@ -448,12 +543,12 @@ impl Broker {
             }
             ApiKey::Produce => {
                 let request = ProduceRequest::decode(&mut body, api_version).ok()?;
-                let response = self.produce(&request, session.identity.as_ref());
+                let response = self.produce(&request, session);
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::Fetch => {
                 let request = FetchRequest::decode(&mut body, api_version).ok()?;
-                let response = self.fetch(&request, session.identity.as_ref());
+                let response = self.fetch(&request, session).await;
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::ListOffsets => {
@@ -478,51 +573,68 @@ impl Broker {
             }
             ApiKey::JoinGroup => {
                 let request = JoinGroupRequest::decode(&mut body, api_version).ok()?;
-                let response = self
-                    .group(&request.group_id.0, true, |group| group.join(&request))
-                    .unwrap_or_else(|| {
-                        ::kafka_protocol::messages::JoinGroupResponse::default()
-                            .with_error_code(no_coordinator())
-                    });
+                let response = self.join_group(&request, session).await;
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::SyncGroup => {
                 let request = SyncGroupRequest::decode(&mut body, api_version).ok()?;
-                let response = self
-                    .group(&request.group_id.0, false, |group| group.sync(&request))
-                    .unwrap_or_else(|| {
-                        ::kafka_protocol::messages::SyncGroupResponse::default()
-                            .with_error_code(no_coordinator())
-                    });
+                let response = self.sync_group(&request, session).await;
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::Heartbeat => {
                 let request = HeartbeatRequest::decode(&mut body, api_version).ok()?;
-                let response = self
-                    .group(&request.group_id.0, false, |group| group.heartbeat(&request))
-                    .unwrap_or_else(|| {
-                        ::kafka_protocol::messages::HeartbeatResponse::default()
-                            .with_error_code(no_coordinator())
-                    });
+                let response = match self.group_allowed(
+                    session,
+                    &request.group_id.0.to_string(),
+                    iam_access::ACTION_ALTER_GROUP,
+                ) {
+                    false => ::kafka_protocol::messages::HeartbeatResponse::default()
+                        .with_error_code(group_authorization_failed()),
+                    true => self
+                        .group(&request.group_id.0, false, |group| {
+                            group.heartbeat(&request, SystemTime::now())
+                        })
+                        .unwrap_or_else(|| {
+                            ::kafka_protocol::messages::HeartbeatResponse::default()
+                                .with_error_code(no_coordinator())
+                        }),
+                };
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::LeaveGroup => {
                 let request = LeaveGroupRequest::decode(&mut body, api_version).ok()?;
-                let response = self
-                    .group(&request.group_id.0, false, |group| group.leave(&request))
-                    .unwrap_or_else(|| {
-                        ::kafka_protocol::messages::LeaveGroupResponse::default()
-                            .with_error_code(no_coordinator())
-                    });
+                let response = match self.group_allowed(
+                    session,
+                    &request.group_id.0.to_string(),
+                    iam_access::ACTION_ALTER_GROUP,
+                ) {
+                    false => ::kafka_protocol::messages::LeaveGroupResponse::default()
+                        .with_error_code(group_authorization_failed()),
+                    true => self
+                        .group(&request.group_id.0, false, |group| {
+                            group.leave(&request, SystemTime::now())
+                        })
+                        .unwrap_or_else(|| {
+                            ::kafka_protocol::messages::LeaveGroupResponse::default()
+                                .with_error_code(no_coordinator())
+                        }),
+                };
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::OffsetCommit => {
                 let request = OffsetCommitRequest::decode(&mut body, api_version).ok()?;
-                let response = self
-                    .group(&request.group_id.0, true, |group| {
-                        group.commit(&request, MAX_REQUEST_ENTRIES)
-                    })
-                    .unwrap_or_default();
+                let response = match self.group_allowed(
+                    session,
+                    &request.group_id.0.to_string(),
+                    iam_access::ACTION_ALTER_GROUP,
+                ) {
+                    false => committed_nothing(&request, group_authorization_failed()),
+                    true => self
+                        .group(&request.group_id.0, true, |group| {
+                            group.commit(&request, MAX_REQUEST_ENTRIES)
+                        })
+                        .unwrap_or_default(),
+                };
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::OffsetFetch => {
@@ -530,11 +642,19 @@ impl Broker {
                 // A group nobody has joined has committed nothing, which is what the
                 // protocol's "no committed offset" answers — reading it registers no
                 // group.
-                let response = self
-                    .group(&request.group_id.0, false, |group| {
-                        group.fetch_offsets(&request)
-                    })
-                    .unwrap_or_else(|| groups::uncommitted_offsets(&request));
+                let response = match self.group_allowed(
+                    session,
+                    &request.group_id.0.to_string(),
+                    iam_access::ACTION_DESCRIBE_GROUP,
+                ) {
+                    false => ::kafka_protocol::messages::OffsetFetchResponse::default()
+                        .with_error_code(group_authorization_failed()),
+                    true => self
+                        .group(&request.group_id.0, false, |group| {
+                            group.fetch_offsets(&request)
+                        })
+                        .unwrap_or_else(|| groups::uncommitted_offsets(&request)),
+                };
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::CreateAcls => {
@@ -558,9 +678,10 @@ impl Broker {
                 // The ACL decision is taken BEFORE the store is locked: it reads the
                 // bindings under the same lock, so the two cannot be held at once.
                 let withheld = self.withheld_topics(
-                    session.identity.as_ref(),
+                    session,
                     request.topics.iter().map(|topic| topic.name.0.to_string()),
                     super::OPERATION_CREATE,
+                    iam_access::ACTION_CREATE_TOPIC,
                 );
                 let mut store = self.state.lock();
                 let response = topics::create(
@@ -578,7 +699,7 @@ impl Broker {
             ApiKey::DeleteTopics => {
                 let request = DeleteTopicsRequest::decode(&mut body, api_version).ok()?;
                 let withheld = self.withheld_topics(
-                    session.identity.as_ref(),
+                    session,
                     request
                         .topic_names
                         .iter()
@@ -587,6 +708,7 @@ impl Broker {
                             topic.name.as_ref().map(|name| name.0.to_string())
                         })),
                     super::OPERATION_DELETE,
+                    iam_access::ACTION_DELETE_TOPIC,
                 );
                 let mut store = self.state.lock();
                 let response = topics::delete(
@@ -598,6 +720,39 @@ impl Broker {
                     SystemTime::now(),
                 );
                 drop(store);
+                self.encode(key, api_version, &header, &response)
+            }
+            ApiKey::OffsetForLeaderEpoch => {
+                let request =
+                    ::kafka_protocol::messages::OffsetForLeaderEpochRequest::decode(
+                        &mut body,
+                        api_version,
+                    )
+                    .ok()?;
+                let response = self.offset_for_leader_epoch(&request, session);
+                self.encode(key, api_version, &header, &response)
+            }
+            ApiKey::DescribeGroups => {
+                let request = ::kafka_protocol::messages::DescribeGroupsRequest::decode(
+                    &mut body,
+                    api_version,
+                )
+                .ok()?;
+                let response = self.describe_groups(&request, session);
+                self.encode(key, api_version, &header, &response)
+            }
+            ApiKey::ListGroups => {
+                let request =
+                    ::kafka_protocol::messages::ListGroupsRequest::decode(&mut body, api_version)
+                        .ok()?;
+                let response = self.list_groups(&request);
+                self.encode(key, api_version, &header, &response)
+            }
+            ApiKey::DeleteGroups => {
+                let request =
+                    ::kafka_protocol::messages::DeleteGroupsRequest::decode(&mut body, api_version)
+                        .ok()?;
+                let response = self.delete_groups(&request, session);
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::DeleteAcls => {
@@ -673,7 +828,7 @@ impl Broker {
     }
 
     /// The authority the core bound for this path, which is the address a client
-    /// reaches this broker at.
+    /// reaches this cluster's brokers at.
     fn authority(&self) -> String {
         self.state
             .lock()
@@ -764,7 +919,7 @@ impl Broker {
                 SaslAuthenticateResponse::default().with_auth_bytes(challenge)
             }
             Ok(sasl::Leg::Done { response, identity }) => {
-                session.identity = Some(identity);
+                self.authenticated(session, identity);
                 SaslAuthenticateResponse::default().with_auth_bytes(response)
             }
             Err(refusal) => SaslAuthenticateResponse::default()
@@ -822,6 +977,327 @@ impl Broker {
         store.consumer_groups.get_mut(&key).map(answer)
     }
 
+    /// `JoinGroup`: admit the member into the rebalance its join starts or is part of,
+    /// and answer it once the rebalance has gathered the group's members.
+    ///
+    /// The coordinator HOLDS the call while that happens — which is what a client of this
+    /// API waits for, and what makes every member of one generation agree about the
+    /// membership the assignment was computed over. The group is read again on each pass
+    /// rather than under one held lock, so the other members' joins can arrive; a
+    /// rebalance that gathers nobody else ends at the barrier the group's own state
+    /// carries ([`groups::MAX_REBALANCE_BARRIER`]), so this never waits without end.
+    async fn join_group(
+        &self,
+        request: &JoinGroupRequest,
+        session: &Session,
+    ) -> ::kafka_protocol::messages::JoinGroupResponse {
+        if !self.group_allowed(
+            session,
+            &request.group_id.0.to_string(),
+            iam_access::ACTION_ALTER_GROUP,
+        ) {
+            return ::kafka_protocol::messages::JoinGroupResponse::default()
+                .with_error_code(group_authorization_failed());
+        }
+        let begun = self.group(&request.group_id.0, true, |group| {
+            group.begin_join(request, SystemTime::now())
+        });
+        let joining = match begun {
+            None => {
+                return ::kafka_protocol::messages::JoinGroupResponse::default()
+                    .with_error_code(no_coordinator())
+            }
+            Some(Err(code)) => {
+                return ::kafka_protocol::messages::JoinGroupResponse::default()
+                    .with_error_code(code)
+            }
+            Some(Ok(joining)) => joining,
+        };
+        loop {
+            let polled = self.group(&request.group_id.0, false, |group| {
+                group.poll_join(&joining, SystemTime::now())
+            });
+            match polled {
+                // The cluster this socket was opened for has left the registry while the
+                // rebalance was gathering, so there is no coordinator left to answer.
+                None => {
+                    return ::kafka_protocol::messages::JoinGroupResponse::default()
+                        .with_error_code(no_coordinator())
+                }
+                Some(Some(response)) => return response,
+                Some(None) => ::tokio::time::sleep(GROUP_POLL_INTERVAL).await,
+            }
+        }
+    }
+
+    /// `SyncGroup`: the assignment the group's LEADER computed for this member.
+    ///
+    /// The leader's own call states the assignment and is answered at once; every other
+    /// member's call is held until the leader has stated one, since a follower sends no
+    /// assignment of its own. A leader that never states one leaves the followers waiting
+    /// at most [`groups::MAX_REBALANCE_BARRIER`], after which they are told to rejoin.
+    async fn sync_group(
+        &self,
+        request: &SyncGroupRequest,
+        session: &Session,
+    ) -> ::kafka_protocol::messages::SyncGroupResponse {
+        if !self.group_allowed(
+            session,
+            &request.group_id.0.to_string(),
+            iam_access::ACTION_ALTER_GROUP,
+        ) {
+            return ::kafka_protocol::messages::SyncGroupResponse::default()
+                .with_error_code(group_authorization_failed());
+        }
+        let begun = self.group(&request.group_id.0, false, |group| {
+            group.begin_sync(request, SystemTime::now())
+        });
+        match begun {
+            None => {
+                return ::kafka_protocol::messages::SyncGroupResponse::default()
+                    .with_error_code(no_coordinator())
+            }
+            Some(Err(code)) => {
+                return ::kafka_protocol::messages::SyncGroupResponse::default()
+                    .with_error_code(code)
+            }
+            Some(Ok(())) => {}
+        }
+        let deadline = SystemTime::now() + groups::MAX_REBALANCE_BARRIER;
+        loop {
+            let polled = self.group(&request.group_id.0, false, |group| {
+                group.poll_sync(request, SystemTime::now())
+            });
+            match polled {
+                None => {
+                    return ::kafka_protocol::messages::SyncGroupResponse::default()
+                        .with_error_code(no_coordinator())
+                }
+                Some(Some(response)) => return response,
+                Some(None) if SystemTime::now() >= deadline => {
+                    return ::kafka_protocol::messages::SyncGroupResponse::default()
+                        .with_error_code(ResponseError::RebalanceInProgress.code())
+                }
+                Some(None) => ::tokio::time::sleep(GROUP_POLL_INTERVAL).await,
+            }
+        }
+    }
+
+    /// `OffsetForLeaderEpoch`: where the leader epoch a client names ends in each
+    /// partition it asks about.
+    ///
+    /// One endpoint of the cluster answers this, and every broker of it reads the same
+    /// log, so every epoch a client can hold is the current one and it ends where the log
+    /// does — the high watermark. A client that resumed from a committed offset reads this
+    /// to check its position is not past the log, which is what makes a resumed consumer
+    /// start reading rather than reset.
+    fn offset_for_leader_epoch(
+        &self,
+        request: &::kafka_protocol::messages::OffsetForLeaderEpochRequest,
+        session: &Session,
+    ) -> ::kafka_protocol::messages::OffsetForLeaderEpochResponse {
+        use ::kafka_protocol::messages::offset_for_leader_epoch_response::{
+            EpochEndOffset, OffsetForLeaderTopicResult,
+        };
+
+        let now = SystemTime::now();
+        let mut results = Vec::new();
+        let mut entries = 0usize;
+        for topic in request.topics.iter().take(MAX_REQUEST_ENTRIES) {
+            let name = topic.topic.0.to_string();
+            let withheld = self.topic_withheld(
+                session,
+                &name,
+                super::OPERATION_READ,
+                iam_access::ACTION_READ_DATA,
+            );
+            let mut partitions = Vec::new();
+            for partition in topic.partitions.iter() {
+                if entries >= MAX_REQUEST_ENTRIES {
+                    continue;
+                }
+                entries += 1;
+                if withheld {
+                    partitions.push(
+                        EpochEndOffset::default()
+                            .with_partition(partition.partition)
+                            .with_error_code(ResponseError::TopicAuthorizationFailed.code())
+                            .with_leader_epoch(CURRENT_LEADER_EPOCH)
+                            .with_end_offset(-1),
+                    );
+                    continue;
+                }
+                let offsets = self.state.lock().data_plane_offsets(
+                    &self.cluster_arn,
+                    &name,
+                    partition.partition,
+                    now,
+                );
+                partitions.push(match offsets {
+                    Ok((_, high_watermark)) => EpochEndOffset::default()
+                        .with_partition(partition.partition)
+                        .with_leader_epoch(CURRENT_LEADER_EPOCH)
+                        .with_end_offset(high_watermark),
+                    Err(refusal) => EpochEndOffset::default()
+                        .with_partition(partition.partition)
+                        .with_error_code(refusal.code())
+                        .with_leader_epoch(CURRENT_LEADER_EPOCH)
+                        .with_end_offset(-1),
+                });
+            }
+            results.push(
+                OffsetForLeaderTopicResult::default()
+                    .with_topic(TopicName(StrBytes::from_string(name)))
+                    .with_partitions(partitions),
+            );
+        }
+        ::kafka_protocol::messages::OffsetForLeaderEpochResponse::default().with_topics(results)
+    }
+
+    /// `DescribeGroups`: the state, protocol and members of each group the request names.
+    ///
+    /// Answered out of the groups this endpoint coordinates: a group it holds no record of
+    /// is reported `Dead` with no members, which is what a coordinator answers for a group
+    /// that does not exist.
+    fn describe_groups(
+        &self,
+        request: &::kafka_protocol::messages::DescribeGroupsRequest,
+        session: &Session,
+    ) -> ::kafka_protocol::messages::DescribeGroupsResponse {
+        use ::kafka_protocol::messages::describe_groups_response::{
+            DescribedGroup, DescribedGroupMember,
+        };
+
+        let groups = request
+            .groups
+            .iter()
+            .take(MAX_REQUEST_ENTRIES)
+            .map(|group_id| {
+                let name = group_id.0.to_string();
+                if !self.group_allowed(session, &name, iam_access::ACTION_DESCRIBE_GROUP) {
+                    return DescribedGroup::default()
+                        .with_group_id(group_id.clone())
+                        .with_error_code(group_authorization_failed())
+                        .with_group_state(StrBytes::from_static_str(DEAD_GROUP_STATE));
+                }
+                let described = self.group(&group_id.0, false, |group| {
+                    group.expire_members(SystemTime::now());
+                    (
+                        group.state().name().to_string(),
+                        group.protocol_type().unwrap_or_default().to_string(),
+                        group.protocol_name().unwrap_or_default().to_string(),
+                        group.described_members(),
+                    )
+                });
+                let Some((state, protocol_type, protocol_name, members)) = described else {
+                    // A group nothing has joined is `Dead` to a coordinator: it holds no
+                    // record of it, and reading it registers none.
+                    return DescribedGroup::default()
+                        .with_group_id(group_id.clone())
+                        .with_group_state(StrBytes::from_static_str(DEAD_GROUP_STATE));
+                };
+                DescribedGroup::default()
+                    .with_group_id(group_id.clone())
+                    .with_group_state(StrBytes::from_string(state))
+                    .with_protocol_type(StrBytes::from_string(protocol_type))
+                    .with_protocol_data(StrBytes::from_string(protocol_name))
+                    .with_members(
+                        members
+                            .into_iter()
+                            .map(|member| {
+                                DescribedGroupMember::default()
+                                    .with_member_id(StrBytes::from_string(member.id))
+                                    .with_member_metadata(member.metadata)
+                                    .with_member_assignment(member.assignment)
+                            })
+                            .collect(),
+                    )
+            })
+            .collect();
+        ::kafka_protocol::messages::DescribeGroupsResponse::default().with_groups(groups)
+    }
+
+    /// `ListGroups`: every group this cluster's coordinator holds, with the state and
+    /// protocol type a listing reports, narrowed to the states the request filtered on.
+    fn list_groups(
+        &self,
+        request: &::kafka_protocol::messages::ListGroupsRequest,
+    ) -> ::kafka_protocol::messages::ListGroupsResponse {
+        use ::kafka_protocol::messages::list_groups_response::ListedGroup;
+
+        let now = SystemTime::now();
+        let wanted: Vec<String> = request
+            .states_filter
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let mut store = self.state.lock();
+        let listed: Vec<ListedGroup> = store
+            .consumer_groups
+            .iter_mut()
+            .filter(|((cluster, _), _)| *cluster == self.cluster_arn)
+            .map(|((_, group_id), group)| {
+                group.expire_members(now);
+                (
+                    group_id.clone(),
+                    group.state().name().to_string(),
+                    group.protocol_type().unwrap_or_default().to_string(),
+                )
+            })
+            .filter(|(_, state, _)| wanted.is_empty() || wanted.iter().any(|want| want == state))
+            .take(MAX_REQUEST_ENTRIES)
+            .map(|(group_id, state, protocol_type)| {
+                ListedGroup::default()
+                    .with_group_id(::kafka_protocol::messages::GroupId(StrBytes::from_string(
+                        group_id,
+                    )))
+                    .with_group_state(StrBytes::from_string(state))
+                    .with_protocol_type(StrBytes::from_string(protocol_type))
+            })
+            .collect();
+        drop(store);
+        ::kafka_protocol::messages::ListGroupsResponse::default().with_groups(listed)
+    }
+
+    /// `DeleteGroups`: forget each group the request names, with the offsets it committed.
+    ///
+    /// A group that still holds members is not deleted (`NON_EMPTY_GROUP`) — its members
+    /// are using it — and a group this coordinator holds no record of is
+    /// `GROUP_ID_NOT_FOUND`, so an admin client is told which of its deletions landed.
+    fn delete_groups(
+        &self,
+        request: &::kafka_protocol::messages::DeleteGroupsRequest,
+        session: &Session,
+    ) -> ::kafka_protocol::messages::DeleteGroupsResponse {
+        use ::kafka_protocol::messages::delete_groups_response::DeletableGroupResult;
+
+        let now = SystemTime::now();
+        let results = request
+            .groups_names
+            .iter()
+            .take(MAX_REQUEST_ENTRIES)
+            .map(|group_id| {
+                let name = group_id.0.to_string();
+                let result = DeletableGroupResult::default().with_group_id(group_id.clone());
+                if !self.group_allowed(session, &name, iam_access::ACTION_DELETE_GROUP) {
+                    return result.with_error_code(group_authorization_failed());
+                }
+                let key = (self.cluster_arn.clone(), name);
+                let mut store = self.state.lock();
+                let Some(group) = store.consumer_groups.get_mut(&key) else {
+                    return result.with_error_code(ResponseError::GroupIdNotFound.code());
+                };
+                group.expire_members(now);
+                if group.has_members() {
+                    return result.with_error_code(ResponseError::NonEmptyGroup.code());
+                }
+                store.consumer_groups.remove(&key);
+                result
+            })
+            .collect();
+        ::kafka_protocol::messages::DeleteGroupsResponse::default().with_results(results)
+    }
+
     /// `InitProducerId`: the id an IDEMPOTENT producer writes under, which the broker
     /// assigns.
     ///
@@ -835,6 +1311,44 @@ impl Broker {
         InitProducerIdResponse::default()
             .with_producer_id(::kafka_protocol::messages::ProducerId(producer_id))
             .with_producer_epoch(0)
+    }
+
+    /// Whether this connection is kept from `operation` on `topic`: by an ACL binding
+    /// this cluster's brokers hold, or — for a connection authenticated with IAM — by the
+    /// IAM policies of the principal behind it, which must allow `action` on the topic.
+    ///
+    /// The two gates are the same answer: a client is told `TOPIC_AUTHORIZATION_FAILED`
+    /// either way, because either is a topic its principal may not touch.
+    fn topic_withheld(
+        &self,
+        session: &Session,
+        topic: &str,
+        operation: i8,
+        action: &str,
+    ) -> bool {
+        self.withholds(session.identity.as_ref(), topic, operation)
+            || !self.iam_allows(session, action, &iam_access::topic_resource(&self.cluster_arn, topic))
+    }
+
+    /// Whether this connection may perform `action` on the consumer group `group`: an
+    /// IAM-authenticated connection needs its principal's policies to allow it, and every
+    /// other connection is not bounded by one.
+    fn group_allowed(&self, session: &Session, group: &str, action: &str) -> bool {
+        self.iam_allows(
+            session,
+            action,
+            &iam_access::group_resource(&self.cluster_arn, group),
+        )
+    }
+
+    /// Whether Amazon MSK's IAM access control lets this connection perform `action` on
+    /// `resource`. A connection that did not authenticate with IAM carries no permission
+    /// set, and nothing here bounds it.
+    fn iam_allows(&self, session: &Session, action: &str, resource: &str) -> bool {
+        session
+            .permissions
+            .as_ref()
+            .is_none_or(|permissions| permissions.allows(action, resource))
     }
 
     /// Whether an ACL binding this cluster's brokers hold withholds `topic` from the
@@ -858,21 +1372,22 @@ impl Broker {
             })
     }
 
-    /// The topics among `named` an ACL binding this cluster's brokers hold withholds
-    /// from the connection's principal for `operation`.
+    /// The topics among `named` this connection is kept from for `operation`, by an ACL
+    /// binding or by its principal's IAM policies ([`Self::topic_withheld`]).
     ///
     /// Resolved for the whole request before the store is written, since the bindings
     /// are read under the same lock a write to the registry takes. Bounded like every
     /// other per-request list: at most [`MAX_REQUEST_ENTRIES`] names are decided.
     fn withheld_topics(
         &self,
-        identity: Option<&Authenticated>,
+        session: &Session,
         named: impl Iterator<Item = String>,
         operation: i8,
+        action: &str,
     ) -> BTreeSet<String> {
         named
             .take(MAX_REQUEST_ENTRIES)
-            .filter(|name| self.withholds(identity, name, operation))
+            .filter(|name| self.topic_withheld(session, name, operation, action))
             .collect()
     }
 
@@ -882,21 +1397,16 @@ impl Broker {
     /// Every broker node the cluster holds is reported, each at the address the CORE
     /// bound for this path — so a client that asks one node for its configuration, or
     /// re-resolves the cluster from its metadata, reaches this emulator rather than a
-    /// name nothing serves. The cluster's partitions are led by its FIRST node, which
-    /// is the broker that holds the log.
+    /// name nothing serves. Each partition is placed on as many of those nodes as the
+    /// topic's replication factor, starting at the node its own index falls on, and led
+    /// by the first of them — the placement Apache Kafka lays a topic out with, so a
+    /// client reads back the replication the topic was created with.
     fn metadata(&self, request: &MetadataRequest) -> MetadataResponse {
         let now = SystemTime::now();
         let (host, port) = split_authority(&self.authority());
         let (held, broker_ids) = {
             let mut store = self.state.lock();
-            // A serverless cluster has no broker nodes of its own, and the one endpoint
-            // it publishes is one broker to its clients — so the node this endpoint
-            // reports itself under stands in for it.
-            let ids = store
-                .cluster_in(&self.region, &self.cluster_arn)
-                .map(|cluster| cluster.brokers.iter().map(|broker| broker.id).collect())
-                .filter(|ids: &Vec<i32>| !ids.is_empty())
-                .unwrap_or_else(|| vec![BROKER_NODE_ID]);
+            let ids = store.broker_node_ids(&self.region, &self.cluster_arn);
             (store.data_plane_topics(&self.cluster_arn, now), ids)
         };
         // A request naming no topic list at all asks for every topic of the cluster,
@@ -907,21 +1417,24 @@ impl Broker {
                 .filter_map(|topic| topic.name.as_ref().map(|name| name.0.to_string()))
                 .collect()
         });
-        let leader = broker_ids.first().copied().unwrap_or(BROKER_NODE_ID);
+        let controller = broker_ids.first().copied().unwrap_or(BROKER_NODE_ID);
         let reported: Vec<MetadataResponseTopic> = match wanted {
             None => held
                 .iter()
-                .map(|(name, partitions)| topic_metadata(name, *partitions, leader, 0))
+                .map(|topic| topic_metadata(topic, &broker_ids, 0))
                 .collect(),
             Some(names) => names
                 .iter()
                 .take(MAX_REQUEST_ENTRIES)
-                .map(|name| match held.iter().find(|(held, _)| held == name) {
-                    Some((name, partitions)) => topic_metadata(name, *partitions, leader, 0),
+                .map(|name| match held.iter().find(|held| held.name == *name) {
+                    Some(topic) => topic_metadata(topic, &broker_ids, 0),
                     None => topic_metadata(
-                        name,
-                        0,
-                        leader,
+                        &super::DataPlaneTopic {
+                            name: name.clone(),
+                            partitions: 0,
+                            replication_factor: 1,
+                        },
+                        &broker_ids,
                         ResponseError::UnknownTopicOrPartition.code(),
                     ),
                 })
@@ -931,16 +1444,16 @@ impl Broker {
             .with_brokers(
                 broker_ids
                     .iter()
-                    .map(|id| {
+                    .map(|node_id| {
                         MetadataResponseBroker::default()
-                            .with_node_id(BrokerId(*id))
+                            .with_node_id(BrokerId(*node_id))
                             .with_host(StrBytes::from_string(host.clone()))
                             .with_port(port)
                     })
                     .collect(),
             )
             .with_cluster_id(Some(StrBytes::from_string(self.cluster_arn.clone())))
-            .with_controller_id(BrokerId(leader))
+            .with_controller_id(BrokerId(controller))
             .with_topics(reported)
     }
 
@@ -958,14 +1471,19 @@ impl Broker {
     fn produce(
         &self,
         request: &ProduceRequest,
-        identity: Option<&Authenticated>,
+        session: &Session,
     ) -> ProduceResponse {
         let now = SystemTime::now();
         let mut responses = Vec::new();
         let mut entries = 0usize;
-        for topic in request.topic_data.iter() {
+        for topic in request.topic_data.iter().take(MAX_REQUEST_ENTRIES) {
             let name = topic.name.0.to_string();
-            let withheld = self.withholds(identity, &name, super::OPERATION_WRITE);
+            let withheld = self.topic_withheld(
+                session,
+                &name,
+                super::OPERATION_WRITE,
+                iam_access::ACTION_WRITE_DATA,
+            );
             let mut partitions = Vec::new();
             for partition in topic.partition_data.iter() {
                 if entries >= MAX_REQUEST_ENTRIES {
@@ -1022,20 +1540,52 @@ impl Broker {
     /// on, with the ones the topic's retention has aged out already gone — unless an
     /// ACL binding withholds the topic from the connection's principal.
     ///
-    /// BOUNDED as a whole, not per entry: at most [`MAX_REQUEST_ENTRIES`] (topic,
-    /// partition) entries are served, each one once, and the records rendered across
-    /// the whole response stop at [`MAX_FETCHED_RECORDS_PER_REQUEST`]. The store's lock
-    /// is taken and released per entry, so one request cannot hold it for a whole
-    /// batch.
-    fn fetch(&self, request: &FetchRequest, identity: Option<&Authenticated>) -> FetchResponse {
+    /// A fetch that finds less than the request's `MinBytes` of records is HELD until
+    /// that much is there or its `MaxWaitMs` has run out, which is what those two members
+    /// of the request mean: a consumer polling an idle partition waits on the broker
+    /// instead of being answered an empty response at once and asking again immediately.
+    /// The wait is bounded by [`MAX_FETCH_WAIT`] and ends as soon as a record lands, and
+    /// a partition that cannot be served at all is answered without waiting.
+    async fn fetch(&self, request: &FetchRequest, session: &Session) -> FetchResponse {
+        let min_bytes = usize::try_from(request.min_bytes).unwrap_or(0);
+        let wait = fetch_wait(request.max_wait_ms);
+        let deadline = ::std::time::Instant::now() + wait;
+        // The authorization decision is taken ONCE for the whole request, before the
+        // first pass: it depends on the frame and on the policies in force, not on what
+        // the log holds, so a held fetch must not re-decide it on every pass.
+        let withheld = self.withheld_topics(
+            session,
+            request.topics.iter().map(|topic| topic.topic.0.to_string()),
+            super::OPERATION_READ,
+            iam_access::ACTION_READ_DATA,
+        );
+        loop {
+            let answered = self.fetch_once(request, &withheld);
+            let enough = min_bytes == 0 || rendered_bytes(&answered) >= min_bytes;
+            if enough || refuses_a_partition(&answered) || ::std::time::Instant::now() >= deadline {
+                return answered;
+            }
+            ::tokio::time::sleep(GROUP_POLL_INTERVAL).await;
+        }
+    }
+
+    /// One pass of that read: what the partitions hold right now, with `withheld` naming
+    /// the topics this connection may not read.
+    ///
+    /// BOUNDED as a whole, not per entry: at most [`MAX_REQUEST_ENTRIES`] topics and at
+    /// most [`MAX_REQUEST_ENTRIES`] (topic, partition) entries are served, each one once,
+    /// and the records rendered across the whole response stop at
+    /// [`MAX_FETCHED_RECORDS_PER_REQUEST`]. The store's lock is taken and released per
+    /// entry, so one request cannot hold it for a whole batch.
+    fn fetch_once(&self, request: &FetchRequest, withheld: &BTreeSet<String>) -> FetchResponse {
         let now = SystemTime::now();
         let mut responses = Vec::new();
         let mut entries = 0usize;
         let mut rendered = 0usize;
         let mut served: BTreeSet<(String, i32)> = BTreeSet::new();
-        for topic in request.topics.iter() {
+        for topic in request.topics.iter().take(MAX_REQUEST_ENTRIES) {
             let name = topic.topic.0.to_string();
-            let withheld = self.withholds(identity, &name, super::OPERATION_READ);
+            let withheld = withheld.contains(&name);
             let mut partitions = Vec::new();
             for partition in topic.partitions.iter() {
                 if entries >= MAX_REQUEST_ENTRIES
@@ -1050,6 +1600,7 @@ impl Broker {
                             .with_partition_index(partition.partition)
                             .with_error_code(ResponseError::TopicAuthorizationFailed.code())
                             .with_high_watermark(-1)
+                            .with_preferred_read_replica(BrokerId(NO_PREFERRED_READ_REPLICA))
                             .with_records(Some(Bytes::new())),
                     );
                     continue;
@@ -1071,12 +1622,20 @@ impl Broker {
                             .with_high_watermark(fetched.high_watermark)
                             .with_last_stable_offset(fetched.high_watermark)
                             .with_log_start_offset(fetched.log_start_offset)
+                            // No transaction of this endpoint has been aborted, and the
+                            // leader states no preference for a replica to read from:
+                            // one endpoint serves the cluster, so the partition's leader
+                            // is the only place to read it. Both stated rather than left
+                            // out, since a client acts on them.
+                            .with_aborted_transactions(Some(Vec::new()))
+                            .with_preferred_read_replica(BrokerId(NO_PREFERRED_READ_REPLICA))
                             .with_records(encode_records(&fetched.records))
                     }
                     Err(refusal) => PartitionData::default()
                         .with_partition_index(partition.partition)
                         .with_error_code(refusal.code())
                         .with_high_watermark(-1)
+                        .with_preferred_read_replica(BrokerId(NO_PREFERRED_READ_REPLICA))
                         .with_records(Some(Bytes::new())),
                 });
             }
@@ -1102,7 +1661,7 @@ impl Broker {
         let mut topics = Vec::new();
         let mut entries = 0usize;
         let mut served: BTreeSet<(String, i32)> = BTreeSet::new();
-        for topic in request.topics.iter() {
+        for topic in request.topics.iter().take(MAX_REQUEST_ENTRIES) {
             let name = topic.name.0.to_string();
             let mut partitions = Vec::new();
             for partition in topic.partitions.iter() {
@@ -1180,10 +1739,17 @@ impl Broker {
     /// resource, so one request cannot hold it for a whole batch.
     fn describe_configs(&self, request: &DescribeConfigsRequest) -> DescribeConfigsResponse {
         let now = SystemTime::now();
-        let broker_defaults: BTreeMap<String, String> = super::BROKER_CONFIG_DEFAULTS
-            .iter()
-            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
-            .collect();
+        // The configuration this cluster's brokers run with, built ONCE for the request:
+        // the MSK configuration revision the cluster carries, over Apache Kafka's
+        // documented defaults.
+        let broker = {
+            let mut store = self.state.lock();
+            store
+                .settled_cluster_in(&self.region, &self.cluster_arn, now)
+                .cloned()
+                .map(|cluster| super::broker_config::in_force(&store, &cluster, now))
+                .unwrap_or_default()
+        };
         let mut results = Vec::new();
         for resource in request.resources.iter().take(MAX_REQUEST_ENTRIES) {
             let name = resource.resource_name.to_string();
@@ -1200,12 +1766,17 @@ impl Broker {
                         rendered_configuration(
                             &configuration.effective,
                             &configuration.set,
+                            CONFIG_SOURCE_SET_BY_RESOURCE,
                             wanted.as_deref(),
                         )
                     }),
                 RESOURCE_TYPE_BROKER => Some(rendered_configuration(
-                    &broker_defaults,
-                    &BTreeMap::new(),
+                    &broker.effective,
+                    &broker.stated,
+                    // A broker value that comes from the `server.properties` the cluster
+                    // was configured with is a STATIC broker config, which is how a
+                    // client tells it from a default and from one altered at run time.
+                    CONFIG_SOURCE_STATIC_BROKER_CONFIG,
                     wanted.as_deref(),
                 )),
                 _ => None,
@@ -1239,6 +1810,7 @@ impl Broker {
         api_version: i16,
     ) -> FindCoordinatorResponse {
         let (host, port) = split_authority(&self.authority());
+        let node_id = BROKER_NODE_ID;
         if api_version >= 4 {
             return FindCoordinatorResponse::default().with_coordinators(
                 request
@@ -1248,7 +1820,7 @@ impl Broker {
                     .map(|key| {
                         ::kafka_protocol::messages::find_coordinator_response::Coordinator::default()
                             .with_key(key.clone())
-                            .with_node_id(BrokerId(BROKER_NODE_ID))
+                            .with_node_id(BrokerId(node_id))
                             .with_host(StrBytes::from_string(host.clone()))
                             .with_port(port)
                     })
@@ -1256,7 +1828,7 @@ impl Broker {
             );
         }
         FindCoordinatorResponse::default()
-            .with_node_id(BrokerId(BROKER_NODE_ID))
+            .with_node_id(BrokerId(node_id))
             .with_host(StrBytes::from_string(host))
             .with_port(port)
     }
@@ -1267,6 +1839,76 @@ impl Broker {
 /// retries on or reports.
 fn no_coordinator() -> i16 {
     ResponseError::CoordinatorNotAvailable.code()
+}
+
+/// The error a group call is answered with when the connection's principal may not
+/// perform it on that group: the protocol's `GROUP_AUTHORIZATION_FAILED`.
+fn group_authorization_failed() -> i16 {
+    ResponseError::GroupAuthorizationFailed.code()
+}
+
+/// The `OffsetCommit` answer for a request that committed nothing: every (topic,
+/// partition) it named, each carrying `error_code` — so a client is told which of its
+/// commits did not land rather than being told nothing about them.
+fn committed_nothing(
+    request: &OffsetCommitRequest,
+    error_code: i16,
+) -> ::kafka_protocol::messages::OffsetCommitResponse {
+    use ::kafka_protocol::messages::offset_commit_response::{
+        OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+    };
+
+    ::kafka_protocol::messages::OffsetCommitResponse::default().with_topics(
+        request
+            .topics
+            .iter()
+            .take(MAX_REQUEST_ENTRIES)
+            .map(|topic| {
+                OffsetCommitResponseTopic::default()
+                    .with_name(topic.name.clone())
+                    .with_partitions(
+                        topic
+                            .partitions
+                            .iter()
+                            .take(MAX_REQUEST_ENTRIES)
+                            .map(|partition| {
+                                OffsetCommitResponsePartition::default()
+                                    .with_partition_index(partition.partition_index)
+                                    .with_error_code(error_code)
+                            })
+                            .collect(),
+                    )
+            })
+            .collect(),
+    )
+}
+
+/// How long a `Fetch` waits for its partitions to hold the records it asked for: the
+/// `MaxWaitMs` the request states, bounded by [`MAX_FETCH_WAIT`].
+fn fetch_wait(max_wait_ms: i32) -> ::std::time::Duration {
+    let stated = u64::try_from(max_wait_ms).unwrap_or(0);
+    ::std::time::Duration::from_millis(stated).min(MAX_FETCH_WAIT)
+}
+
+/// The bytes of records one fetch answer carries, which is what the request's `MinBytes`
+/// is stated over.
+fn rendered_bytes(response: &FetchResponse) -> usize {
+    response
+        .responses
+        .iter()
+        .flat_map(|topic| topic.partitions.iter())
+        .map(|partition| partition.records.as_ref().map_or(0, Bytes::len))
+        .sum()
+}
+
+/// Whether any partition of one fetch answer could not be served: such an answer is
+/// final, so the fetch is not held waiting for records that are not coming.
+fn refuses_a_partition(response: &FetchResponse) -> bool {
+    response
+        .responses
+        .iter()
+        .flat_map(|topic| topic.partitions.iter())
+        .any(|partition| partition.error_code != 0)
 }
 
 /// Whether `api_version` of `key` is one this endpoint serves.
@@ -1291,25 +1933,46 @@ fn api_versions() -> ApiVersionsResponse {
     )
 }
 
-/// One topic as `Metadata` reports it: every partition led by `leader`, the first
-/// broker node the cluster holds, which is the broker that holds the log.
+/// One topic as `Metadata` reports it: each partition placed on as many of the cluster's
+/// broker nodes as the topic's replication factor, starting at the node the partition's
+/// own index falls on, and led by the first of them.
+///
+/// A partition cannot be placed on more brokers than the cluster has, so the factor is
+/// read within that, as Apache Kafka places a topic. Every replica is in sync: the
+/// brokers of a cluster here read and write one log, so no replica of a partition can
+/// be behind another.
 fn topic_metadata(
-    name: &str,
-    partitions: i32,
-    leader: i32,
+    topic: &super::DataPlaneTopic,
+    broker_ids: &[i32],
     error_code: i16,
 ) -> MetadataResponseTopic {
+    let nodes: Vec<i32> = match broker_ids.is_empty() {
+        true => vec![BROKER_NODE_ID],
+        false => broker_ids.to_vec(),
+    };
+    let replicas = usize::try_from(topic.replication_factor)
+        .unwrap_or(1)
+        .clamp(1, nodes.len());
     MetadataResponseTopic::default()
         .with_error_code(error_code)
-        .with_name(Some(TopicName(StrBytes::from_string(name.to_string()))))
+        .with_name(Some(TopicName(StrBytes::from_string(topic.name.clone()))))
         .with_partitions(
-            (0..partitions)
+            (0..topic.partitions)
                 .map(|index| {
+                    let placed: Vec<BrokerId> = (0..replicas)
+                        .map(|replica| {
+                            let at = usize::try_from(index).unwrap_or(0).saturating_add(replica);
+                            BrokerId(nodes[at % nodes.len()])
+                        })
+                        .collect();
+                    let leader = placed.first().copied().unwrap_or(BrokerId(BROKER_NODE_ID));
                     MetadataResponsePartition::default()
                         .with_partition_index(index)
-                        .with_leader_id(BrokerId(leader))
-                        .with_replica_nodes(vec![BrokerId(leader)])
-                        .with_isr_nodes(vec![BrokerId(leader)])
+                        .with_leader_id(leader)
+                        .with_leader_epoch(CURRENT_LEADER_EPOCH)
+                        .with_replica_nodes(placed.clone())
+                        .with_isr_nodes(placed)
+                        .with_offline_replicas(Vec::new())
                 })
                 .collect(),
         )
@@ -1330,11 +1993,12 @@ fn split_authority(authority: &str) -> (String, i32) {
 }
 
 /// The configuration entries a `DescribeConfigs` result reports: every entry of
-/// `effective`, each marked as the resource's own when `set` carries it and as a
-/// default otherwise, narrowed to `wanted` when the request named keys.
+/// `effective`, each marked `set_source` when `set` carries it and as a default
+/// otherwise, narrowed to `wanted` when the request named keys.
 fn rendered_configuration(
     effective: &BTreeMap<String, String>,
     set: &BTreeMap<String, String>,
+    set_source: i8,
     wanted: Option<&[String]>,
 ) -> Vec<DescribeConfigsResourceResult> {
     effective
@@ -1347,7 +2011,7 @@ fn rendered_configuration(
                 .with_value(Some(StrBytes::from_string(value.clone())))
                 .with_read_only(false)
                 .with_config_source(match configured {
-                    true => CONFIG_SOURCE_SET_BY_RESOURCE,
+                    true => set_source,
                     false => CONFIG_SOURCE_DEFAULT,
                 })
         })

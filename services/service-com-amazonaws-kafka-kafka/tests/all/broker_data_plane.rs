@@ -51,14 +51,14 @@ use crate::kafka_harness::{pct, sleep_past_activation, ClusterRequest, Emulator,
 
 /// The interface the core binds a resource listener on by default, and so the only
 /// host a published bootstrap address may name on this machine.
-const LOOPBACK: &str = "127.0.0.1";
+pub(crate) const LOOPBACK: &str = "127.0.0.1";
 
 /// The client id every connection below identifies itself with.
-const CLIENT_ID: &str = "sim2real-data-plane";
+pub(crate) const CLIENT_ID: &str = "sim2real-data-plane";
 
 /// The SASL mechanism names a client selects, as Amazon MSK's brokers offer them.
 const SCRAM_SHA_512: &str = "SCRAM-SHA-512";
-const AWS_MSK_IAM: &str = "AWS_MSK_IAM";
+pub(crate) const AWS_MSK_IAM: &str = "AWS_MSK_IAM";
 const OAUTHBEARER: &str = "OAUTHBEARER";
 
 /// The username and password the SASL/SCRAM secret in this suite carries.
@@ -79,7 +79,10 @@ trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
 
 /// One client on one published address.
-struct Client {
+///
+/// The suites of this crate that drive a cluster's Apache Kafka endpoint share it, so a
+/// new rule about the data plane adds its own suite rather than a second client.
+pub(crate) struct Client {
     session: Session,
     correlation: i32,
     /// Whether this connection's SASL tokens travel UNWRAPPED, which is what the
@@ -93,7 +96,7 @@ impl Client {
     /// machine: the core binds its listeners on the operator-chosen interface,
     /// loopback by default, so a published bootstrap address is this machine's own —
     /// and that is the address dialled.
-    async fn plaintext(case: &str, authority: &str) -> Self {
+    pub(crate) async fn plaintext(case: &str, authority: &str) -> Self {
         Self {
             session: Box::new(dial(case, authority).await),
             correlation: 0,
@@ -103,7 +106,7 @@ impl Client {
 
     /// The same address over TLS, which is how a client reaches one of the encrypted
     /// paths — the wire the core terminates.
-    async fn tls(case: &str, authority: &str) -> Self {
+    pub(crate) async fn tls(case: &str, authority: &str) -> Self {
         let conn = dial(case, authority).await;
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
@@ -132,7 +135,7 @@ impl Client {
 
     /// Send one request and read its response, framed exactly as the protocol frames
     /// them: a length, the request header for this API and version, and the body.
-    async fn call<Request: Encodable, Response: Decodable>(
+    pub(crate) async fn call<Request: Encodable, Response: Decodable>(
         &mut self,
         case: &str,
         key: ApiKey,
@@ -191,7 +194,7 @@ impl Client {
     }
 
     /// `ApiVersions`, the first call every Kafka client makes.
-    async fn api_versions(&mut self, case: &str) -> ApiVersionsResponse {
+    pub(crate) async fn api_versions(&mut self, case: &str) -> ApiVersionsResponse {
         self.call(
             case,
             ApiKey::ApiVersions,
@@ -204,7 +207,7 @@ impl Client {
     }
 
     /// `Metadata` for every topic of the cluster.
-    async fn metadata(&mut self, case: &str) -> MetadataResponse {
+    pub(crate) async fn metadata(&mut self, case: &str) -> MetadataResponse {
         self.call(
             case,
             ApiKey::Metadata,
@@ -219,7 +222,7 @@ impl Client {
     ///
     /// The tokens travel inside `SaslAuthenticate`, which is the framing a handshake at
     /// version 1 selects; [`Client::authenticate_at`] drives the other one.
-    async fn authenticate(&mut self, case: &str, mechanism: &str, password: &str) -> i16 {
+    pub(crate) async fn authenticate(&mut self, case: &str, mechanism: &str, password: &str) -> i16 {
         self.authenticate_at(case, mechanism, password, 1).await
     }
 
@@ -759,6 +762,90 @@ async fn every_published_bootstrap_address_answers_the_kafka_protocol() {
     );
 }
 
+/// RULE: the brokers a client learns from `Metadata` are the broker nodes the cluster
+/// holds — one entry per node, each at the address the bootstrap string publishes, with
+/// the first of them the controller — so a client sent to any node of the cluster reaches
+/// the endpoint this emulator serves it on.
+///
+/// The rows differ along the number of brokers the cluster holds, which is what the rule
+/// counts over.
+#[tokio::test]
+async fn metadata_reports_every_broker_node_the_cluster_holds() {
+    // (case, the brokers the cluster is created with, the subnets they are placed in)
+    let rows: &[(&str, i64, &[&str])] = &[
+        ("one broker", 1, &["subnet-a"]),
+        ("two brokers", 2, &["subnet-a", "subnet-b"]),
+        ("three brokers", 3, &["subnet-a", "subnet-b", "subnet-c"]),
+    ];
+    for (case, brokers, subnets) in rows {
+        let emulator = Emulator::new();
+        let cluster = emulator
+            .create_ok(&ClusterRequest {
+                client_broker: Some("PLAINTEXT"),
+                brokers: *brokers,
+                subnets: subnets.to_vec(),
+                ..ClusterRequest::named(&format!("plane-brokers-{brokers}"))
+            })
+            .await;
+        // The address the cluster publishes once it has settled, and the nodes the
+        // control plane then reports for it — the ones a client must be told about.
+        let authority = published_address(&emulator, &cluster, "bootstrapBrokerString", case).await;
+        let nodes = emulator
+            .call(
+                "GET",
+                &format!("/v1/clusters/{}/nodes", pct(&cluster)),
+                None,
+            )
+            .await;
+        let node_ids: Vec<i64> = nodes
+            .at("/nodeInfoList")
+            .as_array()
+            .map(|listed| {
+                listed
+                    .iter()
+                    .filter_map(|node| node.pointer("/brokerNodeInfo/brokerId"))
+                    .filter_map(Value::as_f64)
+                    .map(|id| id as i64)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            node_ids.len(),
+            usize::try_from(*brokers).unwrap_or_default(),
+            "case {case:?}: the cluster must hold {brokers} broker nodes, got {}",
+            nodes.body
+        );
+
+        let mut client = Client::plaintext(case, &authority).await;
+        client.api_versions(case).await;
+        let metadata = client.metadata(case).await;
+        let reported: Vec<i64> = metadata
+            .brokers
+            .iter()
+            .map(|broker| i64::from(broker.node_id.0))
+            .collect();
+        assert_eq!(
+            reported, node_ids,
+            "case {case:?}: Metadata must report the cluster's own broker nodes, got \
+             {reported:?} for {node_ids:?}"
+        );
+        for broker in metadata.brokers.iter() {
+            assert_eq!(
+                format!("{}:{}", broker.host.as_str(), broker.port),
+                authority,
+                "case {case:?}: node {} must be reachable at the published address",
+                broker.node_id.0
+            );
+        }
+        assert_eq!(
+            i64::from(metadata.controller_id.0),
+            node_ids.first().copied().unwrap_or_default(),
+            "case {case:?}: the controller must be a node of the cluster, got {}",
+            metadata.controller_id.0
+        );
+    }
+}
+
 /// The `ConfigResource.Type` a `DescribeConfigs` request names a topic by, and the one
 /// it names a broker by (Apache Kafka protocol).
 const RESOURCE_TYPE_TOPIC: i8 = 2;
@@ -826,7 +913,7 @@ impl Client {
     ///
     /// Each record carries the timestamp the row gives it, which is what a producer
     /// sets and what the broker's retention ages a record out by.
-    async fn produce(
+    pub(crate) async fn produce(
         &mut self,
         case: &str,
         topic: &str,
@@ -893,7 +980,7 @@ impl Client {
 
     /// `Fetch` one partition from `offset`, answering the records it read as
     /// `(offset, key, value)`.
-    async fn fetch(
+    pub(crate) async fn fetch(
         &mut self,
         case: &str,
         topic: &str,
@@ -2013,7 +2100,7 @@ impl Client {
     ///
     /// Sent at the highest version this endpoint serves, the one that reports back the
     /// partitions and the replication factor the broker placed.
-    async fn create_topics(
+    pub(crate) async fn create_topics(
         &mut self,
         case: &str,
         topics: &[WireTopic<'_>],
@@ -2132,30 +2219,15 @@ impl Client {
     }
 }
 
-/// The address a cluster publishes for one bootstrap member, once it publishes one.
-///
-/// `GetBootstrapBrokers` refuses while the cluster is still `CREATING`, so this LOOKS
-/// AGAIN until the address is published rather than waiting out a span.
+/// The address a cluster publishes for one bootstrap member, once it publishes one —
+/// through the harness's own poll, which every data-plane suite of this crate shares.
 async fn published_address(
     emulator: &Emulator,
     cluster: &str,
     member: &str,
     case: &str,
 ) -> String {
-    let deadline = std::time::Instant::now() + TOPIC_CONDITION_DEADLINE;
-    loop {
-        let reply = emulator.bootstrap_brokers(cluster).await;
-        if let Some(address) = reply.body.get(member).and_then(Value::as_str) {
-            return address.to_string();
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "case {case:?}: the cluster never published {member}, last read {} {}",
-            reply.status,
-            reply.body
-        );
-        std::thread::sleep(TOPIC_PROBE_INTERVAL);
-    }
+    emulator.published_bootstrap(cluster, member, case).await
 }
 
 /// An authenticated client on the one address an MSK SERVERLESS cluster publishes: the
@@ -3376,6 +3448,45 @@ async fn call_at(
                 )))]);
             client
                 .exchange::<_, wire::DeleteTopicsResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::OffsetForLeaderEpoch => {
+            let request = wire::OffsetForLeaderEpochRequest::default().with_topics(vec![
+                wire::offset_for_leader_epoch_request::OffsetForLeaderTopic::default()
+                    .with_topic(topic_name.clone())
+                    .with_partitions(vec![
+                        wire::offset_for_leader_epoch_request::OffsetForLeaderPartition::default()
+                            .with_partition(0)
+                            .with_leader_epoch(0),
+                    ]),
+            ]);
+            client
+                .exchange::<_, wire::OffsetForLeaderEpochResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::DescribeGroups => {
+            let request = wire::DescribeGroupsRequest::default().with_groups(vec![group.clone()]);
+            client
+                .exchange::<_, wire::DescribeGroupsResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::ListGroups => {
+            let request = wire::ListGroupsRequest::default();
+            client
+                .exchange::<_, wire::ListGroupsResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::DeleteGroups => {
+            // A group name of its own per row, so no row depends on another's outcome.
+            let request = wire::DeleteGroupsRequest::default().with_groups_names(vec![
+                wire::GroupId(StrBytes::from_string(format!("swept-group-v{version}"))),
+            ]);
+            client
+                .exchange::<_, wire::DeleteGroupsResponse>(key, version, &request)
                 .await
                 .map(drop)
         }

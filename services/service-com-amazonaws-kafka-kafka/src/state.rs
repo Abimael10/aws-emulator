@@ -2961,10 +2961,12 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// The socket each cluster's brokers are reached on, keyed by (cluster ARN, access
     /// path), and the address `GetBootstrapBrokers` announces for it
     /// ([`broker_plane::ClusterEndpoint`]). Opened on the first bootstrap read of a
-    /// cluster and held for as long as that cluster is in the registry, so an announced
-    /// address never moves under a client; dropped when the cluster is unregistered,
-    /// which closes the port.
-    pub cluster_endpoints: HashMap<(String, broker_plane::AccessPath), broker_plane::ClusterEndpoint>,
+    /// cluster the registry HOLDS, bounded by
+    /// [`broker_plane::MAX_CLUSTER_ENDPOINTS`] entries, and held for as long as that
+    /// cluster is in the registry, so an announced address never moves under a client;
+    /// dropped when the cluster is unregistered, which closes the port.
+    pub cluster_endpoints:
+        HashMap<(String, broker_plane::AccessPath), broker_plane::ClusterEndpoint>,
     /// The records each partition of each topic holds, keyed by (cluster ARN, topic
     /// name, partition index): what a `Produce` on that cluster's endpoint appends
     /// and a `Fetch` reads, with the records the topic's `retention.ms` has aged out

@@ -42,14 +42,14 @@ use crate::state::{
 /// own default instead of naming one (Apache Kafka protocol, `CreateTopics`).
 const USE_BROKER_DEFAULT: i32 = -1;
 
-/// The partition count such a request is served with: Apache Kafka's `num.partitions`
-/// default, the value this endpoint already reports as its broker configuration
-/// ([`super::BROKER_CONFIG_DEFAULTS`]).
+/// The partition count such a request is served with when the broker's configuration
+/// states none: Apache Kafka's `num.partitions` default, the value this endpoint reports
+/// as its broker configuration ([`super::BROKER_CONFIG_DEFAULTS`]).
 const DEFAULT_PARTITION_COUNT: i32 = 1;
 
-/// The replication factor such a request is served with: Apache Kafka's
-/// `default.replication.factor` default ("Broker Configs", Apache Kafka
-/// documentation).
+/// The replication factor such a request is served with when the broker's configuration
+/// states none: Apache Kafka's `default.replication.factor` default ("Broker Configs",
+/// Apache Kafka documentation).
 const DEFAULT_REPLICATION_FACTOR: i32 = 1;
 
 /// The most topic-level configuration entries one created topic may carry, and the
@@ -99,6 +99,13 @@ pub fn create(
     // topic's replication factor and what every minted topic's identity is derived
     // from.
     let cluster = store.settled_cluster_in(region, cluster_arn, now).cloned();
+    // What the BROKER decides for a topic that leaves a decision to it is its own
+    // configuration — the MSK configuration revision this cluster runs with, over Apache
+    // Kafka's defaults — read once for the whole request.
+    let configuration = cluster
+        .as_ref()
+        .map(|cluster| super::broker_config::in_force(store, cluster, now))
+        .unwrap_or_default();
     // A request that names one topic TWICE says two things about one name, so every
     // entry for that name is refused rather than the first one acted on. Read before
     // anything is created, so a request that only asks to be validated is answered
@@ -114,7 +121,10 @@ pub fn create(
                 Some(_) if repeated.contains(&name) => Err(named_twice()),
                 Some(cluster) => create_one(
                     store,
-                    cluster,
+                    &Broker {
+                        cluster,
+                        configuration: &configuration,
+                    },
                     requested,
                     &name,
                     withheld.contains(&name),
@@ -140,6 +150,17 @@ pub fn create(
     CreateTopicsResponse::default().with_topics(results)
 }
 
+/// The broker a topic is created ON: the cluster whose registry the topic joins and the
+/// configuration that cluster's brokers run with.
+///
+/// The two travel together because every decision below reads both: what the cluster can
+/// PLACE (its broker nodes) and what its configuration DECIDES (the defaults a request
+/// may leave to the broker).
+struct Broker<'a> {
+    cluster: &'a Cluster,
+    configuration: &'a super::broker_config::BrokerConfiguration,
+}
+
 /// One topic of a `CreateTopics` request: validated against what the broker can
 /// place, then registered unless the request only asked for the validation.
 ///
@@ -149,7 +170,7 @@ pub fn create(
 /// ceilings.
 fn create_one(
     store: &mut ComAmazonawsKafkaKafkaState,
-    cluster: &Cluster,
+    broker: &Broker<'_>,
     requested: &CreatableTopic,
     name: &str,
     withheld: bool,
@@ -173,15 +194,18 @@ fn create_one(
             illegal_name_message(name, violation),
         ));
     }
-    assignments_place_every_partition(requested, cluster)?;
-    let partition_count = partition_count(requested)?;
-    let replication_factor = replication_factor(requested, cluster)?;
+    assignments_place_every_partition(requested, broker.cluster)?;
+    let partition_count = partition_count(requested, broker.configuration)?;
+    let replication_factor = replication_factor(requested, broker.cluster, broker.configuration)?;
     let configs = topic_configs(requested)?;
 
     // A name the cluster already reports a topic under — its own, or one a running
     // replicator carries onto it — is taken, whether or not this call would go on to
     // register anything, so the validation and the create agree.
-    if store.observable_topic_in(&cluster.arn, name, now).is_some() {
+    if store
+        .observable_topic_in(&broker.cluster.arn, name, now)
+        .is_some()
+    {
         return Err(Refusal::new(
             ResponseError::TopicAlreadyExists,
             format!("Topic '{name}' already exists."),
@@ -189,7 +213,7 @@ fn create_one(
     }
 
     let topic = Topic::created(
-        cluster,
+        broker.cluster,
         name.to_string(),
         partition_count,
         replication_factor,
@@ -245,15 +269,24 @@ fn illegal_name_message(name: &str, violation: TopicNameViolation) -> String {
 /// number of partitions its manual replica assignment lays out, or the broker's own
 /// default where it named neither.
 ///
+/// The broker's own default is the `num.partitions` its configuration puts in force —
+/// the cluster's MSK configuration revision over Apache Kafka's default — so a topic
+/// created without a count gets the count the cluster was configured for.
+///
 /// A count past [`MAX_PARTITIONS_PER_TOPIC`] — the most partitions of one topic this
 /// endpoint reports and serves — is refused rather than stored, so a topic never
 /// reports a placement that has no partitions behind it.
-fn partition_count(requested: &CreatableTopic) -> Result<i32, Refusal> {
+fn partition_count(
+    requested: &CreatableTopic,
+    broker: &super::broker_config::BrokerConfiguration,
+) -> Result<i32, Refusal> {
     let count = match requested.assignments.len() {
         // A request that lays its replicas out by hand creates one partition per
         // assignment, which is what the assignment list IS.
         0 => match requested.num_partitions {
-            USE_BROKER_DEFAULT => DEFAULT_PARTITION_COUNT,
+            USE_BROKER_DEFAULT => broker
+                .number(super::broker_config::NUM_PARTITIONS_CONFIG)
+                .unwrap_or(DEFAULT_PARTITION_COUNT),
             named => named,
         },
         assignments => i32::try_from(assignments).unwrap_or(i32::MAX),
@@ -286,11 +319,17 @@ fn partition_count(requested: &CreatableTopic) -> Result<i32, Refusal> {
 /// the control plane's create enforces. A cluster whose brokers are not the
 /// customer's (an Amazon MSK Serverless cluster reports no broker nodes at all) has
 /// no such count, so nothing there bounds what the service places.
-fn replication_factor(requested: &CreatableTopic, cluster: &Cluster) -> Result<i32, Refusal> {
+fn replication_factor(
+    requested: &CreatableTopic,
+    cluster: &Cluster,
+    broker: &super::broker_config::BrokerConfiguration,
+) -> Result<i32, Refusal> {
     let factor = match requested.assignments.first() {
         Some(assignment) => i32::try_from(assignment.broker_ids.len()).unwrap_or(i32::MAX),
         None => match i32::from(requested.replication_factor) {
-            USE_BROKER_DEFAULT => DEFAULT_REPLICATION_FACTOR,
+            USE_BROKER_DEFAULT => broker
+                .number(super::broker_config::DEFAULT_REPLICATION_FACTOR_CONFIG)
+                .unwrap_or(DEFAULT_REPLICATION_FACTOR),
             named => named,
         },
     };
