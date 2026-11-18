@@ -38,9 +38,13 @@
 //! ([`::service_common::cloudwatch_logs::delivered_into_held_group_over`], the one
 //! vended-logs write in this tree): a destination nothing created loses the records, which is
 //! what makes a misconfigured destination observable. The write is made AS THE PIPE'S
-//! EXECUTION ROLE like every other data-plane call ([`super::LiveRecord::refusal`]): a role
-//! that may not create the stream or put the events writes nothing, and the execution itself
-//! is unaffected either way — logging a pass is never what decides whether its records were
+//! EXECUTION ROLE like every other data-plane call ([`super::LiveRecord::refusal`]), and it is
+//! authorized on the resource the calls it makes ADDRESS — the log STREAM the records go into
+//! ([`Destination::stream_resource`]), which is what CloudWatch Logs judges a call naming a
+//! stream against, rather than whichever form the destination's `LogGroupArn` was written in.
+//! So a role granted those two actions over the group's streams may write however the
+//! destination was spelled, and a role granted neither writes nothing; the execution itself is
+//! unaffected either way — logging a pass is never what decides whether its records were
 //! moved.
 
 use ::serde_json::{json, Value};
@@ -57,6 +61,14 @@ const PUT_LOG_EVENTS_ACTION: &str = "logs:PutLogEvents";
 /// The one value `IncludeExecutionData` carries: "specify `ALL` to include the execution
 /// data" (`IncludeExecutionDataOption`'s single member).
 const ALL_EXECUTION_DATA: &str = "ALL";
+
+/// The resource type a CloudWatch Logs group's ARN names
+/// (`arn:<partition>:logs:<region>:<account>:log-group:<name>`).
+const LOG_GROUP_RESOURCE_TYPE: &str = "log-group";
+
+/// What follows a GROUP's ARN in the ARN of one STREAM of that group
+/// (`…:log-group:<name>:log-stream:<stream>`). See [`Destination::stream_resource`].
+const STREAM_RESOURCE_QUALIFIER: &str = "log-stream:";
 
 /// The fields every record of an execution carries: the pipe that ran, the instant the
 /// record was written, the execution every record of it shares, the record's own level and
@@ -169,12 +181,29 @@ impl Level {
 /// `CloudwatchLogsLogDestination.LogGroupArn` names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Destination {
-    /// The ARN as the pipe configured it: the resource the write is authorized on.
-    arn: String,
+    /// The GROUP's own ARN, carrying nothing of what is under it whichever form the
+    /// configuration spelled: what the resource the write is authorized on is built from
+    /// ([`Destination::stream_resource`]).
+    group_arn: String,
     /// The group's name, which is what the write addresses.
     group: String,
     /// The Region the ARN names — the records go where the ARN says they do.
     region: String,
+}
+
+impl Destination {
+    /// The ARN of the log STREAM `stream` of this group: the resource a call that names that
+    /// stream is authorized on.
+    ///
+    /// Both calls the write makes NAME the stream they write into, and a call that names a
+    /// stream is authorized against that stream's own ARN —
+    /// `<the group's ARN>:log-stream:<stream>` — so that is the resource asked about, rather
+    /// than whichever of the group ARN's two published forms the destination happened to
+    /// carry. It is what makes a grant written over the group's streams the grant that lets a
+    /// pipe write its execution log either way round.
+    fn stream_resource(&self, stream: &str) -> String {
+        format!("{}:{STREAM_RESOURCE_QUALIFIER}{stream}", self.group_arn)
+    }
 }
 
 /// What a pipe's `LogConfiguration` asks this data plane to WRITE: at which level, with the
@@ -249,7 +278,12 @@ fn cloudwatch_destination(configuration: &PipeLogConfiguration) -> Option<Destin
     let group = ::service_common::cloudwatch_logs::log_group_of_arn(arn)?;
     let parsed = ::service_common::arn::parse(arn)?;
     Some(Destination {
-        arn: arn.to_string(),
+        // The group's OWN ARN, rebuilt from the fields the configured one carries, so that
+        // both published forms of a destination resolve to the one ARN of the one group.
+        group_arn: format!(
+            "arn:{}:{}:{}:{}:{LOG_GROUP_RESOURCE_TYPE}:{group}",
+            parsed.partition, parsed.vendor, parsed.region, parsed.account
+        ),
         group: group.to_string(),
         region: parsed.region.to_string(),
     })
@@ -427,8 +461,12 @@ impl<'a> Execution<'a> {
         let Some(destination) = self.run.logging.destination.as_ref() else {
             return;
         };
+        let stream = stream_of(record.pipe);
+        // Both calls name the stream the records go into, so both are authorized on that
+        // stream's own ARN ([`Destination::stream_resource`]).
+        let resource = destination.stream_resource(&stream);
         for action in [CREATE_LOG_STREAM_ACTION, PUT_LOG_EVENTS_ACTION] {
-            if let Some(detail) = record.refusal(action, &destination.arn) {
+            if let Some(detail) = record.refusal(action, &resource) {
                 ::tracing::debug!(
                     pipe = %record.pipe,
                     log_group = %destination.group,
@@ -448,7 +486,7 @@ impl<'a> Execution<'a> {
             callback,
             &destination.region,
             &destination.group,
-            &stream_of(record.pipe),
+            &stream,
             &messages,
         )
         .await
@@ -509,6 +547,54 @@ mod tests {
         logged_payload, resolve, Level, Logging, MAX_LOGGED_PAYLOAD_BYTES, PAYLOAD_FIELD,
     };
     use crate::ops::types::{CloudwatchLogsLogDestination, PipeLogConfiguration};
+
+    /// RULE: the resource the execution-log write is authorized on is the ARN of the STREAM
+    /// the records go into, inside the group the destination resolves to, whichever published
+    /// form the configured `LogGroupArn` was written in.
+    ///
+    /// The rows differ along that form and along the partition, Region and account the
+    /// destination names, which is what the rule generalises over.
+    #[test]
+    fn the_write_is_authorized_on_the_streams_own_arn() {
+        let stream = "arn:aws:pipes:eu-west-1:000000000000:pipe/one";
+        // (case, the configured destination, the group ARN the resource is built on)
+        let rows: [(&str, &str, &str); 4] = [
+            (
+                "the group on its own",
+                "arn:aws:logs:us-east-1:000000000000:log-group:/aws/vendedlogs/pipes/one",
+                "arn:aws:logs:us-east-1:000000000000:log-group:/aws/vendedlogs/pipes/one",
+            ),
+            (
+                "the group with everything under it",
+                "arn:aws:logs:us-east-1:000000000000:log-group:/aws/vendedlogs/pipes/one:*",
+                "arn:aws:logs:us-east-1:000000000000:log-group:/aws/vendedlogs/pipes/one",
+            ),
+            (
+                "another Region and account",
+                "arn:aws:logs:ap-south-1:123456789012:log-group:audit",
+                "arn:aws:logs:ap-south-1:123456789012:log-group:audit",
+            ),
+            (
+                "another partition",
+                "arn:aws-us-gov:logs:us-gov-west-1:000000000000:log-group:audit:*",
+                "arn:aws-us-gov:logs:us-gov-west-1:000000000000:log-group:audit",
+            ),
+        ];
+        for (case, configured, group_arn) in rows {
+            let logging = resolve(Some(&configuration(Some("TRACE"), Some(configured), true)));
+            let destination = logging
+                .destination
+                .as_ref()
+                .unwrap_or_else(|| panic!("case {case:?}: {configured} names no log group"));
+            let got = destination.stream_resource(stream);
+            let expected = format!("{group_arn}:log-stream:{stream}");
+            assert_eq!(
+                got, expected,
+                "case {case:?}: expected the write to be authorized on {expected:?}, got \
+                 {got:?}"
+            );
+        }
+    }
 
     /// A stored configuration naming `level`, the group `arn` when it names one, and asking
     /// for the execution data when `data` says so.

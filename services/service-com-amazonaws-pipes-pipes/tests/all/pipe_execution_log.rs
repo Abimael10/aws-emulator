@@ -14,7 +14,11 @@
 //! the stage was handed in its own `payload` field exactly when `IncludeExecutionData`
 //! contains `ALL`. An execution that never happened leaves no record, and a destination the
 //! pipe's execution role may not write to, or that the account does not hold, leaves the
-//! group as it was while the execution itself runs unaffected.
+//! group as it was while the execution itself runs unaffected. The write is authorized on the
+//! STREAM the records go into, so the grant AWS publishes for `logs:CreateLogStream` and
+//! `logs:PutLogEvents` — the group with everything under it, or the group's streams — lets a
+//! pipe write whichever form its destination's `LogGroupArn` is in, and a grant over another
+//! group's streams lets it write nothing.
 //!
 //! A record per STAGE is a record per stage the execution HANDS A BATCH TO — the enrichment
 //! and the target; what the source poll took is the `ExecutionStarted` record's own payload,
@@ -23,8 +27,9 @@
 //!
 //! The rows differ along what the rule generalises over — the configured level, whether the
 //! execution data was asked for, whether the execution SUCCEEDS or its target stage fails,
-//! whether the role may write the log, and whether the destination exists at all. Each row is
-//! asserted by its own test, so one row never waits out another row's pipe.
+//! which published form of a log group's ARN the destination is written in, what resource the
+//! role is granted the two log actions on, and whether the destination exists at all. Each
+//! row is asserted by its own test, so one row never waits out another row's pipe.
 //!
 //! Every wait here LOOKS AGAIN until the condition it needs holds, on a generous deadline,
 //! and every assertion that something stays ABSENT is looked at repeatedly across its span:
@@ -196,6 +201,34 @@ async fn stays_empty(router: &MultiServiceRouter, case: &str, group: &str, watch
     }
 }
 
+/// Which published form of a log group's ARN a value is written in.
+///
+/// A destination's `LogGroupArn` may be either, and both name the same group: the group on
+/// its own, and the group together with everything under it — the form `DescribeLogGroups`
+/// reports a group's `arn` in.
+#[derive(Clone, Copy, Debug)]
+enum GroupArn {
+    /// `arn:aws:logs:<region>:<account>:log-group:<name>`.
+    OnItsOwn,
+    /// That ARN followed by `:*`.
+    WithEverythingUnderIt,
+}
+
+/// What the pipe's execution role is granted `logs:CreateLogStream` and `logs:PutLogEvents`
+/// on, as the resource element of its one statement for them.
+#[derive(Clone, Copy, Debug)]
+enum LogGrant {
+    /// Nothing: the role carries no statement for those actions at all.
+    Nothing,
+    /// The configured group with everything under it (`<the group's ARN>:*`).
+    EverythingUnderTheGroup,
+    /// Every stream of the configured group (`<the group's ARN>:log-stream:*`).
+    TheGroupsStreams,
+    /// Every stream of ANOTHER group of the same account: a grant that does not reach the
+    /// destination this pipe names.
+    AnotherGroupsStreams,
+}
+
 /// One row of the table: how the pipe is configured to log, and what the group then holds.
 struct Row {
     case: &'static str,
@@ -205,8 +238,10 @@ struct Row {
     execution_data: bool,
     /// Whether the account holds the log group the configuration names.
     group_held: bool,
-    /// Whether the pipe's execution role may write the log.
-    may_log: bool,
+    /// The form the destination's `LogGroupArn` is written in.
+    destination: GroupArn,
+    /// What the pipe's execution role is granted the two log actions on.
+    log_grant: LogGrant,
     /// Whether that role may deliver to the target: a row that withholds it is an execution
     /// whose TARGET STAGE fails.
     may_deliver: bool,
@@ -221,7 +256,10 @@ struct Row {
 /// one execution they belong to and their own level, and carrying the stage's data in
 /// `payload` exactly when `IncludeExecutionData` contains `ALL` — and writes nothing for an
 /// execution that did not happen, to a destination it may not write to, or to one the
-/// account does not hold.
+/// account does not hold. The write is authorized on the STREAM the records go into, so a
+/// role granted those actions over the group's streams may write whichever published form
+/// the destination's `LogGroupArn` is in, and one granted them only over another group's
+/// streams may not.
 ///
 /// One row of the table below is asserted per test, so the rows run beside each other and no
 /// one of them waits out another's pipe.
@@ -240,6 +278,23 @@ async fn the_rule_holds_for(row: Row) {
                 engine::emulator_account_id()
             )
         };
+        // The destination as the pipe configures it, in the form this row names.
+        let configured_arn = match row.destination {
+            GroupArn::OnItsOwn => group_arn.clone(),
+            GroupArn::WithEverythingUnderIt => format!("{group_arn}:*"),
+        };
+        // What the role is granted the two log actions on, written independently of the form
+        // the destination is in: a grant and a destination that name the same group do so in
+        // whichever forms their own writers chose.
+        let log_grant = match row.log_grant {
+            LogGrant::Nothing => None,
+            LogGrant::EverythingUnderTheGroup => Some(format!("{group_arn}:*")),
+            LogGrant::TheGroupsStreams => Some(format!("{group_arn}:log-stream:*")),
+            LogGrant::AnotherGroupsStreams => Some(format!(
+                "arn:aws:logs:{REGION}:{}:log-group:{group}-elsewhere:log-stream:*",
+                engine::emulator_account_id()
+            )),
+        };
         // The role every stage acts as: the source poll always (a pipe whose role may not
         // take its source's records is never brought up at all, which is
         // `tests/all/pipe_bring_up.rs`), and the delivery and the log write as the row says.
@@ -255,11 +310,11 @@ async fn the_rule_holds_for(row: Row) {
                 "Resource": target_arn,
             }));
         }
-        if row.may_log {
+        if let Some(resource) = log_grant {
             statements.push(json!({
                 "Effect": "Allow",
                 "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
-                "Resource": [group_arn.clone(), format!("{group_arn}:*")],
+                "Resource": resource,
             }));
         }
         let role_arn = given_role_stating(
@@ -270,7 +325,7 @@ async fn the_rule_holds_for(row: Row) {
         )
         .await;
         let mut log_configuration = json!({
-            "CloudwatchLogsLogDestination": { "LogGroupArn": group_arn },
+            "CloudwatchLogsLogDestination": { "LogGroupArn": configured_arn },
             "Level": row.level,
         });
         if row.execution_data {
@@ -480,7 +535,9 @@ async fn the_rule_holds_for(row: Row) {
 }
 
 /// The row of the table the behaviour the issue was filed about is one of: every record the
-/// finest level admits, with the execution data asked for.
+/// finest level admits, with the execution data asked for, over the grant AWS publishes for
+/// these two actions — the group with everything under it — and a destination naming the
+/// group on its own.
 #[tokio::test]
 async fn a_trace_pipe_asking_for_the_execution_data_logs_every_stage_with_the_payload() {
     the_rule_holds_for(Row {
@@ -488,7 +545,8 @@ async fn a_trace_pipe_asking_for_the_execution_data_logs_every_stage_with_the_pa
         level: "TRACE",
         execution_data: true,
         group_held: true,
-        may_log: true,
+        destination: GroupArn::OnItsOwn,
+        log_grant: LogGrant::EverythingUnderTheGroup,
         may_deliver: true,
         expect: &[
             EXECUTION_STARTED,
@@ -509,7 +567,8 @@ async fn an_info_pipe_logs_the_executions_own_records_and_no_stage_record() {
         level: "INFO",
         execution_data: true,
         group_held: true,
-        may_log: true,
+        destination: GroupArn::OnItsOwn,
+        log_grant: LogGrant::EverythingUnderTheGroup,
         may_deliver: true,
         expect: &[EXECUTION_STARTED, EXECUTION_SUCCEEDED],
         forbid: &[
@@ -531,7 +590,8 @@ async fn a_trace_pipe_asking_for_no_execution_data_logs_every_stage_without_the_
         level: "TRACE",
         execution_data: false,
         group_held: true,
-        may_log: true,
+        destination: GroupArn::WithEverythingUnderIt,
+        log_grant: LogGrant::TheGroupsStreams,
         may_deliver: true,
         expect: &[
             EXECUTION_STARTED,
@@ -552,7 +612,8 @@ async fn an_error_pipe_logs_nothing_for_an_execution_that_succeeds() {
         level: "ERROR",
         execution_data: true,
         group_held: true,
-        may_log: true,
+        destination: GroupArn::OnItsOwn,
+        log_grant: LogGrant::EverythingUnderTheGroup,
         may_deliver: true,
         expect: &[],
         forbid: &[
@@ -576,7 +637,8 @@ async fn an_error_pipe_logs_the_stage_that_failed_its_execution() {
         level: "ERROR",
         execution_data: true,
         group_held: true,
-        may_log: true,
+        destination: GroupArn::OnItsOwn,
+        log_grant: LogGrant::TheGroupsStreams,
         may_deliver: false,
         expect: &[EXECUTION_STAGE_FAILED, EXECUTION_FAILED],
         forbid: &[
@@ -597,7 +659,8 @@ async fn a_pipe_whose_logging_is_off_writes_nothing() {
         level: "OFF",
         execution_data: true,
         group_held: true,
-        may_log: true,
+        destination: GroupArn::WithEverythingUnderIt,
+        log_grant: LogGrant::EverythingUnderTheGroup,
         may_deliver: true,
         expect: &[],
         forbid: &[
@@ -621,7 +684,8 @@ async fn a_role_that_may_not_write_the_log_writes_nothing_and_still_delivers() {
         level: "TRACE",
         execution_data: true,
         group_held: true,
-        may_log: false,
+        destination: GroupArn::OnItsOwn,
+        log_grant: LogGrant::Nothing,
         may_deliver: true,
         expect: &[],
         forbid: &[EXECUTION_STARTED, EXECUTION_SUCCEEDED],
@@ -638,7 +702,77 @@ async fn a_destination_the_account_does_not_hold_holds_nothing() {
         level: "TRACE",
         execution_data: true,
         group_held: false,
-        may_log: true,
+        destination: GroupArn::OnItsOwn,
+        log_grant: LogGrant::EverythingUnderTheGroup,
+        may_deliver: true,
+        expect: &[],
+        forbid: &[EXECUTION_STARTED, EXECUTION_SUCCEEDED],
+    })
+    .await;
+}
+
+/// The same pipe as the row above with its destination named in the OTHER published form of
+/// a group's ARN — the group with everything under it, which is what a client reads off
+/// `DescribeLogGroups` — against a role granted the group's streams: the records go into the
+/// one group either ARN names.
+#[tokio::test]
+async fn a_destination_naming_the_group_with_everything_under_it_is_written_to() {
+    the_rule_holds_for(Row {
+        case: "a-destination-naming-everything-under-the-group",
+        level: "TRACE",
+        execution_data: true,
+        group_held: true,
+        destination: GroupArn::WithEverythingUnderIt,
+        log_grant: LogGrant::TheGroupsStreams,
+        may_deliver: true,
+        expect: &[
+            EXECUTION_STARTED,
+            EXECUTION_STAGE_STARTED,
+            EXECUTION_STAGE_SUCCEEDED,
+            EXECUTION_SUCCEEDED,
+        ],
+        forbid: &[EXECUTION_STAGE_FAILED, EXECUTION_FAILED],
+    })
+    .await;
+}
+
+/// A role granted the two actions over the streams of the group the destination names, with
+/// that destination naming the group on its own: the grant reaches the stream the records go
+/// into, so they are written.
+#[tokio::test]
+async fn a_role_granted_the_groups_streams_writes_the_log() {
+    the_rule_holds_for(Row {
+        case: "a-role-granted-the-groups-streams",
+        level: "TRACE",
+        execution_data: true,
+        group_held: true,
+        destination: GroupArn::OnItsOwn,
+        log_grant: LogGrant::TheGroupsStreams,
+        may_deliver: true,
+        expect: &[
+            EXECUTION_STARTED,
+            EXECUTION_STAGE_STARTED,
+            EXECUTION_STAGE_SUCCEEDED,
+            EXECUTION_SUCCEEDED,
+        ],
+        forbid: &[EXECUTION_STAGE_FAILED, EXECUTION_FAILED],
+    })
+    .await;
+}
+
+/// And a role granted those actions over ANOTHER group's streams writes nothing into this
+/// one: the resource the write is authorized on is the stream of the group the destination
+/// names, so a grant that does not reach it is no grant at all — while the execution still
+/// moves the record.
+#[tokio::test]
+async fn a_role_granted_another_groups_streams_writes_nothing_and_still_delivers() {
+    the_rule_holds_for(Row {
+        case: "a-role-granted-another-groups-streams",
+        level: "TRACE",
+        execution_data: true,
+        group_held: true,
+        destination: GroupArn::OnItsOwn,
+        log_grant: LogGrant::AnotherGroupsStreams,
         may_deliver: true,
         expect: &[],
         forbid: &[EXECUTION_STARTED, EXECUTION_SUCCEEDED],
