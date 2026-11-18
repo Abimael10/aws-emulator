@@ -455,12 +455,10 @@ async fn creating_a_view_is_refused_unless_the_caller_is_the_management_account(
         "case \"after the refusals\": a refused create stores nothing"
     );
 
-    // The rule is about the caller, not a blanket refusal: the management
-    // account of the family creates the same view, and it reads back.
-    engine
-        .state::<ComAmazonawsBillingAwsbillingState>()
-        .lock()
-        .organization_management_account_id = Some(ACCOUNT_ID.to_string());
+    // The rule is about the caller, not a blanket refusal: once an
+    // organization the caller manages is recorded in AWS Organizations — the
+    // store the gate reads — the same create goes through and reads back.
+    crate::billing_views::set_organization_management_account(&engine, Some(ACCOUNT_ID));
     let (status, created) = call(&router, "CreateBillingView", &bodies[0]).await;
     assert_eq!(
         status, 200,

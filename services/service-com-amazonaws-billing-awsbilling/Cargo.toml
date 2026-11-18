@@ -12,6 +12,11 @@ engine = { workspace = true }
 # `sts:GetCallerIdentity` and this service must answer with one principal for
 # one credential, so the identity is resolved from the STS store (src/state.rs).
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# Whether the caller is an organization's management account is AWS Organizations'
+# own fact: `CreateBillingView` is reserved to that identity, so the gate reads the
+# organization out of that service's store rather than keeping a copy here
+# (src/state.rs).
+service-com-amazonaws-organizations-awsorganizationsv20161128 = { workspace = true }
 # The opaque `nextToken` every paginated read hands out is AUTHENTICATED under a
 # per-store secret, so a cut point a caller assembled is refused rather than
 # honoured: the workspace's one page-token key (src/state.rs).

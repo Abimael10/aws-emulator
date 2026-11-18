@@ -29,7 +29,9 @@
 //!    the ways a caller can fail the gate (no organization at all, an
 //!    organization another account manages) crossed with requests that differ in
 //!    every member the operation takes, and the management account itself is the
-//!    control.
+//!    control. Which account manages the organization is AWS Organizations' own
+//!    record, read when the decision is made, so one router answers differently
+//!    as that record changes.
 //!
 //! The harness (`call`, `error_code`, …) is the one `billing_views.rs` owns.
 
@@ -44,8 +46,8 @@ use std::sync::Arc;
 // the feature list exists once for both suites.
 use crate::billing_feature_access::{get_body, set_access, update_body, ALL_FEATURES};
 use crate::billing_views::{
-    call, emulator_with_engine, error_code, standalone_emulator_with_engine, ACCOUNT_ID,
-    PRIMARY_ARN,
+    call, emulator_with_engine, error_code, set_organization_management_account,
+    standalone_emulator_with_engine, ACCOUNT_ID, PRIMARY_ARN,
 };
 use crate::rejection_fidelity::message;
 
@@ -287,19 +289,6 @@ const NOT_MANAGEMENT_ACCOUNT_SENTENCE: &str =
     "User account is not an AWS Organization's management account. \
      This operation is only permitted to management accounts.";
 
-/// Put the organization's management account at `management_account`: `None`
-/// models a standalone account, `Some(id)` an account whose organization some
-/// other account manages.
-fn set_organization_management_account(
-    engine: &Arc<engine::InMemoryEngine>,
-    management_account: Option<&str>,
-) {
-    engine
-        .state::<ComAmazonawsBillingAwsbillingState>()
-        .lock()
-        .organization_management_account_id = management_account.map(str::to_string);
-}
-
 /// The `CUSTOM` views the account holds, by name.
 async fn custom_view_names(router: &MultiServiceRouter) -> Vec<String> {
     let (status, listed) = call(
@@ -429,6 +418,76 @@ async fn a_caller_that_is_not_the_management_account_reads_the_fixed_sentence() 
         assert!(
             names.is_empty(),
             "case {world:?}: a refused create stores no view, listed {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_gate_follows_the_organization_store_call_by_call() {
+    // The standing the gate judges by is AWS Organizations' own record, read
+    // when the decision is made — so one router answers differently as that
+    // record changes, and nothing this service stores can stand in for it. The
+    // rows span the ways the record can stand: no organization, one the caller
+    // manages, and one each of two OTHER accounts manage.
+    let (router, engine) = standalone_emulator_with_engine();
+    let worlds: Vec<(&str, Option<&str>, bool)> = vec![
+        ("no organization", None, false),
+        ("an organization the caller manages", Some(ACCOUNT_ID), true),
+        (
+            "an organization another account manages",
+            Some("111111111111"),
+            false,
+        ),
+        ("the caller manages it again", Some(ACCOUNT_ID), true),
+        (
+            "an organization a third account manages",
+            Some("999999999999"),
+            false,
+        ),
+    ];
+
+    let mut created_arns: Vec<String> = Vec::new();
+    for (index, (world, management_account, served)) in worlds.iter().enumerate() {
+        set_organization_management_account(&engine, *management_account);
+        let body = json!({
+            "name": format!("call-by-call-{index}"),
+            "sourceViews": [PRIMARY_ARN],
+        });
+        let (status, got) = call(&router, "CreateBillingView", &body).await;
+        if *served {
+            assert_eq!(
+                status, 200,
+                "case {world:?}: expected the create to be served, got {status} {got:?}"
+            );
+            created_arns.push(got["arn"].as_str().unwrap_or_default().to_string());
+        } else {
+            assert_eq!(
+                (status, error_code(&got).as_str()),
+                (400, "ValidationException"),
+                "case {world:?}: expected 400 ValidationException, got {status} {got:?}"
+            );
+            assert_eq!(
+                message(&got),
+                NOT_MANAGEMENT_ACCOUNT_SENTENCE,
+                "case {world:?}: expected the fixed management-account sentence pair, got {:?}",
+                message(&got)
+            );
+        }
+
+        // Whatever the record says now, the views already created stay stored
+        // and readable: the fact gates the WRITE, it does not withdraw a view.
+        for arn in &created_arns {
+            let (status, read) = call(&router, "GetBillingView", &json!({ "arn": arn })).await;
+            assert_eq!(
+                status, 200,
+                "case {world:?}: the view created earlier still reads back, got {status} {read:?}"
+            );
+        }
+        let names = custom_view_names(&router).await;
+        assert_eq!(
+            names.len(),
+            created_arns.len(),
+            "case {world:?}: exactly the served creates are listed, listed {names:?}"
         );
     }
 }

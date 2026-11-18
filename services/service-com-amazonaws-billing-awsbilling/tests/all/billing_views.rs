@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_billing_awsbilling::EmulatedService;
+use service_com_amazonaws_organizations_awsorganizationsv20161128::state::DEFAULT_FEATURE_SET;
+use service_com_amazonaws_organizations_awsorganizationsv20161128::ComAmazonawsOrganizationsAwsorganizationsv20161128State;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The account id every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
@@ -48,19 +50,48 @@ pub(crate) fn standalone_emulator_with_engine() -> (MultiServiceRouter, Arc<engi
 /// The same router, plus the engine it was built over, for the one test that
 /// asserts a store's resident size rather than an API answer.
 ///
-/// `CreateBillingView` is an organization-management-account action, so this
-/// harness models the caller as the management account of an organization
-/// (`organization_management_account_id`) — the world in which the billing
-/// view lifecycle these tests are about is reachable at all. The refusal a
-/// caller that is NOT the management account gets is asserted in
-/// `tests/all/rejection_fidelity.rs`, over the default state.
+/// `CreateBillingView` is an organization-management-account action, and which
+/// account manages the organization is AWS Organizations' fact, read out of that
+/// service's store — so this harness records an organization there, managed by
+/// the caller, which is what `Organizations:CreateOrganization` does over the
+/// wire. That is the world in which the billing view lifecycle these tests are
+/// about is reachable at all. The refusal a caller that is NOT the management
+/// account gets is asserted in `tests/all/rejection_fidelity.rs`, over the
+/// default state, and the wire path that puts the account in an organization in
+/// `core/router/tests/all/billing_view_creation_needs_an_organization.rs`.
 pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = standalone_emulator_with_engine();
-    engine
-        .state::<service_com_amazonaws_billing_awsbilling::ComAmazonawsBillingAwsbillingState>()
-        .lock()
-        .organization_management_account_id = Some(ACCOUNT_ID.to_string());
+    set_organization_management_account(&engine, Some(ACCOUNT_ID));
     (router, engine)
+}
+
+/// Record, in the AWS Organizations store this engine holds, an organization
+/// whose management account is `management_account` — the fact
+/// `CreateBillingView`'s gate reads
+/// (`state::organization_management_account_id`). `None` puts the account in no
+/// organization at all, which is how a fresh emulator stands up.
+///
+/// The organization is created exactly as Organizations' own
+/// `CreateOrganization` creates it (whose management account is always the
+/// calling account), and then re-pointed for the worlds that model an
+/// organization some OTHER account manages.
+pub(crate) fn set_organization_management_account(
+    engine: &Arc<engine::InMemoryEngine>,
+    management_account: Option<&str>,
+) {
+    let organizations = engine.state::<ComAmazonawsOrganizationsAwsorganizationsv20161128State>();
+    let mut organizations = organizations.lock();
+    match management_account {
+        None => organizations.organization = None,
+        Some(account) => {
+            organizations.create_organization(DEFAULT_FEATURE_SET);
+            let organization = organizations
+                .organization
+                .as_mut()
+                .expect("creating an organization records one");
+            organization.master_account_id = account.to_string();
+        }
+    }
 }
 
 /// Send one awsJson1_0 call and return its HTTP status and decoded body.

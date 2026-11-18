@@ -5,8 +5,10 @@
 //! ARN it mints, and answers with that ARN and the record's `createdAt`.
 //! `clientToken` makes the call idempotent: a replay returns the ARN the first
 //! call minted and creates no second view. A caller that is not the management
-//! account of a consolidated billing family is refused with
-//! `ValidationException` (400) before anything is stored.
+//! account of the organization AWS Organizations holds — read from that
+//! service's own store, so an account becomes one by creating an organization
+//! there — is refused with `ValidationException` (400) before anything is
+//! stored.
 //!
 //! The view is minted OVER the billing views `sourceViews` names, so each of
 //! them must be a view this service holds: a request naming an ARN no view is
@@ -215,26 +217,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `sourceViews` 1..10, `resourceTags` 0..200, the `clientToken` pattern)
         // is refused by the boundary validator before this runs, so reaching
         // here means the input satisfies all of them.
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateBillingViewErrorModeled::InternalServerException(InternalServerException {
-                message: "the billing view store is unavailable".to_string(),
-            })
-        })?;
-        let mut state = state.lock();
-
         // Creating a `CUSTOM` billing view is an organization-management-account
-        // action: a caller that is not the management account of a consolidated
-        // billing family is refused with the modeled `ValidationException`
-        // (400), deterministically and before any state is touched, so
-        // concurrent attempts all get the same answer and none of them leaves a
-        // view behind. See `organization_management_account_id` for why the
-        // emulated standalone account is not one.
+        // action: a caller that is not the management account of an organization
+        // is refused with the modeled `ValidationException` (400),
+        // deterministically and before any state is touched, so concurrent
+        // attempts all get the same answer and none of them leaves a view
+        // behind. Which account manages the organization is AWS Organizations'
+        // own fact, so it is read from THAT service's store at the instant the
+        // decision is made (`state::is_organization_management_account`): an
+        // account becomes a management account by creating an organization
+        // there, and no state of this service can stand in for that.
         // The refusal's sentence is FIXED for this error class
         // (`state::NOT_ORGANIZATION_MANAGEMENT_ACCOUNT`): it names neither the
         // caller's account nor anything the request carried, so the text is the
         // same for every caller and every request that reaches this gate.
         let caller = crate::state::caller_account_id();
-        if !state.is_organization_management_account(caller) {
+        if !crate::state::is_organization_management_account(&*self.engine, caller) {
             return Err(CreateBillingViewErrorModeled::ValidationException(ValidationException {
                 message: crate::state::NOT_ORGANIZATION_MANAGEMENT_ACCOUNT.to_string(),
                 reason: crate::state::VALIDATION_REASON_OTHER.to_string(),
@@ -242,6 +240,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBillingViewErrorModeled::InternalServerException(InternalServerException {
+                message: "the billing view store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
 
         // The view is minted with the tag set the request asks for, so the
         // request's list is collected through the one rule every writer of a tag

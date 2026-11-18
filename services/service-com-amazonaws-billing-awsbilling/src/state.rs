@@ -45,6 +45,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use service_com_amazonaws_organizations_awsorganizationsv20161128::state as organizations_state;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
 
 /// The secret a store's continuation tokens are authenticated under — the
@@ -224,9 +225,8 @@ pub const MANAGED_VIEW_NOT_TAGGABLE: &str = "Managed billing views cannot be tag
 /// account id, no resource name, no ARN and no value from the request — so the
 /// refusal reads the same whichever caller it answers and whichever operation
 /// made the decision. Shared by every gate that consults
-/// [`ComAmazonawsBillingAwsbillingState::is_organization_management_account`],
-/// so a caller cannot learn from the wording which account the service thinks it
-/// is.
+/// [`is_organization_management_account`], so a caller cannot learn from the
+/// wording which account the service thinks it is.
 pub const NOT_ORGANIZATION_MANAGEMENT_ACCOUNT: &str =
     "User account is not an AWS Organization's management account. \
      This operation is only permitted to management accounts.";
@@ -735,26 +735,9 @@ pub struct ComAmazonawsBillingAwsbillingState {
     /// This is the emulated account itself: a standalone account is the payer
     /// account of its own family, which is NOT the same as being an AWS
     /// Organizations management account (see
-    /// [`Self::organization_management_account_id`], `None` by default).
+    /// [`organization_management_account_id`], which answers `None` while no
+    /// organization has been created).
     pub billing_family_management_account_id: String,
-    /// The management account of the AWS Organizations organization this
-    /// emulated account belongs to, when it belongs to one.
-    ///
-    /// Creating a `CUSTOM` billing view is an organization-management-account
-    /// action (see the `UpdateBillingPreferences` doc for the same split:
-    /// sharing keys "may only be set by the management account of a
-    /// consolidated billing family"), so `CreateBillingView` consults this
-    /// before it mutates anything.
-    ///
-    /// `None` by default: an organization is established through AWS
-    /// Organizations, which this emulator models in its own service and whose
-    /// state holds no organization until one is created — so the emulated
-    /// account is a standalone account and is nobody's organization management
-    /// account. That is NOT the same as being the payer account of its own
-    /// consolidated billing family, which a standalone account is (see
-    /// [`Self::credits_for_period`]). Set this to the caller's account id to
-    /// model the management account of an organization.
-    pub organization_management_account_id: Option<String>,
     /// Every credit held by an account of this emulator's consolidated billing
     /// family, keyed and ordered by `creditId`, so `GetCredits` answers in a
     /// deterministic order. Bounded by [`MAX_CREDITS`].
@@ -830,10 +813,12 @@ impl Default for ComAmazonawsBillingAwsbillingState {
             resource_policy: None,
         };
         // The default view's domain is the account's own final charges: the
-        // account belongs to no organization, no billing group and no billing
-        // transfer by default (see `organization_management_account_id`), so the
-        // segment carries no account relationship and is bounded on neither
-        // side — nothing has changed over the account's whole history.
+        // account belongs to no organization (see
+        // `organization_management_account_id`, the fact read from the
+        // Organizations store), no billing group and no billing transfer by
+        // default, so the segment carries no account relationship and is
+        // bounded on neither side — nothing has changed over the account's
+        // whole history.
         let primary_segment =
             BillingViewSegment::in_effect(&primary.arn, BILLING_DOMAIN_BILLABLE);
         let mut billing_view_segments = BTreeMap::new();
@@ -862,7 +847,6 @@ impl Default for ComAmazonawsBillingAwsbillingState {
             next_preference_change_seq: 1,
             consolidated_billing_family,
             billing_family_management_account_id: caller_account_id().to_string(),
-            organization_management_account_id: None,
             // A fresh account holds no credits: the modeled `GetCredits`
             // response "returns an empty list when no credits exist".
             credits: BTreeMap::new(),
@@ -1065,9 +1049,9 @@ impl ComAmazonawsBillingAwsbillingState {
 
     /// Whether `account_id` is the management (payer) account of the
     /// consolidated billing family — the only identity that may set a sharing
-    /// preference. Distinct from
-    /// [`Self::is_organization_management_account`]: a standalone account is its
-    /// own family's payer account but nobody's organization management account.
+    /// preference. Distinct from [`is_organization_management_account`]: a
+    /// standalone account is its own family's payer account but nobody's
+    /// organization management account.
     pub fn is_billing_family_management_account(&self, account_id: &str) -> bool {
         self.billing_family_management_account_id == account_id
     }
@@ -1244,13 +1228,6 @@ impl ComAmazonawsBillingAwsbillingState {
     /// Idempotent.
     pub fn revoke_feature_access(&mut self, feature: &str) {
         self.feature_access.remove(feature);
-    }
-
-    /// Whether `account_id` is the management account of the organization this
-    /// account belongs to — see [`Self::organization_management_account_id`]
-    /// for why a standalone account is not.
-    pub fn is_organization_management_account(&self, account_id: &str) -> bool {
-        self.organization_management_account_id.as_deref() == Some(account_id)
     }
 
     /// The stored view `arn` names when it is one this account may edit or
@@ -1506,6 +1483,46 @@ pub fn caller_identity_arn<Eng: Send + Sync + 'static>(
         })
         .unwrap_or_else(sts_state::ambient_identity)
         .arn
+}
+
+/// The management account of the AWS Organizations organization this emulated
+/// account belongs to, or `None` while it belongs to none.
+///
+/// An organization is AWS Organizations' own resource, so the fact is read from
+/// THAT service's store, at the instant the decision is made — the same way the
+/// principal a refusal names is read from STS's ([`caller_identity_arn`]).
+/// Nothing is cached here: an account becomes a management account by creating
+/// an organization through Organizations, and that call is the only thing that
+/// can make this answer an account id.
+///
+/// `None` also when this service is mounted on an engine that holds no
+/// Organizations store: no organization is recorded anywhere such a process can
+/// see, so the account is standalone.
+pub fn organization_management_account_id<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<String> {
+    let organizations = organizations_state::service_state(engine)?;
+    let organizations = organizations.lock();
+    organizations
+        .organization
+        .as_ref()
+        .map(|organization| organization.master_account_id.clone())
+}
+
+/// Whether `account_id` is the management account of the organization this
+/// account belongs to — the gate an operation reserved to that identity
+/// consults, refusing every other caller with
+/// [`NOT_ORGANIZATION_MANAGEMENT_ACCOUNT`].
+///
+/// `false` while no organization exists: a standalone account is the payer
+/// account of its own consolidated billing family (see
+/// [`ComAmazonawsBillingAwsbillingState::is_billing_family_management_account`])
+/// but is nobody's organization management account.
+pub fn is_organization_management_account<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    account_id: &str,
+) -> bool {
+    organization_management_account_id(engine).as_deref() == Some(account_id)
 }
 
 /// The suffix the billing-preference surface's BACKEND operation token carries
