@@ -422,14 +422,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(crate::state::AnnotationWrite::NoSuchObject) => {
                 return Err(PutObjectAnnotationErrorModeled::NoSuchKey(NoSuchKey {}).into())
             }
-            // "Each object can have up to 1,000 annotations", and past it "the request
-            // would exceed the maximum number of annotations allowed per object" — the
-            // modelled `AnnotationLimitExceeded` (400), which is what this ceiling is.
-            Some(crate::state::AnnotationWrite::LimitReached) => {
-                return Err(PutObjectAnnotationErrorModeled::AnnotationLimitExceeded(
-                    AnnotationLimitExceeded {},
-                )
-                .into())
+            // "Each object can have up to 1,000 annotations", and a write past that is
+            // refused with `AnnotationLimitExceeded` (400) carrying the sentence S3 words
+            // for that condition, which COUNTS: how many annotations this write would have
+            // left the object version holding, against the ceiling it is judged by. The
+            // error shape's documentation sentence states the condition for the API
+            // reference and is not what reaches the wire, so the refusal is worded in the
+            // one place that words it, from the two counts the store just reported.
+            Some(crate::state::AnnotationWrite::LimitReached { would_hold, limit }) => {
+                return Err(crate::scaffolded::Scaffolded::annotation_limit_exceeded(
+                    would_hold, limit,
+                ))
             }
             // The emulator's own ceilings, not AWS limits, so no AWS error code describes
             // them: they go out through the framework's 400 `ValidationException` channel,

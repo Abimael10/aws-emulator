@@ -468,9 +468,12 @@ pub enum AnnotationWrite {
     Applied,
     /// The bucket exists but holds no such object version; nothing was written.
     NoSuchObject,
-    /// The object already carries [`MAX_ANNOTATIONS_PER_OBJECT`] annotations and this call
-    /// names a new one; nothing was written.
-    LimitReached,
+    /// The object already carries as many annotations as it may and this call names a new
+    /// one; nothing was written. `would_hold` is the annotation count the write WOULD have
+    /// produced (what the object version carries plus the one this call names) and `limit`
+    /// the ceiling in force ([`MAX_ANNOTATIONS_PER_OBJECT`]), so the caller reports the two
+    /// counts the refusal states without re-deriving either.
+    LimitReached { would_hold: usize, limit: usize },
     /// Keeping the annotation would take the bucket past [`MAX_OBJECT_BYTES_PER_BUCKET`]
     /// retained bytes; nothing was written.
     ByteBudgetReached { would_hold: usize },

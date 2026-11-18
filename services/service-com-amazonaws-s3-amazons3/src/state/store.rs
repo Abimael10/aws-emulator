@@ -1956,10 +1956,16 @@ impl ComAmazonawsS3Amazons3State {
 
         // "Each object can have up to 1,000 annotations", so only a write that names a
         // name the object does not carry yet can take it past the ceiling: one that
-        // replaces an existing annotation leaves the count where it is.
+        // replaces an existing annotation leaves the count where it is. The refusal carries
+        // the count this write would have produced and the ceiling it is judged against,
+        // because this is where both are known.
         let replaces = object.annotation(name);
-        if replaces.is_none() && object.annotations.len() >= MAX_ANNOTATIONS_PER_OBJECT {
-            return Some(AnnotationWrite::LimitReached);
+        let held_count = object.annotations.len();
+        if replaces.is_none() && held_count >= MAX_ANNOTATIONS_PER_OBJECT {
+            return Some(AnnotationWrite::LimitReached {
+                would_hold: held_count + 1,
+                limit: MAX_ANNOTATIONS_PER_OBJECT,
+            });
         }
 
         // What the bucket and the whole store would retain with this annotation in place

@@ -1211,6 +1211,35 @@ pub const ANNOTATION_NAME_TOO_LONG_CODE: &str = "AnnotationNameTooLong";
 /// model binds to that error shape.
 pub const ANNOTATION_NAME_TOO_LONG_STATUS: u16 = 400;
 
+/// The code S3 answers a write that would take an object version past the number of
+/// annotations it may carry ([`MAX_ANNOTATIONS_PER_OBJECT`]) with, at
+/// [`ANNOTATION_LIMIT_EXCEEDED_STATUS`].
+pub const ANNOTATION_LIMIT_EXCEEDED_CODE: &str = "AnnotationLimitExceeded";
+
+/// The HTTP status [`ANNOTATION_LIMIT_EXCEEDED_CODE`] is rendered with: 400, the status the
+/// model binds to the error shape of that class
+/// (`smithy_query(query="shape",shape="AnnotationLimitExceeded")` reports `httpError: 400`).
+pub const ANNOTATION_LIMIT_EXCEEDED_STATUS: u16 = 400;
+
+/// The `<Message>` S3 sends with [`ANNOTATION_LIMIT_EXCEEDED_CODE`]: the COUNTED sentence,
+/// stating how many annotations the refused write would have left the object version holding
+/// and the ceiling that count is judged against.
+///
+/// Recorded behaviour: fixed text around two variable parts, which is why this is a function
+/// rather than a row of [`crate::scaffolded::DOCUMENTED_ERROR_MESSAGES`] — that catalog holds
+/// the codes whose sentence is the same for every request. `count` is the count the refused
+/// write WOULD have produced (what the object version carries plus the one the request names)
+/// and `limit` the ceiling in force, both read off this emulator's own state rather than
+/// written here, so a caller at the ceiling learns from the refusal both how far over it is
+/// and where the ceiling is.
+///
+/// The error shape's `@documentation` ("The request would exceed the maximum number of
+/// annotations allowed per object.") is the API reference's DESCRIPTION of the condition and
+/// not the sentence on the wire, so it is not what this refusal carries.
+pub fn annotation_limit_exceeded_message(count: usize, limit: usize) -> String {
+    format!("The object annotation count ({count}) exceeds the limit ({limit}).")
+}
+
 /// The zone the rendering above names, and renders the instant in: the one S3's own error
 /// documents are written in, which its `<ArgumentValue>` dates show to be US Pacific.
 ///

@@ -25,7 +25,8 @@
 //!   request fails with HTTP 415 (Unsupported Media Type)"
 //!   (`PutObjectAnnotationRequest$AnnotationPayload`).
 //! * "Each object can have up to 1,000 annotations", and a write past that is
-//!   `AnnotationLimitExceeded`.
+//!   `AnnotationLimitExceeded` carrying the COUNTED sentence: how many annotations the write
+//!   would have left the object version holding, against the ceiling in force.
 //! * A write or a read is addressed by bucket, key and name, so each absent one answers its
 //!   own failure: `NoSuchBucket`, `NoSuchKey`, `NoSuchAnnotation`, each with the `<Message>`
 //!   S3's error document carries for that code. "If specified, the operation only succeeds
@@ -36,12 +37,12 @@
 //!   (`CopyObjectRequest$AnnotationDirective`).
 
 use service_com_amazonaws_s3_amazons3::state::{
-    url_encoded_key, MAX_ANNOTATIONS_PER_OBJECT, MAX_ANNOTATION_NAME_BYTES,
-    MAX_ANNOTATION_PAYLOAD_BYTES, MIN_ANNOTATION_PAYLOAD_BYTES,
+    annotation_limit_exceeded_message, url_encoded_key, MAX_ANNOTATIONS_PER_OBJECT,
+    MAX_ANNOTATION_NAME_BYTES, MAX_ANNOTATION_PAYLOAD_BYTES, MIN_ANNOTATION_PAYLOAD_BYTES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::bucket_lifecycle::{router, send_bytes, Answer};
+use super::bucket_lifecycle::{router, send, send_bytes, Answer};
 use super::object_and_tagging_roundtrip::{bucket, expected_etag, put_object, text};
 
 /// `PUT /<bucket>/<key>?annotation&annotationName=<name>` — `PutObjectAnnotation`. The
@@ -819,6 +820,63 @@ async fn one_name_is_replaced_without_touching_the_others() {
     }
 }
 
+/// Attach annotations to the object version `query` addresses until it carries exactly the
+/// ceiling, so the next write naming a NEW annotation is the first one past it.
+async fn fill_to_the_ceiling(
+    router: &MultiServiceRouter,
+    bucket_name: &str,
+    key: &str,
+    query: &str,
+) {
+    for ordinal in 0..MAX_ANNOTATIONS_PER_OBJECT {
+        let name = format!("note-{ordinal:04}");
+        let put = put_annotation_at(router, bucket_name, key, &name, query, b"x", &[]).await;
+        assert_eq!(
+            put.status,
+            200,
+            "case {name:?}: an object under the ceiling takes the write, got {} with body {:?}",
+            put.status,
+            text(&put)
+        );
+    }
+}
+
+/// The sentence a write past the ceiling is refused with when the object version holds
+/// exactly the ceiling: the count the write would have produced is what the version holds
+/// plus the one the request names, and the ceiling is the one in force.
+///
+/// Computed from [`MAX_ANNOTATIONS_PER_OBJECT`] rather than written out, so what is pinned is
+/// the template and not one ceiling's two numbers.
+fn counted_ceiling_message() -> String {
+    annotation_limit_exceeded_message(MAX_ANNOTATIONS_PER_OBJECT + 1, MAX_ANNOTATIONS_PER_OBJECT)
+}
+
+/// The `@documentation` of an error shape of this service's model, HTML stripped — read from
+/// the model rather than retyped.
+///
+/// For [`LIMIT_EXCEEDED_CODE`] that sentence is the API reference's DESCRIPTION of the
+/// condition, which is exactly what must NOT reach the wire in place of the counted message.
+fn modeled_documentation(shape: &str) -> String {
+    let model_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-s3-amazons3.json"
+    );
+    let model: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(model_path).expect("the service's Smithy model must be readable"),
+    )
+    .expect("the Smithy model must parse as JSON");
+    model["shapes"][format!("com.amazonaws.s3#{shape}")]["traits"]["smithy.api#documentation"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the model must document the shape {shape:?}"))
+        .replace("<p>", "")
+        .replace("</p>", "")
+        .trim()
+        .to_string()
+}
+
+/// The wire error code a write past the per-object annotation ceiling is refused with.
+const LIMIT_EXCEEDED_CODE: &str = "AnnotationLimitExceeded";
+
 #[tokio::test]
 async fn an_object_holds_no_more_annotations_than_the_published_maximum() {
     let router = router();
@@ -828,17 +886,7 @@ async fn an_object_holds_no_more_annotations_than_the_published_maximum() {
     // "Each object can have up to 1,000 annotations": the last write at the ceiling is
     // taken, the first one past it is refused, and a write that REPLACES a name the object
     // already carries is taken even then, because it adds no annotation.
-    for ordinal in 0..MAX_ANNOTATIONS_PER_OBJECT {
-        let name = format!("note-{ordinal:04}");
-        let put = put_annotation(&router, "ceiling-bucket", "full.txt", &name, b"x", &[]).await;
-        assert_eq!(
-            put.status,
-            200,
-            "case {name:?}: an object under the ceiling takes the write, got {} with body {:?}",
-            put.status,
-            text(&put)
-        );
-    }
+    fill_to_the_ceiling(&router, "ceiling-bucket", "full.txt", "").await;
 
     let past = put_annotation(
         &router,
@@ -858,9 +906,16 @@ async fn an_object_holds_no_more_annotations_than_the_published_maximum() {
     );
     assert_eq!(
         past.error_code(),
-        "AnnotationLimitExceeded",
+        LIMIT_EXCEEDED_CODE,
         "case \"one past the ceiling\": expected AnnotationLimitExceeded, got {:?}",
         past.error_code()
+    );
+    let expected = counted_ceiling_message();
+    assert_eq!(
+        past.error_message(),
+        expected,
+        "case \"one past the ceiling\": expected the counted message {expected:?}, got {:?}",
+        past.error_message()
     );
 
     let replaced = put_annotation(
@@ -886,6 +941,268 @@ async fn an_object_holds_no_more_annotations_than_the_published_maximum() {
         "case \"replacing a name at the ceiling\": expected the new payload, got {:?}",
         String::from_utf8_lossy(&got.body)
     );
+}
+
+/// One row of the one-too-many table: the case name, the annotation name the refused write
+/// carries and its payload.
+struct PastTheCeilingRow {
+    case: &'static str,
+    name: String,
+    payload: Vec<u8>,
+}
+
+#[tokio::test]
+async fn a_write_past_the_ceiling_is_refused_with_the_counted_message() {
+    let router = router();
+    bucket(&router, "counted-ceiling-bucket").await;
+    object(&router, "counted-ceiling-bucket", "full.txt", b"payload").await;
+    fill_to_the_ceiling(&router, "counted-ceiling-bucket", "full.txt", "").await;
+
+    let expected = counted_ceiling_message();
+    let prose = modeled_documentation(LIMIT_EXCEEDED_CODE);
+
+    // The rows differ along what the rule generalises over: the annotation NAME's size and
+    // form (a word, a dotted namespaced name, the published 512-byte maximum, UTF-8 text that
+    // is more bytes than characters) and the PAYLOAD's size (the one-byte minimum, a word, a
+    // kibibyte). None of that is in the sentence — it is filled from the object version's own
+    // count and the ceiling in force — so every row is refused with the same one. And none of
+    // them is written, so each later row is still the first past the ceiling.
+    let rows = [
+        PastTheCeilingRow {
+            case: "a plain name, the one-byte minimum payload",
+            name: "one-too-many".to_string(),
+            payload: b"x".to_vec(),
+        },
+        PastTheCeilingRow {
+            case: "a dotted, namespaced name",
+            name: "com.example.pipeline.stage".to_string(),
+            payload: b"ingest".to_vec(),
+        },
+        PastTheCeilingRow {
+            case: "a name of the published maximum length",
+            name: name_of(MAX_ANNOTATION_NAME_BYTES),
+            payload: b"at the bound".to_vec(),
+        },
+        PastTheCeilingRow {
+            case: "a name of UTF-8 text, more bytes than characters",
+            name: "données-été".to_string(),
+            payload: "valeur — oui".as_bytes().to_vec(),
+        },
+        PastTheCeilingRow {
+            case: "a kibibyte of payload",
+            name: "kibibyte".to_string(),
+            payload: text_of(1024),
+        },
+    ];
+
+    for row in &rows {
+        let PastTheCeilingRow {
+            case,
+            name,
+            payload,
+        } = row;
+        let past = put_annotation(
+            &router,
+            "counted-ceiling-bucket",
+            "full.txt",
+            name,
+            payload,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            past.status,
+            400,
+            "case {case:?}: expected HTTP 400, got {} with body {:?}",
+            past.status,
+            text(&past)
+        );
+        assert_eq!(
+            past.error_code(),
+            LIMIT_EXCEEDED_CODE,
+            "case {case:?}: expected error code {LIMIT_EXCEEDED_CODE:?}, got {:?}",
+            past.error_code()
+        );
+        assert_eq!(
+            past.error_message(),
+            expected,
+            "case {case:?}: expected the counted message {expected:?}, got {:?}",
+            past.error_message()
+        );
+        assert_ne!(
+            past.error_message(),
+            prose,
+            "case {case:?}: the error shape's documentation describes the condition for the \
+             API reference and is not the message on the wire, got {:?}",
+            past.error_message()
+        );
+
+        // Nothing was written, so the count the next row is refused against is the one this
+        // row reported: the refused name is not an annotation of the object.
+        let absent = get_annotation(&router, "counted-ceiling-bucket", "full.txt", name).await;
+        assert_eq!(
+            absent.status,
+            404,
+            "case {case:?}: the refused annotation must be absent, got {} with body {:?}",
+            absent.status,
+            text(&absent)
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_annotation_ceiling_is_counted_on_the_addressed_object_version_alone() {
+    let router = router();
+    bucket(&router, "counted-version-bucket").await;
+    let versioning = send(
+        &router,
+        "PUT",
+        "/counted-version-bucket?versioning",
+        &[],
+        "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Status>Enabled</Status></VersioningConfiguration>",
+    )
+    .await;
+    assert_eq!(
+        versioning.status,
+        200,
+        "versioning must be enabled first, got {} with body {:?}",
+        versioning.status,
+        text(&versioning)
+    );
+
+    // Two versions of one key: the FIRST is filled to the ceiling, the second — which is the
+    // key's current object — carries no annotation at all.
+    let first = put_object(&router, "counted-version-bucket", "versioned.txt", b"one", &[]).await;
+    let second = put_object(&router, "counted-version-bucket", "versioned.txt", b"two", &[]).await;
+    let first_version = first
+        .header("x-amz-version-id")
+        .expect("a write into a versioning-enabled bucket reports the version it stored");
+    let second_version = second
+        .header("x-amz-version-id")
+        .expect("a write into a versioning-enabled bucket reports the version it stored");
+    assert_ne!(
+        first_version, second_version,
+        "the two writes must store two versions, got {first_version:?} twice"
+    );
+    let filled = format!("&versionId={first_version}");
+    fill_to_the_ceiling(&router, "counted-version-bucket", "versioned.txt", &filled).await;
+
+    let past = put_annotation_at(
+        &router,
+        "counted-version-bucket",
+        "versioned.txt",
+        "one-too-many",
+        &filled,
+        b"x",
+        &[],
+    )
+    .await;
+    let expected = counted_ceiling_message();
+    assert_eq!(
+        past.status,
+        400,
+        "case \"the filled version\": expected HTTP 400, got {} with body {:?}",
+        past.status,
+        text(&past)
+    );
+    assert_eq!(
+        past.error_message(),
+        expected,
+        "case \"the filled version\": expected the counted message {expected:?}, got {:?}",
+        past.error_message()
+    );
+
+    // The identical write on the OTHER version of the same key is taken: the count the
+    // sentence above stated is that one version's, read off the state of the object version
+    // the request addressed.
+    for (case, query) in [
+        (
+            "the other version, addressed by id",
+            format!("&versionId={second_version}"),
+        ),
+        (
+            "the other version, as the key's current object",
+            String::new(),
+        ),
+    ] {
+        let taken = put_annotation_at(
+            &router,
+            "counted-version-bucket",
+            "versioned.txt",
+            "one-too-many",
+            &query,
+            b"x",
+            &[],
+        )
+        .await;
+        assert_eq!(
+            taken.status,
+            200,
+            "case {case:?}: a version under the ceiling takes the write, got {} with body {:?}",
+            taken.status,
+            text(&taken)
+        );
+    }
+}
+
+#[test]
+fn the_counted_ceiling_sentence_states_the_two_counts_it_is_filled_from() {
+    // The fixed fragments of the sentence, in the order it carries them: the requirement,
+    // with the two counts spliced between them.
+    const OPENS: &str = "The object annotation count (";
+    const JOINS: &str = ") exceeds the limit (";
+    const CLOSES: &str = ").";
+
+    // The rows differ along what the template generalises over — the two counts — from the
+    // smallest ceiling a write can be refused against up to one well past the ceiling this
+    // service holds ([`MAX_ANNOTATIONS_PER_OBJECT`]).
+    let rows: [(&str, usize, usize); 6] = [
+        ("one past a ceiling of nothing", 1, 0),
+        ("one past a ceiling of one", 2, 1),
+        ("one past a ceiling of ten", 11, 10),
+        (
+            "one past the ceiling this service holds",
+            MAX_ANNOTATIONS_PER_OBJECT + 1,
+            MAX_ANNOTATIONS_PER_OBJECT,
+        ),
+        (
+            "well past the ceiling this service holds",
+            MAX_ANNOTATIONS_PER_OBJECT + 500,
+            MAX_ANNOTATIONS_PER_OBJECT,
+        ),
+        ("one past a ceiling of ten thousand", 10_001, 10_000),
+    ];
+
+    for (case, count, limit) in rows {
+        let message = annotation_limit_exceeded_message(count, limit);
+        assert!(
+            message.starts_with(OPENS),
+            "case {case:?}: expected the sentence to open with {OPENS:?}, got {message:?}"
+        );
+        assert!(
+            message.contains(JOINS),
+            "case {case:?}: expected the sentence to join its two counts with {JOINS:?}, got \
+             {message:?}"
+        );
+        assert!(
+            message.ends_with(CLOSES),
+            "case {case:?}: expected the sentence to close with {CLOSES:?}, got {message:?}"
+        );
+
+        // Both counts are read back OUT of the sentence, in the order it states them: the
+        // count the refused write would have produced first, the ceiling second.
+        let counts: Vec<usize> = message
+            .split(['(', ')'])
+            .filter_map(|piece| piece.parse::<usize>().ok())
+            .collect();
+        assert_eq!(
+            counts,
+            vec![count, limit],
+            "case {case:?}: expected the sentence to state {count} then {limit}, got {counts:?} \
+             from {message:?}"
+        );
+    }
 }
 
 #[tokio::test]

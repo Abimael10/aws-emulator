@@ -17,13 +17,15 @@
 //!   code [`crate::scaffolded::Scaffolded::unmodeled`] carries, and the scaffold's 501).
 //! * [`the_documented_message_catalog_matches_the_model`] re-derives the catalog's key
 //!   set from this service's Smithy model, so neither a stale row nor a newly modeled
-//!   error code can go unnoticed.
+//!   error code can go unnoticed — and a code whose sentence the writer words from the
+//!   request and the service's state
+//!   (`crate::scaffolded::WRITER_WORDED_ERROR_CODES`) carries no constant row at all.
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
 use service_com_amazonaws_s3_amazons3::scaffolded::{
-    documented_error_message, DOCUMENTED_ERROR_MESSAGES,
+    documented_error_message, writer_words_its_message, DOCUMENTED_ERROR_MESSAGES,
 };
 use service_com_amazonaws_s3_amazons3::state::CONTENT_MD5_MISMATCH_MESSAGE;
 
@@ -300,6 +302,18 @@ fn the_documented_message_catalog_matches_the_model() {
                 documented.is_none(),
                 "case {name:?}: the shape declares its own message member, so the \
                  catalog must not document one; got {documented:?}"
+            );
+            continue;
+        }
+        if writer_words_its_message(name) {
+            // S3 words this code's sentence from the request and the service's own state (a
+            // counted ceiling, say), so there is no constant to document and the writer that
+            // holds those values words it.
+            assert!(
+                documented.is_none(),
+                "case {name:?}: the writer words this code's message from the request and \
+                 the service's state, so the catalog must not document a constant for it; \
+                 got {documented:?}"
             );
             continue;
         }

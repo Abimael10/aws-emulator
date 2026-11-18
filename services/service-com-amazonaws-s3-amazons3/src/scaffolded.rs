@@ -413,16 +413,16 @@ static DOCUMENTED_MESSAGE: Schema = Schema::new_member(
 ///   model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json")`),
 ///   HTML stripped — the sentence the model states for that condition.
 ///
+/// A code whose sentence S3 words from the REQUEST and the service's own state carries no
+/// row at all ([`WRITER_WORDED_ERROR_CODES`]): there is no constant to document, and the
+/// writer that knows those values words it.
+///
 /// `tests/all/error_message_envelope.rs` re-derives the key set from the model and fails
 /// if a row is stale or an error shape the model declares has no row, so a model update
 /// that adds an error code cannot silently go out message-less.
 pub const DOCUMENTED_ERROR_MESSAGES: &[(&str, &str)] = &[
     // [ErrorCodeList]
     ("AccessDenied", "Access Denied"),
-    (
-        "AnnotationLimitExceeded",
-        "The request would exceed the maximum number of annotations allowed per object.",
-    ),
     // The sentence S3 answers this code with, as recorded behaviour words it: fixed text
     // that states the rule rather than the bound (the model's own documentation of the shape
     // states the bound, and is not what reaches the wire).
@@ -586,6 +586,28 @@ pub const BUCKET_SCOPED_ERROR_CODES: &[&str] = &[
     crate::state::OWNERSHIP_CONTROLS_NOT_FOUND_CODE,
     crate::state::REPLICATION_CONFIGURATION_NOT_FOUND_CODE,
 ];
+
+/// The error codes whose `<Message>` is NOT a constant: S3 words the sentence for these from
+/// the request and from the service's own state, so [`DOCUMENTED_ERROR_MESSAGES`] documents
+/// no text for them and the writer that holds those values words the refusal.
+///
+/// [`crate::state::ANNOTATION_LIMIT_EXCEEDED_CODE`] is one: its sentence counts the
+/// annotations the refused write would have left the object version holding against the
+/// ceiling in force ([`crate::state::annotation_limit_exceeded_message`]), neither of which a
+/// constant can carry. The error shape's `@documentation` states the condition for the API
+/// reference and is NOT that sentence, so documenting it here would put the reference's prose
+/// on the wire in place of the message S3 sends.
+///
+/// `tests/all/error_message_envelope.rs` holds the catalog to this: a code named here must
+/// carry no row, and every other modeled code must carry one.
+pub const WRITER_WORDED_ERROR_CODES: &[&str] = &[crate::state::ANNOTATION_LIMIT_EXCEEDED_CODE];
+
+/// Whether the `<Message>` of an error document carrying `code` is worded by the writer from
+/// the request and the service's state rather than documented as a constant — see
+/// [`WRITER_WORDED_ERROR_CODES`].
+pub fn writer_words_its_message(code: &str) -> bool {
+    WRITER_WORDED_ERROR_CODES.contains(&code)
+}
 
 /// Whether an error document carrying `code` is about the bucket the request addressed, so
 /// a refusal that named no resource of its own is named by it — see
@@ -1923,6 +1945,28 @@ impl<E> Scaffolded<E> {
             crate::state::INVALID_ANNOTATION_CODE,
             crate::state::INVALID_ANNOTATION_STATUS,
             message,
+        )
+    }
+
+    /// The refusal a write that would take an object version past the number of annotations
+    /// it may carry is answered with: [`crate::state::ANNOTATION_LIMIT_EXCEEDED_CODE`] at
+    /// [`crate::state::ANNOTATION_LIMIT_EXCEEDED_STATUS`], carrying the COUNTED sentence
+    /// ([`crate::state::annotation_limit_exceeded_message`]) filled from the count the write
+    /// would have produced and the ceiling in force.
+    ///
+    /// Through the unmodelled channel for the same reason
+    /// [`crate::state::ANNOTATION_NAME_TOO_LONG_CODE`] and
+    /// [`crate::state::INVALID_ANNOTATION_CODE`] travel on it: the sentence on the wire is
+    /// worded from what this call and this emulator's state say, so it cannot be a constant
+    /// row of [`DOCUMENTED_ERROR_MESSAGES`] — which is only ever the text for a code whose
+    /// sentence says the same thing about every request.
+    ///
+    /// ONE place, so every writer that reaches that ceiling reports it identically.
+    pub fn annotation_limit_exceeded(count: usize, limit: usize) -> Self {
+        Self::unmodeled(
+            crate::state::ANNOTATION_LIMIT_EXCEEDED_CODE,
+            crate::state::ANNOTATION_LIMIT_EXCEEDED_STATUS,
+            crate::state::annotation_limit_exceeded_message(count, limit),
         )
     }
 
