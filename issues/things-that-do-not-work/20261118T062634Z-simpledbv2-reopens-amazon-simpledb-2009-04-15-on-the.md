@@ -1,0 +1,68 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: simpledbv2.export-lifecycle-lands-verified-data-in-s3 simpledbv2.list-exports-pagination-surfaces-own-exports simpledbv2.start-domain-export-idempotent-retry-returns-same-export simpledbv2.start-domain-export-token-reuse-with-changed-params-rejected
+Issue-Shape-Id: com.amazonaws.simpledbv2#SimpleDBv2
+Issue-Key: simpledbv2.export-lifecycle-lands-verified-data-in-s3|run#5|ResponseParserError|sdb.create_domain(DomainName=domain)
+Issue-Key: simpledbv2.list-exports-pagination-surfaces-own-exports|run#6|ResponseParserError|sdb.create_domain(DomainName=domain)
+Issue-Key: simpledbv2.start-domain-export-idempotent-retry-returns-same-export|run#6|ResponseParserError|sdb.create_domain(DomainName=domain)
+Issue-Key: simpledbv2.start-domain-export-token-reuse-with-changed-params-rejected|run#6|ResponseParserError|sdb.create_domain(DomainName=domain)
+Issue-Commit: cb678ff2ea6dc380378270cb2637fdde44efeb9e
+
+# REOPENS: Amazon SimpleDB 2009-04-15 on the sdb endpoint is still refused — a SigV2-signed CreateDomain answers AccessDenied "Sign the request with the emulator credentials", and the refusal is serialized as a JSON __type body a query-protocol client cannot parse (2 causes)
+
+> _Note: this issue was identified against the code base at commit `cb678ff2ea6dc380378270cb2637fdde44efeb9e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateDomain
+
+## Description
+REOPENS 20261114T064955Z-simpledbv2-reopens-simpledb-2009-04-15-createdomain-on-the.md: its fix left the call refused. All four simpledbv2 behavioral checks still error on their very first SimpleDB call, sdb.create_domain(DomainName=<name>). The shape of the refusal has changed — it is no longer HTTP 400 InvalidAction "unknown action: CreateDomain", so the request is no longer answered by the generated routing default — but the call is still never served: it is now refused AccessDenied with a JSON error body, and nothing of the v2 domain-export lifecycle is exercised.
+
+Cause 1 of 2: a request to the sdb endpoint signed with AWS Signature Version 2 is not authenticated, so every Amazon SimpleDB 2009-04-15 call is refused AccessDenied. Failing check ids for this cause: simpledbv2.export-lifecycle-lands-verified-data-in-s3, simpledbv2.list-exports-pagination-surfaces-own-exports, simpledbv2.start-domain-export-idempotent-retry-returns-same-export, simpledbv2.start-domain-export-token-reuse-with-changed-params-rejected.
+
+  AWS: recorded behavior only — this repo carries no Smithy model for the 2009-04-15 query surface. The endpoint's wire identity comes from com.amazonaws.simpledbv2#SimpleDBv2 (Smithy: aws.api#service endpointPrefix "sdb" / arnNamespace "sdb", aws.auth#sigv4 name "sdb", protocol restJson1, us-east-1 special-case endpoint https://sdb.amazonaws.com), cited only for that shared identity; the same host also serves the legacy 2009-04-15 AWS Query API on "/". Amazon SimpleDB is a Signature Version 2 service: an SDK's sdb client (botocore's sdb 2009-04-15 model declares signatureVersion v2) sends a form-encoded POST to "/" whose BODY carries Action=CreateDomain, Version=2009-04-15, DomainName=<name>, AWSAccessKeyId, SignatureVersion=2, SignatureMethod=HmacSHA256, Timestamp and Signature — and NO Authorization header at all. AWS accepts that signature on this endpoint and answers HTTP 200 with <CreateDomainResponse xmlns="http://sdb.amazonaws.com/doc/2009-04-15/"> carrying only <ResponseMetadata><RequestId>..</RequestId><BoxUsage>..</BoxUsage></ResponseMetadata>; the domain it creates is then a valid domainName for the v2 StartDomainExport/ListExports/GetExport surface. (RequestId and BoxUsage are per-run values, not requirements.)
+  Emulator: the same call is answered with a non-2xx (botocore entered its error-parsing path) carrying error code AccessDenied and message "Sign the request with the emulator credentials" — the emulator's own signature gate, the identical refusal it gives any request that does not present a SigV4 Authorization header it recognises. That message's fixed text is the whole sentence "Sign the request with the emulator credentials"; it has no variable part. Hypothesis: the auth seam requires a SigV4 Authorization header and has no SigV2 path, so a SimpleDB request whose credential and signature live in the form-encoded body is treated as unsigned. The credentials themselves are sound: every other service in this suite run is signed with SigV4 by the same harness and is served, and SimpleDB is the one surface the SDK signs with Signature Version 2.
+  Why: a client doing exactly what AWS requires — CreateDomain, PutAttributes items into it, then export the domain to S3 — is refused at its first call, so no client can ever obtain a domain and the whole v2 export surface (exportStatus progression to SUCCEEDED, the exported data file under the key prefix, the AWSSimpleDB/<exportId>/<domainName> layout, exportManifest, clientToken idempotency, ListExports pagination) is unreachable through the only API that can create its input. The code is also wrong for the condition: AccessDenied tells a client its credentials are not permitted, when the request was in fact correctly signed for this service.
+  Fix: the sdb endpoint's request-authentication seam in the simpledbv2 service — it must accept AWS Signature Version 2 (credential and signature read from the form-encoded request parameters, not from an Authorization header) for the Amazon SimpleDB 2009-04-15 query surface, and only then hand the request to the already-implemented 2009-04-15 action handlers, while the modelled /v2/* operations keep their SigV4 requirement.
+
+Cause 2 of 2: a refusal on the SimpleDB 2009-04-15 query surface is serialized as a restJson1 error document, so a query-protocol client cannot read the error at all. Failing check ids for this cause: simpledbv2.export-lifecycle-lands-verified-data-in-s3, simpledbv2.list-exports-pagination-surfaces-own-exports, simpledbv2.start-domain-export-idempotent-retry-returns-same-export, simpledbv2.start-domain-export-token-reuse-with-changed-params-rejected.
+
+  AWS: recorded behavior only (no Smithy model for the 2009-04-15 surface in this repo). That surface is an AWS Query/XML API: both its success and its error documents are XML in the http://sdb.amazonaws.com/doc/2009-04-15/ namespace. An error is the query-protocol error envelope — a <Response> carrying <Errors><Error><Code>..</Code><Message>..</Message></Error></Errors> and a <RequestID> — whose Code is the fixed error identifier and whose Message is that error class's text; it is never a JSON object and never carries a "__type" member.
+  Emulator: the refusal body is b'{"__type":"AccessDenied","message":"Sign the request with the emulator credentials"}' — a JSON (restJson1-shaped) error document returned for a form-encoded query request. The SDK, parsing this endpoint with the query/XML error parser, cannot read it and raises botocore.parsers.ResponseParserError: Unable to parse response (not well-formed (invalid token): line 1, column 0), invalid XML received. The error code therefore never reaches the client's error branch at all.
+  Why: even once the status and code are right, a client gets a parser crash instead of a ClientError it can inspect: no Error.Code, no Error.Message, no chance to branch on the condition (NoSuchDomain, DeleteConflictException, InvalidParameterValue) or to retry. Every refusal on this surface is undiagnosable from the client side — the checks' own cleanup paths, which branch on exc.response["Error"]["Code"], cannot work — and it mislabels the endpoint's protocol to anything inspecting the body.
+  Fix: the simpledbv2 service's error serializer / protocol selection for the 2009-04-15 query surface — a request that arrived as a form-encoded Action=... POST on "/" must have its refusal rendered as the SimpleDB query XML error envelope in the http://sdb.amazonaws.com/doc/2009-04-15/ namespace, not as the service's restJson1 __type document (the v2 /v2/* operations keep the JSON form).
+
+Related, not covering this: the open issue 20261118T012202Z-s3-simpledbv2-reopens-amazon-simpledb-2009-04-15-on-the.md describes the same two causes but carries only the two cross-service s3__simpledbv2 check keys under a different service heading, and the suite did not report these four checks as owned by it; 20261109T154301Z-s3-simpledbv2-domain-export-to-s3-checks-blocked-simpledb-2009.md describes the earlier HTTP 400 InvalidAction refusal.
+
+Traces: simpledbv2.export-lifecycle-lands-verified-data-in-s3, simpledbv2.list-exports-pagination-surfaces-own-exports, simpledbv2.start-domain-export-idempotent-retry-returns-same-export, simpledbv2.start-domain-export-token-reuse-with-changed-params-rejected (all four verdict error, all four failing on the first sdb.create_domain call).
+
+## Evidence
+Suite report for this run: simpledbv2 0/4 (0%), 4 failed. All four checks fail identically on their first SimpleDB call, sdb.create_domain(DomainName=<unique name>) with sdb = ctx.client("sdb") (Amazon SimpleDB, API version 2009-04-15) — a form-encoded, SigV2-signed POST to "/" on the sdb endpoint:
+
+  File "parsers.py", line 600, in _do_error_parse
+      root = self._parse_xml_string_to_dom(xml_contents)
+  File "parsers.py", line 550, in _parse_xml_string_to_dom
+      raise ResponseParserError(
+  botocore.parsers.ResponseParserError: Unable to parse response (not well-formed (invalid token): line 1, column 0), invalid XML received. Further retries may succeed:
+  b'{"__type":"AccessDenied","message":"Sign the request with the emulator credentials"}'
+
+Expected (AWS): HTTP 200 with body
+  <CreateDomainResponse xmlns="http://sdb.amazonaws.com/doc/2009-04-15/"><ResponseMetadata><RequestId>..</RequestId><BoxUsage>..</BoxUsage></ResponseMetadata></CreateDomainResponse>
+and the domain afterwards resolvable as domainName by StartDomainExport. Any refusal on this surface is the query XML error envelope (<Response><Errors><Error><Code>..</Code><Message>..</Message></Error></Errors><RequestID>..</RequestID></Response>) in that same namespace.
+
+Actual (emulator): a non-2xx whose error code is AccessDenied, whose message is the fixed sentence "Sign the request with the emulator credentials" (no variable part), and whose body is JSON — b'{"__type":"AccessDenied","message":"Sign the request with the emulator credentials"}' — rather than XML, so the SDK raises ResponseParserError and the code/message never surface as a ClientError.
+
+That the credentials are sound is shown by the rest of the run: every other service the harness exercises is signed with SigV4 and served. SimpleDB is the one surface the SDK signs with Signature Version 2 (credential and signature carried in the form-encoded body, no Authorization header), and it is the one surface refused for being unsigned.
+
+Because the very first call is refused, no assertion past it was reached in any of the four checks: no exportStatus progression to PENDING/IN_PROGRESS/SUCCEEDED, no exported data object under the AWSSimpleDB/<exportId>/<domainName> layout, no exportManifest check, no clientToken idempotent-retry equality (same exportArn for a repeated identical StartDomainExport), no ConflictException "Idempotent request failed due to parameter mismatch." for a reused token with a changed s3KeyPrefix, and no ListExports pagination over the domain's own exports.
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout.
+2. Point an SDK client at it with the legacy SimpleDB API: sdb = boto3.client("sdb")  # Amazon SimpleDB, 2009-04-15, signatureVersion v2.
+3. Call sdb.create_domain(DomainName="behav-domain-1"). On the wire this is POST "/" with a form-encoded body Action=CreateDomain&Version=2009-04-15&DomainName=behav-domain-1&AWSAccessKeyId=...&SignatureVersion=2&SignatureMethod=HmacSHA256&Timestamp=...&Signature=... and NO Authorization header.
+   Observe: the body comes back as {"__type":"AccessDenied","message":"Sign the request with the emulator credentials"} and botocore raises ResponseParserError (invalid XML), instead of HTTP 200 <CreateDomainResponse xmlns="http://sdb.amazonaws.com/doc/2009-04-15/">...</CreateDomainResponse>.
+4. Same for sdb.put_attributes(DomainName="behav-domain-1", ItemName="item-widget", Attributes=[{"Name":"color","Value":"blue","Replace":True}]) and sdb.delete_domain(DomainName="behav-domain-1").
+5. To see cause 2 in isolation once cause 1 is fixed: send any refusable form-encoded Action=... POST on "/" (e.g. an unknown Action, or PutAttributes against a domain that does not exist) and confirm the refusal body is the SimpleDB query XML error envelope in the http://sdb.amazonaws.com/doc/2009-04-15/ namespace with Error/Code and Error/Message, not a JSON __type document.
+6. Then exercise the v2 surface the checks need: StartDomainExport(domainName="behav-domain-1", s3Bucket=<bucket>, s3KeyPrefix="exports/", clientToken=<token>), poll GetExport to a terminal status, read the exported data object, repeat StartDomainExport with the same token (same exportArn), then with the same token but s3KeyPrefix="changed/" (ConflictException "Idempotent request failed due to parameter mismatch."), and page ListExports(domainName=...) with PageSize=1.
+7. Re-replay checks: simpledbv2.export-lifecycle-lands-verified-data-in-s3, simpledbv2.list-exports-pagination-surfaces-own-exports, simpledbv2.start-domain-export-idempotent-retry-returns-same-export, simpledbv2.start-domain-export-token-reuse-with-changed-params-rejected
