@@ -154,8 +154,15 @@ async fn ec2_subnets(
     held
 }
 
-/// Every subnet identifier a create request names, resolved against the subnets the
-/// account has in `region`, in the order the request lists them.
+/// The SET of subnets a create request names, resolved against the subnets the account has
+/// in `region`: one record per DISTINCT identifier, in the order the request first names
+/// it.
+///
+/// A list member is an identifier, and an identifier names ONE subnet however many times
+/// the request repeats it — the modelled list carries no uniqueness constraint, so
+/// repeating a member is a well-formed way of naming the same subnet, and the placement it
+/// asks for is the set of subnets named. Collapsing the repeats here is what makes every
+/// caller of this function read a request that way.
 ///
 /// A cluster is placed in the subnets the request names, so an identifier that names no
 /// subnet of the account cannot be placed at all: the caller refuses the create and
@@ -184,11 +191,15 @@ pub async fn resolve_requested_subnets(
     }
     let held = ec2_subnets(ctx, region, &distinct).await;
 
-    let mut resolved = Vec::with_capacity(subnet_ids.len());
-    for subnet_id in subnet_ids {
-        match held.get(subnet_id.as_str()) {
+    // Every identifier the request named is resolved, in the order it first named it, so
+    // an unresolvable one is reported wherever it sits — and each DISTINCT identifier
+    // contributes one record, so a repeated member names the subnet it named before
+    // instead of placing that subnet twice.
+    let mut resolved = Vec::with_capacity(distinct.len());
+    for subnet_id in distinct {
+        match held.get(subnet_id) {
             Some(subnet) => resolved.push(subnet.clone()),
-            None => return Err(subnet_id.clone()),
+            None => return Err(subnet_id.to_string()),
         }
     }
     Ok(resolved)
@@ -198,7 +209,9 @@ pub async fn resolve_requested_subnets(
 ///
 /// "You can specify only one subnet per Availability Zone" (`CreateCluster$SubnetIds`),
 /// which [`crate::state::zone_named_twice`] refuses before a cluster is minted, so one
-/// zone never loses a subnet to another here.
+/// zone never loses a subnet to another here. `subnets` is the SET
+/// [`resolve_requested_subnets`] resolved, so a request naming one subnet repeatedly maps
+/// that subnet once, under its own zone.
 pub fn subnet_mapping_of(subnets: &[SubnetRecord]) -> HashMap<String, String> {
     subnets
         .iter()
@@ -206,8 +219,12 @@ pub fn subnet_mapping_of(subnets: &[SubnetRecord]) -> HashMap<String, String> {
         .collect()
 }
 
-/// The Availability Zone two of `subnets` share, if any: the first zone a later subnet
-/// repeats, in the order the request listed them.
+/// The Availability Zone two DIFFERENT of `subnets` share, if any: the first zone a later
+/// subnet repeats, in the order the request listed them.
+///
+/// `subnets` holds one record per distinct identifier ([`resolve_requested_subnets`]), so
+/// a zone seen twice here is two different subnets of one zone — the only input "You can
+/// specify only one subnet per Availability Zone" (`CreateCluster$SubnetIds`) refuses.
 pub fn zone_named_twice(subnets: &[SubnetRecord]) -> Option<&SubnetRecord> {
     let mut seen: HashSet<&str> = HashSet::new();
     subnets

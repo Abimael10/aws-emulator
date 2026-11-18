@@ -1014,12 +1014,9 @@ async fn requests_outside_the_documented_rules_are_refused() {
             json!({ "HsmType": "hsm1.medium", "SubnetIds": [first] }),
             "CloudHsmInvalidRequestException",
         ),
-        (
-            "the same subnet named twice, so one Availability Zone twice",
-            "CreateCluster",
-            json!({ "HsmType": "hsm2m.medium", "SubnetIds": [first, first] }),
-            "CloudHsmInvalidRequestException",
-        ),
+        // A subnet named twice is NOT one zone twice: it names one subnet, which is served
+        // (see the suite on `SubnetIds` as a set). Two DIFFERENT subnets of one zone are
+        // what that rule refuses, and that is where it is covered.
         (
             "a retention window one day below the published range",
             "CreateCluster",

@@ -217,6 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::resolve_requested_subnets` asks the service that owns them (see
         // `crate::state`'s `ec2_subnets`). An identifier EC2 reports no subnet for names
         // a subnet the cluster could not be placed in.
+        //
+        // The modelled list declares no uniqueness, so the request is read as the SET of
+        // subnets it names: a repeated identifier names the subnet it already named, and
+        // the resolution collapses it rather than placing one subnet twice.
         let subnets =
             match crate::state::resolve_requested_subnets(ctx, &region, &input.subnet_ids).await {
                 Ok(subnets) => subnets,
@@ -225,7 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can specify only one subnet per Availability Zone" (`SubnetIds` doc),
         // which is a fact of the zones EC2 reports those subnets in rather than of the
-        // identifiers themselves.
+        // identifiers themselves: with one record per distinct identifier, a zone named
+        // twice is two DIFFERENT subnets of that zone, and nothing else breaks the rule.
         if let Some(repeated) = crate::state::zone_named_twice(&subnets) {
             return Err(invalid_request(format!(
                 "More than one of the specified subnets is in Availability Zone {}. You \

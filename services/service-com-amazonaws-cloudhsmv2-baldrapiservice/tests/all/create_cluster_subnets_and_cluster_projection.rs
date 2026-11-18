@@ -21,10 +21,15 @@
 //!    EC2 reports for the requested subnets.
 //! 4. An `HsmType` no cluster can be created with is refused before the subnets are
 //!    resolved at all.
+//! 5. `SubnetIds` names a SET of subnets: an identifier repeated in it names the subnet it
+//!    already named, so the request is served and the cluster is placed once in that
+//!    subnet, while two DIFFERENT subnets of one Availability Zone are refused.
 //!
 //! Every case drives the real wire path (`POST /` with
 //! `X-Amz-Target: BaldrApiService.<Operation>` through the multi-service router), so what
 //! is asserted is what a client sees, body and HTTP status included.
+
+use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
@@ -417,6 +422,209 @@ async fn an_hsm_type_no_cluster_can_be_created_with_is_refused_before_the_subnet
             "Provided HsmType is not supported.",
             "case {case:?}: expected AWS's sentence for an unsupported HSM type, got \
              {response}"
+        );
+    }
+}
+
+/// The `SubnetMapping` a cluster projects, as a sorted zone -> subnet map.
+fn mapping_of(cluster: &Value) -> BTreeMap<String, String> {
+    cluster
+        .get("SubnetMapping")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(zone, subnet_id)| {
+                    (
+                        zone.clone(),
+                        subnet_id.as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The state a freshly created cluster is in.
+const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+
+#[tokio::test]
+async fn a_subnet_named_more_than_once_names_the_subnet_it_already_named() {
+    let emulator = Emulator::new();
+    let held = emulator.subnets_in(REGION).await;
+    assert!(
+        held.len() >= 2,
+        "the account must have subnets in two zones of {REGION}, got {held:?}"
+    );
+    let (zone_a, subnet_a) = held[0].clone();
+    let (zone_b, subnet_b) = held[1].clone();
+    let vpc = emulator.vpc_of(REGION, &subnet_a).await;
+
+    let one_subnet = BTreeMap::from([(zone_a.clone(), subnet_a.clone())]);
+    let both_subnets = BTreeMap::from([
+        (zone_a.clone(), subnet_a.clone()),
+        (zone_b.clone(), subnet_b.clone()),
+    ]);
+
+    // (case, the SubnetIds the request names, the SubnetMapping the cluster must report).
+    // Rows vary how many times an identifier is repeated, where the repeats sit, how many
+    // distinct subnets the list names, and how long the list is — up to the ten members the
+    // modelled `SubnetIds` allows (`smithy_query(query="shape",shape="SubnetIds")`: a list
+    // of `SubnetId`, length 1..10, no uniqueness constraint).
+    let rows: Vec<(&str, Vec<String>, BTreeMap<String, String>)> = vec![
+        (
+            "one subnet, named once",
+            vec![subnet_a.clone()],
+            one_subnet.clone(),
+        ),
+        (
+            "one subnet, named twice",
+            vec![subnet_a.clone(), subnet_a.clone()],
+            one_subnet.clone(),
+        ),
+        (
+            "one subnet, named three times",
+            vec![subnet_a.clone(), subnet_a.clone(), subnet_a.clone()],
+            one_subnet.clone(),
+        ),
+        (
+            "one subnet filling every one of the modelled maximum of ten members",
+            vec![subnet_a.clone(); 10],
+            one_subnet.clone(),
+        ),
+        (
+            "two subnets, each named twice",
+            vec![
+                subnet_a.clone(),
+                subnet_b.clone(),
+                subnet_a.clone(),
+                subnet_b.clone(),
+            ],
+            both_subnets.clone(),
+        ),
+        (
+            "a repeat split by the other subnet",
+            vec![subnet_a.clone(), subnet_b.clone(), subnet_a.clone()],
+            both_subnets.clone(),
+        ),
+        (
+            "the second subnet repeated and the first named once, in the other order",
+            vec![subnet_b.clone(), subnet_b.clone(), subnet_a.clone()],
+            both_subnets.clone(),
+        ),
+    ];
+
+    for (case, subnet_ids, expected) in rows {
+        let created = emulator
+            .ok(
+                case,
+                "CreateCluster",
+                &json!({ "HsmType": "hsm2m.medium", "SubnetIds": subnet_ids }),
+            )
+            .await;
+        let cluster = created["Cluster"].clone();
+        let cluster_id = cluster["ClusterId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no ClusterId in {created}"))
+            .to_string();
+        assert_eq!(
+            cluster["State"].as_str(),
+            Some(CREATE_IN_PROGRESS),
+            "case {case:?}: expected a created cluster to report {CREATE_IN_PROGRESS}, got \
+             {cluster}"
+        );
+
+        // The create's own answer and the read-back project the same placement: one entry
+        // per DISTINCT subnet the request named, each under the zone EC2 reports for it.
+        let described = emulator
+            .ok(
+                case,
+                "DescribeClusters",
+                &json!({ "Filters": { "clusterIds": [cluster_id] } }),
+            )
+            .await;
+        let read_back = described["Clusters"][0].clone();
+        for (projection, cluster) in [("CreateCluster", &cluster), ("DescribeClusters", &read_back)]
+        {
+            assert_eq!(
+                mapping_of(cluster),
+                expected,
+                "case {case:?} via {projection}: expected one entry per distinct subnet \
+                 named, got {cluster}"
+            );
+            assert_eq!(
+                cluster["VpcId"].as_str(),
+                Some(vpc.as_str()),
+                "case {case:?} via {projection}: expected the VPC owning the requested \
+                 subnets, got {cluster}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn two_different_subnets_of_one_zone_are_refused_where_one_named_twice_is_served() {
+    let emulator = Emulator::new();
+    let ec2 = emulator.ec2(REGION);
+    let held = emulator.subnets_in(REGION).await;
+    let (zone, first) = held[0].clone();
+    let vpc = emulator.vpc_of(REGION, &first).await;
+
+    // A SECOND subnet of the same VPC in the SAME zone, so the only rule a request naming
+    // both can break is the one about a zone. Its block is inside the default VPC's own
+    // /16 and outside the /20 blocks its default subnets were given.
+    let second = ec2
+        .create_subnet()
+        .vpc_id(&vpc)
+        .cidr_block("172.31.250.0/24")
+        .availability_zone(&zone)
+        .send()
+        .await
+        .expect("EC2 must create the subnet")
+        .subnet()
+        .and_then(::aws_sdk_ec2::types::Subnet::subnet_id)
+        .expect("the subnet must carry an id")
+        .to_string();
+
+    let (status, response) = emulator
+        .call(
+            "CreateCluster",
+            &json!({
+                "HsmType": "hsm2m.medium",
+                "SubnetIds": [first.clone(), second.clone()],
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&response).as_str()),
+        (400, INVALID_REQUEST),
+        "expected two different subnets of one zone to be refused 400 {INVALID_REQUEST}, \
+         got {status} {response}"
+    );
+    let message = error_message(&response);
+    assert!(
+        message.contains(&zone) && message.contains("only one subnet per Availability Zone"),
+        "expected the refusal to name the zone {zone} and the one-per-zone rule, got \
+         {response}"
+    );
+
+    // Naming ONE of them twice is not two subnets of one zone: each is served, and the
+    // cluster is placed once in the subnet the request named.
+    for (case, subnet_id) in [("a default subnet", &first), ("a created subnet", &second)] {
+        let created = emulator
+            .ok(
+                case,
+                "CreateCluster",
+                &json!({
+                    "HsmType": "hsm2m.medium",
+                    "SubnetIds": [subnet_id.clone(), subnet_id.clone()],
+                }),
+            )
+            .await;
+        assert_eq!(
+            mapping_of(&created["Cluster"]),
+            BTreeMap::from([(zone.clone(), subnet_id.clone())]),
+            "case {case:?}: expected the repeated subnet to be placed once under its own \
+             zone, got {created}"
         );
     }
 }
