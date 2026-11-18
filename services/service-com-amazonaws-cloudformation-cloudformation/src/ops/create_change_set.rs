@@ -20,15 +20,20 @@
 //! `REVIEW_IN_PROGRESS` with no template and no resources, keyed by the `StackId` this call
 //! answers (`ChangeSetType`: "CloudFormation creates a stack with a unique stack ID, but no
 //! template or resources. The stack will be in the REVIEW_IN_PROGRESS state until you
-//! execute the change set"); `ExecuteChangeSet` is what puts the template on it.
+//! execute the change set"); `ExecuteChangeSet` is what puts the template on it. A stack
+//! sitting in that state holds no revision of its own, so it goes on taking change sets of
+//! the types that bring a stack into existence — a further `CREATE`, and the `IMPORT` that
+//! adopts existing resources into one — each planned against that same stack id, however the
+//! change sets already on it settled.
 //!
 //! An UPDATE change set is the PLAN of an update of the stack as it stands, so the statuses
 //! that take a plan are the statuses that take the update
 //! (`crate::state::status_takes_an_update`): a stack whose own failure another operation has
 //! to resolve first (a deletion or a rollback that could not be carried out, a create that
 //! was rolled back), one with an operation still in flight, and one a `CREATE` change set
-//! brought into existence are refused with the `ValidationError` `UpdateStack` answers,
-//! naming the stack and the state it really is in.
+//! brought into existence — which holds no revision for an update to change — are refused
+//! with the `ValidationError` `UpdateStack` answers, naming the stack and the state it really
+//! is in.
 //!
 //! CloudFormation answers this call while it is still computing the change set ("After the
 //! CreateChangeSet call successfully completes, CloudFormation starts creating the change
@@ -711,6 +716,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // creates it — in review, exactly as a CREATE change set does.
         let creates_the_stack = requested_type == change_set_type::CREATE
             || (imports_resources && existing.is_none());
+        // ...and a stack still in REVIEW_IN_PROGRESS is one nothing has created yet: it
+        // holds no template and no resources, so a change set of a type that BRINGS a
+        // stack into existence is a change set FOR that stack rather than an update of a
+        // revision it does not have. The review flow is exactly creating one change set
+        // after another on it until one is worth executing — "the stack will be in the
+        // REVIEW_IN_PROGRESS state until you execute the change set" — so such a call is
+        // accepted and targets that same record, whatever became of the change sets
+        // already on it.
+        let reviews_the_stack =
+            in_review && (requested_type == change_set_type::CREATE || imports_resources);
         if creates_the_stack {
             if existing.is_some() && !in_review {
                 // The request names a stack that is already there with the type that
@@ -762,8 +777,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // another operation has to resolve first, one with an operation still in
                 // flight, and one a CREATE change set brought into existence — which holds
                 // no template to compare an update against — answer the refusal
-                // `UpdateStack` answers, naming the state the stack really is in.
-                if !creates_the_stack && !crate::state::status_takes_an_update(stack_status) {
+                // `UpdateStack` answers, naming the state the stack really is in. A change
+                // set that brings a stack into existence is not that plan, so a stack still
+                // in review takes it ([`reviews_the_stack`]).
+                if !creates_the_stack
+                    && !reviews_the_stack
+                    && !crate::state::status_takes_an_update(stack_status)
+                {
                     return Err(crate::scaffolded::Scaffolded::validation_error(
                         crate::state::stack_cannot_be_updated(stack_id, stack_status),
                     ));

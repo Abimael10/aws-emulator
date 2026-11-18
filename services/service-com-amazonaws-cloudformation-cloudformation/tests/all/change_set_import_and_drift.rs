@@ -48,7 +48,7 @@ const EXISTENCE_CHECK_FAILED: &str =
 /// resource attributes the case needs. The two required properties of the type are its `Type`
 /// and its `Value` (source: the CloudFormation resource reference for
 /// `AWS::SSM::Parameter`).
-fn parameter_template(name: &str, value: &str, attributes: &str) -> String {
+pub(crate) fn parameter_template(name: &str, value: &str, attributes: &str) -> String {
     format!(
         r#"{{"Resources":{{"Param":{{"Type":"AWS::SSM::Parameter"{attributes},
             "Properties":{{"Name":"{name}","Type":"String","Value":"{value}"}}}}}}}}"#

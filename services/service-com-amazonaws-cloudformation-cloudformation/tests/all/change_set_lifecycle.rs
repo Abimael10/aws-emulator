@@ -18,14 +18,16 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_cloudformation_cloudformation::state::{
-    change_action, change_set_status, execution_status, status, MAX_CHANGE_SETS_PER_STACK,
-    NO_CHANGES_REASON, USER_INITIATED,
+    change_action, change_set_status, execution_status, stack_cannot_be_updated, status,
+    MAX_CHANGE_SETS_PER_STACK, NO_CHANGES_REASON, USER_INITIATED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::change_set_import_and_drift::parameter_template;
+use crate::dynamic_references::put_parameter;
 use crate::harness::{
-    call, create_stack, get_template, member, router_with_engine, store, xml_text, xml_texts,
-    REGION,
+    call, create_stack, get_template, member, refusal, router_with_engine, store, xml_text,
+    xml_texts, REGION,
 };
 use crate::stack_lifecycle::{assert_stack_id_shape, describe_stack, ACCOUNT_ID};
 
@@ -1301,5 +1303,249 @@ async fn a_retried_create_change_set_with_the_same_client_token_creates_one_chan
         store(&engine).lock().stacks.len(),
         1,
         "case \"a retried create\": exactly one stack was created"
+    );
+}
+
+/// The `ResourcesToImport` member list naming ONE resource by the `Name` it is identified by,
+/// as an SDK spells a list of structures on the awsQuery wire.
+fn resources_to_import(logical_id: &str, name: &str) -> Vec<(String, String)> {
+    vec![
+        member("ResourcesToImport.member.1.ResourceType", "AWS::SSM::Parameter"),
+        member("ResourcesToImport.member.1.LogicalResourceId", logical_id),
+        member("ResourcesToImport.member.1.ResourceIdentifier.entry.1.key", "Name"),
+        member("ResourcesToImport.member.1.ResourceIdentifier.entry.1.value", name),
+    ]
+}
+
+/// What the rule says becomes of one further change set on a stack that is in review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reviewed {
+    /// Accepted, and planned as one change carrying this action over this physical id — an
+    /// adoption reports the identifier the resource already carries, an addition none.
+    Planned(&'static str, &'static str),
+    /// Refused as the update of a revision the stack does not hold.
+    RefusedAsAnUpdate,
+}
+
+/// RULE: a stack in `REVIEW_IN_PROGRESS` is one a change set brought into existence and
+/// nothing has executed, so it holds no template and no resources: a change set of a type
+/// that BRINGS a stack into existence — `CREATE`, and the `IMPORT` that adopts existing
+/// resources into one — is accepted on it and planned against that same stack id, however
+/// the change sets already on it settled, while only a change set that plans an UPDATE of a
+/// revision the stack does not hold is refused.
+///
+/// The rows differ along what the rule generalises over: the `ChangeSetType` the further
+/// change set states, and whether the call names the stack by the name the first call stated
+/// or by the stack id it answered.
+#[tokio::test]
+async fn a_stack_in_review_takes_further_creating_change_sets() {
+    let (router, engine) = router_with_engine();
+    // Two parameters a CLIENT holds, written through Systems Manager's own wire, so no stack
+    // manages either and an IMPORT has something to adopt.
+    put_parameter(&router, "in review", "/review/one", "String", "held").await;
+    put_parameter(&router, "in review", "/review/two", "String", "held").await;
+
+    // The first change set brings the stack into existence, in review, and FAILS: the
+    // identifier it names is one nothing holds, so there is no resource to adopt.
+    let retained = r#","DeletionPolicy":"Retain""#;
+    let absent = parameter_template("/review/absent", "held", retained);
+    let mut first_members = vec![
+        member("ChangeSetType", "IMPORT"),
+        member("TemplateBody", &absent),
+    ];
+    first_members.extend(resources_to_import("Param", "/review/absent"));
+    let (code, created) = create_change_set(&router, "review-flow", "cs1", &first_members).await;
+    assert_eq!(
+        code, 200,
+        "the change set that creates the stack must be accepted, got {code} {created}"
+    );
+    let stack_id = xml_text(&created, "StackId").expect("the stack the change set created");
+    settle_the_store(&router, &engine).await;
+    let (_, settled) = describe_change_set(&router, "cs1", Some("review-flow")).await;
+    assert_eq!(
+        (
+            xml_text(&settled, "Status").unwrap_or_default(),
+            xml_text(&settled, "ExecutionStatus").unwrap_or_default(),
+            xml_text(&settled, "StatusReason").unwrap_or_default(),
+        ),
+        (
+            change_set_status::FAILED.to_string(),
+            execution_status::UNAVAILABLE.to_string(),
+            "Resource of type 'AWS::SSM::Parameter' with identifier '/review/absent' was not \
+             found."
+                .to_string(),
+        ),
+        "the first change set must fail on the identifier nothing holds, got {settled}"
+    );
+    let (_, described) = describe_stack(&router, &stack_id).await;
+    assert_eq!(
+        xml_text(&described, "StackStatus").as_deref(),
+        Some(status::REVIEW_IN_PROGRESS),
+        "the stack the failed change set created must be in review, got {described}"
+    );
+
+    // `(case, the change set's name, its ChangeSetType, whether the call names the stack by
+    // its id, the name the template declares, whether the type imports it, expectation)`.
+    type Row = (
+        &'static str,
+        &'static str,
+        &'static str,
+        bool,
+        &'static str,
+        Reviewed,
+    );
+    let rows: Vec<Row> = vec![
+        (
+            "a further IMPORT, naming the stack by the id the first call answered",
+            "cs2",
+            "IMPORT",
+            true,
+            "/review/one",
+            Reviewed::Planned(change_action::IMPORT, "/review/one"),
+        ),
+        (
+            "another IMPORT, naming the same stack by its name",
+            "cs3",
+            "IMPORT",
+            false,
+            "/review/two",
+            Reviewed::Planned(change_action::IMPORT, "/review/two"),
+        ),
+        (
+            "a CREATE change set, which plans an addition instead",
+            "cs4",
+            "CREATE",
+            true,
+            "/review/added",
+            Reviewed::Planned(change_action::ADD, ""),
+        ),
+        (
+            "an UPDATE change set, which has no revision to plan against",
+            "cs5",
+            "UPDATE",
+            true,
+            "/review/one",
+            Reviewed::RefusedAsAnUpdate,
+        ),
+    ];
+
+    for (case, change_set, change_set_type, by_id, declared, expected) in &rows {
+        let imports = *change_set_type == "IMPORT";
+        let attributes = if imports { retained } else { "" };
+        let template = parameter_template(declared, "held", attributes);
+        let mut members = vec![
+            member("ChangeSetType", change_set_type),
+            member("TemplateBody", &template),
+        ];
+        if imports {
+            members.extend(resources_to_import("Param", declared));
+        }
+        let named = if *by_id { &stack_id } else { "review-flow" };
+        let (code, answered) = create_change_set(&router, named, change_set, &members).await;
+
+        let (action, physical) = match expected {
+            Reviewed::RefusedAsAnUpdate => {
+                let expected_message =
+                    stack_cannot_be_updated(&stack_id, status::REVIEW_IN_PROGRESS);
+                assert_eq!(
+                    (code, refusal(&answered)),
+                    (
+                        400,
+                        ("ValidationError".to_string(), expected_message.clone()),
+                    ),
+                    "case {case:?}: expected the refusal to read {expected_message:?}, got \
+                     {code} {answered}"
+                );
+                continue;
+            }
+            Reviewed::Planned(action, physical) => (*action, *physical),
+        };
+
+        assert_eq!(
+            code, 200,
+            "case {case:?}: a stack in review must take a {change_set_type} change set, got \
+             {code} {answered}"
+        );
+        assert_eq!(
+            xml_text(&answered, "StackId").as_deref(),
+            Some(stack_id.as_str()),
+            "case {case:?}: the change set must target the stack already in review, got \
+             {answered}"
+        );
+        settle_the_store(&router, &engine).await;
+        let (_, planned) = describe_change_set(&router, change_set, Some(&stack_id)).await;
+        // An addition reports no physical id at all: the resource does not exist yet.
+        let physical_ids = if physical.is_empty() {
+            Vec::new()
+        } else {
+            vec![physical.to_string()]
+        };
+        assert_eq!(
+            (
+                xml_text(&planned, "Status").unwrap_or_default(),
+                xml_text(&planned, "ExecutionStatus").unwrap_or_default(),
+                xml_texts(&planned, "Action"),
+                xml_texts(&planned, "PhysicalResourceId"),
+            ),
+            (
+                change_set_status::CREATE_COMPLETE.to_string(),
+                execution_status::AVAILABLE.to_string(),
+                vec![action.to_string()],
+                physical_ids.clone(),
+            ),
+            "case {case:?}: expected an executable plan reporting one {action} of \
+             {physical_ids:?}, got {planned}"
+        );
+        // Planning deploys nothing: the stack is still the review-only one, which is what
+        // lets the next row plan against it too.
+        let (_, described) = describe_stack(&router, &stack_id).await;
+        assert_eq!(
+            xml_text(&described, "StackStatus").as_deref(),
+            Some(status::REVIEW_IN_PROGRESS),
+            "case {case:?}: planning must leave the stack in review, got {described}"
+        );
+    }
+
+    // Every plan the rows stored lives on that one stack, beside the failed one.
+    let (code, listed) = call(&router, "ListChangeSets", &[member("StackName", &stack_id)]).await;
+    assert_eq!(code, 200, "ListChangeSets must answer 200, got {code} {listed}");
+    let mut names = xml_texts(&listed, "ChangeSetName");
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "cs1".to_string(),
+            "cs2".to_string(),
+            "cs3".to_string(),
+            "cs4".to_string()
+        ],
+        "the stack must carry every plan that was accepted, and none that was refused, got \
+         {listed}"
+    );
+
+    // ...and executing one of them is what the review flow was for: the stack adopts the
+    // parameter that change set named, under the identifier it already carried.
+    let (code, executed) = execute_change_set(&router, "cs2", Some(&stack_id)).await;
+    assert_eq!(
+        code, 200,
+        "the plan made on the stack in review must be executable, got {code} {executed}"
+    );
+    settle_the_store(&router, &engine).await;
+    let (_, described) = describe_stack(&router, &stack_id).await;
+    assert_eq!(
+        xml_text(&described, "StackStatus").as_deref(),
+        Some(status::IMPORT_COMPLETE),
+        "an executed import completes as an import, got {described}"
+    );
+    let (_, resources) = call(
+        &router,
+        "DescribeStackResources",
+        &[member("StackName", &stack_id)],
+    )
+    .await;
+    assert_eq!(
+        xml_texts(&resources, "PhysicalResourceId"),
+        vec!["/review/one".to_string()],
+        "the stack must manage the parameter the executed plan adopted, got {resources}"
     );
 }
