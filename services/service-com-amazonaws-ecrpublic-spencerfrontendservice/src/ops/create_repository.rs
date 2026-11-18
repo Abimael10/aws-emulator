@@ -202,6 +202,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let created_at = ::std::time::SystemTime::now();
 
+        // Where a client will FETCH the payload this create's catalog document publishes:
+        // the address this emulator serves its logo assets at, opened by the first write
+        // that publishes one. Awaited BEFORE the store guard below, because a lock held
+        // across an await would make this future non-`Send`.
+        let logo_asset_base = crate::state::logo_socket::logo_asset_base(
+            &*self.engine,
+            &state,
+            ctx,
+            input
+                .catalog_data
+                .as_ref()
+                .is_some_and(|catalog_data| catalog_data.logo_image_blob.is_some()),
+        )
+        .await;
+
         let mut store = state.lock();
         if store.repositories.contains_key(&input.repository_name) {
             return Err(
@@ -242,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &store.registry_id,
             &input.repository_name,
             input.catalog_data.as_ref(),
-            ctx.endpoint().as_str(),
+            &logo_asset_base,
         );
         // A logo payload this registry will not publish is refused before the repository
         // exists: the modelled byte cap is enforced at the boundary, and what remains is

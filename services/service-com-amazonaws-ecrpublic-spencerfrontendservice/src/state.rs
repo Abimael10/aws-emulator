@@ -38,6 +38,10 @@ pub mod authorization;
 /// minted for it and the route that serves those bytes back.
 pub mod logo_asset;
 
+/// The address this emulator serves the published logo assets at, and the socket that
+/// answers there.
+pub mod logo_socket;
+
 /// The repository policy document in the form this service reports it.
 pub mod policy_document;
 
@@ -50,6 +54,7 @@ pub mod gallery_pull;
 pub mod registry_address;
 
 pub use logo_asset::{logo_asset_route, logo_url, StoredLogo};
+pub use logo_socket::{ensure_logo_asset_base, LogoAssetSocket};
 pub use registry_address::announced_gallery_endpoint;
 pub use policy_document::canonical_policy_document;
 
@@ -460,10 +465,10 @@ pub struct StoredRepository {
     /// `logoImageBlob` is an INPUT-only member, so these bytes are observable only by
     /// fetching that URL — which is why they are kept here rather than counted and
     /// dropped. Exactly the payload the current catalog record names is held: a catalog
-    /// write replaces the record as a whole, so it replaces this asset too, and a write
-    /// that supplies no payload leaves the repository with no logo and no URL. That is
-    /// what bounds what one repository holds — one payload, itself inside the modelled
-    /// `@length(0..512000)` on the member — however many catalog writes it takes.
+    /// write that supplies a payload replaces this asset, and one that supplies none makes
+    /// no statement about the logo and leaves it as it is. That is what bounds what one
+    /// repository holds — one payload, itself inside the modelled `@length(0..512000)` on
+    /// the member — however many catalog writes it takes.
     pub logo: Option<StoredLogo>,
 }
 
@@ -823,6 +828,12 @@ pub struct ComAmazonawsEcrpublicSpencerfrontendserviceState {
     /// In-flight layer uploads keyed by the `uploadId` `InitiateLayerUpload` minted, the
     /// handle `UploadLayerPart` and `CompleteLayerUpload` address an upload by.
     pub uploads: BTreeMap<String, LayerUpload>,
+    /// The address this emulator serves the published logo assets at, and the handle that
+    /// keeps it open ([`logo_socket`]) — `None` until a catalog write has published a logo
+    /// payload, there being nothing to fetch before then. ONE socket serves every
+    /// repository's asset, and it is never replaced, so a `logoUrl` a client is holding
+    /// keeps naming the address that serves it.
+    pub logo_socket: Option<LogoAssetSocket>,
 }
 
 impl Default for ComAmazonawsEcrpublicSpencerfrontendserviceState {
@@ -833,6 +844,7 @@ impl Default for ComAmazonawsEcrpublicSpencerfrontendserviceState {
             repositories: BTreeMap::new(),
             registry_display_name: None,
             uploads: BTreeMap::new(),
+            logo_socket: None,
         }
     }
 }
@@ -1472,14 +1484,61 @@ pub struct CatalogRecord {
     pub logo: Option<StoredLogo>,
 }
 
+impl CatalogRecord {
+    /// This record written OVER the one a repository already holds: every member the
+    /// request's document CARRIES takes effect, and every member it omits keeps the value
+    /// the repository already had.
+    ///
+    /// `PutRepositoryCatalogData` "creates or UPDATES the catalog data for a repository",
+    /// and `RepositoryCatalogDataInput$logoImageBlob` is an INPUT-only member — no reader
+    /// of this API reports the payload, only the `logoUrl` it is served at — so a caller
+    /// has no way to read a stored logo back and send it again. A document that did not
+    /// mention the logo could therefore never be written without destroying it, which is
+    /// why an omitted member is not a statement that the member is now unset: it is the
+    /// absence of a statement about it. A member written with an empty string or an empty
+    /// list IS a statement, and replaces what was stored.
+    ///
+    /// `marketplaceCertified` is nothing an API caller states, so it is carried over from
+    /// the stored record rather than taken from either side's document.
+    pub fn written_over(
+        self,
+        stored: &RepositoryCatalogData,
+        stored_logo: Option<&StoredLogo>,
+    ) -> Self {
+        let written = self.catalog_data;
+        Self {
+            catalog_data: RepositoryCatalogData {
+                description: written.description.or_else(|| stored.description.clone()),
+                architectures: written
+                    .architectures
+                    .or_else(|| stored.architectures.clone()),
+                operating_systems: written
+                    .operating_systems
+                    .or_else(|| stored.operating_systems.clone()),
+                // The URL is a statement ABOUT the payload, so it travels with the payload:
+                // a document that supplies no payload keeps the asset — and the URL that
+                // names it — exactly as it was.
+                logo_url: match self.logo.is_some() {
+                    true => written.logo_url,
+                    false => stored.logo_url.clone(),
+                },
+                about_text: written.about_text.or_else(|| stored.about_text.clone()),
+                usage_text: written.usage_text.or_else(|| stored.usage_text.clone()),
+                marketplace_certified: stored.marketplace_certified,
+            },
+            logo: self.logo.or_else(|| stored_logo.cloned()),
+        }
+    }
+}
+
 /// The catalog record a repository ends up with, given the `RepositoryCatalogDataInput` a
-/// request supplied, the registry it is a repository of, and the endpoint this emulator is
-/// served at.
+/// request supplied, the registry it is a repository of, and the base this emulator serves
+/// the logo asset at ([`logo_socket::logo_asset_base`]).
 ///
 /// Every text/list member passes through unchanged. `logoUrl` is documented as "the URL
 /// that contains the logo that's associated with the repository", so it exists only once
-/// a logo payload has been supplied, and names that payload on the endpoint this emulator
-/// serves the asset on ([`logo_asset::logo_url`]) — its last segment being the payload's
+/// a logo payload has been supplied, and names that payload on the address this emulator
+/// serves the asset at ([`logo_asset::logo_url`]) — its last segment being the payload's
 /// own digest, so the same logo always yields the same URL and a replacement always yields
 /// a different one. `marketplaceCertified` is "whether the repository is certified by
 /// Amazon Web Services Marketplace": it is neither required nor defaulted, and nothing a
@@ -1490,7 +1549,7 @@ pub fn catalog_record_of(
     registry_id: &str,
     repository_name: &str,
     input: Option<&RepositoryCatalogDataInput>,
-    endpoint_base: &str,
+    logo_asset_base: &str,
 ) -> CatalogRecord {
     let Some(input) = input else {
         return CatalogRecord {
@@ -1506,7 +1565,7 @@ pub fn catalog_record_of(
             operating_systems: input.operating_systems.clone(),
             logo_url: logo.as_ref().map(|logo| {
                 logo_url(
-                    endpoint_base,
+                    logo_asset_base,
                     registry_id,
                     repository_name,
                     &logo.asset_id,

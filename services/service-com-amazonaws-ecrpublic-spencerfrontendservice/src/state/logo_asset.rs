@@ -15,10 +15,14 @@
 //! digest — so the same bytes always have the same URL, different bytes never do, and a
 //! replacement payload is published at a URL of its own.
 //!
-//! The URL names the endpoint THIS EMULATOR is served at ([`logo_url`]), not the real
+//! The URL names the ADDRESS this emulator serves the asset at ([`logo_url`]), not the real
 //! gallery host: a URL a client is told to fetch has to lead back to the emulator, which is
 //! also why the asset's path sits under the reserved namespace every emulated data plane is
-//! addressed in (`service_common::data_plane_addressing`).
+//! addressed in (`service_common::data_plane_addressing`). That address is the socket this
+//! service opens for the plane ([`super::logo_socket`]), whose encoder writes a field name in
+//! the canonical spelling a client reading an asset's media type looks for; the same path is
+//! claimed at the emulator's own front door too ([`crate::service`]), so one route answers
+//! whichever address a fetch arrived at.
 //!
 //! The path also names the REGISTRY that published the asset, which the route is resolved
 //! against ([`super::ComAmazonawsEcrpublicSpencerfrontendserviceState::logo_asset`]): the
@@ -133,10 +137,10 @@ fn pixel_size(blob: &[u8]) -> Option<(usize, usize)> {
 /// associated with the repository".
 ///
 /// AWS publishes it on the gallery's own host, which this emulator does not serve. The URL
-/// therefore names the endpoint THIS EMULATOR answers on
-/// ([`::smithy_server_runtime::OperationContext::endpoint`], passed in as `endpoint_base`),
-/// with the asset's identity in the path — a URL a client of the emulator can really fetch
-/// the stored bytes from, rather than one pointing at the real service.
+/// therefore names an address THIS EMULATOR answers on, passed in as `endpoint_base` — the
+/// socket this service serves its assets at ([`super::logo_socket::logo_asset_base`]) — with
+/// the asset's identity in the path, so a client of the emulator can really fetch the stored
+/// bytes from it rather than being pointed at the real service.
 pub fn logo_url(
     endpoint_base: &str,
     registry_id: &str,

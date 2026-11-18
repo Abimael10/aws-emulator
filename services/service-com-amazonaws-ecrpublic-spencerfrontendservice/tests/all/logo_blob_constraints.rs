@@ -27,7 +27,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::error_message;
-use crate::repository_image_lifecycle::{call, logo_url, ok, refused, service, text};
+use crate::repository_image_lifecycle::{
+    call, logo_url_on, ok, published_logo_origin, refused, service, text,
+};
 use crate::repository_logo_asset::{blob_member, bmp, gif, png, INVALID_DIMENSIONS, MIN_PIXELS};
 
 /// The largest logo payload the model admits, in bytes: `LogoImageBlob`'s `@length` max
@@ -264,9 +266,10 @@ async fn each_logo_blob_constraint_is_refused_naming_its_own_rule() {
                     "case {case:?}: expected the payload published, got {status} with {body}"
                 );
                 let url = text(&body, &["catalogData", "logoUrl"], case);
+                let origin = published_logo_origin(&url, case);
                 assert_eq!(
                     url,
-                    logo_url(&name, &blob),
+                    logo_url_on(&origin, &name, &blob),
                     "case {case:?}: expected the URL to name this payload's own digest, \
                      got {url:?}"
                 );
@@ -359,9 +362,10 @@ async fn the_pixel_floor_is_read_from_the_image_header_not_from_the_payload_size
                 "case {case:?}: expected the payload published, got {status} with {body}"
             );
             let url = text(&body, &["catalogData", "logoUrl"], case);
+            let origin = published_logo_origin(&url, case);
             assert_eq!(
                 url,
-                logo_url(&name, &blob),
+                logo_url_on(&origin, &name, &blob),
                 "case {case:?}: expected the payload's own digest in the URL, got {url:?}"
             );
         } else {

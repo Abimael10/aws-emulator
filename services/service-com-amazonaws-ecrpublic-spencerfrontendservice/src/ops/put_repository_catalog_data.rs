@@ -4,15 +4,21 @@
 //!
 //! Creates or updates the catalog data of one repository in this public registry.
 //!
-//! `catalogData` is a complete document, not a patch: this operation PUTs the
-//! repository's whole catalog record, so every member the request omits ends up unset on
-//! the repository — which is also what makes two concurrent puts settle on exactly the
-//! document the last one supplied. The record is derived by
+//! `catalogData` is the document this write STATES: the operation "creates or updates the
+//! catalog data" of one repository, so every member the request carries takes effect and
+//! every member it omits keeps the value the repository already had. That is what makes the
+//! operation usable at all: `logoImageBlob` is an input-only member no reader reports, so a
+//! caller cannot read a stored logo back to send it again, and a document that did not
+//! mention it could never be written without destroying the asset. A member written with an
+//! empty string or an empty list IS a statement and replaces what was stored. Two concurrent
+//! puts therefore settle on the last statement made about each member.
+//!
+//! The document a request states is read by
 //! [`crate::state::catalog_record_of`], the same helper `CreateRepository` uses, so the
 //! `catalogData` the two operations report agrees member for member: text and list
 //! members pass through unchanged, `logoUrl` exists only while a logo payload is
-//! supplied and names that payload's own digest on the endpoint this emulator serves the
-//! asset on, and `marketplaceCertified` is left
+//! supplied or already stored and names that payload's own digest on the address this
+//! emulator serves the asset at, and `marketplaceCertified` is left
 //! unset — nothing a caller of this API does makes a Marketplace certification statement
 //! about a repository, so the member is absent from the reported record rather than
 //! reported as `false`.
@@ -168,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::unsupported_in_region` for the one call that is Region-scoped.
         //
         // Request metadata is used for the audit record only: which repository's catalog
-        // record this call replaces comes from the request body.
+        // record this call updates comes from the request body.
         // Authorization comes first: an action the caller's identity-based policies do not
         // allow is refused before this handler reads or writes anything, so a refused call
         // leaves the registry exactly as it was.
@@ -184,6 +190,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(server_error());
         };
+
+        // Where a client will FETCH the payload this document publishes: the address this
+        // emulator serves its logo assets at, opened by the first write that publishes one.
+        // Awaited BEFORE the store guard below, because a lock held across an await would
+        // make this future non-`Send`.
+        let logo_asset_base = crate::state::logo_socket::logo_asset_base(
+            &*self.engine,
+            &state,
+            ctx,
+            input.catalog_data.logo_image_blob.is_some(),
+        )
+        .await;
 
         let mut store = state.lock();
         if let Some(registry_id) = input.registry_id.as_deref() {
@@ -211,18 +229,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // readings of the same catalog input. It depends on the request and on the
         // registry this repository belongs to, which is also the scope the logo asset it
         // names is served in.
-        let record = crate::state::catalog_record_of(
+        let written = crate::state::catalog_record_of(
             &registry_id,
             &input.repository_name,
             Some(&input.catalog_data),
-            ctx.endpoint().as_str(),
+            &logo_asset_base,
         );
-        let catalog_data = record.catalog_data.clone();
 
         // A logo payload this registry will not publish is refused here, before anything
         // is written: the modelled byte cap is enforced at the boundary, and what remains
         // is the service's own rule about the image itself.
-        if let Some(message) = crate::state::logo_asset::logo_violation(record.logo.as_ref()) {
+        if let Some(message) = crate::state::logo_asset::logo_violation(written.logo.as_ref()) {
             return Err(
                 PutRepositoryCatalogDataErrorModeled::InvalidParameterException(
                     InvalidParameterException {
@@ -250,19 +267,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The document UPDATES the record the repository already holds: a member the
+        // request carries takes effect and a member it omits keeps what was stored, which
+        // is the only reading under which an input-only logo payload survives a write that
+        // does not mention it (see `crate::state::CatalogRecord::written_over`).
+        let record = written.written_over(&repository.catalog_data, repository.logo.as_ref());
+        let catalog_data = record.catalog_data.clone();
         repository.catalog_data = catalog_data.clone();
-        // The record is a whole document, so the asset it names replaces the one the
-        // repository published before it — and a record naming no logo leaves none.
+        // The asset a document DOES supply replaces the one the repository published before
+        // it, which is what mints a URL of the new payload's own.
         repository.logo = record.logo;
         let repository_name = input.repository_name;
         drop(store);
 
         // Audit record for a state-changing operation, as `PutRegistryCatalogData` words
-        // it: who asked, what changed, how it ended. The outcome distinguishes a
-        // document that leaves every caller-supplied member unset — which clears the
-        // record — from one that sets at least one. Only wire metadata and the
-        // identifiers are logged; the catalog document itself is caller content, so none
-        // of it is copied into the log.
+        // it: who asked, what changed, how it ended. The outcome distinguishes a record
+        // that carries no member at all — a document that supplied none, written to a
+        // repository that had none — from one that carries at least one. Only wire metadata
+        // and the identifiers are logged; the catalog document itself is caller content, so
+        // none of it is copied into the log.
         let outcome = if catalog_data.description.is_none()
             && catalog_data.architectures.is_none()
             && catalog_data.operating_systems.is_none()
@@ -270,9 +293,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             && catalog_data.about_text.is_none()
             && catalog_data.usage_text.is_none()
         {
-            "cleared"
+            "empty"
         } else {
-            "replaced"
+            "updated"
         };
         ::tracing::info!(
             target: "emulator::audit",

@@ -23,7 +23,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::error_message;
-use crate::repository_image_lifecycle::{call, logo_url, ok, refused, service, text, REGISTRY_ID};
+use crate::repository_image_lifecycle::{
+    call, logo_url_on, ok, published_logo_origin, refused, service, text, REGISTRY_ID,
+};
 
 /// The refusal a payload below the pixel floor is answered with: the member at fault and
 /// the rule it failed, and neither the rejected dimensions nor the byte cap (the size rule
@@ -226,11 +228,12 @@ async fn a_published_logo_is_served_at_the_url_the_service_minted_for_it() {
             "case {case:?}: expected no logoImageBlob in the record, got {written}"
         );
         let url = text(&written, &["catalogData", "logoUrl"], case);
+        let origin = published_logo_origin(&url, case);
         assert_eq!(
             url,
-            logo_url(&name, &payload.blob),
-            "case {case:?}: expected the URL to name the payload's own digest on this \
-             emulator's endpoint, got {url:?}"
+            logo_url_on(&origin, &name, &payload.blob),
+            "case {case:?}: expected the URL to name the payload's own digest on the \
+             address this emulator serves the asset at, got {url:?}"
         );
 
         // Every reader reports the same URL...
@@ -374,33 +377,57 @@ async fn a_replacement_logo_is_published_at_a_url_of_its_own() {
 }
 
 #[tokio::test]
-async fn a_record_that_names_no_logo_publishes_nothing() {
+async fn a_record_keeps_its_logo_until_another_payload_replaces_it() {
     let router = service();
-    let name = "catalog/cleared";
+    let name = "catalog/kept";
     repository(&router, name).await;
 
-    let published = put_logo(&router, name, &png(64, 64)).await.1;
+    let first = png(64, 64);
+    let published = put_logo(&router, name, &first).await.1;
     let url = text(&published, &["catalogData", "logoUrl"], "published");
 
-    // A catalog record is a whole document, so a write that supplies no payload leaves the
-    // repository with no logo at all — and nothing is served where the old one was.
-    let cleared = ok(
+    // The payload is input-only, so a caller has nothing to send again: a later document
+    // that mentions no payload makes no statement about the logo, and the asset and the URL
+    // that names it are still the record's.
+    let kept = ok(
         &router,
         "PutRepositoryCatalogData",
-        json!({"repositoryName": name, "catalogData": {"description": "no logo"}}),
-        "cleared",
+        json!({"repositoryName": name, "catalogData": {"description": "no payload"}}),
+        "no payload",
     )
     .await;
     assert_eq!(
-        cleared["catalogData"].get("logoUrl"),
-        None,
-        "case \"cleared\": expected no logo URL once no payload is supplied, got {cleared}"
+        kept["catalogData"]["logoUrl"].as_str(),
+        Some(url.as_str()),
+        "case \"no payload\": expected the published logo URL kept, got {kept}"
     );
-    let (status, _, body) = fetch(&router, &url, "cleared").await;
+    let (status, _, body) = fetch(&router, &url, "no payload").await;
+    assert_eq!(
+        (status, &body),
+        (200, &first),
+        "case \"no payload\": expected the asset still served at {url:?}"
+    );
+
+    // A document that DOES supply a payload replaces the asset: the new bytes are served at
+    // a URL of their own and the old asset is held no longer.
+    let second = png(96, 96);
+    let replaced = put_logo(&router, name, &second).await.1;
+    let moved = text(&replaced, &["catalogData", "logoUrl"], "replaced");
+    assert_ne!(
+        moved, url,
+        "case \"replaced\": expected the replacement at a URL of its own"
+    );
+    let (status, _, body) = fetch(&router, &moved, "replaced").await;
+    assert_eq!(
+        (status, &body),
+        (200, &second),
+        "case \"replaced\": expected the new bytes served at {moved:?}"
+    );
+    let (status, _, body) = fetch(&router, &url, "replaced").await;
     assert_eq!(
         (status, body.len()),
         (404, 0),
-        "case \"cleared\": expected nothing served for a logo the registry no longer holds"
+        "case \"replaced\": expected nothing served for the asset the registry replaced"
     );
 }
 
@@ -422,8 +449,9 @@ async fn a_logo_path_naming_no_stored_asset_serves_nothing() {
     // registry's asset), and a path that is no asset path at all (its last segment is no
     // asset id, so this service does not claim it and the emulator's own front door
     // answers).
-    let other = logo_url("catalog/other", &png(64, 64));
-    let unknown = logo_url(name, &png(61, 61));
+    let origin = published_logo_origin(&served, "stored");
+    let other = logo_url_on(&origin, "catalog/other", &png(64, 64));
+    let unknown = logo_url_on(&origin, name, &png(61, 61));
     let cases = [
         ("another repository's path", other, true),
         (

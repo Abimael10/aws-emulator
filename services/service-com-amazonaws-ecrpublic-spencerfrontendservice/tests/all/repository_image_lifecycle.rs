@@ -174,25 +174,58 @@ pub(crate) fn digest_of(manifest: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(manifest.as_bytes()))
 }
 
-/// The URL a stored logo payload is reported under, computed independently of the
-/// emulator.
+/// The PATH a stored logo payload is served at, computed independently of the emulator.
 ///
 /// `RepositoryCatalogData$logoUrl` is "the URL that contains the logo that's associated
 /// with the repository", so it exists only once a payload has been stored, and its last
 /// segment is that payload's own sha256 digest: the same bytes always yield the same URL
-/// and different bytes never do. The host is the endpoint THIS emulator is served at,
-/// which for an in-process router is the unserved base
-/// (`smithy_server_runtime::UNSERVED_URL_BASE`), and the path is the asset plane the
-/// service serves the logo on, under the registry that published it.
+/// and different bytes never do. The path is the asset plane this service serves the logo
+/// on, under the registry that published it.
 ///
-/// `pub(crate)` so the sibling catalog-data suite asserts the same derivation instead of
+/// `pub(crate)` so the sibling catalog-data suites assert the same derivation instead of
 /// keeping a second copy of it.
-pub(crate) fn logo_url(repository: &str, blob: &[u8]) -> String {
+pub(crate) fn logo_asset_path(repository: &str, blob: &[u8]) -> String {
     format!(
-        "{}/_aws/ecr-public-logos/{REGISTRY_ID}/{repository}/{:x}",
-        smithy_server_runtime::UNSERVED_URL_BASE,
+        "/_aws/ecr-public-logos/{REGISTRY_ID}/{repository}/{:x}",
         Sha256::digest(blob)
     )
+}
+
+/// The ADDRESS half (`scheme://authority`) of a URL this registry published, asserted to be
+/// one a client on this machine can really reach: the `https` origin of the socket this
+/// emulator serves its logo assets at, on a loopback host and a port of its own — never a
+/// host of the real gallery, which resolves nowhere near this process.
+///
+/// Read off the reported URL rather than out of the state struct (no suite of this target
+/// reaches into it), because the port is the one the operating system handed the socket.
+pub(crate) fn published_logo_origin(url: &str, case: &str) -> String {
+    let (scheme, rest) = url
+        .split_once("://")
+        .unwrap_or_else(|| panic!("case {case:?}: expected a URL with a scheme, got {url:?}"));
+    assert_eq!(
+        scheme, "https",
+        "case {case:?}: expected the asset published over https, got {url:?}"
+    );
+    let authority = rest.split('/').next().unwrap_or_default();
+    let (host, port) = authority
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("case {case:?}: expected an address with a port, got {url:?}"));
+    assert_eq!(
+        host, "127.0.0.1",
+        "case {case:?}: expected the asset on this machine's own address, got {url:?}"
+    );
+    assert!(
+        port.parse::<u16>().is_ok_and(|port| port > 0),
+        "case {case:?}: expected the address to name a port, got {url:?}"
+    );
+    format!("{scheme}://{authority}")
+}
+
+/// The URL a stored logo payload must be reported under: the address this emulator
+/// published the asset on ([`published_logo_origin`]), then the asset's own path
+/// ([`logo_asset_path`]).
+pub(crate) fn logo_url_on(origin: &str, repository: &str, blob: &[u8]) -> String {
+    format!("{origin}{}", logo_asset_path(repository, blob))
 }
 
 /// Every `repositoryName` form the modelled pattern
@@ -454,9 +487,11 @@ async fn create_repository_reports_the_catalog_data_it_stored() {
         "expected no Marketplace certification statement about a repository created \
          through the API, got {catalog}"
     );
+    let published = catalog["logoUrl"].as_str().unwrap_or_default();
+    let origin = published_logo_origin(published, "a create that supplies a logo");
     assert_eq!(
-        catalog["logoUrl"].as_str().unwrap_or_default(),
-        logo_url("team/catalog", &logo_bytes),
+        published,
+        logo_url_on(&origin, "team/catalog", &logo_bytes),
         "expected the logo URL to be derived from the logo payload, got {catalog}"
     );
 

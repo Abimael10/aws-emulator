@@ -11,6 +11,13 @@
 //! HTTP/1.1 writer that puts it on the wire — so the status line, the headers and the
 //! bytes a socket really delivers are pinned here, in the response text itself, rather
 //! than asserted against the in-process response the sibling suite reads.
+//!
+//! Both addresses the asset is reachable at are probed, because they are written by two
+//! different encoders: the ADDRESS THE URL NAMES, which is the socket this service opens
+//! for its asset plane (`state::logo_socket`, whose encoder writes a field name in the
+//! canonical spelling a client reading the media type looks for), and the emulator's own
+//! front door, which claims the same path and writes every field name normalised to lower
+//! case.
 
 use serde_json::json;
 
@@ -39,17 +46,36 @@ fn raw_get(port: u16, path: &str) -> Vec<u8> {
     answer
 }
 
-/// The response's head, lower-cased, and its body as the bytes they were delivered as. An
+/// The response's head as it was SENT, and its body as the bytes they were delivered as. An
 /// image payload is not text, so the split is over the BYTES: decoding the whole answer as
-/// UTF-8 would rewrite the very bytes this probe is about.
+/// UTF-8 would rewrite the very bytes this probe is about. The head's own bytes are kept as
+/// received, because the SPELLING of a field name is what half of this probe is about.
 fn head_and_body(answer: &[u8], case: &str) -> (String, Vec<u8>) {
     let separator = b"\r\n\r\n";
     let at = answer
         .windows(separator.len())
         .position(|window| window == separator)
         .unwrap_or_else(|| panic!("case {case:?}: expected a response head in the answer"));
-    let head = String::from_utf8_lossy(&answer[..at]).to_ascii_lowercase();
+    let head = String::from_utf8_lossy(&answer[..at]).to_string();
     (head, answer[at + separator.len()..].to_vec())
+}
+
+/// The port and path of a URL this registry published, so a client can dial exactly the
+/// address it was handed.
+fn address_of(url: &str, case: &str) -> (u16, String) {
+    let authority_and_path = url
+        .split_once("://")
+        .map(|(_scheme, rest)| rest)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a URL with a scheme, got {url:?}"));
+    let at = authority_and_path
+        .find('/')
+        .unwrap_or_else(|| panic!("case {case:?}: expected a URL with a path, got {url:?}"));
+    let port = authority_and_path[..at]
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse().ok())
+        .unwrap_or_else(|| panic!("case {case:?}: expected an address with a port, got {url:?}"));
+    (port, authority_and_path[at..].to_string())
 }
 
 /// RULE: the socket answers a published logo with `200`, the media type the payload's own
@@ -117,6 +143,7 @@ async fn the_socket_delivers_a_published_logo_with_its_media_type_and_length() {
             .await
             .expect("the socket exchange runs to completion");
         let (head, body) = head_and_body(&answer, case);
+        let head = head.to_ascii_lowercase();
         assert!(
             head.starts_with("http/1.1 200"),
             "case {case:?}: expected a 200 on the wire for {path:?}, got {head:?}"
@@ -136,6 +163,150 @@ async fn the_socket_delivers_a_published_logo_with_its_media_type_and_length() {
             "case {case:?}: expected the {} uploaded bytes on the wire, got {} of them",
             blob.len(),
             body.len()
+        );
+    }
+}
+
+/// RULE: the ADDRESS a published `logoUrl` names answers the asset with the media type the
+/// payload's own bytes announce, stated under the canonical, hyphen-separated spelling of
+/// the field name (`Content-Type`) — so a client that reads a response's field names AS
+/// RECEIVED, which is what a browser `<img>`, an image pipeline and a publish-time
+/// validator do, finds the type of what it fetched.
+///
+/// The rows differ in the payload's own format, so the type stated is the one THESE bytes
+/// announce; the field NAME is the fixed half of the rule and the same in every row. Each
+/// row is fetched at the address its own URL names, with no credential and no
+/// `X-Amz-Target`: exactly what a browser sends.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_published_address_states_the_media_type_under_its_canonical_field_name() {
+    let router = service();
+
+    let cases: [(&str, &str, Vec<u8>, &str); 3] = [
+        ("a PNG", "published/png-logo", png(64, 64), "image/png"),
+        ("a GIF", "published-gif-logo", gif(120, 90), "image/gif"),
+        (
+            "bytes of no image format",
+            "published/opaque-logo",
+            vec![9u8, 8, 7, 6, 5],
+            "application/octet-stream",
+        ),
+    ];
+    for (case, repository, blob, media_type) in cases {
+        ok(
+            &router,
+            "CreateRepository",
+            json!({"repositoryName": repository}),
+            case,
+        )
+        .await;
+        let written = ok(
+            &router,
+            "PutRepositoryCatalogData",
+            json!({
+                "repositoryName": repository,
+                "catalogData": {"description": "a hosted logo", "logoImageBlob": blob_member(&blob)},
+            }),
+            case,
+        )
+        .await;
+        let url = text(&written, &["catalogData", "logoUrl"], case);
+
+        // The published URL is dialled as it stands: its own port, its own path.
+        let (port, path) = address_of(&url, case);
+        let fetched = path.clone();
+        let answer = tokio::task::spawn_blocking(move || raw_get(port, &fetched))
+            .await
+            .expect("the socket exchange runs to completion");
+        let (head, body) = head_and_body(&answer, case);
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "case {case:?}: expected a 200 at the published address {url:?}, got {head:?}"
+        );
+        let stated = format!("Content-Type: {media_type}");
+        assert!(
+            head.contains(&stated),
+            "case {case:?}: expected the asset served as {stated:?} under that exact field \
+             name, got {head:?}"
+        );
+        let length = format!("Content-Length: {}", blob.len());
+        assert!(
+            head.contains(&length),
+            "case {case:?}: expected {length:?} under that exact field name, got {head:?}"
+        );
+        assert_eq!(
+            body, blob,
+            "case {case:?}: expected the {} uploaded bytes at {url:?}, got {} of them",
+            blob.len(),
+            body.len()
+        );
+    }
+}
+
+/// RULE: the address the asset plane is published at serves THAT plane and nothing else: a
+/// path naming no asset of this registry is answered 404 there, and no other surface of the
+/// emulator is reachable through it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_published_address_serves_the_asset_plane_alone() {
+    let router = service();
+    let repository = "published/scoped-logo";
+    let blob = png(64, 64);
+    ok(
+        &router,
+        "CreateRepository",
+        json!({"repositoryName": repository}),
+        "the published asset",
+    )
+    .await;
+    let written = ok(
+        &router,
+        "PutRepositoryCatalogData",
+        json!({
+            "repositoryName": repository,
+            "catalogData": {"logoImageBlob": blob_member(&blob)},
+        }),
+        "the published asset",
+    )
+    .await;
+    let url = text(
+        &written,
+        &["catalogData", "logoUrl"],
+        "the published asset",
+    );
+    let (port, path) = address_of(&url, "the published asset");
+
+    // The rows span the paths this address does not serve: the emulator's own control-plane
+    // route, a path under another plane's namespace, a well-formed asset path this registry
+    // holds nothing for, and the real gallery's own logo path.
+    let absent = path.replace(
+        path.rsplit('/').next().unwrap_or_default(),
+        &"0".repeat(64),
+    );
+    let cases: [(&str, String); 4] = [
+        ("the control-plane route", "/".to_string()),
+        (
+            "another plane's namespace",
+            "/_aws/es/000000000000/index".to_string(),
+        ),
+        ("an asset id nothing was stored under", absent),
+        (
+            "the real gallery's logo path",
+            format!("/logos/{repository}/logo.png"),
+        ),
+    ];
+    for (case, path) in cases {
+        let fetched = path.clone();
+        let answer = tokio::task::spawn_blocking(move || raw_get(port, &fetched))
+            .await
+            .expect("the socket exchange runs to completion");
+        let (head, body) = head_and_body(&answer, case);
+        assert!(
+            head.starts_with("HTTP/1.1 404"),
+            "case {case:?}: expected nothing served for {path:?} at the asset address, \
+             got {head:?}"
+        );
+        assert_ne!(
+            body, blob,
+            "case {case:?}: expected no asset bytes for {path:?}"
         );
     }
 }

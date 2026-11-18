@@ -16,9 +16,16 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
+# Speaks HTTP/1.1 on the raw connection the core hands the socket every published `logoUrl`
+# names, with the encoder's title-case option set so the asset's media type reaches a client
+# under the field name it reads (`src/state/logo_socket.rs`). `hyper-util` carries the tokio
+# IO and timer adapters for it, `http-body-util` the bounded body reader and the one-shot body.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # The `sha256:` manifest digest an image is identified by, and the logo payload digest.

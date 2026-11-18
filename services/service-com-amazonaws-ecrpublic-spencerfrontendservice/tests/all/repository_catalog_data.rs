@@ -9,20 +9,25 @@
 //! the state struct, so a `catalogData` that is not computed from persisted state cannot
 //! pass.
 //!
-//! The rule under test: `PutRepositoryCatalogData` replaces the whole catalog record of
-//! an existing repository with the document the request supplied — text and list members
-//! verbatim, `logoUrl` present only while a logo payload is, and `marketplaceCertified`
-//! absent, since nothing a caller of this API does makes a certification statement — and
-//! `GetRepositoryCatalogData` reports back exactly that record. The tables below span the
-//! document forms the rule generalises over (every member set, single members, empty
-//! strings, empty lists, unicode, list and text sizes at each published bound, logo
-//! payloads of several sizes) rather than one recorded request.
+//! The rule under test: `PutRepositoryCatalogData` STATES the catalog record of an
+//! existing repository — every member the request's document carries takes effect and every
+//! member it omits keeps the value the repository already had — with text and list members
+//! verbatim, `logoUrl` present only while a logo payload has been supplied, and
+//! `marketplaceCertified` absent, since nothing a caller of this API does makes a
+//! certification statement; and `GetRepositoryCatalogData` reports back exactly that record.
+//! The tables below span the document forms the rule generalises over (every member set,
+//! single members, empty strings, empty lists, unicode, list and text sizes at each
+//! published bound, logo payloads of several sizes, and the members a later document leaves
+//! unmentioned) rather than one recorded request.
 
 use serde_json::{json, Value};
 
-use crate::repository_image_lifecycle::{call, logo_url, ok, refused, service, REGISTRY_ID};
+use crate::repository_image_lifecycle::{
+    call, logo_asset_path, logo_url_on, ok, published_logo_origin, refused, service, REGISTRY_ID,
+};
 
-/// The repository every document in the main table is written to, in turn.
+/// The repository the rows of the main table are each written to — one of its own per row,
+/// so each row states what a reader reports for the document IT supplied.
 const REPO: &str = "team/catalog";
 
 /// A second repository, never named by a put in the main table: it pins that putting one
@@ -55,9 +60,10 @@ async fn create(router: &smithy_server_runtime::MultiServiceRouter, name: &str) 
     .await;
 }
 
-/// Every catalog document form the rule spans, written to ONE repository in sequence —
-/// so each row also proves the previous row's members are gone, which is what "the
-/// request's document replaces the record" means.
+/// Every catalog document form the rule spans. Each row is written to a repository of its
+/// own, so the record a reader reports is the one THAT document stated — which is what the
+/// member-by-member assertions below are about; what a document leaves unmentioned is the
+/// separate rule [`a_put_states_the_members_it_carries_and_leaves_the_rest`] covers.
 fn table() -> Vec<Row> {
     // The bytes 0x00 0x01 0x02, and a one-byte payload: two distinct logo payloads whose
     // derived URLs must differ.
@@ -84,18 +90,18 @@ fn table() -> Vec<Row> {
                 "operatingSystems": ["Linux", "Windows"],
                 "aboutText": "# about",
                 "usageText": "docker pull",
-                "logoUrl": logo_url(REPO, &logo),
+                "logoUrl": logo_asset_path(REPO, &logo),
             }),
         },
         Row {
-            case: "only a description: every other member of the previous document is gone",
+            case: "only a description",
             input: json!({ "description": "just a description" }),
             expected: json!({
                 "description": "just a description",
             }),
         },
         Row {
-            case: "an empty document clears the record",
+            case: "an empty document states nothing, so the record stays empty",
             input: json!({}),
             expected: json!({}),
         },
@@ -174,28 +180,67 @@ fn table() -> Vec<Row> {
             case: "a logo payload on its own",
             input: json!({ "logoImageBlob": blob_member(&other_logo) }),
             expected: json!({
-                "logoUrl": logo_url(REPO, &other_logo),
+                "logoUrl": logo_asset_path(REPO, &other_logo),
             }),
         },
         Row {
             case: "an empty logo payload is still a payload",
             input: json!({ "logoImageBlob": blob_member(&[]) }),
             expected: json!({
-                "logoUrl": logo_url(REPO, &[]),
+                "logoUrl": logo_asset_path(REPO, &[]),
             }),
         },
         Row {
             case: "the largest logo payload the model admits (512000 bytes)",
             input: json!({ "logoImageBlob": blob_member(&vec![7u8; 512_000]) }),
             expected: json!({
-                "logoUrl": logo_url(REPO, &vec![7u8; 512_000]),
+                "logoUrl": logo_asset_path(REPO, &vec![7u8; 512_000]),
             }),
         },
     ]
 }
 
+/// The record as these rows compare it: a published `logoUrl` reduced to the asset's own
+/// PATH, after the ADDRESS it was published on is asserted to be one a client on this
+/// machine reaches ([`published_logo_origin`]).
+///
+/// The address is the socket this emulator serves its logo assets at, whose port the
+/// operating system hands out per run, so the rows state the half of the URL the REQUEST
+/// decides — the registry, the repository and the payload's own digest.
+fn comparable(record: &Value, case: &str) -> Value {
+    let mut record = record.clone();
+    let published = record
+        .get("logoUrl")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(url) = published {
+        let origin = published_logo_origin(&url, case);
+        record["logoUrl"] = json!(url[origin.len()..]);
+    }
+    record
+}
+
+/// Delete `name` and create it again, so the next document is written to a repository with
+/// no catalog record of its own: a repository recreated under the same name starts clean.
+async fn recreate(router: &smithy_server_runtime::MultiServiceRouter, name: &str, case: &str) {
+    ok(
+        router,
+        "DeleteRepository",
+        json!({ "repositoryName": name }),
+        case,
+    )
+    .await;
+    ok(
+        router,
+        "CreateRepository",
+        json!({ "repositoryName": name }),
+        case,
+    )
+    .await;
+}
+
 #[tokio::test]
-async fn put_replaces_the_catalog_record_and_get_reports_it_back() {
+async fn a_put_states_the_catalog_record_and_get_reports_it_back() {
     let router = service();
     create(&router, REPO).await;
     create(&router, OTHER_REPO).await;
@@ -219,6 +264,9 @@ async fn put_replaces_the_catalog_record_and_get_reports_it_back() {
         expected,
     } in table()
     {
+        // Each row states a record of its own, so what a reader reports is what THIS
+        // document stated rather than anything an earlier row left behind.
+        recreate(&router, REPO, case).await;
         let put = ok(
             &router,
             "PutRepositoryCatalogData",
@@ -227,7 +275,8 @@ async fn put_replaces_the_catalog_record_and_get_reports_it_back() {
         )
         .await;
         assert_eq!(
-            put["catalogData"], expected,
+            comparable(&put["catalogData"], case),
+            expected,
             "case {case:?}: expected PutRepositoryCatalogData to report {expected}, got {}",
             put["catalogData"]
         );
@@ -247,7 +296,8 @@ async fn put_replaces_the_catalog_record_and_get_reports_it_back() {
         )
         .await;
         assert_eq!(
-            got["catalogData"], expected,
+            comparable(&got["catalogData"], case),
+            expected,
             "case {case:?}: expected GetRepositoryCatalogData to report the stored \
              record {expected}, got {}",
             got["catalogData"]
@@ -265,6 +315,169 @@ async fn put_replaces_the_catalog_record_and_get_reports_it_back() {
             other["catalogData"], other_expected,
             "case {case:?}: expected putting {REPO:?} to leave {OTHER_REPO:?} alone, got {}",
             other["catalogData"]
+        );
+    }
+}
+
+/// One row of the update rule: the document a repository already holds, the document a
+/// later put states over it, and the record a reader must then report. A `logoUrl` in
+/// `expected` is the asset's own PATH, which is the half of the URL a document decides
+/// ([`comparable`]).
+struct Update {
+    case: &'static str,
+    stored: Value,
+    written: Value,
+    expected: Value,
+}
+
+/// RULE: a put STATES the members its document carries and leaves every member it does not
+/// carry as the repository already had it — so a document that supplies only a logo payload
+/// keeps the text members, a document that supplies only text keeps the published logo, and
+/// a member stated as an empty string or an empty list replaces what was stored.
+///
+/// The rows span what the rule generalises over: which side of the document each member is
+/// on (an input-only payload, text, lists), a payload replaced by another, a document that
+/// states nothing at all, an empty statement about a stored member, and a document that
+/// states every member at once.
+#[tokio::test]
+async fn a_put_states_the_members_it_carries_and_leaves_the_rest() {
+    let router = service();
+    create(&router, REPO).await;
+
+    let logo = vec![0u8, 1, 2];
+    let other_logo = vec![0xffu8];
+    let rows = vec![
+        Update {
+            case: "a payload alone keeps the text members",
+            stored: json!({ "description": "a description", "aboutText": "# about" }),
+            written: json!({ "logoImageBlob": blob_member(&logo) }),
+            expected: json!({
+                "description": "a description",
+                "aboutText": "# about",
+                "logoUrl": logo_asset_path(REPO, &logo),
+            }),
+        },
+        Update {
+            case: "text alone keeps the published logo",
+            stored: json!({
+                "description": "first",
+                "logoImageBlob": blob_member(&logo),
+            }),
+            written: json!({ "description": "second" }),
+            expected: json!({
+                "description": "second",
+                "logoUrl": logo_asset_path(REPO, &logo),
+            }),
+        },
+        Update {
+            case: "a replacement payload keeps the text and moves the URL",
+            stored: json!({
+                "description": "a description",
+                "logoImageBlob": blob_member(&logo),
+            }),
+            written: json!({ "logoImageBlob": blob_member(&other_logo) }),
+            expected: json!({
+                "description": "a description",
+                "logoUrl": logo_asset_path(REPO, &other_logo),
+            }),
+        },
+        Update {
+            case: "a document that states nothing leaves the whole record",
+            stored: json!({
+                "description": "a description",
+                "usageText": "docker pull",
+                "logoImageBlob": blob_member(&logo),
+            }),
+            written: json!({}),
+            expected: json!({
+                "description": "a description",
+                "usageText": "docker pull",
+                "logoUrl": logo_asset_path(REPO, &logo),
+            }),
+        },
+        Update {
+            case: "an empty string is a statement and replaces the stored text",
+            stored: json!({ "description": "a description", "aboutText": "# about" }),
+            written: json!({ "description": "" }),
+            expected: json!({ "description": "", "aboutText": "# about" }),
+        },
+        Update {
+            case: "an empty list is a statement and replaces the stored list",
+            stored: json!({ "architectures": ["x86-64"], "operatingSystems": ["Linux"] }),
+            written: json!({ "architectures": [] }),
+            expected: json!({ "architectures": [], "operatingSystems": ["Linux"] }),
+        },
+        Update {
+            case: "every member stated at once replaces every stored member",
+            stored: json!({
+                "description": "first",
+                "architectures": ["x86-64"],
+                "operatingSystems": ["Linux"],
+                "aboutText": "# first",
+                "usageText": "pull first",
+                "logoImageBlob": blob_member(&logo),
+            }),
+            written: json!({
+                "description": "second",
+                "architectures": ["arm64"],
+                "operatingSystems": ["Windows"],
+                "aboutText": "# second",
+                "usageText": "pull second",
+                "logoImageBlob": blob_member(&other_logo),
+            }),
+            expected: json!({
+                "description": "second",
+                "architectures": ["arm64"],
+                "operatingSystems": ["Windows"],
+                "aboutText": "# second",
+                "usageText": "pull second",
+                "logoUrl": logo_asset_path(REPO, &other_logo),
+            }),
+        },
+    ];
+
+    for Update {
+        case,
+        stored,
+        written,
+        expected,
+    } in rows
+    {
+        // Each row states its own starting record, so what the second put leaves is decided
+        // by that row's two documents alone.
+        recreate(&router, REPO, case).await;
+        ok(
+            &router,
+            "PutRepositoryCatalogData",
+            json!({ "repositoryName": REPO, "catalogData": stored }),
+            case,
+        )
+        .await;
+        let put = ok(
+            &router,
+            "PutRepositoryCatalogData",
+            json!({ "repositoryName": REPO, "catalogData": written }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            comparable(&put["catalogData"], case),
+            expected,
+            "case {case:?}: expected the put to report {expected}, got {}",
+            put["catalogData"]
+        );
+        let got = ok(
+            &router,
+            "GetRepositoryCatalogData",
+            json!({ "repositoryName": REPO }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            comparable(&got["catalogData"], case),
+            expected,
+            "case {case:?}: expected the stored record to be {expected}, got {}",
+            got["catalogData"]
         );
     }
 }
@@ -303,9 +516,10 @@ async fn the_logo_url_is_derived_from_the_payload_bytes() {
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
+            let origin = published_logo_origin(&url, &case);
             assert_eq!(
                 url,
-                logo_url(REPO, payload),
+                logo_url_on(&origin, REPO, payload),
                 "case {case:?} (attempt {attempt}): expected the logo URL to name the \
                  payload's own digest, got {url:?}"
             );
@@ -324,21 +538,26 @@ async fn the_logo_url_is_derived_from_the_payload_bytes() {
         seen.push(urls[0].clone());
     }
 
-    // Dropping the payload drops the URL: the document the request supplies is the whole
-    // record.
-    let cleared = ok(
+    // A document that supplies no payload makes no statement about the logo, so the URL
+    // the last payload was published at is still the record's: the payload is input-only,
+    // so a caller has nothing to send again and an omission cannot mean "remove it".
+    let last = seen
+        .last()
+        .cloned()
+        .expect("every row published a logo URL");
+    let kept = ok(
         &router,
         "PutRepositoryCatalogData",
-        json!({ "repositoryName": REPO, "catalogData": { "description": "no logo" } }),
+        json!({ "repositoryName": REPO, "catalogData": { "description": "no payload" } }),
         "no payload",
     )
     .await;
     assert_eq!(
-        cleared["catalogData"]["logoUrl"],
-        Value::Null,
-        "case \"no payload\": expected no logo URL once the payload is no longer supplied, \
-         got {}",
-        cleared["catalogData"]
+        kept["catalogData"]["logoUrl"],
+        Value::String(last),
+        "case \"no payload\": expected the published logo URL kept by a document that \
+         mentions no payload, got {}",
+        kept["catalogData"]
     );
 }
 
@@ -525,9 +744,14 @@ async fn the_published_catalog_limits_are_enforced_on_each_bound() {
         });
         if accepted {
             let put = ok(&router, "PutRepositoryCatalogData", body, &case).await;
+            let url = put["catalogData"]["logoUrl"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let origin = published_logo_origin(&url, &case);
             assert_eq!(
-                put["catalogData"]["logoUrl"],
-                Value::String(logo_url(REPO, &payload)),
+                url,
+                logo_url_on(&origin, REPO, &payload),
                 "case {case:?}: expected the payload's digest in the logo URL, got {}",
                 put["catalogData"]
             );
@@ -549,8 +773,9 @@ async fn the_last_write_wins_and_a_recreated_repository_starts_clean() {
     let router = service();
     create(&router, REPO).await;
 
-    // A sequence of writers, each supplying a whole document: the record a reader sees
-    // is the one the last writer supplied, whatever the earlier ones held.
+    // A sequence of writers, each stating some of the members: the value a reader sees for
+    // a member is the one the LAST writer that mentioned it stated, and a member no writer
+    // after the first mentioned keeps that first statement.
     let writers = [
         json!({ "description": "first", "architectures": ["x86-64"] }),
         json!({ "aboutText": "second", "operatingSystems": ["Linux"] }),
@@ -571,9 +796,12 @@ async fn the_last_write_wins_and_a_recreated_repository_starts_clean() {
         last,
         json!({
             "description": "third",
+            "architectures": ["x86-64"],
+            "aboutText": "second",
+            "operatingSystems": ["Linux"],
             "usageText": "docker pull",
         }),
-        "expected the last writer's document to be the record, got {last}"
+        "expected each member's last statement to be the record, got {last}"
     );
     let got = ok(
         &router,
