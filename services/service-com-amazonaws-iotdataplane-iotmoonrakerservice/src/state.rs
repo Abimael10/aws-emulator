@@ -179,6 +179,10 @@ pub fn too_many_topic_bytes(max_bytes: usize) -> String {
 /// condition has its own message naming its own limit, so a caller is told which ceiling
 /// it crossed; the limits are independent, so a name of legal depth is still weighed
 /// against the byte ceiling.
+///
+/// This is the rule of the paths that DELIVER a message (`Publish`, `SendDirectMessage`).
+/// A path that only resolves a topic as a store key does not borrow it: a name this
+/// function refuses can hold nothing, so a read of it reports absence.
 pub fn topic_name_refusal(topic: &str) -> Option<String> {
     // MQTT forbids the single-level (`+`) and multi-level (`#`) wildcards in a publish
     // topic: a topic carrying one is a topic FILTER, which only a subscription may be.

@@ -9,13 +9,14 @@
 //! * The broker's over-size refusal states the published PAYLOAD CEILING and nothing of
 //!   the request that crossed it: one fixed sentence, the same for every over-size
 //!   message, so a client matching it reads one number — the limit it has to shrink to.
-//! * A topic is a topic NAME on the read path as much as on the write path, so the
-//!   broker's topic-name rules are applied to both: a name carrying an MQTT subscription
-//!   wildcard, or past the broker's part or byte ceiling, is refused
-//!   `InvalidRequestException` (HTTP 400) with the SAME message whichever side asks,
-//!   while a well-formed name that merely holds no retained message stays
-//!   `ResourceNotFoundException` (HTTP 404). The 400-vs-404 distinction is the whole
-//!   signal: a 404 would tell a caller its filter is a legal name.
+//! * The broker's topic-name rules belong to the paths that DELIVER a message. A
+//!   retained-message read resolves the topic as a store key and nothing else, so every
+//!   name holding no retained message — one carrying an MQTT subscription wildcard or
+//!   past the broker's part or byte ceiling just as much as a well-formed one — is
+//!   `ResourceNotFoundException` (HTTP 404) with the service's fixed not-found sentence,
+//!   never `InvalidRequestException` (HTTP 400). The 400-vs-404 distinction is the whole
+//!   signal: a 400 would tell a caller to stop retrying a probe that simply found
+//!   nothing, and a publish to the same name keeps answering its own 400.
 //! * A shadow name in this service's reserved `$` namespace is not a name a client may
 //!   address — on the write path or on either read path — and is refused
 //!   `InvalidRequestException` (HTTP 400) naming the shadow the request asked for. Only
@@ -169,11 +170,31 @@ fn malformed_topics() -> Vec<MalformedTopic> {
             topic: "z".repeat(4 * MAX_TOPIC_BYTES),
             expected: too_long,
         },
+        MalformedTopic {
+            // The ceiling counts BYTES, so a two-byte character costs two of them.
+            name: "multi-byte characters past the byte ceiling in bytes, not in characters",
+            topic: "é".repeat(MAX_TOPIC_BYTES / 2 + 1),
+            expected: format!("Topic can't contain more than {MAX_TOPIC_BYTES} bytes"),
+        },
+        MalformedTopic {
+            name: "past both ceilings at once",
+            topic: name_of_parts(MAX_TOPIC_PARTS + 1) + &"z".repeat(MAX_TOPIC_BYTES),
+            expected: format!("Topic can't contain more than {MAX_TOPIC_PARTS} parts"),
+        },
+        MalformedTopic {
+            name: "a wildcard on a name that is also too deep",
+            topic: name_of_parts(MAX_TOPIC_PARTS + 2) + "/#",
+            expected: "Invalid topic filter".to_string(),
+        },
     ]
 }
 
+/// The service's fixed answer when a topic holds no retained message, written out here
+/// rather than taken from the renderer under test.
+const RETAINED_MESSAGE_NOT_FOUND: &str = "Retained message not found";
+
 #[tokio::test]
-async fn a_retained_message_read_refuses_a_name_the_broker_would_not_publish_to() {
+async fn a_retained_message_read_reports_absence_for_a_name_the_broker_would_not_publish_to() {
     let harness = Harness::new();
 
     // A legal sibling under the same base, so the contrast is between two reads that
@@ -218,12 +239,13 @@ async fn a_retained_message_read_refuses_a_name_the_broker_would_not_publish_to(
             message(&published)
         );
 
-        // …and the read path's, which must be the same one.
+        // …and the read path's, which reports the store and not the broker's rules: the
+        // name the publish was refused for can hold nothing, so it is absent.
         let read = harness.get_retained_message(&encoded).await;
         assert_eq!(
             read.status,
-            400,
-            "case {:?}: expected the read of a malformed topic name to be refused 400, got \
+            404,
+            "case {:?}: expected the read of a name no publish could store to be 404, got \
              {} with body {}",
             case.name,
             read.status,
@@ -231,22 +253,29 @@ async fn a_retained_message_read_refuses_a_name_the_broker_would_not_publish_to(
         );
         assert_eq!(
             read.error_code(),
-            "InvalidRequestException",
-            "case {:?}: expected InvalidRequestException on the read, got {}",
+            "ResourceNotFoundException",
+            "case {:?}: expected ResourceNotFoundException on the read, got {}",
             case.name,
             String::from_utf8_lossy(&read.body)
         );
         assert_eq!(
             message(&read),
-            case.expected,
-            "case {:?}: expected the read to answer the same refusal as the publish ({:?}), \
-             got {:?}",
+            RETAINED_MESSAGE_NOT_FOUND,
+            "case {:?}: expected the fixed not-found sentence, got {:?}",
             case.name,
-            case.expected,
             message(&read)
         );
-        // The refused publish also retained nothing under that name: the read of this one
-        // name is a refusal, so the listing is what observes the store.
+        // The not-found answer is one fixed sentence: it carries neither the name the
+        // caller asked about nor the ceiling the publish path would have named.
+        assert!(
+            !message(&read).contains(&case.topic) && message(&read) != case.expected,
+            "case {:?}: expected nothing of the request or of the publish refusal in the \
+             not-found answer, got {:?}",
+            case.name,
+            message(&read)
+        );
+        // …and the refused publish retained nothing under that name, which the listing
+        // observes independently of the read.
         let listed = retained_topics(&harness).await;
         assert!(
             !listed.contains(&case.topic),
@@ -255,13 +284,14 @@ async fn a_retained_message_read_refuses_a_name_the_broker_would_not_publish_to(
         );
     }
 
-    // The contrast that must be preserved: a well-formed name holding no retained
-    // message is absent, not malformed.
+    // A name the broker WOULD publish to and that holds nothing answers exactly the
+    // same, so the read path draws no distinction between the two kinds of absence.
     for (case, topic) in [
         ("a legal sibling under the same base", "fleet-telemetry/never"),
         ("a single-character name", "q"),
         ("a name at the part ceiling", &name_of_parts(MAX_TOPIC_PARTS)),
         ("a name at the byte ceiling", &"w".repeat(MAX_TOPIC_BYTES)),
+        ("a multi-byte name", "temperatur-mäßig/温度"),
     ] {
         let read = harness.get_retained_message(&encode_component(topic)).await;
         assert_eq!(
@@ -279,7 +309,7 @@ async fn a_retained_message_read_refuses_a_name_the_broker_would_not_publish_to(
         );
         assert_eq!(
             message(&read),
-            "Retained message not found",
+            RETAINED_MESSAGE_NOT_FOUND,
             "case {case:?}: expected the absent-message answer, got {:?}",
             message(&read)
         );
@@ -302,6 +332,190 @@ async fn a_retained_message_read_refuses_a_name_the_broker_would_not_publish_to(
         "expected the stored topic back, got {}",
         String::from_utf8_lossy(&read.body)
     );
+}
+
+/// One topic name, and whether the broker's PUBLISH path takes it. The read path's
+/// answer is not a function of this flag: it is a function of the store alone.
+struct ReadKeyCase {
+    name: String,
+    topic: String,
+    publishable: bool,
+}
+
+/// Rows spanning what the rule generalises over — how many `/`-separated levels the name
+/// carries, how many bytes it is, and whether it carries an MQTT wildcard — with a row at
+/// each published ceiling and past it. The recorded case, a name one level past the part
+/// ceiling, is one row among them.
+fn read_key_cases() -> Vec<ReadKeyCase> {
+    let mut cases = Vec::new();
+    for parts in [
+        1,
+        MAX_TOPIC_PARTS - 1,
+        MAX_TOPIC_PARTS,
+        MAX_TOPIC_PARTS + 1,
+        MAX_TOPIC_PARTS + 4,
+        3 * MAX_TOPIC_PARTS,
+    ] {
+        cases.push(ReadKeyCase {
+            name: format!("{parts} `/`-separated level(s)"),
+            topic: name_of_parts(parts),
+            publishable: parts <= MAX_TOPIC_PARTS,
+        });
+    }
+    for bytes in [
+        1,
+        MAX_TOPIC_BYTES - 1,
+        MAX_TOPIC_BYTES,
+        MAX_TOPIC_BYTES + 1,
+        4 * MAX_TOPIC_BYTES,
+    ] {
+        cases.push(ReadKeyCase {
+            name: format!("a single level of {bytes} byte(s)"),
+            topic: "n".repeat(bytes),
+            publishable: bytes <= MAX_TOPIC_BYTES,
+        });
+    }
+    for (name, topic) in [
+        ("a single-level wildcard between levels", "sensors/+/temperature"),
+        ("a trailing multi-level wildcard", "sensors/#"),
+    ] {
+        cases.push(ReadKeyCase {
+            name: name.to_string(),
+            topic: topic.to_string(),
+            publishable: false,
+        });
+    }
+    cases
+}
+
+#[tokio::test]
+async fn a_retained_message_read_answers_from_the_store_whatever_the_topics_shape() {
+    let harness = Harness::new();
+
+    for case in read_key_cases() {
+        let encoded = encode_component(&case.topic);
+
+        // Nothing is retained yet, so every name — one the broker would publish to and
+        // one it would not — is absent, with the one fixed not-found sentence.
+        let before = harness.get_retained_message(&encoded).await;
+        assert_eq!(
+            before.status,
+            404,
+            "case {:?}: expected an empty store to answer 404 for every name, got {} with \
+             body {}",
+            case.name,
+            before.status,
+            String::from_utf8_lossy(&before.body)
+        );
+        assert_eq!(
+            before.error_code(),
+            "ResourceNotFoundException",
+            "case {:?}: expected ResourceNotFoundException, got {}",
+            case.name,
+            String::from_utf8_lossy(&before.body)
+        );
+        assert_eq!(
+            message(&before),
+            RETAINED_MESSAGE_NOT_FOUND,
+            "case {:?}: expected the fixed not-found sentence, got {:?}",
+            case.name,
+            message(&before)
+        );
+
+        let published = harness
+            .publish(&encoded, 1, true, None, b"stored".to_vec())
+            .await;
+        let after = harness.get_retained_message(&encoded).await;
+        if !case.publishable {
+            // The write path keeps its own verdict…
+            assert_eq!(
+                published.status,
+                400,
+                "case {:?}: expected the publish to be refused 400, got {} with body {}",
+                case.name,
+                published.status,
+                String::from_utf8_lossy(&published.body)
+            );
+            // …and the read still reports the store, which the refusal left empty.
+            assert_eq!(
+                after.status,
+                404,
+                "case {:?}: expected the read to stay 404 after the refused publish, got {} \
+                 with body {}",
+                case.name,
+                after.status,
+                String::from_utf8_lossy(&after.body)
+            );
+            assert_eq!(
+                after.error_code(),
+                "ResourceNotFoundException",
+                "case {:?}: expected ResourceNotFoundException, got {}",
+                case.name,
+                String::from_utf8_lossy(&after.body)
+            );
+            assert_eq!(
+                message(&after),
+                RETAINED_MESSAGE_NOT_FOUND,
+                "case {:?}: expected the fixed not-found sentence, got {:?}",
+                case.name,
+                message(&after)
+            );
+            continue;
+        }
+
+        assert_eq!(
+            published.status,
+            200,
+            "case {:?}: expected the broker to take the name, got {} with body {}",
+            case.name,
+            published.status,
+            String::from_utf8_lossy(&published.body)
+        );
+        assert_eq!(
+            after.status,
+            200,
+            "case {:?}: expected the stored retained message to be readable, got {} with \
+             body {}",
+            case.name,
+            after.status,
+            String::from_utf8_lossy(&after.body)
+        );
+        assert_eq!(
+            after.json().get("topic").and_then(Value::as_str),
+            Some(case.topic.as_str()),
+            "case {:?}: expected the stored topic back, got {}",
+            case.name,
+            String::from_utf8_lossy(&after.body)
+        );
+
+        // An empty retained payload clears the topic, and the SAME key is absent again:
+        // the read tracks the store in both directions.
+        let cleared = harness.publish(&encoded, 1, true, None, Vec::new()).await;
+        assert_eq!(
+            cleared.status,
+            200,
+            "case {:?}: expected the clearing publish to be taken, got {} with body {}",
+            case.name,
+            cleared.status,
+            String::from_utf8_lossy(&cleared.body)
+        );
+        let gone = harness.get_retained_message(&encoded).await;
+        assert_eq!(
+            gone.status,
+            404,
+            "case {:?}: expected the cleared topic to be absent, got {} with body {}",
+            case.name,
+            gone.status,
+            String::from_utf8_lossy(&gone.body)
+        );
+        assert_eq!(
+            gone.error_code(),
+            "ResourceNotFoundException",
+            "case {:?}: expected ResourceNotFoundException, got {}",
+            case.name,
+            String::from_utf8_lossy(&gone.body)
+        );
+    }
 }
 
 /// Shadow names in the reserved `$` namespace, which no request may address. Every one

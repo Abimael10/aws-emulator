@@ -11,13 +11,14 @@
 //!   malformed request. The quota is measured inclusively: a payload of exactly the
 //!   quota is taken, one byte more is refused, and a refused publish stores nothing. The
 //!   refusal names the CEILING and nothing of the request that crossed it.
-//! * A topic name is weighed against two INDEPENDENT ceilings, each refused with
-//!   `InvalidRequestException` (HTTP 400) carrying its own message naming its own limit:
-//!   how many `/`-separated parts the name carries, and how many BYTES the whole name is
-//!   (measured on the UTF-8 name, so a multi-byte character costs its bytes and not
-//!   one). A name of legal depth is still weighed against the byte ceiling, and the
-//!   same verdict is reached on the READ path: a name the broker will not publish to is
-//!   malformed when a retained-message read names it too, not merely absent.
+//! * A topic name is weighed against two INDEPENDENT ceilings on the PUBLISH path, each
+//!   refused with `InvalidRequestException` (HTTP 400) carrying its own message naming
+//!   its own limit: how many `/`-separated parts the name carries, and how many BYTES the
+//!   whole name is (measured on the UTF-8 name, so a multi-byte character costs its bytes
+//!   and not one). A name of legal depth is still weighed against the byte ceiling. The
+//!   READ path draws a different conclusion from the same name: it resolves the topic as
+//!   a store key, so a name no publish could store under is reported absent —
+//!   `ResourceNotFoundException` (HTTP 404) — and not malformed.
 //!
 //! Every limit is named by the crate (`state::MAX_PUBLISH_PAYLOAD_BYTES`,
 //! `state::MAX_TOPIC_PARTS`, `state::MAX_TOPIC_BYTES`) and every message by the crate's
@@ -52,9 +53,8 @@ pub(crate) fn encode_component(value: &str) -> String {
 /// Every topic the retained-message listing reports — the store's own view of what is
 /// retained.
 ///
-/// A read of ONE malformed topic name is refused before the store is consulted, so the
-/// listing is what observes the other half of that rule: a refused publish retained
-/// nothing under the name it was refused for.
+/// A second, independent witness that a refused publish retained nothing: the read of one
+/// name answers absence, and the listing shows the same store from the other side.
 pub(crate) async fn retained_topics(harness: &Harness) -> Vec<String> {
     let listed = harness.send("GET", "/retainedMessage", &[], Vec::new()).await;
     assert_eq!(
@@ -284,35 +284,34 @@ async fn a_publish_topic_is_weighed_against_the_part_and_the_byte_ceiling() {
                     case.name,
                     message(&answer)
                 );
-                // A refused topic name is refused on the READ path with the same verdict:
-                // the name identifies no single message on either side of the broker.
+                // A name the broker refused is a name nothing can be stored under, so
+                // the READ of it reports absence rather than borrowing the refusal.
                 let read = harness.get_retained_message(&encoded).await;
                 assert_eq!(
                     read.status,
-                    400,
-                    "case {:?}: expected the read of a malformed topic name to be refused \
-                     400, got {} with body {}",
+                    404,
+                    "case {:?}: expected the read of a name no publish could store to be \
+                     404, got {} with body {}",
                     case.name,
                     read.status,
                     String::from_utf8_lossy(&read.body)
                 );
                 assert_eq!(
                     read.error_code(),
-                    "InvalidRequestException",
-                    "case {:?}: expected InvalidRequestException on the read, got {}",
+                    "ResourceNotFoundException",
+                    "case {:?}: expected ResourceNotFoundException on the read, got {}",
                     case.name,
                     String::from_utf8_lossy(&read.body)
                 );
-                assert_eq!(
+                assert_ne!(
                     message(&read),
                     *expected,
-                    "case {:?}: expected the read to carry the same refusal as the \
-                     publish, got {:?}",
+                    "case {:?}: expected the read NOT to answer the publish refusal, got {:?}",
                     case.name,
                     message(&read)
                 );
                 // …and the refused publish retained nothing under that name, which the
-                // listing is what can still observe now the single read is a refusal.
+                // listing observes independently of the read.
                 let listed = retained_topics(&harness).await;
                 assert!(
                     !listed.contains(&case.topic),
