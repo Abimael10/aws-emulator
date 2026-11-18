@@ -79,6 +79,16 @@ pub fn missing_job_message(job_id: &str) -> String {
     plane_not_found("Job", job_id)
 }
 
+/// How this service states that a `jobTemplateId` names no job template this account
+/// holds — for a reader of one and for a job created from one.
+///
+/// A job template is a resource of the JOBS plane, so the miss is stated the way that
+/// plane states every other one ([`plane_not_found`]): the family noun, the id the request
+/// asked about, and the clause ` cannot be found.`
+pub fn missing_job_template_message(job_template_id: &str) -> String {
+    plane_not_found("Job template", job_template_id)
+}
+
 /// How this service states that a `commandId` names no command: the commands plane's
 /// clause, which is the jobs plane's — and NOT the registry families' account-qualified
 /// sentence.

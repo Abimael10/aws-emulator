@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateJobTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateJobTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateJobTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the job template under the `jobTemplateId` the request names: the job
+//! document it deploys together with the rollout, abort, retry, timeout,
+//! maintenance-window, destination-package and pre-signed-URL configuration a job created
+//! from it is deployed under, so `DescribeJobTemplate` reports the created template
+//! member for member (see [`crate::state::RegisteredJobTemplate`]).
+//!
+//! A template needs a job DOCUMENT to deploy: `document` is "Required if you don't
+//! specify a value for documentSource" and `jobArn` is "The ARN of the job to use as the
+//! basis for the job template", so a request naming none of the three is refused with the
+//! modelled `InvalidRequestException` rather than storing a template that deploys
+//! nothing. A `jobArn` is resolved against the SHARED jobs store every creator of an IoT
+//! job records one in (`crate::state::job_store`) — an ARN of another form is the
+//! modelled 400 and one naming no job the modelled 404 — and the template then keeps that
+//! job's document and in-progress timeout for the members the request itself did not
+//! carry; the record is its own from then on, so cancelling or deleting the job does not
+//! change it.
+//!
+//! An id already taken is the modelled `ConflictException` (HTTP 409) and nothing is
+//! written: the id is "A unique identifier for the job template". Past
+//! [`crate::state::MAX_JOB_TEMPLATES`] the create is refused with the modelled
+//! `LimitExceededException`, and `tags` are bounded by
+//! [`crate::state::MAX_JOB_TEMPLATE_TAGS`] before anything is stored, because `TagList`
+//! carries no modelled maximum.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +195,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateJobTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateJobTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateJobTemplate"))
+        let internal = || -> CreateJobTemplateError {
+            CreateJobTemplateErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+            .into()
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal());
+        };
+        // A template created FROM a job reads that job out of the SHARED jobs store,
+        // which is where every creator of an IoT job records one.
+        let Some(jobs) = crate::state::job_store(&*self.engine) else {
+            return Err(internal());
+        };
+
+        let invalid = |message: String| -> CreateJobTemplateError {
+            CreateJobTemplateErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // `Tag$Key` is `@required` and keys a resource's tag set, so the last value given
+        // for a key is the one the template carries. How MANY tags one request may carry
+        // is bounded: `TagList` has no modelled maximum, so without the ceiling one
+        // request would choose how large a single record is.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_JOB_TEMPLATE_TAGS {
+            return Err(invalid(format!(
+                "a job template may carry at most {} tags; this request carries {}",
+                crate::state::MAX_JOB_TEMPLATE_TAGS,
+                requested_tags.len()
+            )));
+        }
+        let tags: ::std::collections::BTreeMap<String, Option<String>> = requested_tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // What the template deploys. `jobArn` names the job the template is BASED on, so
+        // that job's own document is read out of the jobs store and kept on the template
+        // for whatever the request did not carry itself. The ARN is resolved before this
+        // service's store is locked, so a refused request never reaches it.
+        let mut document = input.document;
+        let mut document_source = input.document_source;
+        let mut timeout_config = input.timeout_config;
+        if let Some(job_arn) = input.job_arn.as_deref() {
+            let Some(job_id) = crate::state::job_id_of_job_arn(job_arn) else {
+                return Err(invalid(crate::state::JOB_ARN_SYNTAX_MESSAGE.to_string()));
+            };
+            let based_on = {
+                let registry = jobs.lock();
+                let Some(job) = registry.job(job_id) else {
+                    return Err(CreateJobTemplateErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::missing_job_message(job_id)),
+                        },
+                    )
+                    .into());
+                };
+                job.clone()
+            };
+            if document.is_none() && document_source.is_none() {
+                document = based_on.document.clone();
+                document_source = based_on.document_source.clone();
+            }
+            if timeout_config.is_none() {
+                timeout_config =
+                    based_on
+                        .in_progress_timeout_minutes
+                        .map(|minutes| TimeoutConfig {
+                            in_progress_timeout_in_minutes: Some(minutes),
+                        });
+            }
+        }
+        // "The job document. Required if you don't specify a value for documentSource" /
+        // "required if you don't specify a value for document": a template that names
+        // neither, and is based on no job holding one, deploys nothing, so it is refused
+        // rather than stored.
+        if document.is_none() && document_source.is_none() {
+            return Err(invalid(
+                "One of document, documentSource or jobArn is required".to_string(),
+            ));
+        }
+
+        let template = crate::state::RegisteredJobTemplate {
+            document,
+            document_source,
+            presigned_url_config: input.presigned_url_config,
+            job_executions_rollout_config: input.job_executions_rollout_config,
+            abort_config: input.abort_config,
+            timeout_config,
+            job_executions_retry_config: input.job_executions_retry_config,
+            maintenance_windows: input.maintenance_windows,
+            destination_package_versions: input.destination_package_versions,
+            tags,
+            ..crate::state::RegisteredJobTemplate::created(
+                input.job_template_id.clone(),
+                crate::state::job_template_arn(&region, &input.job_template_id),
+                input.description,
+                now,
+            )
+        };
+
+        let mut store = state.lock();
+
+        // The id is the template's identity, so an id already taken is the conflict
+        // `ConflictException` (HTTP 409) names, reporting the resource that already
+        // exists at the member the shape has for it (`ConflictException$resourceId`, "A
+        // resource with the same name already exists"). Nothing is written.
+        if let Some(existing) = store.job_templates.get(&template.job_template_id) {
+            return Err(CreateJobTemplateErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::existing_job_template_message(
+                        &existing.job_template_id,
+                    )),
+                    resource_id: Some(existing.job_template_id.clone()),
+                },
+            )
+            .into());
+        }
+
+        // The store is one a CALLER grows, a template at a time, so what an account can
+        // hold is bounded. The ceiling is read AFTER the conflict check, because an id
+        // already taken adds no record, and past it nothing is written: the modelled
+        // `LimitExceededException` (HTTP 410) is the refusal, never a 200 that records
+        // nothing.
+        if store.job_templates.len() >= crate::state::MAX_JOB_TEMPLATES {
+            return Err(CreateJobTemplateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the maximum of {} job templates is already reached",
+                        crate::state::MAX_JOB_TEMPLATES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The response is built from the record that is about to be persisted, so what
+        // this call reports and what the next `DescribeJobTemplate` reads are one value,
+        // not two that could drift.
+        let output = CreateJobTemplateOutput {
+            job_template_arn: Some(template.job_template_arn.clone()),
+            job_template_id: Some(template.job_template_id.clone()),
+        };
+        store
+            .job_templates
+            .insert(template.job_template_id.clone(), template);
+        Ok(output)
     }
 }

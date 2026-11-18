@@ -74,6 +74,12 @@ pub fn existing_job_message(job_id: &str) -> String {
     plane_already_exists("Job", job_id)
 }
 
+/// How this service refuses a `CreateJobTemplate` under an id a job template already
+/// holds: the jobs plane's clause, which every resource of that plane shares.
+pub fn existing_job_template_message(job_template_id: &str) -> String {
+    plane_already_exists("Job template", job_template_id)
+}
+
 /// How this service refuses a `CreateCommand` under an id a command already holds: the
 /// jobs plane's clause, which the commands plane shares.
 pub fn existing_command_message(command_id: &str) -> String {

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP coverage of `DescribeJob`: the job registered under a `jobId` is
-//! reported from the stored record, and an id no creator recorded is the modelled 404.
+//! End-to-end HTTP coverage of the JOBS plane's read-back rule, over the two resources
+//! this plane lets a caller create and then read: `DescribeJob` for a job and
+//! `DescribeJobTemplate` for a job template.
 //!
 //! Every case drives the real wire path — `MultiServiceRouter::dispatch` over a
-//! restJson1 `PUT /jobs/{jobId}`, `GET /jobs/{jobId}` and `DELETE /jobs/{jobId}` signed
+//! restJson1 `PUT /jobs/{jobId}`, `GET /jobs/{jobId}` and `DELETE /jobs/{jobId}`, and
+//! `PUT /job-templates/{jobTemplateId}` and `GET /job-templates/{jobTemplateId}`, signed
 //! for the `iot` signing name — so what is asserted is what a client reads back through
 //! the modelled surface, not the state struct.
 //!
@@ -15,10 +17,22 @@
 //! executions have made — and a `jobId` no record holds is the modelled
 //! `ResourceNotFoundException` (HTTP 404), never a success and never a 501.
 //!
-//! The table spans what the rule generalises over — whether the job carries a
+//! The same rule over a JOB TEMPLATE: `DescribeJobTemplate` answers 200 for the
+//! `jobTemplateId` a template was created under, reporting every member of the stored
+//! record — the job document it deploys and the rollout, abort, retry, timeout,
+//! maintenance-window, destination-package and pre-signed-URL configuration a job
+//! created from it is deployed under — while an id the account holds no template under is
+//! that same modelled 404. Two further rules come with the create: a template based on a
+//! job (`jobArn`) keeps THAT job's document and in-progress timeout, and a request the
+//! store cannot take a template for — an id already taken, or no job document named at
+//! all — is refused with the class that states why and writes nothing.
+//!
+//! The tables span what the rules generalise over — for a job, whether it carries a
 //! description, a `targetSelection` (and which), an in-progress timeout, substitution
-//! parameters, an inline document or a `documentSource`, and how many devices it
-//! targets — rather than one recorded request.
+//! parameters, an inline document or a `documentSource`, and how many devices it targets;
+//! for a template, the form and length of its id, how it names the document it deploys
+//! (inline, by S3 link, or inherited from a job) and which optional configuration members
+//! the request carries — rather than one recorded request.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -131,6 +145,20 @@ impl Emulator {
         self.call("DELETE", &format!("/jobs/{job_id}?force=true"), None)
             .await
     }
+
+    async fn create_job_template(&self, job_template_id: &str, request: &Value) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/job-templates/{job_template_id}"),
+            Some(request),
+        )
+        .await
+    }
+
+    async fn describe_job_template(&self, job_template_id: &str) -> Reply {
+        self.call("GET", &format!("/job-templates/{job_template_id}"), None)
+            .await
+    }
 }
 
 /// The thing ARN a target entry names a device by.
@@ -142,6 +170,13 @@ fn thing_arn(thing_name: &str) -> String {
 /// job with format arn:aws:iot:region:account:job/jobId".
 fn job_arn(job_id: &str) -> String {
     format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:job/{job_id}")
+}
+
+/// The job-template ARN this plane mints for `job_template_id`: the `jobtemplate/`
+/// resource type AWS IoT names a job template by, under the region the request was signed
+/// for and the account this emulator serves.
+fn job_template_arn(job_template_id: &str) -> String {
+    format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:jobtemplate/{job_template_id}")
 }
 
 /// One row of the table: a job to create, and what a read of it must report.
@@ -467,4 +502,401 @@ async fn an_unknown_job_id_is_a_404() {
         "case \"a deleted job\": expected ResourceNotFoundException, got {:?}",
         gone.error_code
     );
+}
+
+/// How the job template under test names the job document it deploys.
+enum TemplateSource {
+    /// `document`: the document inline.
+    Document(&'static str),
+    /// `documentSource`: an S3 object URL naming it.
+    DocumentSource(&'static str),
+    /// `jobArn`: the job the template is based on, which the row creates first with the
+    /// document and in-progress timeout the template must then carry itself.
+    BasedOnJob {
+        job_id: &'static str,
+        thing_name: &'static str,
+        document: &'static str,
+        timeout_minutes: i64,
+    },
+}
+
+/// One row of the job-template table: a template to create, and what a read of it must
+/// report.
+struct TemplateCase {
+    case: &'static str,
+    /// The `jobTemplateId` (modelled `length 1..64, pattern ^[a-zA-Z0-9_-]+$`).
+    job_template_id: &'static str,
+    /// `description`, which the model makes `@required` on this create.
+    description: &'static str,
+    source: TemplateSource,
+    /// The optional configuration members this row's request carries. Every one of them
+    /// must come back from the reader unchanged.
+    configuration: Value,
+}
+
+/// The rows differ in the form and length of the id, in HOW the template names its job
+/// document, and in which optional configuration members the request carries — from none
+/// at all to every one the model declares.
+fn template_cases() -> Vec<TemplateCase> {
+    vec![
+        TemplateCase {
+            case: "an inline document and nothing optional",
+            job_template_id: "r",
+            description: "reboot the fleet",
+            source: TemplateSource::Document(r#"{"operation":"reboot"}"#),
+            configuration: json!({}),
+        },
+        TemplateCase {
+            case: "an inline document with a rollout, abort and timeout configuration",
+            job_template_id: "firmware_1-9",
+            description: "install firmware 1.9",
+            source: TemplateSource::Document(r#"{"operation":"install","version":"1.9"}"#),
+            configuration: json!({
+                "jobExecutionsRolloutConfig": {
+                    "maximumPerMinute": 25,
+                    "exponentialRate": {
+                        "baseRatePerMinute": 5,
+                        "incrementFactor": 2.0,
+                        "rateIncreaseCriteria": { "numberOfNotifiedThings": 10 },
+                    },
+                },
+                "abortConfig": {
+                    "criteriaList": [{
+                        "failureType": "FAILED",
+                        "action": "CANCEL",
+                        "thresholdPercentage": 20.0,
+                        "minNumberOfExecutedThings": 5,
+                    }],
+                },
+                "timeoutConfig": { "inProgressTimeoutInMinutes": 45 },
+                "tags": [{ "Key": "fleet", "Value": "lasers" }],
+            }),
+        },
+        TemplateCase {
+            case: "a document source with every remaining configuration member",
+            job_template_id: "DOWNLOAD-FILE_64-characters-long-id-padded-to-the-modelled-max",
+            description: "download the file",
+            source: TemplateSource::DocumentSource(
+                "https://s3.us-east-1.amazonaws.com/example-firmware/device-firmware.1.0",
+            ),
+            configuration: json!({
+                "presignedUrlConfig": {
+                    "roleArn": "arn:aws:iam::000000000000:role/IoTJobPresignedUrlRole",
+                    "expiresInSec": 1800,
+                },
+                "jobExecutionsRetryConfig": {
+                    "criteriaList": [
+                        { "failureType": "FAILED", "numberOfRetries": 2 },
+                        { "failureType": "TIMED_OUT", "numberOfRetries": 1 },
+                    ],
+                },
+                "maintenanceWindows": [
+                    { "startTime": "cron(0 2 ? * SUN *)", "durationInMinutes": 120 },
+                    { "startTime": "cron(0 4 ? * WED *)", "durationInMinutes": 1430 },
+                ],
+                "destinationPackageVersions": [
+                    "arn:aws:iot:us-east-1:000000000000:package/sensor/version/1.0.0"
+                ],
+            }),
+        },
+        TemplateCase {
+            case: "a template based on a job, inheriting its document and timeout",
+            job_template_id: "based-on-a-job",
+            description: "the rollout that worked",
+            source: TemplateSource::BasedOnJob {
+                job_id: "template-source-job",
+                thing_name: "template-source-device",
+                document: r#"{"operation":"recalibrate"}"#,
+                timeout_minutes: 90,
+            },
+            configuration: json!({
+                "abortConfig": {
+                    "criteriaList": [{
+                        "failureType": "ALL",
+                        "action": "CANCEL",
+                        "thresholdPercentage": 50.0,
+                        "minNumberOfExecutedThings": 1,
+                    }],
+                },
+            }),
+        },
+    ]
+}
+
+/// RULE: `DescribeJobTemplate` reports the job template registered under that
+/// `jobTemplateId` from the stored record — every member its creator persisted — and a
+/// template based on a job carries that job's own document and in-progress timeout.
+#[tokio::test]
+async fn a_created_job_template_reads_back_member_for_member() {
+    let emulator = Emulator::new();
+
+    for case in template_cases() {
+        let label = case.case;
+        let id = case.job_template_id;
+
+        let mut request = case.configuration.clone();
+        // What the template deploys, named the way this row names it. A row based on a
+        // job creates that job first, and names nothing else: what the template must then
+        // hold is the job's own document and timeout.
+        let inherited: Option<(&str, i64)> = {
+            let object = request
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("case {label:?}: the row's configuration is an object"));
+            object.insert("description".to_string(), json!(case.description));
+            match case.source {
+                TemplateSource::Document(document) => {
+                    object.insert("document".to_string(), json!(document));
+                    None
+                }
+                TemplateSource::DocumentSource(document_source) => {
+                    object.insert("documentSource".to_string(), json!(document_source));
+                    None
+                }
+                TemplateSource::BasedOnJob {
+                    job_id,
+                    thing_name,
+                    document,
+                    timeout_minutes,
+                } => {
+                    let created = emulator
+                        .create_job(
+                            job_id,
+                            &json!({
+                                "targets": [thing_arn(thing_name)],
+                                "description": "the job the template is based on",
+                                "document": document,
+                                "timeoutConfig": {
+                                    "inProgressTimeoutInMinutes": timeout_minutes,
+                                },
+                            }),
+                        )
+                        .await;
+                    assert_eq!(
+                        created.status, 200,
+                        "case {label:?}: the job the template is based on must be \
+                         creatable, got {} {:?}",
+                        created.status, created.body
+                    );
+                    object.insert("jobArn".to_string(), json!(job_arn(job_id)));
+                    Some((document, timeout_minutes))
+                }
+            }
+        };
+        // The members the request carried, which the reader must report back.
+        let sent_members = request.as_object().cloned().unwrap_or_default();
+
+        let created = emulator.create_job_template(id, &request).await;
+        assert_eq!(
+            created.status, 200,
+            "case {label:?}: the template must be creatable, got {} {:?}",
+            created.status, created.body
+        );
+        assert_eq!(
+            (created.text("/jobTemplateId"), created.text("/jobTemplateArn")),
+            (Some(id.to_string()), Some(job_template_arn(id))),
+            "case {label:?}: expected the created id and the ARN this plane mints, got {:?}",
+            created.body
+        );
+
+        let read = emulator.describe_job_template(id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {label:?}: expected 200, got {} {:?}",
+            read.status, read.body
+        );
+        assert_eq!(
+            (
+                read.text("/jobTemplateId"),
+                read.text("/jobTemplateArn"),
+                read.text("/description")
+            ),
+            (
+                Some(id.to_string()),
+                Some(job_template_arn(id)),
+                Some(case.description.to_string())
+            ),
+            "case {label:?}: expected the stored identity and description, got {:?}",
+            read.body
+        );
+        // Every member the create carried reads back unchanged. `tags` are "metadata that
+        // can be used to manage the job template" and `jobArn` names what the template was
+        // based on, so neither is part of what this reader describes.
+        for (member, sent) in sent_members.iter() {
+            if member == "tags" || member == "jobArn" {
+                assert!(
+                    read.body.get(member).is_none(),
+                    "case {label:?}: {member} is not part of a job template's description, \
+                     got {:?}",
+                    read.body
+                );
+                continue;
+            }
+            assert_eq!(
+                read.body.get(member),
+                Some(sent),
+                "case {label:?}: expected {member} to read back as {sent}, got {:?}",
+                read.body
+            );
+        }
+        if let Some((document, timeout_minutes)) = inherited {
+            assert_eq!(
+                read.text("/document").as_deref(),
+                Some(document),
+                "case {label:?}: expected the based-on job's document, got {:?}",
+                read.body
+            );
+            assert_eq!(
+                read.body
+                    .pointer("/timeoutConfig/inProgressTimeoutInMinutes")
+                    .and_then(Value::as_i64),
+                Some(timeout_minutes),
+                "case {label:?}: expected the based-on job's in-progress timeout, got {:?}",
+                read.body
+            );
+        }
+        // `createdAt` is "The time, in seconds since the epoch, when the job template was
+        // created", so the reader states it rather than leaving it out.
+        assert!(
+            read.body
+                .get("createdAt")
+                .and_then(Value::as_f64)
+                .is_some_and(|seconds| seconds > 0.0),
+            "case {label:?}: expected a createdAt in seconds since the epoch, got {:?}",
+            read.body
+        );
+    }
+}
+
+/// RULE: the id is the job template's identity, so a request the store cannot take a
+/// template for is refused with the class that states why and writes nothing, and an id
+/// the account holds no template under is the modelled `ResourceNotFoundException`
+/// (HTTP 404).
+#[tokio::test]
+async fn a_job_template_request_the_store_cannot_take_is_refused() {
+    let emulator = Emulator::new();
+
+    let taken = "taken-id";
+    let first = emulator
+        .create_job_template(
+            taken,
+            &json!({
+                "description": "the template that took the id",
+                "document": r#"{"operation":"reboot"}"#,
+            }),
+        )
+        .await;
+    assert_eq!(
+        first.status, 200,
+        "the first template must be creatable, got {} {:?}",
+        first.status, first.body
+    );
+
+    // (case, the id the request addresses, the request, the status, the error type and
+    // the message this service states that refusal with)
+    let rows: Vec<(&str, &str, Value, u16, &str, String)> = vec![
+        (
+            "an id a template already holds",
+            taken,
+            json!({
+                "description": "a second template under the same id",
+                "document": r#"{"operation":"install"}"#,
+            }),
+            409,
+            "ConflictException",
+            format!("Job template {taken} already exists."),
+        ),
+        (
+            "a request naming no job document at all",
+            "no-document",
+            json!({ "description": "a template that deploys nothing" }),
+            400,
+            "InvalidRequestException",
+            "One of document, documentSource or jobArn is required".to_string(),
+        ),
+        (
+            "a jobArn that is no IoT job ARN",
+            "malformed-job-arn",
+            json!({
+                "description": "a template based on something that is not a job",
+                "jobArn": thing_arn("not-a-job"),
+            }),
+            400,
+            "InvalidRequestException",
+            "Job ARN not in proper syntax.".to_string(),
+        ),
+        (
+            "a jobArn naming no job",
+            "absent-job",
+            json!({
+                "description": "a template based on a job nobody created",
+                "jobArn": job_arn("never-created"),
+            }),
+            404,
+            "ResourceNotFoundException",
+            "Job never-created cannot be found.".to_string(),
+        ),
+    ];
+
+    for (case, id, request, status, error_type, message) in rows {
+        let reply = emulator.create_job_template(id, &request).await;
+        assert_eq!(
+            reply.status, status,
+            "case {case:?}: expected {status}, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert!(
+            reply
+                .error_code
+                .as_deref()
+                .is_some_and(|code| code.starts_with(error_type)),
+            "case {case:?}: expected the error type {error_type}, got {:?}",
+            reply.error_code
+        );
+        assert_eq!(
+            reply.message(),
+            message,
+            "case {case:?}: expected the refusal to state {message:?}, got {:?}",
+            reply.body
+        );
+    }
+
+    // A refused create wrote nothing: the taken id still names the FIRST template, and
+    // no id a refused request named exists at all — nor does one no request ever used.
+    let read = emulator.describe_job_template(taken).await;
+    assert_eq!(
+        (read.status, read.text("/description")),
+        (200, Some("the template that took the id".to_string())),
+        "the refused create must leave the first template as it was, got {:?}",
+        read.body
+    );
+    // The ids each refused create named, the taken id in another case and with another
+    // separator, and one at the modelled length bound: none of them names a template.
+    let absent_ids: Vec<String> = vec![
+        "no-document".to_string(),
+        "malformed-job-arn".to_string(),
+        "absent-job".to_string(),
+        "TAKEN-ID".to_string(),
+        "taken_id".to_string(),
+        "t".repeat(64),
+    ];
+    for absent in &absent_ids {
+        let reply = emulator.describe_job_template(absent).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {absent:?}: expected 404, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {absent:?}: expected ResourceNotFoundException, got {:?}",
+            reply.error_code
+        );
+        assert_eq!(
+            reply.message(),
+            format!("Job template {absent} cannot be found."),
+            "case {absent:?}: expected the refusal to name the template, got {:?}",
+            reply.body
+        );
+    }
 }

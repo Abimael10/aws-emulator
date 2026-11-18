@@ -224,6 +224,7 @@ fn path_addressed_arn(region: &str, operation: &str, path: &str) -> Option<Strin
         "policies" => crate::state::policy_arn(region, &identifier),
         "rules" => crate::state::topic_rule_arn(region, &identifier),
         "jobs" => crate::state::job_arn(region, &identifier),
+        "job-templates" => crate::state::job_template_arn(region, &identifier),
         "authorizer" => crate::state::authorizer_arn(region, &identifier),
         "commands" => crate::state::command_arn(region, &identifier),
         "packages" => crate::state::package_arn(region, &identifier),

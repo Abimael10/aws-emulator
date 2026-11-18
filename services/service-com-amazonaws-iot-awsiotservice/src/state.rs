@@ -1063,6 +1063,23 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// A caller grows this store, so it is bounded: [`streams::MAX_STREAMS`] is the
     /// ceiling `CreateStream` refuses past.
     pub streams: BTreeMap<String, RegisteredStream>,
+    /// Every JOB TEMPLATE this account created, keyed by `jobTemplateId`.
+    ///
+    /// The id is the template's identity — `CreateJobTemplate$jobTemplateId` is "A unique
+    /// identifier for the job template" and the model binds it as the `@httpLabel` of
+    /// `/job-templates/{jobTemplateId}` on every single-template operation — so a
+    /// `BTreeMap` keyed by id is the store itself. `BTreeMap` (not `HashMap`) because
+    /// `ListJobTemplates` is `@paginated` and a page boundary is only meaningful over a
+    /// stable order.
+    ///
+    /// These are the account's OWN templates, which it creates and deletes, and they are
+    /// a store of their own rather than entries of
+    /// [`ComAmazonawsIotAwsiotserviceState::managed_job_templates`]: the managed catalog
+    /// is a fixed service asset no operation writes, and the two are read by different
+    /// operations. A caller grows this store, so it is bounded:
+    /// [`job_templates::MAX_JOB_TEMPLATES`] is the ceiling `CreateJobTemplate` refuses
+    /// past.
+    pub job_templates: BTreeMap<String, RegisteredJobTemplate>,
     /// The AWS-MANAGED JOB TEMPLATE catalog: the published templates a job can be
     /// created from, keyed by `templateName`.
     ///
@@ -3253,9 +3270,9 @@ pub mod not_found;
 pub use not_found::{
     missing_audit_task_message, missing_authorizer_message, missing_command_message,
     missing_fleet_metric_message, missing_job_execution_job_message, missing_job_execution_message,
-    missing_job_message, missing_thing_group_message, missing_thing_message,
-    missing_thing_type_message, unauthorized_topic_rule_message, unrecognized_index_name_message,
-    MISSING_THING_REGISTRATION_TASK_MESSAGE,
+    missing_job_message, missing_job_template_message, missing_thing_group_message,
+    missing_thing_message, missing_thing_type_message, unauthorized_topic_rule_message,
+    unrecognized_index_name_message, MISSING_THING_REGISTRATION_TASK_MESSAGE,
 };
 
 // How a create whose name is already taken is REFUSED — the fixed sentence each resource
@@ -3265,7 +3282,8 @@ pub use not_found::{
 pub mod already_exists;
 pub use already_exists::{
     existing_certificate_message, existing_certificate_provider_message, existing_command_message,
-    existing_job_message, existing_package_message, existing_policy_message,
+    existing_job_message, existing_job_template_message, existing_package_message,
+    existing_policy_message,
     existing_role_alias_message, existing_thing_group_message, existing_thing_message,
     existing_thing_type_message, existing_topic_rule_message,
 };
@@ -3281,6 +3299,16 @@ pub use managed_job_templates::{
     is_modeled_managed_job_template_name, is_modeled_managed_template_version,
     managed_job_template_arn, ManagedJobTemplate, ManagedJobTemplateCatalog,
     ManagedJobTemplateVersion,
+};
+
+// What a JOB TEMPLATE this account created is — the record one holds, the ARN it is named
+// by and what a reader of one reports — lives in `state/job_templates.rs`, beside the
+// store accessor for the same reason the managed catalog does. Its names are re-exported
+// here so a handler reaches them as `crate::state::<name>`.
+pub mod job_templates;
+pub use job_templates::{
+    job_id_of_job_arn, job_template_arn, RegisteredJobTemplate, JOB_ARN_SYNTAX_MESSAGE,
+    MAX_JOB_TEMPLATES, MAX_JOB_TEMPLATE_TAGS,
 };
 
 // Whether a FLEET INDEXING QUERY STRING is one this service can read at all — the one
