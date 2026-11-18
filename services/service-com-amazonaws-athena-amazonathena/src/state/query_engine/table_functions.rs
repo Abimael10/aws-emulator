@@ -32,14 +32,13 @@ use ::sqlparser::ast::{
     Expr, Statement as SqlStatement, TableAlias, TableFactor, VisitMut, VisitorMut,
 };
 
-use crate::state::catalog_sql::statement::parse_statements;
+use crate::state::catalog_sql::statement::{parse_statements, unnamed_column};
 
-/// The name the one column of an expanded table function carries when the statement's own
-/// alias gives it none.
-///
-/// Trino names a column no alias names after its position in the select list, `_col0` for
-/// the first — which is the name a read of such a statement's results reports.
-const UNALIASED_COLUMN: &str = "_col0";
+/// The POSITION in the select list of the one column an expanded table function is read
+/// through, which is what names it when the statement's own alias gives it no name: Trino
+/// names a column no alias names after its position ([`unnamed_column`]), and a statement
+/// reading one table function projects it first.
+const UNALIASED_COLUMN_POSITION: usize = 0;
 
 /// The function whose result `UNNEST` is read over here beside an array written out:
 /// Trino's `sequence(start, stop[, step])`, "a sequence of integers from start to stop,
@@ -101,7 +100,10 @@ impl VisitorMut for Expansion {
         let column = alias
             .as_ref()
             .and_then(|alias| alias.columns.first())
-            .map_or_else(|| UNALIASED_COLUMN.to_string(), |column| column.to_string());
+            .map_or_else(
+                || unnamed_column(UNALIASED_COLUMN_POSITION),
+                |column| column.to_string(),
+            );
         let Some(rows) = rows_of(array, &column, self.replaced) else {
             return ControlFlow::Continue(());
         };

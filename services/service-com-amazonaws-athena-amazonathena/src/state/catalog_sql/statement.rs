@@ -680,7 +680,11 @@ pub fn projection_of(query: &::sqlparser::ast::Query) -> Vec<Projection> {
 
 /// The name a query engine gives the column of an unnamed expression: its position in the
 /// projection, counted from zero.
-fn unnamed_column(position: usize) -> String {
+///
+/// The ONE place this tree spells that name, so a view's own column and the result set of a
+/// query that projects the same expression are named the same way.
+#[must_use]
+pub fn unnamed_column(position: usize) -> String {
     format!("_col{position}")
 }
 

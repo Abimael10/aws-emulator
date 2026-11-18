@@ -198,6 +198,11 @@ pub struct CrawlPlan {
     /// The crawler being crawled, which is what every table it writes is stamped
     /// [`UPDATED_BY_CRAWLER_PARAMETER`] with.
     pub crawler_name: String,
+    /// "The IAM role or Amazon Resource Name (ARN) of an IAM role used by the new crawler to
+    /// access customer resources" (`CreateCrawler$Role`): the crawl is performed BY Glue
+    /// acting as that role, so it is the principal every object-store call the crawl makes is
+    /// decided for ([`super::CrawlReadAuthorization`]).
+    pub role: String,
     /// The catalog the crawler writes its output to (`Crawler$CatalogId`).
     pub catalog_id: String,
     /// "The name of the database in which the crawler's output is stored"
@@ -222,6 +227,7 @@ impl CrawlPlan {
         let policy = crawler.schema_change_policy.as_ref();
         Self {
             crawler_name: crawler.name.clone(),
+            role: crawler.role.clone(),
             catalog_id: crawler.catalog_id.clone(),
             database_name: crawler
                 .database_name

@@ -977,6 +977,9 @@ fn execute_once(
         .collect();
     // The types the statement itself fixes, which no value of the run can decide.
     let fixed_types = projection::fixed_column_types(sql);
+    // The names the statement's own projection gives its columns, which the text of a
+    // computed expression cannot decide.
+    let projected_names = projection::projected_names(sql);
 
     let mut rows = statement.query(rusqlite::params_from_iter(bound.iter()))?;
     let mut records: Vec<Row> = Vec::new();
@@ -1052,7 +1055,14 @@ fn execute_once(
             let fixed = (fixed_types.len() == columns.len())
                 .then(|| fixed_types.get(index).copied().flatten())
                 .flatten();
-            column_metadata(name, fixed.or(*column_type))
+            // The STATEMENT's own name for the projected column likewise wins over the name
+            // the engine answers, which for a computed column is the SQL text that produced
+            // it — and under the same condition, so a projection that could not be matched up
+            // with the result renames nothing.
+            let projected = (projected_names.len() == columns.len())
+                .then(|| projected_names.get(index).cloned().flatten())
+                .flatten();
+            column_metadata(projected.as_deref().unwrap_or(name), fixed.or(*column_type))
         })
         .collect();
 

@@ -119,6 +119,9 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The one integration-test target of this crate is rooted at `tests/all/main.rs`, which
+# declares every `tests/all/<name>.rs` beside it as a suite of that binary.
+automod = { workspace = true }
 # The catalog-encryption suite mounts the KMS service beside Glue on one engine, because a
 # catalog write and a catalog read of an SSE-KMS catalog each call it.
 service-com-amazonaws-kms-trentservice = { workspace = true }

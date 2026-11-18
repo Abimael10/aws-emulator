@@ -14697,6 +14697,7 @@ name = "service-com-amazonaws-glue-awsglue"
 version = "0.1.0"
 dependencies = [
  "apache-avro",
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",

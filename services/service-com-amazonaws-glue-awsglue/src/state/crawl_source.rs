@@ -158,7 +158,8 @@ pub fn crawl_target_unreadable(path: &str) -> String {
 /// walk lists ([`MAX_CRAWLED_OBJECTS`]), how many exclusion patterns they are matched against
 /// ([`MAX_CRAWLED_EXCLUSIONS`]) and how many bytes of one object the schema is read from
 /// ([`MAX_CRAWLED_SAMPLE_BYTES`]).
-pub async fn perform_crawl(
+pub async fn perform_crawl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     plan: &CrawlPlan,
@@ -175,7 +176,15 @@ pub async fn perform_crawl(
             }
         };
     let client = super::column_statistics_source::s3_client(ctx, region);
-    let walked = ::tokio::time::timeout(CRAWL_BUDGET, walk_targets(&client, plan)).await;
+    // The crawl reads its data stores AS the crawler's role, so what that role is permitted
+    // is resolved — once, out of the account's own IAM records — before any of the data is
+    // asked for, and consulted before each call the walk makes.
+    let mut authorization = CrawlReadAuthorization::of_role(engine, &plan.role);
+    let walked = ::tokio::time::timeout(
+        CRAWL_BUDGET,
+        walk_targets(&client, plan, &mut authorization),
+    )
+    .await;
     drop(permit);
 
     match walked {
@@ -197,9 +206,17 @@ pub async fn perform_crawl(
 /// A target that holds no object at all yields no dataset — there is nothing there to
 /// describe — and so does one whose objects nothing could be classified from: a crawl writes
 /// a table for data it read, never an empty table for data it could not.
+///
+/// A target the crawl role may not read is not read at all ([`CrawlReadAuthorization`]): the
+/// listing and the object read are each asked for before they are made, and a target the
+/// account's records withhold yields no dataset, so no table and no partition is written for
+/// it. The crawl itself is carried out — the walk reached every target it was permitted — so
+/// what it could not read is logged against the crawl rather than reported as a crawl that
+/// failed.
 async fn walk_targets(
     client: &::aws_sdk_s3::Client,
     plan: &CrawlPlan,
+    authorization: &mut CrawlReadAuthorization,
 ) -> Result<Vec<DiscoveredTable>, String> {
     let mut discovered: Vec<DiscoveredTable> = Vec::new();
     let mut named: HashSet<String> = HashSet::new();
@@ -222,6 +239,20 @@ async fn walk_targets(
         // prefix every key of the dataset starts with, and the root every relative path is
         // taken from.
         let root = folder_prefix(&prefix);
+        // The LISTING is the first call the crawl makes against the target, so it is the
+        // first one the records decide: a crawl role that may not list the bucket under this
+        // prefix reads none of the objects behind it, and the target yields no dataset.
+        if let Some(detail) = authorization
+            .withholds_listing(client, &bucket, &root)
+            .await
+        {
+            ::tracing::debug!(
+                target = ?path,
+                detail = %detail,
+                "a Glue crawl is not permitted to list the objects under one of its targets"
+            );
+            continue;
+        }
         let listed = match list_objects(client, &bucket, &root, budget).await {
             Ok(listed) => listed,
             Err(detail) => {
@@ -254,7 +285,7 @@ async fn walk_targets(
             continue;
         };
         let Some(dataset) =
-            describe_dataset(client, &bucket, &root, name, &objects).await?
+            describe_dataset(client, &bucket, &root, name, &objects, authorization).await?
         else {
             continue;
         };
@@ -421,13 +452,19 @@ async fn retained(
 }
 
 /// The dataset behind one target: its partition keys, its partitions and the columns its
-/// data carries, or `None` when nothing could be classified from its objects.
+/// data carries, or `None` when nothing could be classified from its objects — which is also
+/// the answer for a target whose data the account's records do not permit the crawl role to
+/// read.
+///
+/// The OBJECT whose bytes the schema is read from is authorized against its own ARN, so a
+/// grant narrowed to part of a bucket decides only the objects it covers.
 async fn describe_dataset(
     client: &::aws_sdk_s3::Client,
     bucket: &str,
     root: &str,
     name: String,
     objects: &[CrawledObject],
+    authorization: &mut CrawlReadAuthorization,
 ) -> Result<Option<DiscoveredTable>, String> {
     let (partition_keys, partitions) = partitioning(bucket, root, objects);
     // The schema is inferred from the first object that holds any bytes: an empty object
@@ -435,6 +472,17 @@ async fn describe_dataset(
     let Some(sample) = objects.iter().find(|object| object.size > 0) else {
         return Ok(None);
     };
+    if let Some(detail) = authorization
+        .withholds_object_read(client, bucket, &sample.key)
+        .await
+    {
+        ::tracing::debug!(
+            object = ?sample.key,
+            detail = %detail,
+            "a Glue crawl is not permitted to read the data under one of its targets"
+        );
+        return Ok(None);
+    }
     let bytes = read_sample(client, bucket, &sample.key).await?;
     let Some(schema) = infer_schema(&bytes) else {
         ::tracing::debug!(

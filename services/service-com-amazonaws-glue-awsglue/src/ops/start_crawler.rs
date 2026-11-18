@@ -194,8 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The crawl is PERFORMED here, with no store guard held: it walks the objects under
         // each target out of the emulator's own Amazon S3 and classifies the datasets behind
-        // them. What it answered is what the crawl writes and what its status reports.
-        let outcome = crate::state::perform_crawl(ctx, &region, &plan).await;
+        // them. What it answered is what the crawl writes and what its status reports. The
+        // engine is handed over because the crawl reads its targets AS the crawler's role, and
+        // what that role is permitted is read out of the account's own IAM records, which live
+        // in the same shared engine.
+        let outcome = crate::state::perform_crawl(&*self.engine, ctx, &region, &plan).await;
 
         // The catalog's security configuration is "applied to every catalog write
         // thereafter" (`PutDataCatalogEncryptionSettings`), so the key the crawl's own
