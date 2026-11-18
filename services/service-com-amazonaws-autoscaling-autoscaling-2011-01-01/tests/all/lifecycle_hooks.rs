@@ -36,6 +36,15 @@ use crate::support::{
     borrowed, new_engine, p, query, router_with, tag_value, tag_values, xml_unescape,
 };
 
+/// What an EXPLICIT empty `NotificationTargetARN` does, in its own file beside this one:
+/// the member the model admits the empty string for is the one member a request can CLEAR,
+/// so that one value is followed through both writers and across the updates that come
+/// after it. `tests/all.rs` declares one module per suite FILE, and this is that file's
+/// module; the `#[path]` points it into this suite's own directory, as that file's own
+/// declaration points into `tests/all/`.
+#[path = "lifecycle_hooks/notification_target_override.rs"]
+mod notification_target_override;
+
 /// The launch source every group here is created from — a launch TEMPLATE, because no
 /// account can create a launch configuration (see
 /// `launch_configurations_are_unavailable.rs`).
@@ -84,7 +93,7 @@ const MAX_HOOKS_PER_GROUP: usize = 50;
 
 /// What `GlobalTimeout` a hook with this heartbeat timeout must report: the documented
 /// derivation, written out here so the assertion does not take the handler's own word.
-fn expected_global_timeout(heartbeat_timeout: i32) -> i32 {
+pub(crate) fn expected_global_timeout(heartbeat_timeout: i32) -> i32 {
     (heartbeat_timeout * 100).min(MAX_GLOBAL_TIMEOUT)
 }
 
@@ -144,7 +153,11 @@ pub(crate) async fn create_group(router: &MultiServiceRouter, name: &str) {
 
 /// Create an empty group carrying `extra` request members, and assert the create was
 /// served.
-async fn create_group_with(router: &MultiServiceRouter, name: &str, extra: &[(String, String)]) {
+pub(crate) async fn create_group_with(
+    router: &MultiServiceRouter,
+    name: &str,
+    extra: &[(String, String)],
+) {
     let (status, body) = create_group_result(router, name, extra).await;
     assert_eq!(
         status, 200,
@@ -327,12 +340,12 @@ pub(crate) fn expect(
 
 /// A notification target of the shape a hook names: an Amazon SNS topic ARN of the
 /// account, which the model documents as one of the two kinds of target.
-fn topic_arn(suffix: &str) -> String {
+pub(crate) fn topic_arn(suffix: &str) -> String {
     format!("arn:aws:sns:us-west-2:000000000000:asg-hook-{suffix}")
 }
 
 /// A role of the shape a hook names.
-fn role_arn(suffix: &str) -> String {
+pub(crate) fn role_arn(suffix: &str) -> String {
     format!("arn:aws:iam::000000000000:role/asg-hook-{suffix}")
 }
 
