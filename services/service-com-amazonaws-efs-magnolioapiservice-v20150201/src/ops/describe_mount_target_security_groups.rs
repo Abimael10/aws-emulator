@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMountTargetSecurityGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMountTargetSecurityGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMountTargetSecurityGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the security groups the mount target [`crate::state`] holds under
+//! the requested `MountTargetId` — the set its last `ModifyMountTargetSecurityGroups` (or
+//! its create) left.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +144,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMountTargetSecurityGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMountTargetSecurityGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMountTargetSecurityGroups"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.materialize_due_transitions(now);
+
+        let Some(mount_target) = state.mount_targets.get(&input.mount_target_id) else {
+            return Err(
+                DescribeMountTargetSecurityGroupsErrorModeled::MountTargetNotFound(
+                    MountTargetNotFound {
+                        error_code: "MountTargetNotFound".to_string(),
+                        message: Some(efs::mount_target_not_found_message(
+                            &input.mount_target_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "This operation requires that the network interface of the mount target has been
+        // created and the lifecycle state of the mount target is not deleted."
+        if mount_target.network_interface_id.is_empty()
+            || mount_target.life_cycle_state == efs::LIFE_CYCLE_DELETING
+            || mount_target.life_cycle_state == efs::LIFE_CYCLE_DELETED
+            || mount_target.life_cycle_state == efs::LIFE_CYCLE_ERROR
+        {
+            return Err(
+                DescribeMountTargetSecurityGroupsErrorModeled::IncorrectMountTargetState(
+                    IncorrectMountTargetState {
+                        error_code: "IncorrectMountTargetState".to_string(),
+                        message: Some(format!(
+                            "Mount target {} is in life cycle state {}",
+                            efs::quoted(&input.mount_target_id),
+                            mount_target.life_cycle_state
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "Returns the security groups currently in effect for a mount target": the stored
+        // set, so this read answers exactly what the last write left.
+        Ok(DescribeMountTargetSecurityGroupsOutput {
+            security_groups: mount_target.security_groups.clone(),
+        })
     }
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> DescribeMountTargetSecurityGroupsError {
+    DescribeMountTargetSecurityGroupsErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

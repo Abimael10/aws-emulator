@@ -4,17 +4,24 @@
 //! service mounted on one shared engine behind the same `MultiServiceRouter` the
 //! production entrypoint serves, plus one method per modelled route.
 //!
+//! Amazon EC2 is mounted BESIDE it on that same engine, because a mount target is placed
+//! in a subnet and a subnet is EC2's resource: every subnet, VPC, zone and address range a
+//! suite names is one EC2 minted ([`Emulator::account_subnets`]), and the facts a mount
+//! target reports about its placement are compared against what EC2 itself answers for
+//! that subnet rather than against a value written out in a suite.
+//!
 //! It lives here, and not in a suite, so a new suite reuses the request builder, the
 //! SigV4 scoping the handlers read the Region from, and the clock-settling helper
 //! instead of copying them.
 
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_efs_magnolioapiservice_v20150201::state;
 use service_com_amazonaws_efs_magnolioapiservice_v20150201::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 /// A SigV4 `Authorization` header scoped to `region` and to EFS's signing name, which
 /// is what the router routes on and what the handlers read the Region from.
@@ -44,7 +51,8 @@ impl Reply {
     }
 }
 
-/// The emulator under test: this one service mounted on one shared engine.
+/// The emulator under test: this one service and Amazon EC2 — the owner of the subnets a
+/// mount target is placed in — mounted on one shared engine.
 pub struct Emulator {
     router: MultiServiceRouter,
     region: String,
@@ -58,11 +66,75 @@ impl Emulator {
     pub fn in_region(region: &str) -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(
+            service_com_amazonaws_ec2_amazonec2::EmulatedService::new(engine),
+        );
         Self {
             router,
             region: region.to_string(),
         }
+    }
+
+    /// An EC2 client for this emulator's Region over the router's own in-process callback
+    /// — the very seam the EFS handlers resolve a subnet through. No socket is opened: the
+    /// endpoint URL is only the address that transport routes by.
+    pub fn ec2(&self) -> ::aws_sdk_ec2::Client {
+        let callback = EmbeddedEmulator::from_router(self.router.clone());
+        let config = ::aws_sdk_ec2::Config::builder()
+            .behavior_version(::aws_sdk_ec2::config::BehaviorVersion::latest())
+            .region(::aws_sdk_ec2::config::Region::new(self.region.clone()))
+            .endpoint_url(format!("https://ec2.{}.amazonaws.com", self.region))
+            .credentials_provider(callback.aws_credentials_provider())
+            .http_client(callback.http_client())
+            .retry_config(::aws_sdk_ec2::config::retry::RetryConfig::disabled())
+            .timeout_config(::aws_sdk_ec2::config::timeout::TimeoutConfig::disabled())
+            .identity_cache(::aws_sdk_ec2::config::IdentityCache::no_cache())
+            .stalled_stream_protection(
+                ::aws_sdk_ec2::config::StalledStreamProtectionConfig::disabled(),
+            )
+            .build();
+        ::aws_sdk_ec2::Client::from_conf(config)
+    }
+
+    /// The subnets the account has in this emulator's Region, as EC2 answers for them,
+    /// ordered by Availability Zone: the default VPC's default subnets, whose ids EC2
+    /// minted. Nothing here derives an identifier, a zone or an address range of its own.
+    pub async fn account_subnets(&self) -> Vec<SubnetFacts> {
+        let described = self
+            .ec2()
+            .describe_subnets()
+            .send()
+            .await
+            .expect("EC2 must report the account's subnets");
+        let mut facts: Vec<SubnetFacts> = described
+            .subnets()
+            .iter()
+            .filter_map(|subnet| {
+                Some(SubnetFacts {
+                    subnet_id: subnet.subnet_id()?.to_string(),
+                    vpc_id: subnet.vpc_id()?.to_string(),
+                    zone_name: subnet.availability_zone()?.to_string(),
+                    availability_zone_id: subnet.availability_zone_id()?.to_string(),
+                    cidr_block: subnet.cidr_block()?.to_string(),
+                })
+            })
+            .filter(|facts| facts.zone_name.starts_with(&self.region))
+            .collect();
+        facts.sort_by(|left, right| left.availability_zone_id.cmp(&right.availability_zone_id));
+        facts
+    }
+
+    /// The `index`-th subnet of [`Self::account_subnets`], for a case that needs just one.
+    pub async fn account_subnet(&self, index: usize) -> SubnetFacts {
+        let subnets = self.account_subnets().await;
+        subnets.get(index).cloned().unwrap_or_else(|| {
+            panic!(
+                "the account must have at least {} subnet(s) in {}, got {subnets:?}",
+                index + 1,
+                self.region
+            )
+        })
     }
 
     pub async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
@@ -118,6 +190,28 @@ impl Emulator {
 
     pub async fn create_mount_target(&self, body: Value) -> Reply {
         self.send("POST", "/2015-02-01/mount-targets", Some(body)).await
+    }
+
+    /// `PUT /2015-02-01/mount-targets/{MountTargetId}/security-groups`, the modelled
+    /// `ModifyMountTargetSecurityGroups` binding.
+    pub async fn modify_mount_target_security_groups(&self, id: &str, body: Value) -> Reply {
+        self.send(
+            "PUT",
+            &format!("/2015-02-01/mount-targets/{id}/security-groups"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `GET /2015-02-01/mount-targets/{MountTargetId}/security-groups`, the modelled
+    /// `DescribeMountTargetSecurityGroups` binding.
+    pub async fn describe_mount_target_security_groups(&self, id: &str) -> Reply {
+        self.send(
+            "GET",
+            &format!("/2015-02-01/mount-targets/{id}/security-groups"),
+            None,
+        )
+        .await
     }
 
     pub async fn describe_mount_targets(&self, query: &str) -> Reply {
@@ -306,5 +400,39 @@ pub fn matches_id_pattern(id: &str, prefix: &str) -> bool {
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         }
         None => false,
+    }
+}
+
+/// One subnet of the account, exactly as Amazon EC2 reports it. Everything a mount target
+/// reports about its placement is compared against these values.
+#[derive(Debug, Clone)]
+pub struct SubnetFacts {
+    pub subnet_id: String,
+    pub vpc_id: String,
+    pub zone_name: String,
+    pub availability_zone_id: String,
+    pub cidr_block: String,
+}
+
+impl SubnetFacts {
+    /// The `offset`-th address of this subnet's block, for a case that names an address
+    /// explicitly. Read off the block EC2 reported, so the address is one of the subnet's
+    /// own whatever block the account's network has.
+    pub fn address_at(&self, offset: u32) -> String {
+        let block: ::ipnet::Ipv4Net = self.cidr_block.parse().unwrap_or_else(|error| {
+            panic!("EC2's block {:?} must parse: {error}", self.cidr_block)
+        });
+        Ipv4Addr::from(u32::from(block.network()).saturating_add(offset)).to_string()
+    }
+
+    /// Whether `address` lies inside this subnet's block.
+    pub fn holds(&self, address: &str) -> bool {
+        match (
+            self.cidr_block.parse::<::ipnet::Ipv4Net>(),
+            address.parse::<Ipv4Addr>(),
+        ) {
+            (Ok(block), Ok(address)) => block.contains(&address),
+            _ => false,
+        }
     }
 }

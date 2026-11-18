@@ -4,8 +4,9 @@
 //!
 //! One lock-guarded struct per engine, reached through [`service_state`]. It holds the
 //! file systems, the creation tokens they were made idempotent by, their mount targets
-//! and access points, and the VPC/subnet facts a mount target description is built from
-//! — plus the counter every `fs-`/`fsmt-`/`fsap-`/`eni-`/`vpc-` id is minted from.
+//! and access points — plus the counter every `fs-`/`fsmt-`/`fsap-`/`eni-` id is minted
+//! from. The VPC/subnet facts a mount target description is built from are NOT held here:
+//! they belong to the service that owns subnets and are resolved there ([`ec2_subnets`]).
 //!
 //! The record types here are the single source of every description this service
 //! returns: `FileSystem::describe`, `MountTarget::describe` and `AccessPoint::describe`
@@ -24,6 +25,15 @@ use std::time::{Duration, SystemTime};
 mod model_patterns;
 pub use model_patterns::{
     constraint_refusal, root_directory_violations, tag_key_list_violations, tag_violations,
+};
+
+/// The network a mount target is placed in, as the service that owns subnets reports it.
+/// Re-exported by name for the same reason as the module above: a handler reaches it beside
+/// the rest of this module.
+mod ec2_subnets;
+pub use ec2_subnets::{
+    assignable_ipv4, assignable_ipv6, ipv4_assignable, ipv6_assignable, resolve_subnet,
+    SubnetPlacement,
 };
 
 use crate::ops::types::{
@@ -50,6 +60,14 @@ pub const LIFE_CYCLE_UPDATING: &str = "updating";
 /// complete, new clients can no longer connect to the access point", so the deletion is
 /// not complete when the call returns; see [`DELETING_FOR`].
 pub const LIFE_CYCLE_DELETING: &str = "deleting";
+/// See [`LIFE_CYCLE_CREATING`]. The two terminal phases a mount target can be in that no
+/// mutation of it is served from: its deletion has completed, or the service could not
+/// bring it up. `ModifyMountTargetSecurityGroups` "requires that the network interface of
+/// the mount target has been created and the lifecycle state of the mount target is not
+/// deleted", which is its `IncorrectMountTargetState`.
+pub const LIFE_CYCLE_DELETED: &str = "deleted";
+/// See [`LIFE_CYCLE_DELETED`].
+pub const LIFE_CYCLE_ERROR: &str = "error";
 
 /// Values of the modelled `ReplicationStatus` enum this slice produces
 /// (`smithy_query(query="shape",shape="ReplicationStatus")` -> ENABLED | ENABLING |
@@ -166,11 +184,6 @@ pub const ROOT_DIRECTORY_DEFAULT_PATH: &str = "/";
 /// `FileSystemLimitExceeded` is the modelled answer past it.
 pub const MAX_FILE_SYSTEMS_PER_REGION: usize = 1000;
 
-/// Published VPC quota: "Subnets per VPC: 200" ("Amazon VPC quotas", Amazon VPC User
-/// Guide). This emulator owns one VPC, so it records at most this many subnets and a
-/// request naming a further one is answered `SubnetNotFound`.
-pub const MAX_SUBNETS_PER_VPC: usize = 200;
-
 /// Published EFS quota: "Mount targets per file system, per Availability Zone: 1" and
 /// "Availability Zones per file system: 1 for One Zone, all for Regional" ("Amazon EFS
 /// quotas", Amazon EFS User Guide) — so a file system holds at most one mount target per
@@ -218,51 +231,6 @@ pub const THROUGHPUT_CHANGE_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 6
 /// followed by a letter identifier ("Regions and Zones", Amazon EC2 User Guide); every
 /// commercial Region publishes at least three, so this emulator models six per Region.
 pub const AZ_SUFFIXES: [char; 6] = ['a', 'b', 'c', 'd', 'e', 'f'];
-
-/// Every VPC subnet reserves its first four addresses and its last one ("Subnet CIDR
-/// blocks", Amazon VPC User Guide), so an assignable host octet of an emulated /24 runs
-/// from 4 through 254.
-const FIRST_ASSIGNABLE_HOST: u32 = 4;
-/// See [`FIRST_ASSIGNABLE_HOST`].
-const LAST_ASSIGNABLE_HOST: u32 = 254;
-
-/// An emulated VPC subnet: a mount target's Availability Zone, VPC and address range
-/// all come from its subnet, so the facts are recorded once, on first reference, and
-/// every later mount target in the same subnet reads the same record back.
-#[derive(Debug, Clone)]
-pub struct Subnet {
-    /// The `subnet-…` id the caller named.
-    pub subnet_id: String,
-    /// Allocation order of this subnet, which fixes its Availability Zone and its /24.
-    pub ordinal: u32,
-    /// The VPC every subnet of this emulator belongs to.
-    pub vpc_id: String,
-    /// `<region><letter>`, e.g. `us-east-1a`.
-    pub availability_zone_name: String,
-    /// `<region abbreviation>-az<n>`, e.g. `use1-az1`.
-    pub availability_zone_id: String,
-}
-
-impl Subnet {
-    /// The first three octets of this subnet's emulated `10.x.y.0/24`.
-    fn ipv4_prefix(&self) -> (u32, u32, u32) {
-        (10, (self.ordinal >> 8) & 0xff, self.ordinal & 0xff)
-    }
-
-    /// The IPv4 addresses this subnet can assign, lowest first.
-    pub fn assignable_ipv4(&self) -> impl Iterator<Item = String> + '_ {
-        let (a, b, c) = self.ipv4_prefix();
-        (FIRST_ASSIGNABLE_HOST..=LAST_ASSIGNABLE_HOST).map(move |host| format!("{a}.{b}.{c}.{host}"))
-    }
-
-    /// The IPv6 addresses this subnet can assign, lowest first, from the unique-local
-    /// `fd00::/8` space so an emulated address can never be a routable one.
-    pub fn assignable_ipv6(&self) -> impl Iterator<Item = String> + '_ {
-        let (_, b, c) = self.ipv4_prefix();
-        (FIRST_ASSIGNABLE_HOST..=LAST_ASSIGNABLE_HOST)
-            .map(move |host| format!("fd00:ec2:{b:x}:{c:x}::{host:x}"))
-    }
-}
 
 /// A throughput change an `UpdateFileSystem` call has ACCEPTED and the clock has not
 /// applied yet.
@@ -685,16 +653,10 @@ impl AccessPoint {
 /// The SplitMix64 increment, the step the id counter advances by.
 const SPLITMIX64_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// The seed the one emulated VPC's id is derived from. A fixed seed, not a draw from the
-/// id counter, so reading the VPC id is a pure read; the value is outside the counter's
-/// own sequence because the counter starts at zero and advances by
-/// [`SPLITMIX64_STEP`], never reaching it.
-const VPC_ID_SEED: u64 = 0x5EFC_0DE0_0000_0001;
-
 /// How many lowercase hex digits the body of a MINTED resource id carries.
 ///
-/// AWS mints the ids this service hands out — `fs-`, `fsmt-`, `fsap-`, and the `eni-` and
-/// `vpc-` ids of the network a mount target is reported on — with 17 hex digits, and the
+/// AWS mints the ids this service hands out — `fs-`, `fsmt-`, `fsap-`, and the `eni-` id of
+/// the network interface a mount target is reported on — with 17 hex digits, and the
 /// services that consume them pin that width: Lambda admits an EFS access point as a
 /// function's file system only as `…:access-point/fsap-[a-f0-9]{17}`
 /// (`smithy_query(query="shape",shape="FileSystemConfig",model_path="services/service-com-amazonaws-lambda-awsgirapiservice/smithy-model/com-amazonaws-lambda-awsgirapiservice.json")`).
@@ -703,7 +665,8 @@ const VPC_ID_SEED: u64 = 0x5EFC_0DE0_0000_0001;
 const MINTED_ID_HEX: usize = 17;
 
 /// The salt the digits beyond the first 16 of a minted id are finalised from, so they do
-/// not read as a constant tail every id shares. A fixed salt, like [`VPC_ID_SEED`].
+/// not read as a constant tail every id shares. A fixed salt rather than a draw from the id
+/// counter.
 const MINTED_ID_SALT: u64 = 0x1D5A_1701_0000_0001;
 
 /// [`MINTED_ID_HEX`] lowercase hex digits derived from `seed`.
@@ -738,8 +701,6 @@ pub struct ComAmazonawsEfsMagnolioapiserviceV20150201State {
     pub creation_tokens: BTreeMap<String, String>,
     /// Keyed by `fsmt-…` id.
     pub mount_targets: BTreeMap<String, MountTarget>,
-    /// Keyed by `subnet-…` id, recorded on first reference.
-    pub subnets: BTreeMap<String, Subnet>,
     /// Keyed by `fsap-…` id.
     pub access_points: BTreeMap<String, AccessPoint>,
     /// `ClientToken` -> `fsap-…` id; backs CreateAccessPoint's idempotency rule.
@@ -773,58 +734,6 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
     pub fn next_ordinal(&mut self) -> u64 {
         self.next_ordinal = self.next_ordinal.wrapping_add(1);
         self.next_ordinal
-    }
-
-    /// The one VPC every emulated subnet belongs to.
-    ///
-    /// Derived from a fixed seed rather than minted from the id counter, so this is a
-    /// pure read: resolving a subnet's facts for a request that may still be refused
-    /// writes nothing at all, and every caller observes the same VPC for the life of the
-    /// process.
-    pub fn vpc_id(&self) -> String {
-        format!("vpc-{}", minted_hex_of(VPC_ID_SEED))
-    }
-
-    /// The record for `subnet_id`, or the Availability Zone and /24 it WOULD be given on
-    /// first reference — without recording anything. Allocation order fixes the
-    /// Availability Zone, so two distinct subnets land in distinct zones until the
-    /// Region's zones are exhausted.
-    ///
-    /// Resolving is deliberately separate from [`Self::record_subnet`]: a subnet id is
-    /// caller-chosen and the request that names it may still be refused further down, so
-    /// the facts are computed here and committed only on the success path.
-    ///
-    /// `None` once the emulated VPC already holds [`MAX_SUBNETS_PER_VPC`] subnets and
-    /// `subnet_id` is not one of them, which bounds this map against a caller that names
-    /// a fresh subnet on every request.
-    pub fn subnet(&self, subnet_id: &str, region: &str) -> Option<Subnet> {
-        if let Some(existing) = self.subnets.get(subnet_id) {
-            return Some(existing.clone());
-        }
-        if self.subnets.len() >= MAX_SUBNETS_PER_VPC {
-            return None;
-        }
-        let vpc_id = self.vpc_id();
-        let ordinal = u32::try_from(self.subnets.len()).unwrap_or(u32::MAX);
-        let suffix = AZ_SUFFIXES[usize::try_from(ordinal).unwrap_or(0) % AZ_SUFFIXES.len()];
-        let availability_zone_name = format!("{region}{suffix}");
-        let availability_zone_id = availability_zone_id(&availability_zone_name);
-        Some(Subnet {
-            subnet_id: subnet_id.to_string(),
-            ordinal,
-            vpc_id,
-            availability_zone_name,
-            availability_zone_id,
-        })
-    }
-
-    /// Commit the facts [`Self::subnet`] resolved, on the success path. A subnet already
-    /// recorded keeps the facts it was first recorded with, so every mount target in one
-    /// subnet reports the same zone, VPC and address range.
-    pub fn record_subnet(&mut self, subnet: Subnet) {
-        self.subnets
-            .entry(subnet.subnet_id.clone())
-            .or_insert(subnet);
     }
 
     /// Materialise every lifecycle transition the clock has already made due: a
@@ -927,20 +836,43 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
         })
     }
 
-    /// The lowest address in `subnet` no mount target holds, as EC2's
-    /// `CreateNetworkInterface` assigns a primary private address when the request
-    /// names none. `None` when the subnet has no free address left.
-    pub fn free_ipv4(&self, subnet: &Subnet) -> Option<String> {
-        subnet
-            .assignable_ipv4()
-            .find(|address| !self.ipv4_in_use(&subnet.subnet_id, address))
+    /// How many mount targets this store holds in `subnet_id` — the count alone, which is
+    /// what bounds the search [`Self::free_ipv4`] runs.
+    fn mount_target_count_in(&self, subnet_id: &str) -> u32 {
+        u32::try_from(
+            self.mount_targets
+                .values()
+                .filter(|mount_target| mount_target.subnet_id == subnet_id)
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
     }
 
-    /// See [`Self::free_ipv4`].
-    pub fn free_ipv6(&self, subnet: &Subnet) -> Option<String> {
-        subnet
-            .assignable_ipv6()
-            .find(|address| !self.ipv6_in_use(&subnet.subnet_id, address))
+    /// The lowest address of `subnet`'s own IPv4 block that no mount target holds, as EFS
+    /// "assigns a free address in the subnet (in the same way that the Amazon EC2
+    /// CreateNetworkInterface call does when a request does not specify a primary private
+    /// IP address)". The block is the one EC2 reports for that subnet
+    /// ([`resolve_subnet`]), so the address is one the instances in the subnet can reach.
+    ///
+    /// `None` when the subnet reports no IPv4 block, or when it has no free address left.
+    ///
+    /// Bounded by what this store holds: with `n` mount targets in the subnet, one of the
+    /// first `n + 1` assignable addresses is free, so the search is never longer than that.
+    pub fn free_ipv4(&self, subnet: &SubnetPlacement) -> Option<String> {
+        let cidr_block = subnet.cidr_block.as_deref()?;
+        (0..=self.mount_target_count_in(&subnet.subnet_id)).find_map(|ordinal| {
+            assignable_ipv4(cidr_block, ordinal)
+                .filter(|address| !self.ipv4_in_use(&subnet.subnet_id, address))
+        })
+    }
+
+    /// See [`Self::free_ipv4`], over the subnet's own IPv6 block.
+    pub fn free_ipv6(&self, subnet: &SubnetPlacement) -> Option<String> {
+        let cidr_block = subnet.ipv6_cidr_block.as_deref()?;
+        (0..=self.mount_target_count_in(&subnet.subnet_id)).find_map(|ordinal| {
+            assignable_ipv6(cidr_block, ordinal)
+                .filter(|address| !self.ipv6_in_use(&subnet.subnet_id, address))
+        })
     }
 
     /// How many access points one file system holds — the count alone, without building
@@ -1330,8 +1262,6 @@ pub const FILE_SYSTEM_NOUN: &str = "File system";
 pub const MOUNT_TARGET_NOUN: &str = "Mount target";
 /// The noun EFS names an access point by in its messages; see [`does_not_exist`].
 pub const ACCESS_POINT_NOUN: &str = "Access point";
-/// The noun EFS names a subnet by in its messages; see [`does_not_exist`].
-pub const SUBNET_NOUN: &str = "Subnet";
 
 /// The single construction behind every "not found" message this service emits:
 /// `<Noun> '<id>' does not exist.` — the noun of the resource the request asked for,
@@ -1355,6 +1285,37 @@ pub fn file_system_not_found_message(file_system_id: &str) -> String {
 /// specified ID found in the caller's Amazon Web Services account".
 pub fn mount_target_not_found_message(mount_target_id: &str) -> String {
     does_not_exist(MOUNT_TARGET_NOUN, mount_target_id)
+}
+
+/// `SubnetNotFound`'s message — "Returned if there is no subnet with ID SubnetId provided
+/// in the request": "The subnet ID '" then the `SubnetId` the REQUEST named ([`quoted`])
+/// then "' does not exist", with nothing else interpolated.
+pub fn subnet_not_found_message(subnet_id: &str) -> String {
+    format!("The subnet ID {} does not exist", quoted(subnet_id))
+}
+
+/// `MountTargetConflict`'s message for the per-Availability-Zone restriction — "there can
+/// be only one mount target per Availability Zone".
+///
+/// FIXED text with no variable part: the refusal names neither the file system, nor the
+/// mount target already in the zone, nor the zone itself, and it is the same sentence
+/// whether the retried subnet is the one the existing mount target sits in or another
+/// subnet of that same zone, because the restriction is keyed on the zone.
+pub const MOUNT_TARGET_ZONE_CONFLICT_MESSAGE: &str = "mount target already exists in this AZ";
+
+/// `FileSystemInUse`'s message on `DeleteFileSystem` — "Returned if a file system has
+/// mount targets": "The file system '" then the `FileSystemId` the REQUEST named
+/// ([`quoted`]) then "' cannot be deleted because it has mount targets. You must delete the
+/// mount targets, and then try again."
+///
+/// The file system's id is the one variable part; HOW MANY mount targets it has is not
+/// reported.
+pub fn file_system_in_use_message(file_system_id: &str) -> String {
+    format!(
+        "The file system {} cannot be deleted because it has mount targets. You must delete \
+         the mount targets, and then try again.",
+        quoted(file_system_id)
+    )
 }
 
 /// `AccessPointNotFound`'s message — "Returned if the specified `AccessPointId` value

@@ -198,11 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(DeleteFileSystemErrorModeled::FileSystemInUse(
                     FileSystemInUse {
                         error_code: "FileSystemInUse".to_string(),
-                        message: Some(format!(
-                            "File system {} still has {} mount target(s); delete them first",
-                            efs::quoted(&file_system_id),
-                            file_system.mount_target_ids.len()
-                        )),
+                        message: Some(efs::file_system_in_use_message(&file_system_id)),
                     },
                 )
                 .into())

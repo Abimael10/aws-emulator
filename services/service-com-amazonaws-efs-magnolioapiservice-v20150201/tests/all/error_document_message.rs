@@ -453,16 +453,12 @@ async fn the_framework_documents_carry_a_string_message_member() {
         ));
     }
 
-    // Two reads of this service are still scaffolded (they have their own stub issues),
-    // so they answer the 501 whose message names the operation.
-    let mount_target_id = "fsmt-0123456789abcdef";
-    for (operation, path) in [
-        ("DescribeAccountPreferences", "/2015-02-01/account-preferences".to_string()),
-        (
-            "DescribeMountTargetSecurityGroups",
-            format!("/2015-02-01/mount-targets/{mount_target_id}/security-groups"),
-        ),
-    ] {
+    // One read of this service is still scaffolded (it has its own stub issue), so it
+    // answers the 501 whose message names the operation.
+    for (operation, path) in [(
+        "DescribeAccountPreferences",
+        "/2015-02-01/account-preferences".to_string(),
+    )] {
         rows.push((
             format!("{operation}({path})"),
             efs.send("GET", &path, None).await,
@@ -713,11 +709,17 @@ async fn an_error_document_carries_error_code_only_where_the_refusal_reports_one
 
     // ---- `AvailabilityZonesMismatch`: another class whose `ErrorCode` the model leaves
     // optional and which this service fills — a One Zone file system takes a mount target
-    // only in its own Availability Zone.
+    // only in its own Availability Zone. The zones are the account's own, as EC2 reports
+    // them: the file system is put in the first and the mount target asked for in another.
+    let zones = efs.account_subnets().await;
+    assert!(
+        zones.len() >= 2,
+        "the account must have subnets in at least two zones for this case, got {zones:?}"
+    );
     let one_zone = efs
         .create_file_system(json!({
             "CreationToken": "code-member-one-zone",
-            "AvailabilityZoneName": "us-east-1b",
+            "AvailabilityZoneName": zones[0].zone_name,
         }))
         .await;
     assert_eq!(
@@ -731,7 +733,7 @@ async fn an_error_document_carries_error_code_only_where_the_refusal_reports_one
         "CreateMountTarget in another zone of a One Zone file system".to_string(),
         efs.create_mount_target(json!({
             "FileSystemId": one_zone_id,
-            "SubnetId": "subnet-0ccccccccccccccc1",
+            "SubnetId": zones[1].subnet_id,
         }))
         .await,
         400,

@@ -2,8 +2,8 @@
 
 //! @op CreateMountTarget
 //! IMPLEMENTED: records a mount target against its file system in [`crate::state`],
-//! allocating the network interface, Availability Zone, VPC and address its description
-//! reports from the subnet the request names.
+//! reporting the Availability Zone, VPC and address of the subnet the request names as the
+//! service that OWNS subnets reports it ([`crate::state::resolve_subnet`]).
 //!
 //! ## Shape of an operation
 //!
@@ -291,76 +291,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // boundary has already refused a malformed or over-long list.
         let security_groups = input.security_groups.clone().unwrap_or_default();
 
-        let mut state = state.lock();
-        state.materialize_due_transitions(now);
-
         let file_system_id = efs::file_system_id_of(&input.file_system_id).to_string();
-        let Some(file_system) = state.file_systems.get(&file_system_id) else {
-            return Err(CreateMountTargetErrorModeled::FileSystemNotFound(
-                FileSystemNotFound {
-                    error_code: "FileSystemNotFound".to_string(),
-                    message: Some(efs::file_system_not_found_message(&file_system_id)),
-                },
-            )
-            .into());
-        };
-        // "To create a mount target for a file system, the file system's lifecycle state
-        // must be available."
-        if file_system.life_cycle_state != efs::LIFE_CYCLE_AVAILABLE {
-            return Err(
-                CreateMountTargetErrorModeled::IncorrectFileSystemLifeCycleState(
-                    IncorrectFileSystemLifeCycleState {
-                        error_code: "IncorrectFileSystemLifeCycleState".to_string(),
-                        message: Some(format!(
-                            "File system {} is in life cycle state {}, not {}",
-                            efs::quoted(&file_system_id),
-                            file_system.life_cycle_state,
-                            efs::LIFE_CYCLE_AVAILABLE
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-        let one_zone_az = file_system.availability_zone_name.clone();
 
-        // The subnet "determines the VPC in which Amazon EFS creates the mount target,
-        // the Availability Zone ... and the IP address range from which Amazon EFS
-        // selects the IP address of the mount target". The facts are RESOLVED here and
-        // committed only past every refusal below, so a request that is turned away
-        // leaves nothing behind; and the emulated VPC holds at most the published number
-        // of subnets, so a caller naming a fresh subnet on every request cannot grow the
-        // registry without limit either.
-        let Some(subnet) = state.subnet(&input.subnet_id, &region) else {
+        // This service's OWN records first, under one short hold of the guard, so a request
+        // naming no file system it holds is refused without asking another service anything.
+        // The guard is released again at the end of this block: the subnet below is another
+        // service's resource and this store's lock is never held across that hop.
+        let one_zone_az = {
+            let mut state = state.lock();
+            state.materialize_due_transitions(now);
+            match own_record_refusal(&state, &file_system_id, &region) {
+                Err(refusal) => return Err(refusal),
+                Ok(one_zone_az) => one_zone_az,
+            }
+        };
+
+        // `SubnetId` names a resource of ANOTHER service. The subnet "determines the VPC in
+        // which Amazon EFS creates the mount target, the Availability Zone ... and the IP
+        // address range from which Amazon EFS selects the IP address of the mount target", so
+        // every one of those facts is read off the record EC2 — the owner of subnets — answers
+        // with, and a subnet the account does not have cannot be placed in at all.
+        let Some(subnet) = efs::resolve_subnet(ctx, &region, &input.subnet_id).await else {
             return Err(CreateMountTargetErrorModeled::SubnetNotFound(SubnetNotFound {
                 error_code: "SubnetNotFound".to_string(),
-                message: Some(format!(
-                    "{} VPC {} already holds the maximum of {} subnets",
-                    efs::does_not_exist(efs::SUBNET_NOUN, &input.subnet_id),
-                    state.vpc_id(),
-                    efs::MAX_SUBNETS_PER_VPC
-                )),
+                message: Some(efs::subnet_not_found_message(&input.subnet_id)),
             })
             .into());
         };
-
-        // Each mount target holds one elastic network interface, so the store is bounded
-        // by the interface ceiling it reports.
-        if state.mount_targets.len() >= efs::MAX_MOUNT_TARGETS {
-            return Err(
-                CreateMountTargetErrorModeled::NetworkInterfaceLimitExceeded(
-                    NetworkInterfaceLimitExceeded {
-                        error_code: "NetworkInterfaceLimitExceeded".to_string(),
-                        message: Some(format!(
-                            "This account has reached the limit of {} network interfaces in \
-                             {region}",
-                            efs::MAX_MOUNT_TARGETS
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
 
         // "You can create only one mount target for a One Zone file system. You must
         // create that mount target in the same Availability Zone in which the file system
@@ -381,6 +338,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The record itself, under one hold of the guard. EVERY refusal that depends on this
+        // service's own records is asked again here, because the store moved on while the
+        // owner of the subnet was being asked: the file system could have been deleted or
+        // have left `available`, the interface ceiling could have been reached, and the zone
+        // could have been taken.
+        let mut state = state.lock();
+        state.materialize_due_transitions(now);
+        own_record_refusal(&state, &file_system_id, &region)?;
+
         // "there can be only one mount target per Availability Zone" and a new mount
         // target "must belong to the same VPC as the subnets of the existing mount
         // targets". The zone rule is also what bounds a file system's mount-target list:
@@ -390,11 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreateMountTargetErrorModeled::MountTargetConflict(
                     MountTargetConflict {
                         error_code: "MountTargetConflict".to_string(),
-                        message: Some(format!(
-                            "File system {file_system_id} already has mount target {} in \
-                             Availability Zone {}",
-                            existing.mount_target_id, existing.availability_zone_name
-                        )),
+                        message: Some(efs::MOUNT_TARGET_ZONE_CONFLICT_MESSAGE.to_string()),
                     },
                 )
                 .into());
@@ -416,10 +378,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If the request provides an IpAddress, Amazon EFS assigns that IP address to
         // the network interface. Otherwise, Amazon EFS assigns a free address in the
-        // subnet."
+        // subnet." Either way the address is one of the SUBNET's own: the member is "the
+        // IPv4 address within the address range of the specified subnet", and the range is
+        // the block EC2 reported for it.
         let ip_address = if wants_ipv4 {
             match input.ip_address.clone() {
                 Some(requested) => {
+                    let Some(cidr_block) = subnet.cidr_block.as_deref() else {
+                        return Err(bad_request(format!(
+                            "Subnet {} has no IPv4 CIDR block an IpAddress could come from",
+                            subnet.subnet_id
+                        )));
+                    };
+                    if !efs::ipv4_assignable(cidr_block, &requested) {
+                        return Err(bad_request(format!(
+                            "IpAddress must be within the address range {cidr_block} of subnet \
+                             {}, got {requested}",
+                            subnet.subnet_id
+                        )));
+                    }
                     if state.ipv4_in_use(&subnet.subnet_id, &requested) {
                         return Err(CreateMountTargetErrorModeled::IpAddressInUse(
                             IpAddressInUse {
@@ -456,6 +433,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ipv6_address = if wants_ipv6 {
             match input.ipv6_address.clone() {
                 Some(requested) => {
+                    let Some(cidr_block) = subnet.ipv6_cidr_block.as_deref() else {
+                        return Err(bad_request(format!(
+                            "Subnet {} has no IPv6 CIDR block an Ipv6Address could come from",
+                            subnet.subnet_id
+                        )));
+                    };
+                    if !efs::ipv6_assignable(cidr_block, &requested) {
+                        return Err(bad_request(format!(
+                            "Ipv6Address must be within the address range {cidr_block} of \
+                             subnet {}, got {requested}",
+                            subnet.subnet_id
+                        )));
+                    }
                     if state.ipv6_in_use(&subnet.subnet_id, &requested) {
                         return Err(CreateMountTargetErrorModeled::IpAddressInUse(
                             IpAddressInUse {
@@ -473,6 +463,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => match state.free_ipv6(&subnet) {
                     Some(allocated) => Some(allocated),
                     None => {
+                        // An IPv6 mount target can only be addressed out of an IPv6 range
+                        // the subnet has: "Create mount target with IPv6 only subnet" /
+                        // "dual-stack subnet". A subnet EC2 reports no IPv6 block for has no
+                        // address to assign, which is the malformed request rather than an
+                        // exhausted range.
+                        if subnet.ipv6_cidr_block.is_none() {
+                            return Err(bad_request(format!(
+                                "IpAddressType {ip_address_type} needs an IPv6 CIDR block, and \
+                                 subnet {} has none",
+                                subnet.subnet_id
+                            )));
+                        }
                         return Err(CreateMountTargetErrorModeled::NoFreeAddressesInSubnet(
                             NoFreeAddressesInSubnet {
                                 error_code: "NoFreeAddressesInSubnet".to_string(),
@@ -482,7 +484,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 )),
                             },
                         )
-                        .into())
+                        .into());
                     }
                 },
             }
@@ -507,6 +509,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ip_address,
             ipv6_address,
             network_interface_id,
+            // Every placement fact comes off the subnet record EC2 answered with, so the
+            // mount target reports the network the account really has.
             availability_zone_id: subnet.availability_zone_id.clone(),
             availability_zone_name: subnet.availability_zone_name.clone(),
             vpc_id: subnet.vpc_id.clone(),
@@ -514,10 +518,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let description = mount_target.describe();
-        // Past every refusal, so this is the first write the request makes: the subnet
-        // facts the description was built from are committed alongside the mount target
-        // itself, never by a call that was turned away.
-        state.record_subnet(subnet);
         state
             .mount_targets
             .insert(mount_target_id.clone(), mount_target);
@@ -528,6 +528,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         Ok(description)
     }
+}
+
+/// Why this store cannot take a mount target for `file_system_id` right now, or the
+/// `AvailabilityZoneName` of a One Zone file system (`None` for a Regional one) when it can.
+///
+/// The refusals that depend only on THIS service's records, in one place because they are
+/// asked twice: once before the owner of subnets is asked anything, so a request naming no
+/// file system this store holds costs no hop, and once again under the guard the record is
+/// written through, because the store moved on while that hop was in flight.
+fn own_record_refusal(
+    state: &crate::state::ComAmazonawsEfsMagnolioapiserviceV20150201State,
+    file_system_id: &str,
+    region: &str,
+) -> Result<Option<String>, CreateMountTargetError> {
+    use crate::state as efs;
+
+    let Some(file_system) = state.file_systems.get(file_system_id) else {
+        return Err(
+            CreateMountTargetErrorModeled::FileSystemNotFound(FileSystemNotFound {
+                error_code: "FileSystemNotFound".to_string(),
+                message: Some(efs::file_system_not_found_message(file_system_id)),
+            })
+            .into(),
+        );
+    };
+    // "To create a mount target for a file system, the file system's lifecycle state must
+    // be available."
+    if file_system.life_cycle_state != efs::LIFE_CYCLE_AVAILABLE {
+        return Err(
+            CreateMountTargetErrorModeled::IncorrectFileSystemLifeCycleState(
+                IncorrectFileSystemLifeCycleState {
+                    error_code: "IncorrectFileSystemLifeCycleState".to_string(),
+                    message: Some(format!(
+                        "File system {} is in life cycle state {}, not {}",
+                        efs::quoted(file_system_id),
+                        file_system.life_cycle_state,
+                        efs::LIFE_CYCLE_AVAILABLE
+                    )),
+                },
+            )
+            .into(),
+        );
+    }
+    let one_zone_az = file_system.availability_zone_name.clone();
+    // Each mount target holds one elastic network interface, so the store is bounded by the
+    // interface ceiling it reports.
+    if state.mount_targets.len() >= efs::MAX_MOUNT_TARGETS {
+        return Err(
+            CreateMountTargetErrorModeled::NetworkInterfaceLimitExceeded(
+                NetworkInterfaceLimitExceeded {
+                    error_code: "NetworkInterfaceLimitExceeded".to_string(),
+                    message: Some(format!(
+                        "This account has reached the limit of {} network interfaces in \
+                         {region}",
+                        efs::MAX_MOUNT_TARGETS
+                    )),
+                },
+            )
+            .into(),
+        );
+    }
+    Ok(one_zone_az)
 }
 
 /// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid

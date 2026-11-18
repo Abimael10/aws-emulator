@@ -92,7 +92,9 @@ async fn every_minted_id_carries_the_width_aws_mints_it_with() {
     let mount = efs
         .create_mount_target(json!({
             "FileSystemId": file_system_id,
-            "SubnetId": "subnet-0123456789abcdef0",
+            // The subnet a mount target is placed in is EC2's resource, so the id named
+            // here is one EC2 minted for the account.
+            "SubnetId": efs.account_subnet(0).await.subnet_id,
         }))
         .await;
     assert_eq!(

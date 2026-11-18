@@ -30,7 +30,10 @@ pub(crate) use super::harness::{matches_id_pattern, settle, Emulator, Reply};
 #[tokio::test]
 async fn file_system_and_mount_target_lifecycle_round_trips_through_state() {
     let efs = Emulator::new();
-    let subnet = "subnet-0123456789abcdef0";
+    // The subnet a mount target is placed in is EC2's resource, so the one named here is
+    // one EC2 minted for the account, and every placement member below is compared against
+    // what EC2 itself reports for it.
+    let subnet = efs.account_subnet(0).await;
 
     // CreateFileSystem -> 201 with a minted, stored id.
     let created = efs
@@ -150,7 +153,7 @@ async fn file_system_and_mount_target_lifecycle_round_trips_through_state() {
     let too_early = efs
         .create_mount_target(json!({
             "FileSystemId": file_system_id,
-            "SubnetId": subnet,
+            "SubnetId": subnet.subnet_id,
         }))
         .await;
     assert_eq!(
@@ -177,11 +180,11 @@ async fn file_system_and_mount_target_lifecycle_round_trips_through_state() {
         settled.get("FileSystems")[0]
     );
 
-    // CreateMountTarget -> 200 with a minted id and an allocated address.
+    // CreateMountTarget -> 200 with a minted id and an address of the subnet's own range.
     let mount = efs
         .create_mount_target(json!({
             "FileSystemId": file_system_id,
-            "SubnetId": subnet,
+            "SubnetId": subnet.subnet_id,
         }))
         .await;
     assert_eq!(
@@ -194,23 +197,31 @@ async fn file_system_and_mount_target_lifecycle_round_trips_through_state() {
         matches_id_pattern(&mount_target_id, "fsmt-"),
         "CreateMountTarget: expected a minted fsmt- id, got {mount_target_id:?}"
     );
+    assert!(
+        subnet.holds(&mount.string("IpAddress")),
+        "CreateMountTarget: the address must lie inside the subnet's own block {}, got {:?}",
+        subnet.cidr_block,
+        mount.get("IpAddress")
+    );
     assert_eq!(
         mount.string("IpAddress"),
-        "10.0.0.4",
-        "CreateMountTarget: the first address of a fresh subnet is its first assignable \
-         host, got {:?}",
+        // The subnet reserves its first four addresses ("Subnet CIDR blocks", Amazon VPC
+        // User Guide), so the first address a mount target can be given is the fifth.
+        subnet.address_at(4),
+        "CreateMountTarget: the first mount target of a subnet takes its first assignable \
+         address, got {:?}",
         mount.get("IpAddress")
     );
     assert_eq!(
         mount.string("AvailabilityZoneName"),
-        "us-east-1a",
-        "CreateMountTarget: unexpected AvailabilityZoneName, got {:?}",
+        subnet.zone_name,
+        "CreateMountTarget: the zone is the subnet's, as EC2 reports it, got {:?}",
         mount.get("AvailabilityZoneName")
     );
     assert_eq!(
         mount.string("AvailabilityZoneId"),
-        "use1-az1",
-        "CreateMountTarget: unexpected AvailabilityZoneId, got {:?}",
+        subnet.availability_zone_id,
+        "CreateMountTarget: the zone id is the subnet's, as EC2 reports it, got {:?}",
         mount.get("AvailabilityZoneId")
     );
     assert!(
@@ -218,9 +229,10 @@ async fn file_system_and_mount_target_lifecycle_round_trips_through_state() {
         "CreateMountTarget: expected a minted network interface, got {:?}",
         mount.get("NetworkInterfaceId")
     );
-    assert!(
-        mount.string("VpcId").starts_with("vpc-"),
-        "CreateMountTarget: expected the subnet's VPC, got {:?}",
+    assert_eq!(
+        mount.string("VpcId"),
+        subnet.vpc_id,
+        "CreateMountTarget: the VPC is the subnet's, as EC2 reports it, got {:?}",
         mount.get("VpcId")
     );
 
@@ -256,7 +268,7 @@ async fn file_system_and_mount_target_lifecycle_round_trips_through_state() {
     let conflict = efs
         .create_mount_target(json!({
             "FileSystemId": file_system_id,
-            "SubnetId": subnet,
+            "SubnetId": subnet.subnet_id,
         }))
         .await;
     assert_eq!(
@@ -269,6 +281,12 @@ async fn file_system_and_mount_target_lifecycle_round_trips_through_state() {
         Some("MountTargetConflict"),
         "second CreateMountTarget in the same subnet: unexpected error type, got {:?}",
         conflict.error_type
+    );
+    assert_eq!(
+        conflict.string("Message"),
+        state::MOUNT_TARGET_ZONE_CONFLICT_MESSAGE,
+        "the per-zone restriction's refusal is one fixed sentence, got {:?}",
+        conflict.get("Message")
     );
 
     // The file system is in use while it has mount targets.
@@ -283,6 +301,15 @@ async fn file_system_and_mount_target_lifecycle_round_trips_through_state() {
         Some("FileSystemInUse"),
         "DeleteFileSystem with a mount target: unexpected error type, got {:?}",
         in_use.error_type
+    );
+    assert_eq!(
+        in_use.string("Message"),
+        format!(
+            "The file system '{file_system_id}' cannot be deleted because it has mount \
+             targets. You must delete the mount targets, and then try again."
+        ),
+        "the in-use refusal names the requested file system and nothing else, got {:?}",
+        in_use.get("Message")
     );
 
     // DeleteMountTarget -> 204 with an empty body; the count goes back down.
@@ -781,17 +808,23 @@ async fn one_zone_file_systems_report_the_published_availability_zone_id() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_refused_create_mount_target_records_no_subnet_facts() {
-    // A subnet id is caller-chosen, so the store that remembers a subnet's zone and
-    // address range must only ever be written by a call that succeeded. Zone letters are
-    // handed out in the order subnets are first RECORDED, which makes the rule
-    // observable: had a refused call recorded its subnet, the next subnet to be recorded
-    // would be pushed off the Region's first zone.
+async fn a_one_zone_file_system_takes_a_mount_target_only_in_its_own_zone() {
+    // "You can create only one mount target for a One Zone file system. You must create
+    // that mount target in the same Availability Zone in which the file system is
+    // located." The zone of a subnet is EC2's fact, so the rows are the account's own
+    // subnets: every one outside the file system's zone is refused, and the one inside it
+    // is accepted.
     let efs = Emulator::new();
+    let subnets = efs.account_subnets().await;
+    assert!(
+        subnets.len() >= 2,
+        "the account must have subnets in at least two zones for this case, got {subnets:?}"
+    );
+    let home = subnets[0].clone();
     let one_zone = efs
         .create_file_system(json!({
             "CreationToken": "one-zone-refusal",
-            "AvailabilityZoneName": "us-east-1b",
+            "AvailabilityZoneName": home.zone_name,
         }))
         .await;
     assert_eq!(
@@ -800,133 +833,118 @@ async fn a_refused_create_mount_target_records_no_subnet_facts() {
         one_zone.status, one_zone.body
     );
     let one_zone_id = one_zone.string("FileSystemId");
-    let plain_id = efs.available_file_system("after-refusal").await;
+    efs.wait_until_available(&one_zone_id).await;
 
-    // Every subnet id here is fresh, and each call is refused AFTER the subnet facts are
-    // resolved, so none of them may leave a record behind.
-    for subnet in [
-        "subnet-0aaaaaaaaaaaaaaa1",
-        "subnet-0aaaaaaaaaaaaaaa2",
-        "subnet-0aaaaaaaaaaaaaaa3",
-    ] {
+    for subnet in subnets.iter().skip(1) {
+        let case = &subnet.subnet_id;
         let refused = efs
             .create_mount_target(json!({
                 "FileSystemId": one_zone_id,
-                "SubnetId": subnet,
+                "SubnetId": subnet.subnet_id,
             }))
             .await;
         assert_eq!(
             refused.status, 400,
-            "case {subnet:?}: a One Zone file system refuses another zone, got {} {:?}",
+            "case {case:?}: a One Zone file system refuses another zone, got {} {:?}",
             refused.status, refused.body
         );
         assert_eq!(
             refused.error_type.as_deref(),
             Some("AvailabilityZonesMismatch"),
-            "case {subnet:?}: expected AvailabilityZonesMismatch, got {:?}",
+            "case {case:?}: expected AvailabilityZonesMismatch, got {:?}",
             refused.error_type
         );
     }
 
-    // The first subnet this emulator actually records still takes the Region's FIRST
-    // zone, which it could not if any refusal above had recorded its own.
+    // None of those refusals stored anything, and the subnet of the file system's own zone
+    // is accepted.
     let accepted = efs
         .create_mount_target(json!({
-            "FileSystemId": plain_id,
-            "SubnetId": "subnet-0bbbbbbbbbbbbbbb0",
+            "FileSystemId": one_zone_id,
+            "SubnetId": home.subnet_id,
         }))
         .await;
     assert_eq!(
         accepted.status, 200,
-        "the first accepted mount target: expected 200, got {} {:?}",
+        "the mount target in the file system's own zone: expected 200, got {} {:?}",
         accepted.status, accepted.body
+    );
+    let stored = efs
+        .describe_mount_targets(&format!("FileSystemId={one_zone_id}"))
+        .await;
+    assert_eq!(
+        stored.get("MountTargets"),
+        &json!([accepted.body.clone()]),
+        "only the accepted create may have stored a mount target, got {:?}",
+        stored.get("MountTargets")
     );
     assert_eq!(
         accepted.string("AvailabilityZoneName"),
-        format!("us-east-1{}", state::AZ_SUFFIXES[0]),
-        "a refused call records no subnet, so the first recorded one takes zone a, got {:?}",
+        home.zone_name,
+        "the accepted mount target sits in the subnet's zone, got {:?}",
         accepted.get("AvailabilityZoneName")
     );
     assert_eq!(
         accepted.string("AvailabilityZoneId"),
-        "use1-az1",
-        "a refused call records no subnet, so the first recorded one takes az1, got {:?}",
+        home.availability_zone_id,
+        "the accepted mount target carries the subnet's zone id, got {:?}",
         accepted.get("AvailabilityZoneId")
-    );
-
-    // The VPC a mount target reports is a pure read of the store, so neither the
-    // refusals above nor the ids minted for the accepted call can have shifted it: a
-    // fresh emulator whose first mount target is accepted straight away reports the same
-    // VPC.
-    let clean = Emulator::new();
-    let clean_file_system = clean.available_file_system("no-refusal").await;
-    let clean_mount = clean
-        .create_mount_target(json!({
-            "FileSystemId": clean_file_system,
-            "SubnetId": "subnet-0bbbbbbbbbbbbbbb0",
-        }))
-        .await;
-    assert_eq!(
-        clean_mount.status, 200,
-        "the unrefused mount target: expected 200, got {} {:?}",
-        clean_mount.status, clean_mount.body
-    );
-    assert_eq!(
-        accepted.string("VpcId"),
-        clean_mount.string("VpcId"),
-        "reading the emulated VPC must write nothing, so refused calls before the first \
-         mount target cannot change it; got {:?} after refusals and {:?} without",
-        accepted.get("VpcId"),
-        clean_mount.get("VpcId")
     );
 }
 
 #[tokio::test]
-async fn mount_targets_take_one_availability_zone_each_and_distinct_addresses() {
+async fn mount_targets_take_one_availability_zone_each_and_addresses_of_their_subnet() {
     let efs = Emulator::new();
     let file_system_id = efs.available_file_system("many-subnets").await;
 
-    // One subnet per zone letter: the Region's zones, in the order the subnets are
-    // first referenced. Each row differs in the subnet id, which is what the
-    // placement rule generalises over.
-    let subnets = [
-        "subnet-00000000000000001",
-        "subnet-00000000000000002",
-        "subnet-00000000000000003",
-        "subnet-00000000000000004",
-        "subnet-00000000000000005",
-        "subnet-00000000000000006",
-    ];
+    // One row per subnet the account has: each differs in the subnet id, the zone and the
+    // address range the rule generalises over, and every one of those facts is EC2's.
+    let subnets = efs.account_subnets().await;
+    assert!(
+        subnets.len() >= 2,
+        "the account must have subnets in at least two zones for this case, got {subnets:?}"
+    );
     let mut zones = Vec::new();
     let mut addresses = Vec::new();
-    let mut vpcs = Vec::new();
-    for (index, subnet) in subnets.iter().enumerate() {
+    for subnet in &subnets {
+        let case = &subnet.subnet_id;
         let mount = efs
             .create_mount_target(json!({
                 "FileSystemId": file_system_id,
-                "SubnetId": subnet,
+                "SubnetId": subnet.subnet_id,
             }))
             .await;
         assert_eq!(
             mount.status, 200,
-            "case {subnet:?}: expected 200, got {} {:?}",
+            "case {case:?}: expected 200, got {} {:?}",
             mount.status, mount.body
         );
         assert_eq!(
             mount.string("SubnetId"),
-            *subnet,
-            "case {subnet:?}: the description names its own subnet, got {:?}",
+            subnet.subnet_id,
+            "case {case:?}: the description names its own subnet, got {:?}",
             mount.get("SubnetId")
         );
-        assert_eq!(
-            mount.string("IpAddress"),
-            format!("10.0.{index}.4"),
-            "case {subnet:?}: each subnet allocates from its own range, got {:?}",
+        assert!(
+            subnet.holds(&mount.string("IpAddress")),
+            "case {case:?}: each subnet allocates out of its own block {}, got {:?}",
+            subnet.cidr_block,
             mount.get("IpAddress")
+        );
+        assert_eq!(
+            mount.string("AvailabilityZoneName"),
+            subnet.zone_name,
+            "case {case:?}: the zone is the subnet's, got {:?}",
+            mount.get("AvailabilityZoneName")
+        );
+        assert_eq!(
+            mount.string("VpcId"),
+            subnet.vpc_id,
+            "case {case:?}: the VPC is the subnet's, got {:?}",
+            mount.get("VpcId")
         );
         zones.push(mount.string("AvailabilityZoneName"));
         addresses.push(mount.string("IpAddress"));
-        vpcs.push(mount.string("VpcId"));
     }
 
     let mut distinct_zones = zones.clone();
@@ -945,16 +963,8 @@ async fn mount_targets_take_one_availability_zone_each_and_distinct_addresses() 
         subnets.len(),
         "each mount target must hold its own address, got {addresses:?}"
     );
-    let mut distinct_vpcs = vpcs.clone();
-    distinct_vpcs.sort();
-    distinct_vpcs.dedup();
-    assert_eq!(
-        distinct_vpcs.len(),
-        1,
-        "every emulated subnet belongs to the one VPC, got {vpcs:?}"
-    );
 
-    // All six are stored against the file system, and the count follows them.
+    // All of them are stored against the file system, and the count follows them.
     let described = efs
         .describe_mount_targets(&format!("FileSystemId={file_system_id}"))
         .await;
@@ -974,30 +984,59 @@ async fn mount_targets_take_one_availability_zone_each_and_distinct_addresses() 
         .await;
     assert_eq!(
         counted.get("FileSystems")[0]["NumberOfMountTargets"],
-        json!(6),
-        "DescribeFileSystems: expected NumberOfMountTargets 6, got {:?}",
+        json!(subnets.len()),
+        "DescribeFileSystems: expected NumberOfMountTargets {}, got {:?}",
+        subnets.len(),
         counted.get("FileSystems")[0]
     );
 
-    // A seventh subnet wraps onto a zone already taken, which is the documented
-    // one-per-zone conflict.
-    let wrapped = efs
-        .create_mount_target(json!({
-            "FileSystemId": file_system_id,
-            "SubnetId": "subnet-00000000000000007",
-        }))
-        .await;
-    assert_eq!(
-        wrapped.status, 409,
-        "a seventh zone: expected 409, got {} {:?}",
-        wrapped.status, wrapped.body
-    );
-    assert_eq!(
-        wrapped.error_type.as_deref(),
-        Some("MountTargetConflict"),
-        "a seventh zone: unexpected error type, got {:?}",
-        wrapped.error_type
-    );
+    // ANOTHER subnet of a zone this file system already has a mount target in — a second
+    // subnet EC2 minted in the first zone — is the documented one-per-zone conflict, with
+    // the same fixed sentence a retry of the original subnet gets.
+    let spare = efs
+        .ec2()
+        .create_subnet()
+        .vpc_id(&subnets[0].vpc_id)
+        // A block of the VPC no default subnet takes: those are its first /20 blocks, one
+        // per zone, so the last /20 of a 172.31.0.0/16 default VPC is free.
+        .cidr_block("172.31.240.0/20")
+        .availability_zone(&subnets[0].zone_name)
+        .send()
+        .await
+        .expect("setup: EC2 must create a second subnet in the first zone")
+        .subnet()
+        .and_then(::aws_sdk_ec2::types::Subnet::subnet_id)
+        .expect("setup: EC2 must report the subnet id it minted")
+        .to_string();
+    for (case, subnet_id) in [
+        ("the subnet the zone's mount target is in", &subnets[0].subnet_id),
+        ("another subnet of that same zone", &spare),
+    ] {
+        let wrapped = efs
+            .create_mount_target(json!({
+                "FileSystemId": file_system_id,
+                "SubnetId": subnet_id,
+            }))
+            .await;
+        assert_eq!(
+            wrapped.status, 409,
+            "case {case:?}: expected 409, got {} {:?}",
+            wrapped.status, wrapped.body
+        );
+        assert_eq!(
+            wrapped.error_type.as_deref(),
+            Some("MountTargetConflict"),
+            "case {case:?}: unexpected error type, got {:?}",
+            wrapped.error_type
+        );
+        assert_eq!(
+            wrapped.string("Message"),
+            state::MOUNT_TARGET_ZONE_CONFLICT_MESSAGE,
+            "case {case:?}: the per-zone refusal is one fixed sentence whichever subnet of \
+             the zone is named, got {:?}",
+            wrapped.get("Message")
+        );
+    }
 
     // Each mount target is reachable on its own id, and only that one.
     for entry in &stored {
@@ -1018,13 +1057,19 @@ async fn mount_targets_take_one_availability_zone_each_and_distinct_addresses() 
 async fn mount_target_addressing_honours_the_requested_address_and_family() {
     let efs = Emulator::new();
     let file_system_id = efs.available_file_system("addressing").await;
+    let subnets = efs.account_subnets().await;
+    let subnet = subnets
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("the account must have a subnet, got {subnets:?}"));
 
-    // A supplied IPv4 address is honoured as it stands.
+    // A supplied IPv4 address of the subnet's own range is honoured as it stands.
+    let requested = subnet.address_at(37);
     let supplied = efs
         .create_mount_target(json!({
             "FileSystemId": file_system_id,
-            "SubnetId": "subnet-0aaaaaaaaaaaaaaa1",
-            "IpAddress": "10.0.0.37",
+            "SubnetId": subnet.subnet_id,
+            "IpAddress": requested,
         }))
         .await;
     assert_eq!(
@@ -1034,7 +1079,7 @@ async fn mount_target_addressing_honours_the_requested_address_and_family() {
     );
     assert_eq!(
         supplied.string("IpAddress"),
-        "10.0.0.37",
+        requested,
         "a supplied IpAddress must be honoured, got {:?}",
         supplied.get("IpAddress")
     );
@@ -1050,8 +1095,8 @@ async fn mount_target_addressing_honours_the_requested_address_and_family() {
     let taken = efs
         .create_mount_target(json!({
             "FileSystemId": other,
-            "SubnetId": "subnet-0aaaaaaaaaaaaaaa1",
-            "IpAddress": "10.0.0.37",
+            "SubnetId": subnet.subnet_id,
+            "IpAddress": requested,
         }))
         .await;
     assert_eq!(
@@ -1066,20 +1111,86 @@ async fn mount_target_addressing_honours_the_requested_address_and_family() {
         taken.error_type
     );
 
-    // The address family follows IpAddressType.
-    let cases: [(&str, &str, bool, bool); 3] = [
-        ("IPV4_ONLY", "subnet-0bbbbbbbbbbbbbbb1", true, false),
-        ("DUAL_STACK", "subnet-0bbbbbbbbbbbbbbb2", true, true),
-        ("IPV6_ONLY", "subnet-0bbbbbbbbbbbbbbb3", false, true),
+    // An address that is not one the subnet can assign is refused rather than stored: the
+    // member is "the IPv4 address within the address range of the specified subnet". The
+    // rows are the three ways an address misses that range — another subnet's block, a
+    // block of no subnet at all, and one of the addresses this subnet reserves.
+    let elsewhere = subnets
+        .get(1)
+        .map(|other| other.address_at(4))
+        .unwrap_or_else(|| "192.0.2.4".to_string());
+    for (case, address) in [
+        ("an address of another subnet of the VPC", elsewhere),
+        ("an address of no subnet of the account", "192.0.2.77".to_string()),
+        ("one of the subnet's own reserved addresses", subnet.address_at(1)),
+    ] {
+        let outside = efs
+            .create_mount_target(json!({
+                "FileSystemId": other,
+                "SubnetId": subnet.subnet_id,
+                "IpAddress": address,
+            }))
+            .await;
+        assert_eq!(
+            (outside.status, outside.error_type.as_deref()),
+            (400, Some("BadRequest")),
+            "case {case:?} ({address}): an address outside what subnet {} can assign must \
+             be refused, got {} {:?}",
+            subnet.subnet_id,
+            outside.status,
+            outside.body
+        );
+    }
+
+    // The address family follows IpAddressType. An IPv6 address can only come out of an
+    // IPv6 range the subnet has, so the account's network is given one first — through
+    // EC2, which owns it.
+    let vpc_ipv6 = efs
+        .ec2()
+        .associate_vpc_cidr_block()
+        .vpc_id(&subnet.vpc_id)
+        .amazon_provided_ipv6_cidr_block(true)
+        .send()
+        .await
+        .expect("setup: EC2 must give the VPC an Amazon-provided IPv6 block")
+        .ipv6_cidr_block_association()
+        .and_then(|association| association.ipv6_cidr_block().map(str::to_string))
+        .expect("setup: EC2 must report the IPv6 block it gave the VPC");
+    let dual_stack_subnet = subnets
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| panic!("the account must have a second subnet, got {subnets:?}"));
+    // The first /64 of the VPC's /56, which no other subnet of it holds.
+    let subnet_ipv6 = format!(
+        "{}/64",
+        vpc_ipv6
+            .split_once("::/")
+            .map(|(prefix, _)| format!("{prefix}::"))
+            .unwrap_or(vpc_ipv6.clone())
+    );
+    efs.ec2()
+        .associate_subnet_cidr_block()
+        .subnet_id(&dual_stack_subnet.subnet_id)
+        .ipv6_cidr_block(&subnet_ipv6)
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("setup: EC2 must associate {subnet_ipv6} with the second subnet: {error:?}")
+        });
+
+    let cases: [(&str, bool, bool); 3] = [
+        ("IPV4_ONLY", true, false),
+        ("DUAL_STACK", true, true),
+        ("IPV6_ONLY", false, true),
     ];
-    for (ip_address_type, subnet, ipv4, ipv6) in cases {
+    for (ip_address_type, ipv4, ipv6) in cases {
         let family = efs
             .available_file_system(&format!("family-{ip_address_type}"))
             .await;
         let mount = efs
             .create_mount_target(json!({
                 "FileSystemId": family,
-                "SubnetId": subnet,
+                "SubnetId": dual_stack_subnet.subnet_id,
                 "IpAddressType": ip_address_type,
             }))
             .await;
@@ -1100,15 +1211,52 @@ async fn mount_target_addressing_honours_the_requested_address_and_family() {
             "case {ip_address_type:?}: Ipv6Address presence, got {:?}",
             mount.get("Ipv6Address")
         );
+        if ipv4 {
+            assert!(
+                dual_stack_subnet.holds(&mount.string("IpAddress")),
+                "case {ip_address_type:?}: the address lies in the subnet's block {}, got {:?}",
+                dual_stack_subnet.cidr_block,
+                mount.get("IpAddress")
+            );
+        }
+        if ipv6 {
+            let prefix = subnet_ipv6
+                .split_once("::/")
+                .map(|(head, _)| head.to_string())
+                .unwrap_or_default();
+            assert!(
+                mount.string("Ipv6Address").starts_with(&prefix),
+                "case {ip_address_type:?}: the IPv6 address comes out of the subnet's block \
+                 {subnet_ipv6}, got {:?}",
+                mount.get("Ipv6Address")
+            );
+        }
     }
+
+    // A subnet with no IPv6 range has no IPv6 address to give.
+    let no_ipv6 = efs.available_file_system("family-no-ipv6").await;
+    let refused = efs
+        .create_mount_target(json!({
+            "FileSystemId": no_ipv6,
+            "SubnetId": subnet.subnet_id,
+            "IpAddressType": "IPV6_ONLY",
+        }))
+        .await;
+    assert_eq!(
+        (refused.status, refused.error_type.as_deref()),
+        (400, Some("BadRequest")),
+        "an IPv6-only mount target in a subnet with no IPv6 block must be refused, got {} {:?}",
+        refused.status,
+        refused.body
+    );
 
     // An address of the family the type excludes is refused.
     let mismatched = efs
         .create_mount_target(json!({
             "FileSystemId": file_system_id,
-            "SubnetId": "subnet-0ccccccccccccccc1",
+            "SubnetId": subnet.subnet_id,
             "IpAddressType": "IPV6_ONLY",
-            "IpAddress": "10.0.9.9",
+            "IpAddress": subnet.address_at(9),
         }))
         .await;
     assert_eq!(
@@ -1125,16 +1273,186 @@ async fn mount_target_addressing_honours_the_requested_address_and_family() {
 }
 
 #[tokio::test]
+async fn mount_target_security_groups_are_replaced_and_read_back() {
+    // RULE: `ModifyMountTargetSecurityGroups` "replaces the security groups in effect for
+    // the network interface associated with a mount target, with the SecurityGroups
+    // provided in the request" — 204 with an empty body — and
+    // `DescribeMountTargetSecurityGroups` "returns the security groups currently in effect
+    // for a mount target", so a read answers exactly the set the last write left. A
+    // `MountTargetId` the account has no mount target under is the modelled 404 on both
+    // paths.
+    //
+    // The rows vary what the rule generalises over: how MANY groups the replacement names
+    // (none, one, several), WHICH ones, their ORDER, and a replacement that repeats the set
+    // already in effect.
+    let efs = Emulator::new();
+    let file_system_id = efs.available_file_system("security-groups").await;
+    let subnet = efs.account_subnet(0).await;
+    let created = efs
+        .create_mount_target(json!({
+            "FileSystemId": file_system_id,
+            "SubnetId": subnet.subnet_id,
+            "SecurityGroups": ["sg-0123456789abcdef0"],
+        }))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "CreateMountTarget: expected 200, got {} {:?}",
+        created.status, created.body
+    );
+    let mount_target_id = created.string("MountTargetId");
+
+    // The create's own set is what the read reports before any modification.
+    let at_create = efs
+        .describe_mount_target_security_groups(&mount_target_id)
+        .await;
+    assert_eq!(
+        (at_create.status, at_create.get("SecurityGroups")),
+        (200, &json!(["sg-0123456789abcdef0"])),
+        "the read must answer the set the create stored, got {} {:?}",
+        at_create.status,
+        at_create.body
+    );
+
+    let replacements: [(&str, Value); 5] = [
+        ("one other group", json!(["sg-00000000000000001"])),
+        (
+            "three groups, in the order the request lists them",
+            json!(["sg-00000000000000003", "sg-00000000000000001", "sg-abcdef01"]),
+        ),
+        (
+            "the same three again, which changes nothing",
+            json!(["sg-00000000000000003", "sg-00000000000000001", "sg-abcdef01"]),
+        ),
+        (
+            "the same three in another order",
+            json!(["sg-abcdef01", "sg-00000000000000003", "sg-00000000000000001"]),
+        ),
+        ("no group at all, which empties the set", json!([])),
+    ];
+    for (case, groups) in replacements {
+        let modified = efs
+            .modify_mount_target_security_groups(
+                &mount_target_id,
+                json!({ "SecurityGroups": groups.clone() }),
+            )
+            .await;
+        assert_eq!(
+            modified.status, 204,
+            "case {case:?}: expected 204, got {} {:?}",
+            modified.status, modified.body
+        );
+        assert_eq!(
+            modified.body_len, 0,
+            "case {case:?}: expected an empty body, got {} byte(s)",
+            modified.body_len
+        );
+        let read = efs
+            .describe_mount_target_security_groups(&mount_target_id)
+            .await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: the read expected 200, got {} {:?}",
+            read.status, read.body
+        );
+        assert_eq!(
+            read.get("SecurityGroups"),
+            &groups,
+            "case {case:?}: the read must answer exactly the replacement, got {:?}",
+            read.get("SecurityGroups")
+        );
+    }
+
+    // A request with no `SecurityGroups` member at all replaces the set with an empty one
+    // too — the member is optional, so nothing is left in effect.
+    let emptied = efs
+        .modify_mount_target_security_groups(&mount_target_id, json!({}))
+        .await;
+    assert_eq!(
+        emptied.status, 204,
+        "an omitted SecurityGroups member: expected 204, got {} {:?}",
+        emptied.status, emptied.body
+    );
+    assert_eq!(
+        efs.describe_mount_target_security_groups(&mount_target_id)
+            .await
+            .get("SecurityGroups"),
+        &json!([]),
+        "an omitted SecurityGroups member leaves no group in effect"
+    );
+
+    // A mount target the account does not have is the modelled 404 on BOTH paths, with the
+    // sentence built from the id the request named.
+    let deleted = efs.delete_mount_target(&mount_target_id).await;
+    assert_eq!(
+        deleted.status, 204,
+        "DeleteMountTarget: expected 204, got {} {:?}",
+        deleted.status, deleted.body
+    );
+    for (case, reply) in [
+        (
+            "the deleted mount target",
+            efs.modify_mount_target_security_groups(
+                &mount_target_id,
+                json!({ "SecurityGroups": ["sg-00000000000000001"] }),
+            )
+            .await,
+        ),
+        (
+            "an id no mount target was ever minted under",
+            efs.modify_mount_target_security_groups(
+                "fsmt-0123456789abcdef",
+                json!({ "SecurityGroups": ["sg-00000000000000001"] }),
+            )
+            .await,
+        ),
+    ] {
+        assert_eq!(
+            (reply.status, reply.error_type.as_deref()),
+            (404, Some("MountTargetNotFound")),
+            "case {case:?}: a mutation of a mount target the account has none of must be \
+             refused as not found, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+    }
+    let dead = efs
+        .modify_mount_target_security_groups(
+            &mount_target_id,
+            json!({ "SecurityGroups": ["sg-00000000000000001"] }),
+        )
+        .await;
+    assert_eq!(
+        dead.string("Message"),
+        format!("Mount target '{mount_target_id}' does not exist."),
+        "the refusal names the requested mount target, got {:?}",
+        dead.get("Message")
+    );
+    let read_back = efs
+        .describe_mount_target_security_groups(&mount_target_id)
+        .await;
+    assert_eq!(
+        (read_back.status, read_back.error_type.as_deref()),
+        (404, Some("MountTargetNotFound")),
+        "the read of a deleted mount target's groups must be refused the same way, got {} {:?}",
+        read_back.status,
+        read_back.body
+    );
+}
+
+#[tokio::test]
 async fn create_mount_target_refuses_each_unsatisfiable_request() {
     let efs = Emulator::new();
     let file_system_id = efs.available_file_system("refusals").await;
+    let subnet = efs.account_subnet(0).await;
+    let subnet_id = subnet.subnet_id.clone();
 
     let cases: Vec<(&str, Value, u16, &str)> = vec![
         (
             "an unknown file system",
             json!({
                 "FileSystemId": "fs-deadbeef",
-                "SubnetId": "subnet-0dddddddddddddddd",
+                "SubnetId": subnet_id,
             }),
             404,
             "FileSystemNotFound",
@@ -1143,7 +1461,7 @@ async fn create_mount_target_refuses_each_unsatisfiable_request() {
             "an IpAddressType outside the modelled enum",
             json!({
                 "FileSystemId": file_system_id,
-                "SubnetId": "subnet-0dddddddddddddddd",
+                "SubnetId": subnet_id,
                 "IpAddressType": "IPV8",
             }),
             400,
@@ -1153,11 +1471,22 @@ async fn create_mount_target_refuses_each_unsatisfiable_request() {
             "a security group that is not a VPC security group id",
             json!({
                 "FileSystemId": file_system_id,
-                "SubnetId": "subnet-0dddddddddddddddd",
+                "SubnetId": subnet_id,
                 "SecurityGroups": ["not-a-group"],
             }),
             400,
             "ValidationException",
+        ),
+        (
+            // A well-formed subnet id the account has no subnet under: the subnet is EC2's
+            // resource, so what the account HAS is EC2's answer.
+            "a subnet the account does not have",
+            json!({
+                "FileSystemId": file_system_id,
+                "SubnetId": "subnet-0dddddddddddddddd",
+            }),
+            400,
+            "SubnetNotFound",
         ),
     ];
 
@@ -1191,7 +1520,7 @@ async fn create_mount_target_refuses_each_unsatisfiable_request() {
     let accepted = efs
         .create_mount_target(json!({
             "FileSystemId": file_system_id,
-            "SubnetId": "subnet-0dddddddddddddddd",
+            "SubnetId": subnet_id,
             "SecurityGroups": ["sg-0123456789abcdef0", "sg-abcdef01"],
         }))
         .await;
@@ -1467,117 +1796,34 @@ async fn describe_file_systems_clamps_a_page_to_the_documented_maximum() {
 }
 
 #[tokio::test]
-async fn the_emulated_vpc_records_subnets_only_up_to_the_published_quota() {
-    // Published VPC quota: "Subnets per VPC: 200" ("Amazon VPC quotas", Amazon VPC User
-    // Guide). Past it a further subnet id names no subnet of this VPC, which is the
-    // modelled SubnetNotFound — and it is what stops a caller naming a fresh subnet on
-    // every request from growing the registry without limit.
-    //
-    // Only a SUCCESSFUL CreateMountTarget records a subnet, so the subnets are grouped
-    // one-per-zone onto a file system of their own and every call below must be accepted.
-    let efs = Emulator::new();
-    let zones = state::AZ_SUFFIXES.len();
-    let groups = state::MAX_SUBNETS_PER_VPC.div_ceil(zones);
-    let mut file_systems = Vec::with_capacity(groups);
-    for group in 0..groups {
-        let created = efs
-            .create_file_system(json!({ "CreationToken": format!("subnet-quota-{group}") }))
-            .await;
-        assert_eq!(
-            created.status, 201,
-            "case group {group}: expected 201, got {} {:?}",
-            created.status, created.body
-        );
-        file_systems.push(created.string("FileSystemId"));
-    }
-    settle().await;
-
-    for index in 0..state::MAX_SUBNETS_PER_VPC {
-        let reply = efs
-            .create_mount_target(json!({
-                "FileSystemId": file_systems[index / zones],
-                "SubnetId": format!("subnet-{index:017x}"),
-            }))
-            .await;
-        assert_eq!(
-            reply.status, 200,
-            "case subnet {index}: expected 200, got {} {:?}",
-            reply.status, reply.body
-        );
-    }
-
-    // The file system of the last, partly filled group still has free zones, so what
-    // refuses the next call is the subnet quota and nothing else.
-    let last = file_systems.last().expect("at least one group").clone();
-    let past_quota = efs
-        .create_mount_target(json!({
-            "FileSystemId": last,
-            "SubnetId": "subnet-0ffffffffffffffff",
-        }))
-        .await;
-    assert_eq!(
-        past_quota.status, 400,
-        "case one subnet past the quota: expected 400, got {} {:?}",
-        past_quota.status, past_quota.body
-    );
-    assert_eq!(
-        past_quota.error_type.as_deref(),
-        Some("SubnetNotFound"),
-        "case one subnet past the quota: unexpected error type, got {:?}",
-        past_quota.error_type
-    );
-
-    // A subnet already recorded still resolves, so the cap refuses only new ones. Subnet
-    // 2 was recorded third, which put it in the Region's third zone — one the last
-    // group's file system has not taken.
-    let recorded = efs
-        .create_mount_target(json!({
-            "FileSystemId": last,
-            "SubnetId": format!("subnet-{:017x}", 2),
-        }))
-        .await;
-    assert_eq!(
-        recorded.status, 200,
-        "case an already recorded subnet: expected 200, got {} {:?}",
-        recorded.status, recorded.body
-    );
-    assert_eq!(
-        recorded.string("AvailabilityZoneName"),
-        format!("us-east-1{}", state::AZ_SUFFIXES[2]),
-        "case an already recorded subnet: it keeps the zone it was first recorded with, got {:?}",
-        recorded.get("AvailabilityZoneName")
-    );
-}
-
-#[tokio::test]
 async fn describe_mount_targets_pages_consistently_from_its_next_marker() {
     let efs = Emulator::new();
     let file_system_id = efs.available_file_system("mt-pages").await;
 
-    let subnets = [
-        "subnet-0eeeeeeeeeeeeeee1",
-        "subnet-0eeeeeeeeeeeeeee2",
-        "subnet-0eeeeeeeeeeeeeee3",
-        "subnet-0eeeeeeeeeeeeeee4",
-        "subnet-0eeeeeeeeeeeeeee5",
-    ];
+    // One mount target per Availability Zone the account's subnets span — the most a file
+    // system can have, since "there can be only one mount target per Availability Zone".
+    let subnets = efs.account_subnets().await;
+    assert!(
+        subnets.len() >= 2,
+        "the account must have subnets in at least two zones for this case, got {subnets:?}"
+    );
     let mut created = Vec::new();
-    for subnet in subnets {
+    for subnet in &subnets {
         let reply = efs
             .create_mount_target(json!({
                 "FileSystemId": file_system_id,
-                "SubnetId": subnet,
+                "SubnetId": subnet.subnet_id,
             }))
             .await;
         assert_eq!(
             reply.status, 200,
-            "creating a mount target in {subnet}: expected 200, got {} {:?}",
-            reply.status, reply.body
+            "creating a mount target in {}: expected 200, got {} {:?}",
+            subnet.subnet_id, reply.status, reply.body
         );
         created.push(reply.string("MountTargetId"));
     }
 
-    for page_size in [1_usize, 2, 5] {
+    for page_size in [1_usize, 2, created.len()] {
         let mut walked: Vec<String> = Vec::new();
         let mut marker: Option<String> = None;
         loop {

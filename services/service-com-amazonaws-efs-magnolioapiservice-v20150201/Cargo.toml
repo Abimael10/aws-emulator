@@ -28,6 +28,15 @@ service-common = { path = "../common" }
 # modelled `@pattern` expressions (`Path`, `TagKey`) are written with.
 fancy-regex = "0.16"
 tracing = { workspace = true }
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): the subnet a `CreateMountTarget` places a mount target in
+# — and that subnet's VPC, Availability Zone and address range — are EC2's resources, so
+# `src/state/ec2_subnets.rs` asks EC2 what the account has rather than deciding it here.
+# Only the generated client is needed; the emulator supplies the transport and credentials.
+aws-sdk-ec2 = { version = "1", default-features = false }
+# `ipnet`: the ONE reading of a subnet's CIDR block — which addresses it can assign to a
+# mount target, and whether an address a request named lies inside it.
+ipnet = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -35,6 +44,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The EC2 service, mounted beside this one in the test harness: that a mount target is
+# placed in a subnet the account really has can only be driven end to end with the owner of
+# subnets on the same engine. DEV-ONLY: this crate depends on no other service's crate
+# outside its tests.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # Lets a suite assert a minted id or ARN against the pattern a consuming service's model
 # carries for it, written out as that model writes it.
 regex = "1.13"
