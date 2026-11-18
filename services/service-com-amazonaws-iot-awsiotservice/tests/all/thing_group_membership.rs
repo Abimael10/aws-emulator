@@ -15,6 +15,10 @@
 //!   end either by name or by ARN: a missing end is `ResourceNotFoundException` (404),
 //!   a group whose membership is its query's is `InvalidRequestException` (400), and a
 //!   repeat of the same add leaves the same one membership;
+//! * a thing belongs to at most the published number of thing groups: the add past that
+//!   bound is `InvalidRequestException` (400) and writes nothing, whatever
+//!   `overrideDynamicGroups` asks for, and the bound counts the memberships the thing
+//!   holds at that moment;
 //! * a group's members are what the group's own reader reports, and a RECURSIVE
 //!   listing is the union of the group's members and those of every group below it;
 //! * a job targeting a thing group runs on the group's MEMBERS: each gets one
@@ -114,6 +118,11 @@ impl Emulator {
 
     async fn add_thing_to_group(&self, body: &Value) -> Reply {
         self.dispatch("PUT", "/thing-groups/addThingToThingGroup", Some(body))
+            .await
+    }
+
+    async fn remove_thing_from_group(&self, body: &Value) -> Reply {
+        self.dispatch("PUT", "/thing-groups/removeThingFromThingGroup", Some(body))
             .await
     }
 
@@ -231,6 +240,12 @@ fn thing_arn(thing_name: &str) -> String {
 fn thing_group_arn(group_name: &str) -> String {
     format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:thinggroup/{group_name}")
 }
+
+/// What AWS IoT publishes as "Maximum number of thing groups a thing can belong to":
+/// the figure the service's bound has to be, asserted in
+/// [`a_thing_belongs_to_at_most_the_published_number_of_thing_groups`] rather than taken
+/// on trust from the store.
+const PUBLISHED_THING_GROUPS_PER_THING: usize = 10;
 
 /// RULE: an add writes the membership, whichever way each end is named, and the
 /// group's reader reports it.
@@ -1258,9 +1273,205 @@ async fn a_bulk_update_is_bounded_by_the_group_limit_for_a_thing() {
         swapped.text()
     );
     let expected: Vec<String> = group_names[1..].to_vec();
-    let groups = emulator.groups_of("one group swapped for another", "sensor-a").await;
+    let groups = emulator
+        .groups_of("one group swapped for another", "sensor-a")
+        .await;
     assert_eq!(
         groups, expected,
         "case one group swapped for another: expected {expected:?}, got {groups:?}"
+    );
+}
+
+/// RULE: a thing belongs to at most [`MAX_THING_GROUPS_PER_THING`] thing groups — the
+/// add AT the bound is written, the add PAST it is refused and writes nothing, and the
+/// bound counts the memberships the thing holds at that moment rather than the adds ever
+/// made.
+#[tokio::test]
+async fn a_thing_belongs_to_at_most_the_published_number_of_thing_groups() {
+    let emulator = Emulator::new();
+    // The bound the service enforces is the published one. `AddThingToThingGroup`
+    // declares no limit error of its own
+    // (`smithy_query(query="operation",operation="AddThingToThingGroup")` lists
+    // InternalFailure, InvalidRequest, ResourceNotFound and Throttling), so the add past
+    // it is the modelled `InvalidRequestException`.
+    assert_eq!(
+        MAX_THING_GROUPS_PER_THING, PUBLISHED_THING_GROUPS_PER_THING,
+        "case the published bound: a thing may belong to {PUBLISHED_THING_GROUPS_PER_THING} \
+         thing groups, the service bounds it at {MAX_THING_GROUPS_PER_THING}"
+    );
+    assert_eq!(
+        emulator.create_thing("sensor-a").await.status,
+        200,
+        "the thing every case adds must be registrable"
+    );
+    // One group MORE than the bound admits, so the last of them is the add past it.
+    // Zero-padded, so the name order the registry and both listings use is the order
+    // these were created in.
+    let group_names: Vec<String> = (0..=MAX_THING_GROUPS_PER_THING)
+        .map(|index| format!("fleet-{index:02}"))
+        .collect();
+    for group_name in &group_names {
+        assert_eq!(
+            emulator.create_group(group_name, &json!({})).await.status,
+            200,
+            "case {group_name}: the group must be creatable"
+        );
+    }
+    let (past_the_bound, within_the_bound) = group_names
+        .split_last()
+        .expect("the case list holds one group past the bound");
+
+    // Every add up to and including the bound is written.
+    for (index, group_name) in within_the_bound.iter().enumerate() {
+        let reply = emulator
+            .add_thing_to_group(&json!({ "thingGroupName": group_name, "thingName": "sensor-a" }))
+            .await;
+        assert_eq!(
+            reply.status,
+            200,
+            "case membership {} of {MAX_THING_GROUPS_PER_THING}: expected 200, got {} body {}",
+            index + 1,
+            reply.status,
+            reply.text()
+        );
+    }
+    let at_the_bound = emulator.groups_of("at the bound", "sensor-a").await;
+    assert_eq!(
+        at_the_bound,
+        within_the_bound.to_vec(),
+        "case at the bound: expected every written membership once, got {at_the_bound:?}"
+    );
+
+    // The add past the bound is refused, however the request is phrased. The rows span
+    // what `overrideDynamicGroups` can ask for and how each end is named, because
+    // neither changes the bound: what that member overrides is a DYNAMIC membership
+    // being dropped to make room, and a dynamic group's membership is its query's, so
+    // there is no such membership here to drop.
+    let refused: Vec<(&str, Value)> = vec![
+        (
+            "overrideDynamicGroups left to its modelled default",
+            json!({ "thingGroupName": past_the_bound, "thingName": "sensor-a" }),
+        ),
+        (
+            "overrideDynamicGroups false",
+            json!({
+                "thingGroupName": past_the_bound,
+                "thingName": "sensor-a",
+                "overrideDynamicGroups": false,
+            }),
+        ),
+        (
+            "overrideDynamicGroups true",
+            json!({
+                "thingGroupName": past_the_bound,
+                "thingName": "sensor-a",
+                "overrideDynamicGroups": true,
+            }),
+        ),
+        (
+            "both ends named by ARN",
+            json!({
+                "thingGroupArn": thing_group_arn(past_the_bound),
+                "thingArn": thing_arn("sensor-a"),
+                "overrideDynamicGroups": true,
+            }),
+        ),
+    ];
+    // The limit refusal names the thing from the request and the bound itself; a single
+    // add and a bulk update state the same rule the same way.
+    let over_the_limit = format!(
+        "Thing sensor-a cannot belong to more than {MAX_THING_GROUPS_PER_THING} thing groups"
+    );
+    for (case, body) in &refused {
+        let reply = emulator.add_thing_to_group(body).await;
+        assert_eq!(
+            reply.status,
+            400,
+            "case {case}: expected 400, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+        assert_eq!(
+            reply.error_code(),
+            "InvalidRequestException",
+            "case {case}: got {}",
+            reply.text()
+        );
+        assert_eq!(
+            reply.error_message(),
+            over_the_limit,
+            "case {case}: got {}",
+            reply.text()
+        );
+        // Nothing was written: the group past the bound holds no thing, and the thing's
+        // own listing still reports only the memberships it had.
+        let members = emulator.things_in(case, past_the_bound, "").await;
+        assert!(
+            members.is_empty(),
+            "case {case}: a refused add must write no membership, got {members:?}"
+        );
+        let groups = emulator.groups_of(case, "sensor-a").await;
+        assert_eq!(
+            groups,
+            within_the_bound.to_vec(),
+            "case {case}: a refused add must leave the thing's groups as they were, got \
+             {groups:?}"
+        );
+    }
+
+    // A thing at the bound re-added to a group it is ALREADY in names no new membership,
+    // so that add is still a 200 and leaves the same memberships.
+    let first_group = within_the_bound
+        .first()
+        .expect("the case list holds a group within the bound");
+    let repeat = emulator
+        .add_thing_to_group(&json!({ "thingGroupName": first_group, "thingName": "sensor-a" }))
+        .await;
+    assert_eq!(
+        repeat.status,
+        200,
+        "case a repeat of a membership the thing holds: expected 200, got {} body {}",
+        repeat.status,
+        repeat.text()
+    );
+
+    // The bound counts the memberships the thing holds NOW: giving one up makes room for
+    // exactly one more.
+    let removed = emulator
+        .remove_thing_from_group(&json!({ "thingGroupName": first_group, "thingName": "sensor-a" }))
+        .await;
+    assert_eq!(
+        removed.status,
+        200,
+        "case a membership given up: expected 200, got {} body {}",
+        removed.status,
+        removed.text()
+    );
+    let readmitted = emulator
+        .add_thing_to_group(&json!({ "thingGroupName": past_the_bound, "thingName": "sensor-a" }))
+        .await;
+    assert_eq!(
+        readmitted.status,
+        200,
+        "case the add the removal made room for: expected 200, got {} body {}",
+        readmitted.status,
+        readmitted.text()
+    );
+    let mut expected_groups: Vec<String> = within_the_bound[1..].to_vec();
+    expected_groups.push(past_the_bound.clone());
+    let after = emulator.groups_of("after the removal", "sensor-a").await;
+    assert_eq!(
+        after, expected_groups,
+        "case after the removal: expected the group given up gone and the new one in its \
+         place, got {after:?}"
+    );
+    let members = emulator
+        .things_in("after the removal", past_the_bound, "")
+        .await;
+    assert_eq!(
+        members,
+        vec!["sensor-a".to_string()],
+        "case after the removal: the group's own reader must report the written membership, \
+         got {members:?}"
     );
 }
