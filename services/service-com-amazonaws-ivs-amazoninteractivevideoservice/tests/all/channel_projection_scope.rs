@@ -50,11 +50,12 @@ const UNCONFIGURED: &str = "";
 /// admits, written out rather than minted because `CreatePlaybackRestrictionPolicy` is
 /// still scaffolded in this emulator: what the rows below vary is which ARN a channel
 /// carries, and a channel create stores the ARN the request names.
-const POLICY_ARN: &str = "arn:aws:ivs:us-east-1:000000000000:playback-restriction-policy/listed";
+pub(crate) const POLICY_ARN: &str =
+    "arn:aws:ivs:us-east-1:000000000000:playback-restriction-policy/listed";
 
 /// Mint a recording configuration and answer its ARN, so a row attaches a resource this
 /// emulator really holds.
-async fn recording_configuration(ivs: &Ivs, name: &str) -> String {
+pub(crate) async fn recording_configuration(ivs: &Ivs, name: &str) -> String {
     let created = ivs
         .ok(
             "CreateRecordingConfiguration",
@@ -66,7 +67,7 @@ async fn recording_configuration(ivs: &Ivs, name: &str) -> String {
 }
 
 /// Mint an ad configuration and answer its ARN.
-async fn ad_configuration(ivs: &Ivs, name: &str) -> String {
+pub(crate) async fn ad_configuration(ivs: &Ivs, name: &str) -> String {
     let created = ivs
         .ok(
             "CreateAdConfiguration",
