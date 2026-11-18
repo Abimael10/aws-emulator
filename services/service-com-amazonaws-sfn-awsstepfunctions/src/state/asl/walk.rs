@@ -2145,6 +2145,19 @@ impl Interpreter<'_> {
                 return (Err(failure), at);
             }
             let began = super::super::now();
+            // The PUBLICATION a `Task` state makes is this service's own call: the entries
+            // are the state's document, and what Step Functions adds to each of them is
+            // the attribution of the publication to the run that made it — the execution's
+            // ARN and its state machine's
+            // ([`super::super::integration::publication_request`]). Every other call is
+            // made with the document the state built, unchanged.
+            let attributed = super::super::integration::publication_request(
+                &call,
+                &request,
+                &me.execution_arn,
+                me.state_machine_arn(),
+            );
+            let called = attributed.as_ref().unwrap_or(&request);
             // A CALLBACK task's token goes out WITH this call, and it answers the task
             // from that instant: the work it reaches may report the task's outcome from
             // inside this very call. So it is handed over BEFORE the call is made, which
@@ -2153,7 +2166,18 @@ impl Interpreter<'_> {
             if let Some(token) = &token {
                 me.tasks.hand_over(token, &me.execution_arn, name);
             }
-            let answered = me.tasks.perform(&call, &request, me.call_within(within));
+            let answered = me.tasks.perform(&call, called, me.call_within(within));
+            // A publication the service SERVED but which rejected an entry did not do
+            // this task's work, so it is read as the failure it is before the answer
+            // becomes a result
+            // ([`super::super::integration::rejected_entries`]); every other
+            // answer is carried through as it came back.
+            let answered = answered.and_then(|answer| {
+                match super::super::integration::rejected_entries(&call, &answer) {
+                    Some(failed) => Err(failed),
+                    None => Ok(answer),
+                }
+            });
             // The call has come back, so the handover is over: what it carries, if
             // anything answered it, is this task's own outcome.
             let replied = token

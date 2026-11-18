@@ -4951,3 +4951,7 @@ mod tests;
 /// The catalogue of run-a-job (`.sync`) integrations, and the readings over it.
 mod jobs;
 pub use jobs::*;
+
+/// What a `Task` state's event publication carries, and what a rejected entry makes of it.
+mod published_events;
+pub use published_events::*;

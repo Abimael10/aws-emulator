@@ -147,16 +147,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a refusable entry never reaches the registry or the matcher.
         let screened: Vec<Screened> = input.entries.into_iter().map(|entry| screen(entry, now)).collect();
 
-        // "If you submit a request in which NONE of the entries have each of
-        // these properties, EventBridge fails the entire request"
-        // (`PutPartnerEventsRequestEntry`'s documentation of `Detail`,
-        // `DetailType` and `Source`). The refusal names the property the FIRST
-        // entry was missing, so a caller sees which one to add.
-        if let Some(member) = all_entries_incomplete(&screened) {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::required_member_violation(member),
-            ));
-        }
+        // Each check of PASS 1 fails its OWN entry: a property of one entry is
+        // reported on that entry's row of the answer, which is the channel this
+        // operation carries for exactly that, so a batch no entry of which names
+        // an event is answered with every row failed rather than refused as a
+        // request (see `super::put_events`, which answers for the same rule).
 
         let mut entries: Vec<PutPartnerEventsResultEntry> = Vec::with_capacity(screened.len());
         let mut failed = 0usize;
@@ -178,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ::std::collections::BTreeMap::new();
             for slot in screened {
                 let accepted = match slot {
-                    Screened::Refused { result, .. } => {
+                    Screened::Refused(result) => {
                         failed += 1;
                         entries.push(result);
                         continue;
@@ -369,14 +364,10 @@ fn refused(code: &str, message: String) -> PutPartnerEventsResultEntry {
 
 /// What this call decided about one entry before the registry was consulted.
 enum Screened {
-    /// Refused by a check that needs no state at all. `missing` names the
-    /// required entry property the entry did not provide, when that is WHY it
-    /// was refused — which is what decides whether the whole request is refused
-    /// instead (see [`all_entries_incomplete`]).
-    Refused {
-        result: PutPartnerEventsResultEntry,
-        missing: Option<&'static str>,
-    },
+    /// Refused by a check that needs no state at all: a property of the ENTRY,
+    /// so it is reported on that entry's own row of the answer and the rest of
+    /// the batch is published.
+    Refused(PutPartnerEventsResultEntry),
     /// Acceptable so far; the registry still has to resolve its source.
     Accepted(Accepted),
 }
@@ -388,21 +379,6 @@ struct Accepted {
     detail: Option<String>,
     resources: Vec<String>,
     time: ::std::time::SystemTime,
-}
-
-/// The required entry property the FIRST entry is missing, when EVERY entry of
-/// the request is missing one of them — and `None` as soon as a single entry
-/// names an event, which is the case the per-entry failure envelope reports.
-fn all_entries_incomplete(screened: &[Screened]) -> Option<&'static str> {
-    let mut first: Option<&'static str> = None;
-    for slot in screened {
-        let missing = match slot {
-            Screened::Refused { missing, .. } => (*missing)?,
-            Screened::Accepted(_) => return None,
-        };
-        first = first.or(Some(missing));
-    }
-    first
 }
 
 /// Screen ONE entry against the checks that depend only on the entry: the
@@ -419,22 +395,16 @@ fn screen(entry: PutPartnerEventsRequestEntry, now: ::std::time::SystemTime) -> 
         entry.detail_type.as_deref(),
         entry.detail.as_deref(),
     ) {
-        return Screened::Refused {
-            result: refused(
-                INVALID_ARGUMENT,
-                crate::state::required_member_violation(member),
-            ),
-            missing: Some(member),
-        };
+        return Screened::Refused(refused(
+            INVALID_ARGUMENT,
+            crate::state::required_member_violation(member),
+        ));
     }
 
     // A limit the entry's own documentation states while the model expresses
     // none of it (`DetailType`'s 128 characters today).
     if let Some(violation) = crate::state::entry_limit_violation(entry.detail_type.as_deref()) {
-        return Screened::Refused {
-            result: refused(INVALID_ARGUMENT, violation),
-            missing: None,
-        };
+        return Screened::Refused(refused(INVALID_ARGUMENT, violation));
     }
 
     // `Detail` is "a valid JSON string" (this entry's own documentation), which
@@ -442,10 +412,10 @@ fn screen(entry: PutPartnerEventsRequestEntry, now: ::std::time::SystemTime) -> 
     if let Some(detail) = entry.detail.as_deref() {
         let parsed = ::serde_json::from_str::<::serde_json::Value>(detail);
         if !parsed.is_ok_and(|value| value.is_object()) {
-            return Screened::Refused {
-                result: refused(MALFORMED_DETAIL, "Detail is malformed.".to_string()),
-                missing: None,
-            };
+            return Screened::Refused(refused(
+                MALFORMED_DETAIL,
+                "Detail is malformed.".to_string(),
+            ));
         }
     }
 
@@ -461,17 +431,14 @@ fn screen(entry: PutPartnerEventsRequestEntry, now: ::std::time::SystemTime) -> 
         &resources,
     );
     if size >= crate::state::MAX_ENTRY_SIZE_BYTES {
-        return Screened::Refused {
-            result: refused(
-                INVALID_ARGUMENT,
-                format!(
-                    "Total size of the entries in the request is {size} bytes, which exceeds the \
-                     maximum entry size of {} bytes.",
-                    crate::state::MAX_ENTRY_SIZE_BYTES
-                ),
+        return Screened::Refused(refused(
+            INVALID_ARGUMENT,
+            format!(
+                "Total size of the entries in the request is {size} bytes, which exceeds the \
+                 maximum entry size of {} bytes.",
+                crate::state::MAX_ENTRY_SIZE_BYTES
             ),
-            missing: None,
-        };
+        ));
     }
 
     Screened::Accepted(Accepted {

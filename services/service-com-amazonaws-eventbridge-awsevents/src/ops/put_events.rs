@@ -89,8 +89,12 @@
 //! `FailedEntryCount` is the number of entries that were
 //! NOT accepted, computed from those per-entry outcomes. An entry that does not
 //! provide each of `Detail`, `DetailType` and `Source` names no event, so it
-//! fails on its own — and a request in which NO entry provides all three is
-//! refused whole, as is one whose entries total more than the published size
+//! fails on its OWN ROW whatever the rest of the batch looks like — a batch no
+//! entry of which names an event is answered with every row failed, not refused
+//! as a request (the recorded answer to such a request is this per-entry
+//! envelope, which is what a `PutEvents` task's failure reports the rejected
+//! entries out of). What IS refused whole is a request whose entries total more
+//! than the published size
 //! bound ([`crate::state::MAX_ENTRY_SIZE_BYTES`]), which is charged on the
 //! request rather than on one entry. An entry whose `Source` claims the `aws.`
 //! namespace AWS
@@ -326,25 +330,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // PASS 1 — no lock, no routing: the checks that depend only on the
-        // entry itself, so a refusable entry never reaches the matcher.
+        // entry itself, so a refusable entry never reaches the matcher. Each of
+        // them fails its OWN entry: an entry's own property is reported on that
+        // entry's row of the answer, which is the channel this operation carries
+        // for exactly that (see this module's own documentation).
         let mut screened: Vec<Screened> = input
             .entries
             .into_iter()
             .map(|entry| screen(entry, now, service_publication))
             .collect();
-
-        // "If you submit a request in which NONE of the entries have each of
-        // these properties, EventBridge fails the entire request"
-        // (`PutEventsRequestEntry`'s documentation of `Detail`, `DetailType`
-        // and `Source`): a request in which every entry names no event at all
-        // is refused as a request, not reported entry by entry. The refusal
-        // names the property the FIRST entry was missing, so a caller sees
-        // which one to add.
-        if let Some(member) = all_entries_incomplete(&screened) {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::required_member_violation(member),
-            ));
-        }
 
         // PASS 1b — AUTHORIZE the publication, before an `EventId` is minted for
         // any entry. Publishing onto an event bus is the action
@@ -474,7 +468,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut failed = 0usize;
         for slot in screened {
             let accepted = match slot {
-                Screened::Refused { result, .. } => {
+                Screened::Refused(result) => {
                     failed += 1;
                     entries.push(result);
                     continue;
@@ -1079,31 +1073,12 @@ fn refused(code: &str, message: String) -> PutEventsResultEntry {
 
 /// What this call decided about one entry before any routing happened.
 enum Screened {
-    /// Refused by a check that needs no state at all. `missing` names the
-    /// required entry property the entry did not provide, when that is WHY it
-    /// was refused — which is what decides whether the whole request is
-    /// refused instead (see [`all_entries_incomplete`]).
-    Refused {
-        result: PutEventsResultEntry,
-        missing: Option<&'static str>,
-    },
+    /// Refused by a check that needs no state at all: a property of the ENTRY,
+    /// so it is reported on that entry's own row of the answer and the rest of
+    /// the batch is published.
+    Refused(PutEventsResultEntry),
     /// Acceptable so far; routing still has to resolve its bus.
     Accepted(Accepted),
-}
-
-/// The required entry property the FIRST entry is missing, when EVERY entry of
-/// the request is missing one of them — and `None` as soon as a single entry
-/// names an event, which is the case the per-entry failure envelope reports.
-fn all_entries_incomplete(screened: &[Screened]) -> Option<&'static str> {
-    let mut first: Option<&'static str> = None;
-    for slot in screened {
-        let missing = match slot {
-            Screened::Refused { missing, .. } => (*missing)?,
-            Screened::Accepted(_) => return None,
-        };
-        first = first.or(Some(missing));
-    }
-    first
 }
 
 /// The refusal the policies in force state against this request, or `None` when
@@ -1293,22 +1268,18 @@ fn screen(
         entry.detail_type.as_deref(),
         entry.detail.as_deref(),
     ) {
-        return Screened::Refused {
-            result: refused(
-                INVALID_ARGUMENT,
-                crate::state::required_member_violation(member),
-            ),
-            missing: Some(member),
-        };
+        return Screened::Refused(refused(
+            INVALID_ARGUMENT,
+            crate::state::required_member_violation(member),
+        ));
     }
 
     // The `aws.` namespace belongs to Amazon Web Services' own services: an
     // event whose `Source` is in it asserts an AWS service as its origin, and
     // nothing a caller can be granted lets it publish one. This is an entry's
     // own property, so the entry fails on its own row through the per-entry
-    // failure channel while the rest of the batch is still published. It is NOT
-    // a missing required property, so it never contributes to the whole-request
-    // refusal that an entry naming no event does.
+    // failure channel while the rest of the batch is still published — as every
+    // other property of one entry does.
     //
     // An emulated AWS service publishing ITS OWN events is the one origin the
     // namespace is for, and it never reaches this service over a socket: see
@@ -1318,13 +1289,10 @@ fn screen(
     let may_claim_namespace = service_publication
         && entry.source.as_deref().is_some_and(is_service_source);
     if !may_claim_namespace && entry.source.as_deref().is_some_and(is_reserved_source) {
-        return Screened::Refused {
-            result: refused(
-                NOT_AUTHORIZED_FOR_SOURCE,
-                NOT_AUTHORIZED_FOR_SOURCE_MESSAGE.to_string(),
-            ),
-            missing: None,
-        };
+        return Screened::Refused(refused(
+            NOT_AUTHORIZED_FOR_SOURCE,
+            NOT_AUTHORIZED_FOR_SOURCE_MESSAGE.to_string(),
+        ));
     }
 
     // A limit the entry's own documentation states while the model expresses
@@ -1332,10 +1300,7 @@ fn screen(
     // before this handler runs, and an entry past it is one AWS would not
     // publish, so it is failed per entry rather than published.
     if let Some(violation) = crate::state::entry_limit_violation(entry.detail_type.as_deref()) {
-        return Screened::Refused {
-            result: refused(INVALID_ARGUMENT, violation),
-            missing: None,
-        };
+        return Screened::Refused(refused(INVALID_ARGUMENT, violation));
     }
 
     // "PutEvents accepts the data in JSON format" and `Detail` is "a valid JSON
@@ -1349,10 +1314,7 @@ fn screen(
     // a document past the bound is refused here without being read.
     if let Some(detail) = entry.detail.as_deref() {
         if let Err(refusal) = crate::state::validate_detail(detail) {
-            return Screened::Refused {
-                result: refused(MALFORMED_DETAIL, refusal.message()),
-                missing: None,
-            };
+            return Screened::Refused(refused(MALFORMED_DETAIL, refusal.message()));
         }
     }
 

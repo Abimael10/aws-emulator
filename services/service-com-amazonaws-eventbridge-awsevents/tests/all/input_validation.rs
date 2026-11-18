@@ -15,8 +15,8 @@
 //! 3. A rule whose duplicate-`Id` `PutTargets` was refused therefore carries no
 //!    targets, so `DeleteRule` deletes it without `Force`.
 //! 4. A published event entry that does not provide each of `Detail`, `DetailType`
-//!    and `Source` fails on its own, naming the first property it is missing; a
-//!    request in which no entry provides all three fails entirely.
+//!    and `Source` fails on its own row, naming the first property it is missing,
+//!    whatever the rest of the batch looks like.
 //! 5. A published event entry whose `Detail` is not a JSON object is failed per entry
 //!    under the documented `MalformedDetail` code.
 //! 6. A published event entry whose `DetailType` is longer than the documented
@@ -553,9 +553,10 @@ async fn put_targets_refuses_a_target_whose_arn_is_not_an_arn() {
 }
 
 /// `Detail`, `DetailType` and `Source` are all required for an entry to name an
-/// event: an entry that does not provide one fails on its own, naming the first
-/// property it is missing in the order the entry documents them — and a request in
-/// which NO entry provides all three fails ENTIRELY, with 400. The rows differ along
+/// event: an entry that does not provide one fails ON ITS OWN ROW, naming the first
+/// property it is missing in the order the entry documents them, whatever the rest of
+/// the batch looks like — so a request in which NO entry provides all three is
+/// answered 200 with every row failed rather than refused. The rows differ along
 /// which properties an entry omits and along how many entries the request carries.
 #[tokio::test]
 async fn put_events_requires_detail_detail_type_and_source_per_entry() {
@@ -665,25 +666,32 @@ async fn put_events_requires_detail_detail_type_and_source_per_entry() {
         );
     }
 
-    // A request in which NO entry provides all three properties fails entirely: 400,
-    // nothing published, and the refusal names the first property the first entry is
-    // missing. The rows differ along the entry count and the properties omitted.
-    let whole_request: Vec<(&str, Value, &str)> = vec![
-        ("one entry with nothing at all", json!([{}]), "Detail"),
+    // A request in which NO entry provides all three properties is answered the SAME
+    // way — per entry: 200, every row failed under the property that row is missing,
+    // and nothing published. The rows differ along the entry count and the properties
+    // omitted.
+    //
+    // The entry's own documentation says such a request fails entirely; what a
+    // recorded run of one carries is this per-entry envelope, which is what a Step
+    // Functions `PutEvents` task reads its own failure out of, so the per-entry
+    // channel is where a property of an entry is reported however many entries have
+    // one wrong.
+    let every_entry_incomplete: Vec<(&str, Value, Vec<&str>)> = vec![
+        ("one entry with nothing at all", json!([{}]), vec!["Detail"]),
         (
             "one entry without Detail",
             json!([{ "Source": "com.demo.widgets", "DetailType": "Order Created" }]),
-            "Detail",
+            vec!["Detail"],
         ),
         (
             "one entry without DetailType",
             json!([{ "Source": "com.demo.widgets", "Detail": "{}" }]),
-            "DetailType",
+            vec!["DetailType"],
         ),
         (
             "one entry without Source",
             json!([{ "DetailType": "Order Created", "Detail": "{}" }]),
-            "Source",
+            vec!["Source"],
         ),
         (
             "two entries, each missing a different property",
@@ -691,7 +699,7 @@ async fn put_events_requires_detail_detail_type_and_source_per_entry() {
                 { "Source": "com.demo.widgets", "DetailType": "Order Created" },
                 { "DetailType": "Order Created", "Detail": "{}" },
             ]),
-            "Detail",
+            vec!["Detail", "Source"],
         ),
         (
             "three entries, none complete",
@@ -700,35 +708,50 @@ async fn put_events_requires_detail_detail_type_and_source_per_entry() {
                 { "Detail": "{}" },
                 {},
             ]),
-            "DetailType",
+            vec!["DetailType", "DetailType", "Detail"],
         ),
     ];
 
-    for (case, entries, expected_member) in &whole_request {
+    for (case, entries, missing) in &every_entry_incomplete {
         let before = delivered_count(&emulator);
         let (status, body) = call(&emulator, "PutEvents", &json!({ "Entries": entries })).await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: expected the whole request to be refused, got {status} {body}"
+            status, 200,
+            "case {case:?}: expected 200 with a row per entry, got {status} {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {body}"
+            body["FailedEntryCount"],
+            json!(missing.len()),
+            "case {case:?}: expected every entry counted as failed, got {body}"
         );
-        let expected = format!(
-            "Parameter {expected_member} is not valid. Reason: {expected_member} is a \
-             required argument."
-        );
-        let actual = message(&body);
-        assert_eq!(
-            actual, expected,
-            "case {case:?}: expected {expected:?}, got {actual:?}"
-        );
+        for (index, member) in missing.iter().enumerate() {
+            let entry = &body["Entries"][index];
+            assert_eq!(
+                entry.get("ErrorCode").and_then(Value::as_str),
+                Some("InvalidArgument"),
+                "case {case:?} entry {index}: expected ErrorCode InvalidArgument, got {entry}"
+            );
+            let expected = format!(
+                "Parameter {member} is not valid. Reason: {member} is a required argument."
+            );
+            let actual = entry
+                .get("ErrorMessage")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                actual, expected,
+                "case {case:?} entry {index}: expected {expected:?}, got {actual:?}"
+            );
+            assert_eq!(
+                entry.get("EventId"),
+                None,
+                "case {case:?} entry {index}: a failed row carries no EventId, got {entry}"
+            );
+        }
         assert_eq!(
             delivered_count(&emulator),
             before,
-            "case {case:?}: a refused request publishes nothing"
+            "case {case:?}: an entry that names no event publishes nothing"
         );
     }
 }
