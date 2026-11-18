@@ -392,9 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             slurm_configuration: input.slurm_configuration.map(Into::into),
             error_info: Vec::new(),
             tags: input.tags.unwrap_or_default(),
-            pending: Some(crate::state::Pending::in_a_span(
-                crate::state::PendingChange::Activate,
-            )),
+            pending: Some(crate::state::PendingChange::Activate),
         };
         cluster.queues.insert(id.clone(), record);
         state.remember_create(

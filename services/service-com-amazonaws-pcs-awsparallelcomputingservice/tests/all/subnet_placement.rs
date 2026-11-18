@@ -28,7 +28,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
-use crate::cluster_lifecycle::{call, emulator, wait_past_the_owed_transition};
+use crate::cluster_lifecycle::{call, emulator};
 
 /// The region every case signs for, matching the scope `crate::cluster_lifecycle` signs
 /// with: the Region a request is signed for is the one its subnets are resolved in.
@@ -350,7 +350,6 @@ async fn compute_node_group_subnets_are_resolved_the_same_way() {
     )
     .await;
     assert_eq!(status, 200, "case create the cluster: got {created}");
-    wait_past_the_owed_transition().await;
 
     let group = |name: &str, subnets: &[String]| {
         json!({

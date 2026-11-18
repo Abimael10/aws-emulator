@@ -3,8 +3,8 @@
 //! @op UpdateCluster
 //! Applies an update to a STORED cluster: refuses a scheduler version the service cannot
 //! move a cluster to, merges the requested Slurm options into the stored record, and
-//! reports the cluster `UPDATING` until the clock owes it `ACTIVE` again. `GetCluster`
-//! reads back exactly what this wrote.
+//! reports the cluster `UPDATING`, which the service owes `ACTIVE` again from the next
+//! request on. `GetCluster` reads back exactly what this wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -256,13 +256,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
         }
         if changed {
-            // PCS reports a cluster as UPDATING while it applies the change; the clock
-            // owes it ACTIVE again.
+            // PCS reports a cluster as UPDATING while it applies the change; the service
+            // owes it ACTIVE again from the next request on.
             cluster.status = crate::state::STATUS_UPDATING.to_string();
             cluster.modified_at = crate::state::now_date_time();
-            cluster.pending = Some(crate::state::Pending::in_a_span(
-                crate::state::PendingChange::Activate,
-            ));
+            cluster.pending = Some(crate::state::PendingChange::Activate);
         }
 
         // Answered from the STORED record, so the update and a later read cannot differ.

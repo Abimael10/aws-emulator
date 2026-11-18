@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! Moves the cluster to `DELETING` in [`crate::state`]; the clock then owes its
-//! removal, after which `GetCluster` answers 404 and `ListClusters` no longer lists it.
+//! Moves the cluster to `DELETING` in [`crate::state`]; the service owes its removal from
+//! the next request on, after which `GetCluster` answers 404 and `ListClusters` no longer
+//! lists it.
 //!
 //! ## Shape of an operation
 //!
@@ -196,12 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // PCS reports a cluster as DELETING until it is gone; the clock owes the removal.
+        // PCS reports a cluster as DELETING until it is gone; the service owes the
+        // removal from the next request on.
         cluster.status = crate::state::STATUS_DELETING.to_string();
         cluster.modified_at = crate::state::now_date_time();
-        cluster.pending = Some(crate::state::Pending::in_a_span(
-            crate::state::PendingChange::Remove,
-        ));
+        cluster.pending = Some(crate::state::PendingChange::Remove);
         Ok(DeleteClusterOutput {})
     }
 }

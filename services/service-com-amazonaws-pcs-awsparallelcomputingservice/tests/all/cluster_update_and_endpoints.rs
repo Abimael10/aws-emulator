@@ -9,7 +9,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 
-use crate::cluster_lifecycle::{call, emulator, wait_past_the_owed_transition};
+use crate::cluster_lifecycle::{call, emulator};
 
 /// Values that LABEL a scheduler release, so the service carries on with them.
 ///
@@ -153,8 +153,6 @@ async fn an_active_cluster_publishes_the_scheduler_endpoints_its_configuration_e
             created["cluster"]["endpoints"].is_null(),
             "case {case}: expected no endpoints while CREATING, got {created}"
         );
-
-        wait_past_the_owed_transition().await;
 
         let published = endpoints_of(&router, &name).await;
         let types: Vec<&str> = published
@@ -307,7 +305,6 @@ async fn update_cluster_accepts_every_scheduler_release_label() {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    wait_past_the_owed_transition().await;
 
     // The update path holds `version` to the same rule, so every release label is applied
     // and reads back — including the ones no printed list names.
@@ -329,8 +326,6 @@ async fn update_cluster_accepts_every_scheduler_release_label() {
             json!(version),
             "case update to {version}: got {updated}"
         );
-
-        wait_past_the_owed_transition().await;
 
         let (status, settled) =
             call(&router, "GetCluster", &json!({"clusterIdentifier": &id})).await;
@@ -406,7 +401,6 @@ async fn update_cluster_persists_the_slurm_options_the_request_carries() {
     )
     .await;
     assert_eq!(status, 200, "case create: got {created}");
-    wait_past_the_owed_transition().await;
 
     // `scaleDownIdleTimeInSeconds` is `@range(min: 1, max: 10000000)`: both published
     // bounds and a value between them are accepted and persist.
@@ -426,8 +420,6 @@ async fn update_cluster_persists_the_slurm_options_the_request_carries() {
             json!("UPDATING"),
             "case scaleDownIdleTime {seconds}: expected the transient status, got {updated}"
         );
-
-        wait_past_the_owed_transition().await;
 
         let (status, settled) =
             call(&router, "GetCluster", &json!({"clusterIdentifier": name})).await;
@@ -481,7 +473,6 @@ async fn update_cluster_persists_the_slurm_options_the_request_carries() {
     )
     .await;
     assert_eq!(status, 200, "case accounting on: got {updated}");
-    wait_past_the_owed_transition().await;
 
     let (status, settled) = call(&router, "GetCluster", &json!({"clusterIdentifier": name})).await;
     assert_eq!(status, 200, "case accounting on: got {settled}");
@@ -552,8 +543,12 @@ async fn update_cluster_refuses_a_cluster_it_cannot_find_or_cannot_update() {
         );
     }
 
-    // A cluster that has not finished provisioning cannot be updated.
-    let name = "still-creating";
+    // The transition a create owes is materialised before the next request is answered, so
+    // the cluster a create has just accepted is updatable on the request that FOLLOWS it.
+    // (An update of a cluster that has not finished provisioning is refused; that refusal
+    // is covered in `tests/all/cluster_lifecycle/settles_on_the_next_request.rs`, which
+    // holds a cluster in CREATING.)
+    let name = "freshly-created";
     let (status, created) = call(
         &router,
         "CreateCluster",
@@ -561,33 +556,8 @@ async fn update_cluster_refuses_a_cluster_it_cannot_find_or_cannot_update() {
     )
     .await;
     assert_eq!(status, 200, "case create: got {created}");
-    let (status, refused) = call(
-        &router,
-        "UpdateCluster",
-        &json!({
-            "clusterIdentifier": name,
-            "slurmConfiguration": {"scaleDownIdleTimeInSeconds": 700},
-        }),
-    )
-    .await;
-    assert_eq!(
-        status, CLIENT_ERROR_STATUS,
-        "case update while CREATING: expected a conflict, got {refused}"
-    );
-    assert_eq!(
-        refused["__type"],
-        json!("ConflictException"),
-        "case update while CREATING: got {refused}"
-    );
-    assert_eq!(
-        refused["message"],
-        json!("A cluster isn't in ACTIVE status."),
-        "case update while CREATING: got {refused}"
-    );
 
-    wait_past_the_owed_transition().await;
-
-    // Once it is ACTIVE the same request is served, resolved by name OR by id.
+    // The same request is served, resolved by name OR by id.
     let (status, updated) = call(
         &router,
         "UpdateCluster",
@@ -602,7 +572,6 @@ async fn update_cluster_refuses_a_cluster_it_cannot_find_or_cannot_update() {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    wait_past_the_owed_transition().await;
     let (status, by_id) = call(
         &router,
         "UpdateCluster",
@@ -631,7 +600,6 @@ async fn a_not_found_refusal_names_the_resource_kind_and_no_identifier() {
     )
     .await;
     assert_eq!(status, 200, "case create: got {created}");
-    wait_past_the_owed_transition().await;
 
     // Two identifiers of each of the forms `ClusterIdentifier` allows: the sentence is
     // the same for every one of them, so it carries none of them.

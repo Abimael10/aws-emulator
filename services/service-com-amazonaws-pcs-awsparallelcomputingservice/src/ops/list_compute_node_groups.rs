@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller = crate::state::cluster_authorization::caller_principal_arn(&*self.engine, ctx);
 
         // A reporting operation: the one write is `settle`, which materialises only the
-        // lifecycle transitions the clock had already made due.
+        // lifecycle transitions an earlier request had already made due.
         let mut state = state.lock();
         state.settle();
 

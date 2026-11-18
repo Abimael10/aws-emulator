@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteComputeNodeGroup
-//! Moves the compute node group to `DELETING` in [`crate::state`]; the clock then owes it
-//! `DELETED` and, a span later, its removal, after which `GetComputeNodeGroup` answers 404
-//! and `ListComputeNodeGroups` no longer lists it.
+//! Moves the compute node group to `DELETING` in [`crate::state`]; the service then owes
+//! it `DELETED` on the next request and its removal on the one after that, after which
+//! `GetComputeNodeGroup` answers 404 and `ListComputeNodeGroups` no longer lists it.
 //!
 //! "You must delete all queues associated with the compute node group first", so a group a
 //! queue of its cluster still assigns jobs to is refused with `ConflictException` (HTTP
@@ -254,12 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // PCS reports the group as DELETING until the delete comes due, then DELETED for
-        // one span before the record is forgotten (see [`crate::state::STATUS_DELETED`]).
+        // one request before the record is forgotten (see
+        // [`crate::state::STATUS_DELETED`]).
         group.status = crate::state::STATUS_DELETING.to_string();
         group.modified_at = crate::state::now_date_time();
-        group.pending = Some(crate::state::Pending::in_a_span(
-            crate::state::PendingChange::MarkDeleted,
-        ));
+        group.pending = Some(crate::state::PendingChange::MarkDeleted);
         Ok(DeleteComputeNodeGroupOutput {})
     }
 }

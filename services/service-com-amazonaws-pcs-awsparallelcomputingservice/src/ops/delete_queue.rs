@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteQueue
-//! Moves the queue to `DELETING` in [`crate::state`]; the clock then owes its removal,
-//! after which `GetQueue` answers 404 and `ListQueues` no longer lists it.
+//! Moves the queue to `DELETING` in [`crate::state`]; the service owes its removal from
+//! the next request on, after which `GetQueue` answers 404 and `ListQueues` no longer
+//! lists it.
 //!
 //! A queue that is not settled \u2014 still being provisioned, or already on its way out \u2014 has
 //! another operation of its own in flight, so deleting it is refused with
@@ -236,12 +237,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // PCS reports the queue as DELETING until it is gone; the clock owes the removal.
+        // PCS reports the queue as DELETING until it is gone; the service owes the
+        // removal from the next request on.
         queue.status = crate::state::STATUS_DELETING.to_string();
         queue.modified_at = crate::state::now_date_time();
-        queue.pending = Some(crate::state::Pending::in_a_span(
-            crate::state::PendingChange::Remove,
-        ));
+        queue.pending = Some(crate::state::PendingChange::Remove);
         Ok(DeleteQueueOutput {})
     }
 }

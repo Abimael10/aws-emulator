@@ -38,7 +38,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 use service_com_amazonaws_pcs_awsparallelcomputingservice::state::MAX_TAGS_PER_RESOURCE;
 
-use super::cluster_lifecycle::{call, emulator, wait_past_the_owed_transition};
+use super::cluster_lifecycle::{call, emulator};
 
 /// The fixed tail of the sentence IAM states a refusal it cannot decide the question on
 /// with: the resource may not exist, a policy may deny the action, or no policy may grant
@@ -156,7 +156,6 @@ async fn every_client_error_carries_one_status_and_names_its_class_in_the_body()
         .as_str()
         .unwrap_or_default()
         .to_string();
-    wait_past_the_owed_transition().await;
 
     // A tag write past the ceiling the service holds a resource's tag set to.
     let past_the_tag_ceiling: Value = (0..=MAX_TAGS_PER_RESOURCE)
@@ -322,7 +321,6 @@ async fn a_resolvable_cluster_is_refused_about_the_resource_the_call_names() {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    wait_past_the_owed_transition().await;
 
     // Addressed by either form of the identifier of a cluster that EXISTS, no call is
     // refused about the caller: it is served, or refused about the child it names.
@@ -445,7 +443,6 @@ async fn a_cluster_scoped_delete_is_refused_by_what_its_cluster_identifier_resol
         .as_str()
         .unwrap_or_default()
         .to_string();
-    wait_past_the_owed_transition().await;
     let (status, group) = call(
         &router,
         "CreateComputeNodeGroup",
@@ -464,7 +461,6 @@ async fn a_cluster_scoped_delete_is_refused_by_what_its_cluster_identifier_resol
     )
     .await;
     assert_eq!(status, 200, "setup: CreateQueue: got {queue}");
-    wait_past_the_owed_transition().await;
 
     // The forms and widths the NAME alternative of `ClusterIdentifier` admits
     // (`smithy_query(query="shape",shape="ClusterIdentifier")`:
@@ -597,13 +593,17 @@ async fn a_cluster_scoped_delete_is_refused_by_what_its_cluster_identifier_resol
 
     // And a child that IS there deletes, so the refusals above are the cluster boundary and
     // not a delete that never works: the queue addressed by the cluster's name, the compute
-    // node group by its generated id.
-    for (operation, request, reader, member) in [
+    // node group by its generated id. The removal each delete owes is materialised before
+    // the next request is answered, so the read that FOLLOWS it reports the settled child —
+    // gone for a queue, and `DELETED` for a compute node group, the one resource whose
+    // status enum declares that member.
+    for (operation, request, reader, member, settled) in [
         (
             "DeleteQueue",
             json!({"clusterIdentifier": "held-cluster", "queueIdentifier": "work"}),
             "GetQueue",
             "queue",
+            None,
         ),
         (
             "DeleteComputeNodeGroup",
@@ -613,6 +613,7 @@ async fn a_cluster_scoped_delete_is_refused_by_what_its_cluster_identifier_resol
             }),
             "GetComputeNodeGroup",
             "computeNodeGroup",
+            Some("DELETED"),
         ),
     ] {
         let (status, deleted) = call(&router, operation, &request).await;
@@ -621,12 +622,20 @@ async fn a_cluster_scoped_delete_is_refused_by_what_its_cluster_identifier_resol
             "case {operation} of a child the cluster holds: got {status} with {deleted}"
         );
         let (status, read) = call(&router, reader, &request).await;
-        assert_eq!(
-            (status, read[member]["status"].as_str()),
-            (200, Some("DELETING")),
-            "case {operation}: expected the child reported DELETING straight after the \
-             delete, got {status} with {read}"
-        );
+        match settled {
+            Some(expected) => assert_eq!(
+                (status, read[member]["status"].as_str()),
+                (200, Some(expected)),
+                "case {operation}: expected the child reported {expected} on the request \
+                 that follows the delete, got {status} with {read}"
+            ),
+            None => assert_eq!(
+                (status, error_code(&read).as_str()),
+                (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+                "case {operation}: expected the child gone on the request that follows the \
+                 delete, got {status} with {read}"
+            ),
+        }
     }
 
     // None of the refused calls wrote anything: the account still holds the one cluster the

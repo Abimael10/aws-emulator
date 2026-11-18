@@ -151,8 +151,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A reporting operation. The one write it drives is `settle`, which materialises
-        // only the lifecycle transitions the CLOCK had already made due — owed at this
-        // same instant even if nobody had called.
+        // only the lifecycle transitions an EARLIER request had already made due — owed
+        // at this same instant even if nobody had called.
         let mut state = state.lock();
         state.settle();
 

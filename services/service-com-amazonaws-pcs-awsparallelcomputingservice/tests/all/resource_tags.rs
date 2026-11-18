@@ -23,13 +23,10 @@
 //! others.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
-use service_com_amazonaws_pcs_awsparallelcomputingservice::state::{
-    MAX_TAGS_PER_RESOURCE, TRANSITION_SPAN,
-};
+use service_com_amazonaws_pcs_awsparallelcomputingservice::state::MAX_TAGS_PER_RESOURCE;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A SigV4 `Authorization` header scoped to `pcs` in `us-east-1`. The router resolves a
@@ -87,13 +84,6 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
     (status, parsed)
 }
 
-/// Wait out the span the service stores for a lifecycle transition the clock owes, so the
-/// next call sees it materialised. The service never sleeps for it — this is the CALLER
-/// waiting, as a caller of the real service would.
-async fn wait_past_the_owed_transition() {
-    tokio::time::sleep(TRANSITION_SPAN + Duration::from_millis(250)).await;
-}
-
 /// The three taggable PCS resources, each ACTIVE and carrying the tags its create asked
 /// for: the cluster, a compute node group inside it and a queue inside it, by ARN.
 struct Tagged {
@@ -104,7 +94,7 @@ struct Tagged {
 }
 
 /// Create a cluster, a compute node group and a queue, each with `tags` set on the
-/// create, and wait until the clock has made them all ACTIVE.
+/// create. Each is ACTIVE from the request that follows its own create on.
 async fn tagged_resources(router: &MultiServiceRouter, tags: &Value) -> Tagged {
     let (status, cluster) = call(
         router,
@@ -121,7 +111,6 @@ async fn tagged_resources(router: &MultiServiceRouter, tags: &Value) -> Tagged {
     assert_eq!(status, 200, "case CreateCluster: got {cluster}");
     let cluster_id = string_at(&cluster, &["cluster", "id"]);
     let cluster_arn = string_at(&cluster, &["cluster", "arn"]);
-    wait_past_the_owed_transition().await;
 
     let (status, group) = call(
         router,
@@ -156,7 +145,6 @@ async fn tagged_resources(router: &MultiServiceRouter, tags: &Value) -> Tagged {
     .await;
     assert_eq!(status, 200, "case CreateQueue: got {queue}");
     let queue_arn = string_at(&queue, &["queue", "arn"]);
-    wait_past_the_owed_transition().await;
 
     Tagged {
         cluster_arn,
@@ -691,8 +679,8 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
     }
 
     // A resource that existed and is gone is in the same class: a cluster of its own,
-    // with no children to delete first, carries tags while it lives and none once the
-    // clock has removed it.
+    // with no children to delete first, carries tags while it lives and none once its
+    // removal has been materialised.
     let (status, body) = call(
         &router,
         "CreateCluster",
@@ -707,7 +695,6 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
     .await;
     assert_eq!(status, 200, "case CreateCluster gone-cluster: got {body}");
     let gone_arn = string_at(&body, &["cluster", "arn"]);
-    wait_past_the_owed_transition().await;
     let while_alive = listed_tags(&router, &gone_arn).await;
     assert_eq!(
         while_alive,
@@ -724,7 +711,6 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
     )
     .await;
     assert_eq!(status, 200, "case DeleteCluster: got {body}");
-    wait_past_the_owed_transition().await;
 
     let (status, body) = call(
         &router,

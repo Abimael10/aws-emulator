@@ -11,10 +11,12 @@
 //! so no two operations can disagree about them:
 //!
 //! * [`ComAmazonawsPcsAwsparallelcomputingserviceState::settle`] — the lifecycle
-//!   transitions the CLOCK owes. A created resource is reported `CREATING` and becomes
-//!   `ACTIVE` once [`TRANSITION_SPAN`] has elapsed; a deleted cluster is reported
-//!   `DELETING` and then disappears. The due instant is stored and checked on the next
-//!   call, so nothing ever sleeps.
+//!   transitions the service owes. A created resource is reported `CREATING` by the call
+//!   that created it and is `ACTIVE` from the next request on; a deleted cluster is
+//!   reported `DELETING` and then disappears. Each change is owed from the instant the
+//!   call that starts it answers and is materialised by the settle pass at the top of the
+//!   NEXT request ([`PendingChange`]), so nothing sleeps and no caller has to let
+//!   wall-clock time pass to observe an outcome the service has already decided.
 //! * the identifier rules: minting a `pcs_...` id, building an ARN, resolving a
 //!   `clusterIdentifier`/`queueIdentifier`/`computeNodeGroupIdentifier` by name OR id,
 //!   and refusing a resource name the boundary validator cannot refuse
@@ -60,7 +62,6 @@ pub mod cluster_authorization;
 pub mod instance_profile;
 
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
 
 use ::aws_smithy_types::DateTime;
 
@@ -96,12 +97,12 @@ pub const STATUS_DELETING: &str = "DELETING";
 /// declares a `DELETED` member (`COMPUTE_NODE_GROUP_STATUS_VALUES` in
 /// `crate::ops::types`, against `CLUSTER_STATUS_VALUES` and `QUEUE_STATUS_VALUES`), so a
 /// deleted compute node group is a thing the API can report and a deleted cluster or queue
-/// is not: the group is reported `DELETED` for one span and then forgotten, while a queue
-/// and a cluster go straight from `DELETING` to gone.
+/// is not: the group is reported `DELETED` for one request and then forgotten, while a
+/// queue and a cluster go straight from `DELETING` to gone.
 pub const STATUS_DELETED: &str = "DELETED";
 
 /// The status a cluster carries while an `UpdateCluster` is being applied (a
-/// `ClusterStatus` member), until the clock owes it [`STATUS_ACTIVE`] again.
+/// `ClusterStatus` member), until the service owes it [`STATUS_ACTIVE`] again.
 pub const STATUS_UPDATING: &str = "UPDATING";
 
 /// The cluster statuses an update can start from: "You can only update clusters that are
@@ -154,14 +155,6 @@ pub const SLURMRESTD_PORT: &str = "6820";
 /// The `NetworkType` member a cluster whose control plane is addressed over IPv6 carries.
 pub const NETWORK_TYPE_IPV6: &str = "IPV6";
 
-/// How long after the call that starts it a PCS lifecycle transition the clock owes
-/// comes due: a created resource leaving `CREATING`, a deleted cluster leaving
-/// `DELETING` and disappearing. PCS itself takes minutes to provision a cluster; the
-/// emulator keeps the transient state observable to the caller that acts straight after
-/// the call, and never sleeps for it — the due instant is stored and read on the next
-/// call.
-pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
-
 /// The `maxResults` a list operation serves when the request names none: the
 /// `@default(10)` the model declares on `MaxResults`.
 pub const DEFAULT_PAGE_SIZE: usize = 10;
@@ -210,40 +203,32 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// caller retrying long after the fact would get from the real service too.
 pub const MAX_REMEMBERED_CLIENT_TOKENS: usize = 1024;
 
-/// What the clock owes a resource once its pending transition comes due.
+/// A lifecycle transition this service owes a resource, materialised by the settle pass
+/// at the top of the NEXT request.
+///
+/// PCS decides the outcome of a create, an update or a delete when it accepts the call:
+/// that call answers the transient status the real service reports (`CREATING`,
+/// `UPDATING`, `DELETING`), and the change it owes is due from the instant it answers.
+/// No span of the emulator's own is interposed, so a client whose polling interval is
+/// sized against the minutes the real service spends provisioning observes the settled
+/// resource on its FIRST probe instead of paying one whole interval per transition, and a
+/// workflow that chains several lifecycle waits converges as fast as the service can
+/// answer.
+///
+/// What keeps that exact: every handler calls
+/// [`ComAmazonawsPcsAwsparallelcomputingserviceState::settle`] as its first act on this
+/// store, before it owes anything of its own, so a change owed during one request is
+/// never materialised by that same request — the call that starts a transition still
+/// reports the transient status, and the request that follows it sees the settled one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingChange {
-    /// `CREATING` -> [`STATUS_ACTIVE`].
+    /// `CREATING` (or `UPDATING`) -> [`STATUS_ACTIVE`].
     Activate,
     /// `DELETING` -> [`STATUS_DELETED`], and then owed [`PendingChange::Remove`] (see
     /// [`STATUS_DELETED`] for why only a compute node group takes this step).
     MarkDeleted,
     /// `DELETING` -> gone from state.
     Remove,
-}
-
-/// A transition the clock owes a resource, and the instant it comes due.
-#[derive(Debug, Clone, Copy)]
-pub struct Pending {
-    /// The instant from which the change is owed. Never read by sleeping on it.
-    pub due_at: Instant,
-    /// The change the clock owes.
-    pub change: PendingChange,
-}
-
-impl Pending {
-    /// The change, owed [`TRANSITION_SPAN`] after now.
-    pub fn in_a_span(change: PendingChange) -> Self {
-        Self {
-            due_at: Instant::now() + TRANSITION_SPAN,
-            change,
-        }
-    }
-
-    /// Whether `now` has reached the due instant.
-    fn is_due(self, now: Instant) -> bool {
-        now >= self.due_at
-    }
 }
 
 /// A persisted cluster: everything `GetCluster`, `ListClusters` and the child creates
@@ -284,8 +269,8 @@ pub struct ClusterRecord {
     pub compute_node_groups: HashMap<String, ComputeNodeGroupRecord>,
     /// The cluster's queues, by generated id.
     pub queues: HashMap<String, QueueRecord>,
-    /// The transition the clock owes this cluster, if any.
-    pub pending: Option<Pending>,
+    /// The transition this service owes this cluster, if any.
+    pub pending: Option<PendingChange>,
 }
 
 /// A persisted compute node group, stored under its parent cluster.
@@ -331,8 +316,8 @@ pub struct ComputeNodeGroupRecord {
     pub error_info: Vec<ErrorInfo>,
     /// The tags the create request carried.
     pub tags: HashMap<String, String>,
-    /// The transition the clock owes this group, if any.
-    pub pending: Option<Pending>,
+    /// The transition this service owes this group, if any.
+    pub pending: Option<PendingChange>,
 }
 
 /// A persisted queue, stored under its parent cluster.
@@ -362,8 +347,8 @@ pub struct QueueRecord {
     pub error_info: Vec<ErrorInfo>,
     /// The tags the create request carried.
     pub tags: HashMap<String, String>,
-    /// The transition the clock owes this queue, if any.
-    pub pending: Option<Pending>,
+    /// The transition this service owes this queue, if any.
+    pub pending: Option<PendingChange>,
 }
 
 impl ClusterRecord {
@@ -464,14 +449,12 @@ impl ClusterRecord {
                 .count()
     }
 
-    /// Apply every transition the clock owes this cluster and its children at `now`.
+    /// Apply every transition this service owes this cluster and its children.
     /// `true` means the cluster itself is now owed removal.
-    fn settle(&mut self, now: Instant) -> bool {
-        self.compute_node_groups
-            .retain(|_, group| !group.settle(now));
-        self.queues.retain(|_, queue| !queue.settle(now));
-        let removable =
-            apply_pending(&mut self.pending, &mut self.status, &mut self.modified_at, now);
+    fn settle(&mut self) -> bool {
+        self.compute_node_groups.retain(|_, group| !group.settle());
+        self.queues.retain(|_, queue| !queue.settle());
+        let removable = apply_pending(&mut self.pending, &mut self.status, &mut self.modified_at);
         // A cluster that has finished provisioning publishes the scheduler endpoints its
         // own configuration enables. Derived from the stored record, so recomputing it
         // is idempotent: a read can never change what a later caller sees.
@@ -554,13 +537,17 @@ impl ComputeNodeGroupRecord {
         }
     }
 
-    /// Apply the transition the clock owes this group at `now`; `true` means removal.
-    fn settle(&mut self, now: Instant) -> bool {
-        apply_pending(&mut self.pending, &mut self.status, &mut self.modified_at, now)
+    /// Apply the transition this service owes this group; `true` means removal.
+    fn settle(&mut self) -> bool {
+        apply_pending(&mut self.pending, &mut self.status, &mut self.modified_at)
     }
 
     /// Whether this group is already on its way out, so it blocks no delete of the
     /// cluster that holds it.
+    ///
+    /// This is the exclusion a later request still needs: a group deleted one request ago
+    /// is reported [`STATUS_DELETED`] and is still held, so a caller tearing a cluster
+    /// down in order is not made to wait for the record to be forgotten.
     pub fn is_being_deleted(&self) -> bool {
         self.status == STATUS_DELETING || self.status == STATUS_DELETED
     }
@@ -609,13 +596,19 @@ impl QueueRecord {
         }
     }
 
-    /// Apply the transition the clock owes this queue at `now`; `true` means removal.
-    fn settle(&mut self, now: Instant) -> bool {
-        apply_pending(&mut self.pending, &mut self.status, &mut self.modified_at, now)
+    /// Apply the transition this service owes this queue; `true` means removal.
+    fn settle(&mut self) -> bool {
+        apply_pending(&mut self.pending, &mut self.status, &mut self.modified_at)
     }
 
     /// Whether this queue is already on its way out, so it blocks neither the delete of
     /// a compute node group it assigns jobs to nor the delete of its cluster.
+    ///
+    /// A queue is `DELETING` only between the delete that moved it and the next request,
+    /// which removes it, so this answers `true` for a queue the SAME request deleted. The
+    /// compute node group is the resource a later request still finds on its way out,
+    /// because its own status enum declares [`STATUS_DELETED`]
+    /// ([`ComputeNodeGroupRecord::is_being_deleted`]).
     pub fn is_being_deleted(&self) -> bool {
         self.status == STATUS_DELETING
     }
@@ -788,15 +781,16 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
         client_token_order.retain(|key| client_tokens.contains_key(key));
     }
 
-    /// Apply every lifecycle transition the clock owes at this instant. Called at the
-    /// top of every handler, including the reporting ones: it only materialises a change
-    /// that was already due, so a read never moves a status the clock had not reached.
+    /// Apply every lifecycle transition this service owes. Called as the FIRST act of
+    /// every handler on this store, including the reporting ones: it materialises only
+    /// changes a previous request already owed, so a read never moves a status this
+    /// service had not already decided, and a change owed by the request running now is
+    /// left for the next one.
     pub fn settle(&mut self) {
-        let now = Instant::now();
         let removable: Vec<String> = self
             .clusters
             .iter_mut()
-            .filter_map(|(id, cluster)| cluster.settle(now).then(|| id.clone()))
+            .filter_map(|(id, cluster)| cluster.settle().then(|| id.clone()))
             .collect();
         for id in removable {
             if let Some(cluster) = self.clusters.remove(&id) {
@@ -853,34 +847,30 @@ fn control_plane_ipv6(seq: u64) -> String {
     format!("fd00::{seq:x}")
 }
 
-/// Apply the transition the clock owes one record at `now`; `true` means the record is
-/// owed removal and its owner should drop it.
+/// Apply the transition this service owes one record; `true` means the record is owed
+/// removal and its owner should drop it.
 ///
 /// Shared by all three record types so a new [`PendingChange`] variant cannot end up
 /// handled three different ways.
 fn apply_pending(
-    pending: &mut Option<Pending>,
+    pending: &mut Option<PendingChange>,
     status: &mut String,
     modified_at: &mut DateTime,
-    now: Instant,
 ) -> bool {
-    match *pending {
-        Some(owed) if owed.is_due(now) => match owed.change {
-            PendingChange::Activate => {
-                *status = STATUS_ACTIVE.to_string();
-                *modified_at = now_date_time();
-                *pending = None;
-                false
-            }
-            PendingChange::MarkDeleted => {
-                *status = STATUS_DELETED.to_string();
-                *modified_at = now_date_time();
-                *pending = Some(Pending::in_a_span(PendingChange::Remove));
-                false
-            }
-            PendingChange::Remove => true,
-        },
-        _ => false,
+    match pending.take() {
+        Some(PendingChange::Activate) => {
+            *status = STATUS_ACTIVE.to_string();
+            *modified_at = now_date_time();
+            false
+        }
+        Some(PendingChange::MarkDeleted) => {
+            *status = STATUS_DELETED.to_string();
+            *modified_at = now_date_time();
+            *pending = Some(PendingChange::Remove);
+            false
+        }
+        Some(PendingChange::Remove) => true,
+        None => false,
     }
 }
 

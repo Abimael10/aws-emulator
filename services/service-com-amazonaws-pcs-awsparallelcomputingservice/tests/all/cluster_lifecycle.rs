@@ -7,14 +7,25 @@
 //!
 //! Each test builds its own engine, so the state one test writes is invisible to the
 //! others.
+//!
+//! WHEN a lifecycle transition becomes observable is its own suite, in the submodule
+//! below (`tests/all/cluster_lifecycle/settles_on_the_next_request.rs`): a transition this
+//! service owes is materialised before the NEXT request is answered, so the tests here
+//! never wait on the wall clock for one.
 
-use std::time::Duration;
+// `tests/all/cluster_lifecycle.rs` is itself loaded by `#[path]` from `tests/all.rs`, so
+// a submodule of it is looked up beside it rather than in a directory named after it: the
+// `#[path]` here is what points at `tests/all/cluster_lifecycle/`. The layout check
+// declares suites DIRECTLY under `tests/all/`; a file deeper than that is declared by its
+// own parent module, which is this one.
+#[path = "cluster_lifecycle/settles_on_the_next_request.rs"]
+mod settles_on_the_next_request;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 use service_com_amazonaws_pcs_awsparallelcomputingservice::state::{
     MAX_CLUSTERS, MAX_COMPUTE_NODE_GROUPS_PER_CLUSTER, MAX_QUEUES_PER_CLUSTER,
-    MAX_STORED_LIST_ENTRIES, TRANSITION_SPAN,
+    MAX_STORED_LIST_ENTRIES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -30,13 +41,20 @@ const REGION: &str = "us-east-1";
 
 /// An emulator with only PCS mounted, on its own engine.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// [`emulator`], handing back the engine it was built on as well, for a test that has to
+/// put a record into a state no sequence of requests can leave it in.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>)
+{
     let engine = std::sync::Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_pcs_awsparallelcomputingservice::EmulatedService::new(engine),
+        service_com_amazonaws_pcs_awsparallelcomputingservice::EmulatedService::new(engine.clone()),
     );
-    router
+    (router, engine)
 }
 
 /// Call one operation and return its HTTP status and JSON body.
@@ -72,15 +90,21 @@ pub(crate) async fn call(
     (status, parsed)
 }
 
-/// Wait out the span the service stores for a lifecycle transition the clock owes, so
-/// the next call sees it materialised. The service never sleeps for it — this is the
-/// CALLER waiting, as a caller of the real service would.
-pub(crate) async fn wait_past_the_owed_transition() {
-    tokio::time::sleep(TRANSITION_SPAN + Duration::from_millis(250)).await;
+/// `resource` without `members`, so what a create stored can be compared WHOLE against
+/// what the next read answers, minus only the members a settled lifecycle transition
+/// moves.
+fn without_members(resource: &Value, members: &[&str]) -> Value {
+    let mut stripped = resource.clone();
+    if let Some(object) = stripped.as_object_mut() {
+        for member in members {
+            object.remove(*member);
+        }
+    }
+    stripped
 }
 
 /// A `CreateCluster` request carrying every `@required` member.
-fn create_cluster(name: &str, size: &str) -> Value {
+pub(crate) fn create_cluster(name: &str, size: &str) -> Value {
     json!({
         "clusterName": name,
         "scheduler": {"type": "SLURM", "version": "24.11"},
@@ -95,7 +119,7 @@ fn create_cluster(name: &str, size: &str) -> Value {
 
 /// A `CreateComputeNodeGroup` request carrying every `@required` member. The instance
 /// profile ARN satisfies `InstanceProfileArn`'s `@pattern`, which the boundary enforces.
-fn create_compute_node_group(cluster: &str, name: &str) -> Value {
+pub(crate) fn create_compute_node_group(cluster: &str, name: &str) -> Value {
     json!({
         "clusterIdentifier": cluster,
         "computeNodeGroupName": name,
@@ -111,7 +135,7 @@ fn create_compute_node_group(cluster: &str, name: &str) -> Value {
 }
 
 /// A `CreateQueue` request, assigning the queue to `groups`.
-fn create_queue(cluster: &str, name: &str, groups: &[&str]) -> Value {
+pub(crate) fn create_queue(cluster: &str, name: &str, groups: &[&str]) -> Value {
     json!({
         "clusterIdentifier": cluster,
         "queueName": name,
@@ -122,16 +146,15 @@ fn create_queue(cluster: &str, name: &str, groups: &[&str]) -> Value {
     })
 }
 
-/// Create a cluster and wait until the clock has made it ACTIVE, answering its id.
+/// Create a cluster and answer its id. The request that follows the create observes it
+/// `ACTIVE`, so there is nothing to wait for.
 async fn active_cluster(router: &MultiServiceRouter, name: &str) -> String {
     let (status, body) = call(router, "CreateCluster", &create_cluster(name, "SMALL")).await;
     assert_eq!(status, 200, "case create {name}: got {body}");
-    let id = body["cluster"]["id"]
+    body["cluster"]["id"]
         .as_str()
         .unwrap_or_default()
-        .to_string();
-    wait_past_the_owed_transition().await;
-    id
+        .to_string()
 }
 
 #[tokio::test]
@@ -172,7 +195,8 @@ async fn a_cluster_round_trips_through_create_get_list_and_delete() {
     );
 
     // The identifier resolves by either of the two forms `ClusterIdentifier` allows, and
-    // both answer the record the create stored.
+    // both answer the record the create stored, with the transition the create owed
+    // already materialised: the VERY NEXT request after the create reports ACTIVE.
     for identifier in [id.as_str(), "demo-cluster"] {
         let (status, got) = call(
             &router,
@@ -182,42 +206,25 @@ async fn a_cluster_round_trips_through_create_get_list_and_delete() {
         .await;
         assert_eq!(status, 200, "case GetCluster {identifier}: got {got}");
         assert_eq!(
-            got["cluster"], cluster,
-            "case GetCluster {identifier}: expected exactly what CreateCluster stored, got {got}"
+            got["cluster"]["status"],
+            json!("ACTIVE"),
+            "case GetCluster {identifier}: expected the owed CREATING -> ACTIVE transition \
+             on the request that follows the create, got {got}"
+        );
+        // Everything else the create stored reads back unchanged, compared WHOLE with only
+        // the members a settled transition moves taken out: `status` is asserted above,
+        // `modifiedAt` is set when the owed change is materialised, and `endpoints` are
+        // published once the cluster is provisioned (their own suite is
+        // `tests/all/cluster_update_and_endpoints.rs`). `createdAt` is in the comparison, so
+        // it is shown stable across reads.
+        let moved_by_the_transition = ["status", "modifiedAt", "endpoints"];
+        assert_eq!(
+            without_members(&got["cluster"], &moved_by_the_transition),
+            without_members(&cluster, &moved_by_the_transition),
+            "case GetCluster {identifier}: expected every other member exactly as \
+             CreateCluster stored it, got {got}"
         );
     }
-
-    // A child create needs an ACTIVE cluster, and this one is still CREATING.
-    let (status, refused) = call(
-        &router,
-        "CreateQueue",
-        &create_queue("demo-cluster", "demo-queue", &[]),
-    )
-    .await;
-    assert_eq!(
-        status, CLIENT_ERROR_STATUS,
-        "case CreateQueue while CREATING: expected a conflict, got {refused}"
-    );
-    assert_eq!(
-        refused["__type"],
-        json!("ConflictException"),
-        "case CreateQueue while CREATING: got {refused}"
-    );
-
-    wait_past_the_owed_transition().await;
-
-    let (status, settled) = call(&router, "GetCluster", &json!({"clusterIdentifier": &id})).await;
-    assert_eq!(status, 200, "case GetCluster after the span: got {settled}");
-    assert_eq!(
-        settled["cluster"]["status"],
-        json!("ACTIVE"),
-        "case GetCluster after the span: expected the owed CREATING -> ACTIVE transition, \
-         got {settled}"
-    );
-    assert_eq!(
-        settled["cluster"]["createdAt"], cluster["createdAt"],
-        "case GetCluster after the span: createdAt must be stable across reads, got {settled}"
-    );
 
     // A second cluster of the same name conflicts; the name stays bound to the first id.
     let (status, conflict) = call(
@@ -266,7 +273,9 @@ async fn a_cluster_round_trips_through_create_get_list_and_delete() {
         "case ListClusters: expected the summary to carry the stored id, got {listed}"
     );
 
-    // Delete reports DELETING straight away and the clock owes the removal.
+    // Delete reports DELETING on the record it moves, and the removal it owes is
+    // materialised before the next request is answered: the read that follows the delete
+    // is already a miss, by either identifier form.
     let (status, deleted) = call(
         &router,
         "DeleteCluster",
@@ -274,16 +283,6 @@ async fn a_cluster_round_trips_through_create_get_list_and_delete() {
     )
     .await;
     assert_eq!(status, 200, "case DeleteCluster: got {deleted}");
-
-    let (status, deleting) = call(&router, "GetCluster", &json!({"clusterIdentifier": &id})).await;
-    assert_eq!(status, 200, "case GetCluster while DELETING: got {deleting}");
-    assert_eq!(
-        deleting["cluster"]["status"],
-        json!("DELETING"),
-        "case GetCluster while DELETING: expected the transient state, got {deleting}"
-    );
-
-    wait_past_the_owed_transition().await;
 
     for identifier in [id.as_str(), "demo-cluster"] {
         let (status, gone) = call(
@@ -339,7 +338,8 @@ async fn a_compute_node_group_and_a_queue_round_trip_through_their_readers() {
         "case CreateComputeNodeGroup: expected the requested scaling bounds, got {group}"
     );
 
-    // Read it back through its own reader: the create persisted it.
+    // Read it back through its own reader: the create persisted it, and the request that
+    // follows the create reports the group ACTIVE.
     for identifier in [group_id.as_str(), "demo-cng"] {
         let (status, got) = call(
             &router,
@@ -352,8 +352,19 @@ async fn a_compute_node_group_and_a_queue_round_trip_through_their_readers() {
         .await;
         assert_eq!(status, 200, "case GetComputeNodeGroup {identifier}: got {got}");
         assert_eq!(
-            got["computeNodeGroup"], group,
-            "case GetComputeNodeGroup {identifier}: expected what the create stored, got {got}"
+            got["computeNodeGroup"]["status"],
+            json!("ACTIVE"),
+            "case GetComputeNodeGroup {identifier}: expected the owed CREATING -> ACTIVE \
+             transition on the request that follows the create, got {got}"
+        );
+        // As for the cluster: compared whole, without the two members the settled
+        // transition moves.
+        let moved_by_the_transition = ["status", "modifiedAt"];
+        assert_eq!(
+            without_members(&got["computeNodeGroup"], &moved_by_the_transition),
+            without_members(&group, &moved_by_the_transition),
+            "case GetComputeNodeGroup {identifier}: expected every other member exactly as \
+             the create stored it, got {got}"
         );
     }
 
@@ -394,8 +405,17 @@ async fn a_compute_node_group_and_a_queue_round_trip_through_their_readers() {
         .await;
         assert_eq!(status, 200, "case GetQueue {identifier}: got {got}");
         assert_eq!(
-            got["queue"], queue,
-            "case GetQueue {identifier}: expected what the create stored, got {got}"
+            got["queue"]["status"],
+            json!("ACTIVE"),
+            "case GetQueue {identifier}: expected the owed CREATING -> ACTIVE transition on \
+             the request that follows the create, got {got}"
+        );
+        let moved_by_the_transition = ["status", "modifiedAt"];
+        assert_eq!(
+            without_members(&got["queue"], &moved_by_the_transition),
+            without_members(&queue, &moved_by_the_transition),
+            "case GetQueue {identifier}: expected every other member exactly as the create \
+             stored it, got {got}"
         );
     }
 
@@ -790,7 +810,6 @@ async fn an_idempotency_token_replays_the_first_create_instead_of_conflicting() 
         "case CreateCluster with a new token on a taken name: got {status} {conflict}"
     );
 
-    wait_past_the_owed_transition().await;
     let cluster_id = created["cluster"]["id"]
         .as_str()
         .unwrap_or_default()
@@ -886,7 +905,6 @@ async fn an_idempotency_token_cannot_be_replayed_into_another_cluster() {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    wait_past_the_owed_transition().await;
 
     let token = "shared-token-0001";
     let mut request = create_queue(&first_cluster, "demo-queue", &[]);

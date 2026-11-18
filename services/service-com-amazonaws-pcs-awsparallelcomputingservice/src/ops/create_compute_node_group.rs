@@ -479,9 +479,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             node_lifecycle_actions: input.node_lifecycle_actions.map(Into::into),
             error_info: Vec::new(),
             tags: input.tags.unwrap_or_default(),
-            pending: Some(crate::state::Pending::in_a_span(
-                crate::state::PendingChange::Activate,
-            )),
+            pending: Some(crate::state::PendingChange::Activate),
         };
         cluster.compute_node_groups.insert(id.clone(), record);
         state.remember_create(

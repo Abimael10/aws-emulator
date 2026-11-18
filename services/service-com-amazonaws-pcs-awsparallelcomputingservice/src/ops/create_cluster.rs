@@ -337,7 +337,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: crate::state::cluster_arn(&region, &id),
             id: id.clone(),
             name: input.cluster_name.clone(),
-            // PCS reports a new cluster as CREATING; the clock owes it ACTIVE.
+            // PCS reports a new cluster as CREATING; the service owes it ACTIVE from
+            // the next request on.
             status: crate::state::STATUS_CREATING.to_string(),
             created_at: now,
             modified_at: now,
@@ -350,9 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default(),
             compute_node_groups: std::collections::HashMap::new(),
             queues: std::collections::HashMap::new(),
-            pending: Some(crate::state::Pending::in_a_span(
-                crate::state::PendingChange::Activate,
-            )),
+            pending: Some(crate::state::PendingChange::Activate),
         };
 
         state

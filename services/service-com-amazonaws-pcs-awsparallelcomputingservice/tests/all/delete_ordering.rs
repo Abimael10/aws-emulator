@@ -10,10 +10,11 @@
 //! groups associated with the cluster before you can delete the cluster"
 //! (`DeleteCluster`) — and a delete attempted out of that order is refused with
 //! `ConflictException` while the resource it names stays exactly as it was. A
-//! delete made in order is accepted, reports the resource `DELETING`, and the clock then
-//! removes it, so the read answers `ResourceNotFoundException` and the listing drops
-//! it. Every refusal of a client carries one status, the service's
-//! [`CLIENT_ERROR_STATUS`], and names its class in the body.
+//! delete made in order is accepted, and the removal it owes is materialised before the
+//! next request is answered, so the read that follows it answers
+//! `ResourceNotFoundException` and the listing has dropped it. Every refusal of a client
+//! carries one status, the service's [`CLIENT_ERROR_STATUS`], and names its class in the
+//! body.
 //!
 //! The suites are tables. Their rows differ along what the rule generalises over: the form
 //! of the identifier each call addresses a resource by (its generated id or its name, the
@@ -25,7 +26,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::cluster_lifecycle::{call, emulator, wait_past_the_owed_transition};
+use super::cluster_lifecycle::{call, emulator};
 
 /// The region the shared harness signs every call for.
 const REGION: &str = "us-east-1";
@@ -70,7 +71,7 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-/// Create a cluster and wait until the clock has made it ACTIVE.
+/// Create a cluster. The request that follows the create observes it ACTIVE.
 async fn active_cluster(router: &MultiServiceRouter, case: &str, name: &str) -> Created {
     let body = json!({
         "clusterName": name,
@@ -86,7 +87,6 @@ async fn active_cluster(router: &MultiServiceRouter, case: &str, name: &str) -> 
         status, 200,
         "case {case}: CreateCluster must succeed, got {status} with {created}"
     );
-    wait_past_the_owed_transition().await;
     Created {
         id: created["cluster"]["id"]
             .as_str()
@@ -96,7 +96,8 @@ async fn active_cluster(router: &MultiServiceRouter, case: &str, name: &str) -> 
     }
 }
 
-/// Create a compute node group in `cluster` and wait until it is ACTIVE.
+/// Create a compute node group in `cluster`. The request that follows the create observes
+/// it ACTIVE.
 async fn active_group(
     router: &MultiServiceRouter,
     case: &str,
@@ -120,7 +121,6 @@ async fn active_group(
         status, 200,
         "case {case}: CreateComputeNodeGroup must succeed, got {status} with {created}"
     );
-    wait_past_the_owed_transition().await;
     Created {
         id: created["computeNodeGroup"]["id"]
             .as_str()
@@ -131,7 +131,7 @@ async fn active_group(
 }
 
 /// Create a queue in `cluster` assigning jobs to each of `groups` (each written the way
-/// that row addresses it), and wait until it is ACTIVE.
+/// that row addresses it). The request that follows the create observes it ACTIVE.
 async fn active_queue(
     router: &MultiServiceRouter,
     case: &str,
@@ -152,7 +152,6 @@ async fn active_queue(
         status, 200,
         "case {case}: CreateQueue must succeed, got {status} with {created}"
     );
-    wait_past_the_owed_transition().await;
     Created {
         id: created["queue"]["id"].as_str().unwrap_or_default().to_string(),
         name: name.to_string(),
@@ -208,8 +207,8 @@ const CLUSTER_STILL_HAS_CHILDREN: &str =
      compute node groups.";
 
 /// RULE: out of order, each delete is refused with `ConflictException` and changes nothing;
-/// in dependency order, each delete is accepted, reports `DELETING`, and the clock then
-/// removes the resource.
+/// in dependency order, each delete is accepted and the resource is gone — or, where the
+/// status enum declares `DELETED`, reported `DELETED` once — from the next request on.
 #[tokio::test]
 async fn a_dependent_resource_blocks_the_delete_until_it_is_gone() {
     // Each row: how the delete calls address the resources, how the queue names the group,
@@ -327,36 +326,25 @@ async fn a_dependent_resource_blocks_the_delete_until_it_is_gone() {
                 "case {case}: expected DeleteQueue {body} to succeed, got {status} with \
                  {deleted}"
             );
+            // The removal the delete owed is materialised before the next request is
+            // answered, so the read that follows it is already a miss.
             let (status, read) = call(&router, "GetQueue", &body).await;
             assert_eq!(
-                (status, read["queue"]["status"].as_str()),
-                (200, Some("DELETING")),
-                "case {case}: expected the queue to be reported DELETING straight after the \
+                (status, error_code(&read).as_str()),
+                (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+                "case {case}: expected the queue to be gone on the request after its \
                  delete, got {status} with {read}"
             );
-            // Deleting it again, while it is on its way out, conflicts.
+            // Deleting it again names a queue the cluster no longer holds.
             let (status, again) = call(&router, "DeleteQueue", &body).await;
             assert_eq!(
                 (status, error_code(&again).as_str()),
-                (CLIENT_ERROR_STATUS, "ConflictException"),
-                "case {case}: expected a second DeleteQueue to conflict, got {status} with \
-                 {again}"
+                (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+                "case {case}: expected a second DeleteQueue to report the queue gone, got \
+                 {status} with {again}"
             );
         }
 
-        wait_past_the_owed_transition().await;
-        for queue in &queues {
-            let body = json!({
-                "clusterIdentifier": cluster.as_addressed(*address),
-                "queueIdentifier": queue.as_addressed(*address),
-            });
-            let (status, gone) = call(&router, "GetQueue", &body).await;
-            assert_eq!(
-                (status, error_code(&gone).as_str()),
-                (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
-                "case {case}: expected the queue to be gone, got {status} with {gone}"
-            );
-        }
         let (status, listed) = call(
             &router,
             "ListQueues",
@@ -375,31 +363,23 @@ async fn a_dependent_resource_blocks_the_delete_until_it_is_gone() {
             "case {case}: expected DeleteComputeNodeGroup to succeed once no queue depends \
              on it, got {status} with {deleted}"
         );
-        let (status, read) = call(&router, "GetComputeNodeGroup", &delete_group).await;
-        assert_eq!(
-            (status, read["computeNodeGroup"]["status"].as_str()),
-            (200, Some("DELETING")),
-            "case {case}: expected the group to be reported DELETING straight after the \
-             delete, got {status} with {read}"
-        );
-
-        wait_past_the_owed_transition().await;
-        // The group's delete has come due: the one resource of the three whose status enum
-        // declares DELETED is reported DELETED before it is forgotten.
+        // The group's delete has come due by the next request: the one resource of the
+        // three whose status enum declares DELETED is reported DELETED before it is
+        // forgotten.
         let (status, read) = call(&router, "GetComputeNodeGroup", &delete_group).await;
         assert_eq!(
             (status, read["computeNodeGroup"]["status"].as_str()),
             (200, Some("DELETED")),
-            "case {case}: expected the group to be reported DELETED once its delete came \
-             due, got {status} with {read}"
+            "case {case}: expected the group to be reported DELETED on the request after \
+             its delete, got {status} with {read}"
         );
 
-        wait_past_the_owed_transition().await;
         let (status, gone) = call(&router, "GetComputeNodeGroup", &delete_group).await;
         assert_eq!(
             (status, error_code(&gone).as_str()),
             (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
-            "case {case}: expected the group to be gone, got {status} with {gone}"
+            "case {case}: expected the group to be gone once its removal came due, got \
+             {status} with {gone}"
         );
         let (status, listed) = call(
             &router,
@@ -424,12 +404,12 @@ async fn a_dependent_resource_blocks_the_delete_until_it_is_gone() {
             "case {case}: expected DeleteCluster to succeed once the cluster is empty, got \
              {status} with {deleted}"
         );
-        wait_past_the_owed_transition().await;
         let (status, gone) = call(&router, "GetCluster", &cluster_body).await;
         assert_eq!(
             (status, error_code(&gone).as_str()),
             (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
-            "case {case}: expected the cluster to be gone, got {status} with {gone}"
+            "case {case}: expected the cluster to be gone on the request after its delete, \
+             got {status} with {gone}"
         );
     }
 }
@@ -475,11 +455,10 @@ async fn deleting_the_hierarchy_back_to_back_is_served() {
         );
     }
 
-    // The clock then removes all three, so every read of them is a miss. The CLUSTER is gone
-    // too, and every read here names it by the GENERATED ID it was minted with, so each is
-    // the cluster's own not-found rather than a refusal about the caller.
-    wait_past_the_owed_transition().await;
-    wait_past_the_owed_transition().await;
+    // All three removals were owed from the deletes that started them, so every read of
+    // them is a miss. The CLUSTER is gone too, and every read here names it by the
+    // GENERATED ID it was minted with, so each is the cluster's own not-found rather than a
+    // refusal about the caller.
     for (operation, body, expected_code) in [
         (
             "GetQueue",
