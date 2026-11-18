@@ -26,6 +26,10 @@
 //! element is written as the stream's ARN (the row scoped to this stream's ARN is served),
 //! while the refusal names the stream AS THE REQUEST ADDRESSED IT (a row addressing it by
 //! name is refused in a sentence carrying that name and not the ARN).
+//!
+//! The harness and the readers below are this suite's, shared with
+//! [`crate::media_plane_policy_changes`], which drives the same gate while the policies in
+//! force on one principal CHANGE under it.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -46,7 +50,7 @@ const ENDPOINT_HOST: &str = "kinesisvideo.us-east-1.amazonaws.com";
 
 /// The emulator's own published long-term access key: the account credential, which holds
 /// no IAM policies.
-const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
+pub(crate) const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
 
 /// The code and status AWS refuses a call IAM does not permit with — the pair recorded
 /// behaviour shows, which no Kinesis Video media model declares a shape for.
@@ -72,13 +76,13 @@ const MKV_TAG_MARKER: &[u8] = b"AWS_KINESISVIDEO_";
 /// two services and signs every call with the account's credential, while every call here is
 /// signed with the credential of the ROW's own principal and two more services have to be
 /// mounted for those credentials to exist at all.
-struct Harness {
+pub(crate) struct Harness {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -128,7 +132,11 @@ impl Harness {
 
     /// `GetMedia` from the earliest chunk of the stream `addressing` names, signed with
     /// `access_key_id`.
-    async fn get_media(&self, access_key_id: &str, addressing: &Value) -> http::Response<Bytes> {
+    pub(crate) async fn get_media(
+        &self,
+        access_key_id: &str,
+        addressing: &Value,
+    ) -> http::Response<Bytes> {
         let mut body = addressing.as_object().cloned().unwrap_or_default();
         body.insert(
             "StartSelector".to_string(),
@@ -140,7 +148,7 @@ impl Harness {
 
     /// POST one ingest session for `stream_name`, signed with `access_key_id`: one Cluster
     /// of media, as a producer submits it.
-    async fn put_media(
+    pub(crate) async fn put_media(
         &self,
         access_key_id: &str,
         stream_name: &str,
@@ -174,7 +182,7 @@ impl Harness {
 
     /// One awsQuery call to IAM or STS, always with the account's own credential:
     /// `signing_name` picks the service, `version` its API version.
-    async fn query(
+    pub(crate) async fn query(
         &self,
         signing_name: &str,
         version: &str,
@@ -277,7 +285,7 @@ impl Harness {
     }
 
     /// Create `name` through the control plane and answer the `StreamARN` it minted.
-    async fn create_stream(&self, name: &str) -> String {
+    pub(crate) async fn create_stream(&self, name: &str) -> String {
         let response = self
             .call(
                 ACCOUNT_KEY,
@@ -322,7 +330,7 @@ fn form_encoded(value: &str) -> String {
 }
 
 /// The text of the first `<name>` element of an awsQuery XML response.
-fn xml_element(document: &str, name: &str) -> Option<String> {
+pub(crate) fn xml_element(document: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let start = document.find(&open)? + open.len();
@@ -331,7 +339,7 @@ fn xml_element(document: &str, name: &str) -> Option<String> {
 }
 
 /// An identity-based policy with one statement.
-fn policy(effect: &str, actions: &[&str], resources: &[&str]) -> String {
+pub(crate) fn policy(effect: &str, actions: &[&str], resources: &[&str]) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -343,11 +351,11 @@ fn policy(effect: &str, actions: &[&str], resources: &[&str]) -> String {
     .to_string()
 }
 
-fn status(response: &http::Response<Bytes>) -> u16 {
+pub(crate) fn status(response: &http::Response<Bytes>) -> u16 {
     response.status().as_u16()
 }
 
-fn error_code(response: &http::Response<Bytes>) -> String {
+pub(crate) fn error_code(response: &http::Response<Bytes>) -> String {
     response
         .headers()
         .get("x-amzn-errortype")
@@ -370,7 +378,7 @@ fn content_type(response: &http::Response<Bytes>) -> String {
 }
 
 /// The `Message` of an error answer.
-fn message(response: &http::Response<Bytes>) -> String {
+pub(crate) fn message(response: &http::Response<Bytes>) -> String {
     let parsed = body(response);
     parsed
         .get("Message")
@@ -740,6 +748,6 @@ async fn an_unauthorized_caller_is_refused_before_the_stream_is_resolved() {
 
 /// The producer start timestamp of the `index`th ingest session: whole seconds apart, so
 /// each session's fragment lands on its own producer instant.
-fn producer_start(index: usize) -> SystemTime {
+pub(crate) fn producer_start(index: usize) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_millis(1_761_000_000_000 + (index as u64) * 10_000)
 }
