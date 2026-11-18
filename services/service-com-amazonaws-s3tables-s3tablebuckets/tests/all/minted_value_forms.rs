@@ -25,6 +25,11 @@
 //!   inside its `metadataLocation`, as `GetTable` and `GetTableMetadataLocation` report
 //!   them.
 //!
+//! A TABLE's own `versionToken` is NOT one of them: it is an opaque token rather than an
+//! identifier, minted in the token form `wire_forms.rs` states
+//! ([`assert_table_version_token`]), which is what the read of the table's metadata
+//! location is pinned to below.
+//!
 //! The `id` of a table bucket's metrics configuration is NOT one of them: that
 //! configuration covers the whole bucket and the service names it with a fixed
 //! identifier, which `table_bucket_metrics_configuration.rs` and
@@ -38,7 +43,9 @@
 use serde_json::{json, Value};
 
 use crate::harness::{expected_bucket_arn, timestamp_seconds, Emulator};
-use crate::wire_forms::{assert_canonical_uuid, create_table_request, table_id_of};
+use crate::wire_forms::{
+    assert_canonical_uuid, assert_table_version_token, create_table_request, table_id_of,
+};
 
 /// One account's worth of resources, as a row of the table below.
 #[derive(Debug, Clone, Copy)]
@@ -283,7 +290,7 @@ async fn a_table_s_locations_carry_canonical_uuid_ids() {
             warehouse,
             "case {case:?}: the two reads report different warehouse locations"
         );
-        assert_canonical_uuid(
+        assert_table_version_token(
             &location.text("versionToken"),
             "GetTableMetadataLocation's versionToken",
             case,

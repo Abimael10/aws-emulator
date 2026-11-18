@@ -16,7 +16,8 @@
 //! policy, so it reports success whether or not one was there and leaves the
 //! bucket with none; and a document that is not a resource policy at all is the
 //! client request error the model's `BadRequestException` (400) names, with the
-//! stored policy left as it was.
+//! stored policy left as it was and with the one fixed malformed-policy sentence
+//! whichever clause of the policy grammar the document broke.
 //!
 //! The rows span what the rule generalises over: the shape of the document
 //! (one statement, several statements, a `Deny`, a document with an `Id`, each
@@ -52,10 +53,13 @@ fn reported(policy: &str) -> String {
 }
 
 /// The fixed sentences, spelled out here rather than read from the crate, so
-/// this suite pins the wording itself.
+/// this suite pins the wording itself. The malformed-policy sentence is the
+/// service's refusal for EVERY clause of the policy grammar a document breaks:
+/// it states the class and says nothing about which clause, and it carries no
+/// closing full stop.
 const NO_SUCH_POLICY: &str = "The specified bucket policy does not exist.";
 const NO_SUCH_BUCKET: &str = "The specified bucket does not exist.";
-const INVALID_POLICY: &str = "The specified resource policy is not valid.";
+const INVALID_POLICY: &str = "The specified policy is malformed";
 
 /// Documents that ARE resource policies, one per shape of the language this
 /// service accepts: the policy versions it admits (`2012-10-17`, `2008-10-17`),
@@ -161,6 +165,31 @@ fn unacceptable_documents() -> Vec<(&'static str, String)> {
             })
             .to_string(),
         ),
+        (
+            "a statement that is not an object",
+            json!({
+                "Version": "2012-10-17",
+                "Statement": ["s3tables:GetTable"],
+            })
+            .to_string(),
+        ),
+        (
+            "a statement naming no action",
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Resource": "*",
+                }],
+            })
+            .to_string(),
+        ),
+        (
+            "a document holding no statement at all",
+            json!({ "Version": "2012-10-17", "Statement": [] }).to_string(),
+        ),
+        ("JSON that is a scalar", json!(17).to_string()),
     ]
 }
 

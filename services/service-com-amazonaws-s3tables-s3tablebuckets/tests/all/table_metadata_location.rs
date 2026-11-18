@@ -42,7 +42,7 @@ use service_com_amazonaws_s3tables_s3tablebuckets::state::{
 };
 
 use crate::harness::{expected_bucket_arn, Emulator, Reply};
-use crate::wire_forms::assert_canonical_uuid;
+use crate::wire_forms::assert_table_version_token;
 
 /// The region every case in this suite is scoped to; the assertions follow the values the
 /// create reports, so the region is one choice and not a rule.
@@ -277,7 +277,7 @@ async fn an_update_points_the_table_at_the_metadata_file_it_names() {
             "case {label:?}: the write left the version token at {token:?}, so a caller \
              cannot tell the metadata moved"
         );
-        assert_canonical_uuid(&advanced, "the versionToken an update settles", label);
+        assert_table_version_token(&advanced, "the versionToken an update settles", label);
         assert!(
             held.as_deref() != Some(location.as_str()),
             "case {label:?}: the case does not move the location at all (it was already \

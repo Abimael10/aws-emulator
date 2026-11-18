@@ -62,7 +62,9 @@ use service_com_amazonaws_s3tables_s3tablebuckets::state::{
 
 use crate::harness::{expected_bucket_arn, served, timestamp_seconds, Emulator, Reply};
 use crate::table_maintenance_configuration::{reported_task, Reported};
-use crate::wire_forms::{assert_canonical_uuid, summary_of, table_id_of};
+use crate::wire_forms::{
+    assert_canonical_uuid, assert_table_version_token, summary_of, table_id_of,
+};
 
 /// The region every case in this suite is scoped to; the ARN assertions follow the
 /// bucket ARN the create reports, so the region is one choice and not a rule.
@@ -311,7 +313,11 @@ async fn a_rename_moves_the_one_stored_table_to_its_new_coordinates() {
             "case {case:?}: expected the pre-rename versionToken {version_token:?}, got \
              {moved_token:?}"
         );
-        assert_canonical_uuid(&moved_token, "the versionToken a renamed table carries", case);
+        assert_table_version_token(
+            &moved_token,
+            "the versionToken a renamed table carries",
+            case,
+        );
         let moved_modified_at = timestamp_seconds(&after.body, "modifiedAt", case);
         assert!(
             moved_modified_at >= modified_at,

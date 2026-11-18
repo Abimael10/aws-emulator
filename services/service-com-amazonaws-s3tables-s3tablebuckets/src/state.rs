@@ -1092,6 +1092,16 @@ pub struct TableLocation {
     pub name: String,
 }
 
+/// How many bytes of entropy a table's `versionToken` carries: eight, read as one
+/// unsigned 64-bit stamp and rendered in decimal.
+///
+/// The model constrains a `VersionToken` only by length (`@length(1, 2048)`), so
+/// the FORM is recorded behaviour: the token a table hands back is a decimal
+/// integer of 64-bit width rather than an identifier's hexadecimal or
+/// hyphenated-UUID spelling. Stated once here, so every operation that mints a
+/// table's token mints one class of value.
+const TOKEN_STAMP_BYTES: usize = 8;
+
 /// Per-service state for com-amazonaws-s3tables-s3tablebuckets. A handler reaches it through [`service_state`].
 ///
 /// `table_buckets` is keyed by the bucket's ARN — which carries its region and
@@ -1110,19 +1120,21 @@ pub struct ComAmazonawsS3tablesS3tablebucketsState {
 }
 
 impl ComAmazonawsS3tablesS3tablebucketsState {
-    /// A fresh server-generated id, in the canonical hyphenated UUID form every
-    /// identifier this service mints carries (`tableBucketId`, `namespaceId`, the
-    /// id segment of a `tableARN`, a `versionToken`, a table's metadata file id).
+    /// The 16 bytes of entropy behind ONE minted value, whichever form it is
+    /// then laid out in ([`Self::mint_id`], [`Self::mint_opaque_token`]).
     ///
-    /// The 16 bytes behind it are a digest of the instant it is minted, this
-    /// store's mint counter and `domain` (which kind of id it is), so the id is
-    /// opaque: it carries nothing from the request, two mints never collide (the
-    /// counter separates them inside one clock tick), and two emulator runs do
-    /// not repeat each other's ids. Those bytes are then handed to the `uuid`
-    /// crate, which owns both remaining rules — the version and variant nibbles a
-    /// random-bytes UUID carries, and the canonical lowercase hyphenated
-    /// rendering — so neither is restated here to drift from the library's.
-    fn mint_id(&mut self, domain: &str) -> String {
+    /// They are a digest of the instant the value is minted, this store's mint
+    /// counter and `domain` (which kind of value it is), so what is minted
+    /// carries nothing from the request, two mints never collide (the counter
+    /// separates them inside one clock tick), and two emulator runs do not repeat
+    /// each other's values.
+    ///
+    /// The derivation is DELIBERATELY deterministic — a clock reading and a
+    /// counter, not a random source — because an emulator's minted values are
+    /// test material: none of them is a secret, nothing is authorized by holding
+    /// one, and a value a test can reason about is worth more here than an
+    /// unguessable one.
+    fn mint_entropy(&mut self, domain: &str) -> [u8; 16] {
         use ::sha2::{Digest, Sha256};
         self.minted_ids = self.minted_ids.wrapping_add(1);
         let since_epoch = SystemTime::now()
@@ -1134,10 +1146,39 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
         );
         let mut bytes = [0u8; 16];
         bytes.copy_from_slice(&digest[..16]);
-        ::uuid::Builder::from_random_bytes(bytes)
+        bytes
+    }
+
+    /// A fresh server-generated id, in the canonical hyphenated UUID form every
+    /// identifier this service mints carries (`tableBucketId`, `namespaceId`, the
+    /// id segment of a `tableARN`, a table's metadata file id).
+    ///
+    /// The bytes [`Self::mint_entropy`] hands over are given to the `uuid` crate,
+    /// which owns both remaining rules — the version and variant nibbles a
+    /// random-bytes UUID carries, and the canonical lowercase hyphenated
+    /// rendering — so neither is restated here to drift from the library's.
+    fn mint_id(&mut self, domain: &str) -> String {
+        ::uuid::Builder::from_random_bytes(self.mint_entropy(domain))
             .into_uuid()
             .hyphenated()
             .to_string()
+    }
+
+    /// A fresh opaque TOKEN, laid out in the form this service's version tokens
+    /// take: the first [`TOKEN_STAMP_BYTES`] bytes [`Self::mint_entropy`] hands
+    /// over, read as one unsigned 64-bit stamp and rendered as a DECIMAL integer,
+    /// so the token carries no structure a CLIENT could read anything out of (it
+    /// is derived the deterministic way [`Self::mint_entropy`] describes, so it
+    /// is not an unguessable value and nothing is authorized by holding one).
+    ///
+    /// A token is NOT an identifier: nothing addresses a resource by one, a
+    /// caller only hands back the value it was given, and the service mints it in
+    /// a form of its own — which is why this is not [`Self::mint_id`].
+    fn mint_opaque_token(&mut self, domain: &str) -> String {
+        let entropy = self.mint_entropy(domain);
+        let mut stamp = [0u8; TOKEN_STAMP_BYTES];
+        stamp.copy_from_slice(&entropy[..TOKEN_STAMP_BYTES]);
+        u64::from_be_bytes(stamp).to_string()
     }
 
     /// A fresh `tableBucketId`, retried against the store so an id is never
@@ -1180,12 +1221,24 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
     }
 
     /// A fresh `versionToken` for a table that is being created or changed.
+    ///
+    /// A table's version token is the precondition handle `CreateTable` hands
+    /// back and `GetTable` echoes, which `DeleteTable`, `RenameTable` and
+    /// `UpdateTableMetadataLocation` compare a caller's view against — an opaque
+    /// token, not an identifier of the table, so it is minted in this service's
+    /// token form ([`Self::mint_opaque_token`]) rather than in the id form
+    /// [`Self::mint_id`] lays out.
     pub fn mint_version_token(&mut self) -> String {
-        self.mint_id("table-version")
+        self.mint_opaque_token("table-version")
     }
 
     /// A fresh `versionToken` for a replication configuration — a table
     /// bucket's or a single table's — minted on every write of one.
+    ///
+    /// The configuration's token is a value in the id form [`Self::mint_id`]
+    /// lays out, which is the form the recorded responses for these
+    /// sub-resources carry; a TABLE's own token is a different class of value
+    /// ([`Self::mint_version_token`]), so the two are minted apart.
     pub fn mint_replication_version_token(&mut self) -> String {
         self.mint_id("table-bucket-replication-version")
     }
@@ -1492,16 +1545,16 @@ pub const BUCKET_POLICY_NOT_FOUND_MESSAGE: &str = "The specified bucket policy d
 /// How this service states a resource-based policy document it will not attach:
 /// text that is not a resource policy at all (not JSON, no statement, a
 /// statement naming no principal, action or effect). FIXED text, as
-/// [`INVALID_TABLE_BUCKET_NAME_MESSAGE`]: it names the CLASS of the failure and
+/// [`INVALID_TABLE_BUCKET_NAME_MESSAGE`]: it names the CLASS of the failure, says
+/// nothing about which clause of the policy grammar the document broke, and
 /// quotes nothing of the document back.
 ///
-/// This service's OWN phrase, in the form its other invalid-input sentences
-/// take: no recorded response of this emulator's corpus exercises a malformed
-/// policy on the bucket-policy put, so there is no AWS wording to reproduce for
-/// the class, and the shared policy grammar
+/// The wording is the one the recorded refusal of a malformed policy document
+/// states, not this service's own phrasing — down to the absent full stop — and
+/// the shared policy grammar
 /// (`service_common::iam_policy::PolicyDefect`) deliberately leaves the sentence
 /// to the service that refuses the document.
-pub const INVALID_RESOURCE_POLICY_MESSAGE: &str = "The specified resource policy is not valid.";
+pub const INVALID_RESOURCE_POLICY_MESSAGE: &str = "The specified policy is malformed";
 
 /// How this service states a `GetTable` request that addresses a table by
 /// neither of the two whole forms the operation offers — the table's own ARN
