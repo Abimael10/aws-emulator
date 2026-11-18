@@ -50,8 +50,10 @@ use crate::node_invoke_run::package;
 const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// The Region every request below is signed for, and the one the function's own invocation —
-/// and therefore the client its handler builds — runs in.
-const REGION: &str = "us-east-1";
+/// and therefore the client its handler builds — runs in. `pub(crate)` with the role and
+/// refusal helpers below, which the build-time plane's own suite
+/// (`crate::handler_bedrock_agent_build_plane_sdk`) drives the same way rather than copying.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The module and attribute the package below carries its handler as.
 const HANDLER: &str = "lambda_function.lambda_handler";
@@ -151,7 +153,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// A SigV4 `Authorization` whose credential scope names `service`, which is what routes the
 /// request and where the Region comes from. The signature is never checked here.
-fn authorization(service: &str) -> String {
+pub(crate) fn authorization(service: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential={ACCOUNT_KEY}/20260101/{REGION}/{service}/aws4_request, \
          SignedHeaders=host, Signature=not-verified"
@@ -215,7 +217,12 @@ async fn bedrock_runtime(router: &MultiServiceRouter, what: &str, path: &str) ->
 }
 
 /// One awsQuery call to IAM that must be served.
-async fn iam(router: &MultiServiceRouter, what: &str, action: &str, params: &[(&str, String)]) {
+pub(crate) async fn iam(
+    router: &MultiServiceRouter,
+    what: &str,
+    action: &str,
+    params: &[(&str, String)],
+) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -243,7 +250,11 @@ async fn iam(router: &MultiServiceRouter, what: &str, action: &str, params: &[(&
 /// Create the execution role `role_name`, trusted by Lambda, carrying `policy` as its inline
 /// identity policy — written with IAM's own operations, so the role a session is minted of is
 /// the record `iam:CreateRole` wrote.
-async fn execution_role(router: &MultiServiceRouter, role_name: &str, policy: &str) -> String {
+pub(crate) async fn execution_role(
+    router: &MultiServiceRouter,
+    role_name: &str,
+    policy: &str,
+) -> String {
     let trust = json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -272,7 +283,12 @@ async fn execution_role(router: &MultiServiceRouter, role_name: &str, policy: &s
 
 /// The identity policy in force on `role_name` from now on, so a row is about the grant in
 /// force when the handler calls rather than the one in force when the role was made.
-async fn role_policy(router: &MultiServiceRouter, what: &str, role_name: &str, document: &str) {
+pub(crate) async fn role_policy(
+    router: &MultiServiceRouter,
+    what: &str,
+    role_name: &str,
+    document: &str,
+) {
     iam(
         router,
         what,
@@ -287,7 +303,7 @@ async fn role_policy(router: &MultiServiceRouter, what: &str, role_name: &str, d
 }
 
 /// One identity policy document granting `actions` on every resource.
-fn allow(actions: &[&str]) -> String {
+pub(crate) fn allow(actions: &[&str]) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{"Effect": "Allow", "Action": actions, "Resource": "*"}],
@@ -297,7 +313,7 @@ fn allow(actions: &[&str]) -> String {
 
 /// The logging grant every execution role carries, which names no action of either service
 /// below: the position a role whose policy was never extended is in.
-fn logs_only() -> String {
+pub(crate) fn logs_only() -> String {
     allow(&[
         "logs:CreateLogGroup",
         "logs:CreateLogStream",
@@ -325,7 +341,7 @@ fn knowledge_base_arn(knowledge_base_id: &str) -> String {
 /// The assumed-role session a function's own calls are made as:
 /// `arn:aws:sts::<account>:assumed-role/<role name>/<function name>`, the identity AWS reports
 /// for a function's calls.
-fn session_principal(role_name: &str, function_name: &str) -> String {
+pub(crate) fn session_principal(role_name: &str, function_name: &str) -> String {
     format!(
         "arn:aws:sts::{}:assumed-role/{role_name}/{function_name}",
         engine::emulator_account_id()
@@ -334,7 +350,7 @@ fn session_principal(role_name: &str, function_name: &str) -> String {
 
 /// The sentence IAM refuses a request with, built here from the principal, the action and the
 /// resource rather than read off the crates under test.
-fn denial(principal: &str, action: &str, resource: &str) -> String {
+pub(crate) fn denial(principal: &str, action: &str, resource: &str) -> String {
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} \
          because no identity-based policy allows the {action} action"
