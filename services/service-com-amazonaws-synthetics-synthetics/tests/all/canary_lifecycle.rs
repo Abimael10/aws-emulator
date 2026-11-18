@@ -271,6 +271,12 @@ impl Synthetics {
             .await
     }
 
+    /// `PATCH /canary/{Name}`.
+    pub(crate) async fn update(&self, name: &str, body: Value) -> Answer {
+        self.call("PATCH", &format!("/canary/{name}"), Some(body))
+            .await
+    }
+
     pub(crate) async fn delete(&self, name: &str) -> Answer {
         self.call("DELETE", &format!("/canary/{name}?deleteLambda=true"), None)
             .await
@@ -1558,4 +1564,675 @@ pub(crate) fn is_uuid(value: &str) -> bool {
                     && group.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
             })
 }
+
+/// Shorter than the span after which the emulator owes an update its completion, so an
+/// assertion about an update that is still IN FLIGHT is only made when the read provably
+/// happened inside it.
+const UPDATE_STILL_IN_FLIGHT_WITHIN: Duration = Duration::from_millis(250);
+
+/// One update row: the members one `UpdateCanary` call supplies, and the path in the reported
+/// `Canary` each one shows up at afterwards with the value it should carry.
+struct Update {
+    case: &'static str,
+    body: Value,
+    /// `(path, expected value after the update)`. Every configuration member NOT under one of
+    /// these paths is asserted unchanged, so each row pins both halves of the rule.
+    reported: Vec<(&'static str, Value)>,
+}
+
+/// The configuration `create_body` writes, as `GetCanary` reports it: a row that supplies
+/// none of these members has to leave each one exactly as the create left it.
+const CONFIGURATION_PATHS: [&str; 10] = [
+    "Canary.Code.Handler",
+    "Canary.ExecutionRoleArn",
+    "Canary.Schedule.Expression",
+    "Canary.RunConfig.TimeoutInSeconds",
+    "Canary.SuccessRetentionPeriodInDays",
+    "Canary.FailureRetentionPeriodInDays",
+    "Canary.ArtifactS3Location",
+    "Canary.RuntimeVersion",
+    "Canary.ProvisionedResourceCleanup",
+    "Canary.VpcConfig",
+];
+
+/// The configuration member a reported path names: its first two segments, so
+/// `Canary.RunConfig.TimeoutInSeconds` and `Canary.RunConfig.MemoryInMB` are one member.
+fn reported_member(path: &str) -> String {
+    path.split('.').take(2).collect::<Vec<_>>().join(".")
+}
+
+/// Create one canary, wait out the provisioning the clock owes it and hand back the `READY`
+/// record every update row starts from.
+async fn ready_canary(aws: &Synthetics, case: &str, name: &str) -> Answer {
+    let mut body = create_body(name);
+    // Tags are part of the canary and NOT part of what an update may change, so every row
+    // starts from a canary that carries one.
+    body["Tags"] = json!({ "env": "test" });
+    let created = aws.create(body).await;
+    assert_eq!(
+        created.status, 200,
+        "case {case}: expected the seed create to answer 200, got {} ({:?})",
+        created.status, created.body
+    );
+    poll_until(
+        case,
+        || aws.get(name),
+        |answer| answer.at("Canary.Status.State").as_str() == Some("READY"),
+    )
+    .await
+}
+
+/// `UpdateCanary` writes every configuration member the request supplies onto the stored
+/// canary and leaves every member it omits alone — asserted one row per member, over values,
+/// structures, lists and enums, with the record read back through `GetCanary`.
+#[tokio::test]
+async fn an_update_writes_each_supplied_member_and_keeps_the_rest() {
+    // Rows differ along WHICH member is supplied and along the kind of value it carries
+    // (scalar, enum, list, nested structure); the values come from the members' own modelled
+    // types, and `RuntimeVersion` from this service's published catalogue
+    // (`DescribeRuntimeVersions`).
+    let rows = vec![
+        Update {
+            case: "no members at all",
+            body: json!({}),
+            reported: Vec::new(),
+        },
+        Update {
+            case: "runtime version",
+            body: json!({ "RuntimeVersion": "syn-nodejs-puppeteer-10.0" }),
+            reported: vec![(
+                "Canary.RuntimeVersion",
+                json!("syn-nodejs-puppeteer-10.0"),
+            )],
+        },
+        Update {
+            case: "runtime version of another family",
+            body: json!({ "RuntimeVersion": "syn-python-selenium-5.1" }),
+            reported: vec![("Canary.RuntimeVersion", json!("syn-python-selenium-5.1"))],
+        },
+        Update {
+            case: "schedule with a duration",
+            body: json!({ "Schedule": { "Expression": "rate(1 hour)", "DurationInSeconds": 3600 } }),
+            reported: vec![
+                ("Canary.Schedule.Expression", json!("rate(1 hour)")),
+                ("Canary.Schedule.DurationInSeconds", json!(3600)),
+            ],
+        },
+        Update {
+            case: "schedule without a duration takes the member's documented default",
+            body: json!({ "Schedule": { "Expression": "cron(0 10 * * ? *)" } }),
+            reported: vec![
+                ("Canary.Schedule.Expression", json!("cron(0 10 * * ? *)")),
+                ("Canary.Schedule.DurationInSeconds", json!(0)),
+            ],
+        },
+        Update {
+            case: "both retention periods",
+            body: json!({
+                "SuccessRetentionPeriodInDays": 7,
+                "FailureRetentionPeriodInDays": 14,
+            }),
+            reported: vec![
+                ("Canary.SuccessRetentionPeriodInDays", json!(7)),
+                ("Canary.FailureRetentionPeriodInDays", json!(14)),
+            ],
+        },
+        Update {
+            case: "run configuration",
+            body: json!({
+                "RunConfig": { "TimeoutInSeconds": 120, "MemoryInMB": 1024, "ActiveTracing": true },
+            }),
+            reported: vec![
+                ("Canary.RunConfig.TimeoutInSeconds", json!(120)),
+                ("Canary.RunConfig.MemoryInMB", json!(1024)),
+                ("Canary.RunConfig.ActiveTracing", json!(true)),
+            ],
+        },
+        Update {
+            case: "run configuration without a timeout follows the new schedule frequency",
+            body: json!({
+                "Schedule": { "Expression": "rate(2 minutes)" },
+                "RunConfig": { "MemoryInMB": 960 },
+            }),
+            reported: vec![
+                ("Canary.Schedule.Expression", json!("rate(2 minutes)")),
+                ("Canary.RunConfig.MemoryInMB", json!(960)),
+                ("Canary.RunConfig.TimeoutInSeconds", json!(120)),
+            ],
+        },
+        Update {
+            case: "artifact location",
+            body: json!({ "ArtifactS3Location": "s3://updated-artifacts/canary" }),
+            reported: vec![(
+                "Canary.ArtifactS3Location",
+                json!("s3://updated-artifacts/canary"),
+            )],
+        },
+        Update {
+            case: "execution role",
+            body: json!({ "ExecutionRoleArn": "arn:aws:iam::123456789012:role/UpdatedRole" }),
+            reported: vec![(
+                "Canary.ExecutionRoleArn",
+                json!("arn:aws:iam::123456789012:role/UpdatedRole"),
+            )],
+        },
+        Update {
+            case: "code",
+            body: json!({
+                "Code": { "Handler": "updated.handler", "S3Bucket": "scripts", "S3Key": "updated.zip" },
+            }),
+            reported: vec![("Canary.Code.Handler", json!("updated.handler"))],
+        },
+        Update {
+            case: "provisioned resource cleanup",
+            body: json!({ "ProvisionedResourceCleanup": "OFF" }),
+            reported: vec![("Canary.ProvisionedResourceCleanup", json!("OFF"))],
+        },
+        Update {
+            case: "two browsers",
+            body: json!({
+                "BrowserConfigs": [{ "BrowserType": "CHROME" }, { "BrowserType": "FIREFOX" }],
+            }),
+            reported: vec![(
+                "Canary.BrowserConfigs",
+                json!([{ "BrowserType": "CHROME" }, { "BrowserType": "FIREFOX" }]),
+            )],
+        },
+        Update {
+            case: "one browser",
+            body: json!({ "BrowserConfigs": [{ "BrowserType": "FIREFOX" }] }),
+            reported: vec![(
+                "Canary.BrowserConfigs",
+                json!([{ "BrowserType": "FIREFOX" }]),
+            )],
+        },
+        Update {
+            case: "vpc placement",
+            body: json!({
+                "VpcConfig": { "SubnetIds": ["subnet-0a1b2c3d"], "SecurityGroupIds": ["sg-0a1b2c3d"] },
+            }),
+            reported: vec![
+                ("Canary.VpcConfig.SubnetIds", json!(["subnet-0a1b2c3d"])),
+                (
+                    "Canary.VpcConfig.SecurityGroupIds",
+                    json!(["sg-0a1b2c3d"]),
+                ),
+            ],
+        },
+        Update {
+            case: "artifact encryption",
+            body: json!({ "ArtifactConfig": { "S3Encryption": { "EncryptionMode": "SSE_S3" } } }),
+            reported: vec![(
+                "Canary.ArtifactConfig.S3Encryption.EncryptionMode",
+                json!("SSE_S3"),
+            )],
+        },
+        Update {
+            case: "customer managed key",
+            body: json!({
+                "KmsKeyArn": "arn:aws:kms:us-east-2:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+            }),
+            reported: vec![(
+                "Canary.KmsKeyArn",
+                json!("arn:aws:kms:us-east-2:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"),
+            )],
+        },
+    ];
+
+    let aws = Synthetics::new("us-east-2");
+    for (index, row) in rows.into_iter().enumerate() {
+        let name = format!("updated-canary-{index}");
+        let before = ready_canary(&aws, row.case, &name).await;
+
+        let updated = aws.update(&name, row.body.clone()).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {}: expected 200, got {} ({:?})",
+            row.case, updated.status, updated.body
+        );
+        // `UpdateCanaryResponse` models no members: the record, not the answer, is where the
+        // update is observable.
+        assert!(
+            updated.at("Canary").is_null(),
+            "case {}: expected an answer with no members, got {:?}",
+            row.case,
+            updated.body
+        );
+
+        // The move out of UPDATING is owed by the clock, so the read waits for the condition
+        // rather than for a span.
+        let settled = poll_until(
+            row.case,
+            || aws.get(&name),
+            |answer| answer.at("Canary.Status.State").as_str() != Some("UPDATING"),
+        )
+        .await;
+        for (path, expected) in &row.reported {
+            assert_eq!(
+                settled.at(path),
+                expected,
+                "case {}: expected {path} to report {expected:?}, got {:?}",
+                row.case,
+                settled.at(path)
+            );
+        }
+
+        // The untouched half of the rule: every configuration member this row did not supply
+        // still reports what the create wrote.
+        let touched: BTreeSet<String> = row
+            .reported
+            .iter()
+            .map(|(path, _)| reported_member(path))
+            .collect();
+        for path in CONFIGURATION_PATHS {
+            if touched.contains(&reported_member(path)) {
+                continue;
+            }
+            assert_eq!(
+                settled.at(path),
+                before.at(path),
+                "case {}: expected {path} to be left alone, got {:?}",
+                row.case,
+                settled.at(path)
+            );
+        }
+        // An update replaces the canary's script, never the layer Synthetics reports it at.
+        assert_eq!(
+            settled.at("Canary.Code.SourceLocationArn"),
+            before.at("Canary.Code.SourceLocationArn"),
+            "case {}: expected the canary's own code layer to be kept, got {:?}",
+            row.case,
+            settled.at("Canary.Code.SourceLocationArn")
+        );
+        // "You can't use this operation to update the tags of an existing canary", and the
+        // canary's identity and creation instant are not configuration either.
+        for path in ["Canary.Tags", "Canary.Id", "Canary.Name", "Canary.EngineArn"] {
+            assert_eq!(
+                settled.at(path),
+                before.at(path),
+                "case {}: expected {path} to be untouched by an update, got {:?}",
+                row.case,
+                settled.at(path)
+            );
+        }
+        assert_eq!(
+            settled.at("Canary.Timeline.Created"),
+            before.at("Canary.Timeline.Created"),
+            "case {}: expected the creation instant to be untouched, got {:?}",
+            row.case,
+            settled.at("Canary.Timeline.Created")
+        );
+    }
+}
+
+/// An update is reported as in flight — `UPDATING` with the `UPDATE_IN_PROGRESS` reason code —
+/// until the clock owes its completion, at which point the canary carries `UPDATE_COMPLETE`
+/// and goes back to what it was doing: an update neither starts nor stops a canary.
+#[tokio::test]
+async fn an_update_reports_updating_until_the_clock_owes_update_complete() {
+    let aws = Synthetics::new("eu-central-1");
+    // Both states an update can arrive in, which is what the resumption rule generalises
+    // over: a canary standing by, and one making its scheduled runs.
+    for (case, running) in [("ready canary", false), ("running canary", true)] {
+        let name = format!("transitioning-{}", if running { "running" } else { "ready" });
+        let before = ready_canary(&aws, case, &name).await;
+        if running {
+            let started = aws.start(&name).await;
+            assert_eq!(
+                started.status, 200,
+                "case {case}: expected the start to answer 200, got {} ({:?})",
+                started.status, started.body
+            );
+        }
+        let expected_state = if running { "RUNNING" } else { "READY" };
+
+        let began = std::time::Instant::now();
+        let updated = aws
+            .update(&name, json!({ "RuntimeVersion": "syn-nodejs-puppeteer-10.0" }))
+            .await;
+        assert_eq!(
+            updated.status, 200,
+            "case {case}: expected 200, got {} ({:?})",
+            updated.status, updated.body
+        );
+        let in_flight = aws.get(&name).await;
+        let read_within = began.elapsed();
+        // Guarded on elapsed wall-clock time, like the open-run assertion above: the move out
+        // of UPDATING comes due half a second after the update, so this is an assertion about
+        // the in-flight canary only while the read provably happened before that. A loaded
+        // machine that took longer legitimately sees the settled canary, which the poll below
+        // asserts on either way.
+        if read_within < UPDATE_STILL_IN_FLIGHT_WITHIN {
+            assert_eq!(
+                in_flight.at("Canary.Status.State").as_str(),
+                Some("UPDATING"),
+                "case {case} (read within {read_within:?}): expected UPDATING, got {:?}",
+                in_flight.at("Canary.Status")
+            );
+            assert_eq!(
+                in_flight.at("Canary.Status.StateReasonCode").as_str(),
+                Some("UPDATE_IN_PROGRESS"),
+                "case {case} (read within {read_within:?}): expected UPDATE_IN_PROGRESS, got {:?}",
+                in_flight.at("Canary.Status")
+            );
+            // A canary with an update still in flight refuses a second one: that is
+            // `ConflictException`'s documented "a conflicting operation is already in
+            // progress".
+            let second = aws.update(&name, json!({})).await;
+            if began.elapsed() < UPDATE_STILL_IN_FLIGHT_WITHIN {
+                assert_eq!(
+                    second.status, 409,
+                    "case {case}: expected 409 while the update is in flight, got {} ({:?})",
+                    second.status, second.body
+                );
+                assert_eq!(
+                    second.error_code.as_deref(),
+                    Some("ConflictException"),
+                    "case {case}: expected ConflictException, got {:?}",
+                    second.error_code
+                );
+                assert_eq!(
+                    second.at("Message").as_str(),
+                    Some("Canary is in a state that can't be updated: UPDATING"),
+                    "case {case}: expected the service's state-conflict sentence, got {:?}",
+                    second.at("Message")
+                );
+            }
+        }
+
+        let settled = poll_until(
+            case,
+            || aws.get(&name),
+            |answer| answer.at("Canary.Status.State").as_str() != Some("UPDATING"),
+        )
+        .await;
+        assert_eq!(
+            settled.at("Canary.Status.State").as_str(),
+            Some(expected_state),
+            "case {case}: expected the canary to resume {expected_state}, got {:?}",
+            settled.at("Canary.Status")
+        );
+        assert_eq!(
+            settled.at("Canary.Status.StateReasonCode").as_str(),
+            Some("UPDATE_COMPLETE"),
+            "case {case}: expected UPDATE_COMPLETE once the update is applied, got {:?}",
+            settled.at("Canary.Status")
+        );
+        assert_eq!(
+            settled.string_at("Canary.RuntimeVersion"),
+            "syn-nodejs-puppeteer-10.0",
+            "case {case}: expected the updated runtime version, got {:?}",
+            settled.at("Canary.RuntimeVersion")
+        );
+        // The record observably changed, so its modification instant advanced with it while
+        // its creation instant did not.
+        let modified = settled
+            .at("Canary.Timeline.LastModified")
+            .as_f64()
+            .unwrap_or_default();
+        let created = settled
+            .at("Canary.Timeline.Created")
+            .as_f64()
+            .unwrap_or_default();
+        let modified_before = before
+            .at("Canary.Timeline.LastModified")
+            .as_f64()
+            .unwrap_or_default();
+        assert!(
+            modified >= modified_before && modified >= created,
+            "case {case}: expected LastModified to advance with the change, got {modified} \
+             against {modified_before}"
+        );
+
+        // The same record, through the other reader.
+        let described = aws.describe(json!({})).await;
+        let listed = described
+            .at("Canaries")
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let entry = listed
+            .iter()
+            .find(|canary| canary["Name"].as_str() == Some(name.as_str()))
+            .unwrap_or_else(|| panic!("case {case}: DescribeCanaries dropped {name}"));
+        assert_eq!(
+            entry["RuntimeVersion"].as_str(),
+            Some("syn-nodejs-puppeteer-10.0"),
+            "case {case}: expected DescribeCanaries to report the update too, got {:?}",
+            entry["RuntimeVersion"]
+        );
+    }
+}
+
+/// Every rule the model states in prose about an update's members refuses the request, and a
+/// refused update leaves the canary exactly as it was.
+#[tokio::test]
+async fn an_update_the_model_forbids_is_refused_and_writes_nothing() {
+    let aws = Synthetics::new("us-west-1");
+    let name = "refusing-update";
+    let before = ready_canary(&aws, "seed", name).await;
+
+    // A syntactically valid `UUID` (the `DryRunId` pattern) that names no dry run.
+    let absent_dry_run = "00000000-0000-4000-8000-000000000000";
+    let rows: Vec<(&str, Value, u16, &str)> = vec![
+        (
+            "a runtime version outside the published catalogue",
+            json!({ "RuntimeVersion": "syn-nodejs-puppeteer-0.1" }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "an artifact location that is not an s3 location",
+            json!({ "ArtifactS3Location": "artifacts/canary" }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "an artifact bucket with a period in it",
+            json!({ "ArtifactS3Location": "s3://my.bucket/canary" }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "memory that is not a multiple of 64",
+            json!({ "RunConfig": { "MemoryInMB": 1000 } }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "code with neither a zip file nor an s3 location",
+            json!({ "Code": { "Handler": "index.handler" } }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "code with both a handler and a blueprint",
+            json!({
+                "Code": {
+                    "Handler": "index.handler",
+                    "BlueprintTypes": ["multi-checks"],
+                    "S3Bucket": "b",
+                    "S3Key": "k",
+                },
+            }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "a visual reference",
+            json!({ "VisualReference": { "BaseCanaryRunId": "lastrun" } }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "a list of visual references",
+            json!({ "VisualReferences": [{ "BaseCanaryRunId": "lastrun" }] }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "replica locations to add",
+            json!({ "AddReplicaLocations": [{ "Location": "us-east-1" }] }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "replica locations to remove",
+            json!({ "RemoveReplicaLocations": ["us-east-1"] }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "a dry run id beside a member other than the schedule",
+            json!({
+                "DryRunId": absent_dry_run,
+                "RuntimeVersion": "syn-nodejs-puppeteer-10.0",
+            }),
+            400,
+            "ValidationException",
+        ),
+        (
+            "a dry run id naming no dry run of this canary",
+            json!({ "DryRunId": absent_dry_run }),
+            404,
+            "ResourceNotFoundException",
+        ),
+    ];
+
+    for (case, body, status, code) in rows {
+        let answer = aws.update(name, body).await;
+        assert_eq!(
+            answer.status, status,
+            "case {case}: expected {status}, got {} ({:?})",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code.as_deref(),
+            Some(code),
+            "case {case}: expected {code}, got {:?}",
+            answer.error_code
+        );
+        assert!(
+            answer.at("Message").is_string(),
+            "case {case}: expected a Message on the refusal, got {:?}",
+            answer.body
+        );
+        // Nothing was written: the canary is still the record the create left, and it was
+        // never moved into UPDATING.
+        let read = aws.get(name).await;
+        assert_eq!(
+            read.at("Canary"),
+            before.at("Canary"),
+            "case {case}: a refused update changed the canary anyway, got {:?}",
+            read.at("Canary")
+        );
+    }
+
+    // An update of a canary this store does not hold is not found rather than created.
+    let ghost = aws.update("ghost", json!({})).await;
+    assert_eq!(
+        ghost.status, 404,
+        "case unknown canary: expected 404, got {} ({:?})",
+        ghost.status, ghost.body
+    );
+    assert_eq!(
+        ghost.error_code.as_deref(),
+        Some("ResourceNotFoundException"),
+        "case unknown canary: expected ResourceNotFoundException, got {:?}",
+        ghost.error_code
+    );
+    assert_eq!(
+        aws.get("ghost").await.status,
+        404,
+        "case unknown canary: a refused update created a canary"
+    );
+}
+
+/// `UpdateCanaryRequest$DryRunId`: an update that names a dry run takes that dry run's
+/// configuration, and may carry a `Schedule` beside it.
+#[tokio::test]
+async fn an_update_from_a_dry_run_applies_the_configuration_it_exercised() {
+    let aws = Synthetics::new("ap-south-1");
+    let name = "promoting-canary";
+    let before = ready_canary(&aws, "seed", name).await;
+
+    let dry_run = aws
+        .call(
+            "POST",
+            &format!("/canary/{name}/dry-run/start"),
+            Some(json!({
+                "RuntimeVersion": "syn-python-selenium-5.1",
+                "ArtifactS3Location": "s3://dry-run-artifacts/probe",
+                "SuccessRetentionPeriodInDays": 9,
+            })),
+        )
+        .await;
+    assert_eq!(
+        dry_run.status, 200,
+        "case dry run: expected 200, got {} ({:?})",
+        dry_run.status, dry_run.body
+    );
+    let dry_run_id = dry_run.string_at("DryRunConfig.DryRunId");
+    // The dry run on its own changes nothing about the canary.
+    assert_eq!(
+        aws.get(name).await.at("Canary.RuntimeVersion"),
+        before.at("Canary.RuntimeVersion"),
+        "case dry run: a dry run must not change the canary"
+    );
+
+    let updated = aws
+        .update(
+            name,
+            json!({
+                "DryRunId": dry_run_id,
+                "Schedule": { "Expression": "rate(10 minutes)" },
+            }),
+        )
+        .await;
+    assert_eq!(
+        updated.status, 200,
+        "case promote: expected 200, got {} ({:?})",
+        updated.status, updated.body
+    );
+
+    let settled = poll_until(
+        "promote",
+        || aws.get(name),
+        |answer| answer.at("Canary.Status.State").as_str() != Some("UPDATING"),
+    )
+    .await;
+    for (path, expected) in [
+        ("Canary.RuntimeVersion", json!("syn-python-selenium-5.1")),
+        (
+            "Canary.ArtifactS3Location",
+            json!("s3://dry-run-artifacts/probe"),
+        ),
+        ("Canary.SuccessRetentionPeriodInDays", json!(9)),
+        ("Canary.Schedule.Expression", json!("rate(10 minutes)")),
+        ("Canary.Status.StateReasonCode", json!("UPDATE_COMPLETE")),
+    ] {
+        assert_eq!(
+            settled.at(path),
+            &expected,
+            "case promote: expected {path} to report {expected:?}, got {:?}",
+            settled.at(path)
+        );
+    }
+    // What the dry run did NOT exercise is the canary's own: its execution role, its
+    // identity and its code layer.
+    for path in [
+        "Canary.ExecutionRoleArn",
+        "Canary.Id",
+        "Canary.Code.SourceLocationArn",
+        "Canary.FailureRetentionPeriodInDays",
+    ] {
+        assert_eq!(
+            settled.at(path),
+            before.at(path),
+            "case promote: expected {path} to be kept, got {:?}",
+            settled.at(path)
+        );
+    }
+}
+
 

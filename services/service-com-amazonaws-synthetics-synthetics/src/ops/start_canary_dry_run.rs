@@ -130,10 +130,11 @@ use std::time::SystemTime;
 
 use crate::state::{
     canary_run::RunWork, canary_state_conflict, is_published_runtime_version,
-    is_s3_artifact_location, new_uuid, source_location_arn, unknown_runtime_version,
-    CanaryRunState, CanaryState, CanaryTransition, StoredArtifactConfig, StoredCode,
-    StoredDependency, StoredDryRun, StoredRun, StoredRunConfig, StoredVpcConfig,
+    is_s3_artifact_location, new_uuid, run_config_violation, source_location_arn,
+    unknown_runtime_version, CanaryRunState, CanaryState, CanaryTransition, StoredArtifactConfig,
+    StoredCode, StoredDependency, StoredDryRun, StoredRun, StoredRunConfig, StoredVpcConfig,
     ARTIFACT_S3_LOCATION_MALFORMED, CANARY_NOT_FOUND, RUN_SETTLE, STORE_UNAVAILABLE,
+    VISUAL_MONITORING_UNSUPPORTED,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -228,13 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(validation(unknown_runtime_version(requested)));
             }
         }
-        if let Some(memory) = input.run_config.as_ref().and_then(|rc| rc.memory_in_mb) {
+        if let Some(message) = input.run_config.as_ref().and_then(run_config_violation) {
             // `CanaryRunConfigInput$MemoryInMB`: "This value must be a multiple of 64."
-            if memory % 64 != 0 {
-                return Err(validation(format!(
-                    "RunConfig.MemoryInMB must be a multiple of 64, got {memory}"
-                )));
-            }
+            return Err(validation(message));
         }
         if input.visual_reference.is_some() || input.visual_references.is_some() {
             // Visual monitoring compares the screenshots a run took against a baseline
@@ -279,6 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // canary record, not to one of the configurations it has been run with.
         config.runs.clear();
         config.dry_runs.clear();
+        // Nor any transition the canary itself is owed: this snapshot is a configuration, and
+        // the lifecycle reported for it is the dry run's own.
+        config.pending_update = None;
         if let Some(code) = input.code {
             config.code = StoredCode {
                 // `Handler` carries `@default: ""`, so an omitted handler arrives as the
@@ -463,11 +463,6 @@ fn not_found() -> StartCanaryDryRunError {
     })
     .into()
 }
-
-/// `ValidationException$Message` for the two visual-reference members: this emulator
-/// executes no canary script, so it holds no screenshot a baseline could be compared with.
-const VISUAL_MONITORING_UNSUPPORTED: &str =
-    "VisualReference is not supported: this emulator does not perform visual monitoring";
 
 /// The modelled 400 this operation refuses a bad request with.
 fn validation(message: impl Into<String>) -> StartCanaryDryRunError {

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCanary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCanary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCanary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a configuration change to a canary already in this service's store: every member
+//! the request supplies replaces the stored value, every member it omits keeps it, and the
+//! canary is reported as `UPDATING` until the clock owes the move back out of it.
 //!
 //! ## Shape of an operation
 //!
@@ -155,6 +149,18 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
+
+use crate::state::{
+    canary_state_conflict, code_violation, default_run_timeout_in_seconds,
+    is_published_runtime_version, is_s3_artifact_location, replica_locations_unsupported,
+    request_caller, request_region, run_config_violation, unknown_runtime_version, CanaryState,
+    CanaryTransition, PendingUpdate, StoredArtifactConfig, StoredCanary, StoredCode,
+    StoredDependency, StoredRunConfig, StoredSchedule, StoredVpcConfig,
+    ARTIFACT_S3_LOCATION_MALFORMED, AUDIT_TARGET, CANARY_NOT_FOUND,
+    DEFAULT_SCHEDULE_DURATION_IN_SECONDS, DRY_RUN_NOT_FOUND, PROVISIONING_SETTLE,
+    STORE_UNAVAILABLE, UPDATE_IN_PROGRESS_REASON_CODE, VISUAL_MONITORING_UNSUPPORTED,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -226,21 +232,374 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCanary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCanaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCanary"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_error)?;
+        let now = SystemTime::now();
+        let region = request_region(&ctx.parts().headers);
+
+        // Rules the model documents in prose but cannot express as a constraint, so they are
+        // refused here rather than at the request boundary — before any state is written, so
+        // a refused update leaves the canary exactly as it was.
+        validate(&input)?;
+
+        let mut guard = state.lock();
+        // Only what the clock already owed at this instant (a canary that finished
+        // provisioning or updating, a run whose outcome came due).
+        guard.settle(now);
+        // What that settling finished is published before this call answers: it was owed at
+        // the same instant, whoever called (`crate::state::run_metrics`).
+        crate::state::run_metrics::publish_finished_runs(&*self.engine, &mut guard);
+        let canary = guard.canaries.get_mut(&input.name).ok_or_else(not_found)?;
+
+        // A canary with an operation still in flight (it is being provisioned, started,
+        // stopped, updated or deleted) is exactly `ConflictException`'s documented "a
+        // conflicting operation is already in progress", so this update is refused rather
+        // than racing it. A canary that is merely RUNNING is not a conflict: its
+        // configuration changes under it and it goes on running.
+        if canary.state.operation_in_progress() {
+            return Err(state_conflict(canary.state));
+        }
+
+        // `UpdateCanaryRequest$DryRunId`: "Update the existing canary using the updated
+        // configurations from the DryRun associated with the DryRunId." The configuration
+        // applied is therefore the snapshot that dry run ran with, read off THIS canary's own
+        // dry-run history — an id naming no dry run of this canary resolves to nothing.
+        let promoted = match input.dry_run_id.as_deref() {
+            None => None,
+            Some(dry_run_id) => Some(
+                canary
+                    .dry_run(dry_run_id)
+                    .ok_or_else(dry_run_not_found)?
+                    .config
+                    .clone(),
+            ),
+        };
+
+        // The schedule goes first: a run timeout the request leaves out follows "the
+        // frequency of the canary" (`CanaryRunConfigInput$TimeoutInSeconds`), which is the
+        // frequency this same call may have just changed. `Schedule` is also the one member
+        // that may accompany a `DryRunId`, so it is applied for both forms of the call.
+        if let Some(schedule) = input.schedule.take() {
+            canary.schedule = StoredSchedule {
+                duration_in_seconds: schedule
+                    .duration_in_seconds
+                    .unwrap_or(DEFAULT_SCHEDULE_DURATION_IN_SECONDS),
+                max_retries: schedule.retry_config.map(|retry| retry.max_retries),
+                expression: schedule.expression,
+            };
+        }
+        match promoted {
+            Some(config) => promote(canary, *config),
+            None => apply(canary, input),
+        }
+
+        // The change is reported as still being applied: `UPDATING` with the reason code the
+        // model names for an update in flight, and the move back out of it owed by the clock
+        // rather than by another call. A caller reading straight after this answer therefore
+        // still sees the canary updating, and the conflicts that state implies.
+        let resumes = canary.state;
+        canary.state = CanaryState::Updating;
+        canary.state_reason = None;
+        canary.state_reason_code = Some(UPDATE_IN_PROGRESS_REASON_CODE.to_string());
+        canary.pending_update = Some(PendingUpdate {
+            due: now + PROVISIONING_SETTLE,
+            resumes,
+        });
+        // The record observably changed, so its modification instant advances with it.
+        canary.last_modified = now;
+        // The change is written and nothing below needs the store, so the critical section
+        // covers the state change only.
+        drop(guard);
+        audit(ctx, &region, "updated");
+
+        // `UpdateCanaryResponse` models no members: what the update wrote is read back
+        // through `GetCanary` and `DescribeCanaries`, off the record this call changed.
+        Ok(UpdateCanaryOutput {})
     }
+}
+
+/// Apply one request's configuration members to `canary`: a member the request supplies
+/// replaces the stored value, a member it omits keeps it.
+///
+/// A member that carries a whole STRUCTURE replaces that structure, and the members that
+/// structure leaves out take the defaults their own documentation gives them — the same
+/// reading `CreateCanary` gives the very same structures, so one configuration cannot mean
+/// two different things depending on which call wrote it.
+fn apply(canary: &mut StoredCanary, input: UpdateCanaryInput) {
+    if let Some(code) = input.code {
+        // The canary keeps the layer its code is stored in: an update replaces the script,
+        // not the Lambda layer Synthetics reports the canary's code at.
+        let source_location_arn = canary.code.source_location_arn.clone();
+        canary.code = StoredCode {
+            // `Handler` carries `@default: ""`, so an omitted handler arrives as the empty
+            // string; report it absent rather than as an empty entry point.
+            handler: code.handler.filter(|handler| !handler.is_empty()),
+            blueprint_types: code.blueprint_types.unwrap_or_default(),
+            dependencies: code
+                .dependencies
+                .unwrap_or_default()
+                .into_iter()
+                .map(|dep| StoredDependency {
+                    r#type: dep.r#type,
+                    reference: dep.reference,
+                })
+                .collect(),
+            source_location_arn,
+            s3_bucket: code.s3_bucket,
+            s3_key: code.s3_key,
+            s3_version: code.s3_version,
+        };
+    }
+    if let Some(execution_role_arn) = input.execution_role_arn {
+        canary.execution_role_arn = execution_role_arn;
+    }
+    if let Some(run_config) = input.run_config {
+        // `CanaryRunConfigInput$TimeoutInSeconds`: "If you omit this field, the frequency of
+        // the canary is used as this value" — a property of the member, so it applies to a
+        // run configuration an update supplies as much as to one a create did.
+        let timeout_in_seconds = run_config
+            .timeout_in_seconds
+            .unwrap_or_else(|| default_run_timeout_in_seconds(&canary.schedule.expression));
+        canary.run_config = StoredRunConfig {
+            timeout_in_seconds,
+            memory_in_mb: run_config.memory_in_mb,
+            active_tracing: run_config.active_tracing,
+            ephemeral_storage: run_config.ephemeral_storage,
+            environment_variables: run_config
+                .environment_variables
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        };
+    }
+    if let Some(days) = input.success_retention_period_in_days {
+        canary.success_retention_period_in_days = days;
+    }
+    if let Some(days) = input.failure_retention_period_in_days {
+        canary.failure_retention_period_in_days = days;
+    }
+    if let Some(location) = input.artifact_s3_location {
+        canary.artifact_s3_location = location;
+    }
+    if let Some(artifact_config) = input.artifact_config {
+        canary.artifact_config = Some(StoredArtifactConfig {
+            encryption_mode: artifact_config
+                .s3_encryption
+                .as_ref()
+                .and_then(|enc| enc.encryption_mode.clone()),
+            kms_key_arn: artifact_config
+                .s3_encryption
+                .as_ref()
+                .and_then(|enc| enc.kms_key_arn.clone()),
+        });
+    }
+    if let Some(runtime_version) = input.runtime_version {
+        canary.runtime_version = runtime_version;
+    }
+    if let Some(vpc_config) = input.vpc_config {
+        canary.vpc_config = Some(StoredVpcConfig {
+            subnet_ids: vpc_config.subnet_ids.unwrap_or_default(),
+            security_group_ids: vpc_config.security_group_ids.unwrap_or_default(),
+            ipv6_allowed_for_dual_stack: vpc_config.ipv6_allowed_for_dual_stack,
+        });
+    }
+    if let Some(cleanup) = input.provisioned_resource_cleanup {
+        canary.provisioned_resource_cleanup = cleanup;
+    }
+    if let Some(kms_key_arn) = input.kms_key_arn {
+        // `UpdateCanaryRequest$KmsKeyArn`: "If you omit this parameter, the service retains
+        // the existing value."
+        canary.kms_key_arn = Some(kms_key_arn);
+    }
+    if let Some(browser_configs) = input.browser_configs {
+        // `UpdateCanary`: "you can add or remove browsers by updating the browserConfig list
+        // in the update call", so the list supplied IS the canary's browser set afterwards.
+        canary.browser_types = browser_configs
+            .into_iter()
+            .filter_map(|cfg| cfg.browser_type)
+            .collect();
+    }
+    // `Tags` is no member of this request: "You can't use this operation to update the tags
+    // of an existing canary. To change the tags of an existing canary, use TagResource."
+}
+
+/// Apply the configuration a dry run exercised to the canary itself.
+///
+/// `UpdateCanaryRequest$DryRunId`: "Update the existing canary using the updated
+/// configurations from the DryRun associated with the DryRunId." Every CONFIGURATION member
+/// comes from that dry run's snapshot; the canary's identity, its tags, its lifecycle and its
+/// run history stay its own, and its code keeps the canary's own layer. The snapshot's
+/// schedule is not one of them: `StartCanaryDryRun` takes no schedule, so the only schedule an
+/// update from a dry run can set is the one the request carries beside the `DryRunId`.
+fn promote(canary: &mut StoredCanary, config: StoredCanary) {
+    let source_location_arn = canary.code.source_location_arn.clone();
+    canary.code = StoredCode {
+        source_location_arn,
+        ..config.code
+    };
+    canary.execution_role_arn = config.execution_role_arn;
+    canary.run_config = config.run_config;
+    canary.success_retention_period_in_days = config.success_retention_period_in_days;
+    canary.failure_retention_period_in_days = config.failure_retention_period_in_days;
+    canary.artifact_s3_location = config.artifact_s3_location;
+    canary.artifact_config = config.artifact_config;
+    canary.runtime_version = config.runtime_version;
+    canary.vpc_config = config.vpc_config;
+    canary.provisioned_resource_cleanup = config.provisioned_resource_cleanup;
+    canary.kms_key_arn = config.kms_key_arn;
+    canary.browser_types = config.browser_types;
+}
+
+/// The rules the model states in prose about an update's own members.
+fn validate(input: &UpdateCanaryInput) -> Result<(), UpdateCanaryError> {
+    if input.dry_run_id.is_some() {
+        // `UpdateCanaryRequest$DryRunId`: "When you use the dryRunId field when updating a
+        // canary, the only other field you can provide is the Schedule. Adding any other
+        // field will thrown an exception."
+        if let Some(member) = member_besides_schedule(input) {
+            return Err(validation(format!(
+                "{member} cannot be provided with DryRunId: Schedule is the only other field \
+                 an update from a dry run accepts"
+            )));
+        }
+    }
+    // `UpdateCanaryRequest$ArtifactS3Location` is "The location in Amazon S3 where Synthetics
+    // stores artifacts … The name of the Amazon S3 bucket can't include a period (.)": a value
+    // that is not a well-formed S3 location names no bucket the canary could ever write to, so
+    // it is refused rather than stored verbatim.
+    if let Some(location) = input.artifact_s3_location.as_deref() {
+        if !is_s3_artifact_location(location) {
+            return Err(validation(ARTIFACT_S3_LOCATION_MALFORMED));
+        }
+    }
+    // The model constrains only the value's LENGTH, so the set of values the service accepts
+    // is its own runtime catalogue (`crate::state::RUNTIME_VERSION_CATALOG`, the one list
+    // `DescribeRuntimeVersions` reports). A version outside it names no runtime the canary
+    // could ever be provisioned on.
+    if let Some(requested) = input.runtime_version.as_deref() {
+        if !is_published_runtime_version(requested) {
+            return Err(validation(unknown_runtime_version(requested)));
+        }
+    }
+    if let Some(message) = input.code.as_ref().and_then(code_violation) {
+        return Err(validation(message));
+    }
+    if let Some(message) = input.run_config.as_ref().and_then(run_config_violation) {
+        return Err(validation(message));
+    }
+    if input.visual_reference.is_some() || input.visual_references.is_some() {
+        return Err(validation(VISUAL_MONITORING_UNSUPPORTED));
+    }
+    if input.add_replica_locations.is_some() {
+        return Err(validation(replica_locations_unsupported(
+            "AddReplicaLocations",
+        )));
+    }
+    if input.remove_replica_locations.is_some() {
+        return Err(validation(replica_locations_unsupported(
+            "RemoveReplicaLocations",
+        )));
+    }
+    Ok(())
+}
+
+/// The first member the request carries besides `Schedule`, named as the model declares it
+/// (`smithy_query(query="operation",operation="UpdateCanary")`), or `None` when it carries
+/// none: what decides whether an update from a dry run is admissible.
+fn member_besides_schedule(input: &UpdateCanaryInput) -> Option<&'static str> {
+    [
+        ("Code", input.code.is_some()),
+        ("ExecutionRoleArn", input.execution_role_arn.is_some()),
+        ("RuntimeVersion", input.runtime_version.is_some()),
+        ("RunConfig", input.run_config.is_some()),
+        (
+            "SuccessRetentionPeriodInDays",
+            input.success_retention_period_in_days.is_some(),
+        ),
+        (
+            "FailureRetentionPeriodInDays",
+            input.failure_retention_period_in_days.is_some(),
+        ),
+        ("VpcConfig", input.vpc_config.is_some()),
+        ("VisualReference", input.visual_reference.is_some()),
+        ("ArtifactS3Location", input.artifact_s3_location.is_some()),
+        ("ArtifactConfig", input.artifact_config.is_some()),
+        (
+            "ProvisionedResourceCleanup",
+            input.provisioned_resource_cleanup.is_some(),
+        ),
+        ("VisualReferences", input.visual_references.is_some()),
+        ("BrowserConfigs", input.browser_configs.is_some()),
+        ("AddReplicaLocations", input.add_replica_locations.is_some()),
+        (
+            "RemoveReplicaLocations",
+            input.remove_replica_locations.is_some(),
+        ),
+        ("KmsKeyArn", input.kms_key_arn.is_some()),
+    ]
+    .into_iter()
+    .find_map(|(member, supplied)| supplied.then_some(member))
+}
+
+/// The access record for this state-changing operation: who, where, what and the outcome.
+///
+/// Metadata only — no canary name and no configuration value — so nothing a caller supplied
+/// can reach the trail, and `Debug`-escaped values cannot split a record. Same shape as the
+/// other state-changing operations' (`CreateGroup`, `DeleteGroup`, `TagResource`).
+fn audit(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: AUDIT_TARGET,
+        operation = "UpdateCanary",
+        caller = ?request_caller(ctx.parts()),
+        region = ?region,
+        outcome = outcome,
+        "synthetics canary update",
+    );
+}
+
+/// The modelled 400 this operation refuses a bad request with.
+fn validation(message: impl Into<String>) -> UpdateCanaryError {
+    UpdateCanaryErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled 404 for a canary this store does not hold. The missing-canary message is a
+/// fixed sentence, not built from the lookup key: see `state::CANARY_NOT_FOUND`.
+fn not_found() -> UpdateCanaryError {
+    UpdateCanaryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(CANARY_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 404 for a `DryRunId` naming no dry run of this canary, by the same rule: the
+/// message names the resource KIND that was not found and never the identifier asked for.
+fn dry_run_not_found() -> UpdateCanaryError {
+    UpdateCanaryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(DRY_RUN_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 409 for a canary whose current state does not admit an update, worded by the
+/// one construction every state-transition refusal of this service shares
+/// (`state::canary_state_conflict`).
+fn state_conflict(state: CanaryState) -> UpdateCanaryError {
+    UpdateCanaryErrorModeled::ConflictException(ConflictException {
+        message: Some(canary_state_conflict(CanaryTransition::Updated, state)),
+    })
+    .into()
+}
+
+/// The modelled 500 for a store that cannot be reached. Never a fresh engine: a private store
+/// would accept the write and drop it when the request returns.
+fn internal_error() -> UpdateCanaryError {
+    UpdateCanaryErrorModeled::InternalServerException(InternalServerException {
+        message: Some(STORE_UNAVAILABLE.to_string()),
+    })
+    .into()
 }

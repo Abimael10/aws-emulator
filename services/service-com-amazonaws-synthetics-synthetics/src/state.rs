@@ -18,10 +18,11 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ArtifactConfigOutput, BrowserConfig, Canary, CanaryCodeOutput, CanaryDryRunConfigOutput,
-    CanaryRun, CanaryRunConfigOutput, CanaryRunStatus, CanaryRunTimeline, CanaryScheduleOutput,
-    CanaryStatus, CanaryTimeline, Dependency, DryRunConfigOutput, Group, GroupSummary,
-    RetryConfigOutput, RuntimeVersion, S3EncryptionConfig, VpcConfigOutput,
+    ArtifactConfigOutput, BrowserConfig, Canary, CanaryCodeInput, CanaryCodeOutput,
+    CanaryDryRunConfigOutput, CanaryRun, CanaryRunConfigInput, CanaryRunConfigOutput,
+    CanaryRunStatus, CanaryRunTimeline, CanaryScheduleOutput, CanaryStatus, CanaryTimeline,
+    Dependency, DryRunConfigOutput, Group, GroupSummary, RetryConfigOutput, RuntimeVersion,
+    S3EncryptionConfig, VpcConfigOutput,
 };
 
 /// The WORK one canary run performs, and the verdict that work produces: the run's
@@ -204,6 +205,18 @@ pub const RUN_UNRECORDED_REASON: &str =
 /// `CanaryStateReasonCode` reported while a freshly created canary is still `CREATING`.
 pub const CREATE_IN_PROGRESS_REASON_CODE: &str = "CREATE_IN_PROGRESS";
 
+/// `CanaryStateReasonCode` reported while a configuration change is still being applied to a
+/// canary, which is the `UPDATING` state's reason.
+pub const UPDATE_IN_PROGRESS_REASON_CODE: &str = "UPDATE_IN_PROGRESS";
+
+/// `CanaryStateReasonCode` a canary reports once the configuration change the clock owed it
+/// has been applied.
+///
+/// `CanaryStatus$StateReasonCode` is "the reason code" of the canary's last create or update,
+/// so the code outlives the transition it describes: the canary is out of `UPDATING` and
+/// reports how that update ended until a later lifecycle call moves it again.
+pub const UPDATE_COMPLETE_REASON_CODE: &str = "UPDATE_COMPLETE";
+
 /// The message every handler answers with when the shared store cannot be reached. One
 /// constant so the handlers that can hit it word it identically.
 pub const STORE_UNAVAILABLE: &str = "the synthetics canary store is unavailable";
@@ -250,6 +263,8 @@ pub enum CanaryTransition {
     Deleted,
     /// `StartCanaryDryRun`.
     DryRun,
+    /// `UpdateCanary`.
+    Updated,
 }
 
 impl CanaryTransition {
@@ -260,6 +275,7 @@ impl CanaryTransition {
             Self::Stopped => "stopped",
             Self::Deleted => "deleted",
             Self::DryRun => "dry run",
+            Self::Updated => "updated",
         }
     }
 }
@@ -434,6 +450,22 @@ impl CanaryRunState {
             Self::Failed => "FAILED",
         }
     }
+}
+
+/// The move out of [`CanaryState::Updating`] the clock owes a canary whose configuration a
+/// call has just changed.
+///
+/// `UpdateCanary` answers while the canary is still `UPDATING`, a non-terminal state, so the
+/// move out of it is owed by the clock rather than by any later call — the same contract
+/// [`PROVISIONING_SETTLE`] states for a create.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingUpdate {
+    /// When the update is owed to be complete.
+    pub due: SystemTime,
+    /// The state the canary goes back to once it is: an update changes a canary's
+    /// configuration and neither starts nor stops it, so the canary resumes whatever it was
+    /// doing when the update arrived.
+    pub resumes: CanaryState,
 }
 
 /// Where a canary's script came from, plus the layer ARN Synthetics reports for it.
@@ -703,6 +735,9 @@ pub struct StoredCanary {
     pub state_reason_code: Option<String>,
     /// The instant at which the clock owes the move out of [`CanaryState::Creating`].
     pub ready_due: Option<SystemTime>,
+    /// The move out of [`CanaryState::Updating`] the clock owes, for a canary whose
+    /// configuration a call has just changed. `None` for a canary with no update in flight.
+    pub pending_update: Option<PendingUpdate>,
     /// The instant at which the clock owes the move out of [`CanaryState::Running`],
     /// because the canary's own schedule bounds how long it keeps running
     /// ([`StoredSchedule::running_bound`]). `None` for a schedule that runs until
@@ -743,6 +778,17 @@ impl StoredCanary {
             self.state_reason = None;
             self.state_reason_code = None;
             self.ready_due = None;
+        }
+        // The same contract one state further on: a canary whose configuration was changed
+        // is `UPDATING` until the clock owes the move back out of it, and what it goes back
+        // to is what it was doing before — an update is not a start and not a stop.
+        if self.state == CanaryState::Updating {
+            if let Some(pending) = self.pending_update.filter(|pending| now >= pending.due) {
+                self.state = pending.resumes;
+                self.state_reason = None;
+                self.state_reason_code = Some(UPDATE_COMPLETE_REASON_CODE.to_string());
+                self.pending_update = None;
+            }
         }
         let mut finished = Vec::new();
         for run in &mut self.runs {
@@ -1968,6 +2014,79 @@ pub fn is_published_runtime_version(requested: &str) -> bool {
 /// `DescribeRuntimeVersions`, has that value and nothing else to go on.
 pub fn unknown_runtime_version(requested: &str) -> String {
     format!("Invalid runtime version specified: {requested}")
+}
+
+/// What `CanaryCodeInput` forbids about where a canary's code comes from, as the sentence a
+/// refusal reports — `None` when `code` breaks none of those rules.
+///
+/// The model states them as prose on the members rather than as constraints, so they are
+/// refused by the handler rather than at the request boundary. ONE reading of them, so every
+/// operation that takes a whole `CanaryCodeInput` for a canary (`CreateCanary`,
+/// `UpdateCanary`) agrees about which code structures a canary may carry.
+pub fn code_violation(code: &CanaryCodeInput) -> Option<String> {
+    let blueprints = code
+        .blueprint_types
+        .as_ref()
+        .is_some_and(|types| !types.is_empty());
+    let handler = code.handler.as_deref().is_some_and(|h| !h.is_empty());
+    // `CanaryCodeInput$Handler`: "This field is required when you don't specify
+    // BlueprintTypes and is not allowed when you specify BlueprintTypes."
+    if blueprints && handler {
+        return Some("Code.Handler is not allowed when Code.BlueprintTypes is specified".to_string());
+    }
+    if !blueprints && !handler {
+        return Some("Code.Handler is required when Code.BlueprintTypes is not specified".to_string());
+    }
+
+    // `CanaryCodeInput`: the script is either in Amazon S3 ("the bucket name, key, and
+    // version are also included") or passed in directly ("the script code is contained in
+    // the value of Zipfile") — one of the two, never both.
+    let zip = code.zip_file.as_ref().is_some_and(|zip| !zip.is_empty());
+    let bucket = code.s3_bucket.is_some();
+    let key = code.s3_key.is_some();
+    if zip && (bucket || key) {
+        return Some(
+            "Code.ZipFile cannot be combined with Code.S3Bucket or Code.S3Key".to_string(),
+        );
+    }
+    // That prose is written for a script-based canary. A blueprint canary is created "by
+    // providing only a JSON configuration file instead of writing custom scripts"
+    // (`CanaryCodeInput$BlueprintTypes`), and nothing the model says requires a script
+    // source for it, so the requirement is not imposed on that form.
+    if !(blueprints || zip || bucket && key) {
+        return Some("Code must specify either ZipFile, or both S3Bucket and S3Key".to_string());
+    }
+    None
+}
+
+/// What `CanaryRunConfigInput` forbids about a run configuration, as the sentence a refusal
+/// reports — `None` when `run_config` breaks none of those rules.
+///
+/// `CanaryRunConfigInput$MemoryInMB`: "This value must be a multiple of 64." A range
+/// constraint cannot express that, so it is refused by the handler; ONE reading of it, so
+/// every operation that takes a run configuration refuses the same values.
+pub fn run_config_violation(run_config: &CanaryRunConfigInput) -> Option<String> {
+    let memory = run_config.memory_in_mb?;
+    (memory % 64 != 0).then(|| {
+        format!("RunConfig.MemoryInMB must be a multiple of 64, got {memory}")
+    })
+}
+
+/// `ValidationException$Message` for the visual-reference members: this emulator executes no
+/// canary script, so it holds no screenshot a baseline could ever be compared with, and a
+/// request that asks for visual monitoring is refused rather than accepted and dropped.
+pub const VISUAL_MONITORING_UNSUPPORTED: &str =
+    "VisualReference is not supported: this emulator does not perform visual monitoring";
+
+/// `ValidationException$Message` for the replica-location members `member` names.
+///
+/// Cross-region replicas would have to report a per-region replication state this emulator
+/// cannot produce, so a request that asks for one is refused rather than accepted and
+/// silently dropped.
+pub fn replica_locations_unsupported(member: &str) -> String {
+    format!(
+        "{member} is not supported: this emulator does not replicate canaries across Regions"
+    )
 }
 
 /// How often `expression` runs the canary, in seconds, when that is determinable.

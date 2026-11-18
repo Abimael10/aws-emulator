@@ -149,13 +149,13 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::state::{
-    default_run_timeout_in_seconds, engine_arn, is_published_runtime_version,
-    is_s3_artifact_location, source_location_arn, unknown_runtime_version, CanaryState,
-    StoredArtifactConfig, StoredCanary, StoredCode, StoredDependency, StoredRunConfig,
-    StoredSchedule, StoredVpcConfig, ARTIFACT_S3_LOCATION_MALFORMED,
-    CREATE_IN_PROGRESS_REASON_CODE, DEFAULT_PROVISIONED_RESOURCE_CLEANUP,
-    DEFAULT_RETENTION_PERIOD_IN_DAYS, DEFAULT_SCHEDULE_DURATION_IN_SECONDS, MAX_CANARIES,
-    PROVISIONING_SETTLE, STORE_UNAVAILABLE,
+    code_violation, default_run_timeout_in_seconds, engine_arn, is_published_runtime_version,
+    is_s3_artifact_location, replica_locations_unsupported, run_config_violation,
+    source_location_arn, unknown_runtime_version, CanaryState, StoredArtifactConfig, StoredCanary,
+    StoredCode, StoredDependency, StoredRunConfig, StoredSchedule, StoredVpcConfig,
+    ARTIFACT_S3_LOCATION_MALFORMED, CREATE_IN_PROGRESS_REASON_CODE,
+    DEFAULT_PROVISIONED_RESOURCE_CLEANUP, DEFAULT_RETENTION_PERIOD_IN_DAYS,
+    DEFAULT_SCHEDULE_DURATION_IN_SECONDS, MAX_CANARIES, PROVISIONING_SETTLE, STORE_UNAVAILABLE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -271,13 +271,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         if input.add_replica_locations.is_some() {
-            // Cross-region replicas would have to report a per-region replication state
-            // this emulator cannot produce, so the request is refused instead of being
-            // accepted and silently dropped.
-            return Err(validation(
-                "AddReplicaLocations is not supported: this emulator does not replicate \
-                 canaries across Regions",
-            ));
+            return Err(validation(replica_locations_unsupported(
+                "AddReplicaLocations",
+            )));
         }
 
         let id = crate::state::new_uuid();
@@ -374,6 +370,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state_reason: None,
             state_reason_code: Some(CREATE_IN_PROGRESS_REASON_CODE.to_string()),
             ready_due: Some(now + PROVISIONING_SETTLE),
+            // Nothing is owed a canary no update has been asked of.
+            pending_update: None,
             // Nothing is owed a canary that is not running.
             stop_due: None,
             created: now,
@@ -449,59 +447,21 @@ fn internal_error() -> CreateCanaryError {
     .into()
 }
 
-/// The two prose rules `CanaryCodeInput` states about where a canary's code comes from.
+/// The prose rules `CanaryCodeInput` states about where a canary's code comes from, read
+/// from the ONE place this service states them (`state::code_violation`), so an update of a
+/// canary's code is held to exactly the rules its creation was.
 fn validate_code(code: &CanaryCodeInput) -> Result<(), CreateCanaryError> {
-    let blueprints = code
-        .blueprint_types
-        .as_ref()
-        .is_some_and(|types| !types.is_empty());
-    let handler = code.handler.as_deref().is_some_and(|h| !h.is_empty());
-    // `CanaryCodeInput$Handler`: "This field is required when you don't specify
-    // BlueprintTypes and is not allowed when you specify BlueprintTypes."
-    if blueprints && handler {
-        return Err(validation(
-            "Code.Handler is not allowed when Code.BlueprintTypes is specified",
-        ));
+    match code_violation(code) {
+        Some(message) => Err(validation(message)),
+        None => Ok(()),
     }
-    if !blueprints && !handler {
-        return Err(validation(
-            "Code.Handler is required when Code.BlueprintTypes is not specified",
-        ));
-    }
-
-    // `CanaryCodeInput`: the script is either in Amazon S3 ("the bucket name, key, and
-    // version are also included") or passed in directly ("the script code is contained
-    // in the value of Zipfile") — one of the two, never both.
-    let zip = code.zip_file.as_ref().is_some_and(|zip| !zip.is_empty());
-    let bucket = code.s3_bucket.is_some();
-    let key = code.s3_key.is_some();
-    if zip && (bucket || key) {
-        return Err(validation(
-            "Code.ZipFile cannot be combined with Code.S3Bucket or Code.S3Key",
-        ));
-    }
-    // That prose is written for a script-based canary. A blueprint canary is created
-    // "by providing only a JSON configuration file instead of writing custom scripts"
-    // (`CanaryCodeInput$BlueprintTypes`), and nothing the model says requires a script
-    // source for it, so the requirement is not imposed on that form.
-    if !(blueprints || zip || bucket && key) {
-        return Err(validation(
-            "Code must specify either ZipFile, or both S3Bucket and S3Key",
-        ));
-    }
-    Ok(())
 }
 
-/// `CanaryRunConfigInput$MemoryInMB`: "This value must be a multiple of 64." A range
-/// constraint cannot express that, so it is refused here.
+/// The prose rules `CanaryRunConfigInput` states, from the same single place
+/// (`state::run_config_violation`).
 fn validate_run_config(run_config: Option<&CanaryRunConfigInput>) -> Result<(), CreateCanaryError> {
-    let Some(memory) = run_config.and_then(|rc| rc.memory_in_mb) else {
-        return Ok(());
-    };
-    if memory % 64 != 0 {
-        return Err(validation(format!(
-            "RunConfig.MemoryInMB must be a multiple of 64, got {memory}"
-        )));
+    match run_config.and_then(run_config_violation) {
+        Some(message) => Err(validation(message)),
+        None => Ok(()),
     }
-    Ok(())
 }
