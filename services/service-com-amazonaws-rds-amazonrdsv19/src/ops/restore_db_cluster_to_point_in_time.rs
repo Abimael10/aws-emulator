@@ -1145,6 +1145,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the moment its storage exists: the first one is recorded below, once the data
             // it starts from is in place.
             backtrack_points: Vec::new(),
+            // A restored cluster carries none of the source's backtracks: a backtrack is
+            // performed ON a cluster, and this one is new.
+            backtracks: Vec::new(),
             // A restored cluster joins no global database and replicates nothing: it is a new
             // cluster of the source's data, and this operation names neither.
             global_cluster_identifier: None,

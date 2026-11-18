@@ -228,12 +228,79 @@ pub struct DbClusterRecord {
     /// the DB cluster", and these are this service's consistent times. A point is recorded
     /// when the cluster's storage is opened with backtracking enabled and after each
     /// backtrack; points older than [`Self::backtrack_window`] are dropped, because a
-    /// cluster "can't be backtracked" beyond its window.
+    /// cluster "can't be backtracked" beyond its window, and the cluster keeps at most
+    /// [`MAX_BACKTRACK_POINTS_PER_CLUSTER`] of them, because each one holds a copy of the
+    /// data.
     ///
     /// EMPTY for a cluster created with backtracking disabled (`BacktrackWindow` zero, the
     /// documented default), which keeps none, and for an engine this emulator serves no data
     /// plane for, which has no data to keep.
     pub backtrack_points: Vec<BacktrackPoint>,
+    /// The backtracks PERFORMED on this cluster, oldest first: what
+    /// `DescribeDBClusterBacktracks` "returns information about backtracks for a DB cluster"
+    /// from.
+    ///
+    /// One record per accepted `BacktrackDBCluster`, so the identifier that call answered
+    /// resolves to the backtrack it performed for as long as the cluster holds it. Bounded by
+    /// [`MAX_BACKTRACKS_PER_CLUSTER`] ([`Self::record_backtrack`]), and dropped with the
+    /// cluster, which is the only thing that can be backtracked.
+    pub backtracks: Vec<BacktrackRecord>,
+}
+
+/// Emulator resource guard, NOT an AWS quota: how many performed backtracks one DB cluster
+/// keeps for `DescribeDBClusterBacktracks` to report.
+///
+/// A caller may backtrack a cluster as often as it likes, so the list is the caller's to grow
+/// and has to be capped, like every other caller-sized list this store keeps. Once it is
+/// full the OLDEST record is dropped, so the report holds the most recent backtracks —
+/// generous beside the largest page any report of this front door serves
+/// ([`MAX_RECORDS_RANGE`]), so a caller can still page through what it kept.
+pub const MAX_BACKTRACKS_PER_CLUSTER: usize = 100;
+
+/// Emulator resource guard, NOT an AWS quota: how many CONSISTENT POINTS one DB cluster
+/// keeps ([`DbClusterRecord::backtrack_points`]).
+///
+/// How many points fall inside a cluster's backtrack window is driven by how often a caller
+/// asks for a backtrack, and each point holds a COPY of the cluster's data, so the count has
+/// to be capped as well as the age: without it a caller could make the store hold a copy per
+/// request. Once it is full the OLDEST point is dropped, so what the cluster keeps is the
+/// most recent times it can be rewound to, and the `EarliestBacktrackTime` the cluster
+/// reports moves up with them. Generous beside the points one cluster accumulates in normal
+/// use — one when its storage opens and one per backtrack performed on it.
+pub const MAX_BACKTRACK_POINTS_PER_CLUSTER: usize = 16;
+
+/// One backtrack PERFORMED on a DB cluster, as `DBClusterBacktrack` reports it.
+#[derive(Debug, Clone)]
+pub struct BacktrackRecord {
+    /// `BacktrackIdentifier`: "a valid universally unique identifier (UUID)", minted for the
+    /// call that performed the backtrack and unique across this store
+    /// ([`mint_uuid_token`]).
+    pub identifier: String,
+    /// `BacktrackRequestCreationTime`: when the backtrack was asked for.
+    pub requested_at: ::aws_smithy_types::DateTime,
+    /// `BacktrackedFrom`: the time the cluster was rewound FROM.
+    pub backtracked_from: ::aws_smithy_types::DateTime,
+    /// `BacktrackTo`: the consistent time the cluster was rewound TO.
+    pub backtrack_to: ::aws_smithy_types::DateTime,
+    /// `Status`: one of the values that member publishes (`applying`, `completed`, `failed`,
+    /// `pending`).
+    pub status: String,
+}
+
+impl BacktrackRecord {
+    /// This backtrack as the modelled `DBClusterBacktrack`, under the identifier the cluster
+    /// it was performed on is reported by — which a rename moves, so the report always names
+    /// the cluster as it stands now.
+    pub fn to_wire(&self, cluster_identifier: &str) -> BacktrackDBClusterOutput {
+        BacktrackDBClusterOutput {
+            db_cluster_identifier: Some(cluster_identifier.to_string()),
+            backtrack_identifier: Some(self.identifier.clone()),
+            backtrack_to: Some(self.backtrack_to),
+            backtracked_from: Some(self.backtracked_from),
+            backtrack_request_creation_time: Some(self.requested_at),
+            status: Some(self.status.clone()),
+        }
+    }
 }
 
 /// How precisely two instants are compared when a backtrack picks the point it rewinds to:
@@ -307,14 +374,23 @@ impl DbClusterRecord {
         self.backtrack_window > 0
     }
 
-    /// `EarliestBacktrackTime`: the oldest consistent point the cluster can be backtracked
-    /// to, and `None` for a cluster that kept none ([`Self::backtrack_points`]).
+    /// `EarliestBacktrackTime`: the oldest consistent point the cluster CAN be backtracked
+    /// to, and `None` for a cluster that has no backtracking available — one that kept no
+    /// point ([`Self::backtrack_points`]) and one whose window is zero, since "to disable
+    /// backtracking, set this value to 0" leaves no time the cluster can be rewound to at
+    /// all. So a cluster a modification turned backtracking off for reports no earliest
+    /// time, the same as one created with it off, rather than offering an instant the
+    /// backtrack then refuses.
     pub fn earliest_backtrack_time(&self) -> Option<::aws_smithy_types::DateTime> {
+        if !self.backtracking_enabled() {
+            return None;
+        }
         self.backtrack_points.first().map(|point| point.at)
     }
 
     /// Keep `storage` as the consistent point the cluster holds AS OF NOW, and drop the
-    /// points that have fallen out of the backtrack window.
+    /// points that have fallen out of the backtrack window or past the count the cluster
+    /// keeps.
     ///
     /// A window of zero keeps nothing: backtracking is off, so there is no time the cluster
     /// can be backtracked to.
@@ -340,6 +416,23 @@ impl DbClusterRecord {
                 .is_some_and(|point| point.at.as_secs_f64() < cutoff)
         {
             self.backtrack_points.remove(0);
+        }
+        // And the COUNT bound: how many points fall inside the window is driven by how often
+        // a caller asks for a backtrack, and each one holds a copy of the cluster's data, so
+        // the oldest are dropped once the cluster keeps
+        // [`MAX_BACKTRACK_POINTS_PER_CLUSTER`] of them. The newest points survive, which are
+        // the times a caller can still ask to be rewound to.
+        while self.backtrack_points.len() > MAX_BACKTRACK_POINTS_PER_CLUSTER {
+            self.backtrack_points.remove(0);
+        }
+    }
+
+    /// Keep `backtrack` as a backtrack performed on this cluster, dropping the oldest record
+    /// once the cluster holds [`MAX_BACKTRACKS_PER_CLUSTER`] of them.
+    pub fn record_backtrack(&mut self, backtrack: BacktrackRecord) {
+        self.backtracks.push(backtrack);
+        while self.backtracks.len() > MAX_BACKTRACKS_PER_CLUSTER {
+            self.backtracks.remove(0);
         }
     }
 

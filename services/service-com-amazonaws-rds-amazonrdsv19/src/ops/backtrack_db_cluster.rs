@@ -218,29 +218,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "This action applies only to Aurora MySQL DB clusters": a cluster of another
             // engine has no backtracking at all, which is why `CreateDBCluster` refuses a
             // backtrack window on one. The identifier names a cluster this call does not
-            // apply to — a value the parameter does not accept.
-            if !cluster
-                .engine
-                .eq_ignore_ascii_case(crate::state::BACKTRACK_ENGINE)
-            {
+            // apply to — a value the parameter does not accept, worded by the one sentence
+            // every operation of this front door that serves a single cluster kind refuses
+            // the other kind with.
+            if !crate::state::ClusterKind::AuroraMySql.holds_for(&cluster.engine) {
                 let engine = cluster.engine.clone();
-                return Err(BacktrackDBClusterError::invalid_parameter_value(format!(
-                    "invalid value '{identifier}' for DBClusterIdentifier: \
-                     {} applies only to Aurora MySQL DB clusters, and DB cluster \
-                     {identifier} runs engine {engine}",
-                    Self::NAME
-                )));
+                return Err(BacktrackDBClusterError::invalid_parameter_value(
+                    crate::state::cluster_kind_unsupported_message(
+                        Self::NAME,
+                        &identifier,
+                        &engine,
+                        crate::state::ClusterKind::AuroraMySql,
+                    ),
+                ));
             }
             // A cluster whose backtrack window is zero has backtracking DISABLED ("To
             // disable backtracking, set this value to 0"), so there is no time it can be
             // rewound to: the cluster is not in a state this operation can be performed in,
-            // which is the modelled cluster state fault.
+            // which is the modelled cluster state fault. The sentence is Amazon RDS's fixed
+            // wording for a cluster backtracking is not available to
+            // (`crate::state::BACKTRACK_UNAVAILABLE_MESSAGE`), which states the capability
+            // and interpolates nothing.
             if !cluster.backtracking_enabled() {
                 return Err(BacktrackDBClusterErrorModeled::InvalidDBClusterStateFault(
                     InvalidDBClusterStateFault {
-                        message: Some(format!(
-                            "DB cluster {identifier} does not have backtracking enabled"
-                        )),
+                        message: Some(
+                            crate::state::BACKTRACK_UNAVAILABLE_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());
@@ -334,13 +338,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // successfully been applied to" the cluster, rather than a status nothing is still
         // working towards. `BacktrackedFrom` is the time the cluster was rewound FROM, which
         // is now, and `BacktrackTo` the consistent time it was rewound TO.
-        Ok(BacktrackDBClusterOutput {
-            backtrack_identifier: Some(crate::state::mint_uuid_token("backtrack", mint)),
-            db_cluster_identifier: Some(cluster_identifier),
-            backtrack_request_creation_time: Some(now),
-            backtracked_from: Some(now),
-            backtrack_to: Some(backtracked_to),
-            status: Some(crate::state::BACKTRACK_STATUS_COMPLETED.to_string()),
-        })
+        //
+        // The backtrack is KEPT on the cluster it was performed on, which is what
+        // `DescribeDBClusterBacktracks` reports from: the identifier this answer carries
+        // resolves to that record for as long as the cluster holds it, rather than to
+        // nothing.
+        let performed = crate::state::BacktrackRecord {
+            identifier: crate::state::mint_uuid_token("backtrack", mint),
+            requested_at: now,
+            backtracked_from: now,
+            backtrack_to: backtracked_to,
+            status: crate::state::BACKTRACK_STATUS_COMPLETED.to_string(),
+        };
+        record.record_backtrack(performed.clone());
+        Ok(performed.to_wire(&cluster_identifier))
     }
 }

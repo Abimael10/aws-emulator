@@ -28,6 +28,10 @@ pub enum ClusterKind {
     /// A Multi-AZ DB cluster: "Multi-AZ deployments with two readable standby DB
     /// instances".
     MultiAz,
+    /// An Aurora MySQL DB cluster: a NARROWER kind than [`Self::Aurora`], which the two
+    /// backtrack operations serve — both document "this action applies only to Aurora MySQL
+    /// DB clusters" — because backtracking is a capability of that engine alone.
+    AuroraMySql,
 }
 
 impl ClusterKind {
@@ -36,6 +40,7 @@ impl ClusterKind {
         match self {
             Self::Aurora => "an Aurora DB cluster",
             Self::MultiAz => "a non-Aurora Multi-AZ DB cluster",
+            Self::AuroraMySql => "Aurora MySQL DB clusters",
         }
     }
 
@@ -44,6 +49,8 @@ impl ClusterKind {
         match self {
             Self::Aurora => !is_multi_az_db_cluster(engine),
             Self::MultiAz => is_multi_az_db_cluster(engine),
+            // The one engine whose clusters support backtracking ([`BACKTRACK_ENGINE`]).
+            Self::AuroraMySql => engine.eq_ignore_ascii_case(BACKTRACK_ENGINE),
         }
     }
 }
@@ -137,6 +144,33 @@ pub fn cluster_state_message(identifier: &str, status: &str, expected: &str) -> 
     format!(
         "DbCluster {identifier} is in {status} state but expected it to be one of {expected}."
     )
+}
+
+/// What a backtrack of a DB cluster that has no backtracking available is refused with.
+///
+/// A cluster whose backtrack window is zero kept no consistent time to be rewound to ("To
+/// disable backtracking, set this value to 0"), so it is not in a state the backtrack can
+/// be performed in — the modelled `InvalidDBClusterStateFault`. Amazon RDS words this one
+/// as a statement about the CAPABILITY the cluster does not have, with NO variable part at
+/// all: neither the identifier the caller wrote, the window stored for the cluster nor its
+/// status is interpolated. So it is a constant rather than a `format!` over the request,
+/// exactly as the promotion's precondition sentence
+/// ([`PROMOTE_NOT_A_READ_REPLICA_MESSAGE`]) is, and a caller telling this refusal from the
+/// status refusal of the same fault ([`cluster_state_message`]) by its text sees what the
+/// real service sends.
+pub const BACKTRACK_UNAVAILABLE_MESSAGE: &str =
+    "Backtrack is not currently available to this cluster.";
+
+/// What a report of a DB cluster's backtracks refuses a `BacktrackIdentifier` that names
+/// none of them with.
+///
+/// `DBClusterBacktrackNotFoundFault` is modelled for exactly one thing — "BacktrackIdentifier
+/// doesn't refer to an existing backtrack" — so the sentence states that, in the
+/// `<resource type> <id> not found.` form this front door's REPORTS word a missing resource
+/// in ([`db_cluster_not_found_message`]). `named` is the value the request carried, so a
+/// caller matching the message against what it sent finds it there.
+pub fn db_cluster_backtrack_not_found_message(named: &str) -> String {
+    format!("DBClusterBacktrack {named} not found.")
 }
 
 /// What `RebootDBCluster` refuses an AURORA DB cluster with.

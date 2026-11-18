@@ -985,6 +985,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The points a cluster can be backtracked to are its own, kept once its storage
             // exists; a cluster restored with backtracking off keeps none.
             backtrack_points: Vec::new(),
+            // A restored cluster carries none of the source's backtracks: a backtrack is
+            // performed ON a cluster, and this one is new.
+            backtracks: Vec::new(),
             // A restored cluster joins no global database and replicates nothing: it is a new
             // cluster of the backup's data, and this operation names neither.
             global_cluster_identifier: None,

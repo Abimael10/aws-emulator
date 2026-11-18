@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusterBacktracks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusterBacktracks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the backtracks performed on an Aurora MySQL DB
+//! cluster. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusterBacktracks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The records it reports and their projection onto the modelled wire shapes live in
+//! [`crate::state`], shared with `BacktrackDBCluster`, which performs them.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusterBacktracks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClusterBacktracksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusterBacktracks"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeDBClusterBacktracksError::validation)?;
+        // "Default: 100 Constraints: Minimum 20, maximum 100."
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBClusterBacktracksError::invalid_parameter_value)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters)
+            .map_err(DescribeDBClusterBacktracksError::invalid_parameter_value)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBClusterBacktracksError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed at
+        // this instant whether or not anybody called. It writes nothing else — the
+        // backtracks it reports are the ones `BacktrackDBCluster` performed.
+        store.settle_due_transitions(&region);
+
+        // "The DB cluster identifier of the DB cluster to be described" is required, and
+        // names a cluster that has to exist: a cluster that is not there has no backtracks
+        // to report, which is the modelled fault. RDS is regional, so only the region the
+        // request was signed for is in scope, and the member accepts the identifier or the
+        // ARN ([`crate::state::resolve_db_cluster`]).
+        let named = input.db_cluster_identifier;
+        let cluster = store.resolve_db_cluster(&region, &named).ok_or_else(|| {
+            DescribeDBClusterBacktracksErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(crate::state::db_cluster_not_found_message(&named)),
+                },
+            )
+        })?;
+        // "This action only applies to Aurora MySQL DB clusters": a cluster of another engine
+        // has no backtracking at all, so the identifier names a cluster this report does not
+        // apply to — a value the parameter does not accept, worded by the one sentence every
+        // operation of this front door that serves a single cluster kind refuses the other
+        // kind with, as `BacktrackDBCluster` refuses it.
+        if !crate::state::ClusterKind::AuroraMySql.holds_for(&cluster.engine) {
+            return Err(DescribeDBClusterBacktracksError::invalid_parameter_value(
+                crate::state::cluster_kind_unsupported_message(
+                    Self::NAME,
+                    &cluster.identifier,
+                    &cluster.engine,
+                    crate::state::ClusterKind::AuroraMySql,
+                ),
+            ));
+        }
+
+        // The cluster's own backtracks, in the order they were performed — oldest first,
+        // which is the order the store keeps them in
+        // ([`crate::state::DbClusterRecord::backtracks`]). Each page key is the backtrack's
+        // own identifier, so a `Marker` resumes after the record it was issued for whatever
+        // the report holds by then.
+        let cluster_identifier = cluster.identifier.clone();
+        let mut reported: Vec<(String, BacktrackDBClusterOutput)> = cluster
+            .backtracks
+            .iter()
+            .map(|backtrack| {
+                (
+                    backtrack.identifier.clone(),
+                    backtrack.to_wire(&cluster_identifier),
+                )
+            })
+            .collect();
+
+        // "If specified, this value is the backtrack identifier of the backtrack to be
+        // described": a report narrowed to one backtrack reports that one alone, and an
+        // identifier that refers to no backtrack of this cluster is the fault modelled for
+        // exactly that. A value that is no UUID at all refers to no backtrack either, so it
+        // lands in the same fault rather than in a second refusal the model does not declare.
+        if let Some(wanted) = &input.backtrack_identifier {
+            reported.retain(|(identifier, _)| identifier == wanted);
+            if reported.is_empty() {
+                return Err(
+                    DescribeDBClusterBacktracksErrorModeled::DBClusterBacktrackNotFoundFault(
+                        DBClusterBacktrackNotFoundFault {
+                            message: Some(crate::state::db_cluster_backtrack_not_found_message(
+                                wanted,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        reported.retain(|(_, backtrack)| filters.iter().all(|filter| matches(filter, backtrack)));
+
+        // A `Marker` is placed in the report's own order and the page resumes BEYOND it; a
+        // token this codec could not have produced is refused: see `crate::state::paginate`.
+        let page = crate::state::paginate(reported, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBClusterBacktracksError::invalid_parameter_value)?;
+        Ok(DescribeDBClusterBacktracksOutput {
+            marker: page.next_marker,
+            db_cluster_backtracks: Some(page.items),
+        })
     }
+}
+
+/// The filter names this report supports, as its `Filters` member publishes them:
+/// "Supported filters include the following: `db-cluster-backtrack-id` …
+/// `db-cluster-backtrack-status`".
+const SUPPORTED_FILTER_NAMES: [&str; 2] =
+    ["db-cluster-backtrack-id", "db-cluster-backtrack-status"];
+
+/// Refuse a filter whose `Name` is none of [`SUPPORTED_FILTER_NAMES`].
+///
+/// A filter is refused rather than ignored, because ignoring it would report backtracks the
+/// caller excluded — the same reason every other report of this service checks its filter
+/// names, and with the same wording
+/// ([`crate::state::unrecognized_filter_name_message`]).
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    match filters
+        .iter()
+        .find(|filter| !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()))
+    {
+        None => Ok(()),
+        Some(filter) => Err(crate::state::unrecognized_filter_name_message(&filter.name)),
+    }
+}
+
+/// Whether `backtrack` satisfies `filter`: one of its `Values` equals the member that filter
+/// names.
+///
+/// The status values the filter publishes are written in lower case, as the `Status` member
+/// reports them, and the comparison disregards case rather than holding a caller to one
+/// spelling — the same way every other report of this front door compares a filter value.
+fn matches(filter: &Filter, backtrack: &BacktrackDBClusterOutput) -> bool {
+    let member = match filter.name.as_str() {
+        "db-cluster-backtrack-id" => backtrack.backtrack_identifier.as_deref(),
+        "db-cluster-backtrack-status" => backtrack.status.as_deref(),
+        // Unreachable: `check_filter_names` refused every other name before the report was
+        // built. Answered as "nothing matches" rather than with a panic in a request path.
+        _ => return false,
+    };
+    member.is_some_and(|value| {
+        filter
+            .values
+            .iter()
+            .any(|wanted| wanted.eq_ignore_ascii_case(value))
+    })
 }

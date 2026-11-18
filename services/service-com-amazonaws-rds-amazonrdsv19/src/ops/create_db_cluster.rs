@@ -1300,6 +1300,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // storage exists, which is after the endpoint is opened below: a cluster with
             // backtracking off keeps none at all.
             backtrack_points: Vec::new(),
+            // No backtrack has been performed on a cluster this call just made.
+            backtracks: Vec::new(),
             global_cluster_identifier: global_cluster_identifier.clone(),
             replication_source_arn,
             ca_certificate_identifier: input

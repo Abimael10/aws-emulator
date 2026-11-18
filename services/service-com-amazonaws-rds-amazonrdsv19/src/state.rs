@@ -45,7 +45,10 @@
 //! a copy of the source cluster's database under that same page ceiling, which is what a
 //! restore of one loads —
 //! `MAX_REGIONS * DB_CLUSTER_QUOTA_PER_REGION` DB clusters — each carrying at most
-//! [`MAX_CLUSTER_LIST_VALUES`] values in each of its stored string lists —
+//! [`MAX_CLUSTER_LIST_VALUES`] values in each of its stored string lists, at most
+//! [`MAX_BACKTRACK_POINTS_PER_CLUSTER`] consistent points it can be backtracked to (each a
+//! copy of its database under that same page ceiling) and at most
+//! [`MAX_BACKTRACKS_PER_CLUSTER`] records of the backtracks performed on it —
 //! `MAX_REGIONS * DB_SHARD_GROUP_QUOTA_PER_REGION` DB shard groups,
 //! `MAX_REGIONS * OPTION_GROUP_QUOTA_PER_REGION` option groups and
 //! `MAX_REGIONS * DB_SUBNET_GROUP_QUOTA_PER_REGION` DB subnet groups,
@@ -74,7 +77,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    AvailabilityZone, Certificate, CertificateDetails, ClusterPendingModifiedValues,
+    AvailabilityZone, BacktrackDBClusterOutput, Certificate, CertificateDetails,
+    ClusterPendingModifiedValues,
     CreateDBClusterEndpointOutput, CreateDBShardGroupOutput,
     DBCluster, DBClusterAutomatedBackup, DBClusterMember, DBClusterOptionGroupStatus,
     DBClusterParameterGroup, DBClusterRole, DBClusterSnapshot, DBClusterSnapshotAttribute,
