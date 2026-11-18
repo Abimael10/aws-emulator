@@ -37,7 +37,7 @@ use std::sync::Arc;
 use aws_emulator_router::{build_router, InMemoryEngine};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::eks_wire::{cluster_body, ec2, eks, role_arn, Answer, EC2_NOT_FOUND_CODE};
+use crate::eks_wire::{cluster_body, ec2, eks, role_arn, Answer, EC2_NOT_FOUND_CODE, REGION};
 use crate::query_wire::{element, elements, opt_element};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
@@ -168,12 +168,26 @@ fn eks_mints_the_cluster_security_group_in_ec2_and_releases_it_on_delete() {
                 );
                 let vpc_id = element(&created.text, "vpcId");
                 let mut subnets = Vec::new();
-                for cidr_block in subnet_cidrs {
+                // Each in its OWN Availability Zone: a control plane is placed across at
+                // least two zones, so a VPC whose subnets all sit in one is a layout no
+                // cluster can be created in. EC2 chooses a zone for a subnet that names
+                // none and "we do not necessarily select a different zone for each
+                // subnet", so each zone is named here.
+                let zones = [
+                    format!("{REGION}a"),
+                    format!("{REGION}b"),
+                    format!("{REGION}c"),
+                ];
+                for (cidr_block, zone) in subnet_cidrs.into_iter().zip(&zones) {
                     let answer = ec2(
                         &router,
                         &runtime,
                         "CreateSubnet",
-                        &[("VpcId", vpc_id.as_str()), ("CidrBlock", cidr_block)],
+                        &[
+                            ("VpcId", vpc_id.as_str()),
+                            ("CidrBlock", cidr_block),
+                            ("AvailabilityZone", zone.as_str()),
+                        ],
                     );
                     assert_eq!(
                         answer.status, 200,
@@ -506,12 +520,19 @@ fn a_refusal_that_carries_an_ec2_failure_carries_its_whole_wrapped_form() {
             );
             let vpc_id = element(&created.text, "vpcId");
             let mut held: Vec<String> = Vec::new();
-            for cidr_block in ["10.6.1.0/24", "10.6.2.0/24"] {
+            // Each in its OWN Availability Zone: a control plane is placed across at least
+            // two zones, so a cluster cannot be created in a VPC whose subnets share one.
+            let zones = [format!("{REGION}a"), format!("{REGION}b")];
+            for (cidr_block, zone) in ["10.6.1.0/24", "10.6.2.0/24"].into_iter().zip(&zones) {
                 let answer = ec2(
                     &router,
                     &runtime,
                     "CreateSubnet",
-                    &[("VpcId", vpc_id.as_str()), ("CidrBlock", cidr_block)],
+                    &[
+                        ("VpcId", vpc_id.as_str()),
+                        ("CidrBlock", cidr_block),
+                        ("AvailabilityZone", zone.as_str()),
+                    ],
                 );
                 assert_eq!(
                     answer.status, 200,

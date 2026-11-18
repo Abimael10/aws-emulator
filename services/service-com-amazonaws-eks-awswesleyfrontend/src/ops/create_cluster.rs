@@ -37,8 +37,12 @@
 //! ([`crate::state::pass_role_refusal`], 403 `AccessDeniedException`), and the subnets it
 //! names must exist in EC2 ([`crate::state::resolve_subnets`], 400
 //! `InvalidParameterException`) — a cluster is never minted against a role the caller
-//! cannot pass or a subnet nothing holds. The security groups it names must belong to the
-//! VPC those subnets sit in ([`crate::state::security_group_vpc_refusal`], 400
+//! cannot pass or a subnet nothing holds. Those same resolved subnets have to place the
+//! control plane in at least two Availability Zones
+//! ([`crate::state::fewer_than_two_availability_zones`], 400
+//! `InvalidParameterException`): the zones are EC2's to report, so two subnets of one
+//! zone are refused exactly as one subnet is. The security groups it names must belong to
+//! the VPC those subnets sit in ([`crate::state::security_group_vpc_refusal`], 400
 //! `InvalidParameterException`): a group of another VPC governs no interface of this
 //! cluster's network.
 //!
@@ -560,6 +564,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         if let Some(why) = resolved_subnets.refusal {
             return Err(invalid_parameter(&input.name, why));
+        }
+
+        // And the rule those resolved subnets are what decides: "You must specify at
+        // least two subnets that are in different Availability Zones". A subnet sits
+        // in exactly one zone and EC2 is what says which, so the question is how many
+        // DISTINCT zones the subnets EC2 reported sit in
+        // ([`state::fewer_than_two_availability_zones`]) — two subnets of one zone
+        // place the control plane in one zone, and a control plane in one zone is not
+        // a cluster this service provisions, whatever the length of the list that
+        // named them. The same Outpost waiver as the count rule above applies: a local
+        // cluster is created in a single subnet.
+        if input.outpost_config.is_none()
+            && state::fewer_than_two_availability_zones(&resolved_subnets.availability_zones)
+        {
+            return Err(invalid_parameter(
+                &input.name,
+                state::SUBNETS_IN_TWO_AVAILABILITY_ZONES_MESSAGE.to_string(),
+            ));
         }
 
         // The security groups the request names are applied to those same interfaces —

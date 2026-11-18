@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use aws_emulator_router::{build_router, InMemoryEngine};
 
-use crate::eks_wire::{autoscaling, cluster_body, ec2, eks, role_arn, Answer};
+use crate::eks_wire::{autoscaling, cluster_body, ec2, eks, role_arn, Answer, REGION};
 use crate::query_wire::{element, elements, opt_element};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
@@ -315,12 +315,16 @@ fn a_fargate_profile_is_accepted_only_in_subnets_with_no_route_to_an_internet_ga
             assert_eq!(vpc.status, 200, "setup: CreateVpc must succeed, got {vpc:?}");
             let vpc_id = element(&vpc.text, "vpcId");
 
-            let subnet = |cidr: &str| {
+            let subnet = |cidr: &str, zone: &str| {
                 let created = ec2(
                     &router,
                     &runtime,
                     "CreateSubnet",
-                    &[("VpcId", vpc_id.as_str()), ("CidrBlock", cidr)],
+                    &[
+                        ("VpcId", vpc_id.as_str()),
+                        ("CidrBlock", cidr),
+                        ("AvailabilityZone", zone),
+                    ],
                 );
                 assert_eq!(
                     created.status, 200,
@@ -331,9 +335,12 @@ fn a_fargate_profile_is_accepted_only_in_subnets_with_no_route_to_an_internet_ga
             // Two private subnets for the cluster itself (a cluster takes public ones
             // too, so these are simply the ones the profile rows build on), one subnet
             // made public by a route table of its own, and one more private subnet.
-            let private_one = subnet("10.20.1.0/24");
-            let private_two = subnet("10.20.2.0/24");
-            let public = subnet("10.20.3.0/24");
+            // The cluster's two sit in DIFFERENT Availability Zones: a control plane is
+            // placed across at least two zones, and EC2 chooses one zone for every
+            // subnet that names none.
+            let private_one = subnet("10.20.1.0/24", &format!("{REGION}a"));
+            let private_two = subnet("10.20.2.0/24", &format!("{REGION}b"));
+            let public = subnet("10.20.3.0/24", &format!("{REGION}c"));
 
             // The internet gateway that makes a subnet public, and the route table that
             // carries the route to it — associated with the public subnet ALONE, so the

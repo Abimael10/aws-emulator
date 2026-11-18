@@ -331,10 +331,10 @@ pub async fn unresolved_subnet_refusal(
 
 /// What EC2 answered about the subnets a request names.
 ///
-/// One `DescribeSubnets` over the whole list answers both of the questions a create
-/// asks about them: whether every id resolves, and — because Amazon EKS provisions
-/// the cluster's own EC2 resources in the network those subnets sit in — which VPC
-/// that is.
+/// One `DescribeSubnets` over the whole list answers all three of the questions a
+/// create asks about them: whether every id resolves, — because Amazon EKS
+/// provisions the cluster's own EC2 resources in the network those subnets sit in —
+/// which VPC that is, and which Availability Zones they place a control plane in.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedSubnets {
     /// Why the list does not resolve, in the wrapped form Amazon EKS reports a
@@ -344,6 +344,10 @@ pub struct ResolvedSubnets {
     /// The VPC every subnet EC2 reported belongs to. `None` when nothing
     /// answered, and when the reported subnets do not agree on one VPC.
     pub vpc_id: Option<String>,
+    /// The DISTINCT Availability Zones of the subnets EC2 reported, in zone-name
+    /// order. Empty when nothing answered, which grounds no refusal: a zone a
+    /// request is judged on is one EC2 named, never one inferred from a subnet id.
+    pub availability_zones: Vec<String>,
 }
 
 /// How many of a request's subnet ids this service resolves INDIVIDUALLY when the
@@ -391,9 +395,10 @@ pub async fn resolve_subnets(
     };
     let ec2 = callback_client!(aws_sdk_ec2, ctx, endpoint, region);
     match describe_subnets_once(&ec2, subnet_ids).await {
-        SubnetAnswer::Resolved(vpc_id) => ResolvedSubnets {
+        SubnetAnswer::Resolved(reported) => ResolvedSubnets {
             refusal: None,
-            vpc_id,
+            vpc_id: reported.vpc_id,
+            availability_zones: reported.availability_zones,
         },
         SubnetAnswer::Unanswered => ResolvedSubnets::default(),
         SubnetAnswer::NotFound(whole_list) => {
@@ -403,6 +408,7 @@ pub async fn resolve_subnets(
                 return ResolvedSubnets {
                     refusal: Some(whole_list),
                     vpc_id: None,
+                    availability_zones: Vec::new(),
                 };
             }
             // The two halves of the bound this walk is held to: an id already asked
@@ -424,6 +430,7 @@ pub async fn resolve_subnets(
                     return ResolvedSubnets {
                         refusal: Some(one),
                         vpc_id: None,
+                        availability_zones: Vec::new(),
                     };
                 }
             }
@@ -434,16 +441,27 @@ pub async fn resolve_subnets(
             ResolvedSubnets {
                 refusal: Some(whole_list),
                 vpc_id: None,
+                availability_zones: Vec::new(),
             }
         }
     }
 }
 
+/// The subnets ONE `DescribeSubnets` reported, read as the two facts about the
+/// network they place a resource in.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ReportedSubnets {
+    /// The VPC the reported subnets agree on — `None` when they do not agree on one.
+    pub(super) vpc_id: Option<String>,
+    /// Their DISTINCT Availability Zones, in zone-name order.
+    pub(super) availability_zones: Vec<String>,
+}
+
 /// What ONE `DescribeSubnets` answered.
 pub(super) enum SubnetAnswer {
-    /// Every id it named resolved, and the VPC the reported subnets agree on —
-    /// `None` when they do not agree on one.
-    Resolved(Option<String>),
+    /// Every id it named resolved, and what the reported subnets say about the
+    /// network they sit in ([`ReportedSubnets`]).
+    Resolved(ReportedSubnets),
     /// EC2 refused the read because an id it named carries no subnet of the
     /// account, in the wrapped form this service reports an inner service's
     /// failure in.
@@ -465,7 +483,11 @@ pub(super) async fn describe_subnets_once(ec2: &::aws_sdk_ec2::Client, subnet_id
     // Every requested id resolved: EC2 reports the subnets rather than refusing.
     // A subnet belongs to exactly one VPC, so the VPC a cluster is created in is
     // the one every subnet it names agrees on; a list that spans two names no
-    // single network to provision in, and none is reported.
+    // single network to provision in, and none is reported. A subnet also sits in
+    // exactly one Availability Zone, and EC2 is what says which, so the zones a
+    // request places a resource in are read off the reported subnets — the same
+    // zone reported for two of them is ONE zone, which is why they are collected
+    // distinct rather than counted per id.
     let error = match answer {
         Ok(output) => {
             let mut reported = output
@@ -474,7 +496,16 @@ pub(super) async fn describe_subnets_once(ec2: &::aws_sdk_ec2::Client, subnet_id
                 .filter_map(::aws_sdk_ec2::types::Subnet::vpc_id);
             let first = reported.next().map(str::to_string);
             let vpc_id = first.filter(|vpc_id| reported.all(|other| other == vpc_id.as_str()));
-            return SubnetAnswer::Resolved(vpc_id);
+            let availability_zones: ::std::collections::BTreeSet<String> = output
+                .subnets()
+                .iter()
+                .filter_map(::aws_sdk_ec2::types::Subnet::availability_zone)
+                .map(str::to_string)
+                .collect();
+            return SubnetAnswer::Resolved(ReportedSubnets {
+                vpc_id,
+                availability_zones: availability_zones.into_iter().collect(),
+            });
         }
         Err(error) => error,
     };

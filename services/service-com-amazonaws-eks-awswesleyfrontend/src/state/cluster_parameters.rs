@@ -246,6 +246,26 @@ pub fn invalid_public_access_cidrs(requested: &[String]) -> Vec<String> {
 pub const SUBNETS_IN_TWO_AVAILABILITY_ZONES_MESSAGE: &str =
     "Subnets specified must be in at least two different AZs";
 
+/// Whether the subnets EC2 reported for a request place a control plane in FEWER
+/// than two Availability Zones, which is what
+/// [`SUBNETS_IN_TWO_AVAILABILITY_ZONES_MESSAGE`] refuses.
+///
+/// The requirement is on the ZONES, not on the number of subnet ids a request
+/// lists: "You must specify at least two subnets that are in different
+/// Availability Zones" (`smithy_query(query="shape", shape="VpcConfigRequest")`),
+/// and a subnet's zone is EC2's to report, so two distinct subnets that sit in one
+/// zone place the control plane in one zone and are refused exactly as a single
+/// subnet is. `zones` is therefore the DISTINCT zones EC2 named for the request's
+/// subnets ([`super::ResolvedSubnets::availability_zones`]).
+///
+/// An empty list is EC2 having said nothing about the zones — including this
+/// emulator failing to ask it — and grounds no refusal, for the same reason an
+/// unresolved subnet read does not: a request is refused on what the owning
+/// service answered, never on silence.
+pub fn fewer_than_two_availability_zones(zones: &[String]) -> bool {
+    !zones.is_empty() && zones.len() < 2
+}
+
 /// The sentence a request that turns BOTH paths to a cluster's Kubernetes API server
 /// endpoint off is refused with. Entirely fixed text.
 pub const ENDPOINT_ACCESS_BOTH_DISABLED_MESSAGE: &str =

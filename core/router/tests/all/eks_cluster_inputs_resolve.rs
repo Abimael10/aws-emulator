@@ -42,7 +42,7 @@ use std::sync::Arc;
 use aws_emulator_router::{build_router, InMemoryEngine};
 
 use crate::eks_wire::{
-    cluster_body, ec2, eks, iam, role_arn, Answer, EC2_NOT_FOUND_CODE,
+    cluster_body, ec2, eks, iam, role_arn, Answer, EC2_NOT_FOUND_CODE, REGION,
 };
 use crate::query_wire::opt_element;
 
@@ -125,12 +125,21 @@ fn eks_resolves_its_subnets_against_ec2_and_its_connector_role_against_iam() {
             let vpc_id = opt_element(&created.text, "vpcId")
                 .unwrap_or_else(|| panic!("setup: no <vpcId> in {}", created.text));
             let mut client_subnets: Vec<String> = Vec::new();
-            for cidr_block in ["10.9.1.0/24", "10.9.2.0/24"] {
+            // Each in its OWN Availability Zone: a control plane is placed across at least
+            // two zones, so a VPC whose subnets all sit in one is a layout no cluster can
+            // be created in. EC2 chooses a zone for a subnet that names none and "we do
+            // not necessarily select a different zone for each subnet", so each is named.
+            let zones = [format!("{REGION}a"), format!("{REGION}b")];
+            for (cidr_block, zone) in ["10.9.1.0/24", "10.9.2.0/24"].into_iter().zip(&zones) {
                 let answer = ec2(
                     &router,
                     &runtime,
                     "CreateSubnet",
-                    &[("VpcId", vpc_id.as_str()), ("CidrBlock", cidr_block)],
+                    &[
+                        ("VpcId", vpc_id.as_str()),
+                        ("CidrBlock", cidr_block),
+                        ("AvailabilityZone", zone.as_str()),
+                    ],
                 );
                 assert_eq!(
                     answer.status, 200,
@@ -143,7 +152,9 @@ fn eks_resolves_its_subnets_against_ec2_and_its_connector_role_against_iam() {
             }
             // A default subnet of the account's default VPC: a subnet nothing in this
             // test created, so the rule is shown to hold for a subnet the account simply
-            // HAS as well as for one a client made.
+            // HAS as well as for one a client made. It is taken from a THIRD zone, so a
+            // row that pairs it with a created subnet still places a control plane in two
+            // Availability Zones.
             let defaults = ec2(
                 &router,
                 &runtime,
@@ -151,6 +162,8 @@ fn eks_resolves_its_subnets_against_ec2_and_its_connector_role_against_iam() {
                 &[
                     ("Filter.1.Name", "default-for-az"),
                     ("Filter.1.Value.1", "true"),
+                    ("Filter.2.Name", "availability-zone"),
+                    ("Filter.2.Value.1", &format!("{REGION}c")),
                 ],
             );
             assert_eq!(

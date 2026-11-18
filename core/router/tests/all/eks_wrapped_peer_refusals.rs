@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use aws_emulator_router::{build_router, InMemoryEngine};
 
-use crate::eks_wire::{cluster_body, ec2, eks, iam, role_arn, EC2_NOT_FOUND_CODE};
+use crate::eks_wire::{cluster_body, ec2, eks, iam, role_arn, EC2_NOT_FOUND_CODE, REGION};
 use crate::query_wire::opt_element;
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
@@ -238,12 +238,28 @@ fn eks_reports_a_peer_refusal_wrapped_and_names_the_input_the_peer_refused() {
             let vpc_id = opt_element(&created.text, "vpcId")
                 .unwrap_or_else(|| panic!("setup: no <vpcId> in {}", created.text));
             let mut held: Vec<String> = Vec::new();
-            for cidr_block in ["10.21.1.0/24", "10.21.2.0/24", "10.21.3.0/24"] {
+            // Each in its OWN Availability Zone: a control plane is placed across at least
+            // two zones, so the cluster below cannot be created in a VPC whose subnets
+            // share one. EC2 chooses a zone for a subnet that names none and "we do not
+            // necessarily select a different zone for each subnet".
+            let zones = [
+                format!("{REGION}a"),
+                format!("{REGION}b"),
+                format!("{REGION}c"),
+            ];
+            for (cidr_block, zone) in ["10.21.1.0/24", "10.21.2.0/24", "10.21.3.0/24"]
+                .into_iter()
+                .zip(&zones)
+            {
                 let answer = ec2(
                     &router,
                     &runtime,
                     "CreateSubnet",
-                    &[("VpcId", vpc_id.as_str()), ("CidrBlock", cidr_block)],
+                    &[
+                        ("VpcId", vpc_id.as_str()),
+                        ("CidrBlock", cidr_block),
+                        ("AvailabilityZone", zone.as_str()),
+                    ],
                 );
                 assert_eq!(
                     answer.status, 200,

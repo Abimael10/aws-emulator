@@ -291,6 +291,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(why) = resolved_subnets.refusal {
             return Err(invalid_parameter(&cluster_name, why));
         }
+        // And the rule those resolved subnets decide, the same one a create is held
+        // to: "You must specify at least two subnets that are in different
+        // Availability Zones". The zones come from EC2, which owns the subnets
+        // ([`state::fewer_than_two_availability_zones`]), so a list of distinct ids
+        // that all sit in ONE zone is refused exactly as a single-subnet list is — the
+        // control plane's network interfaces would be placed in one zone.
+        if state::fewer_than_two_availability_zones(&resolved_subnets.availability_zones) {
+            return Err(invalid_parameter(
+                &cluster_name,
+                state::SUBNETS_IN_TWO_AVAILABILITY_ZONES_MESSAGE.to_string(),
+            ));
+        }
 
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateClusterConfigError::from(UpdateClusterConfigErrorModeled::ServerException(

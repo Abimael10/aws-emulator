@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use aws_emulator_router::{build_router, InMemoryEngine};
 
-use crate::eks_wire::{ec2, eks, role_arn};
+use crate::eks_wire::{ec2, eks, role_arn, REGION};
 use crate::query_wire::{element, opt_element};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
@@ -143,12 +143,21 @@ fn eks_refuses_a_service_cidr_that_overlaps_the_vpc_it_creates_the_cluster_in() 
                     );
                 }
                 let mut subnets = Vec::new();
-                for cidr_block in subnet_cidrs {
+                // Each in its OWN Availability Zone: a control plane is placed across at
+                // least two zones, so a cluster cannot be created in a VPC whose subnets
+                // share one. EC2 chooses a zone for a subnet that names none and "we do
+                // not necessarily select a different zone for each subnet".
+                let zones = [format!("{REGION}a"), format!("{REGION}b")];
+                for (cidr_block, zone) in subnet_cidrs.into_iter().zip(&zones) {
                     let answer = ec2(
                         &router,
                         &runtime,
                         "CreateSubnet",
-                        &[("VpcId", vpc_id.as_str()), ("CidrBlock", cidr_block)],
+                        &[
+                            ("VpcId", vpc_id.as_str()),
+                            ("CidrBlock", cidr_block),
+                            ("AvailabilityZone", zone.as_str()),
+                        ],
                     );
                     assert_eq!(
                         answer.status, 200,

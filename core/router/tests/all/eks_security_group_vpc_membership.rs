@@ -37,7 +37,7 @@ use std::time::Duration;
 use aws_emulator_router::{build_router, InMemoryEngine};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::eks_wire::{ec2, eks, role_arn};
+use crate::eks_wire::{ec2, eks, role_arn, REGION};
 use crate::query_wire::{element, elements};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
@@ -198,12 +198,24 @@ fn network(
     );
     let vpc_id = element(&created.text, "vpcId");
     let mut subnets = Vec::new();
-    for cidr_block in subnet_cidrs {
+    // Each in its OWN Availability Zone: a control plane is placed across at least two
+    // zones, so a cluster cannot be created in a VPC whose subnets share one. EC2 chooses
+    // a zone for a subnet that names none and "we do not necessarily select a different
+    // zone for each subnet", so the zone is named here, one per subnet in order.
+    for (index, cidr_block) in subnet_cidrs.iter().enumerate() {
+        let zone = format!(
+            "{REGION}{}",
+            char::from(b'a' + u8::try_from(index).unwrap_or(0))
+        );
         let answer = ec2(
             router,
             runtime,
             "CreateSubnet",
-            &[("VpcId", vpc_id.as_str()), ("CidrBlock", cidr_block)],
+            &[
+                ("VpcId", vpc_id.as_str()),
+                ("CidrBlock", cidr_block),
+                ("AvailabilityZone", zone.as_str()),
+            ],
         );
         assert_eq!(
             answer.status, 200,

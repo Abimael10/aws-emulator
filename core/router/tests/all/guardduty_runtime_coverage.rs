@@ -376,12 +376,21 @@ fn guardduty_reports_the_runtime_coverage_of_the_accounts_own_resources() {
             assert_eq!(vpc.status, 200, "setup: CreateVpc must succeed, got {vpc:?}");
             let vpc_id = element(&vpc.text, "vpcId");
             let mut subnets: Vec<String> = Vec::new();
-            for cidr_block in ["10.7.1.0/24", "10.7.2.0/24"] {
+            // Each in its OWN Availability Zone: an Amazon EKS control plane is placed
+            // across at least two zones, so a cluster cannot be created in a VPC whose
+            // subnets share one. EC2 chooses a zone for a subnet that names none and "we
+            // do not necessarily select a different zone for each subnet".
+            let zones = [format!("{REGION}a"), format!("{REGION}b")];
+            for (cidr_block, zone) in ["10.7.1.0/24", "10.7.2.0/24"].into_iter().zip(&zones) {
                 let answer = ec2(
                     &router,
                     &runtime,
                     "CreateSubnet",
-                    &[("VpcId", vpc_id.as_str()), ("CidrBlock", cidr_block)],
+                    &[
+                        ("VpcId", vpc_id.as_str()),
+                        ("CidrBlock", cidr_block),
+                        ("AvailabilityZone", zone.as_str()),
+                    ],
                 );
                 assert_eq!(
                     answer.status, 200,
@@ -1207,12 +1216,18 @@ fn an_eks_coverage_row_reports_every_agent_addon_fact_it_holds() {
             assert_eq!(vpc.status, 200, "setup: CreateVpc must succeed, got {vpc:?}");
             let vpc_id = element(&vpc.text, "vpcId");
             let mut subnets: Vec<String> = Vec::new();
-            for cidr_block in ["10.9.1.0/24", "10.9.2.0/24"] {
+            // Each in its OWN Availability Zone, for the reason the first setup gives.
+            let zones = [format!("{REGION}a"), format!("{REGION}b")];
+            for (cidr_block, zone) in ["10.9.1.0/24", "10.9.2.0/24"].into_iter().zip(&zones) {
                 let answer = ec2(
                     &router,
                     &runtime,
                     "CreateSubnet",
-                    &[("VpcId", vpc_id.as_str()), ("CidrBlock", cidr_block)],
+                    &[
+                        ("VpcId", vpc_id.as_str()),
+                        ("CidrBlock", cidr_block),
+                        ("AvailabilityZone", zone.as_str()),
+                    ],
                 );
                 assert_eq!(
                     answer.status, 200,

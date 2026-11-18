@@ -840,11 +840,20 @@ async fn given_subnets(router: &MultiServiceRouter) -> Vec<String> {
         .next()
         .unwrap_or_else(|| panic!("setup: no <vpcId> in {}", created.text));
     let mut subnets = Vec::new();
-    for cidr_block in ["10.9.1.0/24", "10.9.2.0/24"] {
+    // Each in its OWN Availability Zone: an Amazon EKS control plane is placed across at
+    // least two zones, so a VPC whose subnets all sit in one is a layout no cluster can be
+    // created in. EC2 chooses a zone for a subnet that names none and "we do not
+    // necessarily select a different zone for each subnet", so each zone is named here.
+    let zones = [format!("{REGION}a"), format!("{REGION}b")];
+    for (cidr_block, zone) in ["10.9.1.0/24", "10.9.2.0/24"].into_iter().zip(&zones) {
         let answer = ec2(
             router,
             "CreateSubnet",
-            &[("VpcId", &vpc_id), ("CidrBlock", cidr_block)],
+            &[
+                ("VpcId", &vpc_id),
+                ("CidrBlock", cidr_block),
+                ("AvailabilityZone", zone),
+            ],
         )
         .await;
         assert!(
