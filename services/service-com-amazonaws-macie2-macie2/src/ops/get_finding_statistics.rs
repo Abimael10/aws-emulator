@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFindingStatistics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFindingStatistics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFindingStatistics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: counts the findings `crate::state` holds that a request's
+//! `findingCriteria` select, grouped by the property its `groupBy` names, in the
+//! order its `sortCriteria` asks for and at most as many groups as its `size`
+//! asks for.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +125,16 @@ impl From<GetFindingStatisticsErrorModeled> for GetFindingStatisticsError {
     }
 }
 
+/// A query this service cannot run, as the 400 `ValidationException` the
+/// operation models — the error "that occurred due to a syntax error in a
+/// request".
+fn validation(message: String) -> GetFindingStatisticsError {
+    GetFindingStatisticsErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `GetFindingStatistics` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,18 +171,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFindingStatistics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFindingStatisticsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFindingStatistics"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFindingStatisticsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the findings store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // Everything about the query that does not depend on the store is
+        // checked HERE, before the store is even locked: the property the
+        // results are grouped by, the criteria that select the findings to
+        // count, and the order the groups are reported in. That refuses a query
+        // this service cannot run whether or not the region holds a finding to
+        // run it over, and caps the work the scan below does before it starts.
+        if let Err(message) = crate::state::validate_group_by(&input.group_by) {
+            return Err(validation(message));
+        }
+        let criterion = input
+            .finding_criteria
+            .as_ref()
+            .and_then(|criteria| criteria.criterion.as_ref());
+        if let Some(criterion) = criterion {
+            if let Err(message) = crate::state::validate_criterion(criterion) {
+                return Err(validation(message));
+            }
+        }
+        if let Err(message) =
+            crate::state::validate_statistics_sort_criteria(input.sort_criteria.as_ref())
+        {
+            return Err(validation(message));
+        }
+
+        let state = store.lock();
+        if state.session(&region).is_none() {
+            return Err(GetFindingStatisticsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The findings this query aggregates: the ones of this region that
+        // satisfy every condition the criteria name — exactly the set
+        // `ListFindings` enumerates for the same criteria.
+        let selected = state.findings_in(&region).filter(|finding| {
+            criterion
+                .is_none_or(|criterion| crate::state::matches_criteria(&finding.finding, criterion))
+        });
+
+        let counts_by_group = crate::state::group_counts(
+            selected,
+            &input.group_by,
+            input.sort_criteria.as_ref(),
+            crate::state::statistics_group_limit(input.size),
+        )
+        .map_err(validation)?;
+
+        Ok(GetFindingStatisticsOutput {
+            counts_by_group: Some(counts_by_group),
+        })
     }
 }

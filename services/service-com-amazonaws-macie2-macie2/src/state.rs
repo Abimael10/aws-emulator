@@ -31,7 +31,8 @@
 //! Three planes of this state have a file of their own. The findings plane
 //! lives in [`findings`], because it carries a query of its own — the
 //! conditions a `findingCriteria` names and the order a `sortCriteria` asks for
-//! — beside the records themselves. The allow lists (`CreateAllowList` stores
+//! — beside the records themselves, with the aggregation a statistics query
+//! runs over those records in [`finding_statistics`]. The allow lists (`CreateAllowList` stores
 //! one, `GetAllowList` projects it together with the status it derives for it,
 //! `ListAllowLists` enumerates them) live in [`allow_lists`], which is where the
 //! object-store read that status rests on lives too. The classification jobs
@@ -42,9 +43,11 @@
 //! `crate::state::…` whichever plane it touches.
 
 pub mod classification_jobs;
+pub mod finding_statistics;
 pub mod findings;
 
 pub use classification_jobs::*;
+pub use finding_statistics::*;
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
