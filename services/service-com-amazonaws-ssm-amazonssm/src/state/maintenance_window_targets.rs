@@ -124,6 +124,35 @@ impl MaintenanceWindowTargetRecord {
         }
     }
 
+    /// Whether this registration is one the criteria `criteria` name: "the managed node ID or
+    /// key-value pair to retrieve information about"
+    /// (`DescribeMaintenanceWindowScheduleRequest$Targets`), which is what makes a window one
+    /// of the windows a node is associated with.
+    ///
+    /// A criterion names this registration when the two state the SAME key and share a value
+    /// under it, since that is the key-value pair the criterion asks about; a criterion
+    /// stating a key this registration does not, or that key under none of its values, names
+    /// other nodes entirely. Criteria UNION, the way a filter's values do: a read asking about
+    /// several targets asks for the windows ANY of them is registered with. A criterion
+    /// stating no key names nothing.
+    #[must_use]
+    pub fn covers(&self, criteria: &[Target]) -> bool {
+        criteria.iter().any(|criterion| {
+            let key = criterion.key.as_deref().unwrap_or_default();
+            let wanted = criterion.values.as_deref().unwrap_or_default();
+            !key.is_empty()
+                && self.targets.iter().any(|registered| {
+                    registered.key.as_deref().unwrap_or_default() == key
+                        && registered
+                            .values
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|value| wanted.contains(value))
+                })
+        })
+    }
+
     /// Whether the filter `key`=`values` selects this target.
     ///
     /// Each key narrows by one property of the target, and a filter's values UNION: a

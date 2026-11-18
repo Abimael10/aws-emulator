@@ -24,6 +24,13 @@
 //! stored schedule, the stored activation window and the clock ([`WindowSchedule`]), and
 //! moves on its own as the clock does.
 //!
+//! The same reading answers for the whole series rather than for its first instant alone:
+//! "information about upcoming executions of a maintenance window"
+//! (`smithy_query(query="doc",shape="DescribeMaintenanceWindowSchedule")`) is the successive
+//! instants that schedule names inside the interval the window is active over
+//! ([`MaintenanceWindowRecord::scheduled_executions`]), so a window's next execution and a
+//! report of its upcoming executions can never disagree.
+//!
 //! The grammars are read by maintained parsers rather than by a hand-written one: the
 //! `cron` crate for a `cron(...)` body normalised by [`normalised_cron`], `chrono` for an
 //! `at(...)` instant and for the ISO-8601 instants that bound a window, and `chrono-tz`
@@ -38,7 +45,7 @@ use std::time::{Duration, SystemTime};
 
 use ::chrono::{Offset, TimeZone};
 
-use crate::ops::types::MaintenanceWindowIdentity;
+use crate::ops::types::{MaintenanceWindowIdentity, PatchOrchestratorFilter};
 
 use super::{ComAmazonawsSsmAmazonssmState, NANOS_PER_MILLISECOND};
 
@@ -200,6 +207,202 @@ pub const MAX_WINDOW_PAGE_SIZE: i32 = super::maintenance_window_targets::MAX_TAR
 /// The page size a window describe serves (see `super::page_size`).
 pub fn window_page_size(max_results: Option<i32>) -> Result<usize, String> {
     super::page_size(max_results, MIN_WINDOW_PAGE_SIZE, MAX_WINDOW_PAGE_SIZE)
+}
+
+/// The filter keys a report of a window's UPCOMING executions may narrow by: "you can limit
+/// maintenance window executions to only those scheduled before or after a certain date and
+/// time" (`DescribeMaintenanceWindowScheduleRequest$Filters`) — the two ends of that range,
+/// each value stating an instant in the same ISO-8601 Extended form a window states its own
+/// bounds in. What a refusal of another key lists, and the one place that set is written.
+pub const SCHEDULE_FILTER_KEYS: &[&str] = &["Before", "After"];
+
+/// Whether `key` is one of the filter keys a schedule report takes
+/// ([`SCHEDULE_FILTER_KEYS`]).
+#[must_use]
+pub fn is_schedule_filter_key(key: &str) -> bool {
+    SCHEDULE_FILTER_KEYS.contains(&key)
+}
+
+/// The smallest page a report of upcoming executions serves, from the modelled
+/// `MaintenanceWindowSearchMaxResults` (`range 1..`).
+pub const MIN_SCHEDULE_PAGE_SIZE: i32 = 1;
+
+/// The largest page that report serves, which is also the page a request naming no
+/// `MaxResults` is served.
+///
+/// That modelled member states no maximum of its own, while the series a schedule names runs
+/// as long as the schedule does — a `rate(...)` or `cron(...)` window is scheduled for as far
+/// ahead as anyone asks — so the page is bounded HERE, at the largest page the other
+/// maintenance window reads of this service serve ([`MAX_WINDOW_PAGE_SIZE`]), rather than
+/// left for a request to choose without limit.
+pub const MAX_SCHEDULE_PAGE_SIZE: i32 = MAX_WINDOW_PAGE_SIZE;
+
+/// What a `MaxResults` past the page this report serves is refused with: the emulator's own
+/// ceiling, named as the emulator's and with the figure the request asked for, so a caller
+/// does not read it as a bound the service models — the modelled member states none
+/// ([`MAX_SCHEDULE_PAGE_SIZE`]).
+#[must_use]
+pub fn schedule_page_ceiling_message(requested: i32) -> String {
+    format!(
+        "Value '{requested}' at 'maxResults' is more than the {MAX_SCHEDULE_PAGE_SIZE} upcoming \
+         executions this emulator serves in one page"
+    )
+}
+
+/// The page size a report of upcoming executions serves: the modelled lower bound refused the
+/// way every other page of this service refuses a figure outside its range
+/// (`super::page_size`), and the emulator's own ceiling named as the emulator's
+/// ([`schedule_page_ceiling_message`]).
+pub fn schedule_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    if let Some(asked) = max_results.filter(|asked| *asked > MAX_SCHEDULE_PAGE_SIZE) {
+        return Err(schedule_page_ceiling_message(asked));
+    }
+    super::page_size(max_results, MIN_SCHEDULE_PAGE_SIZE, MAX_SCHEDULE_PAGE_SIZE)
+}
+
+/// The instants a schedule report's `Filters` admit: the instant its executions have to fall
+/// after and the one they have to fall before, each `None` when nothing bounds that end — or
+/// `None` for filters that admit no instant at all.
+///
+/// Both ends are EXCLUSIVE: "only those scheduled before or after a certain date and time"
+/// (`DescribeMaintenanceWindowScheduleRequest$Filters`) admits what stands before or after the
+/// instant stated and not what stands at it, so the two ends read the same way round.
+///
+/// A filter's values UNION while the filters INTERSECT, the rule every filtered read of this
+/// service follows: an execution passes an `After` filter when it falls after ANY of that
+/// filter's instants (so the earliest of them is the bound), passes a `Before` filter when it
+/// falls before any of them (so the latest is), and has to pass every filter stated. A value
+/// naming no instant is the instant of no execution, so it admits none — the reading
+/// [`MaintenanceWindowRecord::matches_filter`] gives a value spelling neither boolean — and a
+/// filter carrying only such values, or no value at all, therefore admits nothing.
+///
+/// A key outside [`SCHEDULE_FILTER_KEYS`] bounds nothing here either; its caller refuses such
+/// a key, naming it, before anything is asked about the windows.
+#[must_use]
+pub fn schedule_filter_span(
+    filters: &[PatchOrchestratorFilter],
+) -> Option<(Option<SystemTime>, Option<SystemTime>)> {
+    let mut not_before: Option<SystemTime> = None;
+    let mut not_after: Option<SystemTime> = None;
+    for filter in filters {
+        let stated: Vec<SystemTime> = filter
+            .values
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|value| schedule_filter_instant(value))
+            .collect();
+        match filter.key.as_deref().unwrap_or_default() {
+            "After" => {
+                let earliest = stated.into_iter().min()?;
+                not_before = Some(not_before.map_or(earliest, |held| held.max(earliest)));
+            }
+            "Before" => {
+                let latest = stated.into_iter().max()?;
+                not_after = Some(not_after.map_or(latest, |held| held.min(latest)));
+            }
+            _ => return None,
+        }
+    }
+    Some((not_before, not_after))
+}
+
+/// The instant a schedule filter's value states, or `None` for text naming none.
+///
+/// Read the way a window's own `StartDate` and `EndDate` are ([`window_instant`]) — ISO-8601
+/// Extended, at UTC when the text carries no offset of its own, since a filter states no zone
+/// — and additionally in the shortest form this service WRITES an execution time in, the one
+/// whose seconds carry nothing ([`INSTANT_MINUTE_FORMAT`]), so a caller can bound a range by
+/// an instant it was reported.
+fn schedule_filter_instant(value: &str) -> Option<SystemTime> {
+    let value = value.trim();
+    window_instant(value, DEFAULT_ZONE).or_else(|| {
+        seconds_supplied(value).and_then(|stated| window_instant(&stated, DEFAULT_ZONE))
+    })
+}
+
+/// `value` with the zero seconds an instant written only to the minute leaves out supplied,
+/// or `None` when it already states them (or states no time of day at all).
+fn seconds_supplied(value: &str) -> Option<String> {
+    let (date, rest) = value.split_once('T')?;
+    // Where the zone this instant may carry starts: its designator or the sign of its
+    // offset, neither of which stands in the time of day itself.
+    let zone_at = rest
+        .find(['Z', 'z', '+', '-'])
+        .unwrap_or(rest.len());
+    let (time, zone) = rest.split_at(zone_at);
+    (time.matches(':').count() == 1).then(|| format!("{date}T{time}:00{zone}"))
+}
+
+/// The byte a schedule cursor puts between the instant it resumes at and the window that
+/// instant belongs to. Neither a decimal count of milliseconds nor a window id carries it, so
+/// it splits a cursor exactly once.
+const SCHEDULE_CURSOR_SEPARATOR: char = '/';
+
+/// Where a page of a window schedule report resumes: the entry the next page starts at.
+///
+/// A schedule report walks the executions of the windows it was asked about in the order they
+/// are scheduled, the window id breaking a tie so that order is total — which is exactly what
+/// this cursor names, so a page resumes at an ENTRY rather than at an offset into a series
+/// that is computed afresh, from a fresh clock reading, for every request.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScheduleCursor {
+    /// The instant the entry is scheduled at, in whole milliseconds since the epoch — the
+    /// resolution this service states an instant at ([`super::NANOS_PER_MILLISECOND`]), so a
+    /// cursor names the same instant the page it was handed out by reported.
+    pub at: u64,
+    /// The window the entry belongs to.
+    pub window_id: String,
+}
+
+impl ScheduleCursor {
+    /// The cursor of the execution scheduled at `at` in the window `window_id`.
+    #[must_use]
+    pub fn of(at: SystemTime, window_id: &str) -> Self {
+        let since_epoch = at
+            .duration_since(::std::time::UNIX_EPOCH)
+            .map(|since| since.as_millis())
+            .unwrap_or_default();
+        Self {
+            at: u64::try_from(since_epoch).unwrap_or(u64::MAX),
+            window_id: window_id.to_string(),
+        }
+    }
+
+    /// The `NextToken` a page hands out to resume here.
+    #[must_use]
+    pub fn page_token(&self) -> String {
+        format!("{}{SCHEDULE_CURSOR_SEPARATOR}{}", self.at, self.window_id)
+    }
+
+    /// The cursor a `NextToken` names, or `None` for a value this service did not hand out —
+    /// one that does not split into a count of milliseconds and a window id of the modelled
+    /// form ([`is_maintenance_window_id`]) — which is what `InvalidNextToken` reports.
+    #[must_use]
+    pub fn of_token(token: &str) -> Option<Self> {
+        let (at, window_id) = token.split_once(SCHEDULE_CURSOR_SEPARATOR)?;
+        let at: u64 = at.parse().ok()?;
+        is_maintenance_window_id(window_id).then(|| Self {
+            at,
+            window_id: window_id.to_string(),
+        })
+    }
+
+    /// The exclusive lower bound a page resuming here searches a schedule from: one
+    /// millisecond before the instant this cursor names, since the cursor states that instant
+    /// to the millisecond and the occurrence it names may stand anywhere inside it.
+    ///
+    /// No schedule names two occurrences inside one millisecond — the shortest period a
+    /// `rate(...)` states is a minute ([`RATE_UNITS`]) and a `cron(...)` expression names
+    /// instants a minute apart at the closest — so the first occurrence past this bound is
+    /// the one the cursor names.
+    #[must_use]
+    pub fn search_from(&self) -> SystemTime {
+        ::std::time::UNIX_EPOCH
+            .checked_add(Duration::from_millis(self.at))
+            .and_then(|at| at.checked_sub(Duration::from_millis(1)))
+            .unwrap_or(::std::time::UNIX_EPOCH)
+    }
 }
 
 /// Whether `id` is a maintenance window id — the modelled `MaintenanceWindowId` pattern
@@ -748,45 +951,159 @@ impl MaintenanceWindowRecord {
     /// (`MaintenanceWindowIdentity$NextExecutionTime`), or `None` when the window will not
     /// run again.
     ///
-    /// Computed from the stored schedule and the clock, so it moves on its own as the
-    /// clock does rather than being frozen at the instant of a write. A window will not
-    /// run again when it is disabled ("whether the maintenance window is enabled"), when
-    /// its schedule names no further instant, when that instant falls outside the interval
-    /// its `StartDate` and `EndDate` bound, or when a bound it states names no instant this
-    /// reader can place — and a window whose activation is still ahead first runs at the
-    /// first instant after it becomes active.
+    /// The FIRST of the instants this window is scheduled to open at after `now`
+    /// ([`Self::scheduled_execution_times`]) — so a single read of a window and a report of
+    /// its upcoming executions answer from the one series rather than from two readings of
+    /// the schedule, and the value moves on its own as the clock does rather than being
+    /// frozen at the instant of a write.
     #[must_use]
     pub fn next_execution_time(&self, now: SystemTime) -> Option<String> {
-        if !self.enabled {
-            return None;
+        self.scheduled_execution_times(now, None, 1)
+            .into_iter()
+            .next()
+    }
+
+    /// The instants this window is scheduled to OPEN at that fall after `after` and before
+    /// `until` when one is stated, in ascending order: at most `limit` of them.
+    ///
+    /// Both bounds a caller asks for are EXCLUSIVE and both are bounds on the instant the
+    /// window opens at — the instant the schedule names moved on by the whole days a
+    /// `ScheduleOffset` waits — so a window that waits is reported by when it RUNS and not by
+    /// when its expression fired.
+    ///
+    /// The series is read from the stored schedule, the stored activation window and the
+    /// window's zone, so it moves on its own as the clock does and nothing about it is
+    /// stored. A window contributes no instant at all when it is disabled ("whether the
+    /// maintenance window is enabled"), when its schedule names none this emulator can place,
+    /// or when a bound it STATES names no instant this reader can place — such a bound leaves
+    /// the interval the window would run in unknown, so nothing is reported for it rather than
+    /// instants computed as though the window carried no bound at all. The series ends at
+    /// `until`, at the window's own inactivation — which an execution standing exactly at it
+    /// still runs on, the window being active up to that instant — or at the last instant the
+    /// schedule names.
+    #[must_use]
+    pub fn scheduled_executions(
+        &self,
+        after: SystemTime,
+        until: Option<SystemTime>,
+        limit: usize,
+    ) -> Vec<SystemTime> {
+        let mut opens_at: Vec<SystemTime> = Vec::new();
+        if !self.enabled || limit == 0 {
+            return opens_at;
         }
         let zone = self.zone();
-        let occurrences = self.schedule_occurrences()?;
+        let Some(occurrences) = self.schedule_occurrences() else {
+            return opens_at;
+        };
         // "for when you want the maintenance window to become active […] allows you to
         // delay activation of the maintenance window until the specified future date": the
-        // search starts at the later of the clock and that activation. A bound the window
-        // STATES but that names no instant this reader can place leaves the interval the
-        // window would run in unknown, so nothing is reported for it rather than an instant
-        // computed as though the window carried no bound at all.
-        let mut after = now;
+        // series starts at the later of the bound asked for and that activation, so a window
+        // whose activation is still ahead first runs at the first instant after it.
+        let mut opens_after = after;
         if let Some(stated) = self.stated_start_date() {
-            after = after.max(window_instant(stated, zone)?);
-        }
-        let mut at = occurrences.next_after(after, self.created_date)?;
-        // The offset waits whole days after the instant the cron expression named.
-        if occurrences.takes_schedule_offset() {
-            if let Some(days) = self.schedule_offset.filter(|days| *days > 0) {
-                at = at.checked_add(ONE_DAY * u32::try_from(days).ok()?)?;
+            match window_instant(stated, zone) {
+                Some(active_from) => opens_after = opens_after.max(active_from),
+                None => return opens_at,
             }
         }
-        // "for when you want the maintenance window to become inactive": the window runs
-        // no more once that instant has passed.
+        // "for when you want the maintenance window to become inactive": the window runs no
+        // more once that instant has passed — an execution standing AT it still runs, the
+        // window being active up to it.
+        let mut inactive_from = None;
         if let Some(stated) = self.stated_end_date() {
-            if at > window_instant(stated, zone)? {
-                return None;
+            match window_instant(stated, zone) {
+                Some(stated) => inactive_from = Some(stated),
+                None => return opens_at,
             }
         }
-        rendered_instant(at, zone)
+        // The offset waits whole days after each instant the cron expression named, and
+        // applies to a cron schedule and to nothing else
+        // ([`WindowSchedule::takes_schedule_offset`]).
+        let offset = self
+            .schedule_offset
+            .filter(|_| occurrences.takes_schedule_offset())
+            .filter(|days| *days > 0)
+            .and_then(|days| u32::try_from(days).ok())
+            .unwrap_or_default();
+        let waited = ONE_DAY * offset;
+        // Every bound is a bound on the instant the window OPENS at, while the schedule names
+        // the instant the wait is counted from — so each bound is carried back over that wait
+        // and the walk takes the schedule's own instants against it. Counting the wait forward
+        // instead would drop an execution that opens inside the bound from a named instant
+        // that stands before it.
+        let Some(mut cursor) = opens_after.checked_sub(waited) else {
+            return opens_at;
+        };
+        let named_no_later_than = match (until, inactive_from) {
+            (None, None) => None,
+            // The bound asked for is EXCLUSIVE at both ends ("only those scheduled before or
+            // after a certain date and time"), so the last instant it admits is one
+            // millisecond before it — the resolution this service states an instant at —
+            // while the window's own inactivation admits an execution standing exactly at it.
+            (until, inactive_from) => {
+                let asked_last = match until {
+                    None => None,
+                    Some(until) => match until.checked_sub(Duration::from_millis(1)) {
+                        Some(last) => Some(last),
+                        // A bound so early that nothing at all stands before it.
+                        None => return opens_at,
+                    },
+                };
+                // The last instant the SCHEDULE may name for the execution it opens to still
+                // to be admitted: the narrower of the two bounds, carried back over the wait.
+                let last = [asked_last, inactive_from]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .and_then(|last| last.checked_sub(waited));
+                match last {
+                    Some(last) => Some(last),
+                    // Every instant the schedule could name opens past the bound.
+                    None => return opens_at,
+                }
+            }
+        };
+        while opens_at.len() < limit {
+            let Some(named) = occurrences.next_after(cursor, self.created_date) else {
+                break;
+            };
+            // Every pass moves the search past the instant just named, so the walk takes
+            // `limit` steps at most and no occurrence is reported twice.
+            cursor = named;
+            if named_no_later_than.is_some_and(|last| named > last) {
+                break;
+            }
+            let Some(opens) = named.checked_add(waited) else {
+                break;
+            };
+            opens_at.push(opens);
+        }
+        opens_at
+    }
+
+    /// The same instants as the `MaintenanceWindowStringDateTime`s this window reports them
+    /// as ([`Self::execution_time`]), the series stopping at the first instant that has no
+    /// such rendering.
+    #[must_use]
+    pub fn scheduled_execution_times(
+        &self,
+        after: SystemTime,
+        until: Option<SystemTime>,
+        limit: usize,
+    ) -> Vec<String> {
+        self.scheduled_executions(after, until, limit)
+            .into_iter()
+            .map_while(|at| self.execution_time(at))
+            .collect()
+    }
+
+    /// One instant this window opens at, as this window reports it: written in the zone the
+    /// window states its schedule in ([`rendered_instant`]), so every instant a window
+    /// reports is read in the one zone.
+    #[must_use]
+    pub fn execution_time(&self, at: SystemTime) -> Option<String> {
+        rendered_instant(at, self.zone())
     }
 
     /// The activation instant this window STATES, or `None` when it states none — a member
@@ -1088,6 +1405,26 @@ mod tests {
             );
         }
     }
+
+    /// One row of [`the_series_is_the_schedules_successive_instants`]: what a failing
+    /// assertion calls it, the schedule, the zone it is read in, the days it waits, how many
+    /// instants are asked for, and the instants reported.
+    type ScheduleSeriesRow = (
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        Option<i32>,
+        usize,
+        &'static [&'static str],
+    );
+
+    /// One row of [`the_schedule_filters_bound_the_range_reported`]: what a failing assertion
+    /// calls it, the filters stated, and the span they admit.
+    type ScheduleSpanRow = (
+        &'static str,
+        Vec<PatchOrchestratorFilter>,
+        Option<(Option<SystemTime>, Option<SystemTime>)>,
+    );
 
     /// One window, so the rows below differ only along the member each is about.
     fn window(schedule: &str) -> MaintenanceWindowRecord {
@@ -1576,6 +1913,304 @@ mod tests {
             assert_eq!(
                 served, expected,
                 "case {case:?}: expected window_page_size({asked:?})={expected:?}, got {served:?}"
+            );
+        }
+    }
+
+    /// The series a window is scheduled over is the successive instants its schedule names,
+    /// the first of them being the next execution a single read of the window reports: the
+    /// rows differ along the form of the schedule, the zone it is read in, the days it waits
+    /// and how many instants are asked for.
+    #[test]
+    fn the_series_is_the_schedules_successive_instants() {
+        // 2030-01-01T00:00:00Z, a Tuesday.
+        let now = epoch(1_893_456_000);
+        // (case, schedule, timezone, offset, how many are asked for, the instants reported)
+        let rows: [ScheduleSeriesRow; 6] = [
+            (
+                "three days of a daily cron",
+                "cron(0 8 * * ? *)",
+                None,
+                None,
+                3,
+                &["2030-01-01T08:00Z", "2030-01-02T08:00Z", "2030-01-03T08:00Z"],
+            ),
+            (
+                "the same cron read in a western zone",
+                "cron(0 8 * * ? *)",
+                Some("America/Los_Angeles"),
+                None,
+                2,
+                &["2030-01-01T08:00-08:00", "2030-01-02T08:00-08:00"],
+            ),
+            (
+                "a weekly cron waiting two whole days",
+                "cron(0 0 ? * WED *)",
+                None,
+                Some(2),
+                2,
+                &["2030-01-04T00:00Z", "2030-01-11T00:00Z"],
+            ),
+            (
+                "a rate series anchored at the create",
+                "rate(6 hours)",
+                None,
+                None,
+                3,
+                &["2030-01-01T06:00Z", "2030-01-01T12:00Z", "2030-01-01T18:00Z"],
+            ),
+            (
+                "a one-time instant, which the series holds once",
+                "at(2030-06-01T12:00:00)",
+                None,
+                None,
+                4,
+                &["2030-06-01T12:00Z"],
+            ),
+            (
+                "no instant asked for at all",
+                "cron(0 8 * * ? *)",
+                None,
+                None,
+                0,
+                &[],
+            ),
+        ];
+
+        for (case, schedule, timezone, offset, limit, expected) in rows {
+            let mut held = window(schedule);
+            held.schedule_timezone = timezone.map(str::to_string);
+            held.schedule_offset = offset;
+            let series = held.scheduled_execution_times(now, None, limit);
+            assert_eq!(
+                series,
+                expected
+                    .iter()
+                    .map(|at| (*at).to_string())
+                    .collect::<Vec<String>>(),
+                "case {case:?}: expected {expected:?}, got {series:?}"
+            );
+            // The next execution a single read reports is the first of the same series —
+            // asked for the series itself rather than for a page of none of it.
+            if limit > 0 {
+                assert_eq!(
+                    held.next_execution_time(now).as_deref(),
+                    expected.first().copied(),
+                    "case {case:?}: expected the next execution to be the series' first instant"
+                );
+            }
+        }
+
+        // The series stops at the bound asked for, and at the window's own inactivation
+        // whichever of the two comes first.
+        let daily = window("cron(0 8 * * ? *)");
+        let until = epoch(1_893_456_000 + 3 * 86_400);
+        assert_eq!(
+            daily.scheduled_execution_times(now, Some(until), 10),
+            vec![
+                "2030-01-01T08:00Z".to_string(),
+                "2030-01-02T08:00Z".to_string(),
+                "2030-01-03T08:00Z".to_string(),
+            ],
+            "case \"a bound inside the series\": expected the series to stop at it"
+        );
+        let mut inactive = daily.clone();
+        inactive.end_date = Some("2030-01-02T00:00:00Z".to_string());
+        assert_eq!(
+            inactive.scheduled_execution_times(now, Some(until), 10),
+            vec!["2030-01-01T08:00Z".to_string()],
+            "case \"a window that becomes inactive first\": expected the series to stop there"
+        );
+
+        // A bound standing exactly ON an execution: the bound asked for is exclusive, so that
+        // execution is past the range, while the window's own inactivation admits one standing
+        // at it.
+        let at_an_execution = epoch(1_893_456_000 + 86_400 + 8 * 3_600);
+        assert_eq!(
+            daily.scheduled_execution_times(now, Some(at_an_execution), 10),
+            vec!["2030-01-01T08:00Z".to_string()],
+            "case \"a bound standing on an execution\": expected that execution to be past the \
+             range"
+        );
+        let mut inactive_then = daily.clone();
+        inactive_then.end_date = Some("2030-01-02T08:00:00Z".to_string());
+        assert_eq!(
+            inactive_then.scheduled_execution_times(now, None, 10),
+            vec![
+                "2030-01-01T08:00Z".to_string(),
+                "2030-01-02T08:00Z".to_string(),
+            ],
+            "case \"a window inactive from an execution's own instant\": expected that \
+             execution to run"
+        );
+
+        // Every bound is a bound on the instant the window OPENS at, which a `ScheduleOffset`
+        // moves whole days past the instant the expression named: an execution opening inside
+        // the bound is reported even though the instant it was named at stands outside it.
+        let mut waits = window("cron(0 0 ? * WED *)");
+        waits.schedule_offset = Some(2);
+        // The Wednesday is 2030-01-02T00:00Z, so the window opens on the 4th; the bound stands
+        // between the two.
+        let between = epoch(1_893_456_000 + 2 * 86_400);
+        assert_eq!(
+            waits.scheduled_execution_times(between, None, 1),
+            vec!["2030-01-04T00:00Z".to_string()],
+            "case \"a window that waits whole days\": expected the opening instant to be taken \
+             against the bound"
+        );
+        assert_eq!(
+            waits.scheduled_execution_times(now, Some(epoch(1_893_456_000 + 4 * 86_400)), 5),
+            vec!["2030-01-04T00:00Z".to_string()],
+            "case \"a window that waits whole days, bounded above\": expected the opening \
+             instant to be taken against that bound too"
+        );
+    }
+
+    /// A page cursor round-trips through the token it is handed out as, and no value this
+    /// service did not hand out reads as one: the rows differ along what makes the text
+    /// something else.
+    #[test]
+    fn a_schedule_cursor_round_trips_only_through_a_token_it_minted() {
+        let window_id = mint_window_id(3, epoch(1_893_456_000));
+        for at in [
+            epoch(0),
+            epoch(1_893_456_000),
+            ::std::time::UNIX_EPOCH + Duration::from_millis(1_893_456_000_123),
+        ] {
+            let cursor = ScheduleCursor::of(at, &window_id);
+            let token = cursor.page_token();
+            assert_eq!(
+                ScheduleCursor::of_token(&token),
+                Some(cursor.clone()),
+                "case {token:?}: expected the cursor to round-trip"
+            );
+            // The search a resumed page runs starts before the instant the cursor names, so
+            // the occurrence it names is the first one that search finds.
+            assert!(
+                cursor.search_from() < at.max(::std::time::UNIX_EPOCH + Duration::from_millis(1)),
+                "case {token:?}: expected the search to start before the instant named"
+            );
+        }
+
+        // (case, the text)
+        let rows: [(&str, &str); 6] = [
+            ("empty", ""),
+            ("prose", "not-a-token"),
+            ("an instant with no window", "1893456000000"),
+            ("a position that is no instant", "later/mw-00000000000000000"),
+            ("a position past the count a cursor holds", "99999999999999999999/mw-00000000000000000"),
+            ("a position naming no window", "1893456000000/not-a-window"),
+        ];
+        for (case, token) in rows {
+            assert_eq!(
+                ScheduleCursor::of_token(token),
+                None,
+                "case {case:?}: expected no cursor for {token:?}"
+            );
+        }
+    }
+
+    /// The filters a schedule report takes bound the range of instants it serves: each
+    /// filter's values union, the filters intersect, and a filter admitting no instant
+    /// admits nothing at all. The page it serves stays inside the bounds this read states.
+    #[test]
+    fn the_schedule_filters_bound_the_range_reported() {
+        assert_eq!(
+            SCHEDULE_FILTER_KEYS,
+            &["Before", "After"],
+            "expected the two ends of the documented range, got {SCHEDULE_FILTER_KEYS:?}"
+        );
+        for key in SCHEDULE_FILTER_KEYS {
+            assert!(
+                is_schedule_filter_key(key),
+                "case {key:?}: expected a documented key to be taken"
+            );
+        }
+        assert!(
+            !is_schedule_filter_key("before"),
+            "expected the filter keys to be read case-sensitively"
+        );
+
+        let filter = |key: &str, values: &[&str]| PatchOrchestratorFilter {
+            key: Some(key.to_string()),
+            values: Some(values.iter().map(|value| (*value).to_string()).collect()),
+        };
+        let at = |seconds: u64| Some(epoch(seconds));
+        // 2030-01-01T00:00:00Z and the two days after it.
+        let first = 1_893_456_000;
+        // (case, the filters, the span they admit)
+        let rows: Vec<ScheduleSpanRow> = vec![
+            ("no filter at all", vec![], Some((None, None))),
+            (
+                "one instant to be after",
+                vec![filter("After", &["2030-01-01T00:00:00Z"])],
+                Some((at(first), None)),
+            ),
+            (
+                "an instant written only to the minute",
+                vec![filter("Before", &["2030-01-02T00:00Z"])],
+                Some((None, at(first + 86_400))),
+            ),
+            (
+                "values that union on the earliest instant to be after",
+                vec![filter(
+                    "After",
+                    &["2030-01-03T00:00:00Z", "2030-01-01T00:00:00Z"],
+                )],
+                Some((at(first), None)),
+            ),
+            (
+                "values that union on the latest instant to be before",
+                vec![filter(
+                    "Before",
+                    &["2030-01-03T00:00:00Z", "2030-01-01T00:00:00Z"],
+                )],
+                Some((None, at(first + 2 * 86_400))),
+            ),
+            (
+                "both ends, which intersect",
+                vec![
+                    filter("After", &["2030-01-01T00:00:00Z"]),
+                    filter("Before", &["2030-01-03T00:00:00Z"]),
+                ],
+                Some((at(first), at(first + 2 * 86_400))),
+            ),
+            (
+                "two filters of one key, the narrower bound standing",
+                vec![
+                    filter("Before", &["2030-01-03T00:00:00Z"]),
+                    filter("Before", &["2030-01-02T00:00:00Z"]),
+                ],
+                Some((None, at(first + 86_400))),
+            ),
+            (
+                "a value naming no instant",
+                vec![filter("Before", &["whenever"])],
+                None,
+            ),
+            ("a filter carrying no value", vec![filter("After", &[])], None),
+        ];
+        for (case, filters, expected) in rows {
+            let span = schedule_filter_span(&filters);
+            assert_eq!(
+                span, expected,
+                "case {case:?}: expected {expected:?}, got {span:?}"
+            );
+        }
+
+        // (case, the MaxResults asked for, the page served)
+        let pages: [(&str, Option<i32>, Option<usize>); 5] = [
+            ("no bound at all", None, Some(MAX_SCHEDULE_PAGE_SIZE as usize)),
+            ("the smallest page", Some(MIN_SCHEDULE_PAGE_SIZE), Some(MIN_SCHEDULE_PAGE_SIZE as usize)),
+            ("the largest page", Some(MAX_SCHEDULE_PAGE_SIZE), Some(MAX_SCHEDULE_PAGE_SIZE as usize)),
+            ("one below the smallest", Some(MIN_SCHEDULE_PAGE_SIZE - 1), None),
+            ("one above the largest", Some(MAX_SCHEDULE_PAGE_SIZE + 1), None),
+        ];
+        for (case, asked, expected) in pages {
+            let served = schedule_page_size(asked).ok();
+            assert_eq!(
+                served, expected,
+                "case {case:?}: expected schedule_page_size({asked:?})={expected:?}, got {served:?}"
             );
         }
     }

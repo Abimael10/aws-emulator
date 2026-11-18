@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMaintenanceWindowSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMaintenanceWindowSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMaintenanceWindowSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports "information about upcoming executions of a maintenance window": the instants the
+//! schedule of each window asked about names, in the order they are scheduled. Every instant
+//! is read from what a `CreateMaintenanceWindow` persisted
+//! ([`crate::state::maintenance_windows::MaintenanceWindowRecord::scheduled_executions`]) —
+//! the same series a window's `NextExecutionTime` is the first instant of — so this report
+//! and a single read of the window can never disagree, and a window nothing created is
+//! reported on by nothing.
+//!
+//! Which windows are asked about is what the request states: the ONE window a `WindowId`
+//! names (and `DoesNotExistException` when this endpoint holds no window under it), the
+//! windows whose registered targets cover the `Targets` a request asks about
+//! ([`crate::state::maintenance_window_targets::MaintenanceWindowTargetRecord::covers`]), or —
+//! when the request names neither — every window this endpoint holds. `Filters` then narrow
+//! the range of instants reported "to only those scheduled before or after a certain date and
+//! time", and a key outside that documented set is refused naming it rather than served a
+//! report narrowed by nothing.
+//!
+//! A page holds at most `MaxResults` executions and the `NextToken` this read hands out names
+//! the execution the next page starts at, so a walk over the pages reports each execution
+//! once. This is a REPORTING operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +167,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMaintenanceWindowSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMaintenanceWindowScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMaintenanceWindowSchedule"))
+        use crate::state::maintenance_windows::{
+            is_schedule_filter_key, maintenance_window_not_found_message, schedule_filter_span,
+            schedule_page_size, MaintenanceWindowRecord, ScheduleCursor, SCHEDULE_FILTER_KEYS,
+        };
+        use crate::state::{invalid_filter_key_message, non_empty, INVALID_NEXT_TOKEN};
+
+        // The filter list's length (0..5), the target list's (0..5), `ResourceType`'s enum,
+        // `WindowId`'s pattern and `MaxResults`'s lower bound are MODELLED constraints the
+        // centralized request walk has already refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeMaintenanceWindowScheduleErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the maintenance window store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let filters = input.filters.as_deref().unwrap_or_default();
+        for filter in filters {
+            // A key outside the documented set bounds no range of executions, so the filter
+            // cannot be served at all: the key is validated — and the request refused, naming
+            // it — before anything is asked about the windows, worded through the crate's one
+            // wording of this class ([`crate::state::invalid_filter_key_message`]). This
+            // operation models no filter error, so it is a 400 `ValidationException`.
+            let key = filter.key.as_deref().unwrap_or_default();
+            if !is_schedule_filter_key(key) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    invalid_filter_key_message(key, SCHEDULE_FILTER_KEYS),
+                ));
+            }
+        }
+
+        let page_size = schedule_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this operation hands out names the execution the next page starts at, so a
+        // value that does not read as one of those is a token this read did not hand out: it
+        // is refused rather than served the first page over again. This operation models no
+        // token error either, so it is a 400 `ValidationException`.
+        let resume_at = match non_empty(input.next_token.as_deref()) {
+            None => None,
+            Some(token) => match ScheduleCursor::of_token(token) {
+                Some(cursor) => Some(cursor),
+                None => return Err(crate::scaffolded::Scaffolded::validation(INVALID_NEXT_TOKEN)),
+            },
+        };
+
+        // A window lives in the Region its endpoint names, which is the signed credential
+        // scope's, so the windows this report reads are that Region's.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // "The ID of the maintenance window to retrieve information about": a request naming
+        // one asks about that window alone, and an id this endpoint holds no window under
+        // names no window at all.
+        let asked_about: Vec<&MaintenanceWindowRecord> = match non_empty(input.window_id.as_deref())
+        {
+            Some(window_id) => {
+                vec![store.maintenance_window(&region, window_id).ok_or_else(|| {
+                    DescribeMaintenanceWindowScheduleErrorModeled::DoesNotExistException(
+                        DoesNotExistException {
+                            message: Some(maintenance_window_not_found_message(window_id)),
+                        },
+                    )
+                })?]
+            }
+            None => store.maintenance_windows_in(&region),
+        };
+        // "The managed node ID or key-value pair to retrieve information about", of "the type
+        // of resource you want to retrieve information about": a request stating targets asks
+        // about the windows those targets are registered with, and a resource type narrows
+        // that to the registrations made for that type.
+        let criteria = input.targets.as_deref().unwrap_or_default();
+        let resource_type = non_empty(input.resource_type.as_deref());
+        let asked_about: Vec<&MaintenanceWindowRecord> = if criteria.is_empty() {
+            asked_about
+        } else {
+            asked_about
+                .into_iter()
+                .filter(|window| {
+                    store
+                        .maintenance_window_targets_of(&region, &window.window_id)
+                        .into_iter()
+                        .any(|registered| {
+                            resource_type.is_none_or(|wanted| registered.resource_type == wanted)
+                                && registered.covers(criteria)
+                        })
+                })
+                .collect()
+        };
+
+        // Filters admitting no instant at all admit no execution either.
+        let Some((not_before, not_after)) = schedule_filter_span(filters) else {
+            return Ok(DescribeMaintenanceWindowScheduleOutput {
+                scheduled_window_executions: Some(Vec::new()),
+                next_token: None,
+            });
+        };
+
+        // The executions reported are UPCOMING ones, so the search starts at the clock — moved
+        // on to where a resumed page left off, and to the earliest instant the filters admit.
+        let mut search_from = now;
+        if let Some(cursor) = &resume_at {
+            search_from = search_from.max(cursor.search_from());
+        }
+        if let Some(after) = not_before {
+            search_from = search_from.max(after);
+        }
+
+        // Each window contributes the first occurrences of its own series: the page's worth,
+        // one more so the execution the next page starts at is known, and one more again,
+        // since the execution a resumed page starts at may stand behind one scheduled at the
+        // same instant in another window. The walk is bounded by the page the request asked
+        // for and never by how far ahead a schedule runs.
+        let per_window = page_size.saturating_add(2);
+        let mut upcoming: Vec<(ScheduleCursor, ScheduledWindowExecution)> = Vec::new();
+        for window in &asked_about {
+            for at in window.scheduled_executions(search_from, not_after, per_window) {
+                let Some(execution_time) = window.execution_time(at) else {
+                    continue;
+                };
+                let cursor = ScheduleCursor::of(at, &window.window_id);
+                // A resumed page starts AT the execution its token named, so an execution
+                // before that one belongs to a page already served.
+                if resume_at.as_ref().is_some_and(|resume| cursor < *resume) {
+                    continue;
+                }
+                upcoming.push((
+                    cursor,
+                    ScheduledWindowExecution {
+                        window_id: Some(window.window_id.clone()),
+                        name: Some(window.name.clone()),
+                        execution_time: Some(execution_time),
+                    },
+                ));
+            }
+        }
+        // "The time […] that the maintenance window is scheduled to be run" orders the report;
+        // the window id breaks a tie, so the order is total and a page can resume at an entry.
+        upcoming.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let scheduled_window_executions: Vec<ScheduledWindowExecution> = upcoming
+            .iter()
+            .take(page_size)
+            .map(|(_, execution)| execution.clone())
+            .collect();
+        // An execution is still waiting past this page: hand the caller the token it resumes
+        // at, so the next request continues where this one stopped.
+        let next_token = upcoming
+            .get(page_size)
+            .map(|(cursor, _)| cursor.page_token());
+
+        Ok(DescribeMaintenanceWindowScheduleOutput {
+            scheduled_window_executions: Some(scheduled_window_executions),
+            next_token,
+        })
     }
 }
+

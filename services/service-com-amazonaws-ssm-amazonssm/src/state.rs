@@ -148,9 +148,12 @@
 //! `(region, window id)`: `CreateMaintenanceWindow` mints one and
 //! `GetMaintenanceWindow` reports it, so whatever the create persisted is what a later
 //! read reports. What the window will DO is not stored but read from its schedule: the
-//! next execution is the first instant that cron or rate expression names inside the
+//! instants it opens at are the ones that cron or rate expression names inside the
 //! interval the window is active over
-//! ([`maintenance_windows::MaintenanceWindowRecord::next_execution_time`]). The **targets**
+//! ([`maintenance_windows::MaintenanceWindowRecord::scheduled_executions`]), the next
+//! execution being the first of them
+//! ([`maintenance_windows::MaintenanceWindowRecord::next_execution_time`]) and a report of
+//! the window's upcoming executions the series itself. The **targets**
 //! a window's tasks run against ([`maintenance_window_targets`]) hang off the same key
 //! space, keyed by `(region, window target id)`:
 //! `RegisterTargetWithMaintenanceWindow` mints one against a window the Region holds,
