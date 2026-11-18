@@ -288,10 +288,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The caller's precondition, checked against the revision the store
         // holds right now. A request that carries none writes unconditionally.
+        // The refusal is the error class's own fixed wording, built by the
+        // shared constructor, so nothing of this request reaches the message.
         if let Some(expected) = input.expected_revision_id.as_deref() {
             if !crate::state::revision_matches(bus.resource_policy(policy_name), expected) {
                 return Err(PutResourcePolicyErrorModeled::ConflictException(
-                    crate::state::revision_conflict(policy_name, expected),
+                    crate::state::revision_conflict(),
                 )
                 .into());
             }

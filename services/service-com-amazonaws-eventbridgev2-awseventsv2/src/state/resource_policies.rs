@@ -187,22 +187,35 @@ pub fn revision_matches(current: Option<&ResourcePolicy>, expected: &str) -> boo
     }
 }
 
+/// The whole `Message` of the [`revision_conflict`] refusal: the FIXED text of
+/// that error class, with no variable part at all.
+///
+/// Every fact it carries is a property of the error class rather than of one
+/// request: which precondition failed, that the conflict can equally mean the
+/// bus was recreated since the revision was read, what the caller must do
+/// (re-read and re-evaluate, as `ConflictException` documents), and that a read
+/// taken straight after a write can still report the earlier revision. The
+/// precondition the caller sent and the policy it addressed are values the
+/// caller already holds, so neither is interpolated into it.
+pub const REVISION_CONFLICT_MESSAGE: &str = "The resource policy revision does not match \
+     ExpectedRevisionId, or the event bus was recreated since that revision was read. Re-read \
+     the policy and re-evaluate before retrying. A recent policy change can take up to a minute \
+     to be reflected on all endpoints, so a read taken immediately after one may still return \
+     the earlier revision.";
+
 /// The `ConflictException` a conditional policy write or delete answers when the
 /// `ExpectedRevisionId` it carried does not hold.
 ///
-/// ONE construction, so no two operations word that refusal differently: the
-/// error class's own words — "A client-supplied precondition … did not match the
-/// current state of the resource" — over the precondition the request carried
-/// and the policy it addressed. The policy's CURRENT revision id is not part of
-/// it: `ConflictException` documents that "a successful attempt stores a
-/// revision ID the caller never saw, so the revision alone cannot tell the two
-/// apart", and tells the caller to compare the resource's contents instead.
-pub fn revision_conflict(policy_name: &str, expected: &str) -> ConflictException {
+/// ONE construction, so no two operations word that refusal differently, and it
+/// takes nothing of the request: the message is wholly fixed
+/// ([`REVISION_CONFLICT_MESSAGE`]). The policy's CURRENT revision id is not part
+/// of it either — `ConflictException` documents that "a successful attempt
+/// stores a revision ID the caller never saw, so the revision alone cannot tell
+/// the two apart", and tells the caller to compare the resource's contents
+/// instead.
+pub fn revision_conflict() -> ConflictException {
     ConflictException {
-        message: Some(format!(
-            "ExpectedRevisionId {expected} does not match the current state of the {policy_name} \
-             resource policy"
-        )),
+        message: Some(REVISION_CONFLICT_MESSAGE.to_string()),
     }
 }
 
