@@ -42,7 +42,7 @@ use smithy_server_runtime::MultiServiceRouter;
 const ACCOUNT: &str = "000000000000";
 
 /// The Region every call of this suite is made in.
-const REGION: &str = "us-west-2";
+pub const REGION: &str = "us-west-2";
 
 /// The OpenSearch Serverless signing name, which routes a control-plane call to that
 /// service and is the name a client signs a request to a collection endpoint with
@@ -67,15 +67,15 @@ const ACCESS_KEY_ID: &str = "AKIDAMBIENT";
 /// The IAM role the knowledge bases of this suite act as, and the principal the collection's
 /// `data` access policy grants the index permissions to. Matches the modelled
 /// `KnowledgeBaseRoleArn` pattern.
-const KB_ROLE: &str =
+pub const KB_ROLE: &str =
     "arn:aws:iam::000000000000:role/service-role/AmazonBedrockExecutionRoleForKnowledgeBase";
 
 /// The field names AWS's "Create a vector index in Amazon OpenSearch Service" gives a
 /// knowledge base's index, which are what the `fieldMapping` of the storage configuration
 /// names and what the index's own `knn_vector` mapping declares.
-const VECTOR_FIELD: &str = "bedrock-knowledge-base-default-vector";
-const TEXT_FIELD: &str = "AMAZON_BEDROCK_TEXT_CHUNK";
-const METADATA_FIELD: &str = "AMAZON_BEDROCK_METADATA";
+pub const VECTOR_FIELD: &str = "bedrock-knowledge-base-default-vector";
+pub const TEXT_FIELD: &str = "AMAZON_BEDROCK_TEXT_CHUNK";
+pub const METADATA_FIELD: &str = "AMAZON_BEDROCK_METADATA";
 
 /// How many times a read looks again for a transition the clock owes. Generous: every wait
 /// here is for the CONDITION and nothing asserts how long it took.
@@ -88,7 +88,7 @@ const SETTLE_PAUSE: Duration = Duration::from_millis(25);
 /// them. Request authentication is off, as in every other suite here: what each call carries
 /// is a credential scope, which is what routes it and what each handler reads its Region and
 /// its caller from.
-fn build_router() -> MultiServiceRouter {
+pub fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -148,7 +148,7 @@ async fn aoss(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 /// `opensearch-py`'s `indices.create` / `indices.get` send it: addressed to the authority
 /// the endpoint names, signed for the `aoss` signing name, and carrying NO `x-amz-target`,
 /// because the OpenSearch REST API has no RPC target.
-async fn rest(
+pub async fn rest(
     router: &MultiServiceRouter,
     endpoint: &str,
     method: &str,
@@ -188,7 +188,7 @@ fn addressed(endpoint: &str) -> (String, String) {
 
 /// One Bedrock call, over the `restJson1` wire both Bedrock Agent planes declare, on the
 /// method and URI the operation's own `@http` binding names.
-async fn bedrock(
+pub async fn bedrock(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -214,7 +214,7 @@ async fn bedrock(
 ///
 /// The walk holds a REFERENCE at each step and clones the leaf alone, so reading a member of
 /// a large answer in a poll loop copies that member and not the whole document.
-fn at(document: &Value, path: &str) -> Value {
+pub fn at(document: &Value, path: &str) -> Value {
     let mut here = document;
     for segment in path.split('.') {
         match here.get(segment) {
@@ -226,14 +226,14 @@ fn at(document: &Value, path: &str) -> Value {
 }
 
 /// The string at a dotted path, or the empty string where there is none.
-fn text(document: &Value, path: &str) -> String {
+pub fn text(document: &Value, path: &str) -> String {
     at(document, path).as_str().unwrap_or_default().to_string()
 }
 
 /// A `network` security policy admitting public traffic to every collection of this
 /// emulator — AWS's "Network access for Amazon OpenSearch Serverless": "you must have at
 /// least one network policy that applies to a collection in order to access its endpoint".
-async fn admit_network_access(router: &MultiServiceRouter) {
+pub async fn admit_network_access(router: &MultiServiceRouter) {
     let (status, answer) = aoss(
         router,
         "CreateSecurityPolicy",
@@ -256,7 +256,7 @@ async fn admit_network_access(router: &MultiServiceRouter) {
 
 /// An `encryption` security policy for every collection of this emulator, which a collection
 /// cannot be created without.
-async fn encrypt_collections(router: &MultiServiceRouter) {
+pub async fn encrypt_collections(router: &MultiServiceRouter) {
     let (status, answer) = aoss(
         router,
         "CreateSecurityPolicy",
@@ -288,7 +288,7 @@ async fn encrypt_collections(router: &MultiServiceRouter) {
 /// the data access policies do not bound, so the network policy alone admits it. Which
 /// principal and which permissions the two planes decide on is pinned by the crate-local
 /// suites named in this file's header, not here.
-async fn grant_the_role_data_access(router: &MultiServiceRouter, collection: &str) {
+pub async fn grant_the_role_data_access(router: &MultiServiceRouter, collection: &str) {
     let (status, answer) = aoss(
         router,
         "CreateAccessPolicy",
@@ -325,7 +325,7 @@ async fn grant_the_role_data_access(router: &MultiServiceRouter, collection: &st
 ///
 /// The `CREATING -> ACTIVE` move is owed by the clock, so this looks again until the
 /// collection reports `ACTIVE` or a generous deadline passes.
-async fn active_collection(router: &MultiServiceRouter, name: &str) -> Value {
+pub async fn active_collection(router: &MultiServiceRouter, name: &str) -> Value {
     let (status, created) = aoss(
         router,
         "CreateCollection",
@@ -371,7 +371,7 @@ fn knn_index_body(dimension: usize) -> Value {
 
 /// The `storageConfiguration` of a knowledge base whose vectors live in `index` of the
 /// collection `collection_arn` names.
-fn opensearch_storage(collection_arn: &str, index: &str) -> Value {
+pub fn opensearch_storage(collection_arn: &str, index: &str) -> Value {
     json!({
         "type": "OPENSEARCH_SERVERLESS",
         "opensearchServerlessConfiguration": {
@@ -389,7 +389,7 @@ fn opensearch_storage(collection_arn: &str, index: &str) -> Value {
 /// A custom document whose content is defined inline IN BYTES, which is how a client pushes
 /// bytes it holds straight into a knowledge base: `data` travels base64-encoded, as the
 /// modelled `ByteContentDoc$data` blob does.
-fn inline_byte_document(id: &str, bytes: &str) -> Value {
+pub fn inline_byte_document(id: &str, bytes: &str) -> Value {
     json!({
         "content": {
             "dataSourceType": "CUSTOM",
@@ -684,7 +684,7 @@ async fn an_index_created_at_the_collection_endpoint_backs_a_knowledge_base_roun
 
 /// Poll `GetKnowledgeBase` until `knowledge_base_id` reports `ACTIVE`, answering the
 /// `knowledgeBase` that read reports.
-async fn await_active_knowledge_base(
+pub async fn await_active_knowledge_base(
     router: &MultiServiceRouter,
     case: &str,
     knowledge_base_id: &str,
@@ -712,7 +712,7 @@ async fn await_active_knowledge_base(
 
 /// Poll `GetKnowledgeBaseDocuments` until the document `id` reports `INDEXED`, answering the
 /// detail that read reports.
-async fn await_indexed_document(
+pub async fn await_indexed_document(
     router: &MultiServiceRouter,
     case: &str,
     knowledge_base_id: &str,
