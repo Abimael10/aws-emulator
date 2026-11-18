@@ -649,14 +649,22 @@ impl DesiredModel {
         if value.len() > ssm::value_limit(&tier) {
             return Err(NativeRefusal::Invalid(ssm::value_limit_message(&tier)));
         }
+        let data_type = self
+            .data_type
+            .clone()
+            .unwrap_or_else(|| ssm::DEFAULT_DATA_TYPE.to_string());
         Ok(ssm::ParameterVersionRecord {
             version: held.map_or(1, |held| held.next_version),
             value,
             type_,
-            data_type: self
-                .data_type
-                .clone()
-                .unwrap_or_else(|| ssm::DEFAULT_DATA_TYPE.to_string()),
+            // "The aws:ec2:image value is validated asynchronously, and the PutParameter
+            // call returns before the validation is complete": a version written under that
+            // data type owes the owning service's own check of it, whichever API wrote the
+            // version (`ssm::parameter_image_validation`).
+            image_validation_due_at: ssm::parameter_image_validation::validation_due_at(
+                &data_type,
+            ),
+            data_type,
             tier,
             description: self.description.clone(),
             // Carried by the parameter rather than applied here: the version keeps what the

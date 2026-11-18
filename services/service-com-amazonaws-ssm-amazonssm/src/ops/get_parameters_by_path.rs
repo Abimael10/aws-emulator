@@ -388,6 +388,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             Vec::new()
         };
+        // The asynchronous `aws:ec2:image` validation a put left owing was due at the same
+        // instant whether or not anybody called, so it is materialised before the store is
+        // read — with no guard of it held
+        // ([`crate::state::parameter_image_validation`]).
+        crate::state::parameter_image_validation::settle_validations(&*self.engine, &region);
         // The store guard is released before the keys are asked, so no state of this
         // service is held while KMS's decision is made.
         let (mut parameters, next_token, to_open) = {

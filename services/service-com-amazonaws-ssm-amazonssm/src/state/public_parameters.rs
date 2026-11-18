@@ -186,6 +186,28 @@ pub fn published_among(
         .collect()
 }
 
+/// Whether a metadata listing narrowed by `filters` is ADDRESSED AT AWS's published
+/// hierarchy, and so resolves the published catalog beside the account's own parameters.
+///
+/// Each filter is the `(key, option, values)` triple a listing applies. A listing is
+/// addressed at the published hierarchy when one of its filters CONFINES it to that
+/// hierarchy — a `Path` filter whose value lies in it, or a `Name` filter anchored at a name
+/// in it (`Equals` or `BeginsWith`, the two options that anchor a name; `Contains` searches
+/// for a fragment anywhere in a name and so confines a listing to nothing).
+///
+/// A listing that is not confined to it reports the account's own parameters alone: AWS
+/// publishes its catalog in every account and Region alike and no account owns any of it,
+/// so an unnarrowed "list the parameters in your account" is not a request for AWS's.
+pub fn addressed_by_filters(filters: &[(&str, &str, &[String])]) -> bool {
+    filters.iter().any(|(key, option, values)| match *key {
+        super::FILTER_KEY_PATH => values.iter().any(|value| is_published_hierarchy(value)),
+        super::FILTER_KEY_NAME if *option != super::FILTER_OPTION_CONTAINS => {
+            values.iter().any(|value| is_published_name(value))
+        }
+        _ => false,
+    })
+}
+
 /// One published parameter, as a record the reads project the same way they project a
 /// stored one — so a published parameter is reported through [`ParameterRecord`]'s own
 /// `to_parameter` rather than through a second rendering that could disagree with it.
@@ -219,6 +241,10 @@ fn published_record(
             // this account last changed it and none is reported as having done so.
             last_modified_user: None,
             labels: Default::default(),
+            // AWS publishes this parameter already validated — no put of this service wrote
+            // it — so nothing about it is owed
+            // ([`super::parameter_image_validation`]).
+            image_validation_due_at: None,
         }],
     }
 }

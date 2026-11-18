@@ -612,10 +612,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         // The `aws:ec2:image` data type's own validation — "that the specified AMI is
-        // available in your Amazon Web Services account" — is the asynchronous one the
-        // doc describes ("a successful response indicates that the request was received"),
-        // and this emulator holds no image catalog to run it against, so the value is
-        // stored as given rather than refused on a guess.
+        // available in your Amazon Web Services account" — is the ASYNCHRONOUS one the doc
+        // describes: "a successful HTTP 200 response does not guarantee that your parameter
+        // was successfully created or updated … the asynchronous validation will fail and
+        // the parameter will not be created or updated". So the value is stored as given and
+        // this put answers 200; the version it wrote carries the instant that validation
+        // falls due, and is taken back out of the store when the AMI turns out to be one the
+        // account cannot see ([`crate::state::parameter_image_validation`]).
         //
         // "Parameters can't be referenced or nested in the values of other parameters.
         // You can't include values wrapped in double brackets {{}} or
@@ -629,6 +632,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+        // The asynchronous `aws:ec2:image` validation an EARLIER put left owing was due at
+        // the same instant whether or not anybody called, so it is materialised before this
+        // put reads what the store holds: a version that validation discarded is not a
+        // version this one overwrites, and a parameter whose only version it discarded was
+        // never created ([`crate::state::parameter_image_validation`]).
+        crate::state::parameter_image_validation::settle_validations(&*self.engine, &region);
         let now = ::std::time::SystemTime::now();
         // Who is writing this version. Resolved from the credential the request was
         // signed with, through the same reading `sts:GetCallerIdentity` answers from, so
@@ -971,6 +980,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version,
             value: stored_value,
             type_,
+            // "The aws:ec2:image value is validated asynchronously, and the PutParameter
+            // call returns before the validation is complete": the check this put still
+            // owes falls due a span from now, and nothing else is owed for any other data
+            // type ([`crate::state::parameter_image_validation`]).
+            image_validation_due_at:
+                crate::state::parameter_image_validation::validation_due_at(&data_type),
             data_type,
             tier: tier.clone(),
             description,

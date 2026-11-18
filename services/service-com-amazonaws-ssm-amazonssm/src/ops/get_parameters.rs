@@ -305,6 +305,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         let published =
             crate::state::public_parameters::published_among(&*self.engine, &region, &canonical);
+        // The asynchronous `aws:ec2:image` validation a put left owing was due at the same
+        // instant whether or not anybody called, so it is materialised before the store is
+        // read — with no guard of it held
+        // ([`crate::state::parameter_image_validation`]).
+        crate::state::parameter_image_validation::settle_validations(&*self.engine, &region);
 
         // A name in the hierarchy reserved for Secrets Manager references names a SECRET
         // rather than a parameter, so each such name is resolved against that service, its

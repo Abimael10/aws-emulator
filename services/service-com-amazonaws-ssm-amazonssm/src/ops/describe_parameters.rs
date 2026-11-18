@@ -40,6 +40,20 @@
 //! still a scaffold, so nothing in the store is shared with this account and the shared
 //! listing reports the nothing it holds.
 //!
+//! ## AWS's own published parameters
+//!
+//! Beside the account's parameters this endpoint serves the catalog AWS itself publishes in
+//! the reserved `/aws` hierarchy ([`crate::state::public_parameters`]) — the same catalog
+//! `GetParameter` and `GetParametersByPath` resolve — so a parameter that is readable by
+//! name is describable too. Which of the two a listing reports follows from what its
+//! filters ADDRESS: a listing confined to AWS's hierarchy (a `Path` filter inside it, or a
+//! `Name` filter anchored at a name in it) resolves the published catalog as well
+//! ([`crate::state::public_parameters::addressed_by_filters`]), and one that is not reports
+//! the account's own alone, because no account owns any of what AWS publishes. A published
+//! entry is projected through the same record every other read projects, so it is reported
+//! at the standard tier with `text` data, no policy and an ARN whose account field is EMPTY
+//! ([`crate::state::parameter_arn`]).
+//!
 //! ## Paging
 //!
 //! As for `GetParametersByPath`: the token this operation hands out carries the `Name` of
@@ -361,6 +375,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // wrote, and yields it in ascending canonical-name order, which is what makes the
         // resume cursor total.
         let region = request_region(ctx.parts());
+        // AWS's own published parameters are read by ADDRESSING the hierarchy AWS owns: no
+        // parameter of this account can live in it (`PutParameter` refuses such a name) and
+        // AWS publishes nothing in the account's own hierarchy, so a listing confined to
+        // AWS's hierarchy resolves the published catalog beside the store and one that is
+        // not reports the account's own parameters alone
+        // ([`crate::state::public_parameters::addressed_by_filters`]). Projected BEFORE the
+        // store guard is taken, so no state of this service is held while the catalog's own
+        // store is read.
+        let published = if crate::state::public_parameters::addressed_by_filters(&filters) {
+            crate::state::public_parameters::published_records(&*self.engine, &region)
+        } else {
+            Vec::new()
+        };
+        // The asynchronous `aws:ec2:image` validation a put left owing was due at the same
+        // instant whether or not anybody called, so it is materialised before the store is
+        // read — with no guard of it held
+        // ([`crate::state::parameter_image_validation`]).
+        crate::state::parameter_image_validation::settle_validations(&*self.engine, &region);
         let store = state.lock();
         let mut parameters = Vec::new();
         let mut next_token = None;
@@ -373,7 +405,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no promoted share, so a shared listing walks none of the account's own
         // parameters.
         if !input.shared.unwrap_or(false) {
-            for (name, record) in store.parameters_of_region(&region) {
+            // One ascending order over both sources, so a page boundary and the name it
+            // resumes at mean the same thing whichever source the parameter came from.
+            let mut candidates: Vec<(&str, &crate::state::ParameterRecord)> = store
+                .parameters_of_region(&region)
+                .chain(
+                    published
+                        .iter()
+                        .map(|record| (canonical_name(&record.name), record)),
+                )
+                .collect();
+            candidates.sort_by_key(|(name, _)| *name);
+            for (name, record) in candidates {
                 if resume_from.as_deref().is_some_and(|from| name < from) {
                     continue;
                 }
