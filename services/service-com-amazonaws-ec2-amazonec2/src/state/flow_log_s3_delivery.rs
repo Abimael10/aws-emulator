@@ -20,6 +20,13 @@
 //! the bucket owner's enforce-TLS deny, or a refusal of the delivery principal itself — is
 //! left exactly where and as it was.
 //!
+//! The document the grants land in is NAMED and its statements are NUMBERED the way the log
+//! delivery writes them: the document carries the log-delivery grant document's own `Id`
+//! ([`DELIVERY_POLICY_DOCUMENT_ID`]) unless it already carries one of the owner's, and each
+//! statement the delivery writes carries its base statement id followed by its position among
+//! the statements of that kind ([`delivery_statement_id`]). Nothing else about the document is
+//! rewritten, so a policy read back after a create is the one the bucket carries.
+//!
 //! Amazon S3 is reached the way the framework documents a handler reaching another emulated
 //! service ([`smithy_server_runtime::OperationContext::callback`]), through the tree's one
 //! construction of that client (`service_common::s3_client`), so nothing here opens a
@@ -33,15 +40,26 @@
 /// identity the bucket's policy grants.
 pub const LOG_DELIVERY_SERVICE_PRINCIPAL: &str = "delivery.logs.amazonaws.com";
 
-/// The `Sid` of the statement granting that principal the object write.
+/// The BASE `Sid` of the statement granting that principal the object write.
 ///
 /// The name of the GRANT, which is why each delivered location's statement carries it: a
 /// bucket that grants the delivery two prefixes grants it the same thing twice, once per
-/// location.
+/// location. The `Sid` each of those statements carries is this name NUMBERED by its
+/// position among them ([`delivery_statement_id`]).
 pub const DELIVERY_WRITE_SID: &str = "AWSLogDeliveryWrite";
 
-/// The `Sid` of the statement granting it the bucket-ACL read.
+/// The BASE `Sid` of the statement granting it the bucket-ACL read, numbered the same way
+/// ([`delivery_statement_id`]).
 pub const DELIVERY_ACL_CHECK_SID: &str = "AWSLogDeliveryAclCheck";
+
+/// The `Id` the log-delivery grant document carries — the NAME of that document, which the
+/// delivery writes on the policy it leaves on a destination bucket.
+///
+/// A fixed part of the document rather than anything read from a request: no bucket, account
+/// or Region appears in it, so every bucket the delivery writes grants into reports the same
+/// name back. A document that already carries an `Id` of its own KEEPS it — the grants are
+/// merged into the owner's document, and naming it is the owner's.
+const DELIVERY_POLICY_DOCUMENT_ID: &str = "AWSLogDeliveryWrite20150319";
 
 /// The action the records are written with.
 pub const DELIVERY_WRITE_ACTION: &str = "s3:PutObject";
@@ -251,7 +269,10 @@ fn merged_delivery_grants(
     for (offset, location) in locations.iter().enumerate() {
         statements.insert(
             at + offset,
-            delivery_write_grant(location, &source_arn, account),
+            // Numbered by where the grant sits among the write grants of the document, so
+            // the location already granted keeps the statement id it was granted under and a
+            // location granted now is numbered after it.
+            delivery_write_grant(location, offset + 1, &source_arn, account),
         );
     }
 
@@ -274,10 +295,26 @@ fn merged_delivery_grants(
         "Statement".to_string(),
         ::serde_json::Value::Array(statements),
     );
+    // The document the delivery writes carries its own name, and a document that already
+    // carries one keeps it: the grants are merged into the owner's document.
+    document
+        .entry("Id".to_string())
+        .or_insert_with(|| ::serde_json::Value::String(DELIVERY_POLICY_DOCUMENT_ID.to_string()));
     ::serde_json::Value::Object(document)
 }
 
-/// The statement granting the delivery the object write over `location`.
+/// The `Sid` of the `ordinal`-th statement the delivery writes under the base statement id
+/// `base`, counting from one.
+///
+/// The grants of one kind are SEVERAL — a bucket several flow logs publish to is granted the
+/// write once per delivered location — so the statement the delivery writes is named by its
+/// base id followed by its position among the statements of that kind in the document.
+fn delivery_statement_id(base: &str, ordinal: usize) -> String {
+    format!("{base}{ordinal}")
+}
+
+/// The statement granting the delivery the object write over `location`, as the `ordinal`-th
+/// write grant of the document (counting from one).
 ///
 /// One statement per location the delivery writes to, each naming that location alone, which
 /// is how a bucket grants the delivery of several flow logs. The conditions are what bound
@@ -286,11 +323,12 @@ fn merged_delivery_grants(
 /// ([`delivery_source_arn`]).
 fn delivery_write_grant(
     location: &str,
+    ordinal: usize,
     source_arn: &str,
     account: &str,
 ) -> ::serde_json::Value {
     ::serde_json::json!({
-        "Sid": DELIVERY_WRITE_SID,
+        "Sid": delivery_statement_id(DELIVERY_WRITE_SID, ordinal),
         "Effect": ALLOW_EFFECT,
         "Principal": { "Service": LOG_DELIVERY_SERVICE_PRINCIPAL },
         "Action": DELIVERY_WRITE_ACTION,
@@ -307,13 +345,16 @@ fn delivery_write_grant(
 
 /// The statement granting the delivery the read of the destination bucket's ACL, which it
 /// makes against the bucket itself rather than against any object of it.
+///
+/// Always the FIRST ACL-check grant of the document, because there is only ever one: the read
+/// it covers is of the bucket, which every flow log of that bucket makes the same.
 fn delivery_acl_check_grant(
     destination: &FlowLogS3Destination,
     source_arn: &str,
     account: &str,
 ) -> ::serde_json::Value {
     ::serde_json::json!({
-        "Sid": DELIVERY_ACL_CHECK_SID,
+        "Sid": delivery_statement_id(DELIVERY_ACL_CHECK_SID, 1),
         "Effect": ALLOW_EFFECT,
         "Principal": { "Service": LOG_DELIVERY_SERVICE_PRINCIPAL },
         "Action": DELIVERY_ACL_CHECK_ACTION,
@@ -783,8 +824,9 @@ mod tests {
             );
             assert_eq!(
                 write["Sid"],
-                ::serde_json::json!(DELIVERY_WRITE_SID),
-                "case {case:?}: the write grant carries its own statement id, got {write}"
+                ::serde_json::json!(delivery_statement_id(DELIVERY_WRITE_SID, 1)),
+                "case {case:?}: the write grant carries its own numbered statement id, \
+                 got {write}"
             );
             let acl_check = statements
                 .iter()
@@ -798,9 +840,15 @@ mod tests {
             );
             assert_eq!(
                 acl_check["Sid"],
-                ::serde_json::json!(DELIVERY_ACL_CHECK_SID),
-                "case {case:?}: the ACL-check grant carries its own statement id, \
+                ::serde_json::json!(delivery_statement_id(DELIVERY_ACL_CHECK_SID, 1)),
+                "case {case:?}: the ACL-check grant carries its own numbered statement id, \
                  got {acl_check}"
+            );
+            assert_eq!(
+                merged["Id"],
+                ::serde_json::json!(DELIVERY_POLICY_DOCUMENT_ID),
+                "case {case:?}: the document the delivery writes carries its own name, \
+                 got {merged}"
             );
         }
     }
