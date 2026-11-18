@@ -50,7 +50,10 @@ const DOOMED_NAMESPACE: &str = "doomed-ns";
 
 /// The locator a user refusal closes with: the three path labels the call carried,
 /// ending in a period and a space.
-fn locator(account: &str, namespace: &str, user_name: &str) -> String {
+///
+/// `pub(crate)` because every suite that asserts a user miss renders the locator the
+/// same way; a copy that drifted would hide a defect rather than show it.
+pub(crate) fn locator(account: &str, namespace: &str, user_name: &str) -> String {
     format!("AWS account id: {account}, Namespace: {namespace}, Username: {user_name}. ")
 }
 
@@ -62,7 +65,9 @@ fn never_registered_message(account: &str, namespace: &str, user_name: &str) -> 
 
 /// What a user operation reports for a name whose user the service deleted: the
 /// existence sentence, then the locator directly after it.
-fn deleted_message(account: &str, namespace: &str, user_name: &str) -> String {
+///
+/// `pub(crate)` for the same reason [`locator`] is.
+pub(crate) fn deleted_message(account: &str, namespace: &str, user_name: &str) -> String {
     format!(
         "User {user_name} does not exist.{}",
         locator(account, namespace, user_name)
@@ -71,8 +76,10 @@ fn deleted_message(account: &str, namespace: &str, user_name: &str) -> String {
 
 /// `DeleteUser`:
 /// `DELETE /accounts/{AwsAccountId}/namespaces/{Namespace}/users/{UserName}`.
+///
+/// `pub(crate)` because every suite that deletes a user addresses it the same way.
 /// Source: smithy_query(query="operation", operation="DeleteUser").
-async fn delete_user(
+pub(crate) async fn delete_user(
     harness: &Harness,
     account: &str,
     namespace: &str,
@@ -91,8 +98,14 @@ async fn delete_user(
 }
 
 /// `DeleteNamespace`: `DELETE /accounts/{AwsAccountId}/namespaces/{Namespace}`.
+///
+/// `pub(crate)` for the same reason [`delete_user`] is.
 /// Source: smithy_query(query="operation", operation="DeleteNamespace").
-async fn delete_namespace(harness: &Harness, account: &str, namespace: &str) -> (u16, Value) {
+pub(crate) async fn delete_namespace(
+    harness: &Harness,
+    account: &str,
+    namespace: &str,
+) -> (u16, Value) {
     harness
         .call(
             "DELETE",

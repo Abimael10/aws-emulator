@@ -77,7 +77,8 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
     /// the record that went, or `None` when the namespace held no user under that name.
     ///
     /// A removal here is what the identity path's deletions go through, so the deletion
-    /// is remembered by the one code path that performs it.
+    /// is remembered — and the groups this user was a member of lose that member — by
+    /// the one code path that performs it.
     pub fn remove_user(
         &mut self,
         aws_account_id: &str,
@@ -91,6 +92,8 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
         );
         let record = self.users.remove(&key)?;
         self.deleted_users.remember(key);
+        // A group's members are users, so a user that is gone is a member of nothing.
+        self.remove_memberships_of(aws_account_id, namespace, user_name);
         Some(record)
     }
 

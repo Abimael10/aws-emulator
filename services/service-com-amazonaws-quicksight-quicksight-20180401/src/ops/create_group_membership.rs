@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGroupMembership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGroupMembership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds a user of a namespace to a group of that same namespace and persists the
+//! membership, so every later read of that membership answers from the stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGroupMembership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A membership joins two resources that must both exist: the group it is created in,
+//! and the user it names — the model states that a group's members must be users and
+//! that groups can't be members of another group — and either one the namespace does not
+//! hold is refused as a resource that can't be found rather than stored as a membership
+//! of something that is not there. The member's own ARN is the user's, read off that
+//! stored user.
+//!
+//! The call is addressed to the membership itself (`PUT
+//! .../groups/{GroupName}/members/{MemberName}`) and the operation models no
+//! already-exists refusal, so adding a member a group already holds reports that same
+//! membership again rather than failing: one user is a member of one group once. Only a
+//! membership that is actually new is counted against the allowances this emulator holds
+//! memberships under ([`crate::state::MAX_GROUP_MEMBERS_PER_GROUP`] and
+//! [`crate::state::MAX_GROUP_MEMBERS`]).
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +169,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGroupMembership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGroupMembershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGroupMembership"))
+        // Every part of this membership comes from the request's path labels and from
+        // stored state, so nothing here is read off the request's metadata.
+        let _ = ctx;
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateGroupMembershipErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // A membership lives in a namespace of the account, the same place the group and
+        // the user it joins live: one the account does not hold holds neither of them.
+        if !store.namespace_exists(
+            &input.aws_account_id,
+            &input.namespace,
+            std::time::SystemTime::now(),
+        ) {
+            return Err(CreateGroupMembershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Namespace {} not found in account {}.",
+                        input.namespace, input.aws_account_id
+                    )),
+                    resource_type: Some(
+                        crate::state::EXCEPTION_RESOURCE_TYPE_NAMESPACE.to_string(),
+                    ),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // The group the member is added to has to exist: a membership is held inside it.
+        if store
+            .group(&input.aws_account_id, &input.namespace, &input.group_name)
+            .is_none()
+        {
+            return Err(CreateGroupMembershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::group_not_found_message(
+                        &input.aws_account_id,
+                        &input.namespace,
+                        &input.group_name,
+                    )),
+                    resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // And the member names a user of that namespace, whose ARN is the ARN this
+        // membership reports: a group's members are users, so a name no user of the
+        // namespace is known by names no member.
+        let member_arn = match store.user(
+            &input.aws_account_id,
+            &input.namespace,
+            &input.member_name,
+        ) {
+            Some(user) => user.arn.clone(),
+            None => {
+                return Err(CreateGroupMembershipErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(store.user_miss_message(
+                            &input.aws_account_id,
+                            &input.namespace,
+                            &input.member_name,
+                        )),
+                        resource_type: Some(
+                            crate::state::EXCEPTION_RESOURCE_TYPE_USER.to_string(),
+                        ),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let record = crate::state::GroupMemberRecord {
+            member_name: input.member_name.clone(),
+            arn: member_arn,
+        };
+        let key = (
+            input.aws_account_id.clone(),
+            input.namespace.clone(),
+            input.group_name.clone(),
+            input.member_name.clone(),
+        );
+        // A membership the group already holds takes no further room, so only a new one
+        // is counted against the allowances below.
+        if !store.group_members.contains_key(&key) {
+            // Every part of a membership's key comes from the request — all four are
+            // `@httpLabel`s the caller chooses — so naming another group or another
+            // account resets one group's allowance; the total this process holds is what
+            // bounds it.
+            if store.group_members.len() >= crate::state::MAX_GROUP_MEMBERS {
+                return Err(
+                    CreateGroupMembershipErrorModeled::ResourceUnavailableException(
+                        ResourceUnavailableException {
+                            message: Some(format!(
+                                "This QuickSight emulator holds the maximum of {} group \
+                                 memberships.",
+                                crate::state::MAX_GROUP_MEMBERS
+                            )),
+                            resource_type: Some(
+                                crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string(),
+                            ),
+                            request_id: Some(request_id),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The exhausted resource is the group the members hang on, so the refusal
+            // names that group and its allowance.
+            if store.group_member_count(
+                &input.aws_account_id,
+                &input.namespace,
+                &input.group_name,
+            ) >= crate::state::MAX_GROUP_MEMBERS_PER_GROUP
+            {
+                return Err(
+                    CreateGroupMembershipErrorModeled::ResourceUnavailableException(
+                        ResourceUnavailableException {
+                            message: Some(format!(
+                                "Group {} already holds the maximum of {} members.",
+                                input.group_name,
+                                crate::state::MAX_GROUP_MEMBERS_PER_GROUP
+                            )),
+                            resource_type: Some(
+                                crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string(),
+                            ),
+                            request_id: Some(request_id),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // The response reports the membership that now stands, so a caller sees exactly
+        // what the next read will answer with — whether this call created it or the
+        // member was already in the group.
+        let group_member = record.to_group_member();
+        store.group_members.insert(key, record);
+
+        Ok(CreateGroupMembershipOutput {
+            group_member: Some(group_member),
+            request_id: Some(request_id),
+            // `Status` is this response's `@httpResponseCode` member, so it IS the
+            // call's HTTP status.
+            status: 200,
+        })
     }
 }

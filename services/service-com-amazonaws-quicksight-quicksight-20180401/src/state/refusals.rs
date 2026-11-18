@@ -162,6 +162,40 @@ pub fn group_exists_message(group_name: &str, aws_account_id: &str) -> String {
     )
 }
 
+/// The miss a group operation reports for a `GroupName` the namespace holds no group
+/// under — the same text whether the call reads the group or addresses one of its
+/// members through it.
+///
+/// A group is reached by its name inside a namespace of an account, so the refusal names
+/// those three: the address the call presented, which it can report whether or not a
+/// group was ever held there.
+pub fn group_not_found_message(aws_account_id: &str, namespace: &str, group_name: &str) -> String {
+    format!("Group {group_name} not found in namespace {namespace} in account {aws_account_id}.")
+}
+
+/// The miss a group-membership read reports for a member the group does not hold: the
+/// identity path's locator alone, with no sentence before it.
+///
+/// Nothing is said to have stopped existing, because nothing is known to have existed —
+/// the same reading [`user_not_found_message`] makes of a user name: the only thing the
+/// service can report is the address the call asked about, which for a membership is the
+/// account, the namespace, the group and the member the call named.
+pub fn group_membership_not_found_message(
+    aws_account_id: &str,
+    namespace: &str,
+    group_name: &str,
+    member_name: &str,
+) -> String {
+    identity_scope_fields(
+        aws_account_id,
+        &[
+            ("Namespace", namespace),
+            ("groupName", group_name),
+            ("memberName", member_name),
+        ],
+    )
+}
+
 /// The conflict `CreateNamespace` reports for a `Namespace` the account already holds.
 ///
 /// What forbids the create is the status the namespace holding that name is in, so the

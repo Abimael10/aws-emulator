@@ -178,9 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(DescribeGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Group {} not found in namespace {} in account {}.",
-                        input.group_name, input.namespace, input.aws_account_id
+                    message: Some(crate::state::group_not_found_message(
+                        &input.aws_account_id,
+                        &input.namespace,
+                        &input.group_name,
                     )),
                     resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string()),
                     request_id: Some(request_id),

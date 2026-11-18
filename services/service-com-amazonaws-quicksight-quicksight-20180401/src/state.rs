@@ -13,6 +13,7 @@
 mod authorization;
 mod connection_test;
 mod external_login;
+mod group_members;
 /// The impl block in this module adds the account's identity-store reading to the state
 /// struct, so it exports no name of its own and needs no re-export.
 mod identity_store;
@@ -23,6 +24,7 @@ mod users;
 pub use authorization::*;
 pub use connection_test::*;
 pub use external_login::*;
+pub use group_members::*;
 pub use refusals::*;
 pub use user_deletions::*;
 pub use users::*;
@@ -39,6 +41,7 @@ use crate::ops::types::{
     DataPrepConfiguration, DataSet, DataSetSummary, DataSetUsageConfiguration, DataSource,
     User,
     DataSourceErrorInfo, DataSourceParameters, DatasetParameter, FieldFolder, Folder, Group,
+    GroupMember,
     IAMPolicyAssignment, InputColumn, LogicalTable, NamespaceInfoV2, OutputColumn,
     PerformanceConfiguration, PhysicalTable, RefreshFrequency, RefreshSchedule,
     ResourcePermission,
@@ -93,6 +96,12 @@ pub struct ComAmazonawsQuicksightQuicksight20180401State {
     /// account can each hold a group of the same name, and neither is reached from
     /// the other.
     pub groups: HashMap<(String, String, String), GroupRecord>,
+    /// Group memberships by `(AwsAccountId, Namespace, GroupName, MemberName)`.
+    ///
+    /// A membership is a child of one group, so its key is that group's own key with
+    /// the member's name under it; the member it names is a user of the same namespace.
+    /// [`MAX_GROUP_MEMBERS_PER_GROUP`] and [`MAX_GROUP_MEMBERS`] are checked against it.
+    pub group_members: HashMap<(String, String, String, String), GroupMemberRecord>,
     /// Users by `(AwsAccountId, Namespace, UserName)`.
     ///
     /// A user belongs to one namespace and its name identifies it inside that
@@ -582,7 +591,10 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
     /// Removes the groups `(aws_account_id, namespace)` holds, answering how many went:
     /// deleting a namespace deletes the users and groups associated with it, so they go
     /// with the namespace rather than outliving it.
+    ///
+    /// A group's memberships are held inside the group, so they go with it.
     pub fn remove_groups_in(&mut self, aws_account_id: &str, namespace: &str) -> usize {
+        self.remove_group_members_in(aws_account_id, namespace);
         let before = self.groups.len();
         self.groups.retain(|(account, group_namespace, _), _| {
             account != aws_account_id || group_namespace != namespace
