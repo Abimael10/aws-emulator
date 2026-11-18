@@ -27,6 +27,11 @@ pub use model_patterns::{
     constraint_refusal, root_directory_violations, tag_key_list_violations, tag_violations,
 };
 
+/// What a file system HOLDS: the POSIX tree a client that has mounted it reads and writes,
+/// and the view an access point gives one.
+mod file_system_data;
+pub use file_system_data::*;
+
 /// The network a mount target is placed in, as the service that owns subnets reports it.
 /// Re-exported by name for the same reason as the module above: a handler reaches it beside
 /// the rest of this module.
@@ -709,6 +714,10 @@ pub struct ComAmazonawsEfsMagnolioapiserviceV20150201State {
     /// addressed by, and the key its uniqueness rule is stated over: "A file system can
     /// be part of only one replication configuration."
     pub replications: BTreeMap<String, ReplicationConfiguration>,
+    /// `fs-…` id -> the FILES that file system holds, for the clients that have mounted it
+    /// (see [`file_system_data`]). An entry is minted by the first mount and dropped with
+    /// the file system, so this map is bounded by [`Self::file_systems`].
+    file_system_data: BTreeMap<String, MountedFileSystem>,
     /// Drives [`Self::mint_hex`]; see there for why it is not a plain counter.
     next_id_seed: u64,
     /// Drives [`Self::next_ordinal`].

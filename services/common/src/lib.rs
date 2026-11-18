@@ -567,6 +567,11 @@ pub mod posix_shell_arithmetic;
 /// ONE input (a digest, a count, a selection) — so what a pipeline of them comes to follows
 /// from the bytes that went in.
 pub mod posix_shell_text_filters;
+/// The FILES a bounded shell session works over: the seam a session reaches them through, the
+/// utilities that read and change them (`cat`, `ls`, `mkdir`, `touch`, `rm`, `sync`), the
+/// `test` questions about a file, and the redirections of the three standard streams — written
+/// once for every session that performs caller-supplied shell text.
+pub mod posix_shell_files;
 /// The in-memory TREE that session reads and writes when the caller-supplied program is the
 /// program of a MACHINE the emulator holds — its files, its sealed values and its devices,
 /// all bounded, with no host path behind any of them.

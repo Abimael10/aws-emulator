@@ -34,11 +34,12 @@
 //! taking it would hand a caller's task definition the developer's machine.
 //!
 //! What this module does instead is narrower than a shell by construction, and it is not an
-//! implementation of the shell LANGUAGE: it PERFORMS a fixed catalog of session-local
-//! utilities ([`BUILT_IN_COMMANDS`]) over the real grammar's tree, and every other command,
-//! and every command FORM and expansion it does not perform, fails closed with the status a
-//! shell answers for a command it cannot run ([`EXIT_COMMAND_NOT_FOUND`]). There is
-//! therefore no language subset to keep in step with a specification: a command either
+//! implementation of the shell LANGUAGE: it PERFORMS a fixed catalog of utilities
+//! ([`BUILT_IN_COMMANDS`], [`FILE_COMMANDS`] and the text filters of
+//! [`::service_common::posix_shell_text_filters`]) over the real grammar's tree, and every
+//! other command, and every command FORM and expansion it does not perform, fails closed with
+//! the status a shell answers for a command it cannot run ([`EXIT_COMMAND_NOT_FOUND`]). There
+//! is therefore no language subset to keep in step with a specification: a command either
 //! names one of those utilities, or it did not run.
 //!
 //! A run that reached such a command CLAIMS NOTHING about the container
@@ -56,28 +57,74 @@
 //! of the container's either. What it WROTE is delivered all the same — the lines the session
 //! performed are lines the container really wrote — and only the status is withheld.
 //!
-//! # The other reader of this grammar
+//! # What this module shares, and what is its own
+//!
+//! The one bounded shell session this workspace drives for every service with a
+//! caller-supplied script is [`::service_common::posix_shell_session`], and this module is NOT
+//! a second copy of what it holds. Everything the two sessions do the same way is called here
+//! rather than restated:
+//!
+//! * the FILES and the utilities over them — the seam a session reaches its files through,
+//!   `cat`, `ls`, `mkdir`, `touch`, `rm`, `sync`, the `test` questions about a file, and the
+//!   reading of a redirection node ([`::service_common::posix_shell_files`]);
+//! * the TEXT FILTERS ([`::service_common::posix_shell_text_filters`]);
+//! * the `test` questions about values alone
+//!   ([`::service_common::posix_shell_session::value_test_answer`]);
+//! * the in-memory TREE the files are held in ([`::service_common::posix_shell_volume`]),
+//!   which is what a container's own layer and each mounted volume is
+//!   ([`super::container_filesystem`]).
+//!
+//! What is this module's own is the WALK over the grammar's tree, because a container's
+//! program is a PROCESS: it runs without a caller waiting on it, delivers each line as it
+//! writes it, waits, loops and answers the stop signal through the handler the program
+//! installed — so every step of it is `async`. The shared session is SYNCHRONOUS by
+//! construction for its callers, several of which perform a whole program while holding their
+//! own store's lock (`…lambdamicrovms…::state::guest_machine::in_volume`,
+//! `…ec2…::state::guest_console`), and nothing may await under one of those guards. The two
+//! walks are therefore one rule in two drivers, and the parts that need no await are written
+//! once.
 //!
 //! `service-com-amazonaws-codebuild-codebuild-20161006`'s `state::build_shell` reads a
-//! BUILDSPEC's command lines with the same parser crate, and the two are deliberately not
-//! one module: what is shared is the grammar, which is the crate, and what differs is the
-//! whole of the rest. A build's shell is synchronous and performs one command LINE at a
-//! time for a caller that is waiting on a status, keeps no output at all, has no signals
-//! and no waits, and answers the compound forms as commands it did not run. A container's
-//! is a PROCESS: it runs a whole program without a caller waiting on it, delivers every
-//! line it writes as it writes it, waits, loops, and answers the stop signal through the
-//! handler the program installed. Merging them would mean giving a buildspec's line the
-//! container's loops, waits and signal handling — a widening of what a build may run,
-//! decided in a change about neither.
+//! BUILDSPEC's command lines through that same shared session, and giving a buildspec's line
+//! the container's loops, waits and signal handling would widen what a build may run — a
+//! decision for a change about that service, not this one.
 //!
 //! # What this container provides
 //!
-//! It runs IN THIS PROCESS. It has no process to start, no network to reach, no filesystem
-//! and no host environment: the utilities it provides are the ones whose whole effect is
-//! inside the container's own session — its output, its status, its variables and its
-//! signal handlers. The variables it starts with are the container definition's
-//! `environment` (and a `RunTask` override of it), because those are the environment the
-//! container's process is given.
+//! It runs IN THIS PROCESS. It has no process to start, no network to reach and no host
+//! environment: the utilities it provides are the ones whose whole effect is inside the
+//! container's own session — its output, its status, its variables and its signal handlers —
+//! and the ones whose effect is on the container's own FILESYSTEM
+//! ([`super::container_filesystem`]), which is the container's writable layer and the
+//! task-definition volumes mounted into it. The variables it starts with are the container
+//! definition's `environment` (and a `RunTask` override of it), because those are the
+//! environment the container's process is given.
+//!
+//! No host path is reachable from any of it: the filesystem is in memory, every entry of it
+//! was put there by this emulator or by a program it performed, and a path outside the
+//! container's own layer and its mounts resolves to nothing.
+//!
+//! # The forms that reach that filesystem
+//!
+//! A program written against storage writes through the shell's own forms rather than through
+//! a utility, so the session performs them over that filesystem:
+//!
+//! * the REDIRECTIONS of the three standard descriptors — `> path`, `>> path` and `2> path`,
+//!   `< path`, and the duplications `2>&1` and `1>&2` — each OPENED where the shell opens it,
+//!   before the command runs, so a file the filesystem refuses (a read-only mount, a missing
+//!   directory) is reported in the shell's own wording and the command does not run at all;
+//! * a PIPELINE connects its stages: "the standard output of the first command shall be
+//!   connected to the standard input of the second command", so what one stage wrote is what
+//!   the next one reads;
+//! * a COMMAND SUBSTITUTION (`$(…)`, `` `…` ``) is a command whose output is a word of
+//!   another: the text is read by the same grammar and performed in this session as a
+//!   subshell — what it set is put back, an `exit` inside it ends the substitution and not the
+//!   session — and what it wrote, with trailing newlines removed, is the word.
+//!
+//! Standard ERROR is delivered beside standard output: the `awslogs` driver "sends container
+//! logs to Amazon CloudWatch Logs", which is both of the streams a container writes, so a
+//! diagnostic a command reports reaches the container's log stream exactly as its output does
+//! — while a command SUBSTITUTION captures standard output alone, as the shell specifies.
 //!
 //! An asynchronous list (`command &`) is run in the FOREGROUND: this session has no job
 //! control, so there is no second thread of execution for a job to run on, and `wait`
@@ -90,13 +137,21 @@
 //! or declined — and one per loop iteration, latched: once spent the run is ABANDONED and no
 //! status is claimed for it), how long it may run for (the deadline its session is
 //! constructed with, which also clamps every wait), how deeply a line may nest
-//! ([`MAX_COMMAND_NESTING`]), how much one word may expand to, and how much output it may
-//! deliver ([`super::MAX_CONTAINER_LOG_LINES`]).
+//! ([`MAX_COMMAND_NESTING`]), how much one word may expand to, how many command substitutions
+//! it may perform ([`MAX_SUBSTITUTIONS`]) and how deeply they may nest
+//! ([`MAX_SUBSTITUTION_DEPTH`]), how much one substitution or one stage of a pipeline may
+//! carry ([`MAX_CAPTURED_BYTES`]), and how much output it may deliver
+//! ([`super::MAX_CONTAINER_LOG_LINES`]). The filesystem holds its own
+//! ([`super::container_filesystem`]).
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use ::service_common::posix_shell_files::{
+    AppliedRedirect, FileRefusal, Redirections, ShellFiles, FILE_COMMANDS,
+};
 
 use super::*;
 
@@ -136,11 +191,13 @@ const SIGTERM_NAMES: [&str; 3] = ["TERM", "SIGTERM", "15"];
 /// answer a status, `exit` ends the session, `export`/`unset` change its variables, `trap`
 /// records what a signal does to it, `sleep` waits, `wait` answers for the jobs it has none
 /// of, and `test` — with its `[ ... ]` spelling — answers a question about the words it was
-/// given ([`ContainerShell::run_test`]). A command that is not one of these needs a program,
-/// a filesystem or a network this container does not have.
+/// given or about the container's own filesystem ([`ContainerShell::run_test`]). The
+/// commands that work over that filesystem are [`FILE_COMMANDS`]; a command outside either
+/// catalog and outside the text filters needs a program or a network this container does not
+/// have.
 pub const BUILT_IN_COMMANDS: &[&str] = &[
     "echo", "true", "false", ":", "exit", "export", "unset", "trap", "sleep", "wait", "test",
-    "[",
+    "[", "set",
 ];
 
 /// The commands an assignment written before them persists in the session for: POSIX's
@@ -238,6 +295,47 @@ const MAX_PENDING_LINE_BYTES: usize = 256 * 1024;
 /// A future this session's own recursion goes through, so the mutually recursive walk over
 /// the grammar's tree has a size the compiler can work out.
 type ShellFuture<'a, T> = Pin<Box<dyn ::std::future::Future<Output = T> + Send + 'a>>;
+
+/// How many bytes ONE command substitution, or ONE stage of a pipeline, may carry. THIS
+/// NUMBER IS THE EMULATOR'S, under [`MAX_EXPANSION_BYTES`]' rule applied to what a nested
+/// command produced: past it the substitution has no value at all rather than a clipped one,
+/// and the pipeline carrying it ends rather than leaving the stage after it to answer for a
+/// stream nothing produced.
+const MAX_CAPTURED_BYTES: usize = 256 * 1024;
+
+/// How many bytes one REDIRECTED command's output is collected for the file it names. THIS
+/// NUMBER IS THE EMULATOR'S, under [`MAX_CAPTURED_BYTES`]' rule applied to a redirection;
+/// what the filesystem itself will hold is its own bound
+/// ([`super::container_filesystem::CONTAINER_LAYER_LIMITS`]).
+const MAX_REDIRECTED_BYTES: usize = 256 * 1024;
+
+/// How many command substitutions one run performs. THIS NUMBER IS THE EMULATOR'S: each one
+/// performs a program of its own, so this is what bounds the work a program can reach by
+/// writing one inside another. Each also spends a step of [`MAX_COMMANDS_PER_RUN`].
+pub const MAX_SUBSTITUTIONS: usize = 4096;
+
+/// How deeply command substitutions may nest inside one another. THIS NUMBER IS THE
+/// EMULATOR'S, under [`MAX_COMMAND_NESTING`]'s rule: this walk recurses once per open
+/// substitution, and that recursion is what this keeps in range.
+pub const MAX_SUBSTITUTION_DEPTH: usize = 8;
+
+/// The name a shell reports its own diagnostics under — a redirection it could not open
+/// among them — which is the name the container's program was invoked as.
+const SHELL_NAME: &str = "sh";
+
+/// What one command SUBSTITUTION, one stage of a pipeline, or one redirected command has
+/// captured so far.
+#[derive(Debug, Default)]
+struct Capture {
+    /// The bytes the commands inside it wrote to standard output.
+    text: String,
+    /// How many of those bytes it may hold ([`MAX_CAPTURED_BYTES`],
+    /// [`MAX_REDIRECTED_BYTES`]).
+    limit: usize,
+    /// Set once it went past that limit, in which case the write did not happen at all and
+    /// the capture has no value rather than a clipped one.
+    overflowed: bool,
+}
 
 /// What one container is given to run: the argument vector its image was handed, read as
 /// the program it is.
@@ -371,16 +469,51 @@ pub struct ContainerShell {
     signals: Arc<ContainerSignals>,
     /// When this emulator gives up on the run.
     deadline: Instant,
+    /// The FILESYSTEM this container's program reads and writes: its own writable layer and
+    /// the volumes the task definition mounts into it
+    /// ([`super::container_filesystem`]).
+    filesystem: ContainerFilesystem,
+    /// The captures that are open, innermost last: while one is, what a command writes to
+    /// standard output is ITS bytes rather than the container's output — a command
+    /// substitution's value, one stage of a pipeline, or the file a redirection names.
+    captures: Vec<Capture>,
+    /// For each command SUBSTITUTION being performed, innermost last, what this session's
+    /// variables have to be put back to when it ends: the value each name the substituted
+    /// commands touched held before they did. A substitution is a subshell, and this is what
+    /// rolls one back — which costs what it changed rather than a copy of the store.
+    substitution_undo: Vec<BTreeMap<String, Option<String>>>,
+    /// The status of the last command substitution performed for the simple command being
+    /// run, which is the status of a command that has no command name at all.
+    last_substitution_status: Option<i32>,
+    /// How many more command substitutions this run performs ([`MAX_SUBSTITUTIONS`]).
+    substitutions_left: usize,
+    /// What the stage BEFORE the command being performed wrote, which is that command's
+    /// standard input — `None` for a command that is not reading one stage of a pipeline.
+    piped_input: Option<String>,
+    /// Set when a write to the file a redirection named did not happen, which is what makes
+    /// the command carrying it answer as one that failed rather than as one that wrote.
+    redirect_failed: bool,
+    /// Whether the program asked to be ENDED by the first command that fails (`set -e`).
+    errexit: bool,
+    /// How many CONDITIONS are being evaluated right now — an `if`'s, a loop's — inside which
+    /// a command that fails is the condition's answer rather than a failure that ends the
+    /// program under `set -e`.
+    condition_depth: usize,
+    /// Whether the pipeline just performed was written with `!`, which is the other form
+    /// `set -e` does not end the program for.
+    negated_pipeline: bool,
 }
 
 impl ContainerShell {
     /// A session holding `variables` — the container's environment — writing to `output`,
-    /// answering the signals raised on `signals`, and given until `deadline`.
+    /// answering the signals raised on `signals`, given until `deadline`, and reading and
+    /// writing `filesystem` — the container's own layer and the volumes mounted into it.
     pub fn new(
         variables: BTreeMap<String, String>,
         output: Arc<ContainerOutput>,
         signals: Arc<ContainerSignals>,
         deadline: Instant,
+        filesystem: ContainerFilesystem,
     ) -> Self {
         let held_bytes = variables
             .iter()
@@ -402,6 +535,16 @@ impl ContainerShell {
             pending_line: String::new(),
             signals,
             deadline,
+            filesystem,
+            captures: Vec::new(),
+            substitution_undo: Vec::new(),
+            last_substitution_status: None,
+            substitutions_left: MAX_SUBSTITUTIONS,
+            piped_input: None,
+            redirect_failed: false,
+            errexit: false,
+            condition_depth: 0,
+            negated_pipeline: false,
         }
     }
 
@@ -551,7 +694,7 @@ impl ContainerShell {
         clause: &'a ::brush_parser::ast::CaseClauseCommand,
     ) -> ShellFuture<'a, i32> {
         Box::pin(async move {
-            let Some(value) = self.expand_word(&clause.value.value) else {
+            let Some(value) = self.expand_word(&clause.value.value).await else {
                 return self.declined();
             };
             for item in &clause.cases {
@@ -559,7 +702,7 @@ impl ContainerShell {
                     return EXIT_COMMAND_NOT_FOUND;
                 }
                 for pattern in &item.patterns {
-                    let Some(expanded) = self.expand_word(&pattern.value) else {
+                    let Some(expanded) = self.expand_word(&pattern.value).await else {
                         return self.declined();
                     };
                     let Some(matched) = case_pattern_matches(&expanded, &value) else {
@@ -589,7 +732,7 @@ impl ContainerShell {
         clause: &'a ::brush_parser::ast::IfClauseCommand,
     ) -> ShellFuture<'a, i32> {
         Box::pin(async move {
-            let condition = self.run_compound_list(&clause.condition).await;
+            let condition = self.run_condition(&clause.condition).await;
             if self.stopped() {
                 return condition;
             }
@@ -600,7 +743,7 @@ impl ContainerShell {
                 match otherwise.condition.as_ref() {
                     // An `elif`, which carries its own condition and its own branch.
                     Some(condition) => {
-                        let answered = self.run_compound_list(condition).await;
+                        let answered = self.run_condition(condition).await;
                         if self.stopped() {
                             return answered;
                         }
@@ -640,7 +783,7 @@ impl ContainerShell {
                 if !self.take_command_budget().await {
                     return status;
                 }
-                let condition = self.run_compound_list(&clause.0).await;
+                let condition = self.run_condition(&clause.0).await;
                 if self.stopped() {
                     return status;
                 }
@@ -678,6 +821,21 @@ impl ContainerShell {
         })
     }
 
+    /// Run a compound list as a CONDITION — an `if`'s, an `elif`'s or a loop's — which is
+    /// what a command that fails inside it answers rather than ending the program under
+    /// `set -e` ([`Self::run_and_or_list`]).
+    fn run_condition<'a>(
+        &'a mut self,
+        list: &'a ::brush_parser::ast::CompoundList,
+    ) -> ShellFuture<'a, i32> {
+        Box::pin(async move {
+            self.condition_depth = self.condition_depth.saturating_add(1);
+            let status = self.run_compound_list(list).await;
+            self.condition_depth = self.condition_depth.saturating_sub(1);
+            status
+        })
+    }
+
     /// Run the argument vector of a container whose image exec's it directly: its first
     /// word is the utility and the rest are its arguments, with no shell to expand or split
     /// them.
@@ -688,7 +846,10 @@ impl ContainerShell {
         if !self.take_command_budget().await {
             return EXIT_COMMAND_NOT_FOUND;
         }
-        self.run_built_in(name, arguments).await
+        // A vector the image exec's carries no redirection of its own: there is no shell to
+        // read one.
+        let redirections = Redirections::default();
+        self.run_built_in(name, arguments, &redirections).await
     }
 
     /// Whether this session has stopped running commands: `exit` (or a signal) latched a
@@ -789,47 +950,127 @@ impl ContainerShell {
     /// Run an and-or list: its first pipeline, then each later pipeline only when the
     /// operator before it says so — `&&` runs the next on a zero status, `||` on a non-zero
     /// one — and answer the status of the last pipeline that ran.
+    ///
+    /// A list that ends in a failure ENDS the program when the program asked for that
+    /// (`set -e`, [`Self::run_set`]) — and only then: POSIX exempts "any command of an
+    /// AND-OR list other than the last", so a `write && echo done` whose WRITE failed is a
+    /// list the program goes on from, while the same failure standing alone, or in the last
+    /// command of such a list, ends it. The conditions of an `if` or a loop
+    /// ([`Self::condition_depth`]) and a pipeline written with `!` are exempt for the same
+    /// reason, as is a command inside a pipeline that is not its last.
     fn run_and_or_list<'a>(
         &'a mut self,
         list: &'a ::brush_parser::ast::AndOrList,
     ) -> ShellFuture<'a, i32> {
         Box::pin(async move {
+            let (status, ran_last) = self.run_and_or_pipelines(list).await;
+            if self.errexit
+                && status != EXIT_SUCCESS
+                && ran_last
+                && self.condition_depth == 0
+                && !self.negated_pipeline
+                // A command this session DECLINED is not a command that FAILED: it is one the
+                // session does not perform, so the status it answers is read by the
+                // conditions around it ([`Self::declined`]) and never ends the program. The
+                // run claims nothing either way, and what the program wrote is delivered all
+                // the same.
+                && !self.unperformed
+                && self.exit_status.is_none()
+            {
+                self.exit_status = Some(status);
+            }
+            status
+        })
+    }
+
+    /// [`Self::run_and_or_list`]'s walk over the pipelines of the list: the status of the last
+    /// pipeline that ran, and whether that pipeline was the LAST of the list — which is what
+    /// decides whether `set -e` reads the status at all.
+    fn run_and_or_pipelines<'a>(
+        &'a mut self,
+        list: &'a ::brush_parser::ast::AndOrList,
+    ) -> ShellFuture<'a, (i32, bool)> {
+        Box::pin(async move {
             let mut status = self.run_pipeline(&list.first).await;
-            for next in &list.additional {
+            // The first pipeline is the last one when the list holds no other.
+            let mut ran_last = list.additional.is_empty();
+            let last = list.additional.len().saturating_sub(1);
+            for (index, next) in list.additional.iter().enumerate() {
                 if self.stopped() {
                     break;
                 }
-                match next {
+                let ran = match next {
                     ::brush_parser::ast::AndOr::And(pipeline) => {
                         if status == EXIT_SUCCESS {
                             status = self.run_pipeline(pipeline).await;
+                            true
+                        } else {
+                            false
                         }
                     }
                     ::brush_parser::ast::AndOr::Or(pipeline) => {
                         if status != EXIT_SUCCESS {
                             status = self.run_pipeline(pipeline).await;
+                            true
+                        } else {
+                            false
                         }
                     }
+                };
+                if ran {
+                    ran_last = index == last;
                 }
             }
-            status
+            (status, ran_last)
         })
     }
 
     /// Run a pipeline and answer its status: "the exit status of a pipeline shall be the
     /// exit status of the last command", negated when the pipeline is written with `!`.
     ///
-    /// Every command of the pipeline is run, in order, because each answers its own status;
-    /// what one writes is read by the next, and this container connects no command's output
-    /// to another's input, so nothing is passed along but the statuses.
+    /// A pipeline CONNECTS its commands: "the standard output of the first command shall be
+    /// connected to the standard input of the second command", so every stage but the last
+    /// writes to the stage after it rather than to the container's output, and what the last
+    /// one wrote is what the pipeline wrote. A stage that redirects its own standard output
+    /// sends it to the file instead and so passes nothing on, the way the shell's redirection
+    /// takes precedence over the pipe.
+    ///
+    /// A stage that wrote more than [`MAX_CAPTURED_BYTES`] ends the pipeline: the bytes the
+    /// pipe could not carry are bytes the next stage would have read, so the pipeline answers
+    /// the failure of the write that did not happen rather than running the rest of it over a
+    /// stream nothing produced.
     fn run_pipeline<'a>(
         &'a mut self,
         pipeline: &'a ::brush_parser::ast::Pipeline,
     ) -> ShellFuture<'a, i32> {
         Box::pin(async move {
             let mut status = EXIT_SUCCESS;
-            for command in &pipeline.seq {
+            let last = pipeline.seq.len().saturating_sub(1);
+            // Which form the pipeline took is what `set -e` reads after it
+            // ([`Self::run_and_or_list`]).
+            self.negated_pipeline = pipeline.bang;
+            // What the stage before the one being performed wrote.
+            let mut upstream: Option<String> = None;
+            for (index, command) in pipeline.seq.iter().enumerate() {
+                let connected = index < last;
+                if connected {
+                    self.captures.push(Capture {
+                        limit: MAX_CAPTURED_BYTES,
+                        ..Capture::default()
+                    });
+                }
+                // The input belongs to this one command: whatever the command around this
+                // pipeline was reading is put back after it.
+                let held_input = ::std::mem::replace(&mut self.piped_input, upstream.take());
                 status = self.run_command(command).await;
+                self.piped_input = held_input;
+                if connected {
+                    let captured = self.captures.pop().unwrap_or_default();
+                    if captured.overflowed {
+                        return EXIT_FAILURE;
+                    }
+                    upstream = Some(captured.text);
+                }
                 if self.stopped() {
                     break;
                 }
@@ -879,8 +1120,9 @@ impl ContainerShell {
         })
     }
 
-    /// Run a simple command: its variable assignments, then the command its first word
-    /// names with the words after it as its arguments.
+    /// Run a simple command: its variable assignments and its REDIRECTIONS, then the command
+    /// its first word names with the words after it as its arguments, with what it writes
+    /// going where those redirections send it.
     ///
     /// A command with no word at all is the assignment form — "the variable assignments
     /// shall affect the current execution environment". An assignment written BEFORE a
@@ -888,8 +1130,16 @@ impl ContainerShell {
     /// only for the special built-in utilities POSIX keeps it for ([`PERSISTING_COMMANDS`]);
     /// since every word is expanded before the assignments are applied, a command that does
     /// not keep them sees the value either way. Any prefix or suffix item that is neither a
-    /// word nor an assignment is a redirection or a substitution this container does not
-    /// perform, and the command is then not run.
+    /// word, an assignment nor a redirection this container performs
+    /// ([`Self::apply_redirect`]) is a form it does not perform, and the command is then not
+    /// run.
+    ///
+    /// The files the redirections name are OPENED before the command is resolved, which is
+    /// the order a shell opens them in: a file the container's filesystem refuses to open —
+    /// a write through a read-only mount, a path whose directory is missing — is reported in
+    /// the shell's own wording and the command does NOT run ([`Self::open_redirections`]).
+    /// What a redirected command then writes is collected and written to the file as the
+    /// command finishes, so one command's output is one write of the file.
     fn run_simple_command<'a>(
         &'a mut self,
         simple: &'a ::brush_parser::ast::SimpleCommand,
@@ -908,14 +1158,26 @@ impl ContainerShell {
             // Each command gets the whole expansion budget: the words of one command are
             // live at the same instant, and the words of the command before it are not.
             self.expansion_left = MAX_LINE_EXPANSION_BYTES;
+            // The status of a command with no command name is the status of the last command
+            // substitution ITS OWN words performed, so what an earlier command substituted is
+            // not read here.
+            self.last_substitution_status = None;
             let mut assignments: Vec<(String, String)> = Vec::new();
             let mut words: Vec<String> = Vec::new();
-            let prefix = simple.prefix.as_ref().map(|prefix| &prefix.0);
-            let suffix = simple.suffix.as_ref().map(|suffix| &suffix.0);
-            for item in prefix.into_iter().chain(suffix).flatten() {
+            let mut redirections = Redirections::default();
+            // The prefix's items and the suffix's are read in the order they were written,
+            // gathered first so the walk over them has one type.
+            let mut items: Vec<&::brush_parser::ast::CommandPrefixOrSuffixItem> = Vec::new();
+            if let Some(prefix) = simple.prefix.as_ref() {
+                items.extend(prefix.0.iter());
+            }
+            if let Some(suffix) = simple.suffix.as_ref() {
+                items.extend(suffix.0.iter());
+            }
+            for item in items {
                 match item {
                     ::brush_parser::ast::CommandPrefixOrSuffixItem::Word(word) => {
-                        let Some(expanded) = self.expand_word(&word.value) else {
+                        let Some(expanded) = self.expand_word(&word.value).await else {
                             return self.declined();
                         };
                         words.push(expanded);
@@ -924,16 +1186,22 @@ impl ContainerShell {
                         assignment,
                         _,
                     ) => {
-                        let Some(pair) = self.assignment_of(assignment) else {
+                        let Some(pair) = self.assignment_of(assignment).await else {
                             return self.declined();
                         };
                         assignments.push(pair);
+                    }
+                    ::brush_parser::ast::CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
+                        let Some(applied) = self.apply_redirect(redirect).await else {
+                            return self.declined();
+                        };
+                        applied.record(&mut redirections);
                     }
                     _ => return self.declined(),
                 }
             }
             let name = match simple.word_or_name.as_ref() {
-                Some(word) => match self.expand_word(&word.value) {
+                Some(word) => match self.expand_word(&word.value).await {
                     Some(expanded) => Some(expanded),
                     None => return self.declined(),
                 },
@@ -949,37 +1217,167 @@ impl ContainerShell {
                     }
                 }
             }
-            match name {
-                Some(name) => self.run_built_in(&name, &words).await,
-                // Nothing but assignments: they have been applied, which is the whole
-                // command.
-                None => EXIT_SUCCESS,
+            // The files are opened before the command is resolved, the way a shell opens
+            // them: one the filesystem refuses means the command did not run at all.
+            if let Err(status) = self.open_redirections(&redirections).await {
+                return status;
             }
+            // What a redirected command writes is collected for the file and written when the
+            // command has finished, which is one write of what the command produced.
+            //
+            // The refused-write flag is this command's own: a command nested inside it (a
+            // substitution, a stage of a pipeline) answers for its own refused write, and the
+            // one held for a command still running is restored after it.
+            let outer_refused = ::std::mem::replace(&mut self.redirect_failed, false);
+            let redirected = redirections.out.take();
+            if redirected.is_some() {
+                self.captures.push(Capture {
+                    limit: MAX_REDIRECTED_BYTES,
+                    ..Capture::default()
+                });
+            }
+            let status = match name {
+                Some(name) => self.run_built_in(&name, &words, &redirections).await,
+                // Nothing but assignments or a redirection alone: they have been applied,
+                // which is the whole command. "If there is no command name, but the command
+                // contained a command substitution, the command shall complete with the exit
+                // status of the last command substitution performed."
+                None => self
+                    .last_substitution_status
+                    .take()
+                    .unwrap_or(EXIT_SUCCESS),
+            };
+            if let Some((path, _)) = redirected {
+                let captured = self.captures.pop().unwrap_or_default();
+                // The file was opened above, so what the command wrote is ADDED to what that
+                // open left: a `>` truncated the file as it opened it, and a `>>` left what
+                // the file held.
+                if captured.overflowed {
+                    self.redirect_failed = true;
+                } else if !captured.text.is_empty() {
+                    if let Err(refusal) = self.filesystem.write(&path, &captured.text, true) {
+                        self.report_write_refusal(&path, refusal, &redirections).await;
+                        self.redirect_failed = true;
+                    }
+                }
+            }
+            if ::std::mem::replace(&mut self.redirect_failed, outer_refused) {
+                // A write the filesystem would not take did not happen, so the command did
+                // not do what it was asked: it answers failure, the way a command whose
+                // redirection failed does.
+                return EXIT_FAILURE;
+            }
+            status
         })
+    }
+
+    /// One redirection of a simple command as this session records it — `None` for a form
+    /// this container does not perform.
+    ///
+    /// WHICH forms are read is the shared reading of a redirection node
+    /// ([`AppliedRedirect::of`]), over the target word this session expanded: the
+    /// redirections of the three standard descriptors and the duplication of one standard
+    /// stream onto the other, which is how a program asks for its diagnostics on the one
+    /// stream its caller reads.
+    fn apply_redirect<'a>(
+        &'a mut self,
+        redirect: &'a ::brush_parser::ast::IoRedirect,
+    ) -> ShellFuture<'a, Option<AppliedRedirect>> {
+        Box::pin(async move {
+            let ::brush_parser::ast::IoRedirect::File(descriptor, kind, target) = redirect else {
+                return None;
+            };
+            let expanded = match target {
+                ::brush_parser::ast::IoFileRedirectTarget::Duplicate(word)
+                | ::brush_parser::ast::IoFileRedirectTarget::Filename(word) => {
+                    self.expand_word(&word.value).await?
+                }
+                _ => return None,
+            };
+            AppliedRedirect::of(*descriptor, kind, &expanded)
+        })
+    }
+
+    /// OPEN the files this command's redirections name, the way a shell opens them before it
+    /// resolves the command: a `>` truncates the file (creating it where there is none), a
+    /// `>>` creates it and leaves what it holds, and a `<` has to be readable.
+    ///
+    /// `Err` is a redirection that could not be opened, which is reported on standard error
+    /// in the shell's own wording — `sh: can't create <path>: <what the filesystem answered>`
+    /// — and makes the command one that did not run at all: it answers failure, and the
+    /// program around it reads that status.
+    async fn open_redirections(&mut self, redirections: &Redirections) -> Result<(), i32> {
+        for (path, append) in [redirections.out.clone(), redirections.error.clone()]
+            .into_iter()
+            .flatten()
+        {
+            // An open for writing creates the file; `>` also truncates what it held, which
+            // is what writing nothing from the start of it does.
+            if let Err(refusal) = self.filesystem.write(&path, "", append) {
+                self.report_write_refusal(&path, refusal, redirections).await;
+                return Err(EXIT_FAILURE);
+            }
+        }
+        if let Some(path) = redirections.input.clone() {
+            if let Err(refusal) = self.filesystem.read(&path) {
+                self.write_stderr(
+                    &format!("{SHELL_NAME}: can't open {path}: {}\n", refusal.message()),
+                    redirections,
+                )
+                .await;
+                return Err(EXIT_FAILURE);
+            }
+        }
+        Ok(())
+    }
+
+    /// Report a write the container's filesystem refused, in the wording the shell reports a
+    /// redirection it could not open in — which carries the text of the error the kernel
+    /// answered, so a write through a read-only mount says `Read-only file system`.
+    async fn report_write_refusal(
+        &mut self,
+        path: &str,
+        refusal: FileRefusal,
+        redirections: &Redirections,
+    ) {
+        self.write_stderr(
+            &format!(
+                "{SHELL_NAME}: can't create {path}: {}\n",
+                refusal.message()
+            ),
+            redirections,
+        )
+        .await;
     }
 
     /// One assignment of a simple command as the name and value it sets, or `None` when it
     /// is a form this container does not perform — an array assignment, an appending
     /// assignment, or a value whose expansion it cannot resolve.
-    fn assignment_of(
-        &mut self,
-        assignment: &::brush_parser::ast::Assignment,
-    ) -> Option<(String, String)> {
-        if assignment.append {
-            return None;
-        }
-        let ::brush_parser::ast::AssignmentName::VariableName(name) = &assignment.name else {
-            return None;
-        };
-        let ::brush_parser::ast::AssignmentValue::Scalar(value) = &assignment.value else {
-            return None;
-        };
-        Some((name.clone(), self.expand_word(&value.value)?))
+    fn assignment_of<'a>(
+        &'a mut self,
+        assignment: &'a ::brush_parser::ast::Assignment,
+    ) -> ShellFuture<'a, Option<(String, String)>> {
+        Box::pin(async move {
+            if assignment.append {
+                return None;
+            }
+            let ::brush_parser::ast::AssignmentName::VariableName(name) = &assignment.name else {
+                return None;
+            };
+            let ::brush_parser::ast::AssignmentValue::Scalar(value) = &assignment.value else {
+                return None;
+            };
+            Some((name.clone(), self.expand_word(&value.value).await?))
+        })
     }
 
     /// Set `name` to `value` in this session, unless it is already holding
     /// [`MAX_SESSION_BYTES`] or [`MAX_SESSION_VARIABLES`] — `false` is then a command this
     /// container did not perform, which is what its caller reports.
+    ///
+    /// A change made while a command SUBSTITUTION is open is recorded on that substitution's
+    /// undo log first ([`Self::record_for_rollback`]), so it is put back when the subshell
+    /// ends.
     fn set_variable(&mut self, name: String, value: String) -> bool {
         let displaced = self
             .variables
@@ -996,6 +1394,7 @@ impl ContainerShell {
         if would_hold > MAX_SESSION_BYTES {
             return false;
         }
+        self.record_for_rollback(&name);
         self.held_bytes = would_hold;
         self.variables.insert(name, value);
         true
@@ -1003,6 +1402,7 @@ impl ContainerShell {
 
     /// Remove `name` from this session, with the bytes it held.
     fn unset_variable(&mut self, name: &str) {
+        self.record_for_rollback(name);
         if let Some(value) = self.variables.remove(name) {
             self.held_bytes = self
                 .held_bytes
@@ -1010,10 +1410,19 @@ impl ContainerShell {
         }
     }
 
-    /// Run the command `name` with `arguments`, when it is one this container provides
-    /// ([`BUILT_IN_COMMANDS`]).
+    /// Record what the innermost open command substitution has to put `name` back to, when
+    /// one is open and has not recorded it already — the FIRST touch is the one that names
+    /// the value to go back to.
+    fn record_for_rollback(&mut self, name: &str) {
+        let held = self.variables.get(name).cloned();
+        if let Some(undo) = self.substitution_undo.last_mut() {
+            undo.entry(name.to_string()).or_insert(held);
+        }
+    }
+
+    /// Run the command `name` with `arguments`, when it is one this container provides.
     ///
-    /// `echo` writes its arguments and a newline to the container's output (`-n` leaves the
+    /// `echo` writes its arguments and a newline to its standard output (`-n` leaves the
     /// newline off, as that option is specified to). `true` and `:` answer success and
     /// `false` answers failure, which is the whole of what those utilities do. `exit` ends
     /// the session with the status its argument names, defaulting to success, and a status
@@ -1021,14 +1430,27 @@ impl ContainerShell {
     /// `export`/`unset` change the session's variables, `trap` records what a signal does
     /// to it, `sleep` waits for the seconds its argument names, and `wait` answers success
     /// because this session starts no job to wait for.
+    ///
+    /// A name outside [`BUILT_IN_COMMANDS`] is one of the commands that work over the
+    /// container's FILESYSTEM ([`FILE_COMMANDS`], [`Self::run_file_command`]) or one of the
+    /// TEXT FILTERS that compute over one input
+    /// ([`::service_common::posix_shell_text_filters`], [`Self::run_text_filter`]); a name
+    /// outside all three needs a program or a network this container does not have.
     fn run_built_in<'a>(
         &'a mut self,
         name: &'a str,
         arguments: &'a [String],
+        redirections: &'a Redirections,
     ) -> ShellFuture<'a, i32> {
         Box::pin(async move {
-            // The catalog is what this container provides: a command outside it needs a
-            // program, a filesystem or a network this container does not have.
+            if FILE_COMMANDS.contains(&name) {
+                return self.run_file_command(name, arguments, redirections).await;
+            }
+            if ::service_common::posix_shell_text_filters::TEXT_FILTER_COMMANDS.contains(&name) {
+                return self.run_text_filter(name, arguments, redirections).await;
+            }
+            // The catalogs are what this container provides: a command outside them needs a
+            // program or a network this container does not have.
             if !BUILT_IN_COMMANDS.contains(&name) {
                 return self.declined();
             }
@@ -1042,8 +1464,11 @@ impl ContainerShell {
                     if newline {
                         written.push('\n');
                     }
-                    self.write_output(&written).await;
-                    EXIT_SUCCESS
+                    if self.write_stdout(&written, redirections).await {
+                        EXIT_SUCCESS
+                    } else {
+                        EXIT_FAILURE
+                    }
                 }
                 "true" | ":" => EXIT_SUCCESS,
                 "false" => EXIT_FAILURE,
@@ -1082,6 +1507,7 @@ impl ContainerShell {
                     EXIT_SUCCESS
                 }
                 "trap" => self.run_trap(arguments),
+                "set" => self.run_set(arguments),
                 "sleep" => self.run_sleep(arguments).await,
                 // "wait: ... If no process ID is given, waits for all currently active
                 // child processes" — this session has none, so there is nothing to wait
@@ -1096,13 +1522,17 @@ impl ContainerShell {
     /// `test EXPRESSION`, and its `[ EXPRESSION ]` spelling: the question the expression
     /// asks, answered as a status — success for true, failure for false.
     ///
-    /// The utility is a shell BUILT-IN whose whole effect is its status, so this container
-    /// performs the half of it that is about the words it was given and nothing else
-    /// ([`::service_common::posix_shell_session::value_test_answer`]): an expression of one
-    /// argument, `-z`/`-n`, the string comparisons and the integer comparisons, each
-    /// optionally negated with a leading `!`. Every other form — a question about a file,
-    /// which this container has no filesystem to answer, or an expression joined with `-a`
-    /// or `-o` — is one this session does not answer, so it is a command that did not run
+    /// Two kinds of question are answered. The ones about the container's own FILESYSTEM —
+    /// `-e` (the path exists), `-f` (it is a regular file), `-d` (it is a directory), `-s`
+    /// (it is a file with something in it), `-r` and `-w` (it can be read, it can be
+    /// written, which is what a read-only mount answers false for) — and the ones about the
+    /// words themselves, which is the half of the utility this workspace's own reading of it
+    /// answers ([`::service_common::posix_shell_session::value_test_answer`]): an expression
+    /// of one argument, `-z`/`-n`, the string comparisons and the integer comparisons. Each
+    /// may be negated with a leading `!`.
+    ///
+    /// Every other form — an expression joined with `-a` or `-o`, a question about a file's
+    /// mode or age — is one this session does not answer, so it is a command that did not run
     /// ([`Self::declined`]) rather than an answer of false.
     fn run_test(&mut self, name: &str, arguments: &[String]) -> i32 {
         let mut arguments = arguments.to_vec();
@@ -1119,15 +1549,53 @@ impl ContainerShell {
         if negated {
             arguments.remove(0);
         }
-        let Some(answer) = ::service_common::posix_shell_session::value_test_answer(&arguments)
-        else {
-            return self.declined();
+        let answer = match self.file_test_answer(&arguments) {
+            Some(answer) => answer,
+            None => match ::service_common::posix_shell_session::value_test_answer(&arguments) {
+                Some(answer) => answer,
+                None => return self.declined(),
+            },
         };
         if answer != negated {
             EXIT_SUCCESS
         } else {
             EXIT_FAILURE
         }
+    }
+
+    /// What the `test` questions about a FILE answer for `arguments`: the shared reading of
+    /// them ([`::service_common::posix_shell_files::file_test_answer`]) over this container's
+    /// own filesystem, and `None` for an expression that asks about something else (see
+    /// [`Self::run_test`]).
+    fn file_test_answer(&self, arguments: &[String]) -> Option<bool> {
+        ::service_common::posix_shell_files::file_test_answer(arguments, &self.filesystem)
+    }
+
+    /// `set [-e|+e]`: turn the shell option its argument names on or off.
+    ///
+    /// `-e` is the option a container's program is written with: "when this option is on, if
+    /// a simple command fails … the shell shall immediately exit" — except where the command
+    /// that failed is a CONDITION (an `if`'s, a loop's), stands before a `&&` or `||`, or is a
+    /// pipeline written with `!`, which are the exemptions POSIX states and
+    /// [`Self::run_and_or_list`] applies. A command this SESSION declines is exempt too, for
+    /// the reason stated there. `+e` turns it off again.
+    ///
+    /// Every other invocation is one this session does not perform: a bare `set` writes a
+    /// listing of the session's variables, which this writes none of, and the other options
+    /// change how the shell itself behaves in ways nothing here implements — so a program
+    /// asking for one did not run rather than running without it.
+    fn run_set(&mut self, arguments: &[String]) -> i32 {
+        if arguments.is_empty() {
+            return self.declined();
+        }
+        for argument in arguments {
+            match argument.as_str() {
+                "-e" => self.errexit = true,
+                "+e" => self.errexit = false,
+                _ => return self.declined(),
+            }
+        }
+        EXIT_SUCCESS
     }
 
     /// `trap ACTION SIGNAL...`: record what each named signal does to this session.
@@ -1223,25 +1691,259 @@ impl ContainerShell {
         self.output.write_line(&line).await;
     }
 
+    /// Write `text` to the standard OUTPUT of the command being performed: to the file a
+    /// redirection names, to the capture an open substitution or pipeline stage is
+    /// collecting, or — when neither — to the container's own output.
+    ///
+    /// `false` is a write that did not happen, which is the failure the command performing it
+    /// reports: a write the filesystem refused, or a capture past its bound.
+    async fn write_stdout(&mut self, text: &str, redirections: &Redirections) -> bool {
+        if redirections.out_to_error {
+            // `1>&2`: this command's output goes where its diagnostics go.
+            return self.write_error_stream(text, redirections).await;
+        }
+        self.write_stream(redirections.out.clone(), text, redirections)
+            .await
+    }
+
+    /// Write `text` to the standard ERROR of the command being performed, which is where a
+    /// command reports what it could not do.
+    ///
+    /// With a redirection of its own it goes to the file that names. With none it is
+    /// DELIVERED to the container's output: the log driver "sends container logs" — both of
+    /// the streams a container writes — so a diagnostic reaches the container's log stream
+    /// exactly as its output does. What it is never part of is a command SUBSTITUTION's
+    /// value, which captures standard output alone.
+    async fn write_stderr(&mut self, text: &str, redirections: &Redirections) -> bool {
+        if redirections.error_to_out {
+            // `2>&1`: this command's diagnostics go where its output goes, so they are what
+            // a redirection takes and what a substitution captures.
+            return self
+                .write_stream(redirections.out.clone(), text, redirections)
+                .await;
+        }
+        self.write_error_stream(text, redirections).await
+    }
+
+    /// [`Self::write_stderr`]'s write to the ERROR stream itself, with no duplication
+    /// applied: the file a redirection of standard error names, and otherwise the container's
+    /// own output.
+    async fn write_error_stream(&mut self, text: &str, redirections: &Redirections) -> bool {
+        if let Some((path, _)) = redirections.error.clone() {
+            // The file was opened before the command ran, so each write ADDS to it.
+            if self.filesystem.write(&path, text, true).is_err() {
+                self.redirect_failed = true;
+                return false;
+            }
+            return true;
+        }
+        self.write_output(text).await;
+        true
+    }
+
+    /// [`Self::write_stdout`]'s and [`Self::write_stderr`]'s one write.
+    async fn write_stream(
+        &mut self,
+        target: Option<(String, bool)>,
+        text: &str,
+        redirections: &Redirections,
+    ) -> bool {
+        if let Some((path, _)) = target {
+            if let Err(refusal) = self.filesystem.write(&path, text, true) {
+                // The diagnostic cannot go through a duplication onto the very stream whose
+                // write just failed, so it is reported on the error stream itself.
+                let reported = format!(
+                    "{SHELL_NAME}: can't create {path}: {}\n",
+                    refusal.message()
+                );
+                self.write_error_stream(&reported, redirections).await;
+                self.redirect_failed = true;
+                return false;
+            }
+            return true;
+        }
+        if let Some(capture) = self.captures.last_mut() {
+            if capture.text.len().saturating_add(text.len()) > capture.limit {
+                capture.overflowed = true;
+                return false;
+            }
+            capture.text.push_str(text);
+            return true;
+        }
+        self.write_output(text).await;
+        true
+    }
+
+    /// What the command being performed reads from STANDARD INPUT, and `None` when there is
+    /// none to read.
+    ///
+    /// The file an input redirection names, when the command carries one, and otherwise what
+    /// the stage before it in a pipeline wrote. It is TAKEN: a stream is consumed by whoever
+    /// reads it, so the command after it in the same pipeline reads nothing rather than the
+    /// same bytes twice. There is no terminal behind this: a command with neither reads
+    /// nothing at all.
+    fn standard_input(&mut self, redirections: &Redirections) -> Option<String> {
+        if let Some(path) = redirections.input.clone() {
+            return self.filesystem.read(&path).ok();
+        }
+        self.piped_input.take()
+    }
+
+    /// [`Self::standard_input`] for the utilities that READ it, with the status to answer
+    /// when there is nothing to read: the utility's own failure for a file standard input was
+    /// redirected from that cannot be read — reported on standard error in the utility's own
+    /// wording — and a command that could not run when there was no input at all, since there
+    /// is no terminal behind it here.
+    async fn read_standard_input(
+        &mut self,
+        name: &str,
+        redirections: &Redirections,
+    ) -> Result<String, i32> {
+        let redirected = redirections.input.clone();
+        match self.standard_input(redirections) {
+            Some(input) => Ok(input),
+            None => match redirected {
+                Some(path) => {
+                    let refusal = self
+                        .filesystem
+                        .read(&path)
+                        .err()
+                        .unwrap_or(FileRefusal::NotFound);
+                    self.write_stderr(
+                        &format!("{name}: {path}: {}\n", refusal.message()),
+                        redirections,
+                    )
+                    .await;
+                    Err(EXIT_FAILURE)
+                }
+                None => Err(self.declined()),
+            },
+        }
+    }
+
+    /// Run one of the commands that work over the container's FILESYSTEM
+    /// ([`FILE_COMMANDS`]), and write what it produced through this session's own streams.
+    ///
+    /// WHAT each of them does and SAYS is the shared reading of those utilities
+    /// ([`::service_common::posix_shell_files::perform_file_command`]), performed over this
+    /// container's own filesystem; what this session adds is where its two streams go and the
+    /// standard input only it can resolve — the file one was redirected from, or what the
+    /// stage before it in a pipeline wrote, which is what `cat` with no operand reads.
+    fn run_file_command<'a>(
+        &'a mut self,
+        name: &'a str,
+        arguments: &'a [String],
+        redirections: &'a Redirections,
+    ) -> ShellFuture<'a, i32> {
+        Box::pin(async move {
+            let reads_input = name == "cat"
+                && !::service_common::posix_shell_files::names_an_operand(arguments);
+            let input = if reads_input {
+                match self.read_standard_input(name, redirections).await {
+                    Ok(input) => Some(input),
+                    Err(status) => return status,
+                }
+            } else {
+                None
+            };
+            let Some(outcome) = ::service_common::posix_shell_files::perform_file_command(
+                name,
+                arguments,
+                &mut self.filesystem,
+                input.as_deref(),
+            ) else {
+                return self.declined();
+            };
+            if !outcome.errors.is_empty() {
+                self.write_stderr(&outcome.errors, redirections).await;
+            }
+            if !outcome.output.is_empty()
+                && !self.write_stdout(&outcome.output, redirections).await
+            {
+                return EXIT_FAILURE;
+            }
+            if outcome.succeeded {
+                EXIT_SUCCESS
+            } else {
+                EXIT_FAILURE
+            }
+        })
+    }
+
+    /// Perform one of the TEXT FILTERS over its one input: the file it names, or standard
+    /// input.
+    ///
+    /// What it writes is what [`::service_common::posix_shell_text_filters`] computed over
+    /// those bytes — a count, a selection, a digest — and nothing of the invocation is
+    /// interpreted here. An option or operand form that module does not perform is a command
+    /// this container could not run, a file this filesystem will not read is reported the way
+    /// the file commands report one, and a filter with no input at all could not run either:
+    /// there is no terminal behind standard input here.
+    async fn run_text_filter(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        redirections: &Redirections,
+    ) -> i32 {
+        use ::service_common::posix_shell_text_filters::{Filter, STANDARD_INPUT_LABEL};
+        let Some(filter) = Filter::read(name, arguments) else {
+            return self.declined();
+        };
+        let (label, input) = match filter.file() {
+            Some(path) => match self.filesystem.read(path) {
+                Ok(held) => (path.to_string(), held),
+                Err(refusal) => {
+                    self.write_stderr(
+                        &format!("{name}: {path}: {}\n", refusal.message()),
+                        redirections,
+                    )
+                    .await;
+                    return EXIT_FAILURE;
+                }
+            },
+            None => match self.read_standard_input(name, redirections).await {
+                Ok(input) => (STANDARD_INPUT_LABEL.to_string(), input),
+                Err(status) => return status,
+            },
+        };
+        let written = match filter.perform(&label, &input) {
+            Ok(written) => written,
+            // An input the utility cannot compute over: what it writes about it goes to
+            // standard error, and nothing is written to standard output.
+            Err(refusal) => {
+                self.write_stderr(&format!("{refusal}\n"), redirections).await;
+                return EXIT_FAILURE;
+            }
+        };
+        if self.write_stdout(&written, redirections).await {
+            EXIT_SUCCESS
+        } else {
+            EXIT_FAILURE
+        }
+    }
+
     /// `word` with its expansions resolved, or `None` when it carries an expansion this
     /// container cannot resolve.
     ///
     /// The pieces come from `brush-parser`'s word parser, so what is quoted, what is a
-    /// parameter expansion and what is literal text is the shell's own reading of the word.
-    /// A parameter this session holds nothing for expands to nothing, which is what an
-    /// unset parameter expands to, and an escape sequence stands for the character it
-    /// escapes ([`escaped_text`]). A command substitution, an arithmetic expansion or a
-    /// tilde prefix is an expansion whose value this container cannot resolve — it would
-    /// have to run a command, or resolve a home directory it does not have — so the word
-    /// has no expansion here and the command carrying it is not run. Nor does a word that
-    /// expands past [`MAX_EXPANSION_BYTES`], or one whose expansion would take the command
-    /// past [`MAX_LINE_EXPANSION_BYTES`].
-    fn expand_word(&mut self, word: &str) -> Option<String> {
-        let options = ::brush_parser::ParserOptions::default();
-        let pieces = ::brush_parser::word::parse(word, &options).ok()?;
-        let expanded = self.expand_pieces(&pieces, MAX_WORD_DEPTH, false)?;
-        self.expansion_left = self.expansion_left.checked_sub(expanded.len())?;
-        Some(expanded)
+    /// parameter expansion, what is a command substitution and what is literal text is the
+    /// shell's own reading of the word. A parameter this session holds nothing for expands
+    /// to nothing, which is what an unset parameter expands to, and an escape sequence
+    /// stands for the character it escapes ([`escaped_text`]). An arithmetic expansion or a
+    /// tilde prefix is an expansion whose value this container cannot resolve — it would have
+    /// to resolve a home directory it does not have — so the word has no expansion here and
+    /// the command carrying it is not run. Nor does a word that expands past
+    /// [`MAX_EXPANSION_BYTES`], or one whose expansion would take the command past
+    /// [`MAX_LINE_EXPANSION_BYTES`].
+    fn expand_word<'a>(&'a mut self, word: &str) -> ShellFuture<'a, Option<String>> {
+        let word = word.to_string();
+        Box::pin(async move {
+            let options = ::brush_parser::ParserOptions::default();
+            let pieces = ::brush_parser::word::parse(&word, &options).ok()?;
+            let expanded = self.expand_pieces(pieces, MAX_WORD_DEPTH, false).await?;
+            self.expansion_left = self.expansion_left.checked_sub(expanded.len())?;
+            Some(expanded)
+        })
     }
 
     /// [`Self::expand_word`]'s walk over the pieces a word parsed into, with `depth` levels
@@ -1251,34 +1953,99 @@ impl ContainerShell {
     /// `double_quoted` is whether these pieces stand INSIDE a double-quoted sequence, which
     /// is what decides how an escape sequence reads ([`escaped_text`]).
     fn expand_pieces(
-        &self,
-        pieces: &[::brush_parser::word::WordPieceWithSource],
+        &mut self,
+        pieces: Vec<::brush_parser::word::WordPieceWithSource>,
         depth: usize,
         double_quoted: bool,
-    ) -> Option<String> {
-        let depth = depth.checked_sub(1)?;
-        let mut expanded = String::new();
-        for piece in pieces {
-            let addition = match &piece.piece {
-                ::brush_parser::word::WordPiece::Text(text)
-                | ::brush_parser::word::WordPiece::SingleQuotedText(text) => text.clone(),
-                ::brush_parser::word::WordPiece::DoubleQuotedSequence(inner) => {
-                    self.expand_pieces(inner, depth, true)?
+    ) -> ShellFuture<'_, Option<String>> {
+        Box::pin(async move {
+            let depth = depth.checked_sub(1)?;
+            let mut expanded = String::new();
+            for piece in pieces {
+                let addition = match piece.piece {
+                    ::brush_parser::word::WordPiece::Text(text)
+                    | ::brush_parser::word::WordPiece::SingleQuotedText(text) => text,
+                    ::brush_parser::word::WordPiece::DoubleQuotedSequence(inner) => {
+                        self.expand_pieces(inner, depth, true).await?
+                    }
+                    ::brush_parser::word::WordPiece::ParameterExpansion(parameter) => {
+                        self.expand_parameter(&parameter)?
+                    }
+                    ::brush_parser::word::WordPiece::CommandSubstitution(program)
+                    | ::brush_parser::word::WordPiece::BackquotedCommandSubstitution(program) => {
+                        self.expand_substitution(&program).await?
+                    }
+                    ::brush_parser::word::WordPiece::EscapeSequence(sequence) => {
+                        escaped_text(&sequence, double_quoted)?
+                    }
+                    _ => return None,
+                };
+                if expanded.len().saturating_add(addition.len()) > MAX_EXPANSION_BYTES {
+                    return None;
                 }
-                ::brush_parser::word::WordPiece::ParameterExpansion(parameter) => {
-                    self.expand_parameter(parameter)?
-                }
-                ::brush_parser::word::WordPiece::EscapeSequence(sequence) => {
-                    escaped_text(sequence, double_quoted)?
-                }
-                _ => return None,
-            };
-            if expanded.len().saturating_add(addition.len()) > MAX_EXPANSION_BYTES {
+                expanded.push_str(&addition);
+            }
+            Some(expanded)
+        })
+    }
+
+    /// The value of a command SUBSTITUTION: what the commands inside it wrote to standard
+    /// output, "with one or more trailing newline characters removed", as the shell
+    /// specifies.
+    ///
+    /// The commands run in THIS session — the same variables, the same filesystem, the same
+    /// budget and the same catalogs — so a substitution reaches nothing its session cannot.
+    /// It is a SUBSHELL: an `exit` inside one ends the substitution rather than the session,
+    /// and the variables it set or removed are put back off the undo log it recorded
+    /// ([`Self::record_for_rollback`]), which costs what it changed rather than a copy of the
+    /// store.
+    ///
+    /// Its own cost comes out of the same budgets: performing one spends a step of
+    /// [`MAX_COMMANDS_PER_RUN`] before anything else — so how many a command may open is
+    /// bounded whatever their text performs — and the commands inside it spend their own.
+    ///
+    /// `None` is a substitution with no value: one past [`MAX_SUBSTITUTIONS`],
+    /// [`MAX_SUBSTITUTION_DEPTH`] or the run's budget does not run, and one whose output went
+    /// past [`MAX_CAPTURED_BYTES`] has no value rather than a clipped one.
+    fn expand_substitution<'a>(&'a mut self, program: &str) -> ShellFuture<'a, Option<String>> {
+        let program = program.to_string();
+        Box::pin(async move {
+            if self.substitutions_left == 0
+                || self.substitution_undo.len() >= MAX_SUBSTITUTION_DEPTH
+            {
                 return None;
             }
-            expanded.push_str(&addition);
-        }
-        Some(expanded)
+            if !self.take_command_budget().await {
+                return None;
+            }
+            self.substitutions_left = self.substitutions_left.saturating_sub(1);
+            self.captures.push(Capture {
+                limit: MAX_CAPTURED_BYTES,
+                ..Capture::default()
+            });
+            self.substitution_undo.push(BTreeMap::new());
+            let held_exit = self.exit_status.take();
+            let held_bytes = self.held_bytes;
+            let status = self.run_text(&program).await;
+            self.exit_status = held_exit;
+            for (name, held) in self.substitution_undo.pop().unwrap_or_default() {
+                match held {
+                    Some(value) => self.variables.insert(name, value),
+                    None => self.variables.remove(&name),
+                };
+            }
+            // The store is back to what it was, so what it holds is back to what it held.
+            self.held_bytes = held_bytes;
+            // The LAST substitution performed is the one a command with no command name
+            // answers with, so this replaces what a substitution performed earlier in the
+            // same command left.
+            self.last_substitution_status = Some(status);
+            let capture = self.captures.pop()?;
+            if capture.overflowed {
+                return None;
+            }
+            Some(capture.text.trim_end_matches('\n').to_string())
+        })
     }
 
     /// The value a parameter expansion resolves to in this session.

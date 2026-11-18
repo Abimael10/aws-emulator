@@ -182,48 +182,38 @@
 //!   two streams separately ([`ShellSession::output`], [`ShellSession::errors`]) because its
 //!   API carries a member for each.
 //!
-//! One service still carries its OWN copy of this session, written before this module
-//! existed, and it is to be MIGRATED onto this one rather than copied again — exactly as the
-//! claim-rule and log-group-name copies this crate lists are:
-//! `service-com-amazonaws-ecs-amazonec2containerservicev20141113`'s `state::container_shell`
-//! performs a container's program as a PROCESS — it loops, waits, installs signal handlers
-//! and delivers each line as it is written — so moving it here means ADDING those to this
-//! session rather than taking them away, and doing that in a change about neither of the two
-//! services above would widen what their programs may run.
+//! # The other session, and what the two SHARE
 //!
-//! Nothing new should restate the session — call this module.
+//! `service-com-amazonaws-ecs-amazonec2containerservicev20141113`'s `state::container_shell`
+//! performs a container's program as a PROCESS: it loops, waits, installs signal handlers and
+//! delivers each line as it is written, which this session does none of — it is driven
+//! SYNCHRONOUSLY by callers that perform a whole program while holding their own store's lock
+//! (`…lambdamicrovms…::state::guest_machine::in_volume` hands this session a machine's tree
+//! from inside that guard, and `…ec2…::state::guest_console` performs a boot script the same
+//! way), so the walk over the grammar's tree cannot be the same function in both until those
+//! callers no longer need a synchronous one.
+//!
+//! What IS the same is everything that needs no await, and it lives in ONE place rather than
+//! in two copies:
+//!
+//! * the FILES both sessions work over and the utilities that work over them — the seam, `cat`,
+//!   `ls`, `mkdir`, `touch`, `rm`, `sync`, the `test` questions about a file, and the
+//!   redirections of the three standard streams ([`super::posix_shell_files`]);
+//! * the TEXT FILTERS ([`super::posix_shell_text_filters`]);
+//! * the `test` questions about values alone ([`value_test_answer`]);
+//! * the in-memory TREE a machine's files are held in ([`super::posix_shell_volume`]).
+//!
+//! Nothing new should restate any of those — call these modules. A new session needs only its
+//! own walk, and only where the one here cannot serve it.
 
 use std::collections::BTreeMap;
 
 use super::posix_shell_arithmetic::{self, ArithmeticVariables};
+use super::posix_shell_files::{
+    self, AppliedRedirect, FileRefusal, Redirections, ShellFiles,
+};
 use super::posix_shell_text_filters::{Filter, STANDARD_INPUT_LABEL, TEXT_FILTER_COMMANDS};
 use super::posix_shell_volume::ShellVolume;
-
-/// Where one command's standard output, standard error and standard input were REDIRECTED
-/// to, for the command being performed.
-///
-/// Every session performs a redirection of standard output into the tree it writes; the
-/// other two are performed only by a session given a MACHINE's tree
-/// ([`ShellSession::in_volume`]), whose program is the one that reports on another
-/// descriptor and reads a file back.
-#[derive(Debug, Clone, Default)]
-struct Redirections {
-    /// The path standard output goes to, and whether it is APPENDED to.
-    out: Option<(String, bool)>,
-    /// The path standard error goes to, and whether it is APPENDED to.
-    error: Option<(String, bool)>,
-    /// The path standard input is read from.
-    input: Option<String>,
-    /// The TEXT standard input carries, for a command whose input is written inside the
-    /// command itself: a here-document (`<<WORD`, `<<-WORD`) or a here-string (`<<<WORD`).
-    /// It is the input itself rather than a path, so nothing of the tree is read for it.
-    input_text: Option<String>,
-    /// Set by `2>&1`: standard error goes wherever standard OUTPUT goes for this command,
-    /// which is how a program asks for its diagnostics on the one stream its caller reads.
-    error_to_out: bool,
-    /// Set by `1>&2`: the same the other way round.
-    out_to_error: bool,
-}
 
 /// The commands a session provides, as their names.
 ///
@@ -621,17 +611,6 @@ fn within_parse_bounds(line: &str, bounds: &Bounds) -> bool {
     grouped.saturating_add(worded) <= bounds.nesting
 }
 
-/// The file descriptor a command's own writes go to, which every session performs a
-/// redirection of.
-const STANDARD_OUTPUT: i32 = 1;
-
-/// The descriptor a command reports what it could not do on, and the one it reads from: the
-/// two a session given a MACHINE's tree performs a redirection of too.
-const STANDARD_ERROR: i32 = 2;
-
-/// See [`STANDARD_ERROR`].
-const STANDARD_INPUT: i32 = 0;
-
 /// What one command SUBSTITUTION, or one redirected command, has captured so far.
 #[derive(Debug, Default)]
 struct Capture {
@@ -747,6 +726,77 @@ impl ProgramFiles for SessionFiles<'_> {
 
     fn make_directories(&mut self, path: &str) -> bool {
         self.session.tree_make_directories(path)
+    }
+}
+
+/// The same files, as the SEAM the shared file utilities reach them through
+/// ([`posix_shell_files::ShellFiles`]) — so what `cat`, `ls`, `mkdir`, `touch` and `rm` do and
+/// SAY is written once for every session in this workspace, and what differs is only where
+/// the files are.
+///
+/// A refusal is reported as the error the tree's answer stands for: this tree answers a write
+/// or a removal with whether it happened, and a path it will not take one for is the
+/// `No such file or directory` a session has always reported for it. It keeps no mode, owner
+/// or modification time, so it reports no [`posix_shell_files::FileEntry`] — which is what
+/// makes a long listing a form these sessions do not perform.
+impl ShellFiles for SessionFiles<'_> {
+    fn read(&self, path: &str) -> Result<String, FileRefusal> {
+        self.session.read_path(path).ok_or(FileRefusal::NotFound)
+    }
+
+    fn write(&mut self, path: &str, text: &str, append: bool) -> Result<(), FileRefusal> {
+        if self.session.write_path(path, text, append) {
+            Ok(())
+        } else {
+            Err(FileRefusal::NotFound)
+        }
+    }
+
+    fn make_directories(&mut self, path: &str) -> Result<(), FileRefusal> {
+        if self.session.tree_make_directories(path) {
+            Ok(())
+        } else {
+            Err(FileRefusal::NotFound)
+        }
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<(), FileRefusal> {
+        if self.session.tree_holds_directory(path) {
+            return Err(FileRefusal::IsADirectory);
+        }
+        if self.session.tree_remove_file(path) {
+            Ok(())
+        } else {
+            Err(FileRefusal::NotFound)
+        }
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        self.session.tree_holds(path)
+    }
+
+    fn is_file(&self, path: &str) -> bool {
+        self.session.tree_holds_file(path)
+    }
+
+    fn is_directory(&self, path: &str) -> bool {
+        self.session.tree_holds_directory(path)
+    }
+
+    fn writable(&self, path: &str) -> bool {
+        // This tree takes a write to any path it accepts at all, so what `-w` asks about is
+        // whether it holds it.
+        self.session.tree_holds(path)
+    }
+
+    fn entry_names(&self, path: &str) -> Vec<String> {
+        self.session.tree_entry_names(path)
+    }
+
+    fn keeps_directories(&self) -> bool {
+        // A session's OWN tree keys a file by its whole path and holds no directory entry, so
+        // every directory above a file exists already; a MACHINE's tree holds them.
+        self.session.volume.is_some()
     }
 }
 
@@ -1370,27 +1420,24 @@ impl ShellSession {
     /// One redirection of a simple command, recorded in `redirections` — `false` for a form
     /// this session does not perform.
     ///
-    /// Every session performs the output redirections of standard output: `> path` writes the
-    /// file from the start and `>> path` adds to what it holds ("the file shall be opened for
-    /// appending"), and `>|` is `>` with the no-clobber option off. A session given a
-    /// MACHINE's tree performs the other descriptors a machine's program redirects too —
-    /// standard error to a file or a device (`2>`, `2>>`), standard input from one (`<`), and
-    /// the HERE-DOCUMENT and HERE-STRING forms, whose text is written inside the command
-    /// itself: `<<WORD` — with `<<-WORD` stripping the leading tabs off each of its lines —
-    /// and `<<<WORD` are the command's standard input, which is how a machine's program writes
-    /// a document it was given into a file. A document whose delimiter was QUOTED
-    /// (`<<'WORD'`) is taken literally, and an unquoted one is expanded, as the shell
-    /// specifies.
-    /// A duplication of one standard stream onto the other (`2>&1`, `1>&2`) is performed by
-    /// every session, which is how a program asks for its diagnostics on the one stream its
-    /// caller reads. A read-write open, a duplication of any other descriptor and a descriptor
-    /// other than 0, 1 and 2 are forms no session performs.
+    /// WHICH forms are read is the shared reading of a redirection node
+    /// ([`AppliedRedirect::of`]); which of them this SESSION performs is its own: every
+    /// session performs the output redirections of standard output and the duplication of one
+    /// standard stream onto the other, while standard error to a file and standard input from
+    /// one are a MACHINE program's forms, so only a session given a machine's tree performs
+    /// them.
+    ///
+    /// A session given a machine's tree also performs the HERE-DOCUMENT and HERE-STRING
+    /// forms, whose text is written inside the command itself: `<<WORD` — with `<<-WORD`
+    /// stripping the leading tabs off each of its lines — and `<<<WORD` are the command's
+    /// standard input, which is how a machine's program writes a document it was given into a
+    /// file. A document whose delimiter was QUOTED (`<<'WORD'`) is taken literally, and an
+    /// unquoted one is expanded, as the shell specifies.
     fn apply_redirect(
         &mut self,
         redirect: &::brush_parser::ast::IoRedirect,
         redirections: &mut Redirections,
     ) -> bool {
-        use ::brush_parser::ast::IoFileRedirectKind as Kind;
         let machine = self.volume.is_some();
         if let Some(text) = self.here_document(redirect) {
             // A here-document reaches the descriptor a `<` does, so it is a form a session
@@ -1401,50 +1448,31 @@ impl ShellSession {
             redirections.input_text = Some(text);
             return true;
         }
-        let ::brush_parser::ast::IoRedirect::File(fd, kind, target) = redirect else {
+        let ::brush_parser::ast::IoRedirect::File(descriptor, kind, target) = redirect else {
             return false;
         };
-        // A DUPLICATION names a descriptor rather than a file, however the grammar spelled
-        // it: `2>&1` and `1>&2` are the only two a session performs, because the two
-        // standard streams are the only descriptors it has.
-        if matches!(kind, Kind::DuplicateOutput) {
-            let duplicated = match target {
-                ::brush_parser::ast::IoFileRedirectTarget::Duplicate(word)
-                | ::brush_parser::ast::IoFileRedirectTarget::Filename(word) => self
-                    .expand_word(&word.value)
-                    .and_then(|named| named.parse().ok()),
-                _ => None,
-            };
-            match (fd.unwrap_or(STANDARD_OUTPUT), duplicated) {
-                (STANDARD_ERROR, Some(STANDARD_OUTPUT)) => redirections.error_to_out = true,
-                (STANDARD_OUTPUT, Some(STANDARD_ERROR)) => redirections.out_to_error = true,
-                _ => return false,
-            }
-            return true;
-        }
-        let ::brush_parser::ast::IoFileRedirectTarget::Filename(word) = target else {
-            return false;
-        };
-        let Some(path) = self.expand_word(&word.value) else {
-            return false;
-        };
-        match kind {
-            Kind::Read => {
-                if !machine || fd.unwrap_or(0) != STANDARD_INPUT {
-                    return false;
-                }
-                redirections.input = Some(path);
-            }
-            Kind::Write | Kind::Clobber | Kind::Append => {
-                let append = matches!(kind, Kind::Append);
-                match fd.unwrap_or(STANDARD_OUTPUT) {
-                    STANDARD_OUTPUT => redirections.out = Some((path, append)),
-                    STANDARD_ERROR if machine => redirections.error = Some((path, append)),
-                    _ => return false,
+        let expanded = match target {
+            ::brush_parser::ast::IoFileRedirectTarget::Duplicate(word)
+            | ::brush_parser::ast::IoFileRedirectTarget::Filename(word) => {
+                match self.expand_word(&word.value) {
+                    Some(expanded) => expanded,
+                    None => return false,
                 }
             }
-            Kind::ReadAndWrite | Kind::DuplicateInput | Kind::DuplicateOutput => return false,
+            _ => return false,
+        };
+        let Some(applied) = AppliedRedirect::of(*descriptor, kind, &expanded) else {
+            return false;
+        };
+        if !machine
+            && matches!(
+                applied,
+                AppliedRedirect::Input(_) | AppliedRedirect::Error(..)
+            )
+        {
+            return false;
         }
+        applied.record(redirections);
         true
     }
 
@@ -2006,7 +2034,7 @@ impl ShellSession {
                     self.config.statuses.failure
                 }
             }
-            "cat" => self.run_cat(arguments, redirections),
+            "cat" => self.run_files_command(name, arguments, redirections),
             "true" | ":" => self.config.statuses.success,
             "false" => self.config.statuses.failure,
             "exit" => {
@@ -2069,18 +2097,65 @@ impl ShellSession {
         redirections: &Redirections,
     ) -> i32 {
         match name {
-            "cat" => self.run_cat(arguments, redirections),
+            // The utilities that work over the session's FILES are the shared reading of them
+            // ([`super::posix_shell_files`]), performed over this session's own tree.
+            name if posix_shell_files::FILE_COMMANDS.contains(&name) => {
+                self.run_files_command(name, arguments, redirections)
+            }
             "printf" => self.run_printf(arguments, redirections),
-            "mkdir" => self.run_mkdir(arguments, redirections),
-            "touch" => self.run_touch(arguments, redirections),
-            "rm" => self.run_remove(arguments, redirections),
-            "ls" => self.run_list(arguments, redirections),
             TEE_COMMAND => self.run_tee(arguments, redirections),
             "test" | "[" => self.run_test(name, arguments),
             "sh" | "bash" => self.run_nested_program(arguments, redirections),
             "." | "source" => self.run_dot(arguments, redirections),
             "sleep" => self.run_sleep(arguments, redirections),
             _ => self.config.statuses.could_not_run,
+        }
+    }
+
+    /// Perform one of the FILE utilities ([`posix_shell_files::FILE_COMMANDS`]) over this
+    /// session's tree, and write what it produced through this session's own streams.
+    ///
+    /// WHAT each utility does and SAYS is the shared reading of it; what the session adds is
+    /// where its files are ([`SessionFiles`]) and where its two streams go. `cat` with no
+    /// operand reads STANDARD INPUT, which only the session can resolve — the file one was
+    /// redirected from, or what the stage before it in a pipeline wrote.
+    fn run_files_command(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        redirections: &Redirections,
+    ) -> i32 {
+        let reads_input = name == "cat" && !posix_shell_files::names_an_operand(arguments);
+        let input = if reads_input {
+            match self.read_standard_input(name, redirections) {
+                Ok(input) => Some(input),
+                Err(status) => return status,
+            }
+        } else {
+            None
+        };
+        let performed = {
+            let mut files = SessionFiles { session: self };
+            posix_shell_files::perform_file_command(
+                name,
+                arguments,
+                &mut files,
+                input.as_deref(),
+            )
+        };
+        let Some(outcome) = performed else {
+            return self.config.statuses.could_not_run;
+        };
+        if !outcome.errors.is_empty() {
+            let _ = self.write_stderr(&outcome.errors, redirections);
+        }
+        if !outcome.output.is_empty() && !self.write_stdout(&outcome.output, redirections) {
+            return self.config.statuses.failure;
+        }
+        if outcome.succeeded {
+            self.config.statuses.success
+        } else {
+            self.config.statuses.failure
         }
     }
 
@@ -2186,57 +2261,6 @@ impl ShellSession {
         self.config.statuses.success
     }
 
-    /// `cat`: the contents of each file named, in order, on standard output.
-    ///
-    /// Read out of the tree this session reads ([`Self::read_path`]), so a session given a
-    /// machine's tree reads that machine's files and every other session reads its own. "cat
-    /// … shall exit with a value >0 if an error occurred", and a path the tree holds no file
-    /// for is one this session could not read: it is reported on standard error in the
-    /// utility's own wording and the command answers failure, without stopping the files
-    /// after it.
-    ///
-    /// With no file named it reads STANDARD INPUT: the file one was redirected from, or what
-    /// the stage before it in a pipeline wrote ([`Self::standard_input`]). A session with
-    /// neither has no terminal to read, so that form is one it does not perform.
-    fn run_cat(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
-        let paths: Vec<String> = arguments
-            .iter()
-            .filter(|argument| !argument.starts_with('-'))
-            .cloned()
-            .collect();
-        if paths.is_empty() {
-            let input = match self.read_standard_input("cat", redirections) {
-                Ok(input) => input,
-                Err(status) => return status,
-            };
-            return if self.write_stdout(&input, redirections) {
-                self.config.statuses.success
-            } else {
-                self.config.statuses.failure
-            };
-        }
-        let mut status = self.config.statuses.success;
-        for path in paths {
-            // The tree answers a read only for what can be read: a file of its own, or a
-            // device that discards what is written to it (and so has nothing to give back).
-            match self.read_path(&path) {
-                Some(contents) => {
-                    if !self.write_stdout(&contents, redirections) {
-                        status = self.config.statuses.failure;
-                    }
-                }
-                None => {
-                    let _ = self.write_stderr(
-                        &format!("cat: {path}: No such file or directory\n"),
-                        redirections,
-                    );
-                    status = self.config.statuses.failure;
-                }
-            }
-        }
-        status
-    }
-
     /// `tee`: "copy standard input to each OUTPUT FILE and also to standard output".
     ///
     /// What it reads is its standard input ([`Self::read_standard_input`]) — a here-document,
@@ -2299,182 +2323,6 @@ impl ShellSession {
         }
     }
 
-    /// `mkdir`: the directories named, with the ones above them when `-p` asks for it.
-    fn run_mkdir(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
-        let parents = arguments.iter().any(|argument| argument == "-p");
-        let mut status = self.config.statuses.success;
-        for path in arguments
-            .iter()
-            .filter(|argument| !argument.starts_with('-'))
-            .cloned()
-            .collect::<Vec<String>>()
-        {
-            if self.tree_holds_directory(&path) {
-                if !parents {
-                    let _ = self.write_stderr(
-                        &format!("mkdir: cannot create directory '{path}': File exists\n"),
-                        redirections,
-                    );
-                    status = self.config.statuses.failure;
-                }
-                continue;
-            }
-            // Without `-p` a machine makes ONE directory, so the one above it has to be
-            // there already. A tree that holds no directory entry of its own has every
-            // path above it already ([`Self::tree_holds_directory`]).
-            let has_parent = self.volume.is_none()
-                || path.rsplit_once('/').is_none_or(|(parent, _)| {
-                    self.tree_holds_directory(if parent.is_empty() { "/" } else { parent })
-                });
-            if (!parents && !has_parent) || !self.tree_make_directories(&path) {
-                let _ = self.write_stderr(
-                    &format!("mkdir: cannot create directory '{path}': No such file or directory\n"),
-                    redirections,
-                );
-                status = self.config.statuses.failure;
-            }
-        }
-        status
-    }
-
-    /// `touch`: an empty file where the tree holds none, and nothing at all where it already
-    /// holds one — this session keeps no modification time to move.
-    fn run_touch(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
-        let mut status = self.config.statuses.success;
-        for path in arguments
-            .iter()
-            .filter(|argument| !argument.starts_with('-'))
-            .cloned()
-            .collect::<Vec<String>>()
-        {
-            if self.tree_holds(&path) {
-                continue;
-            }
-            if !self.write_path(&path, "", false) {
-                let _ = self.write_stderr(
-                    &format!("touch: cannot touch '{path}': No such file or directory\n"),
-                    redirections,
-                );
-                status = self.config.statuses.failure;
-            }
-        }
-        status
-    }
-
-    /// `rm`: the files named removed from the tree. A file that is not there is the
-    /// utility's own failure unless `-f` was given, and a directory is not removed by this
-    /// command at all.
-    fn run_remove(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
-        let forced = arguments
-            .iter()
-            .any(|argument| argument.starts_with('-') && argument.contains('f'));
-        let mut status = self.config.statuses.success;
-        for path in arguments
-            .iter()
-            .filter(|argument| !argument.starts_with('-'))
-            .cloned()
-            .collect::<Vec<String>>()
-        {
-            if self.tree_holds_directory(&path) {
-                let _ = self.write_stderr(
-                    &format!("rm: cannot remove '{path}': Is a directory\n"),
-                    redirections,
-                );
-                status = self.config.statuses.failure;
-                continue;
-            }
-            if !self.tree_remove_file(&path) && !forced {
-                let _ = self.write_stderr(
-                    &format!("rm: cannot remove '{path}': No such file or directory\n"),
-                    redirections,
-                );
-                status = self.config.statuses.failure;
-            }
-        }
-        status
-    }
-
-    /// `ls`: the names the tree holds at the paths the command was given, one per line.
-    ///
-    /// "For each operand that names a file of a type other than directory … `ls` shall write
-    /// the name of the file"; for one that names a directory it writes "the names of files
-    /// contained within" it, and "if no operands are given, the contents of the current
-    /// directory shall be written" — which is the tree's own root here, the directory every
-    /// path of this tree is relative to. Several operands are written as blocks separated by a
-    /// blank line, each directory's block headed by its own path, and the names are sorted,
-    /// which is the order this utility is specified to write them in.
-    ///
-    /// An operand the tree holds nothing at is reported on standard error in the utility's own
-    /// wording and leaves the command answering failure, the way the file utilities beside it
-    /// report one. Every option but `-1` — which asks for the one-name-per-line form this
-    /// command already writes — is a form this session does not perform: a long listing's
-    /// modes, owners and sizes are facts no tree here holds.
-    fn run_list(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
-        let mut operands: Vec<String> = Vec::new();
-        for argument in arguments {
-            if argument == "-1" {
-                continue;
-            }
-            if argument.len() > 1 && argument.starts_with('-') {
-                return self.config.statuses.could_not_run;
-            }
-            operands.push(argument.clone());
-        }
-        operands.sort();
-        let mut status = self.config.statuses.success;
-        let mut blocks: Vec<String> = Vec::new();
-        if operands.is_empty() {
-            blocks.push(self.listed_names(""));
-        } else {
-            // A file operand is written as the caller spelled it, and all of them together
-            // make the first block — the order `ls` writes a mixed list of operands in.
-            let mut named = String::new();
-            let mut directories: Vec<(String, String)> = Vec::new();
-            for path in &operands {
-                if self.tree_holds_directory(path) {
-                    let names = self.listed_names(path);
-                    directories.push((path.clone(), names));
-                } else if self.tree_holds(path) {
-                    named.push_str(path);
-                    named.push('\n');
-                } else {
-                    let _ = self.write_stderr(
-                        &format!("ls: cannot access '{path}': No such file or directory\n"),
-                        redirections,
-                    );
-                    status = self.config.statuses.failure;
-                }
-            }
-            let headed = operands.len() > 1;
-            if !named.is_empty() {
-                blocks.push(named);
-            }
-            for (path, names) in directories {
-                if headed {
-                    blocks.push(format!("{path}:\n{names}"));
-                } else {
-                    blocks.push(names);
-                }
-            }
-        }
-        // Each block already ends in a newline, so joining them with one leaves the blank
-        // line `ls` separates two blocks with.
-        let written = blocks.join("\n");
-        if !written.is_empty() && !self.write_stdout(&written, redirections) {
-            return self.config.statuses.failure;
-        }
-        status
-    }
-
-    /// The names directly under the directory `path` names, one per line — what [`Self::run_list`]
-    /// writes for a directory operand.
-    fn listed_names(&self, path: &str) -> String {
-        self.tree_entry_names(path)
-            .into_iter()
-            .map(|name| format!("{name}\n"))
-            .collect()
-    }
-
     /// `test` / `[`: the question its arguments ask, answered as a status — success for
     /// true, failure for false.
     ///
@@ -2512,21 +2360,16 @@ impl ShellSession {
     /// [`Self::run_test`]'s reading of the question, or `None` for a form it does not
     /// answer.
     ///
-    /// The questions about the TREE are this session's own, because only a session holding
-    /// one can answer them; the questions about VALUES are the same wherever the utility is
-    /// performed, so they are read by the shared [`value_test_answer`].
-    fn test_answer(&self, arguments: &[String]) -> Option<bool> {
-        if let [operator, value] = arguments {
-            match operator.as_str() {
-                "-e" => return Some(self.tree_holds(value)),
-                "-f" => return Some(self.tree_holds_file(value)),
-                "-d" => return Some(self.tree_holds_directory(value)),
-                "-s" => return Some(self.read_path(value).is_some_and(|held| !held.is_empty())),
-                "-r" | "-w" => return Some(self.tree_holds(value)),
-                _ => {}
-            }
-        }
-        value_test_answer(arguments)
+    /// The questions about a FILE are the shared reading of them
+    /// ([`posix_shell_files::file_test_answer`]) over this session's own tree, and the
+    /// questions about VALUES are the same wherever the utility is performed
+    /// ([`value_test_answer`]).
+    fn test_answer(&mut self, arguments: &[String]) -> Option<bool> {
+        let answered = {
+            let files = SessionFiles { session: self };
+            posix_shell_files::file_test_answer(arguments, &files)
+        };
+        answered.or_else(|| value_test_answer(arguments))
     }
 
     /// `sh -c PROGRAM` (and `bash -c`), and `sh FILE`: the program performed in THIS

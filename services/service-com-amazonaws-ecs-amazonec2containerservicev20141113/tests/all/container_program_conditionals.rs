@@ -164,6 +164,16 @@ const ROWS: &[Row] = &[
         program: "D='{a,b}'; case \"$D\" in \"{a,b}\") exit 28;; *) exit 81;; esac",
         exit_code: 28,
     },
+    Row {
+        case: "a `[` question about a file the container's filesystem holds nothing at",
+        program: "[ -f /etc/passwd ] && exit 31; exit 32",
+        exit_code: 32,
+    },
+    Row {
+        case: "a `case` branch that reads a path the container's filesystem holds nothing at",
+        program: "V=a; case \"$V\" in a) cat /etc/passwd;; esac; exit 34",
+        exit_code: 34,
+    },
 ];
 
 /// The rows whose program reaches a form this container performs nothing of, so the
@@ -176,18 +186,8 @@ const UNPERFORMED: &[Row] = &[
         exit_code: 0,
     },
     Row {
-        case: "a `[` question about a file, which needs a filesystem",
-        program: "[ -f /etc/passwd ] && exit 31; exit 32",
-        exit_code: 0,
-    },
-    Row {
         case: "a `for` loop, a compound form this container does not perform",
         program: "for name in one two; do echo $name; done; exit 33",
-        exit_code: 0,
-    },
-    Row {
-        case: "a `case` branch that reaches a utility the container has no program for",
-        program: "V=a; case \"$V\" in a) cat /etc/passwd;; esac; exit 34",
         exit_code: 0,
     },
 ];

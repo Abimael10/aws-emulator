@@ -381,6 +381,13 @@ pub struct HealthProbeLaunch {
     environment: BTreeMap<String, String>,
     /// How long it may take before it is the failure `HealthCheck$timeout` documents.
     timeout: Duration,
+    /// The volumes mounted into the container, for the same reason the environment is the
+    /// container's: the probe runs INSIDE the container, so the paths its command names are
+    /// the container's own ([`super::container_volumes`]).
+    mounts: Vec<MountRequest>,
+    /// `ContainerDefinition$workingDirectory`, which the probe's relative paths are resolved
+    /// against — the container's own, for the same reason.
+    working_directory: Option<String>,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -448,8 +455,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ) -> Vec<HealthProbeLaunch> {
         self.forget_abandoned_health_probes();
         let mut in_flight = self.health_probes_in_flight();
-        let mut due: Vec<(String, ContainerProgram, BTreeMap<String, String>, Duration)> =
-            Vec::new();
+        let mut due: Vec<HealthProbeLaunch> = Vec::new();
         // Every container whose instant this pass CONSUMED, launched or not: each has its
         // next execution scheduled below, which is what keeps the clock's wait in the future.
         let mut consumed: Vec<String> = Vec::new();
@@ -491,26 +497,34 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     continue;
                 };
                 // The probe runs INSIDE the container, so it sees the container's own
-                // environment (`KeyValuePair` entries of the definition it was minted from).
-                let environment = definition
-                    .and_then(|definition| {
-                        definition.container_definitions.iter().find(|candidate| {
-                            candidate.name.is_some() && candidate.name == container.name
-                        })
+                // environment (`KeyValuePair` entries of the definition it was minted from),
+                // and the volumes that definition mounts into it.
+                let stored = definition.and_then(|definition| {
+                    definition.container_definitions.iter().find(|candidate| {
+                        candidate.name.is_some() && candidate.name == container.name
                     })
+                });
+                let environment = stored
                     .map(|stored| health_probe_environment(stored.environment.as_deref()))
                     .unwrap_or_default();
+                let mounts = match (definition, stored) {
+                    (Some(definition), Some(stored)) => mount_requests(definition, stored, task),
+                    _ => Vec::new(),
+                };
                 in_flight += 1;
-                due.push((
-                    container.container_arn.clone(),
+                due.push(HealthProbeLaunch {
+                    container_arn: container.container_arn.clone(),
                     program,
                     environment,
-                    health.timeout,
-                ));
+                    timeout: health.timeout,
+                    mounts,
+                    working_directory: stored
+                        .and_then(|stored| stored.working_directory.clone()),
+                });
             }
         }
         let launched: ::std::collections::HashSet<String> =
-            due.iter().map(|(arn, ..)| arn.clone()).collect();
+            due.iter().map(|probe| probe.container_arn.clone()).collect();
         for container_arn in consumed {
             let taken = launched.contains(&container_arn);
             if let Some(health) = self.container_health_mut(&container_arn) {
@@ -529,16 +543,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 });
             }
         }
-        due.into_iter()
-            .map(
-                |(container_arn, program, environment, timeout)| HealthProbeLaunch {
-                    container_arn,
-                    program,
-                    environment,
-                    timeout,
-                },
-            )
-            .collect()
+        due
     }
 
     /// Abort and forget the probe of every container that is no longer being probed: one
@@ -791,7 +796,14 @@ pub fn settle_container_health<Eng: Send + Sync + 'static>(
         let container_arn = probe.container_arn.clone();
         let probe_state = ::engine::ServiceState::clone(&state);
         let callback = callback.clone();
-        let handle = runtime.spawn(async move { run_health_probe(probe_state, callback, probe).await });
+        // Resolved with NO guard of this store held, exactly as a container's own run
+        // resolves its mounts ([`super::container_runtime::settle_container_runtime`]).
+        let filesystem = ContainerFilesystem::new(
+            probe.working_directory.as_deref(),
+            mounted_volumes(&**engine, &state, &probe.mounts),
+        );
+        let handle = runtime
+            .spawn(async move { run_health_probe(probe_state, callback, probe, filesystem).await });
         // The handle is kept with the container's health record, so a probe whose container
         // is gone is aborted rather than merely forgotten.
         state.lock().attach_health_probe(&container_arn, handle);
@@ -811,13 +823,14 @@ async fn run_health_probe(
     state: ::engine::ServiceState<ComAmazonawsEcsAmazonec2containerservicev20141113State>,
     callback: ::smithy_server_runtime::EmbeddedEmulator,
     probe: HealthProbeLaunch,
+    filesystem: ContainerFilesystem,
 ) {
     let output = Arc::new(ContainerOutput::new(&callback, None));
     // The probe answers no signal: `StopTask` stops the container, and the probe is bounded
     // by the `timeout` its own member documents.
     let signals = Arc::new(ContainerSignals::new());
     let deadline = Instant::now() + probe.timeout;
-    let mut shell = ContainerShell::new(probe.environment, output, signals, deadline);
+    let mut shell = ContainerShell::new(probe.environment, output, signals, deadline, filesystem);
     let program = probe.program;
     let outcome = ::tokio::time::timeout(probe.timeout, async move { shell.run(&program).await })
         .await

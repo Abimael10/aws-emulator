@@ -27,6 +27,16 @@
 //! * DIRECTORIES, so a write to a path whose directory the machine does not have fails the
 //!   way it fails on a machine rather than silently inventing the tree.
 //!
+//! # What a listing of it reports
+//!
+//! A program asks what the tree HOLDS as well as what is in a file: a long listing names
+//! what each entry is, how many bytes it holds and when it was last written
+//! ([`ShellVolume::facts`]), and a listing of a directory names the entries directly under
+//! it ([`ShellVolume::entry_names`]). Those are facts of the tree itself — the entry's own
+//! kind, the bytes it holds and the instant a write of it happened — so they are kept here
+//! beside the contents rather than computed by whoever reports them; how a caller WORDS a
+//! listing is the caller's, because the form belongs to the utility it stands for.
+//!
 //! # Bounds
 //!
 //! Every write is bounded by [`VolumeLimits`], held here rather than in the program's
@@ -36,6 +46,7 @@
 //! this process without a stated ceiling.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::SystemTime;
 
 /// How much one volume may hold. Every field is the EMULATOR's number: the programs are
 /// caller-supplied text, so what one of them can store is bounded here.
@@ -81,6 +92,30 @@ enum Device {
     Discard,
 }
 
+/// What one entry of a tree IS — which is the first thing a long listing of it reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A regular file: something with contents a program reads and writes.
+    File,
+    /// A directory: something that holds the names of the entries under it.
+    Directory,
+    /// A device, which a program writes to rather than keeps bytes in.
+    Device,
+}
+
+/// One entry of a tree as a long listing reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryFacts {
+    /// What the entry is.
+    pub kind: EntryKind,
+    /// How many bytes it holds: a file's contents, and for a directory the names it holds,
+    /// which is what a directory's own bytes are.
+    pub size: usize,
+    /// When this entry was last written — a write of the entry itself, and for a directory
+    /// the creation or removal of something under it, which is what changes a directory.
+    pub modified: SystemTime,
+}
+
 /// The tree one session's commands read and write. See the module docs.
 #[derive(Debug, Clone)]
 pub struct ShellVolume {
@@ -92,6 +127,10 @@ pub struct ShellVolume {
     directories: BTreeSet<String>,
     /// The devices the tree has, by absolute path.
     devices: BTreeMap<String, Device>,
+    /// When each entry of the tree was last written, by absolute path — what
+    /// [`EntryFacts::modified`] reports. An entry is recorded here as it is written, so the
+    /// instant is the one the write happened at rather than one computed afterwards.
+    modified: BTreeMap<String, SystemTime>,
     /// How many bytes the files come to, kept as they are written rather than recomputed.
     held_bytes: usize,
     limits: VolumeLimits,
@@ -106,6 +145,48 @@ impl Default for ShellVolume {
 /// The directory every tree has, which every absolute path is resolved against.
 pub const ROOT: &str = "/";
 
+/// `path` with the empty, `.` and `..` segments a path may carry resolved, as a process
+/// resolves an ABSOLUTE path — and `None` for a path that is not absolute at all, which a
+/// caller resolves against its own working directory first.
+///
+/// `..` above the root resolves to the root, as it does on a machine, which is also what keeps
+/// a path under a mount point from climbing out of what is mounted there.
+///
+/// The one reading of that rule in this workspace: [`ShellVolume::resolve`] is this with the
+/// tree's own path bound applied, and a caller that has to resolve a path BEFORE it knows
+/// which tree holds it calls this.
+#[must_use]
+pub fn resolved_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            named => segments.push(named),
+        }
+    }
+    if segments.is_empty() {
+        return Some(ROOT.to_string());
+    }
+    Some(format!("/{}", segments.join("/")))
+}
+
+/// The directory the resolved `path` lies in, and `None` for a path with no directory above
+/// it — the ROOT itself, which lies in no directory.
+#[must_use]
+pub fn parent_path(path: &str) -> Option<String> {
+    let (parent, _) = path.trim_end_matches('/').rsplit_once('/')?;
+    if parent.is_empty() {
+        return Some(ROOT.to_string());
+    }
+    Some(parent.to_string())
+}
+
 impl ShellVolume {
     /// An empty tree — the root directory and nothing else — bounded by `limits`.
     #[must_use]
@@ -115,45 +196,27 @@ impl ShellVolume {
             sealed: BTreeSet::new(),
             directories: BTreeSet::from([ROOT.to_string()]),
             devices: BTreeMap::new(),
+            modified: BTreeMap::from([(ROOT.to_string(), SystemTime::now())]),
             held_bytes: 0,
             limits,
         }
     }
 
     /// `path` as this tree resolves it: absolute, with the empty, `.` and `..` segments a
-    /// path may carry resolved, or `None` for a path this tree does not accept — a relative
-    /// one (a session has no working directory of its own), or one past
+    /// path may carry resolved ([`resolved_path`]), or `None` for a path this tree does not
+    /// accept — a relative one (a session has no working directory of its own), or one past
     /// [`VolumeLimits::path_bytes`].
-    ///
-    /// `..` above the root resolves to the root, as it does on a machine.
     #[must_use]
     pub fn resolve(&self, path: &str) -> Option<String> {
-        if path.len() > self.limits.path_bytes || !path.starts_with('/') {
+        if path.len() > self.limits.path_bytes {
             return None;
         }
-        let mut segments: Vec<&str> = Vec::new();
-        for segment in path.split('/') {
-            match segment {
-                "" | "." => {}
-                ".." => {
-                    segments.pop();
-                }
-                named => segments.push(named),
-            }
-        }
-        if segments.is_empty() {
-            return Some(ROOT.to_string());
-        }
-        Some(format!("/{}", segments.join("/")))
+        resolved_path(path)
     }
 
     /// The directory `path` lies in, or `None` for the root itself.
     fn parent_of(path: &str) -> Option<String> {
-        let (parent, _) = path.rsplit_once('/')?;
-        if parent.is_empty() {
-            return Some(ROOT.to_string());
-        }
-        Some(parent.to_string())
+        parent_path(path)
     }
 
     /// Seed a file a program may read and WRITE, with the directories above it — what the
@@ -190,7 +253,8 @@ impl ShellVolume {
     pub fn add_keeping_device(&mut self, path: &str) {
         if let Some(resolved) = self.resolve(path) {
             self.make_directories_of(&resolved);
-            self.devices.insert(resolved, Device::Keep(Vec::new()));
+            self.devices.insert(resolved.clone(), Device::Keep(Vec::new()));
+            self.record_written(&resolved);
         }
     }
 
@@ -199,7 +263,8 @@ impl ShellVolume {
     pub fn add_discarding_device(&mut self, path: &str) {
         if let Some(resolved) = self.resolve(path) {
             self.make_directories_of(&resolved);
-            self.devices.insert(resolved, Device::Discard);
+            self.devices.insert(resolved.clone(), Device::Discard);
+            self.record_written(&resolved);
         }
     }
 
@@ -227,8 +292,26 @@ impl ShellVolume {
         if self.directories.len().saturating_add(made.len()) > self.limits.directories {
             return false;
         }
+        for directory in &made {
+            self.record_written(directory);
+        }
         self.directories.extend(made);
         true
+    }
+
+    /// Record `path` as written NOW, which is what [`EntryFacts::modified`] reports for it.
+    fn record_written(&mut self, path: &str) {
+        self.modified.insert(path.to_string(), SystemTime::now());
+    }
+
+    /// Record the directory `path` lies in as written, which is what creating or removing
+    /// something under a directory does to that directory.
+    fn record_parent_written(&mut self, path: &str) {
+        if let Some(parent) = Self::parent_of(path) {
+            if self.directories.contains(&parent) {
+                self.record_written(&parent);
+            }
+        }
     }
 
     /// The directories above `path`, made as far as the bounds allow. Used where a seed the
@@ -324,12 +407,17 @@ impl ShellVolume {
             return false;
         }
         self.held_bytes = would_hold;
+        let created = held.is_none();
         match self.files.get_mut(resolved) {
             Some(file) if append => file.push_str(contents),
             Some(file) => *file = contents.to_string(),
             None => {
                 self.files.insert(resolved.to_string(), contents.to_string());
             }
+        }
+        self.record_written(resolved);
+        if created {
+            self.record_parent_written(resolved);
         }
         true
     }
@@ -362,6 +450,7 @@ impl ShellVolume {
             }
             lines.push(line);
         }
+        self.record_written(resolved);
         true
     }
 
@@ -380,10 +469,85 @@ impl ShellVolume {
                 self.held_bytes = self
                     .held_bytes
                     .saturating_sub(contents.len().saturating_add(resolved.len()));
+                self.modified.remove(&resolved);
+                self.record_parent_written(&resolved);
                 true
             }
             None => false,
         }
+    }
+
+    /// What the tree holds at `path`, as a long listing of it reports that entry — and
+    /// `None` for a path the tree holds nothing at.
+    ///
+    /// A FILE's size is the bytes it holds. A DIRECTORY holds the names of the entries under
+    /// it, so its size is the bytes those names come to. A DEVICE keeps no bytes of its own,
+    /// so its size is none.
+    #[must_use]
+    pub fn facts(&self, path: &str) -> Option<EntryFacts> {
+        let resolved = self.resolve(path)?;
+        let (kind, size) = if let Some(contents) = self.files.get(&resolved) {
+            (EntryKind::File, contents.len())
+        } else if self.directories.contains(&resolved) {
+            let held = self
+                .entry_names(&resolved)
+                .iter()
+                .map(|name| name.len())
+                .sum();
+            (EntryKind::Directory, held)
+        } else if self.devices.contains_key(&resolved) {
+            (EntryKind::Device, 0)
+        } else {
+            return None;
+        };
+        Some(EntryFacts {
+            kind,
+            size,
+            // An entry the tree holds was written when it was put there; a tree whose entry
+            // predates this record reports the start of the clock's own epoch rather than an
+            // instant nothing happened at.
+            modified: self
+                .modified
+                .get(&resolved)
+                .copied()
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+        })
+    }
+
+    /// The names of the entries directly under the DIRECTORY `path`, sorted — what a listing
+    /// of a directory names. Empty for a path that is not a directory of this tree.
+    #[must_use]
+    pub fn entry_names(&self, path: &str) -> Vec<String> {
+        let Some(resolved) = self.resolve(path) else {
+            return Vec::new();
+        };
+        if !self.directories.contains(&resolved) {
+            return Vec::new();
+        }
+        let under = if resolved == ROOT {
+            ROOT.to_string()
+        } else {
+            format!("{resolved}/")
+        };
+        let mut names: Vec<String> = Vec::new();
+        let held = self
+            .files
+            .keys()
+            .chain(self.directories.iter())
+            .chain(self.devices.keys());
+        for entry in held {
+            let Some(relative) = entry.strip_prefix(under.as_str()) else {
+                continue;
+            };
+            // Only what lies DIRECTLY under the directory is an entry of it: a deeper path
+            // names the directory between them instead.
+            let name = relative.split('/').next().unwrap_or(relative);
+            if !name.is_empty() && !names.iter().any(|held| held == name) {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        names
     }
 
     /// The lines written to the device at `path`, in the order they were written — empty for
@@ -414,7 +578,7 @@ impl ShellVolume {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellVolume, VolumeLimits};
+    use super::{EntryKind, ShellVolume, VolumeLimits};
 
     /// RULE: a path is resolved the way a machine resolves one — absolute, with empty, `.`
     /// and `..` segments resolved and `..` above the root staying at the root — and a
@@ -590,6 +754,59 @@ mod tests {
         assert!(
             !volume.remove_file("/proc/sys/kernel/random/boot_id"),
             "a sealed file was removed by the program"
+        );
+    }
+
+    /// RULE: what a listing of the tree reports about an entry is the entry's own facts —
+    /// what it is, the bytes it holds and when it was last written — and a listing of a
+    /// directory names the entries directly under it, each once.
+    #[test]
+    fn a_listing_reports_each_entrys_own_facts() {
+        let mut volume = ShellVolume::default();
+        let before = ::std::time::SystemTime::now();
+        volume.make_directories("/data/deep/under");
+        volume.write("/data/payload", "abcdef\n", false);
+        volume.add_discarding_device("/data/sink");
+
+        // (case, path, what it is, the bytes it holds)
+        let rows = [
+            ("a file", "/data/payload", Some((EntryKind::File, 7))),
+            ("a directory", "/data/deep", Some((EntryKind::Directory, "under".len()))),
+            ("a device", "/data/sink", Some((EntryKind::Device, 0))),
+            ("a path the tree holds nothing at", "/data/absent", None),
+            ("a relative path", "data/payload", None),
+        ];
+        for (case, path, expected) in rows {
+            let facts = volume.facts(path);
+            let reported = facts.map(|facts| (facts.kind, facts.size));
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected {expected:?}, got {reported:?}"
+            );
+            if let Some(facts) = facts {
+                assert!(
+                    facts.modified >= before,
+                    "case {case:?}: expected a write instant at or after {before:?}, got {:?}",
+                    facts.modified
+                );
+            }
+        }
+
+        let names = volume.entry_names("/data");
+        assert_eq!(
+            names,
+            ["deep", "payload", "sink"],
+            "expected the entries directly under the directory, got {names:?}"
+        );
+        let root = volume.entry_names("/");
+        assert_eq!(
+            root, ["data"],
+            "expected the root to hold the one directory made under it, got {root:?}"
+        );
+        let of_a_file = volume.entry_names("/data/payload");
+        assert!(
+            of_a_file.is_empty(),
+            "a path that is not a directory names no entries, got {of_a_file:?}"
         );
     }
 }

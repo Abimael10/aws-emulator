@@ -24,10 +24,11 @@
 //!
 //! The rows span what the rule generalises over: WHICH part of a program is not performed —
 //! a utility the session has no program for (named directly in the vector and inside a shell
-//! program), a redirection, a command substitution, an unsupported compound form, an
-//! unsupported assignment form — and where it sits in the program (first, after a command
-//! that did run, behind an `&&`). The contrast rows are programs that really do end with a
-//! status, which still report it.
+//! program), an unsupported compound form, an unsupported assignment form — and where it sits
+//! in the program (first, after a command that did run, behind an `&&`). The contrast rows are
+//! programs that really do end with a status, which still report it — including the ones that
+//! read and write the container's own FILESYSTEM (`state::container_filesystem`), which is
+//! something the session does perform.
 //!
 //! Nothing here reaches into a state struct: every value asserted is read back through
 //! `DescribeTasks`, `DescribeServices` and `DescribeTargetHealth`.
@@ -72,26 +73,11 @@ struct Row {
 }
 
 const ROWS: &[Row] = &[
-    // The CONFINEMENT rows: this container has no filesystem, no process to start and no
-    // host to reach, so each of these forms runs nothing — and claims nothing.
+    // The CONFINEMENT rows: this container has no process to start and no host to reach, so
+    // each of these forms runs nothing — and claims nothing.
     Row {
         case: "a vector naming a utility the container has no program for",
         command: &["definitely-not-a-utility"],
-        exit_code: None,
-    },
-    Row {
-        case: "a utility of the host's filesystem, inside a shell program",
-        command: &["sh", "-c", "cat /etc/passwd"],
-        exit_code: None,
-    },
-    Row {
-        case: "a redirection into a host path",
-        command: &["sh", "-c", "echo secret > /tmp/emulator-escape"],
-        exit_code: None,
-    },
-    Row {
-        case: "a command substitution, which would have to run a command",
-        command: &["sh", "-c", "echo $(echo inner)"],
         exit_code: None,
     },
     Row {
@@ -105,8 +91,9 @@ const ROWS: &[Row] = &[
         exit_code: None,
     },
     Row {
-        // The shape the recorded workloads take: a line that RUNS, and then the server the
-        // image holds, which this emulator has no program for.
+        // The shape the recorded workloads take: a line that RUNS — a redirection into the
+        // container's own writable layer — and then the server the image holds, which this
+        // emulator has no program for.
         case: "a program that writes and then needs the image's own server",
         command: &[
             "sh",
@@ -124,6 +111,30 @@ const ROWS: &[Row] = &[
     Row {
         case: "a vector the image exec's directly, which runs to success",
         command: &["echo", "direct"],
+        exit_code: Some(0),
+    },
+    Row {
+        // The container HAS a filesystem (`state::container_filesystem`) and this emulator
+        // holds no image, so a path the image would have provided is one that filesystem
+        // holds nothing at: the read fails, which is a status the program really ended with.
+        case: "a read of a path the container's filesystem holds nothing at",
+        command: &["sh", "-c", "cat /etc/passwd"],
+        exit_code: Some(1),
+    },
+    Row {
+        // No host path is reachable from it: the write lands in the container's own layer,
+        // which is memory of this process.
+        case: "a redirection, which writes the container's own layer",
+        command: &[
+            "sh",
+            "-c",
+            "echo secret > /tmp/emulator-escape && cat /tmp/emulator-escape",
+        ],
+        exit_code: Some(0),
+    },
+    Row {
+        case: "a command substitution, whose commands run in this same session",
+        command: &["sh", "-c", "echo $(echo inner)"],
         exit_code: Some(0),
     },
 ];

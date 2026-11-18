@@ -182,6 +182,13 @@ pub struct ContainerLaunch {
     /// as the environment variable its entry spells
     /// ([`super::container_secrets::fetched_environment`]).
     secrets: Vec<ContainerSecret>,
+    /// The volumes its `mountPoints` mount into it, read off the revision
+    /// ([`super::container_volumes`]) and resolved to the storage each is backed by where the
+    /// run is started, because resolving one is a read of another service's store.
+    mounts: Vec<MountRequest>,
+    /// `ContainerDefinition$workingDirectory`, which the program's relative paths are
+    /// resolved against.
+    working_directory: Option<String>,
     /// The signals it answers.
     signals: Arc<ContainerSignals>,
 }
@@ -197,6 +204,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// half needs anything outside this store, which is why it is answered rather than done
     /// here.
     pub(super) fn settle_container_runs(&mut self, region: &str) -> Vec<ContainerLaunch> {
+        // The storage of a volume whose task or container instance is gone is gone with it,
+        // settled on the same pass the runs are ([`super::container_volumes`]).
+        self.prune_volume_storage();
         let forgotten: Vec<String> = self
             .container_runs
             .iter()
@@ -340,6 +350,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     // is performed: reading one is a call to the service that holds it,
                     // which this pass cannot make under the store's lock.
                     secrets: container_environment_secrets(&definition, name),
+                    // The mount points this container declares, against the volumes the
+                    // revision declares: both are members of this store's own records, and
+                    // the storage each names is resolved where the run is started.
+                    mounts: mount_requests(&definition, stored, task),
+                    working_directory: stored.working_directory.clone(),
                     signals,
                 });
             }
@@ -501,7 +516,16 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
         let container_arn = launch.container_arn.clone();
         let run_state = ::engine::ServiceState::clone(&state);
         let callback = callback.clone();
-        let handle = runtime.spawn(async move { run_container(run_state, callback, launch).await });
+        // The volumes the container's `mountPoints` mount, resolved with NO guard of this
+        // store held: the files of an `efsVolumeConfiguration` volume are the Amazon EFS
+        // service's own, so resolving one reads that service's store
+        // ([`super::container_volumes`]).
+        let filesystem = ContainerFilesystem::new(
+            launch.working_directory.as_deref(),
+            mounted_volumes(&**engine, &state, &launch.mounts),
+        );
+        let handle = runtime
+            .spawn(async move { run_container(run_state, callback, launch, filesystem).await });
         // The handle is kept with the run, so a run whose task is gone is aborted rather
         // than merely forgotten.
         state.lock().attach_container_run(&container_arn, handle);
@@ -524,6 +548,7 @@ async fn run_container(
     state: ::engine::ServiceState<ComAmazonawsEcsAmazonec2containerservicev20141113State>,
     callback: ::smithy_server_runtime::EmbeddedEmulator,
     launch: ContainerLaunch,
+    filesystem: ContainerFilesystem,
 ) {
     // The values the agent fetches for the container, before anything of it runs: a secret
     // it could not retrieve starts NO program, so the container reports no exit code —
@@ -553,6 +578,7 @@ async fn run_container(
         Arc::clone(&output),
         Arc::clone(&launch.signals),
         deadline,
+        filesystem,
     );
     let outcome = shell.run(program).await;
     state

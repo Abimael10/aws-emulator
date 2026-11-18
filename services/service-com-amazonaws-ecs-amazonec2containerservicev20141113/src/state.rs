@@ -359,6 +359,17 @@ pub use container_credentials::*;
 mod container_runtime;
 pub use container_runtime::*;
 
+/// The FILESYSTEM a container's program runs over: its own writable layer, and the volumes
+/// the task definition mounts into it.
+mod container_filesystem;
+pub use container_filesystem::*;
+
+/// WHERE a mounted volume's files live: each task-definition volume resolved to the storage
+/// it is backed by — an Amazon EFS file system's own files for an `efsVolumeConfiguration`
+/// volume, and storage of this store for the rest.
+mod container_volumes;
+pub use container_volumes::*;
+
 /// The values the agent FETCHES for a container before it exists — a container definition's
 /// `secrets` — read as the task's execution role: the stop a launch whose role may not read
 /// one earns, and the environment a container that may read them runs with.
@@ -1307,13 +1318,15 @@ pub const ESSENTIAL_CONTAINER_EXITED_REASON: &str = "Essential container in task
 /// service's desired count in place, so the service always holds a task that is running.
 ///
 /// How long the work takes is the workload's own business and AWS publishes no duration
-/// for it, so the span is CHOSEN: long enough that a client that places a task and then
-/// polls it observes it `RUNNING` — the status Amazon ECS reports for a task that is doing
-/// its work — across several reads, and short enough that a client waiting for the task to
-/// finish gets its answer inside an ordinary poll budget. The instant is STORED
+/// for it, so the span is CHOSEN: this emulator's own transient spans are three seconds, which
+/// is long enough that a client that places a task and then polls it observes it `RUNNING` —
+/// the status Amazon ECS reports for a task that is doing its work — across several reads, and
+/// short enough that a client running SEVERAL tasks one after another, each waiting out the
+/// one before it (the shape a scenario that hands data from one task to the next takes), gets
+/// its answer inside an ordinary poll budget. The instant is STORED
 /// ([`TaskRecord::work_done_due_at`]) and materialised by whoever next looks at the task or
 /// by the clock pump; nothing sleeps for it.
-pub const CONTAINER_WORK_SPAN: Duration = Duration::from_secs(10);
+pub const CONTAINER_WORK_SPAN: Duration = Duration::from_secs(3);
 
 /// The network mode that gives each task its own elastic network interface, from the
 /// `NetworkMode` enum. Named here because three derivations key off it: which launch
@@ -4563,6 +4576,12 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// [`container_runtime`]). An entry exists only while the container's program is being
     /// run, so the map is the set of containers that are really executing.
     container_runs: HashMap<String, ContainerRun>,
+    /// The FILES of every task-definition volume this store holds storage for — the volumes
+    /// that are not another service's file system (see [`container_volumes`]). Keyed by what
+    /// the volume's own configuration says its data belongs to, so two containers mounting one
+    /// volume share one namespace; pruned as the tasks and instances they belong to go, and
+    /// bounded by [`MAX_VOLUME_STORAGE`].
+    volume_storage: HashMap<VolumeKey, VolumeFiles>,
     /// The secret this store's `nextToken` values are authenticated under, drawn from the
     /// system's randomness when the store is created and never reported — see
     /// [`page_tokens`]. It is what lets a paginated read tell a token it minted from one a

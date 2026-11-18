@@ -16,6 +16,10 @@
 //!    standalone `RunTask` task — which no scheduler maintains a count for — is never
 //!    relaunched. A service's task reports `group` `service:<service name>`; a standalone
 //!    task does not.
+//! 4. A VOLUME the task definition declares is mounted into the container at each of its
+//!    `mountPoints[].containerPath`, over ONE namespace, and a mount point whose `readOnly`
+//!    is `true` has every write to it refused with the kernel's EROFS while the read through
+//!    it still answers.
 //!
 //! CloudWatch Logs is mounted BESIDE Amazon ECS on the SAME engine, so a container's output
 //! travels the real in-process callback into the real log service and is read back with that
@@ -830,5 +834,143 @@ async fn a_stopped_service_task_is_replaced_while_a_standalone_task_is_not() {
         vec![standalone.clone()],
         "no standalone task is relaunched, so the only one is the task RunTask placed; \
          the cluster holds {arns:?}"
+    );
+}
+
+/// RULE 4: a VOLUME the task definition declares is mounted into the container at each of its
+/// `mountPoints[].containerPath` as a real filesystem over ONE namespace — so a file written
+/// through one mount point of a volume is read back through another mount point of the same
+/// volume — and a mount point whose `readOnly` is `true` gives the container read-only access:
+/// the kernel refuses every write to it with EROFS, whose text is `Read-only file system`,
+/// while the read through it still answers and the volume is left as it was.
+///
+/// One task mounts one volume TWICE, read-write and read-only, which is what makes the two
+/// halves of the rule observable in one run: the same bytes through both paths, and only one of
+/// them writable. The volume is a `host` volume, whose data belongs to the task, so nothing
+/// outside this task is involved; the Amazon EFS file system a volume can be backed by instead
+/// — the namespace two TASKS share — is `core/router/tests/all/ecs_efs_volume_mounts.rs`,
+/// because that one spans another service's store.
+#[tokio::test]
+async fn a_declared_volume_is_mounted_and_a_read_only_mount_point_refuses_writes() {
+    let router = emulator();
+    let cluster = "volumes";
+    let case = "mounted volumes";
+    cluster_with_capacity(&router, cluster, case).await;
+    create_log_group(&router, case).await;
+
+    let marker = "marker-the-container-wrote";
+    let family = "volumemounts";
+    ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": family,
+            "volumes": [{ "name": "shared", "host": {} }],
+            "containerDefinitions": [{
+                "name": CONTAINER,
+                "image": IMAGE,
+                "memory": 128,
+                "essential": true,
+                "command": ["sh", "-c",
+                    "set -e; \
+                     echo \"$MARKER\" > /data/payload; \
+                     echo \"SIZE=$(wc -c < /data/payload)\"; \
+                     echo \"MODE=$(ls -l /data/payload | cut -c1-10)\"; \
+                     echo \"SHARED=$(cat /readonly/payload)\"; \
+                     echo appended >> /readonly/payload && echo WROTE; \
+                     echo \"KEPT=$(cat /data/payload)\"; \
+                     echo DONE"],
+                "mountPoints": [
+                    { "sourceVolume": "shared", "containerPath": "/data", "readOnly": false },
+                    { "sourceVolume": "shared", "containerPath": "/readonly", "readOnly": true },
+                ],
+                "environment": [{ "name": "MARKER", "value": marker }],
+                "logConfiguration": {
+                    "logDriver": "awslogs",
+                    "options": {
+                        "awslogs-group": LOG_GROUP,
+                        "awslogs-region": SIGNED_REGION,
+                        "awslogs-stream-prefix": STREAM_PREFIX,
+                    },
+                },
+            }],
+        }),
+        case,
+    )
+    .await;
+    let task_arn = run_task(&router, cluster, family, case).await;
+    let stream = stream_of(&task_arn);
+
+    // The program runs to its end, which is what makes the lines before it the whole of what
+    // it wrote.
+    let lines = poll_until(
+        || async {
+            let events = delivered(&router, &stream).await;
+            events
+                .iter()
+                .any(|line| line == "DONE")
+                .then_some(events)
+        },
+        &format!("case {case:?}: the container's own lines in {stream}"),
+    )
+    .await;
+
+    let value_of = |name: &str| -> Option<String> {
+        lines
+            .iter()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .map(str::to_string)
+    };
+    let expected_size = (marker.len() + 1).to_string();
+    let size = value_of("SIZE");
+    assert_eq!(
+        size.as_deref(),
+        Some(expected_size.as_str()),
+        "case {case:?}: expected SIZE={expected_size} from the container's own wc, got \
+         {size:?} in {lines:?}"
+    );
+    let mode = value_of("MODE");
+    assert!(
+        mode.as_deref().is_some_and(|mode| mode.starts_with("-rw")),
+        "case {case:?}: expected a regular writable file's mode, got {mode:?} in {lines:?}"
+    );
+    let shared = value_of("SHARED");
+    assert_eq!(
+        shared.as_deref(),
+        Some(marker),
+        "case {case:?}: expected the same bytes through the other mount point of the one \
+         volume, got {shared:?} in {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("Read-only file system")),
+        "case {case:?}: expected the write through the read-only mount point to be refused \
+         with the kernel's EROFS text, got {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line == "WROTE"),
+        "case {case:?}: the refused write must not be reported as done, got {lines:?}"
+    );
+    let kept = value_of("KEPT");
+    assert_eq!(
+        kept.as_deref(),
+        Some(marker),
+        "case {case:?}: expected the refused write to have left the volume as it was, got \
+         {kept:?} in {lines:?}"
+    );
+    let exit_code = poll_until(
+        || async {
+            let task = describe(&router, cluster, &task_arn, case).await;
+            let containers = list(&task, "containers", case);
+            present_count(&containers[0], "exitCode", case)
+        },
+        &format!("case {case:?}: the container's exitCode"),
+    )
+    .await;
+    assert_eq!(
+        exit_code, 0,
+        "case {case:?}: expected the program to end successfully, got {exit_code} with \
+         {lines:?}"
     );
 }
