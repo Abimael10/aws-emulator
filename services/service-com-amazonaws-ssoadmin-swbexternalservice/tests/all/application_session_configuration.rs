@@ -150,7 +150,12 @@ fn applications() -> Vec<Application> {
             "a Name at the 100-character limit, spanning spaces and punctuation",
             &format!("App 9 (prod) - {}", "y".repeat(85)),
         )
-        .with_portal_options(json!({"SignInOptions": {"Origin": "IDENTITY_CENTER"}})),
+        .with_portal_options(json!({
+            "SignInOptions": {
+                "Origin": "APPLICATION",
+                "ApplicationUrl": "https://portal.example.com",
+            },
+        })),
         Application::new(
             "an APPLICATION sign-in origin with its required ApplicationUrl",
             "application-origin",

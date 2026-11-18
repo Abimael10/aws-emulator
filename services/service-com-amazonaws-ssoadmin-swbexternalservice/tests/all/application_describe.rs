@@ -158,7 +158,8 @@ impl Row {
 /// the length of `Name` at both published bounds (`len 1..100`, `^[\S\s]*$`, so spaces and
 /// punctuation are admitted), whether `Description` was stored at all and its length at
 /// both bounds (`len 1..128`), each `ApplicationStatus` (`ENABLED | DISABLED`), the shape
-/// of `PortalOptions` (absent, `Visibility` only, each `SignInOrigin`), the Region the
+/// of `PortalOptions` (absent, `Visibility` only, a sign-in origin the provider admits),
+/// the Region the
 /// create ran in, and whether the create carried members this output does not model
 /// (`Tags`, `ClientToken`). Every constraint is from
 /// `smithy_query(query="operation",operation="CreateApplication")` and
@@ -206,11 +207,16 @@ fn rows() -> Vec<Row> {
             region: "ap-southeast-2",
         },
         Row {
-            label: "the IDENTITY_CENTER sign-in origin, from a four-segment Region",
-            name: "identity center origin".to_string(),
+            label: "an APPLICATION sign-in origin at a bare URL, from a four-segment Region",
+            name: "application origin".to_string(),
             description: None,
             status: None,
-            portal_options: Some(json!({"SignInOptions": {"Origin": "IDENTITY_CENTER"}})),
+            portal_options: Some(json!({
+                "SignInOptions": {
+                    "Origin": "APPLICATION",
+                    "ApplicationUrl": "https://portal.example.com",
+                },
+            })),
             tags: Vec::new(),
             client_token: Some("describe-rules-token-1"),
             region: "us-gov-east-1",

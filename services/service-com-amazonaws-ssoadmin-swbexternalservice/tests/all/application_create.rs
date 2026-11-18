@@ -128,7 +128,8 @@ impl Row {
 /// `^([a-z]+-){2,3}\d$`), the length of `Name` at both published bounds (`len 1..100`,
 /// `^[\S\s]*$`, so spaces and punctuation are admitted), whether `Description`
 /// (`len 1..128`, asserted at both bounds) and `Status` (`ENABLED | DISABLED`) are sent,
-/// the shape of `PortalOptions` (absent, `Visibility` only, each `SignInOrigin`) and the
+/// the shape of `PortalOptions` (absent, `Visibility` only, a sign-in origin the provider
+/// admits) and the
 /// number of `Tags` (`len 0..75`). Every constraint is from
 /// `smithy_query(query="operation",operation="CreateApplication")` and
 /// `smithy_query(query="shape",shape="PortalOptions,SignInOptions,ApplicationStatus")`.
@@ -175,12 +176,17 @@ fn rows() -> Vec<Row> {
             region: "ap-southeast-2",
         },
         Row {
-            label: "IDENTITY_CENTER sign-in origin, from a four-segment Region",
+            label: "an APPLICATION sign-in origin at a bare URL, from a four-segment Region",
             provider_arn: PROVIDER_CUSTOM,
-            name: "identity center origin".to_string(),
+            name: "application origin".to_string(),
             description: None,
             status: None,
-            portal_options: Some(json!({"SignInOptions": {"Origin": "IDENTITY_CENTER"}})),
+            portal_options: Some(json!({
+                "SignInOptions": {
+                    "Origin": "APPLICATION",
+                    "ApplicationUrl": "https://portal.example.com",
+                },
+            })),
             tags: Vec::new(),
             region: "us-gov-east-1",
         },
@@ -533,6 +539,18 @@ async fn a_refused_create_stores_nothing() {
                     "Visibility": "DISABLED",
                 },
                 "Tags": [{"Key": "owner", "Value": "platform"}],
+            }),
+            "ValidationException",
+        ),
+        (
+            // The SAML-only sign-in origin on a provider that federates over OAuth 2.0;
+            // `application_create_providers.rs` owns the rule and its wording.
+            "an IDENTITY_CENTER sign-in origin under an OAuth 2.0 provider",
+            json!({
+                "InstanceArn": instance_arn,
+                "ApplicationProviderArn": PROVIDER_CUSTOM,
+                "Name": "identity-center-origin",
+                "PortalOptions": {"SignInOptions": {"Origin": "IDENTITY_CENTER"}},
             }),
             "ValidationException",
         ),

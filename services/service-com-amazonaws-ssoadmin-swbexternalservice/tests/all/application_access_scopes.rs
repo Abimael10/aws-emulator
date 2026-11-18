@@ -173,7 +173,7 @@ impl Application {
 /// `Name` (`len 1..100`, `^[\S\s]*$`, so spaces
 /// and punctuation are admitted), whether `Description` (`len 1..128`) and `Status`
 /// (`ENABLED | DISABLED`) are sent, the shape of `PortalOptions` (absent, `Visibility`
-/// only, either `SignInOrigin`, with and without an `ApplicationUrl`) and the number of
+/// only, a sign-in origin the provider admits, at URLs of several forms) and the number of
 /// `Tags` (`len 0..75`). Every constraint is from
 /// `smithy_query(query="operation",operation="CreateApplication")` and
 /// `smithy_query(query="shape",shape="PortalOptions,SignInOptions")`.
@@ -192,10 +192,15 @@ fn applications() -> Vec<Application> {
             .with_portal_options(json!({"Visibility": "DISABLED"}))
             .with_description("d"),
         Application::new(
-            "IDENTITY_CENTER sign-in origin, no ApplicationUrl",
-            "identity-center-origin",
+            "APPLICATION sign-in origin at a bare URL, no Visibility",
+            "bare-url-origin",
         )
-        .with_portal_options(json!({"SignInOptions": {"Origin": "IDENTITY_CENTER"}})),
+        .with_portal_options(json!({
+            "SignInOptions": {
+                "Origin": "APPLICATION",
+                "ApplicationUrl": "https://portal.example.com",
+            },
+        })),
         Application::new("APPLICATION sign-in origin with an ApplicationUrl", "application-origin")
             .with_portal_options(json!({
                 "SignInOptions": {
@@ -899,6 +904,16 @@ async fn creating_an_application_is_refused_where_the_request_cannot_be_served()
                 "ApplicationProviderArn": CUSTOM_PROVIDER_ARN,
                 "Name": "no-application-url",
                 "PortalOptions": {"SignInOptions": {"Origin": "APPLICATION"}},
+            }),
+            "ValidationException",
+        ),
+        (
+            "an IDENTITY_CENTER sign-in origin under an OAuth 2.0 provider",
+            json!({
+                "InstanceArn": instance_arn,
+                "ApplicationProviderArn": CUSTOM_PROVIDER_ARN,
+                "Name": "identity-center-origin",
+                "PortalOptions": {"SignInOptions": {"Origin": "IDENTITY_CENTER"}},
             }),
             "ValidationException",
         ),

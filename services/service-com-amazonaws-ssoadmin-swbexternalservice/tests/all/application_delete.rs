@@ -90,7 +90,8 @@ struct ApplicationCase {
 /// The rows differ along every axis the create generalises over, so the removal cannot be
 /// keyed to one request's shape: which optional members are present, `Name` at both
 /// published bounds (`length 1..100`), `Description` at its upper bound (`length 1..128`),
-/// both values of `ApplicationStatus`, both `SignInOrigin` forms and both values of
+/// both values of `ApplicationStatus`, the sign-in origin the provider admits at URLs of
+/// several forms and both values of
 /// `ApplicationVisibility`, a tagged application and one created under a `ClientToken`.
 /// The bounds and value sets come from
 /// `smithy_query(query="operation",operation="CreateApplication")` and
@@ -128,11 +129,14 @@ fn application_cases() -> Vec<ApplicationCase> {
             }),
         },
         ApplicationCase {
-            label: "portal sign-in from the IDENTITY_CENTER origin, tagged",
+            label: "portal sign-in from the APPLICATION origin at a bare URL, tagged",
             members: json!({
-                "Name": "identity-center sign-in",
+                "Name": "bare-url sign-in",
                 "PortalOptions": {
-                    "SignInOptions": {"Origin": "IDENTITY_CENTER"},
+                    "SignInOptions": {
+                        "Origin": "APPLICATION",
+                        "ApplicationUrl": "https://portal.example.com",
+                    },
                     "Visibility": "ENABLED",
                 },
                 "Tags": [

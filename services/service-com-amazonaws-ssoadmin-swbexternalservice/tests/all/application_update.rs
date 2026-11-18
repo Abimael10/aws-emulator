@@ -65,7 +65,7 @@ const UNKNOWN_APPLICATION_ARN_GOV: &str =
 ///
 /// They differ along what an update can touch — whether a `Description` was ever stored,
 /// which `ApplicationStatus` the application carries (`ENABLED | DISABLED`, from
-/// `smithy_query(query="shape",shape="ApplicationStatus")`), which `SignInOrigin` its
+/// `smithy_query(query="shape",shape="ApplicationStatus")`), which sign-in origin its
 /// portal options carry (or none at all) and which `ApplicationVisibility` they carry.
 #[derive(Debug, Clone)]
 struct Base {
@@ -117,13 +117,10 @@ fn bases() -> Vec<Base> {
             })),
         },
         Base {
-            label: "an ENABLED application signing in through Identity Center",
+            label: "an ENABLED application whose portal options carry a visibility only",
             description: Some("d"),
             status: Some("ENABLED"),
-            portal_options: Some(json!({
-                "SignInOptions": {"Origin": "IDENTITY_CENTER"},
-                "Visibility": "ENABLED",
-            })),
+            portal_options: Some(json!({"Visibility": "ENABLED"})),
         },
     ]
 }
@@ -134,7 +131,8 @@ fn bases() -> Vec<Base> {
 /// carries (none, each one alone, all of them) and along the values those members take —
 /// `Name` at both published length bounds (`len 1..100`, `^[\S\s]*$`, so spaces and
 /// punctuation are admitted), `Description` at both of its (`len 1..128`), each
-/// `ApplicationStatus` and each `SignInOrigin`. Every constraint is from
+/// `ApplicationStatus` and each `SignInOrigin` the provider admits. Every constraint is
+/// from
 /// `smithy_query(query="operation",operation="UpdateApplication")` and
 /// `smithy_query(query="shape",shape="UpdateApplicationPortalOptions,SignInOptions,ApplicationStatus")`.
 fn updates() -> Vec<(&'static str, Value)> {
@@ -159,8 +157,15 @@ fn updates() -> Vec<(&'static str, Value)> {
         ("Status alone, DISABLED", json!({"Status": "DISABLED"})),
         ("Status alone, ENABLED", json!({"Status": "ENABLED"})),
         (
-            "portal options alone, the IDENTITY_CENTER origin",
-            json!({"PortalOptions": {"SignInOptions": {"Origin": "IDENTITY_CENTER"}}}),
+            "portal options alone, the APPLICATION origin at a bare URL",
+            json!({
+                "PortalOptions": {
+                    "SignInOptions": {
+                        "Origin": "APPLICATION",
+                        "ApplicationUrl": "https://portal.example.com",
+                    },
+                },
+            }),
         ),
         (
             "portal options alone, the APPLICATION origin and its URL",
@@ -417,6 +422,27 @@ async fn a_refused_update_changes_nothing() {
                 "Description": "a complete update but for the sign-in URL",
                 "Status": "ENABLED",
                 "PortalOptions": {"SignInOptions": {"Origin": "APPLICATION"}},
+            }),
+            "ValidationException",
+        ),
+        (
+            // The SAML-only origin on an application whose provider federates over OAuth
+            // 2.0; `application_create_providers.rs` owns the rule and its wording.
+            "an IDENTITY_CENTER sign-in origin on an application of an OAuth 2.0 provider",
+            json!({
+                "ApplicationArn": arn,
+                "PortalOptions": {"SignInOptions": {"Origin": "IDENTITY_CENTER"}},
+            }),
+            "ValidationException",
+        ),
+        (
+            "an IDENTITY_CENTER sign-in origin on an otherwise complete update",
+            json!({
+                "ApplicationArn": arn,
+                "Name": "would-be-renamed-too",
+                "Description": "a complete update but for the sign-in origin",
+                "Status": "ENABLED",
+                "PortalOptions": {"SignInOptions": {"Origin": "IDENTITY_CENTER"}},
             }),
             "ValidationException",
         ),

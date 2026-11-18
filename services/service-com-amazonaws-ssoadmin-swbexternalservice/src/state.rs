@@ -54,6 +54,12 @@ pub use session_duration::*;
 mod tag_requests;
 pub use tag_requests::*;
 
+/// The validation the two writes that carry portal options ask of their `SignInOptions`,
+/// and the sign-in origins it names. Re-exported, so `crate::state::sign_in_options_refusal`
+/// stays the path both of them share.
+mod sign_in_options;
+pub use sign_in_options::*;
+
 /// The identity-store instance every `InstanceArn`-taking operation resolves against.
 ///
 /// IAM Identity Center allows ONE instance per account, so the emulator seeds exactly
@@ -485,21 +491,6 @@ pub const APPLICATION_ASSIGNMENT_REQUIRED_DEFAULT: bool = true;
 /// nothing has configured, so the emulator reports the resting state — a background
 /// session nothing has enabled is not enabled, which this enum spells `DISABLED`.
 pub const USER_BACKGROUND_SESSION_STATUS_DEFAULT: &str = "DISABLED";
-
-/// `SignInOrigin::APPLICATION` — the origin that redirects the user to the application's
-/// own URL, which is why `SignInOptions$ApplicationUrl` is required with it.
-pub const SIGN_IN_ORIGIN_APPLICATION: &str = "APPLICATION";
-
-/// The refusal a `SignInOptions` with `Origin` `APPLICATION` and no `ApplicationUrl`
-/// earns, as the message of the modelled `ValidationException`.
-///
-/// The rule is `SignInOptions$ApplicationUrl`'s own documentation: "The URL that accepts
-/// authentication requests for an application. This is a required parameter if the
-/// Origin parameter is APPLICATION." The model cannot express a conditionally required
-/// member, so the boundary validator passes the request and the handler refuses it.
-pub const APPLICATION_URL_REQUIRED_MESSAGE: &str =
-    "PortalOptions.SignInOptions.ApplicationUrl is required when \
-     PortalOptions.SignInOptions.Origin is APPLICATION.";
 
 /// The refusal `CreateApplication` answers with when `ApplicationProviderArn` names a
 /// published provider that cannot back a CUSTOMER MANAGED OAuth 2.0 application, as the

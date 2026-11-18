@@ -135,7 +135,8 @@ impl AppRow {
 /// published bounds (`len 1..100`, `^[\S\s]*$`, so spaces and punctuation are admitted),
 /// whether `Description` (`len 1..128`, asserted at both bounds) and `Status`
 /// (`ENABLED | DISABLED`) are sent, and the shape of `PortalOptions` (absent, `Visibility`
-/// only, and each `SignInOrigin`). Every constraint is from
+/// only, and the sign-in origin the provider admits at URLs of several forms). Every
+/// constraint is from
 /// `smithy_query(query="operation",operation="CreateApplication")` and
 /// `smithy_query(query="shape",shape="PortalOptions,SignInOptions,ApplicationStatus")`.
 fn app_rows() -> Vec<AppRow> {
@@ -172,11 +173,16 @@ fn app_rows() -> Vec<AppRow> {
             portal_options: Some(json!({"Visibility": "DISABLED"})),
         },
         AppRow {
-            label: "IDENTITY_CENTER sign-in origin",
-            name: "identity centre origin".to_string(),
+            label: "APPLICATION sign-in origin at a bare URL",
+            name: "bare url origin".to_string(),
             description: None,
             status: None,
-            portal_options: Some(json!({"SignInOptions": {"Origin": "IDENTITY_CENTER"}})),
+            portal_options: Some(json!({
+                "SignInOptions": {
+                    "Origin": "APPLICATION",
+                    "ApplicationUrl": "https://portal.example.com",
+                },
+            })),
         },
     ]
 }

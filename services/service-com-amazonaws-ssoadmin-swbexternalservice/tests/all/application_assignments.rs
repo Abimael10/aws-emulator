@@ -166,7 +166,8 @@ impl Application {
 /// `Name` (`len 1..100`, `^[\S\s]*$`, so whitespace and punctuation are in), whether
 /// `Description` is sent (`len 1..128`), both values of `ApplicationStatus`
 /// (`ENABLED | DISABLED`), the `PortalOptions` forms the model admits (absent, visibility
-/// only, each `SignInOrigin`), the number of `Tags` and whether a `ClientToken` is sent.
+/// only, a sign-in origin the provider admits at URLs of several forms), the number of
+/// `Tags` and whether a `ClientToken` is sent.
 /// All constraints are from
 /// `smithy_query(query="operation",operation="CreateApplication")` and
 /// `smithy_query(query="shape",shape="PortalOptions,SignInOptions,ApplicationStatus")`.
@@ -199,10 +200,15 @@ fn applications() -> Vec<Application> {
         }))
         .with_client_token("apl-token-2"),
         Application::new(
-            "SignInOrigin IDENTITY_CENTER and no Visibility, which takes the model default",
-            "idp-initiated-app",
+            "SignInOrigin APPLICATION at a bare URL and no Visibility, which takes the model default",
+            "bare-url-app",
         )
-        .with_portal_options(json!({"SignInOptions": {"Origin": "IDENTITY_CENTER"}}))
+        .with_portal_options(json!({
+            "SignInOptions": {
+                "Origin": "APPLICATION",
+                "ApplicationUrl": "https://portal.example.com",
+            },
+        }))
         .with_description("Description at the 128-character limit padded out here")
         .with_tags(&[("only", "one")]),
     ]
@@ -625,17 +631,37 @@ async fn a_create_the_model_cannot_refuse_itself_is_refused_rather_than_stored()
         );
     }
 
-    // `Origin` `IDENTITY_CENTER` needs no `ApplicationUrl`: the rule is about the one
-    // origin that redirects to the application's own URL.
+    // The rule is about the one origin that redirects to the application's own URL, so
+    // portal options carrying no sign-in options at all need no `ApplicationUrl` either.
     let accepted = Application::new(
-        "Origin IDENTITY_CENTER with no ApplicationUrl",
+        "portal options carrying no SignInOptions",
         "accepted-app",
     )
-    .with_portal_options(json!({"SignInOptions": {"Origin": "IDENTITY_CENTER"}}));
+    .with_portal_options(json!({"Visibility": "ENABLED"}));
     let (status, body) = create_application(&router, &instance_arn, &accepted).await;
     assert_eq!(
         status, 200,
-        "IDENTITY_CENTER needs no ApplicationUrl, got {status} {body}"
+        "portal options with no SignInOptions need no ApplicationUrl, got {status} {body}"
+    );
+
+    // The OTHER origin is refused here for a different reason: `IDENTITY_CENTER` is SAML
+    // identity-provider initiated sign-in, which an application of an OAuth 2.0 provider
+    // has none of (`application_create_providers.rs` owns that rule and its wording).
+    let identity_center = Application::new(
+        "Origin IDENTITY_CENTER under an OAuth 2.0 provider",
+        "identity-center-app",
+    )
+    .with_portal_options(json!({"SignInOptions": {"Origin": "IDENTITY_CENTER"}}));
+    let (status, body) = create_application(&router, &instance_arn, &identity_center).await;
+    assert_eq!(
+        status, 400,
+        "the IDENTITY_CENTER origin must be refused 400 on an OIDC application, got \
+         {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "expected ValidationException for the IDENTITY_CENTER origin, got {body}"
     );
 
     // An `ApplicationProviderArn` the catalog does not publish resolves to nothing.

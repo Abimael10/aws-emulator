@@ -12,9 +12,11 @@
 //! `Visibility` alone: this operation cannot change visibility at all.
 //!
 //! An `ApplicationArn` this account holds no application for is a
-//! `ResourceNotFoundException` (404), and a `SignInOptions` naming the `APPLICATION`
-//! origin without an `ApplicationUrl` is refused with the modelled `ValidationException`
-//! (400) — the same conditional requirement `CreateApplication` enforces.
+//! `ResourceNotFoundException` (404), and the `SignInOptions` a request carries are judged
+//! by the same validation `CreateApplication` asks, against the provider the stored
+//! application was created under: the `APPLICATION` origin without an `ApplicationUrl`, and
+//! the SAML-only `IDENTITY_CENTER` origin on an application whose provider federates over
+//! OAuth 2.0, are both refused with the modelled `ValidationException` (400).
 //!
 //! The response models no members: the updated record is read back through
 //! `DescribeApplication`.
@@ -146,6 +148,20 @@ fn validation(message: impl Into<String>) -> UpdateApplicationError {
     .into()
 }
 
+/// The modelled refusal for an `ApplicationArn` this account holds no application for:
+/// never created, or created under an instance that has since gone.
+///
+/// `Reason` is left absent for the reason [`validation`] states: every value the model's
+/// `ResourceNotFoundExceptionReason` enum carries reports a KMS key fault, and this refusal
+/// inspects no key.
+fn application_not_found(application_arn: &str) -> UpdateApplicationError {
+    UpdateApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::application_not_found_message(application_arn)),
+        reason: None,
+    })
+    .into()
+}
+
 /// The `UpdateApplication` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -188,27 +204,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // `SignInOptions$ApplicationUrl` is "a required parameter if the Origin parameter
-        // is APPLICATION" — a conditional requirement the model cannot express, so the
-        // boundary validator passed the request and this is where it is refused. The
-        // update REPLACES the sign-in options rather than merging into them (the member is
-        // a structure, not a map of fields), so the URL has to arrive with the origin
-        // instead of being inherited from the options this call overwrites.
-        if let Some(options) = input
-            .portal_options
-            .as_ref()
-            .and_then(|portal| portal.sign_in_options.as_ref())
-        {
-            if options.origin == crate::state::SIGN_IN_ORIGIN_APPLICATION
-                && options
-                    .application_url
-                    .as_ref()
-                    .is_none_or(|url| url.is_empty())
-            {
-                return Err(validation(crate::state::APPLICATION_URL_REQUIRED_MESSAGE));
-            }
-        }
-
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // What the CLOCK already owes every instance, plus the account's ambient instance
@@ -219,16 +214,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Never created, or created under an instance that has since gone — the same
         // answer either way: there is no such application to update.
-        let record = store.application_mut(&input.application_arn).ok_or_else(|| {
-            UpdateApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::application_not_found_message(
-                    &input.application_arn,
-                )),
-                // The model's `ResourceNotFoundExceptionReason` enum carries only KMS key
-                // states, none of which this refusal is.
-                reason: None,
-            })
-        })?;
+        let stored = store
+            .application(&input.application_arn)
+            .ok_or_else(|| application_not_found(&input.application_arn))?;
+        // The application federates through the provider its create ran under, so that is
+        // what the sign-in options this update would store are judged against — by the ONE
+        // validation both writes that carry portal options share
+        // (`crate::state::sign_in_options_refusal`, which states both rules the model
+        // cannot express). The update REPLACES the sign-in options rather than merging into
+        // them (the member is a structure, not a map of fields), so the whole configuration
+        // has to be legal as sent instead of inheriting anything from the options this call
+        // overwrites. Asked before anything is written, so a refused update leaves the
+        // stored options exactly as they were.
+        let provider = crate::state::built_in_application_provider(&stored.application_provider_arn);
+        if let Some(message) = crate::state::sign_in_options_refusal(
+            input
+                .portal_options
+                .as_ref()
+                .and_then(|portal| portal.sign_in_options.as_ref()),
+            provider,
+        ) {
+            return Err(validation(message));
+        }
+
+        let record = store
+            .application_mut(&input.application_arn)
+            .ok_or_else(|| application_not_found(&input.application_arn))?;
 
         // Only the members the request CARRIES are written: an absent member leaves the
         // stored value alone, so a caller renaming an application cannot silently clear

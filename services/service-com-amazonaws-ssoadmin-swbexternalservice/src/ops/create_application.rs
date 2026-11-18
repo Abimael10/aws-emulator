@@ -14,6 +14,12 @@
 //! behalf, are refused with the modelled `ValidationException` (400), while an ARN naming
 //! no published provider at all is a `ResourceNotFoundException` (404).
 //!
+//! `PortalOptions.SignInOptions` is judged against that provider: the `APPLICATION` origin
+//! needs the `ApplicationUrl` it redirects to, and the `IDENTITY_CENTER` origin — SAML
+//! identity-provider initiated sign-in — is refused with the modelled `ValidationException`
+//! (400) on an application whose provider federates over OAuth 2.0, which every provider
+//! this operation creates under does.
+//!
 //! `ApplicationArn` is server-generated here; `Name`, `Description`, `PortalOptions`,
 //! `Status` and `Tags` are the caller's input, persisted so `DescribeApplication` reads
 //! back the same values, and `CreatedFrom` is the Region of this request.
@@ -325,23 +331,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sign_in_options: None,
             visibility: crate::state::APPLICATION_VISIBILITY_ENABLED.to_string(),
         });
-        // `SignInOptions$ApplicationUrl` is "a required parameter if the Origin parameter
-        // is APPLICATION" — a conditional requirement the model cannot express, so the
-        // boundary validator passed it and this is where it is refused.
-        if portal_options
-            .sign_in_options
-            .as_ref()
-            .is_some_and(|options| {
-                options.origin == crate::state::SIGN_IN_ORIGIN_APPLICATION
-                    && options
-                        .application_url
-                        .as_ref()
-                        .is_none_or(|url| url.is_empty())
-            })
-        {
+        // The portal sign-in options this create would store, judged by the ONE validation
+        // both writes that carry portal options share
+        // (`crate::state::sign_in_options_refusal`, which states both rules the model
+        // cannot express: the URL the `APPLICATION` origin redirects to, and the SAML-only
+        // `IDENTITY_CENTER` origin). Judged against the provider this create runs under —
+        // the application federates over that provider's protocol — and before anything is
+        // minted, so a refused create stores nothing.
+        if let Some(message) = crate::state::sign_in_options_refusal(
+            portal_options.sign_in_options.as_ref(),
+            Some(provider),
+        ) {
             return Err(CreateApplicationErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(crate::state::APPLICATION_URL_REQUIRED_MESSAGE.to_string()),
+                    message: Some(message),
+                    // The model's `ValidationExceptionReason` enum carries only KMS key
+                    // states, none of which this refusal is.
                     reason: None,
                 },
             )
