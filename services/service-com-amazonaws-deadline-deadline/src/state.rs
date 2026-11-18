@@ -27,6 +27,22 @@ pub use templates::*;
 mod queue_environments;
 pub use queue_environments::*;
 
+/// The steps and tasks a job's template declared, and what a run does to them.
+mod steps;
+pub use steps::*;
+
+/// Reading the work \u2014 steps, tasks, environments \u2014 out of a job template.
+mod job_template;
+pub use job_template::*;
+
+/// The sessions a worker runs a job's tasks in, and the actions each one holds.
+mod sessions;
+pub use sessions::*;
+
+/// Giving a worker its next task, and recording what it reports back.
+mod scheduling;
+pub use scheduling::*;
+
 /// `QueueStatus` value a freshly created queue carries.
 ///
 /// From `smithy_query(query="shape", shape="QueueStatus")`: `IDLE`, `SCHEDULING`,
@@ -284,6 +300,16 @@ pub const FORBIDDEN_MAX_COUNT: i32 = 0;
 /// however it is spread. The budget is released when the resources holding those bytes are
 /// deleted.
 pub const MAX_STORED_TEMPLATE_BYTES: usize = 8 * 1024 * 1024;
+
+/// How much of the stored jobs' work this emulator holds at once, in bytes, across every
+/// job it holds.
+///
+/// The companion of [`MAX_STORED_TEMPLATE_BYTES`] for what a template EXPANDS to: a job's
+/// steps and tasks are read out of its template, so a small request can store a large task
+/// set, and [`MAX_TEMPLATE_TASK_BYTES`] bounds only what ONE template may describe. This is
+/// the whole store's budget, charged with every job whose work is stored and released with
+/// every job removed, so repeated creates cannot compound into unbounded state.
+pub const MAX_STORED_TASK_BYTES: usize = 32 * 1024 * 1024;
 
 /// `quotaCode` this service reports when a create would pass one of those bounds.
 pub const QUOTA_CODE_RESOURCE_COUNT: &str = "L-RESOURCE-COUNT";
@@ -865,6 +891,20 @@ pub struct Job {
     /// schedules onto comes due; `None` once it has been materialised. See
     /// [`JOB_RECONCILE_AFTER`].
     pub reconcile_due_at: Option<Instant>,
+    /// The steps and tasks the job's template declared, in declared order, minted when the
+    /// job was created (see [`steps`] and [`job_template`]).
+    pub steps: Vec<Step>,
+    /// The names of the environments the job's own template declares, in declared order: a
+    /// session running one of this job's tasks enters them after its queue's.
+    pub environments: Vec<String>,
+    /// Whether every step and task the template declared was read out of it. A job whose
+    /// work was only partly read is placed on no worker — see `job_template`'s header for
+    /// what that covers and why.
+    pub work_fully_read: bool,
+    /// Every session a worker has run this job's tasks in, keyed by `sessionId`, exactly as
+    /// the model's paths nest it
+    /// (`/2023-10-12/farms/{farmId}/queues/{queueId}/jobs/{jobId}/sessions/{sessionId}`).
+    pub sessions: HashMap<String, Session>,
 }
 
 impl Job {
@@ -887,6 +927,12 @@ impl Job {
                 // Creation has converged on the status the request asked the job to start
                 // in, so that is what the job's tasks now carry.
                 self.task_run_status = self.target_task_run_status.clone();
+                let target = self.target_task_run_status.clone();
+                for task in self.tasks_mut() {
+                    if task.run_status == TASK_RUN_STATUS_PENDING {
+                        task.run_status = target.clone();
+                    }
+                }
                 self.create_complete_due_at = None;
             }
         }
@@ -899,6 +945,11 @@ impl Job {
                          queue can run it."
                             .to_string();
                     self.task_run_status = TASK_RUN_STATUS_NOT_COMPATIBLE.to_string();
+                    // Nothing can pick the job's tasks up either, so they carry what the
+                    // job does.
+                    for task in self.tasks_mut() {
+                        task.run_status = TASK_RUN_STATUS_NOT_COMPATIBLE.to_string();
+                    }
                     // The service, not a caller, moved the job, so the update it made is
                     // dated here and `updatedBy` stays absent: no principal made it.
                     self.updated_at = Some(SystemTime::now());
@@ -932,6 +983,16 @@ impl Job {
             .ends_with("_IN_PROGRESS")
             .then(|| self.target_task_run_status.clone())
     }
+
+    /// Whether this emulator can place this job's work on a worker.
+    ///
+    /// A job holds work only when its template declared a step, and the scheduler places it
+    /// only when every step and task that template declared was read out of it — handing a
+    /// worker a task set that is not the one the template describes would be worse than
+    /// handing it nothing (see `super::job_template`).
+    pub fn assignable(&self) -> bool {
+        self.work_fully_read && self.steps.iter().any(|step| !step.tasks.is_empty())
+    }
 }
 
 /// Per-service state for com-amazonaws-deadline-deadline. A handler reaches it through [`service_state`].
@@ -952,6 +1013,9 @@ pub struct ComAmazonawsDeadlineDeadlineState {
     /// How many bytes of job templates the stored jobs hold, kept in step with every
     /// job inserted and every job deleted, so the byte budget is released with its jobs.
     stored_template_bytes: usize,
+    /// How many bytes of task state the stored jobs' work holds, kept in step the same way,
+    /// so [`MAX_STORED_TASK_BYTES`] is released with the jobs that spent it.
+    stored_task_bytes: usize,
 }
 
 /// What one client token created, and when (in `id_sequence` order) it was recorded, so
@@ -1039,6 +1103,21 @@ impl ComAmazonawsDeadlineDeadlineState {
     /// Release the template bytes of jobs that have been deleted.
     pub fn release_template_bytes(&mut self, bytes: usize) {
         self.stored_template_bytes = self.stored_template_bytes.saturating_sub(bytes);
+    }
+
+    /// Would storing `bytes` more of job work fit inside [`MAX_STORED_TASK_BYTES`]?
+    pub fn task_bytes_fit(&self, bytes: usize) -> bool {
+        self.stored_task_bytes.saturating_add(bytes) <= MAX_STORED_TASK_BYTES
+    }
+
+    /// Charge `bytes` of job work to the budget, as a job holding it is stored.
+    pub fn charge_task_bytes(&mut self, bytes: usize) {
+        self.stored_task_bytes = self.stored_task_bytes.saturating_add(bytes);
+    }
+
+    /// Release the work of jobs that have been deleted.
+    pub fn release_task_bytes(&mut self, bytes: usize) {
+        self.stored_task_bytes = self.stored_task_bytes.saturating_sub(bytes);
     }
 
     /// The farm `farm_id` names, or `None` when this emulator holds no such farm.

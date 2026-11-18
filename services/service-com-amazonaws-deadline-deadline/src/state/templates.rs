@@ -10,6 +10,10 @@
 //! either enum spells (`smithy_query(query="shape", shape="EnvironmentTemplateType")` and
 //! `smithy_query(query="shape", shape="JobTemplateType")`).
 //!
+//! A job template also describes the WORK the job is made of, which the scheduler needs as
+//! steps and tasks: [`template_document`] hands the whole document to
+//! [`super::job_template_work`], which reads it there.
+//!
 //! Both readers are real parsers of their language rather than a hand-written subset.
 //!
 //! The JSON one is bounded by what the request already bounds (`EnvironmentTemplate, len
@@ -49,6 +53,32 @@ pub const TEMPLATE_TYPE_JSON: &str = "JSON";
 /// The `YAML` member of the two template-type enums.
 pub const TEMPLATE_TYPE_YAML: &str = "YAML";
 
+/// The whole template as one document tree, read with the parser `template_type` names.
+///
+/// Every reader in this crate goes through here, so a template is parsed by exactly one
+/// parser per language and every later walk is over the same tree shape — a
+/// [`::serde_json::Value`], which is what the JSON parser already builds and what a loaded
+/// YAML document is converted to.
+///
+/// `Ok(None)` is a `template_type` that names neither language (so there is no document to
+/// read); `Err` is a document that is not the language it said it was, and the caller
+/// answers it as the modeled 400 for an unparseable payload.
+pub fn template_document(
+    template: &str,
+    template_type: &str,
+) -> Result<Option<::serde_json::Value>, String> {
+    match template_type {
+        TEMPLATE_TYPE_JSON => ::serde_json::from_str(template)
+            .map(Some)
+            .map_err(|error| format!("The template isn't valid JSON: {error}")),
+        TEMPLATE_TYPE_YAML => yaml_document(template),
+        // Neither enum spells a third language, so a validated request reaches this arm
+        // only where the member is absent entirely: there is no document to read, which
+        // is not the same as a document that failed to parse.
+        _ => Ok(None),
+    }
+}
+
 /// The string a template declares at `path` — each element one mapping key, nested left to
 /// right — read with the parser `template_type` names.
 ///
@@ -60,14 +90,17 @@ pub fn template_string(
     template_type: &str,
     path: &[&str],
 ) -> Result<Option<String>, String> {
-    match template_type {
-        TEMPLATE_TYPE_JSON => json_string_at(template, path),
-        TEMPLATE_TYPE_YAML => yaml_string_at(template, path),
-        // Neither enum spells a third language, so a validated request reaches this arm
-        // only where the member is absent entirely: there is no document to read, which
-        // is not the same as a document that failed to parse.
-        _ => Ok(None),
+    let Some(document) = template_document(template, template_type)? else {
+        return Ok(None);
+    };
+    let mut node = &document;
+    for key in path {
+        let Some(child) = node.get(*key) else {
+            return Ok(None);
+        };
+        node = child;
     }
+    Ok(node.as_str().map(str::to_string))
 }
 
 /// The name a JOB template declares.
@@ -95,41 +128,54 @@ pub fn environment_template_name(
     template_string(template, template_type, &["environment", "name"])
 }
 
-/// [`template_string`] for a JSON document.
-fn json_string_at(template: &str, path: &[&str]) -> Result<Option<String>, String> {
-    let document: ::serde_json::Value = ::serde_json::from_str(template)
-        .map_err(|error| format!("The template isn't valid JSON: {error}"))?;
-    let mut node = &document;
-    for key in path {
-        let Some(child) = node.get(*key) else {
-            return Ok(None);
-        };
-        node = child;
-    }
-    Ok(node.as_str().map(str::to_string))
-}
-
-/// [`template_string`] for a YAML document: the FIRST document of the stream, which is the
-/// whole of a template that carries one.
+/// [`template_document`] for a YAML document: the FIRST document of the stream, which is
+/// the whole of a template that carries one.
 ///
 /// The bounds this module's header states are taken FIRST, so the tree-building loader is
 /// reached only by a document whose expansion is already known to be bounded.
-fn yaml_string_at(template: &str, path: &[&str]) -> Result<Option<String>, String> {
+fn yaml_document(template: &str) -> Result<Option<::serde_json::Value>, String> {
     yaml_within_bounds(template)?;
     let documents = ::yaml_rust2::YamlLoader::load_from_str(template)
         .map_err(|error| format!("The template isn't valid YAML: {error}"))?;
-    let Some(document) = documents.first() else {
-        return Ok(None);
-    };
-    let mut node = document;
-    for key in path {
-        let child = &node[*key];
-        if child.is_badvalue() {
-            return Ok(None);
-        }
-        node = child;
+    Ok(documents.first().map(yaml_as_json))
+}
+
+/// A loaded YAML node as the document tree every reader here walks.
+///
+/// The two languages a template may be written in describe the same documents, so they are
+/// read through one tree rather than one walk per language. The recursion is bounded before
+/// this runs: [`yaml_within_bounds`] has already refused a document that holds more than
+/// [`MAX_TEMPLATE_DEPTH`] collections open at once, so the depth here is not
+/// caller-controlled. A node of a kind no template declares a value with (a tag-only node,
+/// an unresolved alias) becomes `null`, which every reader treats as "nothing declared".
+fn yaml_as_json(node: &::yaml_rust2::Yaml) -> ::serde_json::Value {
+    use ::serde_json::Value;
+    if let Some(text) = node.as_str() {
+        return Value::String(text.to_string());
     }
-    Ok(node.as_str().map(str::to_string))
+    if let Some(value) = node.as_bool() {
+        return Value::Bool(value);
+    }
+    if let Some(value) = node.as_i64() {
+        return Value::Number(value.into());
+    }
+    if let Some(value) = node.as_f64() {
+        return ::serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number);
+    }
+    if let Some(items) = node.as_vec() {
+        return Value::Array(items.iter().map(yaml_as_json).collect());
+    }
+    if let Some(entries) = node.as_hash() {
+        return Value::Object(
+            entries
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.as_str().map(|key| (key.to_string(), yaml_as_json(value)))
+                })
+                .collect(),
+        );
+    }
+    Value::Null
 }
 
 /// Whether a YAML template is flat enough, and free enough of expansion, to build a tree

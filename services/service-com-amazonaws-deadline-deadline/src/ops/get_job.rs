@@ -222,15 +222,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_by: job.updated_by.clone(),
             started_at: job.started_at.map(crate::state::timestamp),
             ended_at: job.ended_at.map(crate::state::timestamp),
-            // The run status the service has settled the job's tasks to, and the target
-            // it is still working towards only while it is (see
-            // `crate::state::Job::reported_target_task_run_status`). This slice persists
-            // no steps or tasks, so the per-task counts and the retry count stay absent
-            // until the step/task operations are written.
+            // The run status the service has settled the job's tasks to, and the target it
+            // is still working towards only while it is (see
+            // `crate::state::Job::reported_target_task_run_status`), beside the counts of
+            // what the job's own tasks carry — absent for a job whose template declared no
+            // step, which has no task to count.
             task_run_status: Some(job.task_run_status.clone()),
             target_task_run_status: job.reported_target_task_run_status(),
-            task_run_status_counts: None,
-            task_failure_retry_count: None,
+            task_run_status_counts: job.task_run_status_counts(),
+            task_failure_retry_count: job.task_failure_retry_count(),
             storage_profile_id: job.storage_profile_id.clone(),
             max_failed_tasks_count: Some(job.max_failed_tasks_count),
             max_retries_per_task: Some(job.max_retries_per_task),

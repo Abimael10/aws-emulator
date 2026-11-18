@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkerSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkerSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The worker-facing half of the scheduler: a worker reports what it did with the session
+//! actions it holds and is given what to do next, in one call.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkerSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What this answers is computed from the store every time: the sessions the scheduler has
+//! assigned to THIS worker, each carrying the actions it has not finished. Both halves —
+//! recording the report and assigning the next action — are
+//! [`crate::state::ComAmazonawsDeadlineDeadlineState::report_session_actions`] and
+//! [`schedule_worker`](crate::state::ComAmazonawsDeadlineDeadlineState::schedule_worker),
+//! which is where the scheduling rules and their grounding are written down, because a job,
+//! its steps and tasks, and the sessions running them are one piece of state.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +160,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkerSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkerScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkerSchedule"))
+        // A mutating call: the worker's report is written down and the next action is
+        // assigned, which is what this operation is for.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateWorkerScheduleErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The schedule is the worker's, and a worker is reached only through its own fleet
+        // and farm, so every level the path names is reported as itself.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(UpdateWorkerScheduleErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        if store.fleet(&input.farm_id, &input.fleet_id).is_none() {
+            return Err(UpdateWorkerScheduleErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FLEET, &input.fleet_id),
+            )
+            .into());
+        }
+        if store
+            .worker(&input.farm_id, &input.fleet_id, &input.worker_id)
+            .is_none()
+        {
+            return Err(UpdateWorkerScheduleErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_WORKER, &input.worker_id),
+            )
+            .into());
+        }
+
+        // The report comes first: what the worker did decides what it is given next.
+        if let Some(reported) = input.updated_session_actions.as_ref() {
+            if let Err(session_action_id) = store.report_session_actions(
+                &input.farm_id,
+                &input.worker_id,
+                reported,
+            ) {
+                // A worker reports only on the actions the service handed IT. An id that
+                // belongs to no session of this worker names a resource this worker cannot
+                // report on, and the whole report is refused rather than half-applied.
+                return Err(UpdateWorkerScheduleErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(
+                        crate::state::RESOURCE_TYPE_SESSION_ACTION,
+                        &session_action_id,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let schedule =
+            store.schedule_worker(&input.farm_id, &input.fleet_id, &input.worker_id);
+
+        Ok(UpdateWorkerScheduleOutput {
+            assigned_sessions: schedule.assigned_sessions,
+            cancel_session_actions: schedule.cancel_session_actions,
+            desired_worker_status: schedule.desired_worker_status,
+            update_interval_seconds: crate::state::UPDATE_INTERVAL_SECONDS,
+        })
     }
 }

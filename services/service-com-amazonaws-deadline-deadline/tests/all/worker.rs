@@ -28,6 +28,16 @@ use serde_json::{json, Value};
 use crate::farm_queue_job::{absent_id, error_code, is_resource_id, string_at, Emulator};
 use crate::fleet::{create_fleet, create_fleet_path, customer_managed, get_fleet_path, ROLE_ARN};
 
+/// The worker's own half of the scheduler: `UpdateWorkerSchedule` and the sessions it hands
+/// a worker.
+///
+/// Declared here rather than in `tests/all.rs`, which declares the suites directly under
+/// `tests/all/`: a file deeper than that is declared by its own parent module, which this
+/// suite is. The `#[path]` is relative to this file's own directory, and is needed because
+/// `tests/all.rs` pulled this file in with a `#[path]` of its own.
+#[path = "worker/schedule.rs"]
+mod schedule;
+
 pub(crate) fn create_worker_path(farm_id: &str, fleet_id: &str) -> String {
     format!("/2023-10-12/farms/{farm_id}/fleets/{fleet_id}/workers")
 }

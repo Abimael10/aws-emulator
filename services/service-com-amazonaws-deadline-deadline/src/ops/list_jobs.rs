@@ -221,12 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 started_at: job.started_at.map(crate::state::timestamp),
                 ended_at: job.ended_at.map(crate::state::timestamp),
                 // The settled run status, and the target only while the job is still
-                // converging to it — the same rule as in `get_job`. This slice persists no
-                // steps or tasks, so the per-task counts stay absent.
+                // converging to it — the same rule as in `get_job`, as are the counts of
+                // what its tasks carry.
                 task_run_status: Some(job.task_run_status.clone()),
                 target_task_run_status: job.reported_target_task_run_status(),
-                task_run_status_counts: None,
-                task_failure_retry_count: None,
+                task_run_status_counts: job.task_run_status_counts(),
+                task_failure_retry_count: job.task_failure_retry_count(),
                 max_failed_tasks_count: Some(job.max_failed_tasks_count),
                 max_retries_per_task: Some(job.max_retries_per_task),
                 max_worker_count: job.max_worker_count,

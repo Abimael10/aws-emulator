@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateJob
-//! Creates a job under a farm's queue and persists it there under the `jobId` it mints.
+//! Creates a job under a farm's queue and persists it there under the `jobId` it mints,
+//! together with the steps and tasks its template declares, under ids of their own.
 //!
 //! ## Shape of an operation
 //!
@@ -214,6 +215,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below unless `nameOverride` supplies one.
         .filter(|name| !name.is_empty());
 
+        // The WORK the job is made of comes out of the same document, read here for the
+        // same reason: a job's steps and tasks exist from the moment the job does (nothing
+        // else carries them — `CreateJob` takes no member for a step), and the parse must
+        // not run while every other request of this service waits on the store lock.
+        let declared_work = match (input.template.as_deref(), input.template_type.as_deref()) {
+            (Some(body), Some(language)) => crate::state::job_template_work(body, language)
+                .map_err(|message| {
+                    CreateJobError::from(CreateJobErrorModeled::ValidationException(
+                        crate::state::cannot_parse("template", &message),
+                    ))
+                })?,
+            _ => crate::state::DeclaredWork::default(),
+        };
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateJobErrorModeled::InternalServerErrorException(
                 crate::state::state_unavailable(),
@@ -346,8 +361,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // What the template EXPANDS to is budgeted the same way: the steps and tasks read
+        // out of it are stored state a small request can make a lot of, so the store's own
+        // allowance for them is checked before any of this job's work is minted.
+        let task_bytes = match (input.template.as_deref(), &source) {
+            (Some(_), _) => declared_work.task_bytes,
+            (None, Some(job)) => crate::state::stored_task_bytes(&job.steps),
+            (None, None) => 0,
+        };
+        if !store.task_bytes_fit(task_bytes) {
+            return Err(CreateJobErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::RESOURCE_TYPE_JOB,
+                    "You exceeded the total amount of job work this emulator stores. Delete \
+                     jobs and try again.",
+                ),
+            )
+            .into());
+        }
 
         let job_id = store.mint_id("job");
+        // The job's work is its own template's when the request carried one, and otherwise
+        // the source job's, copied under ids of its own: that job's template was read when
+        // IT was created, so no document is parsed twice.
+        let (steps, environments, work_fully_read) = match (input.template.as_deref(), &source) {
+            (Some(_), _) => (
+                store.mint_steps(&declared_work),
+                declared_work.environments.clone(),
+                declared_work.fully_read,
+            ),
+            (None, Some(job)) => (
+                store.copy_steps(&job.steps),
+                job.environments.clone(),
+                job.work_fully_read,
+            ),
+            // A job created from neither a template nor a source job holds no work, which
+            // every reader of it reports as no steps rather than as work it could not read.
+            (None, None) => (Vec::new(), Vec::new(), true),
+        };
         let job = crate::state::Job {
             job_id: job_id.clone(),
             queue_id: input.queue_id.clone(),
@@ -390,6 +441,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             reconcile_due_at: Some(
                 ::std::time::Instant::now() + crate::state::JOB_RECONCILE_AFTER,
             ),
+            steps,
+            environments,
+            work_fully_read,
+            // Nothing has run the job yet, so no worker holds a session on it.
+            sessions: ::std::collections::HashMap::new(),
         };
 
         let Some(queue) = store.queue_mut(&input.farm_id, &input.queue_id) else {
@@ -400,6 +456,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         queue.jobs.insert(job_id.clone(), job);
         store.charge_template_bytes(template_bytes);
+        store.charge_task_bytes(task_bytes);
         if let Some(key) = token {
             store.remember_resource(key, &job_id);
         }

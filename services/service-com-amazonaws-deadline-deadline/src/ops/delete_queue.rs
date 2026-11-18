@@ -178,13 +178,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The client tokens of the queue, of its jobs and of its environments are released
         // with them, so the idempotency record cannot grow past the resources it describes,
-        // and the template bytes those jobs and environments held go back to the store's
-        // budget.
+        // and the template bytes those jobs and environments held — together with the work
+        // read out of those templates — go back to the store's budgets.
         let mut removed = vec![removed_queue.queue_id.clone()];
         let mut released_template_bytes = 0;
+        let mut released_task_bytes = 0;
         for job in removed_queue.jobs.values() {
             removed.push(job.job_id.clone());
             released_template_bytes += job.template.as_deref().map_or(0, str::len);
+            released_task_bytes += crate::state::stored_task_bytes(&job.steps);
         }
         for environment in removed_queue.environments.values() {
             removed.push(environment.queue_environment_id.clone());
@@ -192,6 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         store.forget_resources(&removed);
         store.release_template_bytes(released_template_bytes);
+        store.release_task_bytes(released_task_bytes);
 
         Ok(DeleteQueueOutput {})
     }
