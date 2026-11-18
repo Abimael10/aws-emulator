@@ -583,6 +583,10 @@ pub fn constraint_clause(member_path: &str, requirement: &str) -> String {
 /// The subject is `Value null`, because there was no value: the request carried
 /// nothing at that path, which is a fact about the request's SHAPE rather than a value
 /// echoed back from it.
+///
+/// A member whose value is merely WITHHELD is not this case: a `@sensitive` member's
+/// violation carries no value to show but was raised on one the request did carry, so
+/// it is stated through [`constraint_clause`] like any other present member's.
 pub fn absent_member_clause(member_path: &str, requirement: &str) -> String {
     format!("Value null at '{member_path}'{CONSTRAINT_SEPARATOR}{requirement}")
 }
@@ -810,10 +814,17 @@ fn violation_clause(violation: &Violation) -> String {
         return constraint_clause(member_path, &requirement);
     }
     let requirement = requirement_text(violation.kind.clone());
-    match violation.value {
-        // No value at that path: the member was absent from the request.
-        None => absent_member_clause(&violation.path, &requirement),
-        Some(_) => constraint_clause(&violation.path, &requirement),
+    // Whether the request carried a value at that path, which is what decides the
+    // clause's SUBJECT. A violation the walk recorded with no value is the absent
+    // member; a violation whose value the walk WITHHELD because the member's shape is
+    // `@sensitive` was raised ON a value — only its bytes are gone, and the member was
+    // present — so it is worded as every other present-but-invalid member is, which is
+    // also how the framework words such a violation itself.
+    let carried_a_value = violation.value.is_some() || violation.sensitive;
+    if carried_a_value {
+        constraint_clause(&violation.path, &requirement)
+    } else {
+        absent_member_clause(&violation.path, &requirement)
     }
 }
 

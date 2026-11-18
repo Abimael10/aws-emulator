@@ -29,17 +29,26 @@
 //!    so a bare name or id is reported absent too), and both resources the policy
 //!    operations reference (an absent GROUP is reported as the group; a group that
 //!    exists with no policy as the policy).
+//! 3. WHICH SUBJECT a clause of rule 1 takes is decided by whether the request carried
+//!    a value at that path, never by whether the refusal has one to show: a member the
+//!    request did not carry is the only `Value null` subject, and a violation raised on
+//!    a value whose bytes are withheld — a `@sensitive` member's — is stated as every
+//!    other present-but-invalid member is. The rows span the two subjects, the
+//!    constraint classes a withheld value can break, and both layers that word one (the
+//!    boundary walk and a handler's own rule).
 
 use std::sync::Arc;
 
+use aws_smithy_schema::traits::SensitiveTrait;
 use aws_smithy_schema::Schema;
-use aws_smithy_schema_server::constraints::PatternTrait;
+use aws_smithy_schema_server::constraints::{LengthTrait, PatternTrait};
 use serde_json::{json, Value};
 use service_com_amazonaws_aiops_aiops::ops::types::{
     CREATE_INVESTIGATION_GROUP_INPUT_SCHEMA, ENCRYPTION_CONFIGURATION_TYPE_VALUES,
+    LIST_INVESTIGATION_GROUPS_INPUT_SCHEMA,
 };
 use service_com_amazonaws_aiops_aiops::state;
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{MultiServiceRouter, Violation, ViolationKind};
 
 /// The region every request below signs for.
 const REGION: &str = "us-west-2";
@@ -192,16 +201,43 @@ fn pattern_requirement(pattern: &str) -> String {
     format!("Member must satisfy regular expression pattern: {pattern}")
 }
 
+/// The generated schema of one member of `input`, or `None` when `input` has no such
+/// member — the one lookup every reader of a modelled trait below goes through, so all
+/// of them resolve a member the way the boundary walk does.
+fn member_schema<'a>(input: &'a Schema, member: &str) -> Option<&'a Schema> {
+    input
+        .members()
+        .iter()
+        .copied()
+        .find(|candidate| candidate.member_name() == Some(member))
+}
+
 /// The `@pattern` expression the model declares for one member of `input`, or `None`
 /// when it declares none — read off the generated schema, which is the same trait map
 /// the boundary walk enforces, so this cannot drift from the model.
 fn modelled_member_pattern(input: &Schema, member: &str) -> Option<&'static str> {
-    let member_schema = input
-        .members()
-        .iter()
-        .find(|candidate| candidate.member_name() == Some(member))?;
-    let declared = member_schema.traits()?.get(&PatternTrait::TRAIT_ID)?;
+    let declared = member_schema(input, member)?
+        .traits()?
+        .get(&PatternTrait::TRAIT_ID)?;
     Some(declared.as_any().downcast_ref::<PatternTrait>()?.regex)
+}
+
+/// The length MAXIMUM the model declares for one member of `input`, or `None` when it
+/// declares none — read off the generated schema, the same trait map the boundary walk
+/// enforces, so a bound asserted here cannot drift from the model.
+fn modelled_member_length_max(input: &Schema, member: &str) -> Option<i64> {
+    let declared = member_schema(input, member)?
+        .traits()?
+        .get(&LengthTrait::TRAIT_ID)?;
+    declared.as_any().downcast_ref::<LengthTrait>()?.max
+}
+
+/// Whether the model marks one member of `input` `@sensitive` — the marker that makes
+/// the boundary walk withhold the value of every violation it raises on that member.
+fn member_is_sensitive(input: &Schema, member: &str) -> bool {
+    member_schema(input, member)
+        .and_then(|member_schema| member_schema.traits())
+        .is_some_and(|traits| traits.get(&SensitiveTrait::TRAIT_ID).is_some())
 }
 
 /// Identifier forms that resolve no group: a bare label no group carries, a bare
@@ -644,4 +680,295 @@ async fn an_absent_policy_on_a_group_that_exists_is_a_different_resource() {
         (404, group_absent.as_str()),
         "case \"after the group is deleted\": expected {group_absent:?}, got {after_delete:?}"
     );
+}
+
+/// The subject a clause takes when the request carried NOTHING at that path, which is
+/// the one condition it states.
+const ABSENT_SUBJECT: &str = "Value null at";
+
+/// One row of the subject table: the case name, the request (method, URI, body), the
+/// value the request carried at the path the refusal names (`None` where it carried
+/// none, which is the absent-member case), and the message the service must answer with.
+type SubjectCase = (
+    &'static str,
+    &'static str,
+    String,
+    Option<Value>,
+    Option<String>,
+    String,
+);
+
+/// The requirement the HANDLER states for a page token it did not issue — the layer
+/// below the boundary walk, which words the same member without a value either.
+const PAGE_TOKEN_REQUIREMENT: &str =
+    "Member must be a pagination token returned by a previous ListInvestigationGroups call";
+
+#[tokio::test]
+async fn a_withheld_sensitive_value_is_named_as_a_present_member_and_only_absence_is_null() {
+    let router = emulator();
+
+    // The premise is read off the MODEL, not written here: the page token is a member a
+    // request carries whose violations are withheld, and the length maximum a boundary
+    // refusal of it states is the model's.
+    assert!(
+        member_is_sensitive(LIST_INVESTIGATION_GROUPS_INPUT_SCHEMA, "nextToken"),
+        "the page token is the member whose violation values are withheld; the model no \
+         longer marks it @sensitive, so this suite is pinning nothing"
+    );
+    let max = modelled_member_length_max(LIST_INVESTIGATION_GROUPS_INPUT_SCHEMA, "nextToken")
+        .and_then(|max| usize::try_from(max).ok())
+        .expect("the model declares a length maximum for the page token");
+    let length_requirement = format!("Member must have length less than or equal to {max}");
+    let one_past_the_bound = "a".repeat(max + 1);
+    let far_past_the_bound = "b".repeat(max * 2 + 1);
+    let at_the_bound = "c".repeat(max);
+
+    // Rows: (case, method, uri, body, the value the request carried at the refused path —
+    // `None` where it carried none — expected message). They differ along WHETHER the
+    // request carried a value there, how far past the bound the withheld value was, and
+    // which layer worded the refusal (the boundary walk for a bound, the handler for its
+    // own token rule) — so the subject is decided by the request and not by the layer or
+    // by the value being shown.
+    let cases: Vec<SubjectCase> = vec![
+        (
+            "a withheld page token one character past its length maximum",
+            "GET",
+            format!("/investigationGroups?nextToken={one_past_the_bound}"),
+            None,
+            Some(one_past_the_bound.clone()),
+            envelope(&[clause("nextToken", &length_requirement)]),
+        ),
+        (
+            "a withheld page token far past its length maximum",
+            "GET",
+            format!("/investigationGroups?nextToken={far_past_the_bound}"),
+            None,
+            Some(far_past_the_bound.clone()),
+            envelope(&[clause("nextToken", &length_requirement)]),
+        ),
+        (
+            "a withheld page token at its length maximum, which the handler refuses",
+            "GET",
+            format!("/investigationGroups?nextToken={at_the_bound}"),
+            None,
+            Some(at_the_bound.clone()),
+            envelope(&[clause("nextToken", PAGE_TOKEN_REQUIREMENT)]),
+        ),
+        (
+            "a short withheld page token no page issued",
+            "GET",
+            "/investigationGroups?nextToken=not-a-token".to_string(),
+            None,
+            Some("not-a-token".to_string()),
+            envelope(&[clause("nextToken", PAGE_TOKEN_REQUIREMENT)]),
+        ),
+        (
+            "a required member the request never carried, the one absent subject",
+            "POST",
+            "/investigationGroups".to_string(),
+            Some(json!({ "roleArn": ROLE_ARN })),
+            None,
+            envelope(&[absent_clause("name")]),
+        ),
+    ];
+
+    for (case, method, uri, body, submitted, expected) in cases {
+        let (status, code, message) = call(&router, method, &uri, body.as_ref()).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} / {code} / {message:?}"
+        );
+        assert_eq!(
+            code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {code} / {message:?}"
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+        assert_eq!(
+            message.contains(ABSENT_SUBJECT),
+            submitted.is_none(),
+            "case {case:?}: the {ABSENT_SUBJECT:?} subject states that the request carried \
+             nothing at that path, got {message:?}"
+        );
+        // Only a row that carried a value has one the message could echo.
+        if let Some(submitted) = submitted.as_deref() {
+            assert!(
+                !message.contains(submitted),
+                "case {case:?}: the message must not echo the submitted value {submitted:?}, \
+                 got {message:?}"
+            );
+        }
+    }
+
+    // One request breaking a withheld member's bound AND a shown member's: both clauses
+    // name a present member, in one envelope.
+    let (status, code, message) = call(
+        &router,
+        "GET",
+        &format!("/investigationGroups?nextToken={one_past_the_bound}&maxResults=999"),
+        None,
+    )
+    .await;
+    let case = "a withheld page token past its bound beside a page size past its own";
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "ValidationException"),
+        "case {case:?}: expected a 400 ValidationException, got {status} / {code} / {message:?}"
+    );
+    for expected_clause in [
+        clause("nextToken", &length_requirement),
+        clause(
+            "maxResults",
+            "Member must have value less than or equal to 50",
+        ),
+    ] {
+        assert!(
+            message.contains(&expected_clause),
+            "case {case:?}: expected the clause {expected_clause:?}, got {message:?}"
+        );
+    }
+    assert!(
+        !message.contains(ABSENT_SUBJECT),
+        "case {case:?}: neither member was absent, got {message:?}"
+    );
+    assert!(
+        !message.contains(&one_past_the_bound),
+        "case {case:?}: the message must not echo the submitted token, got {message:?}"
+    );
+}
+
+#[test]
+fn a_withheld_value_takes_the_present_member_subject_whatever_it_violated() {
+    // The wire path above can only break the ONE bound this model gives its withheld
+    // member, so the rule is pinned here over every constraint class a violation can
+    // carry, each handed to the refusal renderer exactly as the walk records it: a
+    // withheld value (`sensitive`, no value to show), a value the walk echoes, and no
+    // value at all.
+    //
+    // Rows: (case, the violation as recorded, the expected message).
+    let cases = [
+        (
+            "a withheld value past a length maximum",
+            Violation {
+                path: "nextToken".to_string(),
+                kind: ViolationKind::MaxLength(2048),
+                value: None,
+                sensitive: true,
+            },
+            clause(
+                "nextToken",
+                "Member must have length less than or equal to 2048",
+            ),
+        ),
+        (
+            "a withheld value below a length minimum",
+            Violation {
+                path: "nextToken".to_string(),
+                kind: ViolationKind::MinLength(1),
+                value: None,
+                sensitive: true,
+            },
+            clause(
+                "nextToken",
+                "Member must have length greater than or equal to 1",
+            ),
+        ),
+        (
+            "a withheld value outside a pattern",
+            Violation {
+                path: "nextToken".to_string(),
+                kind: ViolationKind::Pattern(r"^[a-z]+$".to_string()),
+                value: None,
+                sensitive: true,
+            },
+            clause(
+                "nextToken",
+                &pattern_requirement("[a-z]+"),
+            ),
+        ),
+        (
+            "a withheld value outside an enum value set",
+            Violation {
+                path: "encryptionConfiguration.type".to_string(),
+                kind: ViolationKind::EnumValue(vec!["AWS_OWNED_KEY".to_string()]),
+                value: None,
+                sensitive: true,
+            },
+            clause(
+                "encryptionConfiguration.type",
+                "Member must satisfy enum value set: [AWS_OWNED_KEY]",
+            ),
+        ),
+        (
+            "a withheld value under a range minimum",
+            Violation {
+                path: "retentionInDays".to_string(),
+                kind: ViolationKind::MinValue("7".to_string()),
+                value: None,
+                sensitive: true,
+            },
+            clause(
+                "retentionInDays",
+                "Member must have value greater than or equal to 7",
+            ),
+        ),
+        (
+            "a withheld value inside a list element",
+            Violation {
+                path: "crossAccountConfigurations.1.member.sourceRoleArn".to_string(),
+                kind: ViolationKind::MaxLength(2048),
+                value: None,
+                sensitive: true,
+            },
+            clause(
+                "crossAccountConfigurations.1.member.sourceRoleArn",
+                "Member must have length less than or equal to 2048",
+            ),
+        ),
+        (
+            "a value the walk echoes rather than withholds",
+            Violation {
+                path: "name".to_string(),
+                kind: ViolationKind::MaxLength(512),
+                value: Some("n".repeat(513)),
+                sensitive: false,
+            },
+            clause("name", "Member must have length less than or equal to 512"),
+        ),
+        (
+            "no value at that path at all",
+            Violation {
+                path: "name".to_string(),
+                kind: ViolationKind::MissingRequiredMember,
+                value: None,
+                sensitive: false,
+            },
+            absent_clause("name"),
+        ),
+    ];
+
+    for (case, violation, expected_clause) in cases {
+        let expected = envelope(std::slice::from_ref(&expected_clause));
+        let message = state::validation_exception_message(std::slice::from_ref(&violation));
+        assert_eq!(
+            message.as_deref(),
+            Some(expected.as_str()),
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+        let actual = message.unwrap_or_default();
+        assert_eq!(
+            actual.contains(ABSENT_SUBJECT),
+            violation.value.is_none() && !violation.sensitive,
+            "case {case:?}: the {ABSENT_SUBJECT:?} subject states that the request carried \
+             nothing at that path, got {actual:?}"
+        );
+        if let Some(shown) = violation.value.as_deref() {
+            assert!(
+                !actual.contains(shown),
+                "case {case:?}: no clause echoes the value it refused, got {actual:?}"
+            );
+        }
+    }
 }
