@@ -206,8 +206,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         };
+        let detail = guard.daemon_detail(&daemon);
+        // The pass above may have started or stopped daemon tasks: "a task that reaches
+        // `RUNNING` is a task whose containers are running", so the runs behind the
+        // containers of a task it moved into that status were owed at the instant it moved,
+        // and the runs of a task it moved out of it were owed their termination signal then
+        // ([`crate::state::settle_container_runtime`], the same pass the clock pump drives:
+        // it starts nothing for a task that is not running and nothing twice, so it settles
+        // what the clock already made due and never what this call happened to ask about).
+        // OUR guard is dropped first, since the reconcile takes this store's lock itself.
+        drop(guard);
+        crate::state::settle_container_runtime(
+            ctx.callback(),
+            &self.engine,
+            &crate::state::request_region(ctx),
+        );
         Ok(DescribeDaemonOutput {
-            daemon: Some(guard.daemon_detail(&daemon)),
+            daemon: Some(detail),
         })
     }
 }

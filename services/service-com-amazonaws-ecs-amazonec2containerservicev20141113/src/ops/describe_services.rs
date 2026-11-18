@@ -267,6 +267,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // And so were the target registrations those tasks hold in the Elastic Load Balancing
         // v2 groups their service binds ([`crate::state::settle_load_balancer_targets`]).
         crate::state::settle_load_balancer_targets(&*self.engine);
+        // And so was the CONTAINER data plane of every task that pass started or stopped: "a
+        // task that reaches `RUNNING` is a task whose containers are running", so the runs
+        // behind the containers of a task this read has just moved into that status were owed
+        // at the instant it moved, and the runs of a task it moved out of it were owed their
+        // termination signal then ([`crate::state::settle_container_runtime`], the same pass
+        // the clock pump drives: it starts nothing for a task that is not running and nothing
+        // twice, so it settles what the clock already made due and never what this call
+        // happened to ask about).
+        crate::state::settle_container_runtime(ctx.callback(), &self.engine, &region);
 
         Ok(DescribeServicesOutput {
             services: Some(services),

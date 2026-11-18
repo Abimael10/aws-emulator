@@ -36,6 +36,16 @@
 //! `DescribeServices`, `ListTasks`, `DescribeTasks`, `DescribeLogStreams` and `GetLogEvents`.
 //! The stream naming is spelled out here rather than imported, so a wrong naming in the
 //! implementation cannot make a test pass.
+//!
+//! Every one of those reads is a WAIT FOR ITS CONDITION, re-read until it holds: what this
+//! rule is about is owed by the clock, so each reading that could still be one scheduler pass
+//! or one delivery behind — the counters, the task list the counters are a projection of, the
+//! events a container's run delivers and the streams its group then holds — is polled rather
+//! than taken at whatever instant the reading before it settled. The deadlines are derived
+//! from the spans the emulator itself documents for that chain plus a margin far wider than
+//! any of them ([`LOADED_HOST_MARGIN`]), and nothing here asserts on how long anything took:
+//! an outcome that depended on how fast the host ran would hide a real failure on an idle
+//! machine and fail a release on a loaded one.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -44,9 +54,13 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::{
+    ROLLOUT_STEP_SPAN, TRANSITION_SPAN,
+};
+
 use crate::ecs_wire::{
     awsvpc_network_configuration, cluster_with_capacity, count, iam, list, ok,
-    seed_awsvpc_subnets, string, ACCOUNT, SIGNED_REGION,
+    seed_awsvpc_subnets, string, ACCOUNT, AWSVPC_START, SIGNED_REGION,
 };
 
 /// The cluster every row's service runs in. One cluster for all of them, so the rows differ
@@ -77,14 +91,39 @@ const ASSUME_ROLE: &str = "sts:AssumeRole";
 /// service runs.
 const STAY_UP_SECONDS: u32 = 300;
 
-/// How often a poll re-reads the emulator.
+/// How often a poll re-reads the emulator. A cadence, not a bound: a poll that finds its
+/// condition unmet looks again until its deadline, so this decides how promptly the suite
+/// notices and never whether it passes.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// How long a poll keeps trying before it gives up: comfortably past every clock-owed
-/// transition the start of an `awsvpc` task takes (the interface is created and attached one
-/// documented step at a time, and only then is the task's own start owed), with generous
-/// margin for a loaded test machine.
-const POLL_BUDGET: Duration = Duration::from_secs(90);
+/// How much longer than the spans it waits on every deadline below allows.
+///
+/// Deliberately far wider than the whole chain a service converges through, because a test
+/// host shares its cores with every other suite of this crate and may be orders of magnitude
+/// slower than an idle one. Nothing here measures how long anything took, so the only thing
+/// this margin costs is the time a BROKEN emulator takes to be reported — and the only thing
+/// too small a margin buys is a suite that fails a release on a loaded machine.
+const LOADED_HOST_MARGIN: Duration = Duration::from_secs(120);
+
+/// The spans the emulator DOCUMENTS for the chain one row's service converges through: the
+/// interface an `awsvpc` task is allocated is created and attached one documented step at a
+/// time and only then is that task's own start owed ([`AWSVPC_START`]), the scheduler takes
+/// one step per placement of the rollout (`state::ROLLOUT_STEP_SPAN`), and the steady state
+/// the rollout settles into is owed one transition later (`state::TRANSITION_SPAN`).
+const CONVERGENCE_SPANS: Duration = AWSVPC_START
+    .saturating_add(ROLLOUT_STEP_SPAN)
+    .saturating_add(TRANSITION_SPAN);
+
+/// How long a wait for one row's service to hold the task set it was asked for keeps trying:
+/// the spans that chain is made of, with [`LOADED_HOST_MARGIN`] on top.
+const CONVERGENCE_BUDGET: Duration = CONVERGENCE_SPANS.saturating_add(LOADED_HOST_MARGIN);
+
+/// How long a wait for what a container's run delivers keeps trying.
+///
+/// The delivery is owed no span of its own: the driver creates the stream as the container
+/// starts and writes each line the program writes, so this is the margin alone — what a task
+/// already reported as `RUNNING` owes is observable from the instant it is reported.
+const DELIVERY_BUDGET: Duration = LOADED_HOST_MARGIN;
 
 /// One row: the service the scheduler is given, and what its container writes.
 struct Row {
@@ -367,7 +406,7 @@ async fn create_service(router: &MultiServiceRouter, row: &Row) {
 /// completed, and answer the service as it is then reported.
 async fn converged_service(router: &MultiServiceRouter, row: &Row) -> Value {
     let case = row.case;
-    let deadline = Instant::now() + POLL_BUDGET;
+    let deadline = Instant::now() + CONVERGENCE_BUDGET;
     loop {
         let described = ok(
             router,
@@ -411,62 +450,87 @@ async fn converged_service(router: &MultiServiceRouter, row: &Row) -> Value {
 
 /// The ARNs of the RUNNING tasks of one row's service, with each task's status asserted on
 /// the way.
+///
+/// WAITED FOR, not read once: the counters [`converged_service`] settled on are the SERVICE's
+/// own projection of the task records, while this is the task records' own, so a list that is
+/// still one scheduler pass behind those counters is a condition to look again on rather than
+/// a failure. The assertions are the same ones either way — they are made on the reading this
+/// settles on, or on the last one taken before the deadline, which is what names the actual
+/// value when it never settles.
 async fn running_task_arns(router: &MultiServiceRouter, row: &Row) -> Vec<String> {
     let case = row.case;
-    let listed = ok(
-        router,
-        "ListTasks",
-        json!({
-            "cluster": CLUSTER,
-            "serviceName": row.service_name,
-            "desiredStatus": "RUNNING",
-        }),
-        case,
-    )
-    .await;
-    let arns = list(&listed, "taskArns", case);
-    assert_eq!(
-        arns.len() as i64,
-        row.desired,
-        "case {case:?}: expected {} task ARN(s) of the converged service, got {listed}",
-        row.desired
-    );
-    let described = ok(
-        router,
-        "DescribeTasks",
-        json!({ "cluster": CLUSTER, "tasks": arns }),
-        case,
-    )
-    .await;
-    let tasks = list(&described, "tasks", case);
-    assert_eq!(
-        tasks.len() as i64,
-        row.desired,
-        "case {case:?}: every listed task must be describable, got {described}"
-    );
-    let mut task_arns = Vec::new();
-    for task in &tasks {
+    let deadline = Instant::now() + CONVERGENCE_BUDGET;
+    loop {
+        let listed = ok(
+            router,
+            "ListTasks",
+            json!({
+                "cluster": CLUSTER,
+                "serviceName": row.service_name,
+                "desiredStatus": "RUNNING",
+            }),
+            case,
+        )
+        .await;
+        let arns = list(&listed, "taskArns", case);
+        // A describe of no task names no task to describe, so an empty list is reported as
+        // the empty answer it is rather than put to the emulator as a request.
+        let described = if arns.is_empty() {
+            json!({ "tasks": [], "failures": [] })
+        } else {
+            ok(
+                router,
+                "DescribeTasks",
+                json!({ "cluster": CLUSTER, "tasks": arns.clone() }),
+                case,
+            )
+            .await
+        };
+        let tasks = list(&described, "tasks", case);
+        let settled = arns.len() as i64 == row.desired
+            && tasks.len() == arns.len()
+            && tasks
+                .iter()
+                .all(|task| task["lastStatus"].as_str() == Some("RUNNING"));
+        if !settled && Instant::now() < deadline {
+            ::tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
+        }
         assert_eq!(
-            task["lastStatus"].as_str(),
-            Some("RUNNING"),
-            "case {case:?}: a task counted as running reports RUNNING, got {task}"
+            arns.len() as i64,
+            row.desired,
+            "case {case:?}: expected {} task ARN(s) of the converged service, got {listed}",
+            row.desired
         );
         assert_eq!(
-            task["launchType"].as_str(),
-            Some(row.launch_type),
-            "case {case:?}: the task runs the launch type the service was created with, got \
-             {task}"
+            tasks.len() as i64,
+            row.desired,
+            "case {case:?}: every listed task must be describable, got {described}"
         );
-        assert_eq!(
-            task["group"].as_str(),
-            Some(format!("service:{}", row.service_name).as_str()),
-            "case {case:?}: the task the scheduler placed carries the service's own group, \
-             got {task}"
-        );
-        task_arns.push(string(task, "taskArn", case));
+        let mut task_arns = Vec::new();
+        for task in &tasks {
+            assert_eq!(
+                task["lastStatus"].as_str(),
+                Some("RUNNING"),
+                "case {case:?}: a task counted as running reports RUNNING, got {task}"
+            );
+            assert_eq!(
+                task["launchType"].as_str(),
+                Some(row.launch_type),
+                "case {case:?}: the task runs the launch type the service was created with, got \
+                 {task}"
+            );
+            assert_eq!(
+                task["group"].as_str(),
+                Some(format!("service:{}", row.service_name).as_str()),
+                "case {case:?}: the task the scheduler placed carries the service's own group, \
+                 got {task}"
+            );
+            task_arns.push(string(task, "taskArn", case));
+        }
+        task_arns.sort();
+        return task_arns;
     }
-    task_arns.sort();
-    task_arns
 }
 
 /// The stream the `awslogs` driver delivers one container of one task to:
@@ -483,22 +547,38 @@ fn stream_of(row: &Row, task_arn: &str) -> String {
 /// most recently written streams first. Which streams the group holds is what this rule is
 /// about, so the names are compared as a set; the ordering that call applies is its own
 /// surface and is pinned by the log service's own suites.
-async fn described_streams(router: &MultiServiceRouter, row: &Row) -> BTreeSet<String> {
-    let described = logs_ok(
-        router,
-        "DescribeLogStreams",
-        json!({
-            "logGroupName": row.log_group,
-            "orderBy": "LastEventTime",
-            "descending": true,
-        }),
-        row.case,
-    )
-    .await;
-    list(&described, "logStreams", row.case)
-        .into_iter()
-        .filter_map(|stream| stream["logStreamName"].as_str().map(str::to_string))
-        .collect()
+///
+/// WAITED FOR, not read once: the streams are created by the runs of the containers the
+/// clock started, so a group that does not hold them all YET is a condition to look again
+/// on. `wanted` is the set the caller will compare against, and the reading this answers is
+/// the one that matched it or the last one taken before the deadline.
+async fn described_streams(
+    router: &MultiServiceRouter,
+    row: &Row,
+    wanted: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let deadline = Instant::now() + DELIVERY_BUDGET;
+    loop {
+        let described = logs_ok(
+            router,
+            "DescribeLogStreams",
+            json!({
+                "logGroupName": row.log_group,
+                "orderBy": "LastEventTime",
+                "descending": true,
+            }),
+            row.case,
+        )
+        .await;
+        let streams: BTreeSet<String> = list(&described, "logStreams", row.case)
+            .into_iter()
+            .filter_map(|stream| stream["logStreamName"].as_str().map(str::to_string))
+            .collect();
+        if &streams == wanted || Instant::now() >= deadline {
+            return streams;
+        }
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// The messages CloudWatch Logs holds in `stream` of one row's group, oldest first. An
@@ -529,84 +609,154 @@ async fn delivered(router: &MultiServiceRouter, row: &Row, stream: &str) -> Vec<
         .unwrap_or_default()
 }
 
-/// Poll `probe` until it answers `Some`, or the budget runs out — for the clock-owed
+/// Poll `probe` until it answers `Some`, or `budget` runs out — for the clock-owed
 /// transitions and the deliveries a container's own run makes.
-async fn poll_until<T, F, Fut>(probe: F, description: &str) -> T
+async fn poll_until<T, F, Fut>(probe: F, budget: Duration, description: &str) -> T
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
-    let deadline = Instant::now() + POLL_BUDGET;
+    let deadline = Instant::now() + budget;
     loop {
         if let Some(answer) = probe().await {
             return answer;
         }
         assert!(
             Instant::now() < deadline,
-            "{description}: not observed within {POLL_BUDGET:?}"
+            "{description}: not observed within {budget:?}"
         );
         ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Everything one row is asserted to converge on and to deliver, read back through the API
+/// alone: the counters and the rollout, the tasks the scheduler placed, the events each of
+/// their containers wrote, and the streams the group then holds.
+///
+/// One function, so the two tests below observe one row by exactly the same readings and the
+/// same assertions: what differs between them is only WHAT materialises the clock-owed work
+/// behind those readings.
+async fn observed_row(router: &MultiServiceRouter, row: &Row) {
+    let case = row.case;
+    let service = converged_service(router, row).await;
+    let deployment = &service["deployments"][0];
+    assert_eq!(
+        count(deployment, "runningCount", case),
+        row.desired,
+        "case {case:?}: the completed rollout holds the tasks the service runs, got {deployment}"
+    );
+
+    let task_arns = running_task_arns(router, row).await;
+    let expected: Vec<String> = row.lines.iter().map(|line| line.to_string()).collect();
+    let mut streams = BTreeSet::new();
+    for task_arn in &task_arns {
+        let stream = stream_of(row, task_arn);
+        // Every line the container wrote is one event of its own stream, in the order
+        // the program wrote them.
+        let events = poll_until(
+            || async {
+                let events = delivered(router, row, &stream).await;
+                (events.len() >= expected.len()).then_some(events)
+            },
+            DELIVERY_BUDGET,
+            &format!("case {case:?}: {} line(s) in {stream}", expected.len()),
+        )
+        .await;
+        assert_eq!(
+            events, expected,
+            "case {case:?}: expected {expected:?} in {stream}, got {events:?}"
+        );
+        streams.insert(stream);
+    }
+
+    // The group lists exactly those streams: one per task of the service, and nothing
+    // else was delivered to it.
+    let described = described_streams(router, row, &streams).await;
+    assert_eq!(
+        described, streams,
+        "case {case:?}: expected the group {} to hold one stream per running task, got \
+         {described:?}",
+        row.log_group
+    );
+}
+
+/// Create the cluster, the execution role, and every row's group, revision and service.
+async fn place_services(router: &MultiServiceRouter, rows: &[&Row]) {
+    // The cluster holds registered capacity, because one row's launch type runs on it: "The
+    // EC2 launch type runs your tasks on Amazon EC2 instances registered to your cluster".
+    cluster_with_capacity(router, CLUSTER, "the cluster every row's service runs in").await;
+    let execution_role =
+        create_execution_role(router, "the role Amazon ECS assumes to launch a task").await;
+    // Every row's service is created up front, so the clock-owed work of all of them falls
+    // due at once rather than one row's budget after another's.
+    for row in rows {
+        create_log_group(router, row).await;
+        register_definition(router, row, &execution_role).await;
+        create_service(router, row).await;
     }
 }
 
 #[tokio::test]
 async fn a_services_tasks_come_up_and_their_containers_output_reaches_cloudwatch_logs() {
     let router = emulator();
-    // The cluster holds registered capacity, because one row's launch type runs on it: "The
-    // EC2 launch type runs your tasks on Amazon EC2 instances registered to your cluster".
-    cluster_with_capacity(&router, CLUSTER, "the cluster every row's service runs in").await;
-    let execution_role =
-        create_execution_role(&router, "the role Amazon ECS assumes to launch a task").await;
-
-    // Every row's service is created up front, so the clock-owed work of all of them falls
-    // due at once rather than one row's budget after another's.
-    for row in &ROWS {
-        create_log_group(&router, row).await;
-        register_definition(&router, row, &execution_role).await;
-        create_service(&router, row).await;
+    let rows: Vec<&Row> = ROWS.iter().collect();
+    place_services(&router, &rows).await;
+    for row in &rows {
+        observed_row(&router, row).await;
     }
+}
 
-    for row in &ROWS {
-        let case = row.case;
-        let service = converged_service(&router, row).await;
-        let deployment = &service["deployments"][0];
-        assert_eq!(
-            count(deployment, "runningCount", case),
-            row.desired,
-            "case {case:?}: the completed rollout holds the tasks the service runs, got \
-             {deployment}"
-        );
+/// The rows the test below places and then observes through READS alone.
+///
+/// The `awsvpc` ones: the first thing the clock owes such a task is the interface Amazon ECS
+/// creates and attaches for it, one documented step at a time
+/// (`state::INTERFACE_ATTACH_LIFECYCLE`), and its own start is owed only after that — so the
+/// services are placed, and the runtime that placed them dropped, while every task of them is
+/// still provisioning and no container of any of them has been started by anything. They
+/// still differ along what the rule generalises over: how many tasks the service wants (one,
+/// two) and how many lines each of their containers writes (one, two).
+fn read_driven_rows() -> Vec<&'static Row> {
+    ROWS.iter().filter(|row| row.network_mode == "awsvpc").collect()
+}
 
-        let task_arns = running_task_arns(&router, row).await;
-        let expected: Vec<String> = row.lines.iter().map(|line| line.to_string()).collect();
-        let mut streams = BTreeSet::new();
-        for task_arn in &task_arns {
-            let stream = stream_of(row, task_arn);
-            // Every line the container wrote is one event of its own stream, in the order
-            // the program wrote them.
-            let events = poll_until(
-                || async {
-                    let events = delivered(&router, row, &stream).await;
-                    (events.len() >= expected.len()).then_some(events)
-                },
-                &format!("case {case:?}: {} line(s) in {stream}", expected.len()),
-            )
-            .await;
-            assert_eq!(
-                events, expected,
-                "case {case:?}: expected {expected:?} in {stream}, got {events:?}"
-            );
-            streams.insert(stream);
+/// The same rule, where the only thing that materialises it is a client READING.
+///
+/// RULE: what a task has reached is owed by the CLOCK, so every reading of a task
+/// materialises what the clock already owed it — and a task that has reached `RUNNING` is a
+/// task whose containers are RUNNING, so the output of their programs follows the status a
+/// client reads back rather than the liveness of whichever in-process task of this emulator
+/// happened to be driving the clock when the service was created.
+///
+/// The condition is produced the way a client cannot tell from any other: the services are
+/// placed on one runtime, that runtime is DROPPED — which ends every in-process task this
+/// emulator started while it was alive, with whatever each of them was holding left behind —
+/// and the rows are then observed from a second runtime, which calls nothing that writes a
+/// task's status. Every transition those rows reach, and every container program whose output
+/// arrives, is therefore owed to a read: it is the readings themselves that materialise the
+/// placement, the interface, the task's start and the runs behind its containers.
+#[test]
+fn a_read_materialises_the_container_runs_of_the_task_it_reports_as_running() {
+    let router = emulator();
+    let rows = read_driven_rows();
+
+    let placing = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime to place the services on");
+    placing.block_on(place_services(&router, &rows));
+    // Every in-process task this emulator started while the services were being placed ends
+    // here, the one driving the clock among them. Nothing of the stores goes with it: what a
+    // task has reached is a due INSTANT each record carries, never a wait something is
+    // sitting in.
+    drop(placing);
+
+    let reading = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime to read the emulator from");
+    reading.block_on(async {
+        for row in &rows {
+            observed_row(&router, row).await;
         }
-
-        // The group lists exactly those streams: one per task of the service, and nothing
-        // else was delivered to it.
-        let described = described_streams(&router, row).await;
-        assert_eq!(
-            described, streams,
-            "case {case:?}: expected the group {} to hold one stream per running task, got \
-             {described:?}",
-            row.log_group
-        );
-    }
+    });
 }

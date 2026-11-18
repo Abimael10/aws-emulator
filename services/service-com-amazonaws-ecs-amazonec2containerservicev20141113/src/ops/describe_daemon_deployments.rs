@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeDaemonDeploymentsErrorModeled::ServerException(ServerException {
@@ -253,6 +253,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => failures.push(crate::state::missing_failure(reference)),
             }
         }
+
+        // The pass above may have started or stopped daemon tasks: "a task that reaches
+        // `RUNNING` is a task whose containers are running", so the runs behind the
+        // containers of a task it moved into that status were owed at the instant it moved,
+        // and the runs of a task it moved out of it were owed their termination signal then
+        // ([`crate::state::settle_container_runtime`], the same pass the clock pump drives:
+        // it starts nothing for a task that is not running and nothing twice, so it settles
+        // what the clock already made due and never what this call happened to ask about).
+        // OUR guard is dropped first, since the reconcile takes this store's lock itself.
+        drop(guard);
+        crate::state::settle_container_runtime(
+            ctx.callback(),
+            &self.engine,
+            &crate::state::request_region(ctx),
+        );
 
         Ok(DescribeDaemonDeploymentsOutput {
             daemon_deployments: Some(daemon_deployments),
