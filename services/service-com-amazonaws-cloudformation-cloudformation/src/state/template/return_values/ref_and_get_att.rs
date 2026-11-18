@@ -1734,6 +1734,31 @@ pub(crate) fn return_values(
             attributes.insert("SpendingLimitArn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // Clean Rooms ML's own control plane: the training dataset an
+        // `AWS::CleanRoomsML::TrainingDataset` declares. "Ref returns the training dataset ARN"
+        // (the type's primary identifier); Fn::GetAtt reads `TrainingDatasetArn`. That service
+        // MINTS the ARN — `CreateTrainingDataset` takes no identifier for the dataset and
+        // answers the `trainingDatasetArn` it assigned, whose resource path carries an
+        // identifier of its own (`TrainingDatasetArn`:
+        // `^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:training-dataset/[-a-zA-Z0-9_/.]+$`)
+        // — so the value here is a STAND-IN of that form, which `super::provisioning` re-points
+        // at the ARN the create really answered
+        // ([`super::provisioner::Provisioner::CleanRoomsMlTrainingDataset`]).
+        CLEANROOMSML_TRAINING_DATASET => {
+            let arn = ::emulator_server::emulator_arn(
+                CLEANROOMSML_ARN_NAMESPACE,
+                region,
+                &format!(
+                    "{CLEANROOMSML_TRAINING_DATASET_PATH}/{}",
+                    generated_uuid(resource_type, name)
+                ),
+            );
+            attributes.insert(
+                CLEANROOMSML_TRAINING_DATASET_ARN_ATTRIBUTE.to_string(),
+                arn.clone(),
+            );
+            (arn, attributes)
+        }
         // Backup Gateway's own control plane: the hypervisor an
         // `AWS::BackupGateway::Hypervisor` declares. "Ref returns the hypervisor ARN" (the
         // type's primary identifier); Fn::GetAtt reads `HypervisorArn`. That service MINTS

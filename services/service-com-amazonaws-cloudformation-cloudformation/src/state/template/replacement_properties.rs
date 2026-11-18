@@ -66,6 +66,17 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
         BRAKET_SPENDING_LIMIT => &["DeviceArn"],
+        // Clean Rooms ML publishes no call that changes a training dataset at all: the
+        // dataset's description, the role it reads its data with and the datasets themselves
+        // are all fixed when `CreateTrainingDataset` records it, so a declaration restating one
+        // of them asks for a different dataset. (Its NAME is in the same position through
+        // [`name_is_create_only`].) Its `Tags` are here for the same reason rather than as an
+        // exception: that service does change a dataset's tags in place, through its own
+        // `TagResource`/`UntagResource`, but no arm of [`crate::state::provisioner`] calls
+        // them for this type yet — so a changed tag set is applied by replacing the dataset,
+        // whose create carries the tags, rather than reported as applied by nothing. A tag arm
+        // retires this entry.
+        CLEANROOMSML_TRAINING_DATASET => &["Description", "RoleArn", "Tags", "TrainingData"],
         // A hypervisor keeps the encryption key it was imported with: `KmsKeyArn` is a member
         // of `ImportHypervisorConfiguration` and of no member of `UpdateHypervisor` (which
         // takes the host, the credentials, the name and the log group), so a declaration

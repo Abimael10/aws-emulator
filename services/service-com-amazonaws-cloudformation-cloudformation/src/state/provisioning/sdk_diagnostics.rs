@@ -56,6 +56,16 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // ValidationException; Request ID: …)" (RequestToken: …, HandlerErrorCode:
     // InvalidRequest)`).
     ("braket", "Braket", SdkDiagnostic::Operation),
+    // Clean Rooms ML's SDK names it `CleanRoomsMl` — that model's own `sdkId` (`CleanRoomsML`,
+    // `smithy_query(query="service_info")` on that service's model) written with a lower-case
+    // final letter, which is the client name its SDK carries. The shape is the ATTEMPT-counting
+    // one, as the recorded `ResourceStatusReason` of an `AWS::CleanRoomsML::TrainingDataset`
+    // whose Glue table's Amazon S3 location holds nothing carries it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check
+    // `cleanroomsml__cloudformation.deploy-cfn-cleanroomsml-training-dataset-empty-s3-location-rejected`,
+    // whose reason reads `<the service's sentence> (Service: CleanRoomsMl, Status Code: 400,
+    // Request ID: …) (SDK Attempt Count: …)` with `HandlerErrorCode: InvalidRequest`).
+    ("cleanrooms-ml", "CleanRoomsMl", SdkDiagnostic::Attempts),
     // AWS CodePipeline's SDK names it by that model's own `sdkId` (`CodePipeline`,
     // `smithy_query(query="service_info")` on that service's model), which is also the
     // `cloudFormationName` the type names of its resources carry. The shape is the

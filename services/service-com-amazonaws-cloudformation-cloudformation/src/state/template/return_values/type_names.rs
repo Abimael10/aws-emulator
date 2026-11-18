@@ -150,6 +150,38 @@ pub const BRAKET_ARN_NAMESPACE: &str = "braket";
 /// for it, from that same pattern.
 pub(super) const BRAKET_SPENDING_LIMIT_PATH: &str = "spending-limit";
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of a CLEAN ROOMS ML TRAINING DATASET: the
+/// metadata record that service's own `CreateTrainingDataset` makes for a Glue table, which an
+/// audience model is then trained from. The middle segment is that model's own
+/// `awsService.sdkId` (`CleanRoomsML`).
+///
+/// "Ref returns the training dataset ARN" — the type's primary identifier — and `Fn::GetAtt`
+/// reads [`CLEANROOMSML_TRAINING_DATASET_ARN_ATTRIBUTE`] and the dataset's `Status`. Clean Rooms
+/// ML MINTS that ARN:
+/// `CreateTrainingDataset` takes no identifier for the dataset — the declaration states its
+/// name, the role to read the data with and the datasets themselves — and answers the
+/// `trainingDatasetArn` it assigned, whose resource path carries an identifier of its own
+/// (`TrainingDatasetArn`:
+/// `^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:training-dataset/[-a-zA-Z0-9_/.]+$`), so
+/// it cannot be computed from the template — that is what [`identity_is_service_assigned`]
+/// names this type for, and it is the handle `GetTrainingDataset` and `DeleteTrainingDataset`
+/// each address a dataset by.
+pub const CLEANROOMSML_TRAINING_DATASET: &str = "AWS::CleanRoomsML::TrainingDataset";
+
+/// Clean Rooms ML's ARN namespace, which is the namespace a training-dataset ARN carries (that
+/// same pattern), and the resource path such an ARN carries before the identifier that service
+/// minted.
+pub const CLEANROOMSML_ARN_NAMESPACE: &str = "cleanrooms-ml";
+pub(super) const CLEANROOMSML_TRAINING_DATASET_PATH: &str = "training-dataset";
+
+/// The one `Fn::GetAtt` attribute a [`CLEANROOMSML_TRAINING_DATASET`] publishes that these
+/// naming rules can compute a stand-in for: the ARN Clean Rooms ML minted, which is also what
+/// the type's `Ref` returns. The dataset's `Status` is that service's own to report and reaches
+/// the resource off its report of the created dataset
+/// ([`crate::state::provisioner::Provisioner::CleanRoomsMlTrainingDataset`]), exactly as an
+/// `AWS::Braket::SpendingLimit`'s `CreatedAt` does.
+pub const CLEANROOMSML_TRAINING_DATASET_ARN_ATTRIBUTE: &str = "TrainingDatasetArn";
+
 /// The `AWS::<cloudFormationName>::<Resource>` type of a BACKUP GATEWAY HYPERVISOR: the
 /// on-premises host Backup Gateway reads virtual machines off, connected to by that service's
 /// own `ImportHypervisorConfiguration`. The middle segment is that model's own

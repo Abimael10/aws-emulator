@@ -270,6 +270,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // service's own report of the limit rather than from here, exactly as a knowledge
         // base's instants do.
         BRAKET_SPENDING_LIMIT => &["SpendingLimitArn"],
+        // A training dataset publishes the ARN Clean Rooms ML minted for it, which is the one
+        // return value these naming rules compute a stand-in for before it exists; its
+        // `Status` is that service's own to report and reaches the resource off its report of
+        // the created dataset rather than from here, exactly as a spending limit's `CreatedAt`
+        // does.
+        CLEANROOMSML_TRAINING_DATASET => &[CLEANROOMSML_TRAINING_DATASET_ARN_ATTRIBUTE],
         // A hypervisor publishes the ARN Backup Gateway minted for it, which is the one return
         // value these naming rules compute a stand-in for before it exists.
         BACKUP_GATEWAY_HYPERVISOR => BACKUP_GATEWAY_HYPERVISOR_ATTRIBUTES,
@@ -761,6 +767,14 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // That ARN is also what every call on a limit takes (`UpdateSpendingLimit` and
         // `DeleteSpendingLimit` each address one by it).
         || resource_type == BRAKET_SPENDING_LIMIT
+        // A CLEAN ROOMS ML training dataset is one more: `CreateTrainingDataset` takes no
+        // identifier for the dataset — the declaration states its name, the role that reads
+        // the data and the datasets themselves — and answers the `trainingDatasetArn` that
+        // service minted, whose resource path carries an identifier of its own. That ARN is
+        // what "Ref returns the training dataset ARN" publishes and what `GetTrainingDataset`
+        // and `DeleteTrainingDataset` each address a dataset by, and no name CloudFormation
+        // decides is such an ARN, so the identity in force is the one that service answered.
+        || resource_type == CLEANROOMSML_TRAINING_DATASET
         // A RECYCLE BIN retention rule is one more: `CreateRule` takes no identifier for the
         // rule — the declaration states what to retain and for how long — and answers the
         // `Identifier` that service minted (`^[0-9a-zA-Z]{11}$`) with the `RuleArn` built

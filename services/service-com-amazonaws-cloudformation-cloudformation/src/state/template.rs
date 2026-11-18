@@ -2965,6 +2965,8 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::BedrockAgentCore::Memory",
     "AWS::BedrockAgentCore::Runtime",
     "AWS::BedrockAgentCore::WorkloadIdentity",
+    // The Clean Rooms ML training dataset, publishing the ARN that service mints for it.
+    CLEANROOMSML_TRAINING_DATASET,
     CLOUDFRONT_CACHE_POLICY,
     CLOUDFRONT_CONNECTION_FUNCTION,
     CLOUDFRONT_CONNECTION_GROUP,

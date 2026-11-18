@@ -95,6 +95,10 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // ("Ref returns the spending limit ARN"), which is the handle every spending-limit
         // API takes — the type declares no name a client could name one by.
         BRAKET_SPENDING_LIMIT => "SpendingLimitArn",
+        // A Clean Rooms ML training dataset, identified by the ARN that service minted for it
+        // ("Ref returns the training dataset ARN"), which is the `trainingDatasetArn` every
+        // call on one takes; the type's own `Name` is only what the dataset is called.
+        CLEANROOMSML_TRAINING_DATASET => CLEANROOMSML_TRAINING_DATASET_ARN_ATTRIBUTE,
         // A Backup Gateway hypervisor, identified by the ARN that service minted for it ("Ref
         // returns the hypervisor ARN") — the `ServerArn` every call on a hypervisor takes; the
         // type's own `Name` is only what the hypervisor is called.

@@ -485,7 +485,7 @@ use super::template::{
     BEDROCK_FLOW,
     BEDROCK_GUARDRAIL,
     BEDROCK_KNOWLEDGE_BASE,
-    BRAKET_SPENDING_LIMIT,
+    BRAKET_SPENDING_LIMIT, CLEANROOMSML_TRAINING_DATASET,
     CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODEARTIFACT_DOMAIN, CODEARTIFACT_REPOSITORY,
     CODEBUILD_PROJECT,
@@ -1098,6 +1098,11 @@ pub(super) enum Provisioner {
     /// the `spendingLimitArn` the type publishes — the handle every spending-limit API takes
     /// — so it is read off that create's own answer and is the identity a `Ref` resolves to.
     BraketSpendingLimit,
+    /// `AWS::CleanRoomsML::TrainingDataset`: the metadata record Clean Rooms ML's own
+    /// `CreateTrainingDataset` makes for a Glue table, which `DeleteTrainingDataset` removes by
+    /// the `trainingDatasetArn` that service minted — the ARN this type's `Ref` returns and
+    /// this resource's physical id ([`cleanrooms_ml_training_datasets`]).
+    CleanRoomsMlTrainingDataset,
     /// `AWS::AmplifyUIBuilder::Component`, `::Form` and `::Theme`: the three user-interface
     /// entities of an Amplify app environment, which Amplify UI Builder's own
     /// `CreateComponent`, `CreateForm` and `CreateTheme` make under the name the template
@@ -1388,6 +1393,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
         BRAKET_SPENDING_LIMIT => Some(Provisioner::BraketSpendingLimit),
+        CLEANROOMSML_TRAINING_DATASET => Some(Provisioner::CleanRoomsMlTrainingDataset),
         AMPLIFYUIBUILDER_COMPONENT => Some(Provisioner::AmplifyUiBuilderComponent),
         AMPLIFYUIBUILDER_FORM => Some(Provisioner::AmplifyUiBuilderForm),
         AMPLIFYUIBUILDER_THEME => Some(Provisioner::AmplifyUiBuilderTheme),
@@ -2066,6 +2072,13 @@ impl Provisioner {
             // declaration asks for.
             Self::BraketSpendingLimit => {
                 create_braket_spending_limit(ctx, region, resource, propagated).await
+            }
+            // `AWS::CleanRoomsML::TrainingDataset` publishes `Tags`, which
+            // `CreateTrainingDataset` takes as its own tag MAP, so a dataset a stack creates
+            // carries the tags CloudFormation gives it beside the ones the declaration asks
+            // for.
+            Self::CleanRoomsMlTrainingDataset => {
+                create_training_dataset(ctx, region, resource, propagated).await
             }
             // Each of the three `AWS::AmplifyUIBuilder::*` types publishes `Tags` as a MAP,
             // which is the shape its create's own `tags` member takes, so an entity a stack
@@ -4123,6 +4136,10 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 delete_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the dataset by the ARN Clean Rooms ML minted for it.
+            Self::CleanRoomsMlTrainingDataset => {
+                delete_training_dataset(ctx, region, physical_resource_id).await
+            }
             // The delete addresses the entity by the id Amplify UI Builder minted for it,
             // which is this resource's physical id, inside the app environment its declaration
             // names.
@@ -4238,6 +4255,10 @@ mod bedrock_flows;
 /// the return-value catalogue key their entries for those types by.
 pub(crate) mod sagemaker_resources;
 mod braket_spending_limits;
+/// The Clean Rooms ML TRAINING DATASET arms: the dataset an
+/// `AWS::CleanRoomsML::TrainingDataset` declares, recorded in the service that owns it so a
+/// client's own reads resolve the ARN the stack publishes.
+mod cleanrooms_ml_training_datasets;
 /// The AWS Backup Gateway HYPERVISOR arms: the on-premises host an
 /// `AWS::BackupGateway::Hypervisor` declares, imported into the service that owns it so a
 /// client's own reads — and the gateway a later declaration associates with it — resolve the
@@ -4380,6 +4401,7 @@ use bedrock_data_sources::*;
 use bedrock_flows::*;
 use sagemaker_resources::*;
 use braket_spending_limits::*;
+use cleanrooms_ml_training_datasets::*;
 use backup_gateway_hypervisors::*;
 use amplify_ui_builder::*;
 use amplify_apps::*;

@@ -32,6 +32,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
+/// Whether the training data a `CreateTrainingDataset` points at is there to be read: the
+/// Amazon S3 location the dataset's Glue table stores its data at, and whether that location
+/// holds anything to train on.
+pub mod training_data_location;
+
 // Clean Rooms' own store, which is where a membership lives: Clean Rooms ML
 // resources are created under a membership, and a membership is a Clean Rooms
 // resource, so this service reads one from the service that owns it rather than

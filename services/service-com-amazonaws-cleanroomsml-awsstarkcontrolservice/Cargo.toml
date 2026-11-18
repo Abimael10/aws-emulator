@@ -25,6 +25,12 @@ tracing = { workspace = true }
 # created under a membership, so this crate reads that membership from the store
 # the owning service keeps.
 service-com-amazonaws-cleanrooms-awsbastioncontrolplaneservicelambda = { workspace = true }
+# The AWS Glue Data Catalog holds the TABLE a training dataset's `GlueDataSource` names, and
+# Amazon S3 holds the objects that table's location stores: a create resolves both through
+# those services' OWN state accessors rather than keeping a second copy of either, which is
+# how it knows whether the training data is there to be read.
+service-com-amazonaws-glue-awsglue = { workspace = true }
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 # `service-common` carries the workspace's ONE restJson1 codec that renders a timestamp
 # member in the `date-time` form a model declares; every timestamp member of this model
 # declares it, so this service answers through that codec.

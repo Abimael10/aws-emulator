@@ -4,7 +4,10 @@
 //! Mints a training dataset: the record is persisted in [`crate::state`], keyed by the ARN
 //! this operation returns, and every later `GetTrainingDataset` / `ListTrainingDatasets`
 //! answer is computed from it. A `name` that already names a persisted training dataset is
-//! refused, because the model documents the name as unique in the account and region.
+//! refused, because the model documents the name as unique in the account and region. A
+//! request whose `trainingData` points at a Glue table whose Amazon S3 location holds no
+//! non-zero-sized object is refused too: there is nothing there to train on
+//! ([`crate::state::training_data_location`]).
 //!
 //! ## Shape of an operation
 //!
@@ -174,6 +177,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+
+        // Clean Rooms ML reads the records of the Glue table a dataset points at out of the
+        // Amazon S3 location that table stores its data at, so a create whose location holds
+        // nothing to train on is refused before anything is persisted — which is why this is
+        // judged before this service's own store is locked, and why it takes the two owning
+        // services' locks and holds neither after it
+        // ([`crate::state::training_data_location`]).
+        if let Some(unreadable) = crate::state::training_data_location::unreadable_training_data(
+            &*self.engine,
+            &input.training_data,
+        ) {
+            return Err(CreateTrainingDatasetErrorModeled::ValidationException(
+                ValidationException {
+                    message: unreadable,
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
 
         // The store is bounded: past its quota a create is refused rather than

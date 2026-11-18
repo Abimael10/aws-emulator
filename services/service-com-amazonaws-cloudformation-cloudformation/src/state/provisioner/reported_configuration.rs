@@ -557,6 +557,10 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 describe_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // Clean Rooms ML's own read of the dataset, by the ARN it minted.
+            Self::CleanRoomsMlTrainingDataset => {
+                describe_training_dataset(ctx, region, physical_resource_id).await
+            }
             // Amplify UI Builder's own read of the entity, by the id it minted, inside the app
             // environment the declaration names.
             Self::AmplifyUiBuilderComponent => {

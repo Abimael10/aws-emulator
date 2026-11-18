@@ -87,6 +87,7 @@ use super::template::{
     APIGATEWAY_ACCOUNT,
     APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, BACKUP_GATEWAY_HYPERVISOR,
     BRAKET_SPENDING_LIMIT,
+    CLEANROOMSML_TRAINING_DATASET,
     CLOUDFRONT_CONNECTION_FUNCTION, CLOUDFRONT_CONNECTION_GROUP, CLOUDFRONT_FUNCTION,
     CLOUDFRONT_KEY_VALUE_STORE, CLOUDFRONT_MONITORING_SUBSCRIPTION,
     CUSTOMER_PROFILES_DOMAIN, GLUE_TABLE_OPTIMIZER, MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH,
@@ -319,6 +320,13 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::CertificateManager::Account",
     "AWS::CertificateManager::AcmeEndpoint",
     "AWS::CertificateManager::Certificate",
+    // Clean Rooms ML. A training dataset is the metadata record that service's own
+    // `CreateTrainingDataset` makes for a Glue table, which `super::provisioner` creates
+    // there. (The other published types of this namespace, and the AWS::CleanRooms ones
+    // beside them, are not here yet: a catalogued type with no provisioner would deploy as
+    // declared-only, and a client that deployed one would read nothing back from the service
+    // that is supposed to own it.)
+    CLEANROOMSML_TRAINING_DATASET,
     // AWS CloudFormation's own types, including the generic custom resource and the
     // registry's own records.
     CLOUDFORMATION_CUSTOM_RESOURCE,
