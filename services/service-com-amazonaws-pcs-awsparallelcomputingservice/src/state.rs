@@ -55,7 +55,8 @@ pub mod ec2_subnets;
 pub mod cluster_authorization;
 
 /// The IAM instance profile a compute node group's instances assume, resolved against the
-/// service that owns instance profiles.
+/// service that owns instance profiles — both whether that account holds it and whether the
+/// role inside it is one this service may take out of it.
 pub mod instance_profile;
 
 use std::collections::{HashMap, VecDeque};

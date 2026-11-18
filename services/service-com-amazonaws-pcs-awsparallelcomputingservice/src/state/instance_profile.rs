@@ -26,6 +26,18 @@
 //! before anybody is asked, in this service's own words
 //! ([`not_of_this_account_message`]).
 //!
+//! Resolving the reference is only half of what this service asks about a profile. The other
+//! half is the role INSIDE it: "the role contained in your instance profile must have the
+//! pcs:RegisterComputeNodeGroupInstance permission and the role name must start with AWSPCS
+//! or must have the path /aws-pcs/" (`CreateComputeNodeGroup$iamInstanceProfileArn`), so a
+//! profile whose contained role satisfies neither half of that naming convention is one this
+//! service cannot take a role out of, and the create is refused with the service's own fixed
+//! sentence ([`ROLE_IS_NOT_ONE_PCS_MAY_ASSUME`]). The role comes from IAM's answer — the profile
+//! report carries the roles it contains — so the name and the path read are the ones the
+//! account holds now. [`violation`] is the ONE place both halves are asked, so every path
+//! that takes an `iamInstanceProfileArn` (the create today, `UpdateComputeNodeGroup` once it
+//! is implemented) decides them alike.
+//!
 //! Nothing is cached and nothing is stored here: a profile created a moment ago resolves at
 //! once, and one that was deleted stops resolving at once.
 
@@ -47,6 +59,37 @@ const NOT_FOUND_STATUS: u16 = 404;
 /// (`service_common::iam_client`), so the call behind the refusal was attempted exactly
 /// once; the count is a fact about that call rather than a value to pick.
 const SDK_ATTEMPT_COUNT: u32 = 1;
+
+/// The name prefix a role this service may take out of an instance profile carries, as
+/// `CreateComputeNodeGroup$iamInstanceProfileArn` states the convention: "the role name must
+/// start with AWSPCS or must have the path /aws-pcs/".
+const ROLE_NAME_PREFIX: &str = "AWSPCS";
+
+/// The IAM path the same convention admits instead of that prefix. A role BENEATH this path
+/// is on it as well, since an IAM path is a hierarchy and a role at `/aws-pcs/team/` is one
+/// the convention places there.
+const ROLE_PATH: &str = "/aws-pcs/";
+
+/// The sentence this service refuses an instance profile it can take no role out of with:
+/// the role the profile contains is on neither half of the naming convention, or the profile
+/// contains no role at all.
+///
+/// Every word of it is fixed — it names neither the profile, nor the role, nor the caller —
+/// so a client reads the convention out of the API reference it points at rather than out of
+/// the refusal.
+const ROLE_IS_NOT_ONE_PCS_MAY_ASSUME: &str =
+    "AWS PCS can't access a role associated with the instance profile because the role ARN \
+     is invalid. For more information, see CreateComputeNodeGroup or UpdateComputeNodeGroup \
+     in the API reference.";
+
+/// Whether a role IAM reports inside an instance profile is one this service may take out of
+/// it: its name carries [`ROLE_NAME_PREFIX`], or it is on [`ROLE_PATH`].
+///
+/// The ONE expression of the convention, so the create path and every later path that takes
+/// an `iamInstanceProfileArn` cannot disagree about it.
+fn role_may_be_assumed(role_name: &str, role_path: &str) -> bool {
+    role_name.starts_with(ROLE_NAME_PREFIX) || role_path.starts_with(ROLE_PATH)
+}
 
 /// The sentence this service refuses a value that names no instance profile of this account
 /// with, built from the REQUEST: its one variable part is the value the caller sent, so the
@@ -79,9 +122,11 @@ fn carried_through(message: &str, status: u16) -> String {
 /// The modelled `ValidationException` (HTTP 400) a create naming `arn` is refused with, or
 /// `None` when the create may proceed.
 ///
-/// `Some` where the reference resolves to no instance profile this account holds: the value
+/// `Some` where the reference resolves to no instance profile this account holds — the value
 /// names no instance profile of this account at all, or IAM answered that it holds no such
-/// entity under the name the ARN carries.
+/// entity under the name the ARN carries — and `Some` where IAM reported the profile but
+/// this service may take no role out of it, because the role it contains is on neither half
+/// of the naming convention ([`role_may_be_assumed`]) or it contains no role at all.
 ///
 /// `None` — refuse nothing — for every answer that is NOT such a report: a hop that could
 /// not be made at all is this emulator failing to ask rather than IAM reporting an
@@ -104,8 +149,21 @@ pub async fn violation(
         .instance_profile_name(name)
         .send()
         .await;
-    let Err(error) = answer else {
-        return None;
+    let error = match answer {
+        // IAM holds the profile and reported what is in it, so the convention is decided on
+        // the roles of that report. A report this emulator could not read carries no role to
+        // decide on, so it refuses nothing, like every other answer that is not IAM's own
+        // report about the reference.
+        Ok(held) => {
+            let profile = held.instance_profile()?;
+            let may_be_assumed = profile
+                .roles()
+                .iter()
+                .any(|role| role_may_be_assumed(role.role_name(), role.path()));
+            return (!may_be_assumed)
+                .then(|| service_validation(ROLE_IS_NOT_ONE_PCS_MAY_ASSUME.to_string()));
+        }
+        Err(error) => error,
     };
     // IAM reporting that this account holds no such instance profile is the one answer a
     // refusal is grounded in; anything else is this emulator failing to ask.
