@@ -76,11 +76,6 @@ const OUTPUT_PROVENANCE_JOB_NAME: &str = "job_name";
 /// See [`OUTPUT_PROVENANCE_JOB_NAME`].
 const OUTPUT_PROVENANCE_RUN_ID: &str = "job_run_id";
 
-/// The header a write names the media type of the object it stores on, which an output
-/// write carries NONE of: the object store applies its own default to an upload that names
-/// no type, and that is the type DataBrew's output objects carry.
-const CONTENT_TYPE_HEADER: &str = "content-type";
-
 /// What a run needs in order to be performed, copied out of the store under its lock so
 /// nothing is read from the store while Amazon S3 is being called.
 #[derive(Debug, Clone)]
@@ -428,15 +423,10 @@ async fn write_output(
             .metadata(OUTPUT_PROVENANCE_JOB_NAME, &run.job_name)
             .metadata(OUTPUT_PROVENANCE_RUN_ID, run_id)
             .body(::aws_sdk_s3::primitives::ByteStream::from(body))
-            .customize()
             // The job sets no media type on its output, so the object carries the object
-            // store's own default for an upload that names none. The header this drops is
-            // the SDK's blob-payload default rather than anything the job chose, and an
-            // object store that recorded it would report a transport decision as the media
-            // type the job wrote its output under.
-            .mutate_request(|request| {
-                request.headers_mut().remove(CONTENT_TYPE_HEADER);
-            })
+            // store's own default for an upload that names none. Keeping the SDK's
+            // blob-payload default off the request is the shared client's own job
+            // (`::service_common::s3_client`), so this write states nothing the job did not.
             .send()
             .await
             .map_err(|error| {

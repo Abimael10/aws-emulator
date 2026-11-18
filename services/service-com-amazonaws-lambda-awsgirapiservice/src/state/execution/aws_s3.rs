@@ -156,6 +156,18 @@ fn client(
         .force_path_style(!bucket.is_some_and(addresses_an_access_point))
         .http_client(callback.http_client())
         .interceptor(observed)
+        // The object a guest's own write stores carries the properties that CALL set and no
+        // others. Left at its default, the SDK computes a checksum of its own choosing for
+        // every upload and declares it, and the object store records THAT algorithm as the
+        // one the object was stored under — so a later read reports a transport decision
+        // rather than what the call asked for. Asking for a checksum only where an operation
+        // requires one leaves the store to apply its own default to a write that named none.
+        .request_checksum_calculation(
+            ::aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+        )
+        // ... and the same for the object's MEDIA TYPE, which the protocol would otherwise
+        // invent for every write that declared none.
+        .interceptor(::service_common::s3_client::DeclaredMediaTypeOnly)
         .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
         .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
         .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
