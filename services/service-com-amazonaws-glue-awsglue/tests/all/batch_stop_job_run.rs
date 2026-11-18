@@ -12,7 +12,9 @@
 //! `SuccessfulSubmissions`, with `STOPPED` owed it one span later, while a run the stop
 //! cannot reach (one the named job does not hold, or one that has already finished) is
 //! reported in `Errors` with its own `ErrorDetail` — so every named run gets exactly one
-//! outcome and a per-run problem never fails the batch.
+//! outcome and a per-run problem never fails the batch. A run the job HOLDS but whose
+//! state leaves no stop to submit is reported as a STATE conflict (the "cannot be
+//! stopped" error class and its one fixed sentence), not as a complaint about the input.
 //!
 //! The recorded case — a stop naming one in-flight run of one job — is ONE row of the
 //! tables below; the rows differ along how many runs the batch names, how many of the
@@ -24,12 +26,15 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_glue_awsglue::state::messages::JOB_NOT_FOUND;
+use service_com_amazonaws_glue_awsglue::state::messages::{JOB_NOT_FOUND, JOB_RUN_CANNOT_BE_STOPPED};
 use service_com_amazonaws_glue_awsglue::state::{
-    JOB_RUN_ID_PREFIX, JOB_RUN_STATE_FAILED, JOB_RUN_STATE_STARTING, JOB_RUN_STATE_STOPPED,
-    JOB_RUN_STATE_STOPPING, TERMINAL_JOB_RUN_STATES,
+    ComAmazonawsGlueAwsglueState, JOB_RUN_ID_PREFIX, JOB_RUN_STATE_ERROR, JOB_RUN_STATE_EXPIRED,
+    JOB_RUN_STATE_FAILED, JOB_RUN_STATE_RUNNING, JOB_RUN_STATE_STARTING, JOB_RUN_STATE_STOPPED,
+    JOB_RUN_STATE_STOPPING, JOB_RUN_STATE_SUCCEEDED, JOB_RUN_STATE_TIMEOUT, JOB_RUN_STATE_WAITING,
+    TERMINAL_JOB_RUN_STATES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -38,7 +43,7 @@ use crate::job_runs::{
     already_past, emulator_with_engine, far_future, get_run, job_body, set_due_instant, start_run,
     stored_runs, OWED_TRANSITION_WINDOW,
 };
-use crate::wire::{call, error_code, ok, ERROR_DETAIL_TAG};
+use crate::wire::{call, error_code, ok, ERROR_DETAIL_TAG, REGION};
 
 /// How many run ids one `BatchStopJobRun` request may name.
 ///
@@ -50,9 +55,36 @@ const JOB_RUN_IDS_BOUNDS: (usize, usize) = (1, 25);
 /// The `ErrorDetail$ErrorCode` reported for a run the named job does not hold.
 const ENTITY_NOT_FOUND_CODE: &str = "EntityNotFoundException";
 
-/// The `ErrorDetail$ErrorCode` reported for a run that has already finished, so there is
-/// nothing left to stop.
-const INVALID_INPUT_CODE: &str = "InvalidInputException";
+/// The `ErrorDetail$ErrorCode` reported for a run the named job HOLDS but whose current
+/// state leaves no stop to submit, because the run has already finished: a STATE conflict
+/// rather than a complaint about the input.
+const CANNOT_BE_STOPPED_CODE: &str = "JobRunCannotBeStoppedException";
+
+/// The `JobRunState` values a run never leaves again, so a stop of one has nothing left to
+/// stop — written out here from the modelled value list rather than read from the crate, so
+/// the catalog the rule is asserted over is pinned independently of it.
+///
+/// Source: the `JobRunState` enum — STARTING, RUNNING, STOPPING, STOPPED, SUCCEEDED,
+/// FAILED, TIMEOUT, ERROR, WAITING, EXPIRED
+/// (`smithy_query(query="shape",shape="JobRunState")`) — of which these are the ones that
+/// name a run that has finished. The recorded case cites only `SUCCEEDED`.
+const STATES_WITH_NO_STOP_LEFT: [&str; 6] = [
+    JOB_RUN_STATE_STOPPED,
+    JOB_RUN_STATE_SUCCEEDED,
+    JOB_RUN_STATE_FAILED,
+    JOB_RUN_STATE_TIMEOUT,
+    JOB_RUN_STATE_ERROR,
+    JOB_RUN_STATE_EXPIRED,
+];
+
+/// The other half of that enum: the states a run still owes a further state from, so a
+/// stop submitted while it is in one of them is accepted.
+const STATES_A_STOP_IS_ACCEPTED_IN: [&str; 4] = [
+    JOB_RUN_STATE_STARTING,
+    JOB_RUN_STATE_RUNNING,
+    JOB_RUN_STATE_STOPPING,
+    JOB_RUN_STATE_WAITING,
+];
 
 /// A run id of the shape a start mints (the prefix plus 64 lowercase hex characters)
 /// that no start ever minted, distinct per `nonce`.
@@ -414,11 +446,15 @@ async fn a_run_the_stop_cannot_reach_is_reported_per_run() {
             settled[JOB_RUN_ID_PREFIX.len()..].to_string(),
             ENTITY_NOT_FOUND_CODE,
         ),
-        ("a run the clock finished", settled.clone(), INVALID_INPUT_CODE),
+        (
+            "a run the clock finished",
+            settled.clone(),
+            CANNOT_BE_STOPPED_CODE,
+        ),
         (
             "a run an earlier stop finished",
             already_stopped.clone(),
-            INVALID_INPUT_CODE,
+            CANNOT_BE_STOPPED_CODE,
         ),
     ];
 
@@ -458,10 +494,13 @@ async fn a_run_the_stop_cannot_reach_is_reported_per_run() {
                 "case {case:?}: expected the job-run miss sentence, got {message:?}"
             );
         } else {
-            assert!(
-                message.contains(&unreachable),
-                "case {case:?}: the message must name the run that could not be stopped, \
-                 got {message:?}"
+            // A run the job HOLDS but whose state leaves no stop to submit is the state
+            // conflict every such entry reports with ONE fixed sentence: the entry names
+            // the run in `JobRunId`, so the detail echoes nothing back. The tables at the
+            // end of this file pin that wording over every state a run never leaves again.
+            assert_eq!(
+                message, JOB_RUN_CANNOT_BE_STOPPED,
+                "case {case:?}: expected the cannot-be-stopped sentence, got {message:?}"
             );
         }
         assert_eq!(
@@ -674,4 +713,228 @@ async fn a_run_id_list_outside_its_published_bounds_is_refused() {
         JOB_RUN_STATE_STOPPING,
         "case at the maximum: the real run is stopping"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Which STATE a named run is in, and how the stop reports it
+// ---------------------------------------------------------------------------
+
+/// Put one run of `job_name` into `state`, writing it straight into the store: a state the
+/// run never leaves again is written with every owed transition dropped, and one that still
+/// owes a further state keeps that transition, held far enough out that it does not fall
+/// due while the stop is submitted.
+fn place_run_in_state(
+    engine: &Arc<engine::InMemoryEngine>,
+    job_name: &str,
+    run_id: &str,
+    state: &str,
+) {
+    let store_state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let mut store = store_state.lock();
+    let run = store
+        .job_mut(REGION, job_name)
+        .and_then(|job| job.run_mut(run_id))
+        .unwrap_or_else(|| panic!("the store must hold run {run_id:?} of job {job_name:?}"));
+    run.state = state.to_string();
+    // No script execution is owed in either case: what is under test is the state the run
+    // is already in when the stop arrives.
+    run.awaiting_script = false;
+    run.rests_at = None;
+    run.rests_in = None;
+    run.rests_error = None;
+    if TERMINAL_JOB_RUN_STATES.contains(&state) {
+        run.settles_at = None;
+        run.completed_on = Some(SystemTime::now());
+    } else {
+        run.settles_at = Some(far_future());
+        run.completed_on = None;
+    }
+}
+
+/// Start one run of `job_name` and leave it in `state`, answering its id.
+async fn run_in_state(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    job_name: &str,
+    state: &str,
+) -> String {
+    let run_id = start_run(router, &json!({ "JobName": job_name })).await;
+    set_due_instant(engine, job_name, far_future());
+    place_run_in_state(engine, job_name, &run_id, state);
+    run_id
+}
+
+/// A run in any state it never leaves again is reported as a STATE conflict: the
+/// "cannot be stopped" error class and its one fixed sentence, naming nothing the request
+/// sent — while a run of the same job that still owes a further state is stopped in the
+/// same call.
+///
+/// The rows are the states a run comes to rest in; the recorded case is the `SUCCEEDED`
+/// row.
+#[tokio::test]
+async fn a_run_with_no_stop_left_is_reported_as_unable_to_be_stopped() {
+    let (router, engine) = emulator_with_engine();
+    let name = "stop-terminal-runs";
+    ok(
+        &router,
+        "CreateJob",
+        &job_body(
+            name,
+            json!({ "ExecutionProperty": { "MaxConcurrentRuns": 10 } }),
+        ),
+    )
+    .await;
+
+    for state in STATES_WITH_NO_STOP_LEFT {
+        let case = format!("a run in {state}");
+        let finished = run_in_state(&router, &engine, name, state).await;
+        // One run the stop CAN reach alongside it, so the state conflict is reported per
+        // run rather than failing the batch.
+        let in_flight = run_in_state(&router, &engine, name, JOB_RUN_STATE_RUNNING).await;
+        let named = vec![finished.clone(), in_flight.clone()];
+        let answer = stop_runs(&router, name, &named).await;
+        assert_one_outcome_per_named_run(&case, &answer, named.len());
+
+        let errors = error_entries(&case, &answer, name);
+        assert_eq!(
+            errors.len(),
+            1,
+            "case {case:?}: exactly the run with no stop left failed, got {answer}"
+        );
+        let (reported_id, code, message) = &errors[0];
+        assert_eq!(
+            reported_id, &finished,
+            "case {case:?}: the entry names the run the request named, got {answer}"
+        );
+        assert_eq!(
+            code, CANNOT_BE_STOPPED_CODE,
+            "case {case:?}: expected error code {CANNOT_BE_STOPPED_CODE}, got {code:?}"
+        );
+        assert_eq!(
+            message, JOB_RUN_CANNOT_BE_STOPPED,
+            "case {case:?}: expected the cannot-be-stopped sentence, got {message:?}"
+        );
+        // The sentence is fixed: the run, the job and the state it is in are reported in
+        // members of their own, or not at all — never spliced into the message.
+        for sent in [finished.as_str(), name, state] {
+            assert!(
+                !message.contains(sent),
+                "case {case:?}: the message echoes {sent:?} back, got {message:?}"
+            );
+        }
+
+        assert_eq!(
+            submitted_ids(&case, &answer, name),
+            vec![in_flight.clone()],
+            "case {case:?}: the run that still owes a state is stopped, got {answer}"
+        );
+        assert_eq!(
+            stored_state(&engine, name, &finished),
+            state,
+            "case {case:?}: a refused stop leaves the run in the state it had"
+        );
+        assert_eq!(
+            stored_state(&engine, name, &in_flight),
+            JOB_RUN_STATE_STOPPING,
+            "case {case:?}: the run the stop reached really is stopping"
+        );
+        // The reached run is brought to rest, so the next row starts from a job holding no
+        // run the clock still owes anything.
+        place_run_in_state(&engine, name, &in_flight, JOB_RUN_STATE_STOPPED);
+    }
+}
+
+/// A run in any state that still owes a further one takes the stop: it is reported in
+/// `SuccessfulSubmissions`, the call reports no error for it, and the store really holds it
+/// as stopping — so the refusal above is keyed on the run's state and not on stopping as
+/// such.
+#[tokio::test]
+async fn a_run_that_still_owes_a_state_takes_the_stop() {
+    let (router, engine) = emulator_with_engine();
+    let name = "stop-unfinished-runs";
+    ok(
+        &router,
+        "CreateJob",
+        &job_body(
+            name,
+            json!({ "ExecutionProperty": { "MaxConcurrentRuns": 10 } }),
+        ),
+    )
+    .await;
+
+    for state in STATES_A_STOP_IS_ACCEPTED_IN {
+        let case = format!("a run in {state}");
+        let run_id = run_in_state(&router, &engine, name, state).await;
+        let answer = stop_runs(&router, name, std::slice::from_ref(&run_id)).await;
+        assert!(
+            error_entries(&case, &answer, name).is_empty(),
+            "case {case:?}: a run that still owes a state takes the stop, got {answer}"
+        );
+        assert_eq!(
+            submitted_ids(&case, &answer, name),
+            vec![run_id.clone()],
+            "case {case:?}: the stop is submitted for the run named, got {answer}"
+        );
+        assert_eq!(
+            stored_state(&engine, name, &run_id),
+            JOB_RUN_STATE_STOPPING,
+            "case {case:?}: the run really is stopping"
+        );
+        // Brought to rest so the next row's run is the only one in flight.
+        place_run_in_state(&engine, name, &run_id, JOB_RUN_STATE_STOPPED);
+    }
+}
+
+/// A batch every one of whose named runs has no stop left gets one entry per named run,
+/// each carrying the same code and the same sentence — so a client sees one outcome per id
+/// whatever the mix of states, and the call itself still succeeds.
+#[tokio::test]
+async fn every_named_run_with_no_stop_left_gets_its_own_entry() {
+    let (router, engine) = emulator_with_engine();
+    let name = "stop-only-terminal-runs";
+    ok(
+        &router,
+        "CreateJob",
+        &job_body(
+            name,
+            json!({ "ExecutionProperty": { "MaxConcurrentRuns": 10 } }),
+        ),
+    )
+    .await;
+
+    let mut named = Vec::new();
+    for state in STATES_WITH_NO_STOP_LEFT {
+        named.push(run_in_state(&router, &engine, name, state).await);
+    }
+    // The same run named twice as well: an id repeated is an id named, and gets its own
+    // outcome.
+    named.push(named[0].clone());
+
+    let case = "every named run has finished";
+    let answer = stop_runs(&router, name, &named).await;
+    assert_one_outcome_per_named_run(case, &answer, named.len());
+    assert!(
+        submitted_ids(case, &answer, name).is_empty(),
+        "case {case:?}: no stop can be submitted for any named run, got {answer}"
+    );
+    let errors = error_entries(case, &answer, name);
+    assert_eq!(
+        errors.len(),
+        named.len(),
+        "case {case:?}: one entry per named run, got {answer}"
+    );
+    for (reported_id, code, message) in &errors {
+        assert!(
+            named.contains(reported_id),
+            "case {case:?}: the entries name the runs the request named, got {answer}"
+        );
+        assert_eq!(
+            code, CANNOT_BE_STOPPED_CODE,
+            "case {case:?}: expected error code {CANNOT_BE_STOPPED_CODE}, got {code:?}"
+        );
+        assert_eq!(
+            message, JOB_RUN_CANNOT_BE_STOPPED,
+            "case {case:?}: expected the cannot-be-stopped sentence, got {message:?}"
+        );
+    }
 }

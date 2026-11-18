@@ -487,6 +487,18 @@ pub fn s3_target_not_found(path: &str) -> String {
 /// reports the job itself as missing ([`JOB_NOT_FOUND`]).
 pub const JOB_RUN_NOT_FOUND: &str = "Job run not found for the given job name and runId.";
 
+/// Each `BatchStopJobRun` entry for a run the named job DOES hold but whose current
+/// `JobRunState` leaves no stop to submit — a run that has already finished
+/// ([`crate::state::TERMINAL_JOB_RUN_STATES`]).
+///
+/// Recorded CONSTANT, and the whole message: the service states that the run's state is
+/// what stands in the way, in fixed words, and echoes back neither the run id nor the
+/// state it is in — the entry AROUND the detail is what names the job and the run
+/// ([`crate::ops::batch_stop_job_run`]). This is a STATE conflict rather than a bad
+/// request, so the entry's `ErrorCode` names the "cannot be stopped" error class and not
+/// the operation's input-validation one.
+pub const JOB_RUN_CANNOT_BE_STOPPED: &str = "Job Run cannot be stopped in current state.";
+
 /// A bookmark operation (`GetJobBookmark`, `ResetJobBookmark`) that resolves no bookmark:
 /// a job no run of has written one yet, a job whose run the request's `RunId` names no run
 /// of, and a `JobName` this Region holds no job definition under at all — the surface

@@ -194,15 +194,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             job_run_id: Some(run_id.clone()),
                         });
                     } else {
-                        let settled_state = run.state.clone();
+                        // The run is there, so this is a STATE conflict and not a bad
+                        // request: the entry names the error class for a run whose state
+                        // leaves no stop to submit, with the fixed sentence that class
+                        // carries — nothing of the request, not the run id and not the
+                        // state, is echoed into it.
                         errors.push(stop_error(
                             &input.job_name,
                             run_id,
-                            INVALID_INPUT_CODE,
-                            format!(
-                                "Job run {run_id} has already finished in state \
-                                 {settled_state} and cannot be stopped"
-                            ),
+                            JOB_RUN_CANNOT_BE_STOPPED_CODE,
+                            crate::state::messages::JOB_RUN_CANNOT_BE_STOPPED.to_string(),
                         ));
                     }
                 }
@@ -258,14 +259,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `BatchDeleteTable`'s per-table miss names it.
 const ENTITY_NOT_FOUND_CODE: &str = "EntityNotFoundException";
 
-/// The per-run `ErrorCode` for a run that cannot be stopped because it has already
-/// finished: this operation's own modelled client error class, "The input provided was
-/// not valid", named by its shape the same way.
-const INVALID_INPUT_CODE: &str = "InvalidInputException";
+/// The per-run `ErrorCode` for a run the named job holds but whose current `JobRunState`
+/// leaves no stop to submit — one that has already finished: the Glue error class for
+/// exactly that state conflict, named by its own shape the same way as the entity miss
+/// above.
+///
+/// A client branches on this code to tell "this run's state has no stop left to submit"
+/// from "your input was invalid", so a state conflict is never reported as the latter.
+const JOB_RUN_CANNOT_BE_STOPPED_CODE: &str = "JobRunCannotBeStoppedException";
 
 /// One `Errors` entry: the run the request named, and the detail of why no stop was
-/// submitted for it. The wording of these per-run messages is not recorded anywhere, so
-/// what they state is the reference the request gave and the reason it failed.
+/// submitted for it. Each of these per-run messages is a FIXED sentence of this service's
+/// own ([`crate::state::messages`]) that echoes nothing back: the entry around the detail
+/// is what names the job and the run it is reported for.
 fn stop_error(
     job_name: &str,
     job_run_id: &str,
