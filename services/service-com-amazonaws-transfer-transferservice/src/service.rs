@@ -6,13 +6,22 @@
 //! Transfer's `ValidationException` message is a TEMPLATE over the request's
 //! structure, never over its values: every clause names the member path and the
 //! modelled constraint the member failed, and no clause quotes the value that failed
-//! it (a `@pattern` is quoted as the model's expression with the anchors a Smithy
-//! pattern writes around it removed). [`constraint_envelope`] is the one place that
-//! sentence is built.
+//! it — not the submitted bytes, and not the `null` the framework writes where a member
+//! was absent (a `@pattern` is quoted as the model's expression with the anchors a Smithy
+//! pattern writes around it removed). [`constraint_refusal`] is the one place that
+//! message is built, and it DELEGATES: the envelope, the member paths, the clause order
+//! within one member, the element sets and every requirement sentence are
+//! `service_common::validation_message`'s and the framework's.
 //!
-//! The one part of a clause that is neither the request's nor the model's is the ORDER an
-//! enum clause lists the enum's admitted values in: the membership is the model's, the
-//! order is this service's own listing of that enum ([`VALUE_LISTINGS`], [`listed`]).
+//! Two parts of a refusal are this service's own, and nothing else is:
+//!
+//! * the ORDER an enum clause lists the enum's admitted values in — the membership is the
+//!   model's, the order is this service's own listing of that enum ([`VALUE_LISTINGS`],
+//!   [`listed`]);
+//! * a value outside a member's ARN-shaped `@pattern`, which is not a validation clause at
+//!   all but this service's own modelled client error ([`arn_constraint_envelope`]), whose
+//!   text reaches the caller in the member this model declares it in
+//!   ([`error_message_member`]).
 //!
 //! EDIT THIS FILE. It is emitted once with working defaults and is never
 //! regenerated, so a choice made here survives adding another service or
@@ -51,19 +60,14 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+mod error_message_member;
+mod input_schemas;
+
+use service_common::validation_message;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
-
-/// The error code this service answers an input-constraint violation with.
-///
-/// Transfer's model declares no `ValidationException` of its own, so a refusal the
-/// framework makes before any handler runs renders the framework's synthetic one —
-/// which is also the code the real service answers these refusals with. It is
-/// restated here because `override_refusal` replaces code and message together: only
-/// the message's CONSTRUCTION changes below.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 /// The error code this service answers a malformed ARN with.
 ///
@@ -104,11 +108,21 @@ fn member_name(path: &str) -> String {
 ///
 /// `None` for every other violation class, including a pattern on a member that is
 /// not an ARN: those keep this service's generic constraint wording below.
+///
+/// `None` too for a constraint declared on the ELEMENTS of a collection member, which the
+/// framework's walk reports at the offending element (`<collection>.<position>.member`):
+/// this refusal names the MEMBER whose own pattern demands an ARN, and an element has no
+/// member name of its own — the last segment of its path is the collection step. Such a
+/// violation is stated at the collection member with the element shape's whole declared
+/// constraint set instead ([`constraint_refusal`]).
 fn arn_constraint_clause(violation: &Violation) -> Option<String> {
     let ViolationKind::Pattern(pattern) = &violation.kind else {
         return None;
     };
     if !is_arn_pattern(pattern) {
+        return None;
+    }
+    if ::service_common::validation::list_of_element(&violation.path).is_some() {
         return None;
     }
     Some(format!("Invalid {} ARN", member_name(&violation.path)))
@@ -138,23 +152,12 @@ fn arn_constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// without them. A `$` the expression ESCAPES (`\$`) is a literal dollar sign, not an
 /// anchor, so it stays.
 ///
-/// The strip is POSITIONAL, so it handles the one anchored expression Transfer's model
-/// writes (`^…$`) and would garble an alternation that anchors each branch
-/// (`^a$|^b$`); the model carries none. The same rule is staged, unwired, in
-/// `services/common/src/validation.rs` and inlined in ~25 service crates — this copy
-/// is one of them, and should move when that module is wired up.
-fn unanchored(pattern: &str) -> &str {
-    let body = pattern.strip_prefix('^').unwrap_or(pattern);
-    let Some(trimmed) = body.strip_suffix('$') else {
-        return body;
-    };
-    // An ODD number of backslashes before the `$` escapes it, making it a literal.
-    let escaped = trimmed.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1;
-    if escaped {
-        body
-    } else {
-        trimmed
-    }
+/// The rule itself is `service_common::validation::unanchored`, the fleet's one home for
+/// this rendering, CALLED rather than restated here: which of the renderings that module
+/// offers a service's refusals are recorded stating is the only part that is this service's,
+/// and the expression this one quotes is the pair-positional strip.
+fn unanchored(pattern: &str) -> String {
+    ::service_common::validation::unanchored(pattern)
 }
 
 /// The order this service LISTS an enum's admitted values in, for the enums it is
@@ -222,84 +225,58 @@ fn listed(values: &[String]) -> Vec<&str> {
     }
 }
 
-/// The REQUIREMENT one violation states, as Transfer words it — the modelled
-/// constraint the member failed, with nothing of the value that failed it.
+/// `violation` with an enum clause's value set in the order this service LISTS that enum's
+/// values ([`listed`]), and every other violation returned as it was.
 ///
-/// `None` for a violation class this service has no wording for (the framework's
-/// `ViolationKind` is `#[non_exhaustive]`, so one can be added), which declines the
-/// rewording and keeps the framework's own.
-///
-/// The sentences are the ones `services/common/src/validation.rs` stages for every
-/// service; that module is not wired into any crate yet, so this table is a copy, and
-/// it should move when it is.
-fn requirement(kind: &ViolationKind) -> Option<String> {
-    Some(match kind {
-        ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
-        ViolationKind::MinLength(min) => {
-            format!("Member must have length greater than or equal to {min}")
-        }
-        ViolationKind::MaxLength(max) => {
-            format!("Member must have length less than or equal to {max}")
-        }
-        ViolationKind::MinValue(min) => {
-            format!("Member must have value greater than or equal to {min}")
-        }
-        ViolationKind::MaxValue(max) => {
-            format!("Member must have value less than or equal to {max}")
-        }
-        ViolationKind::Pattern(pattern) => format!(
-            "Member must satisfy regular expression pattern: {}",
-            unanchored(pattern)
-        ),
-        // The bracketed set states the MEMBERSHIP the model declares, in the order this
-        // service lists that enum's values ([`listed`]).
-        ViolationKind::EnumValue(allowed) => format!(
-            "Member must satisfy enum value set: [{}]",
-            listed(allowed).join(", ")
-        ),
-        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
-        _ => return None,
-    })
-}
-
-/// Render ONE constraint violation the way Transfer states it: the member PATH and
-/// the modelled constraint it failed, and NOTHING of the value that was submitted.
-///
-/// A member that was absent has no submitted value at all, and `null` is the
-/// service's own word for that absence rather than caller data, so that one clause
-/// keeps its `Value null at '…'` subject.
-fn constraint_clause(violation: &Violation) -> Option<String> {
-    let requirement = requirement(&violation.kind)?;
-    let subject = match violation.kind {
-        ViolationKind::MissingRequiredMember => "Value null at",
-        _ => "Value at",
+/// Only what goes INTO the clause moves: the member path, the requirement's wording and the
+/// clause around it keep coming from the one renderer below, so a listing cannot reword a
+/// constraint.
+fn in_listed_order(violation: &Violation) -> Violation {
+    let ViolationKind::EnumValue(allowed) = &violation.kind else {
+        return violation.clone();
     };
-    Some(format!(
-        "{subject} '{}' failed to satisfy constraint: {requirement}",
-        violation.path
-    ))
+    Violation {
+        path: violation.path.clone(),
+        kind: ViolationKind::EnumValue(
+            listed(allowed).into_iter().map(str::to_owned).collect(),
+        ),
+        value: violation.value.clone(),
+        sensitive: violation.sensitive,
+    }
 }
 
-/// The refusal message for a set of constraint violations: the AWS envelope
-/// (`N validation error(s) detected: `) over one clause per violation, in the same
-/// shape the framework's own envelope uses.
+/// The refusal for a set of constraint violations: the AWS envelope
+/// (`N validation error(s) detected: `) over one clause per violation, with the error code
+/// that envelope travels under.
 ///
-/// `None` declines the whole refusal — including one that mixes a class this service
-/// words with a class it does not — which keeps one consistent wording for the
-/// message rather than two half-rendered ones.
-fn constraint_envelope(violations: &[Violation]) -> Option<String> {
-    let clauses: Vec<String> = violations
-        .iter()
-        .map(constraint_clause)
-        .collect::<Option<Vec<_>>>()?;
-    match clauses.len() {
-        0 => None,
-        1 => Some(format!("1 validation error detected: {}", clauses[0])),
-        n => Some(format!(
-            "{n} validation errors detected: {}",
-            clauses.join("; ")
-        )),
-    }
+/// DELEGATED to `service_common::validation_message`, the fleet's one home for AWS's own
+/// wording, which this service passes the three facts that are its own:
+///
+/// * the `@pattern` rendering its refusals are recorded quoting ([`unanchored`]);
+/// * that NO clause of its refusals states a value, whichever member it is about — not the
+///   submitted bytes, and not the `null` the framework writes where a member was absent;
+/// * the ORDER an enum clause lists a value set in ([`in_listed_order`]).
+///
+/// Everything else is that module's and the framework's: the envelope and its count word,
+/// the member paths, each requirement sentence, and the two orderings AWS's own refusals
+/// state —
+/// [`validation_message::in_pattern_first_order`] (within ONE member the EXPRESSION the value
+/// must match is reported before any bound on it, because the expression is the shape of the
+/// value) and the statement of a constraint declared on the ELEMENTS of a collection member
+/// at that MEMBER, carrying the element shape's whole declared set nested inside
+/// `Member must satisfy constraint: [ … ]` rather than the one constraint that happened to
+/// fail ([`input_schemas`] is where that set is read from).
+fn constraint_refusal(violations: &[Violation]) -> Option<Refused> {
+    let stated: Vec<Violation> = validation_message::in_pattern_first_order(violations)
+        .into_iter()
+        .map(in_listed_order)
+        .collect();
+    validation_message::aws_validation_refusal_over_elements_withholding(
+        &Refusal::Invalid(stated),
+        input_schemas::INPUT_SCHEMAS,
+        unanchored,
+        |_| true,
+    )
 }
 
 /// The `com-amazonaws-transfer-transferservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -344,12 +321,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve the operation the generated routing table names, through the layer that
+        // reports a modelled error's text in the member this service's error shapes declare
+        // (see `error_message_member`, whose wrapper is
+        // `service_common::restated_refusal`'s): the framework's own refusal renderer writes
+        // that text under the synthetic `message` for every service, and this service names
+        // one of its MODELLED error shapes as the code of an ARN refusal. The routing
+        // decision itself is NOT overridden — the key is resolved by the model's own
+        // protocol — and a request the table cannot serve is declined here, so the
+        // framework's routing-error path stays exactly as it was.
+        ::service_common::restated_refusal::routes(self.definition(), req).then_some(
+            &error_message_member::SERVED_OPERATION_LAYER as &dyn ErasedOperation,
+        )
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -365,25 +348,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //   <Member> ARN`: the service validates an ARN itself, and
         //   `ValidationException` is not in any of its operations' modelled error
         //   lists, so a client cannot catch that refusal through the service's
-        //   exception.
+        //   exception. That body's text reaches the caller in the `Message` member this
+        //   model declares through `error_message_member`.
         // * every other constraint violation keeps the framework's
         //   `ValidationException` but is stated WITHOUT the value that was
         //   submitted: the message names the member path and the modelled
         //   constraint only, so caller-controlled input is never echoed back into a
-        //   client's logs.
+        //   client's logs. `constraint_refusal` owns that rendering, and the code travels
+        //   with the message because this seam replaces the two together.
         //
-        // An authentication refusal, and a violation class this service has no
-        // wording for, keep the framework's wording.
+        // An authentication refusal is a different failure with its own code and
+        // status, and nothing about it is this service's to word.
         match refusal {
             Refusal::Invalid(violations) => match arn_constraint_envelope(violations) {
                 Some(message) => Some(Refused {
                     code: INVALID_REQUEST_EXCEPTION.to_string(),
                     message,
                 }),
-                None => Some(Refused {
-                    code: VALIDATION_EXCEPTION.to_string(),
-                    message: constraint_envelope(violations)?,
-                }),
+                None => constraint_refusal(violations),
             },
             _ => None,
         }
@@ -558,9 +540,17 @@ mod tests {
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
             );
-            let stated = requirement(&ViolationKind::EnumValue(arriving.clone()));
+            // Through the one renderer, so what is asserted is the clause a caller reads.
+            let stated = constraint_refusal(&[Violation {
+                path: "domain".to_string(),
+                kind: ViolationKind::EnumValue(arriving.clone()),
+                value: None,
+                sensitive: false,
+            }])
+            .map(|refused| refused.message);
             let wanted = Some(format!(
-                "Member must satisfy enum value set: [{}]",
+                "1 validation error detected: Value at 'domain' failed to satisfy constraint: \
+                 Member must satisfy enum value set: [{}]",
                 expected.join(", ")
             ));
             assert_eq!(
@@ -589,7 +579,7 @@ mod tests {
                 sensitive: false,
             },
         ];
-        let actual = constraint_envelope(&violations);
+        let actual = constraint_refusal(&violations).map(|refused| refused.message);
         let expected = Some(
             "2 validation errors detected: Value at 'steps.1.member.type' failed to satisfy \
              constraint: Member must satisfy enum value set: [DELETE, DECRYPT, CUSTOM, COPY, \

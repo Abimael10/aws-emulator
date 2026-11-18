@@ -15,7 +15,9 @@
 //!    `InvalidRequestException` (HTTP 400).
 //! 3. A value that fails a member's ARN-shaped modelled pattern is refused with this
 //!    service's OWN `InvalidRequestException`, not the framework's unmodelled
-//!    `ValidationException`.
+//!    `ValidationException` — and that refusal reports its text in the member the
+//!    refused shape declares it in (`Message` for this service's own errors, the
+//!    framework's `message` for the shape this model does not declare).
 //! 4. A write that passes an IAM role validates the role's ACCOUNT before resolving
 //!    any resource the request names, refusing another account's role with
 //!    `AccessDeniedException`.
@@ -689,19 +691,24 @@ async fn a_provider_url_naming_no_api_is_verified_only_by_an_unscoped_allow() {
 /// RULE: a value that fails a member's ARN-shaped modelled pattern is refused with
 /// this service's modelled `InvalidRequestException` (HTTP 400) worded
 /// `Invalid <Member> ARN` — never with the framework's `ValidationException`, which
-/// no Transfer operation models.
+/// no Transfer operation models — and that text reaches the caller in the member the
+/// REFUSED SHAPE declares it in: `Message` for one of this service's own error shapes
+/// (every one of them spells it that way, and `InvalidRequestException.Message` is
+/// `@required`), the framework's synthetic `message` for the `ValidationException` this
+/// model does not declare. One spelling per body, never both.
 ///
 /// The rows differ along the operation, the member (`Role` on three operations, the
-/// optional `LoggingRole` on a fourth), and how the value fails the pattern: not an
-/// ARN at all, an ARN of another resource type, and an ARN with no role name. A
-/// pattern violation on a member that is NOT an ARN is the last row: it keeps the
+/// optional `LoggingRole` on a create and on an update), and how the value fails the
+/// pattern: not an ARN at all, an ARN of another resource type, and an ARN with no role
+/// name. A pattern violation on a member that is NOT an ARN is the last row: it keeps the
 /// framework's `ValidationException`, so the rewording cannot swallow every pattern.
 #[tokio::test]
 async fn a_malformed_arn_is_refused_with_the_services_own_client_error() {
     let emulator = Emulator::new();
 
-    // (case, operation, request, expected code, the message fragment)
-    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
+    // (case, operation, request, expected code, the body member the text travels in,
+    //  the message fragment)
+    let rows: Vec<(&str, &str, Value, &str, &str, &str)> = vec![
         (
             "CreateAccess Role that is not an ARN",
             "CreateAccess",
@@ -711,6 +718,7 @@ async fn a_malformed_arn_is_refused_with_the_services_own_client_error() {
                 "Role": "not-an-iam-role-arn-at-all",
             }),
             "InvalidRequestException",
+            "Message",
             "Invalid Role ARN",
         ),
         (
@@ -722,6 +730,7 @@ async fn a_malformed_arn_is_refused_with_the_services_own_client_error() {
                 "Role": "not-a-valid-role-arn",
             }),
             "InvalidRequestException",
+            "Message",
             "Invalid Role ARN",
         ),
         (
@@ -733,6 +742,7 @@ async fn a_malformed_arn_is_refused_with_the_services_own_client_error() {
                 "Role": "arn:aws:iam::000000000000:user/not-a-role",
             }),
             "InvalidRequestException",
+            "Message",
             "Invalid Role ARN",
         ),
         (
@@ -744,6 +754,7 @@ async fn a_malformed_arn_is_refused_with_the_services_own_client_error() {
                 "Role": "arn:aws:iam::000000000000:role/",
             }),
             "InvalidRequestException",
+            "Message",
             "Invalid Role ARN",
         ),
         (
@@ -751,6 +762,18 @@ async fn a_malformed_arn_is_refused_with_the_services_own_client_error() {
             "CreateServer",
             json!({"LoggingRole": "transfer-logs"}),
             "InvalidRequestException",
+            "Message",
+            "Invalid LoggingRole ARN",
+        ),
+        (
+            "UpdateServer LoggingRole naming another resource type",
+            "UpdateServer",
+            json!({
+                "ServerId": UNMINTED_SERVER_ID,
+                "LoggingRole": "arn:aws:iam::000000000000:user/not-a-role",
+            }),
+            "InvalidRequestException",
+            "Message",
             "Invalid LoggingRole ARN",
         ),
         (
@@ -758,11 +781,12 @@ async fn a_malformed_arn_is_refused_with_the_services_own_client_error() {
             "CreateUser",
             json!({"ServerId": UNMINTED_SERVER_ID, "UserName": "a b", "Role": ROLE}),
             "ValidationException",
+            "message",
             "userName",
         ),
     ];
 
-    for (case, operation, request, code, fragment) in rows {
+    for (case, operation, request, code, detail_member, fragment) in rows {
         let answer = emulator.call(operation, request).await;
         assert_eq!(
             answer.status, 400,
@@ -775,16 +799,26 @@ async fn a_malformed_arn_is_refused_with_the_services_own_client_error() {
             "case {case:?}: expected {code}, got body {}",
             answer.body
         );
-        // The modelled `InvalidRequestException` spells its member `Message`; the
-        // framework's synthetic shape spells it `message`.
-        let message = member_of(&answer.body, "Message")
+        // The member the refused SHAPE declares its text in, and no other: the modelled
+        // Transfer errors spell it `Message`, the framework's synthetic shape `message`.
+        let message = member_of(&answer.body, detail_member)
             .as_str()
-            .or_else(|| member_of(&answer.body, "message").as_str())
             .unwrap_or_default()
             .to_string();
         assert!(
             message.contains(fragment),
-            "case {case:?}: expected the refusal to name {fragment:?}, got {message:?}"
+            "case {case:?}: expected {detail_member} to name {fragment:?}, got body {}",
+            answer.body
+        );
+        let other = if detail_member == "Message" {
+            "message"
+        } else {
+            "Message"
+        };
+        assert!(
+            member_of(&answer.body, other).is_null(),
+            "case {case:?}: expected the text under {detail_member} alone, got body {}",
+            answer.body
         );
     }
 }

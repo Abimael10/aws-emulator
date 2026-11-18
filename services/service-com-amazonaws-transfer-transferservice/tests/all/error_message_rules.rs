@@ -20,6 +20,13 @@
 //!    expression without the anchors a Smithy pattern writes around it, since Smithy
 //!    pattern semantics are a find. The rows differ along the constraint class, the
 //!    member, how deep it sits in the request, and how many members are wrong at once.
+//! 3. The same template, over the three things a clause's PLACE in that message is
+//!    decided by, each asserted over its own table below: an ABSENT member is stated
+//!    with no value token at all (it submitted none), two requirements of ONE member
+//!    state the EXPRESSION the value must match before any bound on it, and a
+//!    constraint the model declares on the ELEMENTS of a collection member is stated
+//!    at that MEMBER with the element shape's whole declared set nested inside
+//!    `Member must satisfy constraint: [ … ]`.
 //!
 //! Every request goes over the real wire path (`POST /` with
 //! `X-Amz-Target: TransferService.<Op>`) through the shared [`crate::harness`], so what
@@ -741,10 +748,11 @@ fn clause(path: &str, requirement: &str) -> String {
     format!("Value at '{path}' failed to satisfy constraint: {requirement}")
 }
 
-/// The clause an ABSENT member contributes. It submitted no value at all, and `null`
-/// is the service's own word for that absence rather than anything the caller sent.
+/// The clause an ABSENT member contributes. It submitted no value at all, so the
+/// clause states the member and the requirement and nothing in the value slot the
+/// other constraint classes use for a submitted value.
 fn absent_clause(path: &str) -> String {
-    format!("Value null at '{path}' failed to satisfy constraint: Member must not be null")
+    format!("Value at '{path}' failed to satisfy constraint: Member must not be null")
 }
 
 /// Assert `answer` is the 400 `ValidationException` whose message is the envelope over
@@ -1072,6 +1080,348 @@ async fn a_value_inside_the_modelled_bound_is_not_refused() {
              it, got {} with body {}",
             answer.status,
             answer.body
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 3: where a clause sits in that message
+// ---------------------------------------------------------------------------
+
+/// `ServerId`'s modelled `@pattern` as a clause quotes it: the expression without the
+/// anchors the model writes around it (`smithy_query(query="shape",
+/// shape="com.amazonaws.transfer#ServerId")` declares `^s-([0-9a-f]{17})$`, `len 19..19`).
+const SERVER_ID_PATTERN: &str = "Member must satisfy regular expression pattern: s-([0-9a-f]{17})";
+
+/// `UserName`'s modelled `@pattern`, likewise (`shape="com.amazonaws.transfer#UserName"`
+/// declares `^[\w][\w@.-]{2,99}$`, `len 3..100`) — a second shape, so the ordering rule
+/// below is not a fact about one member.
+const USER_NAME_PATTERN: &str =
+    r"Member must satisfy regular expression pattern: [\w][\w@.-]{2,99}";
+
+/// The whole requirement a clause states at a COLLECTION member for a constraint its
+/// ELEMENTS carry: the element shape's whole declared set, nested.
+///
+/// `StructuredLogDestinations` is a list whose MEMBER targets `Arn`
+/// (`smithy_query(query="shape", shape="com.amazonaws.transfer#StructuredLogDestinations")`
+/// reports `length 0..1` on the list and `length 20..1600`, pattern `^arn:\S+$` on the
+/// member), so these three requirements are the element shape's, in the order AWS's
+/// element-constraint clauses state them: the length maximum, its minimum, then the
+/// pattern. The whole set, not the one constraint a row happens to break.
+const ARN_ELEMENT_SET: &str = r"Member must satisfy constraint: [Member must have length less than or equal to 1600, Member must have length greater than or equal to 20, Member must satisfy regular expression pattern: arn:\S+]";
+
+/// A log-group ARN satisfying `Arn`'s modelled `len 20..1600` and `^arn:\S+$`: what a
+/// `StructuredLogDestinations` entry the boundary accepts looks like.
+const LOG_GROUP_ARN: &str = "arn:aws:logs:us-east-1:000000000000:log-group:/aws/transfer/one";
+
+/// A second accepted one, so a row can carry two entries without either being refused for
+/// the element constraints.
+const OTHER_LOG_GROUP_ARN: &str =
+    "arn:aws:logs:us-east-1:000000000000:log-group:/aws/transfer/two";
+
+/// The whole message a refusal states over `clauses`, in that order: the AWS envelope and
+/// its count word over the `; `-joined clauses, written from the rule rather than from the
+/// implementation.
+fn envelope(clauses: &[String]) -> String {
+    let n = clauses.len();
+    let opening = if n == 1 {
+        "1 validation error detected: ".to_string()
+    } else {
+        format!("{n} validation errors detected: ")
+    };
+    format!("{opening}{}", clauses.join("; "))
+}
+
+/// Assert `answer` is the 400 `ValidationException` whose message is EXACTLY the envelope
+/// over `clauses`, in that order.
+fn assert_stated_exactly(case: &str, answer: &Answer, clauses: &[String]) {
+    assert_eq!(
+        answer.status, 400,
+        "case {case:?}: expected HTTP 400, got {} with body {}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error_code(),
+        "ValidationException",
+        "case {case:?}: expected ValidationException, got body {}",
+        answer.body
+    );
+    let actual = message_of(&answer.body);
+    let expected = envelope(clauses);
+    assert_eq!(
+        actual, expected,
+        "case {case:?}: expected {expected:?}, got {actual:?}"
+    );
+}
+
+/// RULE: a member the request OMITTED is stated with NO value token at all — `Value at
+/// '<member>'`, the slot other constraint classes carry the submitted value in left empty —
+/// because an absent member submitted nothing for that slot to report.
+///
+/// The rows differ along the operation, the member, its target shape, and how deep the
+/// member sits in the request (at the top level, and inside a structure in a list).
+#[tokio::test]
+async fn an_absent_required_member_is_stated_with_no_value_token() {
+    let emulator = Emulator::new();
+
+    // (case, operation, request, the clauses the message must state, in order)
+    let rows: Vec<(&str, &str, Value, Vec<String>)> = vec![
+        (
+            "UpdateServer with no ServerId",
+            "UpdateServer",
+            json!({"LoggingRole": ROLE}),
+            vec![absent_clause("serverId")],
+        ),
+        (
+            "DescribeServer with no ServerId",
+            "DescribeServer",
+            json!({}),
+            vec![absent_clause("serverId")],
+        ),
+        (
+            "DeleteServer with no ServerId",
+            "DeleteServer",
+            json!({}),
+            vec![absent_clause("serverId")],
+        ),
+        (
+            "CreateUser with no UserName",
+            "CreateUser",
+            json!({"ServerId": UNMINTED_SERVER_ID, "Role": ROLE}),
+            vec![absent_clause("userName")],
+        ),
+        (
+            "CreateProfile with no ProfileType",
+            "CreateProfile",
+            json!({"As2Id": "partner-as2-id"}),
+            vec![absent_clause("profileType")],
+        ),
+        (
+            "CreateUser with no Entry on a home-directory mapping, inside a list",
+            "CreateUser",
+            json!({
+                "ServerId": UNMINTED_SERVER_ID,
+                "UserName": "u-absent",
+                "Role": ROLE,
+                "HomeDirectoryType": "LOGICAL",
+                "HomeDirectoryMappings": [{"Target": "/bucket/home"}],
+            }),
+            vec![absent_clause("homeDirectoryMappings.1.member.entry")],
+        ),
+    ];
+
+    for (case, operation, request, clauses) in rows {
+        let answer = emulator.call(operation, request).await;
+        assert_stated_exactly(case, &answer, &clauses);
+        assert!(
+            !message_of(&answer.body).contains("Value null"),
+            "case {case:?}: an absent member reports no value, got body {}",
+            answer.body
+        );
+    }
+}
+
+/// RULE: where ONE member broke two requirements, the clause for the EXPRESSION the value
+/// must match is stated BEFORE the clause for any bound on it — the expression is the shape
+/// of the value and a bound is a measure of it.
+///
+/// The rows differ along the operation, the member and its target shape, which bound the
+/// value also broke (the length maximum and the length minimum), and how it broke it (too
+/// long, too short), since the order is a property of the two REQUIREMENTS rather than of
+/// any of those.
+#[tokio::test]
+async fn two_requirements_of_one_member_state_the_pattern_first() {
+    let emulator = Emulator::new();
+
+    /// An id over `ServerId`'s length and outside its pattern: 20 hexadecimal digits where
+    /// the pattern admits 17.
+    const OVERLONG_SERVER_ID: &str = "s-0123456789abcdef0123";
+    /// One under that length and outside the same pattern.
+    const SHORT_SERVER_ID: &str = "s-abc";
+
+    let long_user_name = format!("{LONG_USER_NAME}k");
+
+    // (case, operation, request, the clauses the message must state, in order)
+    let rows: Vec<(&str, &str, Value, Vec<String>)> = vec![
+        (
+            "DescribeServer: a ServerId both over the length maximum and off the pattern",
+            "DescribeServer",
+            json!({"ServerId": OVERLONG_SERVER_ID}),
+            vec![
+                clause("serverId", SERVER_ID_PATTERN),
+                clause("serverId", "Member must have length less than or equal to 19"),
+            ],
+        ),
+        (
+            "UpdateServer: the same two requirements on the same member of another operation",
+            "UpdateServer",
+            json!({"ServerId": OVERLONG_SERVER_ID}),
+            vec![
+                clause("serverId", SERVER_ID_PATTERN),
+                clause("serverId", "Member must have length less than or equal to 19"),
+            ],
+        ),
+        (
+            "DeleteServer: a ServerId under the length minimum and off the pattern",
+            "DeleteServer",
+            json!({"ServerId": SHORT_SERVER_ID}),
+            vec![
+                clause("serverId", SERVER_ID_PATTERN),
+                clause(
+                    "serverId",
+                    "Member must have length greater than or equal to 19",
+                ),
+            ],
+        ),
+        (
+            "CreateUser: a UserName under its length minimum and off its pattern",
+            "CreateUser",
+            json!({"ServerId": UNMINTED_SERVER_ID, "UserName": "a", "Role": ROLE}),
+            vec![
+                clause("userName", USER_NAME_PATTERN),
+                clause(
+                    "userName",
+                    "Member must have length greater than or equal to 3",
+                ),
+            ],
+        ),
+        (
+            "CreateUser: a UserName over its length maximum and off its pattern",
+            "CreateUser",
+            json!({
+                "ServerId": UNMINTED_SERVER_ID,
+                "UserName": long_user_name,
+                "Role": ROLE,
+            }),
+            vec![
+                clause("userName", USER_NAME_PATTERN),
+                clause("userName", "Member must have length less than or equal to 100"),
+            ],
+        ),
+    ];
+
+    for (case, operation, request, clauses) in rows {
+        let answer = emulator.call(operation, request).await;
+        assert_stated_exactly(case, &answer, &clauses);
+    }
+}
+
+/// RULE: a constraint the model declares on the ELEMENTS of a collection member is stated
+/// at that MEMBER — no element position and no `member` step — with every requirement the
+/// element shape declares nested inside `Member must satisfy constraint: [ … ]`, which is
+/// what tells a caller what each entry has to satisfy. A constraint the COLLECTION ITSELF
+/// declares keeps its own requirement.
+///
+/// The rows differ along the operation, which of the element shape's requirements the entry
+/// broke (the length minimum, the length maximum, the pattern, and two at once), how many
+/// entries offended, and — for the last rows — whether the broken constraint is the
+/// element's or the collection's own.
+#[tokio::test]
+async fn an_element_constraint_is_stated_at_the_collection_member() {
+    let emulator = Emulator::new();
+
+    let overlong_arn = format!("arn:{}", "x".repeat(1597));
+
+    // (case, operation, request, the clauses the message must state, in order)
+    let rows: Vec<(&str, &str, Value, Vec<String>)> = vec![
+        (
+            "UpdateServer: an entry that is neither long enough nor an ARN",
+            "UpdateServer",
+            json!({
+                "ServerId": UNMINTED_SERVER_ID,
+                "StructuredLogDestinations": ["not-an-arn"],
+            }),
+            vec![clause("structuredLogDestinations", ARN_ELEMENT_SET)],
+        ),
+        (
+            "CreateServer: the same member of another operation",
+            "CreateServer",
+            json!({"StructuredLogDestinations": ["x"]}),
+            vec![clause("structuredLogDestinations", ARN_ELEMENT_SET)],
+        ),
+        (
+            "UpdateServer: an entry over the element's length maximum",
+            "UpdateServer",
+            json!({
+                "ServerId": UNMINTED_SERVER_ID,
+                "StructuredLogDestinations": [overlong_arn],
+            }),
+            vec![clause("structuredLogDestinations", ARN_ELEMENT_SET)],
+        ),
+        (
+            "UpdateServer: the COLLECTION's own length maximum keeps its own requirement",
+            "UpdateServer",
+            json!({
+                "ServerId": UNMINTED_SERVER_ID,
+                "StructuredLogDestinations": [LOG_GROUP_ARN, OTHER_LOG_GROUP_ARN],
+            }),
+            vec![clause(
+                "structuredLogDestinations",
+                "Member must have length less than or equal to 1",
+            )],
+        ),
+    ];
+
+    for (case, operation, request, clauses) in rows {
+        let answer = emulator.call(operation, request).await;
+        assert_stated_exactly(case, &answer, &clauses);
+    }
+
+    // The other side of the same rule: an entry INSIDE the element shape's constraints is
+    // not refused for them, so the clause above is the model's constraint set rather than a
+    // blanket refusal of the member.
+    let answer = emulator
+        .call(
+            "UpdateServer",
+            json!({
+                "ServerId": UNMINTED_SERVER_ID,
+                "StructuredLogDestinations": [LOG_GROUP_ARN],
+            }),
+        )
+        .await;
+    assert_ne!(
+        answer.error_code(),
+        "ValidationException",
+        "case \"an accepted log-destination ARN\": an entry inside the element constraints \
+         must not be refused for them, got {} with body {}",
+        answer.status,
+        answer.body
+    );
+}
+
+/// RULE (the same one, over a collection of another element SHAPE): the grouping follows
+/// the model's element constraints wherever they are declared, not one member's — so an
+/// enumerated element set is stated at its collection member too.
+///
+/// The bracketed value set itself is not asserted here: which values an enum clause lists,
+/// and in which order, is the rule `crate::enum_value_set_listing` owns.
+#[tokio::test]
+async fn an_enumerated_element_set_is_stated_at_its_collection_member_too() {
+    let emulator = Emulator::new();
+
+    // (case, the Protocols the request carries)
+    let rows: [(&str, Value); 2] = [
+        (
+            "one offending protocol beside an accepted one",
+            json!(["SFTP", "BOGUS"]),
+        ),
+        ("one offending protocol alone", json!(["NFS"])),
+    ];
+
+    for (case, protocols) in rows {
+        let answer = emulator
+            .call("CreateServer", json!({"Protocols": protocols}))
+            .await;
+        let message = message_of(&answer.body);
+        let opening = "1 validation error detected: Value at 'protocols' failed to satisfy \
+                       constraint: Member must satisfy constraint: [";
+        assert!(
+            message.starts_with(opening),
+            "case {case:?}: expected the clause stated at the collection member, got {message:?}"
+        );
+        assert!(
+            message.contains("Member must satisfy enum value set: ["),
+            "case {case:?}: expected the element shape's requirement nested, got {message:?}"
         );
     }
 }
