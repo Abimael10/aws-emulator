@@ -138,6 +138,48 @@ pub(crate) async fn create_signing_kms_key(router: &MultiServiceRouter, case: &s
     create_kms_key(router, case, SIGNING_KEY_SPEC, SIGNING_KEY_USAGE).await
 }
 
+/// Turn the customer managed key `kms_arn` into one Route 53 cannot sign with,
+/// and back.
+///
+/// `KeySigningKey$KmsArn` requires the key to be configured "Status Enabled", so
+/// `DisableKey` and `EnableKey` — the operations a client moves that status with —
+/// are what a test uses to take the key out of service and put it back, rather
+/// than writing the KMS store behind its own API.
+pub(crate) async fn set_kms_key_enabled(
+    router: &MultiServiceRouter,
+    case: &str,
+    kms_arn: &str,
+    enabled: bool,
+) {
+    let operation = if enabled { "EnableKey" } else { "DisableKey" };
+    let (status, body) = kms_call(router, operation, &json!({ "KeyId": kms_arn })).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: {operation} for {kms_arn} must succeed, got {status} with body {body}"
+    );
+}
+
+/// Schedule the customer managed key `kms_arn` for deletion, which is the other
+/// way a client takes a key out of service ("Check to make sure that the
+/// customer managed key has not been deleted", `KeySigningKey$KmsArn`).
+pub(crate) async fn schedule_kms_key_deletion(
+    router: &MultiServiceRouter,
+    case: &str,
+    kms_arn: &str,
+) {
+    let (status, body) = kms_call(
+        router,
+        "ScheduleKeyDeletion",
+        &json!({ "KeyId": kms_arn, "PendingWindowInDays": 7 }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: ScheduleKeyDeletion for {kms_arn} must succeed, got {status} with body \
+         {body}"
+    );
+}
+
 /// The DNSKEY key material of the KMS key `kms_arn`, as KMS itself publishes it:
 /// the trailing coordinate pair of the X.509 `SubjectPublicKeyInfo`
 /// `GetPublicKey` answers with, which is what a DNSKEY carries for this algorithm

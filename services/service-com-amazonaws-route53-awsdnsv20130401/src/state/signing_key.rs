@@ -173,6 +173,20 @@ pub struct SigningKeyMaterial {
     pub dnskey_record: String,
 }
 
+/// Whether the customer managed key `kms_arn` is one this service can sign a
+/// zone with as things stand.
+///
+/// The same question [`signing_key_material`] answers on the way to the key
+/// material, asked on its own by an operation that puts an EXISTING key-signing
+/// key into use rather than creating one: the material a KSK publishes was
+/// computed when it was created, so what such an operation has left to check is
+/// that the customer managed key behind it is still a usable sign-and-verify
+/// [`REQUIRED_KEY_SPEC`] key of the KMS store — which is what the modelled
+/// `InvalidKMSArn` reports when it is not.
+pub fn can_sign_with<Eng: Send + Sync + 'static>(engine: &Eng, kms_arn: &str) -> bool {
+    signing_public_key(engine, kms_arn).is_some()
+}
+
 /// What the key-signing key over the customer managed key `kms_arn` publishes for
 /// the zone named `zone_name`, or `None` when that ARN names no key this emulator
 /// can sign a zone with.

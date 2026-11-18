@@ -165,6 +165,12 @@ pub const SIGNING_KEY_STATUS_ACTIVE: &str = "ACTIVE";
 /// used for signing."
 pub const SIGNING_KEY_STATUS_INACTIVE: &str = "INACTIVE";
 
+/// The `Status` of a key-signing key that is on its way out.
+///
+/// `KeySigningKey$Status`'s own documentation: "DELETING: The KSK is in the
+/// process of being deleted."
+pub const SIGNING_KEY_STATUS_DELETING: &str = "DELETING";
+
 /// The `Status` of a key-signing key a failed request left in error.
 ///
 /// `KeySigningKey$Status`'s own documentation: "INTERNAL_FAILURE: There was an

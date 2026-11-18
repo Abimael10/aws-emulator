@@ -41,7 +41,7 @@
 //! sentence this service reports an unknown zone with — and the key's `Name` is
 //! never reported as the thing that is missing. Only the MESSAGE follows the
 //! zone: the error CLASS stays the 404 these operations model for a key, since
-//! neither declares a zone-level error at all.
+//! none of them declares a zone-level error at all.
 //!
 //! The harness, the key creation and the DNSSEC reads and writes all come from
 //! the suites that own them, so these tests drive the service through the same
@@ -111,9 +111,25 @@ async fn reported_keys(router: &MultiServiceRouter, zone_id: &str) -> Vec<(Strin
         .collect()
 }
 
+/// Activate one key-signing key:
+/// `POST /2013-04-01/keysigningkey/{HostedZoneId}/{Name}/activate`
+/// (`smithy_query(query="operation",operation="ActivateKeySigningKey")`).
+///
+/// `pub(crate)` so the sibling suite over the key status state machine drives the
+/// SAME call rather than growing a second copy of it.
+pub(crate) async fn activate_ksk(router: &MultiServiceRouter, zone_id: &str, name: &str) -> Reply {
+    call(
+        router,
+        "POST",
+        &format!("/2013-04-01/keysigningkey/{zone_id}/{name}/activate"),
+        "",
+    )
+    .await
+}
+
 /// The status reported for the key named `name`, or `None` when the zone reports
 /// no key of that name.
-async fn reported_status(
+pub(crate) async fn reported_status(
     router: &MultiServiceRouter,
     zone_id: &str,
     name: &str,
@@ -146,7 +162,7 @@ fn not_found_message(name: &str) -> String {
 /// The message a refusal of a customer managed key this service cannot sign a
 /// zone with carries: fixed text around the `KeyManagementServiceArn` from the
 /// request.
-fn unusable_key_message(kms_arn: &str) -> String {
+pub(crate) fn unusable_key_message(kms_arn: &str) -> String {
     format!(
         "The customer managed key with ARN '{kms_arn}' could not be used by Route 53 DNSSEC. \
          Check to make sure that the customer managed key has not been deleted. Otherwise, \
@@ -539,7 +555,7 @@ async fn an_unusable_customer_managed_key_is_refused_naming_the_arn_it_rejected(
 
 /// The message a deactivation of the one key a signing zone has to sign with is
 /// refused with: fixed text around the `Name` the request addressed.
-fn in_use_message(name: &str) -> String {
+pub(crate) fn in_use_message(name: &str) -> String {
     format!("Key Signing Key with name '{name}' is the only available ACTIVE key for the hosted zone.")
 }
 
@@ -859,23 +875,30 @@ async fn a_deactivation_of_an_address_that_resolves_to_no_key_is_not_found() {
     }
 }
 
-/// The two key-addressed operations the zone-resolution rule below covers: the
+/// The three key-addressed operations the zone-resolution rule below covers: the
 /// ones that take `(HostedZoneId, Name)` as `@httpLabel`s.
 #[derive(Debug, Clone, Copy)]
 enum KeyOperation {
+    /// `POST /2013-04-01/keysigningkey/{HostedZoneId}/{Name}/activate`.
+    Activate,
     /// `POST /2013-04-01/keysigningkey/{HostedZoneId}/{Name}/deactivate`.
     Deactivate,
     /// `DELETE /2013-04-01/keysigningkey/{HostedZoneId}/{Name}`.
     Delete,
 }
 
-/// Both of them, so every row below is driven through each.
-const KEY_OPERATIONS: [KeyOperation; 2] = [KeyOperation::Deactivate, KeyOperation::Delete];
+/// All of them, so every row below is driven through each.
+const KEY_OPERATIONS: [KeyOperation; 3] = [
+    KeyOperation::Activate,
+    KeyOperation::Deactivate,
+    KeyOperation::Delete,
+];
 
 impl KeyOperation {
     /// The operation's modelled name, for the case a failing assertion names.
     fn name(self) -> &'static str {
         match self {
+            Self::Activate => "ActivateKeySigningKey",
             Self::Deactivate => "DeactivateKeySigningKey",
             Self::Delete => "DeleteKeySigningKey",
         }
@@ -884,6 +907,7 @@ impl KeyOperation {
     /// Address `(zone_id, name)` through this operation.
     async fn call(self, router: &MultiServiceRouter, zone_id: &str, name: &str) -> Reply {
         match self {
+            Self::Activate => activate_ksk(router, zone_id, name).await,
             Self::Deactivate => deactivate_ksk(router, zone_id, name).await,
             Self::Delete => delete_ksk(router, zone_id, name).await,
         }
@@ -997,9 +1021,9 @@ async fn a_key_addressed_at_a_missing_zone_reports_the_missing_zone() {
                     "case {case:?}: expected 404, got {} with body {}",
                     refused.status, refused.body
                 );
-                // The class is the operation's own 404: neither operation models
-                // a zone-level error, so the zone is reported in the MESSAGE and
-                // not in the code.
+                // The class is the operation's own 404: no key-addressed
+                // operation models a zone-level error, so the zone is reported
+                // in the MESSAGE and not in the code.
                 assert_eq!(
                     refused.error_code(),
                     "NoSuchKeySigningKey",
