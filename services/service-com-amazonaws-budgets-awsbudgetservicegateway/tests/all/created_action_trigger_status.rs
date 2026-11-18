@@ -34,6 +34,11 @@
 //! request validation refuses before any status is stamped. Every row is read back through
 //! `DescribeBudgetAction`, the per-budget listing and the account-wide listing, so no read
 //! reports a status another does not.
+//!
+//! The last test pins the other half of the rule, which no single value can show: whichever
+//! of the two statuses a created action is given, that status is SETTLED — the clock owes a
+//! created action no move, so read after read reports it and nothing but a call of the
+//! caller's own takes the action off it.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -42,8 +47,8 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     ACTION_STATUS_PENDING, ACTION_STATUS_STANDBY,
 };
 
-use super::budget_action_execution::{email_subscriber, iam_definition};
-use super::budget_lifecycle::{caller_account, call, is_error, router};
+use super::budget_action_execution::{email_subscriber, iam_definition, settles_at};
+use super::budget_lifecycle::{caller_account, call, is_error, router, router_with_engine};
 use super::client_error_envelopes::message;
 
 /// The published bounds of `NotificationThreshold`, which `ActionThresholdValue` targets.
@@ -388,4 +393,98 @@ async fn a_threshold_past_either_published_bound_creates_nothing() {
         Some(0),
         "expected the refused creates to store no action, got {body}"
     );
+}
+
+/// RULE, the other half: the status a created action is given is SETTLED. No settle is owed
+/// for it ([`settles_at`]), which is the only thing that moves an action's status with no
+/// call, so a caller that creates an action and then polls it reads that one status however
+/// many times it looks — the action does not advance on its own, in either of the two
+/// statuses a create can give it.
+#[tokio::test]
+async fn the_created_status_is_settled_and_no_clock_owes_it_a_move() {
+    let (router, engine) = router_with_engine();
+    let account_id = caller_account();
+    // Rows cover both statuses a create can give an action, and both approval models: a
+    // threshold the budget's zero ACTUAL spend has not reached, one it has, a threshold the
+    // budget states no figure to compare at all, and an action that needs no approval.
+    let rows: [(&str, &str, f64, &str, &str, &str); 4] = [
+        (
+            "a MANUAL ACTUAL action at a percentage the spend has not reached",
+            "ACTUAL",
+            80.0,
+            "PERCENTAGE",
+            "MANUAL",
+            ACTION_STATUS_STANDBY,
+        ),
+        (
+            "a MANUAL ACTUAL action at the published minimum threshold",
+            "ACTUAL",
+            THRESHOLD_MIN,
+            "ABSOLUTE_VALUE",
+            "MANUAL",
+            ACTION_STATUS_PENDING,
+        ),
+        (
+            "a MANUAL FORECASTED action, whose figure the budget states nothing of",
+            "FORECASTED",
+            THRESHOLD_MIN,
+            "PERCENTAGE",
+            "MANUAL",
+            ACTION_STATUS_STANDBY,
+        ),
+        (
+            "an AUTOMATIC ACTUAL action at the published minimum threshold",
+            "ACTUAL",
+            THRESHOLD_MIN,
+            "PERCENTAGE",
+            "AUTOMATIC",
+            ACTION_STATUS_STANDBY,
+        ),
+    ];
+
+    for (
+        position,
+        (case, notification_type, threshold_value, threshold_type, approval_model, expected),
+    ) in rows.iter().enumerate()
+    {
+        let budget_name = format!("settled-status-{position}");
+        seed_budget(&router, &account_id, &budget_name).await;
+        let (status, created) = call(
+            &router,
+            "CreateBudgetAction",
+            &create_body(
+                &account_id,
+                &budget_name,
+                notification_type,
+                *threshold_value,
+                threshold_type,
+                approval_model,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected CreateBudgetAction to answer 200, got {status} {created}"
+        );
+        let action_id = created["ActionId"].as_str().unwrap_or_default().to_string();
+
+        // Nothing is owed: a settle is what moves a status with no call, and a created
+        // action has none — so the status cannot age out from under a caller.
+        assert!(
+            settles_at(&engine, &account_id, &budget_name, &action_id).is_none(),
+            "case {case:?}: expected a created action to be owed no settle"
+        );
+        // And read after read reports that one status, through every reader of an action.
+        for read in 0..4 {
+            let reported = status_of(&router, &account_id, &budget_name, &action_id, case).await;
+            assert_eq!(
+                &reported, expected,
+                "case {case:?}: expected read {read} to report {expected}, got {reported:?}"
+            );
+            assert!(
+                settles_at(&engine, &account_id, &budget_name, &action_id).is_none(),
+                "case {case:?}: expected read {read} to leave the action owed no settle"
+            );
+        }
+    }
 }

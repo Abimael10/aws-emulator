@@ -387,7 +387,10 @@ pub(crate) fn seed_status(
 
 /// The instant the clock owes the stored action's settle, or `None` when nothing is
 /// owed.
-fn settles_at(
+///
+/// `pub(crate)` so a sibling suite can assert that a status NOTHING owes a move is
+/// SETTLED, rather than inferring it from repeated reads alone.
+pub(crate) fn settles_at(
     engine: &Arc<engine::InMemoryEngine>,
     account_id: &str,
     budget_name: &str,
