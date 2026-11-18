@@ -24,6 +24,9 @@
 //!   already taken is the document's refusal, not the conflict;
 //! * the SAME reading serves `CreatePolicy` and `CreatePolicyVersion`, so the two cannot
 //!   drift apart on what they accept;
+//! * a statement's `Effect` names one of the two decisions the policy language defines,
+//!   read without regard to how it is capitalised, and only a value naming neither is
+//!   refused;
 //! * a document that satisfies the grammar is accepted and read back verbatim — including
 //!   every condition operator the policy language defines, under a set qualifier and with
 //!   the `IfExists` suffix.
@@ -38,7 +41,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_iot_awsiotservice::state::{
-    CONDITION_OPERATORS, MALFORMED_POLICY_DOCUMENT_PREFIX,
+    CONDITION_OPERATORS, MALFORMED_POLICY_DOCUMENT_PREFIX, POLICY_EFFECTS,
 };
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -439,6 +442,140 @@ async fn a_new_version_is_read_under_the_same_grammar() {
         "1",
         "a refused version create must write nothing"
     );
+}
+
+/// RULE: a statement's `Effect` names one of the two DECISIONS the policy language
+/// defines, read without regard to how it is capitalised — so a document spelling a
+/// decision in any casing is accepted and stored verbatim, and only a value naming
+/// neither decision is refused.
+#[tokio::test]
+async fn a_statements_effect_is_read_without_regard_to_case() {
+    let emulator = Emulator::new();
+
+    // The catalog is `state::POLICY_EFFECTS`, the decisions the IAM JSON policy reference
+    // defines; each row spells one of them another way, including spellings no recording
+    // cited (`DENY`, `dEnY`, `aLlOw`).
+    let accepted: Vec<String> = POLICY_EFFECTS
+        .iter()
+        .flat_map(|effect| {
+            [
+                (*effect).to_string(),
+                effect.to_lowercase(),
+                effect.to_uppercase(),
+                alternating_case(effect),
+            ]
+        })
+        .collect();
+
+    for (index, spelling) in accepted.iter().enumerate() {
+        let document = statement(effected(json!(spelling)));
+        let policy_name = format!("effect-{index}");
+        let created = emulator.create_policy(&policy_name, &document).await;
+        assert_eq!(
+            created.status,
+            200,
+            "case {spelling:?}: a decision in any casing must be accepted, got {} body {}",
+            created.status,
+            created.text()
+        );
+        // Stored VERBATIM: the casing the caller wrote is the casing a reader gets back,
+        // since nothing canonicalises the document.
+        assert_eq!(
+            emulator.get_policy(&policy_name).await.member("policyDocument"),
+            document,
+            "case {spelling:?}: the stored document must come back verbatim"
+        );
+    }
+
+    // What the rule does NOT cover: a value naming neither decision, and a value that is
+    // no string at all. The rows differ in the form the value takes.
+    let refused: Vec<(&str, String)> = vec![
+        (
+            "a word that is no decision",
+            statement(effected(json!("Permit"))),
+        ),
+        (
+            "a decision with text around it",
+            statement(effected(json!("Allowed"))),
+        ),
+        ("an empty effect", statement(effected(json!("")))),
+        (
+            "an effect that is not even a string",
+            statement(effected(json!(true))),
+        ),
+        (
+            "an effect stated as a list of decisions",
+            statement(effected(json!(["Allow"]))),
+        ),
+    ];
+    for (index, (case, document)) in refused.iter().enumerate() {
+        let policy_name = format!("unreadable-effect-{index}");
+        let reply = emulator.create_policy(&policy_name, document).await;
+        assert_eq!(
+            reply.status,
+            400,
+            "case {case:?}: a value naming no decision must be refused 400, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+        assert_eq!(
+            reply.error_code(),
+            MALFORMED_POLICY,
+            "case {case:?}: expected {MALFORMED_POLICY}, got {}",
+            reply.text()
+        );
+        assert_eq!(
+            emulator.get_policy(&policy_name).await.status,
+            404,
+            "case {case:?}: a refused create must persist nothing"
+        );
+    }
+
+    // The SAME reading serves `CreatePolicyVersion`: a version whose decision is spelled
+    // another way is accepted and the document it carries is the one submitted.
+    let lowercase_deny = statement(effected(json!("deny")));
+    let versioned = emulator.create_version("effect-0", &lowercase_deny).await;
+    assert_eq!(
+        versioned.status,
+        200,
+        "a version whose decision is spelled lowercase must be accepted, got {} body {}",
+        versioned.status,
+        versioned.text()
+    );
+    assert_eq!(
+        versioned.member("policyVersionId"),
+        "2",
+        "the accepted version must be the policy's second, got {}",
+        versioned.text()
+    );
+    assert_eq!(
+        versioned.member("policyDocument"),
+        lowercase_deny,
+        "the accepted version must carry the document submitted, got {}",
+        versioned.text()
+    );
+}
+
+/// `text` with every other character upper-cased, so a row spells a decision in a casing
+/// that is neither the documented one nor a uniform one.
+fn alternating_case(text: &str) -> String {
+    text.chars()
+        .enumerate()
+        .map(|(index, character)| {
+            if index % 2 == 0 {
+                character.to_ascii_lowercase()
+            } else {
+                character.to_ascii_uppercase()
+            }
+        })
+        .collect()
+}
+
+/// The statement every row starts from, with `effect` as its `Effect`.
+fn effected(effect: Value) -> Value {
+    let mut members = allow_publish();
+    members["Effect"] = effect;
+    members
 }
 
 /// RULE: every condition operator the policy language defines is accepted — under a set

@@ -538,9 +538,11 @@ const LOG_LEVEL_DISABLED: &str = "DISABLED";
 /// The check is about a policy that gives permissions wider than a device needs, so a
 /// document is non-compliant when one of its `Allow` statements names NO specific action
 /// (`*`, or the whole service as `iot:*`) or NO specific resource (`*`): either one lets
-/// the principal do more than the statement describes. A document that is not readable as
-/// an IAM-grammar policy states no such grant — nothing here re-judges what
-/// [`super::validate_policy_document`] already accepts.
+/// the principal do more than the statement describes. The granting statements are read
+/// the way the grammar reads an `Effect` ([`super::names_policy_effect`]) — without regard
+/// to case — so a grant written in another casing is still read as a grant. A document
+/// that is not readable as an IAM-grammar policy states no such grant — nothing here
+/// re-judges what [`super::validate_policy_document`] already accepts.
 pub fn policy_is_overly_permissive(document: &str) -> bool {
     let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
         return false;
@@ -553,7 +555,10 @@ pub fn policy_is_overly_permissive(document: &str) -> bool {
         None => Vec::new(),
     };
     statements.iter().any(|statement| {
-        statement.get("Effect").and_then(|effect| effect.as_str()) == Some("Allow")
+        statement
+            .get("Effect")
+            .and_then(|effect| effect.as_str())
+            .is_some_and(|effect| effect.eq_ignore_ascii_case(super::POLICY_EFFECT_ALLOW))
             && (named_values(statement.get("Action"))
                 .iter()
                 .any(|action| action == "*" || action == "iot:*")

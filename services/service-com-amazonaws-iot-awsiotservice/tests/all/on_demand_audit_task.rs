@@ -300,9 +300,17 @@ impl Reply {
 /// A policy document that allows `action` on `resource`, in the IAM grammar
 /// `CreatePolicy$policyDocument` takes.
 fn policy_document(action: Value, resource: Value) -> Value {
+    policy_document_with_effect("Allow", action, resource)
+}
+
+/// The same document with its statement's `Effect` spelled `effect`.
+///
+/// An `Effect` names a DECISION rather than a capitalisation, so a grant written in another
+/// casing is the same grant — which is what the policy check below reads it as.
+fn policy_document_with_effect(effect: &str, action: Value, resource: Value) -> Value {
     json!({
         "Version": "2012-10-17",
-        "Statement": [{ "Effect": "Allow", "Action": action, "Resource": resource }],
+        "Statement": [{ "Effect": effect, "Action": action, "Resource": resource }],
     })
 }
 
@@ -525,10 +533,11 @@ struct OutcomeCase {
 
 /// What a check amounts to is read off the account's resources, not off the request.
 ///
-/// The account below holds two certificates, three IoT policies — one narrow, one granting
-/// the whole service and one granting every resource — and no logging options, and the rows
-/// differ in the resource class the check is about and in how many of that class break its
-/// rule (none of them, some of them, all of them).
+/// The account below holds two certificates, four IoT policies — one narrow, one granting
+/// the whole service, one granting every resource and one granting every resource under an
+/// `Effect` spelled in another casing — and no logging options, and the rows differ in the
+/// resource class the check is about and in how many of that class break its rule (none of
+/// them, some of them, all of them).
 #[tokio::test]
 async fn audit_check_outcomes_come_from_the_accounts_resources() {
     let emulator = Emulator::new();
@@ -563,6 +572,13 @@ async fn audit_check_outcomes_come_from_the_accounts_resources() {
             &policy_document(json!(["iot:Publish"]), json!("*")),
         )
         .await;
+    emulator
+        .create_policy(
+            case,
+            "lowercase-effect-every-resource-policy",
+            &policy_document_with_effect("allow", json!(["iot:Publish"]), json!("*")),
+        )
+        .await;
 
     let targets: Vec<String> = AUDIT_CHECK_NAMES.iter().map(|n| (*n).to_string()).collect();
     let task_id = emulator.started_audit(case, &targets).await;
@@ -588,10 +604,10 @@ async fn audit_check_outcomes_come_from_the_accounts_resources() {
             non_compliant_resources: 0,
         },
         OutcomeCase {
-            case: "three policies, two of them granting more than they name",
+            case: "four policies, three of them granting more than they name",
             check_name: IOT_POLICY_OVERLY_PERMISSIVE_CHECK,
-            total_resources: 3,
-            non_compliant_resources: 2,
+            total_resources: 4,
+            non_compliant_resources: 3,
         },
         OutcomeCase {
             case: "a check about resources this account holds none of",
