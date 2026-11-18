@@ -390,6 +390,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             removal_due_at: None,
             // Nothing has failed on a knowledge base this call just created.
             failure_reasons: Vec::new(),
+            // A knowledge base is created carrying no resource-based policy: one
+            // exists only once a write attaches it (`crate::state::resource_policies`).
+            resource_policy: None,
             tags: input.tags.unwrap_or_default(),
             client_token: input.client_token.clone(),
             created_at: now,

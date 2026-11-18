@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the resource-based policy stored on the knowledge base the
+//! `resourceArn` names — the document a write attached to that very record, the
+//! revision that write left it at, and the knowledge base's own ARN.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The two readings the answer turns on are
+//! [`crate::state::resource_policies`]'s, folded into the one resolution every
+//! resource-policy operation shares
+//! ([`crate::state::ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::policy_bearing_knowledge_base`]):
+//! an ARN that names no knowledge base of this plane, and a knowledge base whose
+//! KIND carries no policy at all, are bad requests the modelled
+//! `ValidationException` refuses; an ARN naming a knowledge base this store does not
+//! hold, and a knowledge base carrying no policy, are the missing resources
+//! `ResourceNotFoundException` refuses — the modelled output makes `policy` and
+//! `revisionId` both @required, so there is no successful answer for a knowledge
+//! base that has no policy to report.
 //!
-//! The two readings a resource policy of a knowledge base turns on — which knowledge
-//! base a `resourceArn` names, and which kind of knowledge base carries a policy at
-//! all — are in [`crate::state::resource_policies`]. What is NOT written down
-//! anywhere this emulator can read is the wording of the refusals AWS answers here,
-//! so they have to come from the recorded responses.
+//! A pure read: nothing about the knowledge base or its policy changes, and the one
+//! write is the materialising of a transition the CLOCK had already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +166,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A read: the policy is reported as the knowledge base holds it, and the one
+        // write is the materialising of a transition the CLOCK had already made due —
+        // owed at this instant whether or not anyone asked for the policy, and what
+        // takes a knowledge base whose removal came due out of the store.
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        let record = match state.policy_bearing_knowledge_base(&input.resource_arn) {
+            Ok(record) => record,
+            Err(crate::state::ResourcePolicyRefusal::NotAKnowledgeBase) => {
+                return Err(GetResourcePolicyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::resource_policy_arn_pattern_message(
+                            &input.resource_arn,
+                        )),
+                        field_list: None,
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::ResourcePolicyRefusal::NoSuchKnowledgeBase(knowledge_base_id)) => {
+                return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::policied_knowledge_base_not_found_message(
+                            &knowledge_base_id,
+                        )),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::ResourcePolicyRefusal::KindCarriesNoPolicy) => {
+                return Err(GetResourcePolicyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::unsupported_resource_policy_message()),
+                        field_list: None,
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Both `policy` and `revisionId` are @required, so a knowledge base that
+        // carries no policy has no successful answer: the policy is the resource that
+        // could not be retrieved, and the knowledge base it would belong to is there.
+        let Some(policy) = record.resource_policy.as_ref() else {
+            return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_policy_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetResourcePolicyOutput {
+            // The knowledge base's OWN ARN, off the record the policy hangs on,
+            // rather than the value the request spelled: it is "the ARN of the
+            // knowledge base that the resource policy is associated with".
+            resource_arn: record.knowledge_base_arn.clone(),
+            policy: policy.policy.clone(),
+            revision_id: policy.revision_id(),
+        })
     }
 }

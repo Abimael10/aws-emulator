@@ -65,10 +65,11 @@
 //! record is what keeps a refused call from telling an unauthorized caller whether what it
 //! named exists.
 //!
-//! The three resource-policy operations of this model are still scaffolded (501), so this
-//! emulator holds no resource-based policy for any resource of this service and the
-//! identity-based decision is the whole decision; a document one of them stores later is
-//! read beside the caller's own, as every gate in this tree that holds one does.
+//! The two resource-policy operations that WRITE one — `PutResourcePolicy` and
+//! `DeleteResourcePolicy` — are still scaffolded (501), so this emulator holds no
+//! resource-based policy for any resource of this service and the identity-based decision is
+//! the whole decision; a document one of them stores later is read beside the caller's own,
+//! as every gate in this tree that holds one does.
 //!
 //! ## The callers this gate does not bound
 //!

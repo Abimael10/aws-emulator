@@ -44,6 +44,14 @@
 //! vector store, in the `vector_store` module beside this one, so no knowledge
 //! base is created against an index that is not there.
 //!
+//! A knowledge base's resource-based POLICY (`GetResourcePolicy`, and the write
+//! and delete beside it) is held on the knowledge base's own record, as
+//! [`KnowledgeBaseRecord::resource_policy`]: which knowledge base a
+//! `resourceArn` names, which KIND of knowledge base carries a policy at all and
+//! the one resolution both of those readings make are in the
+//! `resource_policies` module beside this one, so every operation about a policy
+//! answers one ARN alike.
+//!
 //! A knowledge base's data sources (`CreateDataSource`, `UpdateDataSource`,
 //! `GetDataSource`) are backed by the
 //! [`data_sources`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::data_sources)
@@ -1186,6 +1194,16 @@ pub struct KnowledgeBaseRecord {
     /// Reasons the last API operation on the knowledge base failed; empty while
     /// nothing has failed.
     pub failure_reasons: Vec<String>,
+    /// The resource-based POLICY this knowledge base carries, and `None` while it
+    /// carries none.
+    ///
+    /// It lives on the knowledge base's own record rather than in a map beside it
+    /// because a resource policy is an attribute OF the knowledge base: the one a
+    /// resource-policy read reports is the one the write attached to this very
+    /// record, and a knowledge base that leaves the store takes its policy with it
+    /// instead of leaving one behind for a later knowledge base to find. See
+    /// [`resource_policies`].
+    pub resource_policy: Option<ResourcePolicyRecord>,
     pub tags: HashMap<String, String>,
     pub client_token: Option<String>,
     pub created_at: SystemTime,
