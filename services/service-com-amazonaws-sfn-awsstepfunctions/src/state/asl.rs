@@ -2628,11 +2628,13 @@ impl ContinuedEntry {
 ///
 /// "TimeoutSeconds (Optional) … The maximum number of seconds an execution of the state
 /// machine can run. If it runs longer than the specified time, the execution fails with
-/// a States.Timeout error name." It bounds the whole execution, so it is read once —
-/// before the walk, which STOPS at it ([`Interpreter::past_timeout`]), and after it, to
-/// report a run that got past it ([`interpret`]) — and a value that is not a whole
-/// number of seconds declares no bound to measure.
-fn definition_timeout(document: &Value) -> Option<Duration> {
+/// a States.Timeout error name." It bounds the whole EXECUTION rather than any one walk of
+/// it, so the configuration an execution runs resolves it ONCE through here
+/// ([`super::RanConfiguration`]) and the walk reads the same member: before each
+/// transition, which it STOPS at ([`Interpreter::past_timeout`]), and after the walk, to
+/// report a run that got past it ([`interpret`]). A value that is not a whole number of
+/// seconds declares no bound to measure.
+pub(super) fn definition_timeout(document: &Value) -> Option<Duration> {
     document
         .get("TimeoutSeconds")
         .and_then(Value::as_u64)

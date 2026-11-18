@@ -739,7 +739,12 @@ fn in_flight_or_release(
         }
         in_flight = true;
         let due = execution.pending.as_ref().map(|pending| pending.due_at);
-        next_due = next_due.into_iter().chain(due).min();
+        // The instant the execution's OWN allowance runs out is due as much as the
+        // outcome a walk computed: an execution waiting for something nobody will send
+        // is carried to that bound by this clock rather than by a client's next call
+        // ([`ComAmazonawsSfnAwsstepfunctionsState::settle`]).
+        let allowance = execution.allowance_ends_at();
+        next_due = next_due.into_iter().chain(due).chain(allowance).min();
     }
     if !in_flight {
         release(store, generation);

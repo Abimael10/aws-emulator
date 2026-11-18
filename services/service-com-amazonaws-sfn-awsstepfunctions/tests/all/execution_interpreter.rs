@@ -29,7 +29,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sfn_awsstepfunctions::state::asl::{MAX_CAUSE_BYTES, MAX_ERROR_BYTES};
 
 use crate::state_machine_lifecycle::{
-    create_machine, describe_execution, start_execution, Emulator, PAST_THE_EXECUTION_DELAY,
+    create_machine, describe_execution, error_code, start_execution, string, Emulator,
+    PAST_THE_EXECUTION_DELAY,
 };
 
 /// What a row expects the execution to end as.
@@ -879,6 +880,105 @@ async fn an_execution_past_its_definition_timeout_times_out() {
     assert!(
         after.get("output").is_none_or(Value::is_null),
         "case timeout: a timed-out execution reports no output, got {after:?}"
+    );
+}
+
+/// How long a wait for the allowance looks at the execution again, and how long it waits
+/// for it at all: the wait is for the CONDITION, so the deadline is generous and a host
+/// that runs this slowly spends none of it.
+const ALLOWANCE_POLL: Duration = Duration::from_millis(25);
+/// See [`ALLOWANCE_POLL`].
+const ALLOWANCE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The allowance bounds the execution WHATEVER it is waiting on: an execution suspended at
+/// an activity task a worker claimed and never answered ends `TIMED_OUT` when the
+/// allowance runs out — reporting that status and nothing else, exactly as a run that
+/// COMPUTED past the bound does — and the task it was waiting at can no longer be
+/// answered, because the execution it belonged to has ended.
+#[tokio::test]
+async fn an_execution_waiting_at_a_task_past_its_definition_timeout_times_out() {
+    let emulator = Emulator::new();
+    let created = emulator
+        .ok("CreateActivity", &json!({ "name": "waited-on" }))
+        .await;
+    let activity_arn = string(&created, "activityArn");
+    let definition = format!(
+        r#"{{"TimeoutSeconds":1,"StartAt":"W","States":{{"W":{{"Type":"Task","Resource":"{activity_arn}","End":true}}}}}}"#
+    );
+    let machine = create_machine(&emulator, "waiting-timeout", &definition).await;
+    let execution = start_execution(&emulator, &machine, "only", "{}").await;
+
+    // A worker TAKES the task and then never answers it, so nothing but the execution's
+    // own allowance can end the execution: the state declares no bound of its own.
+    let claimed = emulator
+        .ok(
+            "GetActivityTask",
+            &json!({ "activityArn": &activity_arn, "workerName": "idle" }),
+        )
+        .await;
+    let token = string(&claimed, "taskToken");
+
+    let giving_up_at = std::time::Instant::now() + ALLOWANCE_DEADLINE;
+    let mut described = describe_execution(&emulator, &execution).await;
+    while described.get("status").and_then(Value::as_str) == Some("RUNNING")
+        && std::time::Instant::now() < giving_up_at
+    {
+        ::tokio::time::sleep(ALLOWANCE_POLL).await;
+        described = describe_execution(&emulator, &execution).await;
+    }
+    assert_eq!(
+        described.get("status").and_then(Value::as_str),
+        Some("TIMED_OUT"),
+        "case \"waiting at a task\": an execution past its TimeoutSeconds times out however \
+         long its task stays outstanding, got {described:?}"
+    );
+    for member in ["error", "cause", "output"] {
+        assert!(
+            described.get(member).is_none_or(Value::is_null),
+            "case \"waiting at a task\": a machine-level timeout names no {member}, got \
+             {described:?}"
+        );
+    }
+    assert!(
+        described.get("stopDate").is_some_and(|at| !at.is_null()),
+        "case \"waiting at a task\": a timed-out execution reports when it stopped, got \
+         {described:?}"
+    );
+
+    // The history ends on the event that says what happened.
+    let history = emulator
+        .ok(
+            "GetExecutionHistory",
+            &json!({ "executionArn": &execution }),
+        )
+        .await;
+    let ended_on = history
+        .get("events")
+        .and_then(Value::as_array)
+        .and_then(|events| events.last())
+        .and_then(|event| event.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    assert_eq!(
+        ended_on.as_deref(),
+        Some("ExecutionTimedOut"),
+        "case \"waiting at a task\": the history must end on the execution timing out, got \
+         {history:?}"
+    );
+
+    // And the task the execution was waiting at is gone with it, so the worker's answer is
+    // refused exactly as a late answer to a task that timed out is.
+    let (refused_status, refusal) = emulator
+        .call(
+            "SendTaskSuccess",
+            &json!({ "taskToken": &token, "output": "{}" }),
+        )
+        .await;
+    assert_eq!(
+        (refused_status, error_code(&refusal).as_str()),
+        (400, "TaskTimedOut"),
+        "case \"waiting at a task\": the answer to a task whose execution timed out must be \
+         refused with TaskTimedOut, got {refused_status} with {refusal}"
     );
 }
 

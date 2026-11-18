@@ -10,6 +10,28 @@ Issue-Commit: 69fbb491696def14b5ee7dd45913958907d046a9
 
 > _Note: this issue was identified against the code base at commit `69fbb491696def14b5ee7dd45913958907d046a9`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+The emission gap this cause describes is closed, and the transition that was really missing from the
+execution-status path is now published: a state machine's top-level `TimeoutSeconds` bounds the WHOLE
+execution, so an execution that is WAITING on something when that span runs out — suspended at an
+activity task no worker claims, at a callback task nobody answers, or parked at another service's job
+— now ends `TIMED_OUT` at the allowance (no `error`, no `cause`) and that status change is published
+onto the default bus like every other. Before this, the allowance was applied only by the walk, to a
+run that COMPUTED past it, so a waiting execution stayed `RUNNING` for ever and its queue received
+the `RUNNING` envelope and nothing else.
+
+`events__sqs__stepfunctions.xsvc-sfn-2-redrive-status-change` passes. The other check,
+`step-functions-execution-status-change-reaches-the-default-bus`, still ends `Check timed out after
+60.0s`, and that failure is NOT the absence described above: the scenario in "Steps to Reproduce" was
+driven end to end — in process, on an authenticating router, and on the STARTED binary over TLS with
+long-polling receives — and the envelopes arrive every time. The three suites added with this fix pin
+that over the shapes a client's scenario takes (which dimension the rule's pattern filters on, what
+the queue policy grants, how the queue is encrypted, how the target is configured, what the workflow
+does, who started the execution, and what answers the task it waits at). Whatever that one check
+still waits for is not reproducible from this report; a fixer picking it up should start from a shape
+those tables do not already cover rather than from "nothing is published".
+
 ## Operation
 StartExecution
 

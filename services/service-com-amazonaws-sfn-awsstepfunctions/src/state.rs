@@ -1097,12 +1097,20 @@ pub struct RanConfiguration {
     pub logging_configuration: Option<LoggingConfiguration>,
     pub tracing_configuration: Option<TracingConfiguration>,
     pub encryption_configuration: Option<EncryptionConfiguration>,
+    /// The span this configuration's own `TimeoutSeconds` allows ONE EXECUTION of it, and
+    /// `None` for a definition that declares none.
+    ///
+    /// Resolved once, as the snapshot is taken ([`Self::allowance`]), and read by whatever
+    /// asks how much of its allowance an execution has left
+    /// ([`Execution::allowance_ends_at`]).
+    pub allowance: Option<Duration>,
 }
 
 impl RanConfiguration {
     /// The configuration the state machine `machine` currently holds.
     pub fn of_state_machine(machine: &StateMachine) -> Self {
         Self {
+            allowance: Self::allowance(&machine.definition),
             definition: machine.definition.clone(),
             role_arn: machine.role_arn.clone(),
             revision_id: machine.revision_id.clone(),
@@ -1116,6 +1124,7 @@ impl RanConfiguration {
     /// The configuration the published version `version` holds.
     pub fn of_version(version: &StateMachineVersion) -> Self {
         Self {
+            allowance: Self::allowance(&version.definition),
             definition: version.definition.clone(),
             role_arn: version.role_arn.clone(),
             revision_id: version.revision_id.clone(),
@@ -1124,6 +1133,19 @@ impl RanConfiguration {
             tracing_configuration: version.tracing_configuration.clone(),
             encryption_configuration: version.encryption_configuration.clone(),
         }
+    }
+
+    /// The span `definition` allows ONE EXECUTION of it, read off the member the walk
+    /// reads it by ([`asl::definition_timeout`]).
+    ///
+    /// Resolved HERE, as the snapshot is taken, because the allowance belongs to the
+    /// configuration an execution RUNS rather than to any one observation of that
+    /// execution: the definition is a caller's document bounded at the modelled 1 MiB, so
+    /// reading it once per start — and once for every child workflow execution, which share
+    /// this very snapshot — is what keeps the store and the clock from re-reading it
+    /// whenever they ask what is due.
+    fn allowance(definition: &str) -> Option<Duration> {
+        asl::definition_timeout(&serde_json::from_str::<serde_json::Value>(definition).ok()?)
     }
 
     /// The caller-sized bytes this snapshot retains, for the record carrying it; the
@@ -2047,6 +2069,23 @@ impl Execution {
     /// which is the one a Map Run enumerates and redrives.
     pub fn is_map_run_child(&self) -> bool {
         self.map_run_arn.is_some()
+    }
+
+    /// The instant this execution's OWN allowance runs out, and `None` for one whose
+    /// definition declares none.
+    ///
+    /// A state machine's top-level `TimeoutSeconds` bounds the execution rather than any
+    /// one walk of it ("the maximum number of seconds an execution of the state machine
+    /// can run"), so the span is measured from the instant the attempt now running began
+    /// — the redrive that re-ran the execution, or its start — and it is spent whatever
+    /// the execution is doing: computing, or waiting for a worker's reply, for an answer
+    /// quoting its task token or for a job of another service. The span is the one the
+    /// configuration this execution RAN resolved ([`RanConfiguration::allowance`]), so a
+    /// state machine updated since does not move the bound of a run already under way, and
+    /// asking what is due costs no reading of the definition.
+    pub fn allowance_ends_at(&self) -> Option<SystemTime> {
+        let began = self.redrive_date.unwrap_or(self.start_date);
+        self.ran.allowance.map(|allowance| after(began, allowance))
     }
 
     /// The bytes this record would retain, including the outcome the interpreter

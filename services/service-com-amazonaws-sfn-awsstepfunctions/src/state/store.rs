@@ -73,14 +73,19 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// This is the ONE write a reporting operation performs, and it is owed whether
     /// or not anybody called: an execution whose outcome came due is reported
     /// terminal, an activity task that ran out of time is closed and the execution
-    /// waiting at it has failed, a map run whose items were due reports the status
-    /// they produced, and a state machine whose deletion came due is gone.
+    /// waiting at it has failed, an execution whose own allowance ran out while it
+    /// waited for something is `TIMED_OUT`, a map run whose items were due reports the
+    /// status they produced, and a state machine whose deletion came due is gone.
     /// Tasks settle before executions and executions before deletions, so an outcome
     /// owed before the machine disappeared is still recorded.
     pub fn settle(&mut self, now: SystemTime) {
         self.settle_activity_tasks(now);
         self.settle_callback_handovers(now);
         self.settle_job_tasks(now);
+        // And every execution whose own allowance has run out while it waited for
+        // something, which the bounds above cannot reach: they close one TASK's window,
+        // this closes the EXECUTION's ([`Self::settle_execution_allowances`]).
+        self.settle_execution_allowances(now);
         let mut still_pending = Vec::with_capacity(self.pending_executions.len());
         for arn in std::mem::take(&mut self.pending_executions) {
             let Some(execution) = self.executions.get_mut(&arn) else {
@@ -1098,6 +1103,112 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         // The terminal status this bound reached is published here, for the reason
         // [`Self::time_out_activity_task`] publishes its own.
         self.observe_execution_settled(execution_arn);
+    }
+
+    /// End every execution whose own allowance the clock has passed while it was waiting
+    /// on something ([`Execution::allowance_ends_at`]).
+    ///
+    /// A definition's top-level `TimeoutSeconds` bounds the EXECUTION, so the execution is
+    /// `TIMED_OUT` once that span has passed however far its walk got. A run that
+    /// COMPUTED past the bound reports it itself — that is the outcome the clock then owes
+    /// — so what is left for this is every execution whose next transition nothing else
+    /// owes: one suspended at an activity task no worker answered, at a callback task
+    /// nobody answered, or parked at a job of another service. An execution whose outcome
+    /// is already owed is left to that outcome, so one bound is never applied twice.
+    fn settle_execution_allowances(&mut self, now: SystemTime) {
+        let overdue: Vec<(String, SystemTime)> = self
+            .executions
+            .values()
+            .filter(|execution| !execution.is_terminal() && execution.pending.is_none())
+            .filter_map(|execution| {
+                let due = execution.allowance_ends_at().filter(|due| *due <= now)?;
+                Some((execution.arn.clone(), due))
+            })
+            .collect();
+        for (arn, due) in overdue {
+            self.time_out_execution(&arn, due);
+        }
+    }
+
+    /// Report the execution `arn` `TIMED_OUT` at `due`, the instant its own allowance ran
+    /// out, and release what it was waiting on.
+    ///
+    /// What ran out is the EXECUTION's allowance rather than anything a state did, so the
+    /// record reports the status alone — no `error` and no `cause` — which is the same
+    /// terminal a run that computed past the bound reports ([`asl`]). The step the attempt
+    /// had reached is what a later redrive continues from, exactly as a task that timed
+    /// out leaves it, and the task or job the execution was waiting at can never be
+    /// answered now: it leaves the store here, as the next settle would drop it for an
+    /// execution that ended any other way.
+    fn time_out_execution(&mut self, arn: &str, due: SystemTime) {
+        let waiting_at = self.waiting_step_of(arn);
+        self.discard_tasks_of_executions(&[arn.to_string()]);
+        let Some(execution) = self.executions.get_mut(arn) else {
+            return;
+        };
+        if execution.is_terminal() {
+            return;
+        }
+        let before = execution.retained_bytes;
+        execution.status = EXECUTION_STATUS_TIMED_OUT.to_string();
+        execution.stop_date = Some(due);
+        // "This field is set only if the execution succeeds": an execution the clock cut
+        // off produced no output.
+        execution.output = None;
+        execution.error = None;
+        execution.cause = None;
+        if let Some(step) = waiting_at {
+            execution.redrive_step = Some(step);
+        }
+        execution.push_event(EVENT_EXECUTION_TIMED_OUT, due);
+        execution.retained_bytes = execution.measure();
+        let after = execution.retained_bytes;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(after)
+            .saturating_sub(before);
+        self.pending_executions.retain(|pending| pending != arn);
+        // The terminal status this bound reached is what the execution publishes about
+        // having ended, for the reason [`Self::time_out_job_task`] publishes its own.
+        self.observe_execution_settled(arn);
+        // A Map Run of this execution had not finished either, so it stopped when the
+        // execution did.
+        self.abort_map_runs_of(arn, due);
+    }
+
+    /// The step the execution `arn` is WAITING at, for the record a later redrive
+    /// continues from: the state that scheduled the activity or callback task it is
+    /// suspended at, or the state that started the job it is parked at.
+    ///
+    /// An execution can be waiting at SEVERAL tasks at once — a `Parallel` whose branches
+    /// each suspended at one — so the EARLIEST one is the step reported: a redrive
+    /// continues "the failed execution from the unsuccessful step", and the earliest of the
+    /// outstanding steps is the one every later branch follows, which also makes the choice
+    /// the same whichever order the store holds the tasks in.
+    ///
+    /// `None` for an execution waiting at neither, which a redrive then walks from the
+    /// definition's `StartAt`.
+    fn waiting_step_of(&self, arn: &str) -> Option<asl::RedriveStep> {
+        let earliest = self
+            .activity_tasks
+            .values()
+            .filter(|task| task.execution_arn == arn)
+            .min_by(|one, other| {
+                one.available_at
+                    .cmp(&other.available_at)
+                    .then_with(|| one.token.cmp(&other.token))
+            });
+        if let Some(task) = earliest {
+            return Some(asl::RedriveStep {
+                state_name: task.state_name.clone(),
+                state_input: task.state_input.clone(),
+            });
+        }
+        let job = self.job_tasks.get(arn)?;
+        Some(asl::RedriveStep {
+            state_name: job.state_name.clone(),
+            state_input: job.state_input.clone(),
+        })
     }
 
     /// Make the outcome the clock has already made due for the execution `arn` a
