@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for the WORDING of this service's dependency refusal, and for the
-//! delete path of the infrastructure configuration that carries it.
+//! End-to-end HTTP tests for the WORDING of this service's dependency and already-exists
+//! refusals, and for the delete path of the infrastructure configuration that carries one of
+//! them.
 //!
 //! Every case drives the real wire path — the production `MultiServiceRouter`, restJson1
 //! serialization, the modelled-constraint walk and the handlers — so what is asserted is what
@@ -16,10 +17,15 @@
 //! * a refused delete leaves the store as it was, so the resource is still read back;
 //! * once nothing references it, the delete removes it and echoes the ARN it removed, after
 //!   which both a read and a repeat of the delete report that ARN missing in its family's own
-//!   not-found template.
+//!   not-found template;
+//! * a create whose key this Region already holds is refused `ResourceAlreadyExistsException`
+//!   (HTTP 400) whose message is the FIXED already-exists template of that resource's family:
+//!   where the family's template states an ARN, its only variable part is the ARN of the
+//!   STORED resource that already holds the key — never a name, a version or any other value
+//!   the request carried, and never a second ARN.
 //!
-//! The rows span what the rules generalise over: which kind of resource the delete acts on, in
-//! which kind of resource the reference that protects it lives, and which of the two message
+//! The rows span what the rules generalise over: which kind of resource the call acts on, in
+//! which kind of resource the reference that protects it lives, and which of the message
 //! families the kind belongs to — and each row carries its own name, so the ARN the message
 //! quotes differs from row to row and cannot be a constant.
 
@@ -203,6 +209,19 @@ fn configuration_dependency_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' has dependent resources")
 }
 
+/// The already-exists refusal the components, recipes, pipelines and the distribution
+/// configuration carry: the LABEL of the kind the create would have minted and the ARN of the
+/// resource that already holds the key, and nothing else.
+fn already_exists_message(label: &str, arn: &str) -> String {
+    format!("The following resource '{label}' already exists: '{arn}'.")
+}
+
+/// The already-exists refusal the INFRASTRUCTURE configuration carries: the one kind of this
+/// service whose sentence is entirely fixed text, stating no ARN at all.
+fn configuration_already_exists_message() -> String {
+    "The resource already exists.".to_string()
+}
+
 /// The not-found report this service's authoring and build resources carry, naming the kind
 /// the ARN identifies.
 fn required_resource_message(resource_type: &str, arn: &str) -> String {
@@ -358,6 +377,258 @@ fn assert_quotes_only(case: &str, message: &str, arn: &str, referrer: &str) {
         "case {case:?}: expected the message not to name the referring resource {referrer:?}, \
          got {message:?}"
     );
+}
+
+/// Assert an already-exists `message` quotes exactly two parts — the kind's label and `arn`,
+/// the ARN of the resource that already holds the key — so beside what that stored ARN itself
+/// spells, no value the refused request carried and no second ARN can be in it.
+fn assert_quotes_the_label_and_the_stored_arn(case: &str, message: &str, arn: &str) {
+    let quoted = message.matches(&format!("'{arn}'")).count();
+    assert_eq!(
+        quoted, 1,
+        "case {case:?}: expected the message to quote {arn:?} exactly once, got {quoted} in \
+         {message:?}"
+    );
+    let parts = message.matches('\'').count();
+    assert_eq!(
+        parts, 4,
+        "case {case:?}: expected the message to quote exactly two parts, the label and the ARN, \
+         got {} in {message:?}",
+        parts / 2
+    );
+    let arns = message.matches(ARN_PREFIX).count();
+    assert_eq!(
+        arns, 1,
+        "case {case:?}: expected the message to carry exactly one ARN, got {arns} in \
+         {message:?}"
+    );
+}
+
+/// One row: a create whose key this Region already holds, and what its refusal has to say.
+struct Collision {
+    /// What this row is, named in every assertion it makes.
+    case: &'static str,
+    /// The create under test, called a second time with a client token of its own.
+    uri: &'static str,
+    /// The body that second create carries: the same key, a different token.
+    body: Value,
+    /// The ARN the first create minted, read from its own answer.
+    existing: String,
+    /// The whole sentence the second create's refusal has to carry.
+    message: String,
+    /// Whether this family's template states the stored ARN at all.
+    quotes_arn: bool,
+    /// The read that proves the ARN the refusal states is the stored resource's own, and the
+    /// member it wraps that resource in.
+    read: String,
+    wrapper: &'static str,
+}
+
+#[tokio::test]
+async fn an_already_exists_refusal_states_only_the_stored_resources_arn() {
+    // The rows differ along the KIND the create would have minted — and so along the label
+    // the refusal gives it, which is the kind the stored ARN names except for the pipeline,
+    // whose recorded refusal labels it `Pipeline` rather than the `image-pipeline` its ARN
+    // spells (see `crate::state`'s already-exists wording) — along which part of the key is
+    // already taken (a name, a name and a semantic version, a build version's content), and
+    // along which of the two already-exists families the kind belongs to. Each row names its
+    // own resources, so the ARN the message states differs from row to row.
+    for row_case in [
+        "a component build version whose content is already stored",
+        "an image recipe name and version that is already taken",
+        "a container recipe name and version that is already taken",
+        "a pipeline name that is already taken",
+        "a distribution configuration name that is already taken",
+        "an infrastructure configuration name that is already taken",
+    ] {
+        let router = emulator();
+        let row = match row_case {
+            "a component build version whose content is already stored" => {
+                let component = create_component(&router, "collide-component").await;
+                Collision {
+                    case: row_case,
+                    uri: "/CreateComponent",
+                    body: json!({
+                        "name": "collide-component",
+                        "semanticVersion": "1.0.0",
+                        "platform": "Linux",
+                        "clientToken": "collide-component-again",
+                        "data": BUILD_DOCUMENT,
+                    }),
+                    message: already_exists_message("Component", &component),
+                    quotes_arn: true,
+                    read: format!("/GetComponent?componentBuildVersionArn={component}"),
+                    wrapper: "component",
+                    existing: component,
+                }
+            }
+            "an image recipe name and version that is already taken" => {
+                let component = create_component(&router, "collide-recipe-component").await;
+                let recipe = create_image_recipe(&router, "collide-recipe", &component).await;
+                Collision {
+                    case: row_case,
+                    uri: "/CreateImageRecipe",
+                    body: json!({
+                        "name": "collide-recipe",
+                        "semanticVersion": "1.0.0",
+                        "parentImage": PARENT_IMAGE,
+                        "clientToken": "collide-recipe-again",
+                        "components": [{ "componentArn": component }],
+                    }),
+                    message: already_exists_message("ImageRecipe", &recipe),
+                    quotes_arn: true,
+                    read: format!("/GetImageRecipe?imageRecipeArn={recipe}"),
+                    wrapper: "imageRecipe",
+                    existing: recipe,
+                }
+            }
+            "a container recipe name and version that is already taken" => {
+                let component = create_component(&router, "collide-boxed-component").await;
+                let recipe =
+                    create_container_recipe(&router, "collide-boxed", &component).await;
+                Collision {
+                    case: row_case,
+                    uri: "/CreateContainerRecipe",
+                    body: json!({
+                        "name": "collide-boxed",
+                        "semanticVersion": "1.0.0",
+                        "containerType": "DOCKER",
+                        "parentImage": "amazonlinux:latest",
+                        "clientToken": "collide-boxed-again",
+                        "dockerfileTemplateData": CONTAINER_TEMPLATE,
+                        "targetRepository": {
+                            "service": "ECR",
+                            "repositoryName": "team/images",
+                        },
+                        "components": [{ "componentArn": component }],
+                    }),
+                    message: already_exists_message("ContainerRecipe", &recipe),
+                    quotes_arn: true,
+                    read: format!("/GetContainerRecipe?containerRecipeArn={recipe}"),
+                    wrapper: "containerRecipe",
+                    existing: recipe,
+                }
+            }
+            "a pipeline name that is already taken" => {
+                let component = create_component(&router, "collide-pipe-component").await;
+                let recipe = create_image_recipe(&router, "collide-pipe-recipe", &component).await;
+                let configuration =
+                    create_infrastructure_configuration(&router, "Collide Pipe Infra").await;
+                let pipeline = create_disabled_pipeline(
+                    &router,
+                    "collide-pipeline",
+                    &configuration,
+                    json!({ "imageRecipeArn": recipe.clone() }),
+                )
+                .await;
+                Collision {
+                    case: row_case,
+                    uri: "/CreateImagePipeline",
+                    body: json!({
+                        "name": "collide-pipeline",
+                        "clientToken": "collide-pipeline-again",
+                        "status": "DISABLED",
+                        "infrastructureConfigurationArn": configuration,
+                        "imageRecipeArn": recipe,
+                    }),
+                    message: already_exists_message("Pipeline", &pipeline),
+                    quotes_arn: true,
+                    read: format!("/GetImagePipeline?imagePipelineArn={pipeline}"),
+                    wrapper: "imagePipeline",
+                    existing: pipeline,
+                }
+            }
+            "a distribution configuration name that is already taken" => {
+                let distribution =
+                    create_distribution_configuration(&router, "Collide Dist").await;
+                Collision {
+                    case: row_case,
+                    uri: "/CreateDistributionConfiguration",
+                    body: json!({
+                        "name": "Collide Dist",
+                        "clientToken": "collide-dist-again",
+                        "distributions": [{
+                            "region": REGION,
+                            "amiDistributionConfiguration": {},
+                        }],
+                    }),
+                    message: already_exists_message(
+                        "DistributionConfiguration",
+                        &distribution,
+                    ),
+                    quotes_arn: true,
+                    read: format!(
+                        "/GetDistributionConfiguration?distributionConfigurationArn={distribution}"
+                    ),
+                    wrapper: "distributionConfiguration",
+                    existing: distribution,
+                }
+            }
+            "an infrastructure configuration name that is already taken" => {
+                let configuration =
+                    create_infrastructure_configuration(&router, "Collide Infra").await;
+                Collision {
+                    case: row_case,
+                    uri: "/CreateInfrastructureConfiguration",
+                    body: json!({
+                        "name": "Collide Infra",
+                        "clientToken": "collide-infra-again",
+                        "instanceProfileName": "EC2InstanceProfileForImageBuilder",
+                    }),
+                    message: configuration_already_exists_message(),
+                    quotes_arn: false,
+                    read: format!(
+                        "/GetInfrastructureConfiguration?\
+                         infrastructureConfigurationArn={configuration}"
+                    ),
+                    wrapper: "infrastructureConfiguration",
+                    existing: configuration,
+                }
+            }
+            // Every row above names itself, so an unlisted label is a mistake in the table
+            // rather than a case to fall back on.
+            other => unreachable!("no row builds the case {other:?}"),
+        };
+
+        // The second create is refused in its family's own already-exists template.
+        let (status, refused) = call(&router, "PUT", row.uri, Some(&row.body)).await;
+        assert_refused(
+            row.case,
+            status,
+            &refused,
+            400,
+            "ResourceAlreadyExistsException",
+            &row.message,
+        );
+        let message = text(row.case, &refused, "message");
+        if row.quotes_arn {
+            assert_quotes_the_label_and_the_stored_arn(row.case, &message, &row.existing);
+        } else {
+            assert!(
+                !message.contains(ARN_PREFIX) && !message.contains('\''),
+                "case {:?}: expected the message to state no ARN and quote nothing, got \
+                 {message:?}",
+                row.case
+            );
+        }
+
+        // The ARN the refusal states is the STORED resource's own, which its read reports,
+        // and the refused create registered nothing of its own.
+        let (status, stored) = call(&router, "GET", &row.read, None).await;
+        let stored = assert_ok(row.case, status, stored);
+        let reported = stored.get(row.wrapper).unwrap_or_else(|| {
+            panic!(
+                "case {:?}: expected the read to report the {} it holds, got {stored}",
+                row.case, row.wrapper
+            )
+        });
+        let reported_arn = text(row.case, reported, "arn");
+        assert_eq!(
+            reported_arn, row.existing,
+            "case {:?}: expected the stored resource to be {:?}, got {reported_arn:?}",
+            row.case, row.existing
+        );
+    }
 }
 
 /// One row: a resource a delete is refused for, the resource whose reference refuses it, and
