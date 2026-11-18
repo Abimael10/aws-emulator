@@ -50,6 +50,23 @@ use super::{
     HEALTH_STATUS_UNHEALTHY, INSTANCE_REFRESH_REPLACEMENT,
 };
 
+/// What a failed health check of this instance's group OWES it: the instant the group ACTS
+/// on that check, and the sentence the check records for taking the instance out of service.
+///
+/// The reason travels with the debt because WHICH check failed is what the activity of the
+/// instance leaving the group reports, and the checks a group performs are not one check: a
+/// caller's own ([`USER_HEALTH_CHECK_REASON`]) and the load balancer's
+/// ([`super::ELB_HEALTH_CHECK_FAILURE_REASON`]) are the same replacement under different
+/// sentences, so one debt carries one of them rather than the acting pass guessing.
+#[derive(Debug, Clone, Copy)]
+pub struct HealthCheckDebt {
+    /// When the group's health check acts on the instance.
+    pub due: SystemTime,
+    /// What the activity of the instance leaving the group records as having taken it out of
+    /// service.
+    pub reason: &'static str,
+}
+
 /// The `HealthStatus` values a request may record, in the order the member's own
 /// documentation states them ([`HEALTH_STATUS_HEALTHY`], [`HEALTH_STATUS_UNHEALTHY`]).
 ///
@@ -180,8 +197,12 @@ impl AutoScalingState {
             return Err(HealthRefusal::ManagedByNoGroup(instance_id.to_string()));
         };
         instance.health_status = health_status.to_string();
-        instance.health_check_due = (health_status == HEALTH_STATUS_UNHEALTHY)
-            .then(|| unhealthy_check_due(instance, grace_period, respect_grace_period, now));
+        instance.health_check_due = (health_status == HEALTH_STATUS_UNHEALTHY).then(|| {
+            HealthCheckDebt {
+                due: unhealthy_check_due(instance, grace_period, respect_grace_period, now),
+                reason: USER_HEALTH_CHECK_REASON,
+            }
+        });
         Ok(group_name)
     }
 
@@ -205,22 +226,31 @@ impl AutoScalingState {
         now: SystemTime,
     ) {
         // Read out before anything is written, so the groups are not borrowed across the
-        // replacement each of them owes.
-        let due: Vec<(String, Vec<String>)> = self
+        // replacement each of them owes. One entry per (group, reason): the sentence the
+        // activity records is the one the FAILED CHECK carries, so two checks of different
+        // kinds falling due together are acted on under their own sentences.
+        let due: Vec<(String, &'static str, Vec<String>)> = self
             .groups
             .values()
-            .map(|group| {
-                let instance_ids: Vec<String> = group
-                    .instances
-                    .iter()
-                    .filter(|instance| acts_now(instance, now))
-                    .map(|instance| instance.instance_id.clone())
-                    .collect();
-                (group.name.clone(), instance_ids)
+            .flat_map(|group| {
+                let mut by_reason: Vec<(&'static str, Vec<String>)> = Vec::new();
+                for instance in group.instances.iter().filter(|i| acts_now(i, now)) {
+                    let reason = instance
+                        .health_check_due
+                        .map(|debt| debt.reason)
+                        .unwrap_or(USER_HEALTH_CHECK_REASON);
+                    match by_reason.iter_mut().find(|(held, _)| *held == reason) {
+                        Some((_, ids)) => ids.push(instance.instance_id.clone()),
+                        None => by_reason.push((reason, vec![instance.instance_id.clone()])),
+                    }
+                }
+                by_reason
+                    .into_iter()
+                    .map(|(reason, ids)| (group.name.clone(), reason, ids))
+                    .collect::<Vec<(String, &'static str, Vec<String>)>>()
             })
-            .filter(|(_, instance_ids)| !instance_ids.is_empty())
             .collect();
-        for (group_name, instance_ids) in due {
+        for (group_name, reason, instance_ids) in due {
             // The check has ACTED on these instances, so it owes them nothing further: the
             // debt is discharged here, before the replacement, so this pass is owed exactly
             // once however long the instance then takes to leave the group — an instance a
@@ -235,13 +265,7 @@ impl AutoScalingState {
                     instance.health_check_due = None;
                 }
             }
-            self.replace_unhealthy_instances(
-                engine,
-                &group_name,
-                &instance_ids,
-                USER_HEALTH_CHECK_REASON,
-                now,
-            );
+            self.replace_unhealthy_instances(engine, &group_name, &instance_ids, reason, now);
         }
     }
 }
@@ -279,7 +303,7 @@ fn unhealthy_check_due(
 /// hook as well as one terminating outright: either way it is leaving already, so the check
 /// has nothing to take out.
 fn acts_now(instance: &StoredInstance, now: SystemTime) -> bool {
-    instance.health_check_due.is_some_and(|due| due <= now)
+    instance.health_check_due.is_some_and(|debt| debt.due <= now)
         && !instance.is_leaving_group()
         && !instance.is_in_standby()
 }

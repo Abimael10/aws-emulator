@@ -51,8 +51,8 @@ use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 // share, their wires, and the resources a group is built from — live in `support`, which is
 // their one copy for every suite here.
 use crate::support::{
-    borrowed, create_launch_template, create_target_group, elbv2_query, emulator, p, query,
-    seed_subnets, tag_value, tag_values, vpc_of, xml_unescape, SeededSubnet,
+    borrowed, create_launch_template, create_target_group, ec2_query, elbv2_query, emulator, p,
+    query, seed_subnets, tag_value, tag_values, vpc_of, xml_unescape, SeededSubnet,
 };
 
 /// The most target groups ONE attach may name, from the model's own documentation for
@@ -1927,4 +1927,990 @@ async fn a_blocked_launch_names_the_target_group_it_could_not_update() {
             case.case
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// `DetachInstances`: releasing a member of a group WITHOUT terminating it, and the
+// registrations that leave the target groups with it.
+// ---------------------------------------------------------------------------------------
+
+/// Post one `DetachInstances` and answer its status, wire error code and message.
+async fn detach_instances(
+    router: &MultiServiceRouter,
+    name: &str,
+    instance_ids: &[String],
+    should_decrement: bool,
+) -> (u16, String, String) {
+    let mut params = vec![
+        p("AutoScalingGroupName", name),
+        p(
+            "ShouldDecrementDesiredCapacity",
+            if should_decrement { "true" } else { "false" },
+        ),
+    ];
+    for (index, instance_id) in instance_ids.iter().enumerate() {
+        params.push(p(
+            format!("InstanceIds.member.{}", index + 1).as_str(),
+            instance_id.clone(),
+        ));
+    }
+    let (status, body) = query(router, "DetachInstances", &borrowed(&params)).await;
+    (
+        status,
+        tag_value(&body, "Code"),
+        xml_unescape(&tag_value(&body, "Message")),
+    )
+}
+
+/// The `instanceState` Amazon EC2 reports for `instance_id` — the service that OWNS the
+/// instance is what says whether it is still running, which is what tells a detach from a
+/// termination.
+async fn ec2_instance_state(router: &MultiServiceRouter, instance_id: &str) -> String {
+    let (status, body) = ec2_query(
+        router,
+        "DescribeInstances",
+        &[p("InstanceId.1", instance_id)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DescribeInstances for {instance_id:?} expected 200, got {status}: {body}"
+    );
+    let state = element_inner(&body, "instanceState").unwrap_or_default();
+    tag_value(state, "name")
+}
+
+/// The `InstanceStateName` Amazon EC2 reports for an instance it is running.
+const EC2_STATE_RUNNING: &str = "running";
+
+/// Read the target group until it registers exactly `wanted`, or a generous deadline passes
+/// — the CONDITION, never a fixed wait. Answers what it last read.
+async fn settled_registrations(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+    wanted: &[String],
+) -> Vec<String> {
+    let deadline = Instant::now() + poll_budget();
+    loop {
+        let held = registered_ids(router, arn).await;
+        if held == wanted || Instant::now() >= deadline {
+            assert_eq!(
+                held, wanted,
+                "case {case:?}: expected {arn:?} to register {wanted:?}, got {held:?}"
+            );
+            return held;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// One row of the detach table: how many instances the group starts with, how many the
+/// request releases, whether it asks for the decrement, and what the group is left holding.
+struct DetachRow {
+    case: &'static str,
+    /// The `DesiredCapacity` the group is created with, and so how many instances it holds.
+    desired: usize,
+    /// How many of them the request detaches.
+    detached: usize,
+    /// Whether `ShouldDecrementDesiredCapacity` is set.
+    decrement: bool,
+    /// The `DesiredCapacity` the group reports afterwards.
+    capacity_after: usize,
+}
+
+/// The rows: the two answers `ShouldDecrementDesiredCapacity` can take, and a call that
+/// releases SEVERAL of a group's instances at once rather than one.
+fn detach_rows() -> Vec<DetachRow> {
+    vec![
+        DetachRow {
+            case: "one of two instances, decrementing the desired capacity",
+            desired: 2,
+            detached: 1,
+            decrement: true,
+            capacity_after: 1,
+        },
+        DetachRow {
+            case: "one of two instances, leaving the desired capacity standing",
+            desired: 2,
+            detached: 1,
+            decrement: false,
+            capacity_after: 2,
+        },
+        DetachRow {
+            case: "two of three instances, decrementing the desired capacity",
+            desired: 3,
+            detached: 2,
+            decrement: true,
+            capacity_after: 1,
+        },
+    ]
+}
+
+/// RULE: `DetachInstances` takes exactly the instances a request names out of the group
+/// without terminating them — "removes one or more instances from the specified Auto Scaling
+/// group. After the instances are detached, you can manage them independent of the Auto
+/// Scaling group … If there are target groups attached to the Auto Scaling group, the
+/// instances are deregistered from the target groups" — and "if you do not specify the option
+/// to decrement the desired capacity, Amazon EC2 Auto Scaling launches instances to replace
+/// the ones that are detached".
+///
+/// So each row asserts the four facts one detach is: the named instances stop being instances
+/// of the group, exactly those registrations leave the target group while the group's
+/// remaining instances stay registered, the desired capacity falls by what the request asked
+/// for (or stands, and the group launches a replacement for each), and the detached Amazon EC2
+/// instances are still RUNNING where they live.
+#[tokio::test]
+async fn a_detach_releases_its_instances_and_deregisters_exactly_them() {
+    for (index, row) in detach_rows().into_iter().enumerate() {
+        let (router, engine) = emulator();
+        let subnets = seed_subnets(&engine, 2);
+        let vpc_id = vpc_of(&router, &subnets[0]).await;
+        let template = format!("lt-detach-instances-{index}");
+        create_launch_template(&router, &template).await;
+        let arn = create_target_group(
+            &router,
+            &format!("tg-detach-instances-{index}"),
+            80,
+            TARGET_TYPE_INSTANCE,
+            &vpc_id,
+        )
+        .await;
+        let name = format!("asg-detach-instances-{index}");
+        create_group(
+            &router,
+            &name,
+            &template,
+            &subnets,
+            row.desired,
+            std::slice::from_ref(&arn),
+            AttachedAs::TargetGroupArns,
+        )
+        .await;
+
+        let before = settled_instances(&router, row.case, &name, row.desired).await;
+        settled_registrations(&router, row.case, &arn, &instance_ids(&before)).await;
+
+        let detached: Vec<String> = before
+            .iter()
+            .take(row.detached)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let kept: Vec<String> = before
+            .iter()
+            .skip(row.detached)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let (status, code, message) =
+            detach_instances(&router, &name, &detached, row.decrement).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected the detach to be served, got {status} {code:?} {message:?}",
+            row.case
+        );
+
+        // The group holds the capacity the request left it with, and none of the instances it
+        // released: with the decrement that is the instances it kept, and without it the ones
+        // it kept plus a replacement for each released instance.
+        let after = settled_instances(&router, row.case, &name, row.capacity_after).await;
+        let held = instance_ids(&after);
+        for instance_id in &detached {
+            assert!(
+                !held.contains(instance_id),
+                "case {:?}: expected {instance_id} to be no instance of {name:?}, got {held:?}",
+                row.case
+            );
+        }
+        for instance_id in &kept {
+            assert!(
+                held.contains(instance_id),
+                "case {:?}: expected {name:?} to keep {instance_id}, got {held:?}",
+                row.case
+            );
+        }
+        let capacity = reported_desired_capacity(&router, &name).await;
+        assert_eq!(
+            capacity,
+            row.capacity_after.to_string(),
+            "case {:?}: expected {name:?} to report a desired capacity of {}, got {capacity:?}",
+            row.case,
+            row.capacity_after
+        );
+
+        // Exactly the detached instances left the target group: the ones the group still
+        // holds are still registered, and the released ones are not.
+        settled_registrations(&router, row.case, &arn, &held).await;
+
+        // A detached instance was RELEASED, not terminated: Amazon EC2 still runs it, which
+        // is what "you can manage them independent of the Auto Scaling group" means.
+        for instance_id in &detached {
+            let state = ec2_instance_state(&router, instance_id).await;
+            assert_eq!(
+                state, EC2_STATE_RUNNING,
+                "case {:?}: expected Amazon EC2 to still run the detached {instance_id}, got \
+                 {state:?}",
+                row.case
+            );
+        }
+    }
+}
+
+/// RULE: a detach moves a member of THE GROUP, so a request naming an instance the group does
+/// not hold is refused whole — nothing is detached and the group's capacity does not move —
+/// and so is one naming more instances than the member admits ("you can specify up to 20
+/// instances").
+#[tokio::test]
+async fn a_detach_naming_what_the_group_does_not_hold_is_refused() {
+    let (router, engine) = emulator();
+    let subnets = seed_subnets(&engine, 2);
+    let vpc_id = vpc_of(&router, &subnets[0]).await;
+    create_launch_template(&router, "lt-detach-refusal").await;
+    let arn = create_target_group(
+        &router,
+        "tg-detach-refusal",
+        80,
+        TARGET_TYPE_INSTANCE,
+        &vpc_id,
+    )
+    .await;
+    let name = "asg-detach-refusal";
+    create_group(
+        &router,
+        name,
+        "lt-detach-refusal",
+        &subnets,
+        1,
+        std::slice::from_ref(&arn),
+        AttachedAs::TargetGroupArns,
+    )
+    .await;
+    let before = settled_instances(&router, "the group before any detach", name, 1).await;
+    let held = instance_ids(&before);
+
+    // An id of an instance of no group at all, and one of the account's own instances the
+    // group does not hold: both are instances this group is not holding, which is the one
+    // thing the refusal is about.
+    let foreign = "i-0123456789abcdef0";
+    let too_many: Vec<String> = (0..21).map(|index| format!("i-{index:017x}")).collect();
+    for (case, ids, expected) in [
+        (
+            "an instance of no group",
+            vec![foreign.to_string()],
+            format!("The instance {foreign} is not part of Auto Scaling group {name}."),
+        ),
+        (
+            "an instance of the group beside one it does not hold",
+            vec![held[0].clone(), foreign.to_string()],
+            format!("The instance {foreign} is not part of Auto Scaling group {name}."),
+        ),
+        (
+            "one more instance than the member admits",
+            too_many.clone(),
+            autoscaling::state::too_many_moved_instance_ids_message(too_many.len()),
+        ),
+    ] {
+        let (status, code, message) = detach_instances(&router, name, &ids, true).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the detach to be refused, got {status} {code:?} {message:?}"
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
+        );
+    }
+
+    // Nothing moved: the group holds the instance it held, still registered, at the capacity
+    // it was created with.
+    let after = settled_instances(&router, "the group after every refusal", name, 1).await;
+    assert_eq!(
+        instance_ids(&after),
+        held,
+        "a refused detach must leave the group's instances exactly as they were"
+    );
+    settled_registrations(&router, "the group after every refusal", &arn, &held).await;
+    let capacity = reported_desired_capacity(&router, name).await;
+    assert_eq!(
+        capacity, "1",
+        "a refused detach must leave the group's desired capacity where it was, got \
+         {capacity:?}"
+    );
+}
+
+/// Create one group over the awsQuery wire with the sizes `min`/`max`/`desired`, placed over
+/// `subnets` and attached to `target_group`.
+async fn create_sized_group(
+    router: &MultiServiceRouter,
+    name: &str,
+    template: &str,
+    subnets: &[SeededSubnet],
+    sizes: (usize, usize, usize),
+    target_group: &str,
+) {
+    let (min, max, desired) = sizes;
+    let ids: Vec<&str> = subnets.iter().map(|subnet| subnet.id.as_str()).collect();
+    let params = vec![
+        p("AutoScalingGroupName", name),
+        p("LaunchTemplate.LaunchTemplateName", template),
+        p("MinSize", min.to_string()),
+        p("MaxSize", max.to_string()),
+        p("DesiredCapacity", desired.to_string()),
+        p("VPCZoneIdentifier", ids.join(",")),
+        p("TargetGroupARNs.member.1", target_group),
+    ];
+    let (status, body) = query(router, "CreateAutoScalingGroup", &borrowed(&params)).await;
+    assert_eq!(
+        status, 200,
+        "CreateAutoScalingGroup for {name:?} expected 200, got {status}: {body}"
+    );
+}
+
+/// RULE: the decrement a detach asks for is a change to the group's SIZE, and a group never
+/// holds a desired capacity below its own `MinSize` — so a request that would take it under
+/// is refused whole rather than decrementing by less than it asked for.
+#[tokio::test]
+async fn a_detach_that_would_take_the_group_under_its_minimum_is_refused() {
+    let (router, engine) = emulator();
+    let subnets = seed_subnets(&engine, 2);
+    let vpc_id = vpc_of(&router, &subnets[0]).await;
+    create_launch_template(&router, "lt-detach-min-size").await;
+    // The two forms the refusal takes: a group whose desired capacity is AT its minimum (the
+    // sentence's singular form, which one detached instance is enough to reach) and one
+    // above it that a detach of several would cross. Each row has a target group of its own,
+    // so what one group registers is the whole of what the row reads.
+    for (case, sizes, detached, expected) in [
+        (
+            "the desired capacity already at the group's minimum",
+            (1usize, 4usize, 1usize),
+            1usize,
+            autoscaling::state::min_size_decrement_breach_message("Detaching", 1, 1, 1),
+        ),
+        (
+            "a detach of several crossing a minimum below the desired capacity",
+            (2usize, 4usize, 3usize),
+            2usize,
+            autoscaling::state::min_size_decrement_breach_message("Detaching", 3, 2, 2),
+        ),
+    ] {
+        let name = format!("asg-detach-min-size-{}", sizes.2);
+        let arn = create_target_group(
+            &router,
+            &format!("tg-detach-min-size-{}", sizes.2),
+            80,
+            TARGET_TYPE_INSTANCE,
+            &vpc_id,
+        )
+        .await;
+        let template = "lt-detach-min-size";
+        create_sized_group(&router, &name, template, &subnets, sizes, &arn).await;
+        let held = settled_instances(&router, case, &name, sizes.2).await;
+        let ids = instance_ids(&held);
+        let asked: Vec<String> = ids.iter().take(detached).cloned().collect();
+
+        let (status, code, message) = detach_instances(&router, &name, &asked, true).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the detach to be refused, got {status} {code:?} \
+             {message:?}"
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
+        );
+
+        // Nothing moved: the same members, still registered, at the capacity the group was
+        // created with.
+        let after = settled_instances(&router, case, &name, sizes.2).await;
+        assert_eq!(
+            instance_ids(&after),
+            ids,
+            "case {case:?}: a refused detach must leave the group's instances as they were"
+        );
+        settled_registrations(&router, case, &arn, &ids).await;
+        let capacity = reported_desired_capacity(&router, &name).await;
+        assert_eq!(
+            capacity,
+            sizes.2.to_string(),
+            "case {case:?}: a refused detach must leave the desired capacity where it was, \
+             got {capacity:?}"
+        );
+    }
+}
+
+/// The `LifecycleState` an instance a TERMINATION lifecycle hook is holding waits in, from
+/// the model's own `LifecycleState` enum — read from the crate so the two cannot drift.
+const LIFECYCLE_TERMINATING_WAIT: &str = autoscaling::state::LIFECYCLE_TERMINATING_WAIT;
+
+/// Read the group until `instance_id` is reported in `wanted`, or a generous deadline passes.
+async fn instance_reaching(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    instance_id: &str,
+    wanted: &str,
+) {
+    let deadline = Instant::now() + poll_budget();
+    loop {
+        let held = instance_states(router, name).await;
+        let reported = held
+            .iter()
+            .find(|(id, _)| id == instance_id)
+            .map(|(_, state)| state.clone())
+            .unwrap_or_default();
+        if reported == wanted || Instant::now() >= deadline {
+            assert_eq!(
+                reported, wanted,
+                "case {case:?}: expected {instance_id} of {name:?} to be reported {wanted}, \
+                 got {held:?}"
+            );
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// RULE: a detach releases a member in one of the two states a member of a group is
+/// detachable in — `InService`, or parked out of service in `Standby` — so a request naming
+/// one that is in neither, such as an instance a termination lifecycle hook is holding on its
+/// way out of the group, is refused whole and the member stays exactly where it was.
+#[tokio::test]
+async fn a_detach_of_an_instance_in_neither_detachable_state_is_refused() {
+    let (router, engine) = emulator();
+    let subnets = seed_subnets(&engine, 2);
+    let vpc_id = vpc_of(&router, &subnets[0]).await;
+    create_launch_template(&router, "lt-detach-wrong-state").await;
+    let arn = create_target_group(
+        &router,
+        "tg-detach-wrong-state",
+        80,
+        TARGET_TYPE_INSTANCE,
+        &vpc_id,
+    )
+    .await;
+    let name = "asg-detach-wrong-state";
+    create_group(
+        &router,
+        name,
+        "lt-detach-wrong-state",
+        &subnets,
+        1,
+        std::slice::from_ref(&arn),
+        AttachedAs::TargetGroupArns,
+    )
+    .await;
+    let held = settled_instances(&router, "a member on its way out", name, 1).await;
+    let original = held[0].0.clone();
+
+    // A termination hook of the group holds a member it is taking out of service in the
+    // transition's wait state, which is neither state a detach may release it from — and it
+    // waits there until a client resolves the hold, so the row is not racing a clock.
+    let (status, body) = query(
+        &router,
+        "PutLifecycleHook",
+        &[
+            ("AutoScalingGroupName", name),
+            ("LifecycleHookName", "hold-terminating"),
+            (
+                "LifecycleTransition",
+                autoscaling::state::TRANSITION_TERMINATING,
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "PutLifecycleHook expected 200, got {status}: {body}"
+    );
+    let (status, code, message) = set_desired_capacity(&router, name, 0).await;
+    assert_eq!(
+        status, 200,
+        "the scale-in must be served, got {status} {code:?} {message:?}"
+    );
+    instance_reaching(
+        &router,
+        "a member on its way out",
+        name,
+        &original,
+        LIFECYCLE_TERMINATING_WAIT,
+    )
+    .await;
+
+    let expected = format!(
+        "Instance {original} is in {LIFECYCLE_TERMINATING_WAIT} state, not in InService or \
+         Standby state, and cannot be detached."
+    );
+    let (status, code, message) =
+        detach_instances(&router, name, std::slice::from_ref(&original), false).await;
+    assert_eq!(
+        status, 400,
+        "expected the detach to be refused, got {status} {code:?} {message:?}"
+    );
+    assert_eq!(
+        message, expected,
+        "expected the message {expected:?}, got {message:?}"
+    );
+    // The refused detach moved nothing: the member is still held where the hook holds it.
+    instance_reaching(
+        &router,
+        "a member on its way out, after the refusal",
+        name,
+        &original,
+        LIFECYCLE_TERMINATING_WAIT,
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------------------
+// `HealthCheckType` `ELB`: the load balancer's verdict on an instance's target, folded into
+// the group's own per-instance health.
+// ---------------------------------------------------------------------------------------
+/// The `HealthStatus` values a group reports an instance in.
+const HEALTH_STATUS_HEALTHY: &str = "Healthy";
+const HEALTH_STATUS_UNHEALTHY: &str = "Unhealthy";
+
+/// The two `TargetHealthStateEnum` values a check of a registered target reaches, from the
+/// model's own enum
+/// (`smithy_query(query="shape",shape="TargetHealthStateEnum",
+/// model_path="services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10/smithy-model/com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10.json")`).
+const TARGET_STATE_HEALTHY: &str = "healthy";
+const TARGET_STATE_UNHEALTHY: &str = "unhealthy";
+
+/// How long a row waits for a verdict the load balancer's own health checks reach, and the
+/// group's reaction to it. Generous on purpose — many times the cadence a row configures
+/// times the threshold a verdict takes — because what is asserted is that it happens at all,
+/// never how fast the host runs.
+const HEALTH_POLL_BUDGET: Duration = Duration::from_secs(120);
+
+/// The `HealthCheckIntervalSeconds` the target groups below are checked at: a verdict takes
+/// `UnhealthyThresholdCount` consecutive checks, each one interval after the last, so a row
+/// that waits for one asks for the shortest interval the member admits ("the range is
+/// 5-300").
+const HEALTH_CHECK_INTERVAL_SECONDS: &str = "5";
+
+/// The port the instances below receive traffic on, which their own security group admits the
+/// load balancer's checks on.
+const ADMITTED_PORT: &str = "80";
+
+/// A port it admits nothing on, so a health check pointed at it is answered by nothing.
+const UNADMITTED_PORT: &str = "22";
+
+/// The `TargetHealth$State` of every target the target group `arn` holds, by target id.
+async fn target_health_states(router: &MultiServiceRouter, arn: &str) -> Vec<(String, String)> {
+    let (status, body) =
+        elbv2_query(router, "DescribeTargetHealth", &[p("TargetGroupArn", arn)]).await;
+    assert_eq!(
+        status, 200,
+        "DescribeTargetHealth for {arn:?} expected 200, got {status}: {body}"
+    );
+    let inner = element_inner(&body, "TargetHealthDescriptions").unwrap_or_default();
+    members(inner)
+        .into_iter()
+        .map(|member| (tag_value(member, "Id"), tag_value(member, "State")))
+        .collect()
+}
+
+/// The `HealthStatus` the group reports for each of its instances, by instance id.
+async fn instance_health_statuses(
+    router: &MultiServiceRouter,
+    name: &str,
+) -> Vec<(String, String)> {
+    let body = described(router, name).await;
+    let inner = element_inner(&body, "Instances").unwrap_or_default();
+    members(inner)
+        .into_iter()
+        .map(|member| {
+            (
+                tag_value(member, "InstanceId"),
+                tag_value(member, "HealthStatus"),
+            )
+        })
+        .collect()
+}
+
+/// Create one security group of `vpc_id` through Amazon EC2's own wire and answer its
+/// `GroupId`.
+async fn create_security_group(
+    router: &MultiServiceRouter,
+    name: &str,
+    vpc_id: &str,
+) -> String {
+    let (status, body) = ec2_query(
+        router,
+        "CreateSecurityGroup",
+        &[
+            p("GroupName", name),
+            p("GroupDescription", "an Auto Scaling health-check suite group"),
+            p("VpcId", vpc_id),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateSecurityGroup for {name:?} expected 200, got {status}: {body}"
+    );
+    let group_id = tag_value(&body, "groupId");
+    assert!(
+        !group_id.is_empty(),
+        "CreateSecurityGroup must report the group's id, got {body}"
+    );
+    group_id
+}
+
+/// Admit TCP `port` into `group_id` from the security group `source_group_id`: the one grant a
+/// load balancer's health check of a target governed by `group_id` needs.
+async fn authorize_ingress(
+    router: &MultiServiceRouter,
+    group_id: &str,
+    source_group_id: &str,
+    port: &str,
+) {
+    let (status, body) = ec2_query(
+        router,
+        "AuthorizeSecurityGroupIngress",
+        &[
+            p("GroupId", group_id),
+            p("IpPermissions.1.IpProtocol", "tcp"),
+            p("IpPermissions.1.FromPort", port),
+            p("IpPermissions.1.ToPort", port),
+            p("IpPermissions.1.Groups.1.GroupId", source_group_id),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "AuthorizeSecurityGroupIngress for {group_id:?} expected 200, got {status}: {body}"
+    );
+}
+
+/// Create one internal Application Load Balancer over the subnets `subnets`, associated with
+/// `security_group`, and answer its ARN.
+async fn create_load_balancer(
+    router: &MultiServiceRouter,
+    name: &str,
+    subnets: &[SeededSubnet],
+    security_group: &str,
+) -> String {
+    let mut params = vec![
+        p("Name", name),
+        p("Scheme", "internal"),
+        p("Type", "application"),
+        p("SecurityGroups.member.1", security_group),
+    ];
+    for (index, subnet) in subnets.iter().enumerate() {
+        params.push(p(
+            format!("Subnets.member.{}", index + 1).as_str(),
+            subnet.id.clone(),
+        ));
+    }
+    let (status, body) = elbv2_query(router, "CreateLoadBalancer", &params).await;
+    assert_eq!(
+        status, 200,
+        "CreateLoadBalancer for {name:?} expected 200, got {status}: {body}"
+    );
+    let arn = tag_value(&body, "LoadBalancerArn");
+    assert!(
+        !arn.is_empty(),
+        "CreateLoadBalancer must report the load balancer's ARN, got {body}"
+    );
+    arn
+}
+
+/// Forward a listener of `load_balancer` to the target group `target_group`: what makes that
+/// group one the load balancer CHECKS.
+async fn create_listener(router: &MultiServiceRouter, load_balancer: &str, target_group: &str) {
+    let (status, body) = elbv2_query(
+        router,
+        "CreateListener",
+        &[
+            p("LoadBalancerArn", load_balancer),
+            p("Protocol", "HTTP"),
+            p("Port", ADMITTED_PORT),
+            p("DefaultActions.member.1.Type", "forward"),
+            p("DefaultActions.member.1.TargetGroupArn", target_group),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateListener for {load_balancer:?} expected 200, got {status}: {body}"
+    );
+}
+
+/// One row of the health-check table: which port the target group's checks connect to — one
+/// the instances' own security group admits and one it does not — and which health check type
+/// the group is configured with, which is what decides whether the load balancer's verdict is
+/// the group's.
+struct HealthRow {
+    case: &'static str,
+    /// `HealthCheckPort` of the target group.
+    check_port: &'static str,
+    /// `HealthCheckType` of the Auto Scaling group.
+    health_check_type: &'static str,
+    /// The `TargetHealth$State` the registration reaches.
+    target_state: &'static str,
+    /// Whether the group reports its instance `Unhealthy` and replaces it.
+    replaced: bool,
+}
+
+/// Create one group placed over `subnets`, holding one instance, attached to `target_group`
+/// and health checked the way `health_check_type` says.
+async fn create_health_checked_group(
+    router: &MultiServiceRouter,
+    name: &str,
+    template: &str,
+    subnets: &[SeededSubnet],
+    target_group: &str,
+    health_check_type: &str,
+) {
+    let ids: Vec<&str> = subnets.iter().map(|subnet| subnet.id.as_str()).collect();
+    let params = vec![
+        p("AutoScalingGroupName", name),
+        p("LaunchTemplate.LaunchTemplateName", template),
+        p("MinSize", "0"),
+        p("MaxSize", "4"),
+        p("DesiredCapacity", "1"),
+        p("VPCZoneIdentifier", ids.join(",")),
+        p("TargetGroupARNs.member.1", target_group),
+        p("HealthCheckType", health_check_type),
+        p("HealthCheckGracePeriod", "0"),
+    ];
+    let (status, body) = query(router, "CreateAutoScalingGroup", &borrowed(&params)).await;
+    assert_eq!(
+        status, 200,
+        "CreateAutoScalingGroup for {name:?} expected 200, got {status}: {body}"
+    );
+}
+
+/// Build `row`'s estate and assert the rule over it.
+///
+/// The estate is built in the order the rule needs: the group registers its instance with the
+/// target group FIRST, and the listener that makes the load balancer check that group is
+/// created after — so the periodic checks the listener starts are checks of a registration
+/// that is already there.
+async fn drive_health_row(row: &HealthRow, index: usize) {
+    let case = row.case;
+    let (router, engine) = emulator();
+    let subnets = seed_subnets(&engine, 2);
+    let vpc_id = vpc_of(&router, &subnets[0]).await;
+
+    // The two security groups the check is read against: the load balancer's own, which is
+    // where a check comes FROM, and the instances', which admits it on one port alone.
+    let balancer_group =
+        create_security_group(&router, &format!("elb-health-lb-{index}"), &vpc_id).await;
+    let instance_group =
+        create_security_group(&router, &format!("elb-health-instance-{index}"), &vpc_id).await;
+    authorize_ingress(&router, &instance_group, &balancer_group, ADMITTED_PORT).await;
+
+    // The launch template the group launches from names that instance security group, so the
+    // instances it launches are governed by it.
+    let template = format!("lt-elb-health-{index}");
+    let (status, body) = ec2_query(
+        &router,
+        "CreateLaunchTemplate",
+        &[
+            p("LaunchTemplateName", template.as_str()),
+            p("LaunchTemplateData.ImageId", "ami-0123456789abcdef0"),
+            p("LaunchTemplateData.InstanceType", "t3.micro"),
+            p("LaunchTemplateData.SecurityGroupId.1", instance_group.as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateLaunchTemplate expected 200, got {status}: {body}"
+    );
+
+    let (status, body) = elbv2_query(
+        &router,
+        "CreateTargetGroup",
+        &[
+            p("Name", format!("tg-elb-health-{index}")),
+            p("Protocol", "HTTP"),
+            p("Port", ADMITTED_PORT),
+            p("VpcId", vpc_id.as_str()),
+            p("TargetType", TARGET_TYPE_INSTANCE),
+            p("HealthCheckPort", row.check_port),
+            p("HealthCheckIntervalSeconds", HEALTH_CHECK_INTERVAL_SECONDS),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateTargetGroup expected 200, got {status}: {body}"
+    );
+    let arn = tag_value(&body, "TargetGroupArn");
+
+    let name = format!("asg-elb-health-{index}");
+    create_health_checked_group(
+        &router,
+        &name,
+        &template,
+        &subnets,
+        &arn,
+        row.health_check_type,
+    )
+    .await;
+    let launched = settled_instances(&router, case, &name, 1).await;
+    let original = launched[0].0.clone();
+    settled_registrations(&router, case, &arn, std::slice::from_ref(&original)).await;
+
+    // The load balancer that CHECKS that target group: the listener forwarding to it is what
+    // starts the checks, so they begin on a registration already in place.
+    let load_balancer = create_load_balancer(
+        &router,
+        &format!("elb-health-{index}"),
+        &subnets,
+        &balancer_group,
+    )
+    .await;
+    create_listener(&router, &load_balancer, &arn).await;
+
+    // The verdict the load balancer's own checks reach for that registration, which is the
+    // CONDITION everything below is read after.
+    let deadline = Instant::now() + HEALTH_POLL_BUDGET;
+    // Every per-instance health the group reported meanwhile, so the step the rule is about —
+    // the instance reported `Unhealthy` before it is replaced — is observed rather than
+    // raced for.
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let reached = loop {
+        let reported = target_health_states(&router, &arn).await;
+        let reached = reported
+            .iter()
+            .find(|(id, _)| *id == original)
+            .map(|(_, state)| state.clone())
+            .unwrap_or_default();
+        for observed in instance_health_statuses(&router, &name).await {
+            if !seen.contains(&observed) {
+                seen.push(observed);
+            }
+        }
+        if reached == row.target_state || Instant::now() >= deadline {
+            assert_eq!(
+                reached, row.target_state,
+                "case {case:?}: expected the load balancer to report {original} \
+                 {:?}, got {reported:?}",
+                row.target_state
+            );
+            break reached;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    };
+    assert_eq!(
+        reached, row.target_state,
+        "case {case:?}: expected the registration to reach {:?}",
+        row.target_state
+    );
+
+    if !row.replaced {
+        // The verdict is in and the group is not held to it — either because the load
+        // balancer found the target healthy, or because the group is health checked by
+        // Amazon EC2 rather than by the load balancer — so it keeps the instance it
+        // launched, reported healthy.
+        let held = instance_health_statuses(&router, &name).await;
+        assert_eq!(
+            held,
+            vec![(original.clone(), HEALTH_STATUS_HEALTHY.to_string())],
+            "case {case:?}: expected {name:?} to keep reporting {original} \
+             {HEALTH_STATUS_HEALTHY}, got {held:?}"
+        );
+        return;
+    }
+
+    // The group IS held to it: the instance is reported `Unhealthy`, and that is what makes
+    // the replacement owed — "Amazon EC2 Auto Scaling terminates and replaces the unhealthy
+    // instance".
+    let deadline = Instant::now() + HEALTH_POLL_BUDGET;
+    let replacement = loop {
+        for observed in instance_health_statuses(&router, &name).await {
+            if !seen.contains(&observed) {
+                seen.push(observed);
+            }
+        }
+        let held = instance_states(&router, &name).await;
+        let replacement = held
+            .iter()
+            .find(|(id, state)| *id != original && state == LIFECYCLE_IN_SERVICE)
+            .map(|(id, _)| id.clone());
+        if replacement.is_some() || Instant::now() >= deadline {
+            assert!(
+                replacement.is_some(),
+                "case {case:?}: expected {name:?} to replace the unhealthy {original}, got \
+                 {held:?} having reported {seen:?}"
+            );
+            break replacement.unwrap_or_default();
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    };
+    assert!(
+        seen.contains(&(original.clone(), HEALTH_STATUS_UNHEALTHY.to_string())),
+        "case {case:?}: expected {name:?} to report {original} {HEALTH_STATUS_UNHEALTHY} \
+         before replacing it, got {seen:?}"
+    );
+    assert_ne!(
+        replacement, original,
+        "case {case:?}: expected the replacement to be an instance of its own"
+    );
+    // The replacement is a target of the same target group, which is what keeps the group
+    // serving traffic through the replacement it just made.
+    let registered = registered_ids(&router, &arn).await;
+    assert!(
+        registered.contains(&replacement),
+        "case {case:?}: expected the replacement {replacement} to be registered with {arn:?}, \
+         got {registered:?}"
+    );
+}
+
+/// The rows of the health-check table, each driven by its own test so each gets its own
+/// budget.
+///
+/// RULE: a group whose `HealthCheckType` names `ELB` takes the load balancer's verdict on the
+/// target each of its instances occupies as that instance's OWN health — "`ELB` — Use Elastic
+/// Load Balancing health checks", and with them enabled Amazon EC2 Auto Scaling "considers an
+/// instance unhealthy if it fails either the EC2 status checks or the load balancer target
+/// health checks" — so an instance the load balancer reports `unhealthy` is reported
+/// `Unhealthy` by the group and then terminated and replaced, while one it reports `healthy`
+/// stays `Healthy`. A group health checked by Amazon EC2 alone is held to no such verdict.
+#[tokio::test]
+async fn an_elb_health_checked_group_keeps_an_instance_the_balancer_reaches() {
+    drive_health_row(
+        &HealthRow {
+            case: "ELB health checks, on a port the instances' security group admits",
+            check_port: ADMITTED_PORT,
+            health_check_type: "ELB",
+            target_state: TARGET_STATE_HEALTHY,
+            replaced: false,
+        },
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_elb_health_checked_group_replaces_an_instance_the_balancer_cannot_reach() {
+    drive_health_row(
+        &HealthRow {
+            case: "ELB health checks, on a port the instances' security group admits nothing on",
+            check_port: UNADMITTED_PORT,
+            health_check_type: "ELB",
+            target_state: TARGET_STATE_UNHEALTHY,
+            replaced: true,
+        },
+        1,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_ec2_health_checked_group_is_held_to_no_balancer_verdict() {
+    drive_health_row(
+        &HealthRow {
+            case: "EC2 health checks, with the same unreachable health-check port",
+            check_port: UNADMITTED_PORT,
+            health_check_type: "EC2",
+            target_state: TARGET_STATE_UNHEALTHY,
+            replaced: false,
+        },
+        2,
+    )
+    .await;
 }

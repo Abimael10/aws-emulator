@@ -111,6 +111,8 @@ impl AutoScalingState {
             if lost.is_empty() {
                 continue;
             }
+            // Out of service and replaced through THE ONE path a failed health check takes
+            // a member out by, under this check's own sentence for why it left the group.
             self.replace_unhealthy_instances(
                 engine,
                 &group_name,

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases the instances a request names from the Auto Scaling group it names, through the
+//! one detach transition this service has ([`crate::state::detached_instances`]): each named
+//! instance stops being an instance of the group — reported `Detaching` until it is gone,
+//! and deregistered from the target groups the group is attached to — while the Amazon EC2
+//! instance itself keeps running, and the group's desired capacity falls by what those
+//! instances were providing when the request asked for the decrement.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +149,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachInstances"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DetachInstancesErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        let requested = input.instance_ids.unwrap_or_default();
+        let should_decrement = input.should_decrement_desired_capacity;
+
+        // Whether IAM lets this caller change THIS group, decided against the group's own
+        // ARN before anything is read or written ([`crate::service::authorization`]).
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            crate::state::audit(ctx.parts(), Self::NAME, &name, "refused: not authorized");
+            return Err(refusal);
+        }
+
+        // The member's own documented bound on how many instances ONE call may name, which
+        // the model does not express as a length ("you can specify up to 20 instances"):
+        // checked ahead of the group lookup and of any per-id check, like the other per-call
+        // bounds of this service, because how many ids one request carries is a fact of the
+        // REQUEST.
+        if requested.len() > crate::state::MAX_MOVED_INSTANCE_IDS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_moved_instance_ids_message(requested.len()),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        // A name no group answers to is refused with the wording this service's
+        // group-scoped writes answer with, its detail field left unfilled.
+        if !state.groups.contains_key(&name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+            ));
+        }
+
+        // The one detach transition this service has: it releases every named instance from
+        // the group, records the activity each detach produced, and leaves the group
+        // converging on the capacity the request's own decrement decided
+        // ([`crate::state::detached_instances`]).
+        let activities: Vec<Activity> = state
+            .detach_instances(&*self.engine, &name, &requested, should_decrement, now)
+            .map_err(|refusal| {
+                crate::scaffolded::Scaffolded::validation_error(refusal.message(&name))
+            })?
+            .iter()
+            // The group these activities belong to is the one this call just detached
+            // instances of, so the account holds it.
+            .map(|activity| activity.to_activity(true))
+            .collect();
+
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &name,
+            if should_decrement {
+                "instances detached and the desired capacity decremented"
+            } else {
+                "instances detached"
+            },
+        );
+        // The detached instances leave the group on the clock, and so does any replacement
+        // this call asked the group to launch for them; the lifecycle events those launches
+        // produce are published as they fall due, with no further call from anybody. The
+        // store's lock is released first: the pump takes it itself.
+        drop(state);
+        // "If there are target groups attached to the Auto Scaling group, the instances are
+        // deregistered from the target groups": an instance on its way out of the group is
+        // no longer one its attachments owe a registration for, and a replacement the detach
+        // launched is.
+        crate::state::elbv2_targets::settle_group(&*self.engine, &name);
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
+        Ok(DetachInstancesOutput {
+            activities: Some(activities),
+        })
     }
 }

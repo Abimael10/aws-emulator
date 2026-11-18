@@ -256,6 +256,18 @@ pub mod attached_instances;
 
 pub use attached_instances::{attach_description, AttachRefusal};
 
+/// Taking an Auto Scaling group's own instances OUT of it without terminating them: the one
+/// transition `DetachInstances` performs, and the rules an instance it releases has to meet.
+pub mod detached_instances;
+
+pub use detached_instances::{detach_description, DetachRefusal};
+
+/// What the Elastic Load Balancing verdict on a group's instances MAKES OWED: the group's
+/// own health check, armed on every member that verdict leaves reported unhealthy.
+pub mod elb_health;
+
+pub use elb_health::ELB_HEALTH_CHECK_FAILURE_REASON;
+
 /// The preferences an instance refresh actually runs under: the ones the request stated,
 /// each member the request left out at the default this service applies.
 pub mod refresh_preferences;
@@ -275,8 +287,8 @@ pub use ec2_health::{EC2_INSTANCE_GONE_REASON, UNHEALTHY_REPLACEMENT_REASON};
 pub mod instance_health;
 
 pub use instance_health::{
-    absent_instance_message, health_status_violation_message, HealthRefusal, HEALTH_STATUS_VALUES,
-    UNHEALTHY_INSTANCE_REPLACEMENT, USER_HEALTH_CHECK_REASON,
+    absent_instance_message, health_status_violation_message, HealthCheckDebt, HealthRefusal,
+    HEALTH_STATUS_VALUES, UNHEALTHY_INSTANCE_REPLACEMENT, USER_HEALTH_CHECK_REASON,
 };
 
 /// The instance type a group's attribute-based launch source launches, and the unit the
@@ -339,6 +351,11 @@ pub const LIFECYCLE_TERMINATING: &str = "Terminating";
 pub const LIFECYCLE_ENTERING_STANDBY: &str = "EnteringStandby";
 /// An instance parked out of service in `Standby`.
 pub const LIFECYCLE_STANDBY: &str = "Standby";
+/// An instance on its way out of the group WITHOUT being terminated, the transient state
+/// `DetachInstances` starts.
+pub const LIFECYCLE_DETACHING: &str = "Detaching";
+/// An instance that has left the group without being terminated.
+pub const LIFECYCLE_DETACHED: &str = "Detached";
 
 /// The `HealthStatus` of an instance the service has no failed health check for.
 pub const HEALTH_STATUS_HEALTHY: &str = "Healthy";
@@ -764,11 +781,12 @@ pub struct StoredInstance {
     /// ([`Self::pending_lifecycle_actions`]): nothing the clock owes moves a held instance
     /// on, only the resolution of the hold does.
     pub transition_due: Option<SystemTime>,
-    /// When the group's health check acts on this instance, for one a failed check has
-    /// recorded unhealthy: the instant it is taken out of service and the group launches
-    /// its replacement ([`instance_health`]). `None` for an instance no check has failed
+    /// What the group's health check OWES this instance, for one a failed check has recorded
+    /// unhealthy: the instant it is taken out of service and the group launches its
+    /// replacement, and the sentence the check that failed records
+    /// ([`instance_health::HealthCheckDebt`]). `None` for an instance no check has failed
     /// for, which is every instance the group launches.
-    pub health_check_due: Option<SystemTime>,
+    pub health_check_due: Option<HealthCheckDebt>,
     /// The lifecycle actions the group's own lifecycle hooks are holding this instance at,
     /// one per hook configured for the transition it is taking ([`lifecycle_actions`]).
     /// Empty for an instance no hook is holding, which is every instance of a group that
@@ -1939,6 +1957,11 @@ impl AutoScalingState {
                     } else if instance.lifecycle_state == LIFECYCLE_ENTERING_STANDBY {
                         // An instance `EnterStandby` started parking has finished parking.
                         instance.lifecycle_state = LIFECYCLE_STANDBY.to_string();
+                    } else if instance.lifecycle_state == LIFECYCLE_DETACHING {
+                        // An instance `DetachInstances` started releasing has been released:
+                        // it is no longer a member of the group, which the retain below is
+                        // what carries out.
+                        instance.lifecycle_state = LIFECYCLE_DETACHED.to_string();
                     }
                 }
             }
@@ -1962,6 +1985,11 @@ impl AutoScalingState {
         // balancer: a derived value, recomputed from what that service reports right now,
         // after the pass above has brought this instant's instances into service.
         self.reconcile_elb_instance_health(engine, now);
+        // And what that verdict makes owed: the group's own health check, armed on every
+        // member it leaves reported unhealthy, which the pass above acts on as the clock
+        // makes it due ([`elb_health`], one debt with [`instance_health`]). After the fold,
+        // so what it reads is this instant's verdict.
+        self.arm_elb_health_check_debt(now);
 
         for activity in &mut self.activities {
             if activity.completes_at.is_some_and(|at| at <= now) {
@@ -3747,17 +3775,35 @@ pub const GROUP_NAME_REQUIRED_WITH_INSTANCE_IDS_MESSAGE: &str =
 /// and how many instances it asked to terminate; the rest of the sentence is the same
 /// fixed text.
 pub fn min_size_breach_message(desired_capacity: i32, min_size: i32, terminating: usize) -> String {
+    min_size_decrement_breach_message("Terminating", desired_capacity, min_size, terminating)
+}
+
+/// The message a request that asks to decrement a group's desired capacity below its own
+/// `MinSize` is refused with, for the move `moving` names — THE ONE wording of that
+/// refusal, which `TerminateInstanceInAutoScalingGroup` ([`min_size_breach_message`]) and
+/// `DetachInstances` ([`detached_instances::DetachRefusal`]) both answer with.
+///
+/// The two refusals are about the same floor under the same member: a group never holds a
+/// desired capacity below the minimum it is configured with, so the decrement a request
+/// asked for is refused whole rather than applied in part. What differs between them is
+/// only WHICH move the request asked for, which is the sentence's subject.
+pub fn min_size_decrement_breach_message(
+    moving: &str,
+    desired_capacity: i32,
+    min_size: i32,
+    count: usize,
+) -> String {
     let remedy = "Either set shouldDecrementDesiredCapacity flag to false or lower group's \
                   min size.";
     if desired_capacity == min_size {
         format!(
-            "Currently, desiredSize equals minSize ({min_size}). Terminating instance without \
+            "Currently, desiredSize equals minSize ({min_size}). {moving} instance without \
              replacement will violate group's min size constraint. {remedy}"
         )
     } else {
         format!(
             "Currently, desiredSize is {desired_capacity} and minSize is {min_size}. \
-             Terminating {terminating} instances without replacement will violate group's min \
+             {moving} {count} instances without replacement will violate group's min \
              size constraint. {remedy}"
         )
     }

@@ -295,15 +295,21 @@ impl StoredInstance {
     }
 
     /// Whether this instance is on its way OUT of the group — terminating, waiting at a
-    /// termination hook, or carrying on past one.
+    /// termination hook, carrying on past one, or being detached.
     ///
-    /// Every `LifecycleState` of a leaving instance is the terminating state or a
-    /// colon-qualified form of it, so the one reading of "this instance no longer counts
-    /// towards the group" is this prefix: a scale-in that chose it must not choose it again,
-    /// and the group's capacity is not met by it.
+    /// Every `LifecycleState` of a terminating instance is the terminating state or a
+    /// colon-qualified form of it, so that half is a prefix; the two detached states have no
+    /// qualified forms, so they are named exactly. A DETACHED instance leaves the group just
+    /// as finally without being terminated (`DetachInstances`: "removes one or more instances
+    /// from the specified Auto Scaling group. After the instances are detached, you can
+    /// manage them independent of the Auto Scaling group"), so the one reading of "this
+    /// instance no longer counts towards the group" covers both: a scale-in that chose it
+    /// must not choose it again, and the group's capacity is not met by it.
     #[must_use]
     pub fn is_leaving_group(&self) -> bool {
         self.lifecycle_state.starts_with(LIFECYCLE_TERMINATING)
+            || self.lifecycle_state == super::LIFECYCLE_DETACHING
+            || self.lifecycle_state == super::LIFECYCLE_DETACHED
     }
 
     /// The held action of this instance that `token` names, if it holds one.

@@ -473,6 +473,10 @@ const HEALTH_CHECK_TYPE_ELB: &str = "ELB";
 /// Whether Elastic Load Balancing health checks are enabled for the group: its
 /// `HealthCheckType` names `ELB`, which the member admits beside the other types as a
 /// comma-separated list ([`crate::state::is_valid_health_check_type`]).
+///
+/// THE ONE reading of that member for this question, shared by the attachment states a
+/// client reads off an attachment ([`attachment_states`]) and the per-instance health fold
+/// that replaces a member the load balancer failed ([`crate::state::elb_health`]).
 pub fn elb_health_checks_enabled(group: &StoredGroup) -> bool {
     group
         .health_check_type

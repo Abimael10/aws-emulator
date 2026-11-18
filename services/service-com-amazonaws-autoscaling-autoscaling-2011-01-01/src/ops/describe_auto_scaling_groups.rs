@@ -261,6 +261,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|group| filters.iter().all(|filter| matches_filter(group, filter)))
             .map(|group| group_view(group, include_instances))
             .collect();
+        // The store's lock is released before the clock pump below is started: the pump takes
+        // it itself.
+        drop(state);
+        // The Elastic Load Balancing verdict the pass above materialised can have taken a
+        // member of a group out of service and launched its replacement
+        // ([`crate::state::elb_health`]), and that replacement owes the group's attachments a
+        // registration — which the clock owes rather than the next writer
+        // ([`crate::state::lifecycle_events::drive_lifecycle_clock`], whose pump materialises
+        // what is due, settles those registrations and publishes the events they produced).
+        // Nothing here changes WHEN anything happens: the pump applies only what a stored due
+        // instant has already made due, so two reads at the same instant still answer
+        // identically.
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
         // A token the service issued always points inside the list it was issued
         // for; one that points past the end was not issued for this list. Only a
         // decoded token reaches a non-zero offset, so `token` is the one submitted.

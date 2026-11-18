@@ -646,6 +646,40 @@ pub fn record_group_membership<Eng: Send + Sync + 'static>(
     }
 }
 
+/// Record in the account's own Amazon EC2 store that the instances `instance_ids` names are
+/// NO LONGER instances of the group `group_name`: the tag [`record_group_membership`] put on
+/// them comes off.
+///
+/// The converse of that write, for the one transition that releases a member of a group
+/// without terminating it — a detach ([`super::detached_instances`]): "after the instances
+/// are detached, you can manage them independent of the Auto Scaling group"
+/// (`DetachInstances`), and the tag Amazon EC2 Auto Scaling puts on every member of a group
+/// is exactly what says an instance is not managed independently. An instance whose tag
+/// names ANOTHER group is left alone — it is that group's member, not this one's — and so is
+/// an id this store holds nothing for. EC2's store lock is taken for the one pass and
+/// released before this returns.
+pub fn clear_group_membership<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    instance_ids: &[String],
+    group_name: &str,
+) {
+    if instance_ids.is_empty() {
+        return;
+    }
+    let Some(state) = ec2::service_state(engine) else {
+        return;
+    };
+    let mut store = state.lock();
+    for instance_id in instance_ids {
+        let Some(instance) = store.instances.get_mut(instance_id) else {
+            continue;
+        };
+        if instance.tags.get(GROUP_NAME_TAG).map(String::as_str) == Some(group_name) {
+            instance.tags.remove(GROUP_NAME_TAG);
+        }
+    }
+}
+
 /// The subnet the account's Amazon EC2 store placed `instance_id` in, when it placed it
 /// in one.
 ///
