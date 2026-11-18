@@ -446,6 +446,10 @@ pub mod feature_store_offline_store;
 /// caller-supplied destination names — so that hop, and the reading of an absent stream, are
 /// stated once rather than per service.
 pub mod firehose_client;
+/// The in-flight record of a call one emulated service makes to another ON THE CALLER's
+/// BEHALF — which service the call is arriving through — written by the service making it and
+/// read by the service authorizing it, so the two cannot hold two accounts of one call.
+pub mod forward_access_sessions;
 pub mod front_door;
 /// The request-claim rule for the two emulated services whose SigV4 signing name is
 /// `greengrass` — the 2017-06-07 and 2020-11-30 API versions of one product, which AWS

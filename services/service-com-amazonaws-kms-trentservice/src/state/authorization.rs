@@ -89,9 +89,11 @@
 //! the multi-valued key naming those entries. The encryption-context family is answered for
 //! as a WHOLE, so a clause over an entry the request does not carry is decided as absent
 //! rather than left undecided. `kms:ViaService` is answered for the requests that have a
-//! value for it — the ones another service makes on the caller's behalf, which name
-//! themselves through [`RequestedUse::through_service`] — and for a request a caller makes
-//! directly to this service there is no such value, so it is left unpublished there. A
+//! value for it — the ones another service makes on the caller's behalf, which either arrive
+//! here in a forward access session that names the service they came through ([`caller`]) or,
+//! where the calling service judges the use of the key itself, name it through
+//! [`RequestedUse::through_service`] — and for a request a caller makes directly to this
+//! service there is no such value, so it is left unpublished there. A
 //! request another service makes as its own service principal answers instead for
 //! `aws:SourceArn` and `aws:SourceAccount` — the keys a grant to such a principal is scoped
 //! by — and for no principal ARN, since no IAM entity made it. Every
@@ -175,6 +177,11 @@ pub struct Caller {
     /// made for. `None` for a request a caller made with a credential of its own, which has
     /// no value for [`SOURCE_ARN_KEY`] at all.
     pub on_behalf_of: Option<CallingResource>,
+    /// The regional endpoint name of the service a request arrived THROUGH, for one another
+    /// service made on this caller's behalf while serving a call of its own — the value of
+    /// [`VIA_SERVICE_KEY`]. `None` for a request the caller made to this service DIRECTLY,
+    /// which has no value for that key at all.
+    pub via_service: Option<String>,
 }
 
 /// The resource a service-to-service request was made ON BEHALF OF, as the condition keys
@@ -216,6 +223,9 @@ impl Caller {
                 arn: source_arn.to_string(),
                 account,
             }),
+            // A call a service makes as its OWN principal is not one it makes on a caller's
+            // behalf, which is what the via-service key is about.
+            via_service: None,
         }
     }
 
@@ -229,6 +239,17 @@ impl Caller {
                 .iter()
                 .any(|principal| principal == grantee)
         })
+    }
+
+    /// What this caller is asking of a key: `operation`, as it ARRIVED — through the service
+    /// a request made on this caller's behalf came through ([`Self::via_service`]), and
+    /// directly for every other request.
+    #[must_use]
+    fn asking<'a>(&'a self, operation: &'a str) -> RequestedUse<'a> {
+        match self.via_service.as_deref() {
+            Some(via_service) => RequestedUse::through_service(operation, via_service),
+            None => RequestedUse::direct(operation),
+        }
     }
 
     /// Whether this caller's identity-based half of the decision cannot refuse: the
@@ -278,9 +299,11 @@ impl Caller {
 /// the `kms:` condition keys of a conditioned policy statement are decided against, and
 /// which an operation that takes none passes as `None`.
 ///
-/// This is the decision for a request a caller made to this service DIRECTLY;
-/// [`authorize_use`] is the same decision for one another service makes on the caller's
-/// behalf.
+/// How the request ARRIVED is the caller's own ([`Caller::via_service`]): a request another
+/// service made on this caller's behalf is decided with the value that service's path to the
+/// key carries, and one the caller made to this service directly with no value for it at all.
+/// [`authorize_use`] is this decision with that arrival stated by the asker instead, for a
+/// service that judges a use of a key itself rather than calling this one.
 pub fn authorize(
     caller: &Caller,
     state: &super::ComAmazonawsKmsTrentserviceState,
@@ -295,7 +318,7 @@ pub fn authorize(
         state,
         region,
         key,
-        RequestedUse::direct(operation),
+        caller.asking(operation),
         context,
         presented,
     )
@@ -474,7 +497,7 @@ pub fn authorize_use(
 #[must_use]
 pub fn permits_policy_management(caller: &Caller, policy: &str, key_arn: &str) -> bool {
     let action = format!("{}:{POLICY_MANAGEMENT_OPERATION}", super::ARN_SERVICE);
-    let conditions = request_conditions(caller, None, None);
+    let conditions = request_conditions(caller, None, caller.via_service.as_deref());
     let mut principals = caller.principals.clone();
     principals.extend_from_slice(&caller.account);
     let request = iam::Request::new(&action, key_arn, &principals)
@@ -515,7 +538,7 @@ pub fn authorize_account_action(
     // scoped to a principal is read the same way whichever operation asks. An operation
     // that names no key takes no encryption context either, so the request carries no
     // entry of that family.
-    let conditions = request_conditions(caller, None, None);
+    let conditions = request_conditions(caller, None, caller.via_service.as_deref());
     let request = iam::Request::new(&action, &resource, &caller.principals)
         .with_context(&conditions.carried)
         .with_published_keys(&conditions.published);
@@ -752,7 +775,19 @@ fn explicit_deny_message(principal: &str, action: &str, resource: &str, document
     )
 }
 
-/// The principal this request speaks for, and the documents in force on it.
+/// The principal this request speaks for, the documents in force on it, and how the request
+/// ARRIVED.
+///
+/// A request another emulated service is making on this caller's behalf while serving a call
+/// of its own arrives in a FORWARD ACCESS SESSION, which that service records under the
+/// access key id it signs the call with
+/// ([`::service_common::forward_access_sessions`]) — the one thing about a request a client
+/// cannot choose for itself. Such a request carries that service's regional endpoint name as
+/// the value of [`VIA_SERVICE_KEY`], and a request a caller made to this service directly
+/// carries no value for that key at all. The session says HOW the request arrived and nothing
+/// about WHO it speaks for: the principal is resolved from the credential the ORIGINATING
+/// request presented, so the same key policy statements and the same identity-based documents
+/// bind a caller's own call and the one a service makes for it.
 ///
 /// Called BEFORE this service's own store is locked, so the STS and IAM stores it reads
 /// are never reached while this service's state guard is held.
@@ -760,7 +795,16 @@ pub fn caller<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
 ) -> Caller {
-    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    let presented = ::engine::extract_akid(&ctx.parts().headers);
+    let forwarded =
+        ::service_common::forward_access_sessions::session_of(engine, &presented, SystemTime::now());
+    let via_service = forwarded
+        .as_ref()
+        .map(|session| session.via_service.clone());
+    // The credential whose principal the decision is about: the caller's own, which for a
+    // forwarded call is the one its own request was signed with rather than the one the
+    // relaying service signed this call with.
+    let access_key_id = forwarded.map_or(presented, |session| session.caller_access_key_id);
     let identity = match sts_store::service_state(engine) {
         Some(sts) => sts_store::resolve_caller(
             &mut sts.lock(),
@@ -784,6 +828,7 @@ pub fn caller<Eng: Send + Sync + 'static>(
                 account_credential: false,
                 unreadable_attachment: false,
                 on_behalf_of: None,
+                via_service,
             }
         }
     };
@@ -796,6 +841,7 @@ pub fn caller<Eng: Send + Sync + 'static>(
         documents: Vec::new(),
         unreadable_attachment: false,
         on_behalf_of: None,
+        via_service,
     };
     let Some(iam_state) = iam_store::service_state(engine) else {
         return caller;
@@ -857,6 +903,9 @@ pub fn role_caller<Eng: Send + Sync + 'static>(engine: &Eng, role_arn: &str) -> 
         account_credential: false,
         unreadable_attachment: false,
         on_behalf_of: None,
+        // A role another service uses a key AS is the identity of a request that service
+        // makes, not one arriving through a service on somebody else's behalf.
+        via_service: None,
     };
     let Some(iam_state) = iam_store::service_state(engine) else {
         return caller;

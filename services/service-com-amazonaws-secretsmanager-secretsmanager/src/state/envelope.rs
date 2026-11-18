@@ -50,7 +50,12 @@
 //! KMS is reached the way the rest of this emulator reaches another service: the AWS
 //! SDK driven over the emulator's own in-process transport, through the operation
 //! callback ([`smithy_server_runtime::OperationContext::callback`]), so no socket is
-//! opened and this crate names no other service's crate. An emulator assembled
+//! opened and this crate names no other service's crate. Each cryptographic call made that
+//! way is one this service makes FOR the caller, so it is sent in a forward access session
+//! naming this service's path to the key ([`forward_access_session`]) and KMS's own gate
+//! decides it with `kms:ViaService` answering this service's endpoint — which is why a key
+//! confined to this service's use of it serves these calls while refusing the caller's own
+//! direct ones. An emulator assembled
 //! WITHOUT KMS is the one case a value under a customer managed key is held as sent:
 //! the transport itself refuses the call, nothing is said about the key, and a
 //! service that refused every write of a value would be unusable in such an
@@ -528,7 +533,10 @@ pub async fn seal<Eng: Send + Sync + 'static>(
         return Err(refusal);
     }
 
-    let generated = match kms_client(ctx, region)
+    // The call is one this service makes on the caller's behalf, so it arrives at KMS
+    // through this service's own path to the key rather than as a call of the caller's own.
+    let session = forward_access_session(engine, ctx, region);
+    let generated = match kms_client(ctx, region, session.as_ref())
         .generate_data_key()
         .key_id(key_id)
         .key_spec(::aws_sdk_kms::types::DataKeySpec::Aes256)
@@ -600,7 +608,10 @@ pub async fn open<Eng: Send + Sync + 'static>(
         return Err(refusal);
     }
 
-    let opened = match kms_client(ctx, region)
+    // The unwrap is this service's call on the caller's behalf too, so it arrives through
+    // the same path the seal did.
+    let session = forward_access_session(engine, ctx, region);
+    let opened = match kms_client(ctx, region, session.as_ref())
         .decrypt()
         .ciphertext_blob(::aws_smithy_types::Blob::new(
             sealed.wrapped_data_key.clone(),
@@ -644,6 +655,11 @@ pub async fn open<Eng: Send + Sync + 'static>(
 /// this module: the key's own state and the permissions on it are KMS's to state,
 /// and this asks it (`kms:DescribeKey`).
 ///
+/// That question is about what the key IS rather than a cryptographic use of it, so it is
+/// asked as a plain in-process call rather than in a forward access session
+/// ([`forward_access_session`]): nothing in the answer turns on the path the question
+/// arrived by.
+///
 /// `None`, for the same two cases the sealing path treats as nothing said about the
 /// key: the Amazon Web Services managed key, which names no key a caller can act on,
 /// and an emulator assembled without KMS, where the request reached no KMS at all.
@@ -653,7 +669,7 @@ pub async fn key_refusal(
     kms_key_id: Option<&str>,
 ) -> Option<String> {
     let key_id = customer_managed_key(kms_key_id)?;
-    match kms_client(ctx, region)
+    match kms_client(ctx, region, None)
         .describe_key()
         .key_id(key_id)
         .send()
@@ -892,6 +908,33 @@ fn via_service(region: &str) -> String {
     )
 }
 
+/// The provider name the credential one such call signs with carries: it names this service's
+/// path to the key rather than any AWS credential source, and never travels on the wire.
+const SESSION_CREDENTIAL_PROVIDER: &str = "aws-emulator-forward-access-session";
+
+/// Open the FORWARD ACCESS SESSION one cryptographic call this service makes on the caller's
+/// behalf arrives in, naming this service's own path to the key ([`via_service`]).
+///
+/// A call made in such a session presents a credential minted for it alone, under which the
+/// shared directory ([`::service_common::forward_access_sessions`]) holds the service it
+/// arrived through AND the credential the CALLER's own request was signed with — so KMS
+/// decides it for that caller's principal with `kms:ViaService` answering this service's
+/// endpoint, as it decides any request another service makes on a caller's behalf, while a
+/// request the caller makes to KMS itself still answers nothing for that key. The session is
+/// held only while the call is in flight: dropping it deletes the credential and forgets the
+/// record.
+///
+/// `None` where no session could be opened (see that module), in which case the call is made
+/// with the callback's own credentials and KMS decides it as a direct one — the narrower
+/// answer, and the one every key that is not confined to a service's path already gives.
+fn forward_access_session<'ctx, Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &'ctx smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> Option<::service_common::forward_access_sessions::InFlightSession<'ctx>> {
+    ::service_common::forward_access_sessions::open(engine, ctx, &via_service(region))
+}
+
 /// A KMS client over the in-process callback into this same emulator.
 ///
 /// `region` is the request's own signing region, so the key is used where the secret
@@ -899,20 +942,35 @@ fn via_service(region: &str) -> String {
 /// time out or watch for a stalled stream — and each of those would need a sleep
 /// implementation this client is not given. The same goes for caching the identity:
 /// the credentials the callback hands over are used directly.
+///
+/// `session` is the forward access session a CRYPTOGRAPHIC call arrives in
+/// ([`forward_access_session`]): the call presents that session's own credential, which is
+/// what tells KMS the request reached the key through this service rather than from the
+/// caller directly. A call that is not made on a caller's behalf, and one for which no
+/// session could be opened, presents the callback's own credentials and is a direct call.
 fn kms_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    session: Option<&::service_common::forward_access_sessions::InFlightSession<'_>>,
 ) -> ::aws_sdk_kms::Client {
     let config = ::aws_sdk_kms::Config::builder()
         .behavior_version(::aws_sdk_kms::config::BehaviorVersion::latest())
         .region(::aws_sdk_kms::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://kms.{region}.amazonaws.com"))
-        .credentials_provider(ctx.callback().aws_credentials_provider())
         .http_client(ctx.callback().http_client())
         .retry_config(::aws_sdk_kms::config::retry::RetryConfig::disabled())
         .timeout_config(::aws_sdk_kms::config::timeout::TimeoutConfig::disabled())
         .identity_cache(::aws_sdk_kms::config::IdentityCache::no_cache())
-        .stalled_stream_protection(::aws_sdk_kms::config::StalledStreamProtectionConfig::disabled())
-        .build();
-    ::aws_sdk_kms::Client::from_conf(config)
+        .stalled_stream_protection(::aws_sdk_kms::config::StalledStreamProtectionConfig::disabled());
+    let config = match session {
+        Some(session) => config.credentials_provider(::aws_sdk_kms::config::Credentials::new(
+            session.access_key_id().to_string(),
+            session.secret_access_key().to_string(),
+            None,
+            None,
+            SESSION_CREDENTIAL_PROVIDER,
+        )),
+        None => config.credentials_provider(ctx.callback().aws_credentials_provider()),
+    };
+    ::aws_sdk_kms::Client::from_conf(config.build())
 }
