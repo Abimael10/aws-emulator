@@ -1,0 +1,73 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: ecs.put-attributes-invalid-target-rejected ecs.put-attributes-target-not-found-rejected ecs.delete-attributes-missing-target-rejected ecs.list-attributes-filters-by-target-type ecs.put-attributes-empty-string-value-preserved
+Issue-Shape-Id: com.amazonaws.ecs#AmazonEC2ContainerServiceV20141113
+Issue-Key: ecs.put-attributes-invalid-target-rejected|run#11|AssertionError|assert message == expected_message, message
+Issue-Key: ecs.put-attributes-target-not-found-rejected|run#20|AssertionError|assert message == expected, f"expected {expected!r}, got {message!r}"
+Issue-Key: ecs.delete-attributes-missing-target-rejected|run#17|AssertionError|assert message == f"Container instance {instance_id} is inactive.", (
+Issue-Key: ecs.list-attributes-filters-by-target-type|run#20|AssertionError|assert error == expected, f"expected {expected!r}, got {error!r}"
+Issue-Key: ecs.put-attributes-empty-string-value-preserved|run#22|AssertionError|assert message == "Invalid length for attribute value.", message
+Issue-Commit: 719a7d873c2ead99db4a3b531125e6f7ff90e604
+
+# ecs: the attribute APIs' refusals diverge from AWS — PutAttributes/DeleteAttributes answer the TargetNotFoundException doc sentence instead of the per-target message, and ListAttributes/PutAttributes answer generic enum/pattern prose (4 causes)
+
+> _Note: this issue was identified against the code base at commit `719a7d873c2ead99db4a3b531125e6f7ff90e604`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+PutAttributes
+
+## Description
+Four net-new root causes, all of one family: the ECS attribute APIs (PutAttributes, DeleteAttributes, ListAttributes) refuse the request with the right HTTP status and — in all four — the right error CODE, but answer a message AWS does not word for that error class. An HTTP status, an error code and an error message are each requirements, so each of these is a divergence even where the status and code match. In two of the four the emulator emits the Smithy SHAPE DOC sentence as the error message, and in the other two it emits a generic constraint sentence built from the wire member name instead of the operation's own sentence.
+
+This is the same FAMILY as open issue 20261117T121318Z-ecs-refusal-wording-and-error-classification-diverge-from.md (which calls out the same shape-doc-as-message defect for DeleteCluster's ClusterContainsTasksException) and as fixed issues 20261103T150504Z-ecs-validation-refusals-use-emulator-authored-wording-instead.md and 20261104T062603Z-ecs-refusal-messages-and-error-classes-diverge-from.md, but NONE of them carries PutAttributes, DeleteAttributes or ListAttributes, so the four causes below are net-new. Open issue 20261114T034444Z-ecs-putattributes-stub.md and fixed issue 20261109T190659Z-ecs-putattributes-10-attributes-per-target-ceiling-is.md concern PutAttributes being a 501 scaffold and the 10-per-target ceiling respectively; the handler now answers modeled 400s on these paths, and neither issue covers the refusal WORDING below.
+
+Cause 1 of 4: PutAttributes whose attributes[].targetId is a well-formed container-instance ARN in the caller's own cluster that was never registered.
+AWS: HTTP 400, error code TargetNotFoundException, message template 'Container instance <container-instance-id> not found.' — fixed text 'Container instance ' + ' not found.' with exactly one variable part, the container-instance id (the last ARN segment) taken from the request's targetId. Recorded behavior only for the sentence (Smithy: PutAttributes models TargetNotFoundException httpError 400 with a single `message` member; the model states no message text).
+Emulator: HTTP 400, TargetNotFoundException, message "The specified target wasn't found." — which is verbatim the first sentence of the Smithy DOC string of com.amazonaws.ecs#TargetNotFoundException ("The specified target wasn't found. You can view your available container instances with ListContainerInstances..."). The defect is using the error shape's documentation as the error message, so the message carries no identity of the target that was not found.
+Why: a client that writes placement attributes onto container instances and keys its handling on the refused target cannot tell WHICH targetId of a multi-entry PutAttributes call was rejected; operators and runbooks matching ECS's sentence do not recognise the refusal at all.
+Fix: the PutAttributes handler's target resolution and its refusal mapping — services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/src/ops/put_attributes.rs, the `crate::state::resolve_attribute_targets` / `attribute_target_refusal` pair it calls (put_attributes.rs lines 259-265); the message must be the service's per-target sentence, never the shape doc.
+Traces: ecs.put-attributes-invalid-target-rejected, ecs.put-attributes-target-not-found-rejected.
+
+Cause 2 of 4: DeleteAttributes addressed at a container instance that WAS registered and has since been deregistered (INACTIVE).
+AWS: HTTP 400, error code TargetNotFoundException, message template 'Container instance <container-instance-id> is inactive.' — fixed text 'Container instance ' + ' is inactive.' with one variable part, the container-instance id taken from the request's targetId. AWS distinguishes a target that never existed (Cause 1's 'not found.') from one that exists but is no longer registered ('is inactive.'), under the same error code. Recorded behavior only (Smithy: DeleteAttributes models TargetNotFoundException httpError 400; no message text is modeled).
+Emulator: HTTP 400, TargetNotFoundException, message "The specified target wasn't found." — the same shape-doc sentence as Cause 1, so the deregistered-target state is collapsed into the never-existed state and the id is lost.
+Why: a client cleaning up attributes after draining a host is told the target does not exist when AWS tells it the target is inactive; code that branches on that distinction (re-register vs. give up) takes the wrong branch.
+Fix: the DeleteAttributes handler and the shared attribute-target resolution it uses — services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/src/ops/delete_attributes.rs plus `crate::state::resolve_attribute_targets`/`attribute_target_refusal`; the resolution must report an INACTIVE (deregistered) container instance distinctly from an unknown one and render the id.
+Traces: ecs.delete-attributes-missing-target-rejected.
+
+Cause 3 of 4: ListAttributes with a targetType outside the modeled enum.
+AWS: HTTP 400, error code InvalidParameterException, message template "Unexpected targetType '<value>'." — fixed text "Unexpected targetType '" + "'." with one variable part, the rejected targetType value echoed from the request. Smithy: ListAttributesRequest.targetType is @required, target TargetType, whose only value is `container-instance`; InvalidParameterException (httpError 400) is modeled on the operation; the sentence itself is recorded behavior only.
+Emulator: HTTP 400, InvalidParameterException, message 'target type should be one of [container-instance]' — the generic enum-violation sentence built from the lower-cased member name and the accepted set, which neither echoes the rejected value nor uses AWS's wording or capitalisation.
+Why: callers probing targetType (the API models one value today and AWS's sentence is written to echo whatever was sent) get a message AWS never emits, and message-matching clients miss the refusal.
+Fix: the ListAttributes targetType validation message — services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/src/ops/list_attributes.rs / the shared enum-violation helper it calls; the sentence must be this operation's literal template with the request's value interpolated, not a rendering of the enum.
+Traces: ecs.list-attributes-filters-by-target-type.
+
+Cause 4 of 4: PutAttributes carrying an attribute whose `value` is the empty string.
+AWS: HTTP 400, error code InvalidParameterException, message 'Invalid length for attribute value.' — entirely fixed text, with no part taken from the request or from state. AWS classifies an empty value as a LENGTH violation: Smithy documents Attribute$value as "The value of the attribute. The value must contain between 1 and 128 characters..." (the member carries no @length or @pattern trait, so the rule lives in prose and in the recording); InvalidParameterException httpError 400 is modeled on PutAttributes.
+Emulator: HTTP 400, InvalidParameterException, message 'attributes.value must match ^[a-zA-Z0-9\\-_.@/\\\\:]([a-zA-Z0-9\\-_.@/\\\\: ]{0,126}[a-zA-Z0-9\\-_.@/\\\\:])?$' — a generic pattern-violation sentence naming the wire member path and dumping a regex. It misreports the violation class (a length breach reported as a charset breach) and exposes a regex AWS never returns.
+Why: a client that validates attribute values client-side, or that surfaces the refusal to a user, is told the value contains illegal characters when it is simply empty; nothing in AWS's responses ever carries this regex, so parsers written against AWS mis-handle it.
+Fix: the PutAttributes value validation — `crate::state::attribute_value_violation` as called from services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/src/ops/put_attributes.rs lines 251-257; the 1-128-character bound must be checked separately from the charset and carry the operation's literal length sentence.
+Traces: ecs.put-attributes-empty-string-value-preserved.
+
+## Evidence
+Behavioral replay of simparity-behavioral-aws-v1 against this checkout. All five checks are listed under '### ecs' and none is marked ALREADY FILED or OWNED by an open issue.
+
+Cause 1 — [mismatch] ecs.put-attributes-target-not-found-rejected: AssertionError: expected 'Container instance 00000000-0000-0000-0000-000000000000 not found.', got "The specified target wasn't found." (the error code asserted immediately before, TargetNotFoundException, matched). The uuid shown is the bogus last ARN segment the run constructed; it is the template's variable part, not part of the requirement.
+Cause 1 — [mismatch] ecs.put-attributes-invalid-target-rejected: AssertionError: The specified target wasn't found. — raised on `assert message == expected_message` where expected_message = f"Container instance {bogus_ci_id} not found." and bogus_ci_id is the uuid segment of a well-formed, never-registered container-instance ARN inside the caller's own cluster. The same assertion fails both for an entry carrying a value and for a valueless entry, i.e. the refusal is about target existence, not content.
+
+Cause 2 — [mismatch] ecs.delete-attributes-missing-target-rejected: AssertionError: expected the exact missing-target message, got "The specified target wasn't found." — raised on `assert message == f"Container instance {instance_id} is inactive."` after the check registers a real container instance (AWS-signed identity document), confirms a PutAttributes/DeleteAttributes/ListAttributes round trip against it as a positive control, then calls DeregisterContainerInstance(force=True) and re-issues DeleteAttributes at the same targetId. The error code TargetNotFoundException asserted just before matched.
+
+Cause 3 — [mismatch] ecs.list-attributes-filters-by-target-type: AssertionError: expected ('InvalidParameterException', "Unexpected targetType 'task-definition'."), got ('InvalidParameterException', 'target type should be one of [container-instance]'). 'task-definition' is the value the run sent; it is the template's variable part.
+
+Cause 4 — [mismatch] ecs.put-attributes-empty-string-value-preserved: AssertionError: attributes.value must match ^[a-zA-Z0-9\\-_.@/\\\\:]([a-zA-Z0-9\\-_.@/\\\\: ]{0,126}[a-zA-Z0-9\\-_.@/\\\\:])?$ — raised on `assert message == "Invalid length for attribute value."`. The two positive controls before it pass, so the divergence is isolated to the empty-value refusal: PutAttributes with value='some-value_123' stores and returns the value, and an attribute with no `value` key at all is accepted as a flag attribute.
+
+Corroboration in the checkout: services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/src/ops/put_attributes.rs resolves every entry's target through crate::state::resolve_attribute_targets and maps the failure through crate::state::attribute_target_refusal (lines 259-265), and validates the value through crate::state::attribute_value_violation (lines 251-257) — the two shared helpers that produce the diverging sentences for Causes 1, 2 and 4. Smithy com.amazonaws.ecs#TargetNotFoundException's doc string begins with exactly the sentence the emulator returns as the message.
+
+## Steps to Reproduce
+1. git_clone this checkout and boot the emulator.
+2. Cause 1: ecs CreateCluster(clusterName=<c>); PutAttributes(cluster=<c>, attributes=[{name:'a', value:'x', targetId:'arn:aws:ecs:<region>:<account>:container-instance/<c>/<random-uuid>'}]) where that uuid was never registered. Expect HTTP 400 TargetNotFoundException with message 'Container instance <random-uuid> not found.'; observe "The specified target wasn't found.". Repeat with the entry's `value` omitted — same expected message.
+3. Cause 2: register a real container instance in <c> (RegisterContainerInstance with an AWS-signed EC2 instance identity document + signature), confirm PutAttributes/DeleteAttributes/ListAttributes work against its containerInstanceArn, then DeregisterContainerInstance(cluster=<c>, containerInstance=<arn>, force=True) and call DeleteAttributes(cluster=<c>, attributes=[{name:'nosuch', targetId:<arn>}]). Expect HTTP 400 TargetNotFoundException with message 'Container instance <container-instance-id> is inactive.'; observe "The specified target wasn't found.".
+4. Cause 3: ListAttributes(cluster=<c>, targetType='task-definition'). Expect HTTP 400 InvalidParameterException with message "Unexpected targetType 'task-definition'."; observe 'target type should be one of [container-instance]'.
+5. Cause 4: with a registered container instance <arn> in <c>, PutAttributes(cluster=<c>, attributes=[{name:'empty-val', value:'', targetId:<arn>}]). Expect HTTP 400 InvalidParameterException with message 'Invalid length for attribute value.'; observe the regex sentence 'attributes.value must match ^[a-zA-Z0-9\\-_.@/\\\\:]...$'. Confirm with ListAttributes that the rejected attribute was not persisted (the emulator already gets this part right).
+6. Re-replay the five check ids in trace_ids and confirm each status, error code and error message.
