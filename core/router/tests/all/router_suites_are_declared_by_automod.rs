@@ -222,7 +222,8 @@ fn every_crate_that_holds_suites_keeps_exactly_one_kind_of_declaration_root() {
         reports.len()
     );
     // Without these, a workspace where neither layout was in use would satisfy the rule above
-    // by holding nothing to break it.
+    // by holding nothing to break it. A floor rather than a census: a crate that migrates to
+    // the macro layout moves from one of these counts to the other.
     assert!(
         macro_crates > 0,
         "expected at least one crate to declare its suites with the macro, read none beside \

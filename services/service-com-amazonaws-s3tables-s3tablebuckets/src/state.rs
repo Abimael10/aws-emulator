@@ -897,9 +897,12 @@ pub fn effective_bucket_maintenance(
         .collect()
 }
 
-/// The stored form of the `TableBucketReplicationConfiguration` structure: the
-/// role S3 Tables replicates with, the rules that say where to, and the token
-/// that names this state of the configuration.
+/// The stored form of a replication configuration — the one record behind both
+/// `TableBucketReplicationConfiguration` and `TableReplicationConfiguration`,
+/// which the model declares with the same two members (a role and rules naming
+/// destination table buckets), one scoped to a whole table bucket and one to a
+/// single table: the role S3 Tables replicates with, the rules that say where
+/// to, and the token that names this state of the configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicationConfiguration {
     /// The ARN of the IAM role S3 Tables assumes to replicate tables.
@@ -1050,6 +1053,13 @@ pub struct Table {
     /// on it. Only the tables Amazon Web Services manages take one at all, so
     /// on every other table this stays `None` for the life of the record.
     pub record_expiration: Option<RecordExpiration>,
+    /// The table's OWN replication configuration, `None` until a put sets one on
+    /// it: a table is replicated by a configuration of its own only once one is
+    /// set, which is why a read or a delete of a table that has none is refused
+    /// rather than answered with a default. It is independent of the
+    /// configuration the bucket holding the table carries
+    /// ([`TableBucket::replication`]), so setting one leaves the other alone.
+    pub replication: Option<ReplicationConfiguration>,
     /// The maintenance configurations a put has set on this table, keyed by the
     /// task each settles. A task with no entry runs under the service's own
     /// defaults, which [`effective_table_maintenance`] is where it is reported
@@ -1174,8 +1184,8 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
         self.mint_id("table-version")
     }
 
-    /// A fresh `versionToken` for a table bucket's replication configuration,
-    /// minted on every write of one.
+    /// A fresh `versionToken` for a replication configuration — a table
+    /// bucket's or a single table's — minted on every write of one.
     pub fn mint_replication_version_token(&mut self) -> String {
         self.mint_id("table-bucket-replication-version")
     }

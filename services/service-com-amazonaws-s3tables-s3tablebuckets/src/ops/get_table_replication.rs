@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTableReplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTableReplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTableReplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +113,27 @@ impl From<GetTableReplicationErrorModeled> for GetTableReplicationError {
     }
 }
 
+/// `AccessDeniedException` (HTTP 403) — the calling principal's own
+/// identity-based IAM policies do not allow this action on the table the request
+/// addresses. The sentence is IAM's own, built by the gate.
+fn access_denied(message: String) -> GetTableReplicationError {
+    GetTableReplicationErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// `NotFoundException` (HTTP 404) — the refusal this operation models for a
+/// table the store does not hold, and for one that has no replication
+/// configuration to report, each worded with the one sentence this service
+/// states that class with.
+fn not_found(message: &str) -> GetTableReplicationError {
+    GetTableReplicationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 /// The `GetTableReplication` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -158,18 +170,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTableReplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableReplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTableReplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTableReplicationErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // Reading a table's replication configuration takes the
+        // `s3tables:GetTableReplication` permission, granted on the TABLE —
+        // which this request addresses by its own ARN. Decided BEFORE anything
+        // is answered, with no store guard held, so a caller holding no grant
+        // learns nothing about the table. See `crate::state::authorization`.
+        if let Some(message) =
+            crate::state::authorization::refusal(&*self.engine, ctx, Self::NAME, &input.table_arn)
+        {
+            return Err(access_denied(message));
+        }
+
+        // A pure read: what it answers with is reconstructed from the record a
+        // put persisted, and nothing in the store is touched.
+        let store = state.lock();
+        let table = store
+            .table_by_arn(&input.table_arn)
+            .ok_or_else(|| not_found(crate::state::TABLE_NOT_FOUND_MESSAGE))?;
+
+        // A table is replicated by a configuration of its own only once a put
+        // sets one on it, and the response's `configuration` and `versionToken`
+        // are both required: there is no configuration to report for a table
+        // that has none, so the read is refused with the modeled not-found,
+        // which is how a client observes that table replication is not
+        // configured.
+        let configuration = table
+            .replication
+            .as_ref()
+            .ok_or_else(|| not_found(crate::state::REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE))?;
+
+        Ok(GetTableReplicationOutput {
+            version_token: configuration.version_token.clone(),
+            configuration: TableReplicationConfiguration {
+                role: configuration.role.clone(),
+                rules: configuration
+                    .rules
+                    .iter()
+                    .map(|rule| TableReplicationRule {
+                        destinations: rule
+                            .destinations
+                            .iter()
+                            .map(|destination| ReplicationDestination {
+                                destination_table_bucket_arn: destination.clone(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            },
+        })
     }
 }

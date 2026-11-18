@@ -50,6 +50,9 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # The bounded, seeded generator behind the generated maintenance-configuration
 # rows in `tests/all/table_maintenance_put_round_trip.rs`.
 rand = "0.9"
+# Declares one module per `tests/all/<name>.rs`, so this crate's one integration
+# target needs no hand-kept register of its suites.
+automod = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

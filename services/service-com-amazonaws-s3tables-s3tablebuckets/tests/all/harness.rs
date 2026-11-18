@@ -12,7 +12,8 @@
 //! `table_bucket_lifecycle.rs` still carries its own copy of the router bootstrap:
 //! it covers the bucket create/read rules and is left to migrate with its next edit
 //! rather than be rewritten from under its owner here. (No list of suites is kept
-//! here, so this comment cannot rot — `tests/all.rs` is the register.)
+//! here, so this comment cannot rot — `tests/all/main.rs` declares one module per
+//! suite file beside it.)
 
 // Each suite uses the part of the harness its own rules need; an item no suite has
 // reached yet is still part of the contract this file states.
@@ -489,6 +490,37 @@ impl Emulator {
         self.call(
             "DELETE",
             &format!("/table-bucket-replication{}", query_string(query)),
+            region,
+            None,
+        )
+        .await
+    }
+
+    /// `PutTableReplication`: the TABLE's ARN and an optional `versionToken`
+    /// travel as query members, the configuration as the body's `configuration`.
+    pub async fn put_table_replication(
+        &self,
+        region: &str,
+        query: &[(&str, String)],
+        configuration: &Value,
+    ) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/table-replication{}", query_string(query)),
+            region,
+            Some(&serde_json::json!({ "configuration": configuration })),
+        )
+        .await
+    }
+
+    /// `GetTableReplication`, which addresses the table by a query member.
+    pub async fn get_table_replication(&self, region: &str, table_arn: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!(
+                "/table-replication{}",
+                query_string(&[("tableArn", table_arn.to_string())])
+            ),
             region,
             None,
         )

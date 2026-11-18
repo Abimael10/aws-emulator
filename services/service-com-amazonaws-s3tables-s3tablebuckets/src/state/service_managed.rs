@@ -332,6 +332,9 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
             encryption: None,
             storage_class,
             record_expiration: None,
+            // A freshly created table replicates nowhere until a put sets a
+            // replication configuration on it.
+            replication: None,
             maintenance: BTreeMap::new(),
             maintenance_schedules: BTreeMap::new(),
             tags: BTreeMap::new(),

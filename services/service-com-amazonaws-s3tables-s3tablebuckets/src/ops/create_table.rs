@@ -980,6 +980,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // record expiration belongs to the tables Amazon Web Services
             // manages on an account's behalf.
             record_expiration: None,
+            // Nor any replication configuration: a table is replicated by one of
+            // its own only once `PutTableReplication` sets one on it.
+            replication: None,
             // Maintenance is on for every S3 Tables table from the moment it
             // is created, under the service's own settings, so a freshly
             // created table carries no configuration of its own: the defaults
