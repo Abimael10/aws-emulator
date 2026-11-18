@@ -175,6 +175,14 @@ impl Emulator {
         parsed
     }
 
+    /// One Step Functions call as its status and parsed body, for a call that is NOT expected
+    /// to be served: the refusal half of a rule is read from the status and the error body
+    /// rather than from a call that must answer 200 ([`Self::sfn`]).
+    pub(crate) async fn sfn_call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        self.rpc("states", "AWSStepFunctions", "1.0", operation, body)
+            .await
+    }
+
     /// Call one EventBridge operation, requiring a 200.
     pub(crate) async fn events(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.rpc("events", "AWSEvents", "1.1", operation, body).await;

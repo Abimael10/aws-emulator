@@ -14,17 +14,19 @@
 //! `SendTaskSuccess` or `SendTaskFailure` quoting that token, whoever makes it and however
 //! far the token travelled first: a success is the state's result, exactly the string the
 //! answer carried, and a failure is reported with exactly the `error` and `cause` it named.
-//! For the event-publication integration the token therefore travels in the published
-//! event's own `detail`, and the work that reads it out of a delivered envelope answers the
-//! task from there — so the four-hop trip (publish, match, invoke, answer) ends with the
-//! execution terminal on the worker's own verdict, while a sibling rule the same publication
-//! does not match receives nothing from it.
+//! That answer SPENDS the token, so every later `SendTask*` quoting it is refused
+//! `TaskTimedOut` (400) and the settled execution is unchanged. For the event-publication
+//! integration the token therefore travels in the published event's own `detail` — in an
+//! envelope attributed to the account and Region the entry was published in — and the work
+//! that reads it out of a delivered envelope answers the task from there, so the four-hop trip
+//! (publish, match, invoke, answer) ends with the execution terminal on the worker's own
+//! verdict, while a sibling rule the same publication does not match receives nothing from it.
 //!
 //! The rows differ along what the rule generalises over: how the rendered entry addresses the
 //! bus it publishes onto (the bus's bare name, and its ARN), WHERE in the rendered document
 //! the context object's token is placed (a top-level member of the `Detail`, and a member of
-//! an object nested inside it), and which `SendTask*` the work answers the token with (a
-//! success, and a failure).
+//! an object nested inside it), which `SendTask*` the work answers the token with (a success,
+//! and a failure), and which `SendTask*` then quotes the spent token (all three of them).
 //!
 //! Every expected value is computed here from what the row published — the token and the
 //! event id out of the envelope EventBridge delivered, the job out of the execution's own
@@ -37,7 +39,7 @@ use serde_json::{json, Value};
 
 use crate::execution_status_change_events::{given_queue, read_once, Emulator};
 use crate::lambda_task_control_flow::package;
-use crate::state_machine_lifecycle::{string, ROLE_ARN};
+use crate::state_machine_lifecycle::{error_code, string, ACCOUNT, REGION, ROLE_ARN};
 
 /// The `source` every row's Task publishes under, and the two `detail-type`s the row's two
 /// rules match on: one the publication carries and one it does not.
@@ -69,6 +71,28 @@ const WORKER_TIMEOUT_SECONDS: u64 = 60;
 const SUCCEEDED: &str = "SUCCEEDED";
 const FAILED: &str = "FAILED";
 const RUNNING: &str = "RUNNING";
+
+/// The reserved context-object path a callback `Task`'s `Parameters` quote to ask for that
+/// task's own token, and the marker that opens every context-object path: a rendered document
+/// still carrying either is one where the substitution did not happen.
+const TOKEN_PATH: &str = "$$.Task.Token";
+const CONTEXT_MARKER: &str = "$$";
+
+/// What every `SendTask*` answers for a token whose task is no longer outstanding: the
+/// modelled `TaskTimedOut` — "the task token has either expired or the task associated with
+/// the token has already been closed"
+/// (`smithy_query(query="operation",operation="SendTaskSuccess")`) — carried as a 400, whose
+/// message states the condition and then the reason the service gives for a task that belongs
+/// to no activity, which a callback task never does.
+const SPENT_TOKEN_STATUS: u16 = 400;
+const SPENT_TOKEN_CODE: &str = "TaskTimedOut";
+const SPENT_TOKEN_MESSAGE: &str = "Task Timed Out: 'Provided task does not exist anymore'";
+
+/// The `error` and `cause` the REFUSED re-use of a spent token names, which no execution may
+/// take on: a refused call changes nothing.
+const REUSED_ERROR: &str = "SentAfterTheTaskWasAnswered";
+/// See [`REUSED_ERROR`].
+const REUSED_CAUSE: &str = "this answer arrives for a task that is already closed";
 
 /// The `error` and `cause` the worker's `SendTaskFailure` names, which the failing row's
 /// execution must carry verbatim.
@@ -157,8 +181,8 @@ impl TokenAt {
             "cause": REPORTED_CAUSE,
         });
         match self {
-            Self::Detail => detail["taskToken.$"] = json!("$$.Task.Token"),
-            Self::NestedObject => detail["callback"] = json!({ "taskToken.$": "$$.Task.Token" }),
+            Self::Detail => detail["taskToken.$"] = json!(TOKEN_PATH),
+            Self::NestedObject => detail["callback"] = json!({ "taskToken.$": TOKEN_PATH }),
         }
         detail
     }
@@ -203,6 +227,31 @@ impl Answer {
     }
 }
 
+/// Which `SendTask*` then quotes the token the work's answer above SPENT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reused {
+    Success,
+    Failure,
+    Heartbeat,
+}
+
+impl Reused {
+    /// The call that quotes the spent `token`, as its operation and its request.
+    fn request(self, token: &str) -> (&'static str, Value) {
+        match self {
+            Self::Success => (
+                "SendTaskSuccess",
+                json!({ "taskToken": token, "output": json!({ "late": true }).to_string() }),
+            ),
+            Self::Failure => (
+                "SendTaskFailure",
+                json!({ "taskToken": token, "error": REUSED_ERROR, "cause": REUSED_CAUSE }),
+            ),
+            Self::Heartbeat => ("SendTaskHeartbeat", json!({ "taskToken": token })),
+        }
+    }
+}
+
 /// One row: how the rendered entry addresses its bus, where the token sits in the document it
 /// publishes, and how the worker answers it.
 struct Row {
@@ -215,6 +264,8 @@ struct Row {
     bus_by_arn: bool,
     token_at: TokenAt,
     answer: Answer,
+    /// Which `SendTask*` quotes the token once the row's work has spent it.
+    reused: Reused,
 }
 
 const ROWS: &[Row] = &[
@@ -223,24 +274,28 @@ const ROWS: &[Row] = &[
         bus_by_arn: false,
         token_at: TokenAt::Detail,
         answer: Answer::Success,
+        reused: Reused::Success,
     },
     Row {
         case: "the same publication addressed by the bus's ARN",
         bus_by_arn: true,
         token_at: TokenAt::Detail,
         answer: Answer::Success,
+        reused: Reused::Failure,
     },
     Row {
         case: "the token inside an object nested in the Detail",
         bus_by_arn: true,
         token_at: TokenAt::NestedObject,
         answer: Answer::Success,
+        reused: Reused::Heartbeat,
     },
     Row {
         case: "a worker that answers the token with a failure",
         bus_by_arn: false,
         token_at: TokenAt::Detail,
         answer: Answer::Failure,
+        reused: Reused::Success,
     },
 ];
 
@@ -434,10 +489,11 @@ fn definition(row: &Row, bus: &str, nonce: &str) -> Value {
     })
 }
 
-/// Every row: the token the state minted travels out in the event the Task publishes, the
-/// matching rule's targets receive that very envelope, the work answers the token out of it,
-/// and the paused execution ends on that answer — while the sibling rule the publication does
-/// not match receives nothing from it.
+/// Every row: the token the state minted travels out in the event the Task publishes, in an
+/// envelope attributed to this account and Region; the matching rule's targets receive that
+/// very envelope, the work answers the token out of it, and the paused execution ends on that
+/// answer; the spent token is then refused by the next `SendTask*` and the settled execution is
+/// unchanged — while the sibling rule the publication does not match receives nothing from it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_event_publication_callback_task_is_finished_by_the_answer_to_its_token() {
     let emulator = Emulator::new();
@@ -524,6 +580,17 @@ async fn an_event_publication_callback_task_is_finished_by_the_answer_to_its_tok
             Some(MATCHING_DETAIL_TYPE),
             "case {case:?}: the envelope names the Task's own detail type, got {envelope}"
         );
+        // And it is ATTRIBUTED to the account and Region the entry was published in, which is
+        // what a consumer of the envelope reads the publisher off.
+        assert_eq!(
+            (
+                envelope.get("account").and_then(Value::as_str),
+                envelope.get("region").and_then(Value::as_str),
+            ),
+            (Some(ACCOUNT), Some(REGION)),
+            "case {case:?}: expected the envelope attributed to {ACCOUNT}/{REGION}, got \
+             {envelope}"
+        );
         let detail = envelope
             .get("detail")
             .unwrap_or_else(|| panic!("case {case:?}: expected a detail in {envelope}"))
@@ -539,8 +606,14 @@ async fn an_event_publication_callback_task_is_finished_by_the_answer_to_its_tok
             "case {case:?}: expected the constant the definition carried, got {detail}"
         );
         let token = row.token_at.token_in(case, &detail);
+        let rendered = detail.to_string();
         assert!(
-            !token.is_empty() && token != "$$.Task.Token",
+            !rendered.contains(CONTEXT_MARKER),
+            "case {case:?}: expected every context-object path in the rendered document to \
+             have been substituted, got {rendered}"
+        );
+        assert!(
+            !token.is_empty() && token != TOKEN_PATH,
             "case {case:?}: expected the context object's token to have been substituted, \
              got {token:?}"
         );
@@ -602,6 +675,42 @@ async fn an_event_publication_callback_task_is_finished_by_the_answer_to_its_tok
                 );
             }
         }
+
+        // That token is SPENT by the answer that settled the execution: the next call quoting
+        // it is refused, and the settled execution takes nothing from the refused call.
+        let (operation, request) = row.reused.request(&token);
+        let (status, refusal) = emulator.sfn_call(operation, &request).await;
+        let code = error_code(&refusal);
+        assert_eq!(
+            (status, code.as_str(), refusal["message"].as_str()),
+            (
+                SPENT_TOKEN_STATUS,
+                SPENT_TOKEN_CODE,
+                Some(SPENT_TOKEN_MESSAGE)
+            ),
+            "case {case:?}: expected {operation} on the spent token to be refused \
+             {SPENT_TOKEN_STATUS} {SPENT_TOKEN_CODE} with {SPENT_TOKEN_MESSAGE:?}, got \
+             {status} with {refusal}"
+        );
+        let after = emulator
+            .sfn("DescribeExecution", &json!({ "executionArn": &execution }))
+            .await;
+        assert_eq!(
+            (
+                after.get("status"),
+                after.get("output"),
+                after.get("error"),
+                after.get("cause"),
+            ),
+            (
+                described.get("status"),
+                described.get("output"),
+                described.get("error"),
+                described.get("cause"),
+            ),
+            "case {case:?}: the refused re-use must leave the execution as its answer settled \
+             it ({described}), got {after}"
+        );
 
         // The same publication matched the sibling rule on no field, so its queue took
         // nothing from it.
