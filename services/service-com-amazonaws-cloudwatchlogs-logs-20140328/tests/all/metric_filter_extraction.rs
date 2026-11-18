@@ -213,17 +213,19 @@ async fn an_ingested_event_publishes_the_metric_data_the_groups_filters_extract(
             ],
         },
         Row {
-            case: "an unstructured term pattern with a JSON dimension selector",
+            case: "an unstructured term pattern matching the message text",
             pattern: "ERROR",
             metric_value: "1",
-            dimensions: &[("Service", "$.service")],
+            // An unstructured pattern names no field of the event, so it carries no
+            // dimension: the metric it emits is one series.
+            dimensions: &[],
             unit: Some("Count"),
             default_value: None,
             messages: &[
                 r#"{"service":"billing","msg":"ERROR boom"}"#,
                 r#"{"service":"billing","msg":"INFO fine"}"#,
             ],
-            expected: &[(&[("Service", "billing")], &[1.0])],
+            expected: &[(&[], &[1.0])],
         },
         Row {
             case: "a positional field of a space-delimited event as the dimension",

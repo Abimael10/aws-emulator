@@ -203,7 +203,9 @@ fn round_trip_rows() -> Vec<Row> {
             namespace: "Custom/Access",
             metric_value: "$size",
             default_value: None,
-            dimensions: &[("Ip", "$ip"), ("Status", "$status_code")],
+            // The documented maximum of three dimensions, each selecting a field this
+            // pattern names.
+            dimensions: &[("Ip", "$ip"), ("User", "$user"), ("Status", "$status_code")],
             unit: None,
             apply_on_transformed: false,
             criteria: None,
@@ -231,12 +233,9 @@ fn round_trip_rows() -> Vec<Row> {
             namespace: "Custom/All",
             metric_value: "1",
             default_value: None,
-            // The documented maximum, spanning both selector forms.
-            dimensions: &[
-                ("Json", FIELD_SELECTORS[0]),
-                ("Nested", FIELD_SELECTORS[1]),
-                ("Positional", FIELD_SELECTORS[3]),
-            ],
+            // The empty pattern names no field of the event, so it carries no dimension:
+            // a dimension value would have nothing to select.
+            dimensions: &[],
             unit: Some("Percent"),
             apply_on_transformed: false,
             criteria: None,

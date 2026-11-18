@@ -23,7 +23,9 @@
 //! Each table also carries its own boundary: a put sitting exactly AT the budget, and the
 //! same dimension with a selector value, is accepted and readable back through
 //! `DescribeMetricFilters` — so neither sentence is returned for any bad parameter, and the
-//! two rules keep their own messages.
+//! two rules keep their own messages. Every row's filter pattern is one that NAMES fields of
+//! the log event, so what each row trips is the rule it is about rather than the
+//! pattern/dimension compatibility rule (`metric_filter_pattern_dimension_support.rs`).
 //!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so a
@@ -55,6 +57,12 @@ const DIMENSION_VALUE_NOT_A_SELECTOR: &str =
 const DIMENSIONS_AND_DEFAULT_VALUE: &str =
     "Invalid metric transformation: dimensions and default value are mutually exclusive \
      properties";
+
+/// The whole message a put whose filter pattern names no field of the log event — so it
+/// supports no dimension at all — is refused with. Fixed text for that class too, asserted
+/// here only to show each rule keeps its own sentence; the rule itself is covered by
+/// `metric_filter_pattern_dimension_support.rs`.
+const PATTERN_WITHOUT_DIMENSIONS: &str = "The specified filter pattern does not support dimensions";
 
 /// How many dimensions one metric filter may carry, counting the system fields the same put
 /// emits as dimensions. Source: `MetricTransformation$dimensions` — "One metric filter can
@@ -130,7 +138,7 @@ fn budget_cases() -> Vec<BudgetCase> {
             case: "three dimensions beside one emitted system field",
             group: "/mf/budget-three-and-a-system-field",
             filter: "three-and-one-system-field",
-            pattern: "ERROR",
+            pattern: "{ $.severity = \"ERROR\" }",
             dimensions: &[("A", "$.a"), ("B", "$.b"), ("C", "$.c")],
             system_fields: &[SYSTEM_FIELD_DIMENSIONS[0]],
         },
@@ -138,7 +146,7 @@ fn budget_cases() -> Vec<BudgetCase> {
             case: "two dimensions beside both emitted system fields",
             group: "/mf/budget-two-and-both-system-fields",
             filter: "two-and-both-system-fields",
-            pattern: "%ERROR|WARN%",
+            pattern: "{ $.tenant.id = \"acme\" }",
             dimensions: &[("Tenant", "$.tenant.id"), ("Shard", "$shard")],
             system_fields: &SYSTEM_FIELD_DIMENSIONS,
         },
@@ -146,7 +154,7 @@ fn budget_cases() -> Vec<BudgetCase> {
             case: "one dimension past the budget both system fields almost fill",
             group: "/mf/budget-four-and-both-system-fields",
             filter: "four-and-both-system-fields",
-            pattern: "",
+            pattern: "{ $.a = 1 }",
             dimensions: &[
                 ("A", "$.a"),
                 ("B", "$.b"),
@@ -472,37 +480,47 @@ async fn a_dimension_value_that_is_no_selector_is_refused_with_the_services_fixe
 }
 
 /// Each dimension rule keeps its OWN sentence: over the budget, a value that is no
-/// selector, and a `defaultValue` declared beside dimensions are three different refusals
-/// of the same operation, so a client can still tell them apart.
+/// selector, a `defaultValue` declared beside dimensions and a filter pattern that names no
+/// field of the log event are four different refusals of the same operation, so a client can
+/// still tell them apart. Every row but the last carries a pattern that names event fields,
+/// so each row trips exactly one rule.
 #[tokio::test]
 async fn each_dimension_rule_keeps_its_own_message() {
     let logs = Logs::new();
     const GROUP: &str = "/mf/dimension-rules-apart";
+    const NAMING_PATTERN: &str = "{ $.status = \"fail\" }";
     let mut created = BTreeSet::new();
     create_group(&logs, &mut created, GROUP).await;
 
     let over_budget = put_body(
         GROUP,
         "apart-over-budget",
-        "ERROR",
+        NAMING_PATTERN,
         &[("A", "$.a"), ("B", "$.b"), ("C", "$.c"), ("D", "$.d")],
         &[],
     );
     let literal = put_body(
         GROUP,
         "apart-literal",
-        "ERROR",
+        NAMING_PATTERN,
         &[("Service", "checkout")],
         &[],
     );
     let mut with_default = put_body(
         GROUP,
         "apart-default-value",
-        "ERROR",
+        NAMING_PATTERN,
         &[("Service", "$.service")],
         &[],
     );
     with_default["metricTransformations"][0]["defaultValue"] = json!(0.0);
+    let unsupported_pattern = put_body(
+        GROUP,
+        "apart-unsupported-pattern",
+        "ERROR",
+        &[("Service", "$.service")],
+        &[],
+    );
 
     for (case, body, expected) in [
         ("over the dimension budget", over_budget, TOO_MANY_DIMENSIONS),
@@ -515,6 +533,11 @@ async fn each_dimension_rule_keeps_its_own_message() {
             "a default value beside dimensions",
             with_default,
             DIMENSIONS_AND_DEFAULT_VALUE,
+        ),
+        (
+            "a filter pattern that names no field of the log event",
+            unsupported_pattern,
+            PATTERN_WITHOUT_DIMENSIONS,
         ),
     ] {
         let (code, message) = logs.refusal("PutMetricFilter", &body).await;

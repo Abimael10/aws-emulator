@@ -257,6 +257,24 @@ impl FilterPattern {
             Self::Json(json) => json.match_message(message),
         }
     }
+
+    /// Whether this pattern NAMES fields of the log event — whether, for some event, the
+    /// values it extracts are keyed by a field this pattern selects rather than by nothing at
+    /// all.
+    ///
+    /// One of the syntax's STRUCTURED forms does: a JSON pattern selects the fields of a JSON
+    /// event by their `$.path`, and a space-delimited pattern selects the fields its list
+    /// NAMES. An unstructured pattern names no field of the event — it only states terms the
+    /// message carries — and neither does the empty pattern, which matches everything and
+    /// extracts nothing ([`Self::match_message`]).
+    #[must_use]
+    pub fn names_event_fields(&self) -> bool {
+        match self {
+            Self::Everything | Self::Terms(_) => false,
+            Self::SpaceDelimited(fields) => fields.names_a_field(),
+            Self::Json(_) => true,
+        }
+    }
 }
 
 /// An unstructured pattern: terms that must appear, terms that must not, and the
@@ -535,6 +553,16 @@ impl SpaceDelimitedPattern {
             _ => Some(Expression::All(parsed)),
         };
         Ok(Self { slots, condition })
+    }
+
+    /// Whether this list NAMES any of the fields it declares: a slot the list named is
+    /// selected by that name (`$name`), which is what a dimension value selects a
+    /// space-delimited field by. A list of nothing but the `...` wildcard names none.
+    fn names_a_field(&self) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|slot| slot.name.is_some())
     }
 
     /// Align the event's fields to this list and run its conditions over them.

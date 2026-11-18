@@ -186,6 +186,38 @@ pub fn filter_pattern_regex_count(pattern: &str) -> usize {
     count
 }
 
+/// The refusal for a metric transformation that declares `dimensions` while the filter
+/// pattern it is put with extracts no named field of the log event.
+///
+/// Dimensions are published "with metrics from values in JSON or space-delimited log events":
+/// a dimension VALUE is a selector of a field of the event
+/// ([`is_log_event_field_reference`]), so a pattern that names no field of the event — an
+/// unstructured one, which only states terms the message carries, or the empty one — leaves
+/// every dimension value selecting nothing. Such a filter could never emit the dimensioned
+/// metric it declares, so the put is refused rather than stored.
+///
+/// This is the whole message the service answers for the error class: fixed text that
+/// interpolates nothing of the request — not the pattern, not the filter name, not a
+/// dimension — so every put that trips the rule is refused with exactly this sentence.
+pub const METRIC_FILTER_PATTERN_WITHOUT_DIMENSIONS: &str =
+    "The specified filter pattern does not support dimensions";
+
+/// Whether a `filterPattern` SUPPORTS dimensions: whether it names fields of the log event, so
+/// a dimension value has something to select
+/// ([`filter_pattern::FilterPattern::names_event_fields`]).
+///
+/// A pattern this service cannot read names no field either: there is no field list in it to
+/// select by. A STRUCTURED pattern that does not read is refused by the configuration check
+/// on its own before this is reached
+/// ([`filter_pattern::validate_configured_pattern`]); an unstructured one whose terms the
+/// running grammar does not admit reaches here and names no field, which is the same answer
+/// every unstructured pattern gets.
+#[must_use]
+pub fn pattern_supports_dimensions(pattern: &str) -> bool {
+    filter_pattern::FilterPattern::parse(pattern)
+        .is_ok_and(|parsed| parsed.names_event_fields())
+}
+
 /// Hold one `metricTransformations` entry to the rules `PutMetricFilter` documents for it,
 /// answering the transformation to store. The `Err` carries the message to refuse with, as
 /// the service states the rule.
@@ -197,7 +229,10 @@ pub fn filter_pattern_regex_count(pattern: &str) -> usize {
 ///
 /// Everything the model already constrains — the metric name's and namespace's pattern and
 /// length, the `unit` enum, the one-entry list — is refused by the boundary walk before a
-/// handler runs, so this holds only the rules that span members.
+/// handler runs, so this holds only the rules that span members OF ONE TRANSFORMATION. The
+/// rule that spans the transformation and the FILTER PATTERN the same put names is
+/// [`pattern_supports_dimensions`], which the handler applies once the transformations
+/// themselves read.
 pub fn check_metric_transformation(
     transformation: &crate::ops::types::MetricTransformation,
     emitted_system_fields: usize,

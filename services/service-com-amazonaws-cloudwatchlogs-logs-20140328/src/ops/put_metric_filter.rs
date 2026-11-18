@@ -273,6 +273,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "The fields to use as dimensions for the metric": a dimension value SELECTS a field
+        // of the log event, so a pattern that names no field of the event supports no
+        // dimension at all ([`crate::state::pattern_supports_dimensions`]). Such a put is
+        // refused before anything is stored — otherwise the group would carry, report and
+        // count a filter that could never emit the dimensioned metric it declares.
+        if transformations
+            .iter()
+            .any(|transformation| !transformation.dimensions.is_empty())
+            && !crate::state::pattern_supports_dimensions(&input.filter_pattern)
+        {
+            return Err(invalid(
+                crate::state::METRIC_FILTER_PATTERN_WITHOUT_DIMENSIONS.to_string(),
+            ));
+        }
+
         // "Creates or updates a metric filter and associates it with the specified log
         // group": there is nothing to associate it with until that group exists.
         let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
