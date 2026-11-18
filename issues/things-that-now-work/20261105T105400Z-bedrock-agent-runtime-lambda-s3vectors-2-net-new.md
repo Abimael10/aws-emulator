@@ -37,6 +37,24 @@ Issue-Commit: c1082b91874a267e16e5e882b92de2a31503a88d
 
 > _Note: this issue was identified against the code base at commit `c1082b91874a267e16e5e882b92de2a31503a88d`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution note (both causes above are fixed; one residual cause is NOT this report's)
+
+Cause 1 is fixed: the runtime's call seam binds the vector store (`APIS` in
+`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/execution/aws_api.rs`), so
+`boto3.client("s3vectors")` constructs in a handler and the call reaches the service — 19 of the
+29 checks above pass again (every `cfn-*`, `cli-*`, `lambda-bedrock-*` and `pipeline-*` one).
+Cause 2 is fixed: the runtime supplies the socket interface, the TLS layer and the HTTP client
+built on them as its own standard library, so neither a handler module nor a module a deployment
+package vendors faults on `_socket` any more.
+
+RESIDUAL, for a new report: the ten `lambda-s3vectors-*` checks, whose deployment zip vendors
+`boto3` and `botocore` themselves, now fault one layer deeper —
+`{"errorMessage": "Unable to import module 'index': No module named 's3transfer'", "errorType":
+"Runtime.ImportModuleError"}`. The cause is that the runtime's site-packages carry the SDK but not
+the other distributions a managed runtime ships beside it (`s3transfer` here, which
+`boto3.s3.inject` pulls in when a client for Amazon S3 is built). That is neither cause filed
+above, and the ten checks are not covered by this report's resolution.
+
 ## Operation
 Invoke
 

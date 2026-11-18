@@ -71,6 +71,7 @@ const MUST_REACH: &[&str] = &[
     "opensearch",
     "rekognition",
     "s3",
+    "s3vectors",
     "secretsmanager",
     "sesv2",
     "sfn",
