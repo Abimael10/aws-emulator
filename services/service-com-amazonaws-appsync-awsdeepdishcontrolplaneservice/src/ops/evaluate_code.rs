@@ -264,7 +264,12 @@ fn answer(evaluation: Evaluation) -> Result<EvaluateCodeOutput, EvaluateCodeErro
         ..Default::default()
     };
     match outcome {
-        Outcome::Returned(result) => output.evaluation_result = Some(result),
+        // An early return is a function that RETURNED, with the value it was handed: this
+        // call evaluates ONE function rather than running a resolver's steps, so there is no
+        // later step for the early return to end.
+        Outcome::Returned(result) | Outcome::ReturnedEarly(result) => {
+            output.evaluation_result = Some(result);
+        }
         Outcome::Raised { message, .. } | Outcome::Stopped(message) => {
             output.error = Some(EvaluateCodeErrorDetail {
                 message: Some(message),

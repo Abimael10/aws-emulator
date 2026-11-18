@@ -978,6 +978,12 @@ impl Execution<'_> {
     ///
     /// Each of those steps is the resolver's `code` where it is defined by code, and its
     /// mapping template for that direction where it is defined by templates.
+    ///
+    /// A request function that called `runtime.earlyReturn(value)` has ENDED the step it
+    /// belongs to with `value`: for a UNIT resolver and for one function of a pipeline that is
+    /// that step ([`Self::run_step`], after which the pipeline carries on with the next
+    /// function), and for the pipeline's own BEFORE step it is the resolver — so the functions
+    /// and the after step do not run and `value` is the field's value.
     async fn run(
         &mut self,
         plan: &ResolverPlan,
@@ -1007,8 +1013,13 @@ impl Execution<'_> {
         let mut previous = match (&plan.code, &plan.templates) {
             (Some(code), _) => {
                 let context = step_context(&base, &stash, &Json::Null, None, &Json::Null);
-                self.evaluated(code, REQUEST_FUNCTION, &context, &mut stash)
-                    .await?
+                let evaluated = self
+                    .evaluated(code, REQUEST_FUNCTION, &context, &mut stash)
+                    .await?;
+                if evaluated.early {
+                    return Ok(evaluated.value);
+                }
+                evaluated.value
             }
             (None, Some(templates)) => match &templates.request {
                 Some(template) => {
@@ -1035,6 +1046,7 @@ impl Execution<'_> {
                 let context = step_context(&base, &stash, &previous, Some(&previous), &Json::Null);
                 self.evaluated(code, RESPONSE_FUNCTION, &context, &mut stash)
                     .await
+                    .map(|evaluated| evaluated.value)
             }
             (None, Some(templates)) => match &templates.response {
                 Some(template) => {
@@ -1051,6 +1063,10 @@ impl Execution<'_> {
 
     /// Run ONE step — a UNIT resolver, or one function of a pipeline — against its own data
     /// source, and answer what its definition made of the result.
+    ///
+    /// A request function that called `runtime.earlyReturn(value)` has ENDED this step with
+    /// `value`: the data source the step names is not called and the step's response function
+    /// does not run, so `value` is the step's result as it stands ([`Evaluated`]).
     ///
     /// A step carrying NEITHER `code` nor mapping templates has no definition to run, and that
     /// is exactly the Direct Lambda resolver AppSync documents: "VTL request mapping templates
@@ -1083,11 +1099,17 @@ impl Execution<'_> {
         let requested = self
             .evaluated(code, REQUEST_FUNCTION, &context, stash)
             .await?;
-        self.record_request(recorded, &requested);
+        if requested.early {
+            // The step generated no request for a data source, so its trace carries none:
+            // what it produced is the answer the code ended it with.
+            self.record_response(recorded, &requested.value);
+            return Ok(requested.value);
+        }
+        self.record_request(recorded, &requested.value);
         // A data source that was CALLED and did not answer is handed to the step's own
         // `ctx.error`, over which the response half still runs; a step no data source was
         // called for is reported to the caller ([`Self::run_templates`] states the rule).
-        let (result, error) = match self.data_source_outcome(step, &requested).await {
+        let (result, error) = match self.data_source_outcome(step, &requested.value).await {
             DataSourceOutcome::Result(result) => (result, Json::Null),
             DataSourceOutcome::Answered(failure) => (Json::Null, failure.reported()),
             DataSourceOutcome::NotCalled(failure) => return Err(failure),
@@ -1096,8 +1118,8 @@ impl Execution<'_> {
         let answered = self
             .evaluated(code, RESPONSE_FUNCTION, &context, stash)
             .await?;
-        self.record_response(recorded, &answered);
-        Ok(answered)
+        self.record_response(recorded, &answered.value);
+        Ok(answered.value)
     }
 
     /// Run one step that carries NO definition at all: the Direct Lambda resolver.
@@ -1154,7 +1176,7 @@ impl Execution<'_> {
         function: &str,
         context: &Json,
         stash: &mut Json,
-    ) -> Result<Json, Failure> {
+    ) -> Result<Evaluated, Failure> {
         if self.engine_runs >= MAX_ENGINE_RUNS {
             return Err(format!("{TOO_MANY_ENGINE_RUNS} {MAX_ENGINE_RUNS}.").into());
         }
@@ -1620,7 +1642,7 @@ impl Execution<'_> {
             })
             .collect();
         // Every member's request half, each over its own context and stash.
-        let mut prepared: Vec<Result<(FieldContext, Json, Json), Failure>> =
+        let mut prepared: Vec<Result<(FieldContext, Json, Evaluated), Failure>> =
             Vec::with_capacity(members.len());
         for (member, path) in members.iter().zip(&paths) {
             let Some((field, source)) = fields
@@ -1645,11 +1667,18 @@ impl Execution<'_> {
         let events: Vec<Json> = prepared
             .iter()
             .filter_map(|ready| ready.as_ref().ok())
+            // A member whose request half ended its step early is already answered, so it
+            // waits on no invocation and contributes no event to one.
+            .filter(|(_, _, requested)| !requested.early)
             .map(|(_, _, requested)| match step.has_definition() {
                 // A definition RENDERED the request, so the event is its `payload`; a Direct
                 // Lambda resolver has none, so the event is the context document itself.
-                true => requested.get(PAYLOAD_MEMBER).cloned().unwrap_or(Json::Null),
-                false => requested.clone(),
+                true => requested
+                    .value
+                    .get(PAYLOAD_MEMBER)
+                    .cloned()
+                    .unwrap_or(Json::Null),
+                false => requested.value.clone(),
             })
             .collect();
         let Some(data_source) = step.data_source.clone() else {
@@ -1670,10 +1699,14 @@ impl Execution<'_> {
         let batched = match step.has_definition() {
             true => prepared.iter().all(|ready| {
                 ready.as_ref().ok().is_none_or(|(_, _, requested)| {
-                    requested
-                        .get(OPERATION_MEMBER)
-                        .and_then(Json::as_str)
-                        .is_some_and(|operation| operation == BATCH_INVOKE_OPERATION)
+                    // A member that is already answered names no operation of its own, so it
+                    // decides nothing about how the others are invoked.
+                    requested.early
+                        || requested
+                            .value
+                            .get(OPERATION_MEMBER)
+                            .and_then(Json::as_str)
+                            .is_some_and(|operation| operation == BATCH_INVOKE_OPERATION)
                         || batches(step.max_batch_size)
                 })
             }),
@@ -1711,13 +1744,19 @@ impl Execution<'_> {
         };
         let mut resolved = Vec::with_capacity(members.len());
         for (path, ready) in paths.iter().zip(prepared) {
-            let (base, mut stash, _) = match ready {
+            let (base, mut stash, requested) = match ready {
                 Ok(ready) => ready,
                 Err(failure) => {
                     resolved.push(Err(failure));
                     continue;
                 }
             };
+            if requested.early {
+                // This member's own request half ended its step with that value, so there is
+                // no answer of the invocation to take for it and no response half to run.
+                resolved.push(Ok(requested.value));
+                continue;
+            }
             let result = match answers.next() {
                 Some(Ok(result)) => result,
                 Some(Err(failure)) => {
@@ -1743,6 +1782,10 @@ impl Execution<'_> {
     /// The REQUEST half of one member of a batched resolution: what the step's definition
     /// renders for it, or — for a Direct Lambda resolver — the field's own context document.
     ///
+    /// A request function that called `runtime.earlyReturn(value)` has ENDED this member's
+    /// step: the answer is reported `early` ([`Evaluated`]), and the caller then neither
+    /// invokes the data source for that member nor runs its response half.
+    ///
     /// `in_pipeline` says whether the step is a FUNCTION of a pipeline, which is what decides
     /// whether the resolution has a previous step at all.
     async fn batched_request(
@@ -1751,7 +1794,7 @@ impl Execution<'_> {
         base: &FieldContext,
         stash: &mut Json,
         in_pipeline: bool,
-    ) -> Result<Json, Failure> {
+    ) -> Result<Evaluated, Failure> {
         let previous = in_pipeline.then_some(&Json::Null);
         match (&step.code, &step.templates) {
             (Some(code), _) => {
@@ -1763,11 +1806,11 @@ impl Execution<'_> {
                 Some(template) => {
                     let context = step_context(base, stash, &Json::Null, previous, &Json::Null);
                     let rendered = self.rendered(template, &context, stash).await?;
-                    read_rendered(&rendered, REQUEST_TEMPLATE)
+                    read_rendered(&rendered, REQUEST_TEMPLATE).map(Evaluated::plain)
                 }
-                None => Ok(Json::Null),
+                None => Ok(Evaluated::plain(Json::Null)),
             },
-            (None, None) => Ok(direct_event(base, stash, previous)),
+            (None, None) => Ok(Evaluated::plain(direct_event(base, stash, previous))),
         }
     }
 
@@ -1796,6 +1839,7 @@ impl Execution<'_> {
             (Some(code), _) => {
                 self.evaluated(code, RESPONSE_FUNCTION, &context, stash)
                     .await
+                    .map(|evaluated| evaluated.value)
             }
             (None, Some(templates)) => match &templates.response {
                 Some(template) => {
@@ -2389,6 +2433,33 @@ fn step_context(
     })
 }
 
+/// What ONE evaluation of a resolver's code produced: the value it answered, and whether it
+/// ended the step it belongs to EARLY.
+///
+/// `runtime.earlyReturn(value)` "returns prematurely from a request function", so a request
+/// function that called it has ended the step it belongs to: nothing else of that step runs.
+/// A plain return is the step's request half answering the configuration its data source is
+/// then called with, which is a different thing, so the two are carried apart.
+#[derive(Debug, Clone)]
+struct Evaluated {
+    /// The value the evaluation answered.
+    value: Json,
+    /// Whether the code answered it through `runtime.earlyReturn`.
+    early: bool,
+}
+
+impl Evaluated {
+    /// A value a definition produced the ORDINARY way, which ends no step of its own: what a
+    /// mapping template renders, and the context document a step with no definition at all is
+    /// invoked over.
+    fn plain(value: Json) -> Self {
+        Self {
+            value,
+            early: false,
+        }
+    }
+}
+
 /// Run `function` of `code` over `context` and answer what it returned, carrying the stash
 /// it left behind onto `stash`.
 ///
@@ -2401,7 +2472,7 @@ async fn returned(
     function: &str,
     context: &Json,
     stash: &mut Json,
-) -> Result<Json, Failure> {
+) -> Result<Evaluated, Failure> {
     let evaluation =
         appsync_js::evaluate(code.to_string(), function.to_string(), context.clone()).await;
     if let Some(left) = evaluation
@@ -2411,8 +2482,16 @@ async fn returned(
     {
         *stash = left;
     }
+    let read = |text: &str| ::serde_json::from_str(text).unwrap_or(Json::Null);
     match evaluation.outcome {
-        Outcome::Returned(text) => Ok(::serde_json::from_str(&text).unwrap_or(Json::Null)),
+        Outcome::Returned(text) => Ok(Evaluated {
+            value: read(&text),
+            early: false,
+        }),
+        Outcome::ReturnedEarly(text) => Ok(Evaluated {
+            value: read(&text),
+            early: true,
+        }),
         Outcome::Raised {
             message,
             error_type: Some(error_type),

@@ -180,6 +180,14 @@ pub enum Outcome {
     /// The evaluated function returned: the JSON text of the value it returned, as the
     /// engine rendered it (`null` for a function that returned nothing).
     Returned(String),
+    /// The evaluated function ended the step it belongs to through `runtime.earlyReturn`:
+    /// the JSON text of the value that call was handed (`null` for a call handed nothing).
+    ///
+    /// The value is the step's answer exactly as a plain return's is, so a caller that wants
+    /// only the value reads the two the same way; a caller that RUNS a resolver step reads
+    /// them apart, because an early return is the request function saying the step is over —
+    /// the data source it names is not called and its response function does not run.
+    ReturnedEarly(String),
     /// The evaluated code did not return: it raised, or its module body did. The message is
     /// the error's own, and `error_type` the `errorType` the raise named — `util.error`'s
     /// second argument, which an error of a resolved field reports as its own `errorType` —
@@ -585,12 +593,14 @@ fn read_answer(answered: &str) -> (Outcome, Option<String>) {
         .filter(|text| text.len() <= MAX_ANSWER_BYTES)
         .map(str::to_string);
     let outcome = match document.get("outcome").and_then(Json::as_str) {
-        Some("returned") => {
+        Some(reported @ ("returned" | RETURNED_EARLY_OUTCOME)) => {
             let result = member("result");
             if result.len() > MAX_ANSWER_BYTES {
                 Outcome::Stopped(format!(
                     "the code returned more than {MAX_ANSWER_BYTES} bytes"
                 ))
+            } else if reported == RETURNED_EARLY_OUTCOME {
+                Outcome::ReturnedEarly(result)
             } else {
                 Outcome::Returned(result)
             }
@@ -609,6 +619,10 @@ fn read_answer(answered: &str) -> (Outcome, Option<String>) {
     };
     (outcome, stash)
 }
+
+/// What the sandbox's invoker ([`INVOKER_SOURCE`]) reports for a run the code ended through
+/// `runtime.earlyReturn`, which is what tells that outcome apart from a plain return.
+const RETURNED_EARLY_OUTCOME: &str = "returnedEarly";
 
 /// The message a raise carries: the error's own, as the code worded it.
 fn raised_message(caught: &::rquickjs::CaughtError<'_>) -> String {
@@ -869,10 +883,12 @@ const INVOKER_SOURCE: &str = r#"
             value = handler(context);
         } catch (error) {
             // `runtime.earlyReturn(obj)` ends the call with `obj` as its answer, so the
-            // raise it unwinds with is the code RETURNING rather than failing.
+            // raise it unwinds with is the code RETURNING rather than failing — reported
+            // under its own outcome, because a step whose request function returned this way
+            // is over (nothing else of the step runs).
             if (error !== null && typeof error === "object" && error.__appsyncEarlyReturn === true) {
                 return stringify({
-                    outcome: "returned",
+                    outcome: "returnedEarly",
                     result: render(error.data),
                     stash: stashed(context),
                 });
