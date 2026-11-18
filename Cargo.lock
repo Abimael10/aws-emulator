@@ -11723,6 +11723,7 @@ dependencies = [
  "hex",
  "http",
  "opentelemetry-proto",
+ "percent-encoding",
  "plotters",
  "png 0.17.16",
  "prost 0.14.6",

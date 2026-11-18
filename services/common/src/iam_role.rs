@@ -303,13 +303,31 @@ pub async fn held_role_is_unassumable_by_every(
     role_arn: &str,
     service_principals: &[&str],
 ) -> bool {
+    held_role_is_unassumable_by_every_through(ctx.callback(), region, role_arn, service_principals)
+        .await
+}
+
+/// [`held_role_is_unassumable_by_every`] asked through the emulator callback rather than
+/// through a request's own context, for a service that takes the role on for a task of its
+/// own — work the clock made due rather than work a request asked for.
+///
+/// The question, the grounds and the non-answers are
+/// [`held_role_is_unassumable_by_every`]'s; only who is asking differs
+/// ([`crate::iam_client::iam_client_through`]), exactly as for
+/// [`role_is_unassumable_through`].
+pub async fn held_role_is_unassumable_by_every_through(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    role_arn: &str,
+    service_principals: &[&str],
+) -> bool {
     if service_principals.is_empty() {
         return false;
     }
     let Some(role_name) = role_name(role_arn) else {
         return false;
     };
-    match role_answer(ctx.callback(), region, role_name).await {
+    match role_answer(callback, region, role_name).await {
         RoleAnswer::Held(document) => service_principals
             .iter()
             .all(|principal| trust_withholds(document.as_deref(), principal)),

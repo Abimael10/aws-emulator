@@ -66,6 +66,11 @@ pub const EXECUTION_STATUS_FAILED: &str = "Failed";
 /// that completed, so the value it carries is one the evaluation really compared.
 pub const RESULT_STATUS_COMPLETE: &str = "COMPLETE";
 
+/// The status the same member carries for the result of a run that produced NO aggregated value:
+/// the execution is part of the window the alarm evaluates, and it carries no value because
+/// nothing was computed for it, so the evaluation treats it as the missing data it is.
+pub const RESULT_STATUS_FAILED: &str = "FAILED";
+
 /// `PARTIAL_DATA`, one of the modelled `EvaluationState` values: "it indicates that the query
 /// returned the maximum 500 contributor groups but more matched. The alarm evaluates the
 /// available contributors, but results might be incomplete." (`LogAlarm$EvaluationState`)
@@ -164,11 +169,13 @@ pub struct LogQueryResult {
     pub query_result_id: String,
     /// The execution that produced it.
     pub query_execution_id: String,
-    /// The status of the result: [`RESULT_STATUS_COMPLETE`], the status of a value a completed
-    /// run computed.
+    /// The status of the result: [`RESULT_STATUS_COMPLETE`] for a value a completed run computed,
+    /// and [`RESULT_STATUS_FAILED`] for the result of a run that computed none.
     pub status: String,
-    /// The value itself, as the aggregation expression computed it over the run's rows.
-    pub value: f64,
+    /// The value itself, as the aggregation expression computed it over the run's rows, and `None`
+    /// for a run that produced no aggregation at all — there is no value to report for it, so the
+    /// result carries none and the fold counts it as missing.
+    pub value: Option<f64>,
     /// The contributor group it belongs to, for an aggregation that groups; `None` for one that
     /// yields a single value per execution.
     pub group: Option<String>,
@@ -199,6 +206,11 @@ pub struct LogAlarmQueryRun {
     /// The end of that window: "The offset, in seconds, before the scheduled execution time at
     /// which the query time range ends." (`ScheduleConfiguration$EndTimeOffset`)
     pub end_secs: i64,
+    /// "The Amazon Resource Name (ARN) of the IAM role that CloudWatch assumes when executing the
+    /// scheduled query against the configured log groups."
+    /// (`ScheduledQueryConfiguration$ScheduledQueryRoleARN`) — the identity the run is made under,
+    /// so a run is made only where that role can be taken on.
+    pub scheduled_query_role_arn: String,
     /// The aggregation the rows this run answers are folded by.
     pub aggregation_expression: String,
     /// When this run was triggered, as epoch seconds.
@@ -221,6 +233,11 @@ pub struct LogAlarmRunOutcome {
     /// Whether that failure is one the alarm's own configuration explains, which is what decides
     /// between the two failure values of `EvaluationState`.
     pub configuration_fault: bool,
+    /// The execution status the run ended in, for a run whose end the query's own text does not
+    /// explain — a run that never reached CloudWatch Logs at all because the identity it had to be
+    /// made under could not be taken on ends `Failed`, however much the alarm's configuration
+    /// explains it. `None` leaves the status to the fault the failure carries.
+    pub execution_status: Option<&'static str>,
 }
 
 impl State {
@@ -278,10 +295,12 @@ impl State {
         let Some(stored) = self.log_alarms.get_mut(&run.alarm_name) else {
             return;
         };
-        let status = match (&outcome.failure, outcome.configuration_fault) {
-            (None, _) => EXECUTION_STATUS_COMPLETE,
-            (Some(_), true) => EXECUTION_STATUS_INVALID_QUERY,
-            (Some(_), false) => EXECUTION_STATUS_FAILED,
+        let status = match (&outcome.failure, outcome.execution_status, outcome.configuration_fault)
+        {
+            (None, _, _) => EXECUTION_STATUS_COMPLETE,
+            (Some(_), Some(status), _) => status,
+            (Some(_), None, true) => EXECUTION_STATUS_INVALID_QUERY,
+            (Some(_), None, false) => EXECUTION_STATUS_FAILED,
         };
         // A run nothing could start has no query of its own to name, so the execution is
         // identified by the instant it was triggered at instead of by a query id nobody holds.
@@ -306,8 +325,23 @@ impl State {
                 },
                 query_execution_id: query_id.clone(),
                 status: RESULT_STATUS_COMPLETE.to_string(),
-                value: *value,
+                value: Some(*value),
                 group: group.clone(),
+                at_secs: run.triggered_secs,
+            });
+        }
+        // An execution that produced NOTHING is still one of the query results the alarm
+        // evaluates — it is a scheduled result of the alarm's window, with no aggregation to
+        // report — so it enters the window as a failed result carrying no value, which is what the
+        // fold counts as missing data for that slot. A run that merely matched no log line is not
+        // one of these: its aggregation ran and yielded no row.
+        if outcome.failure.is_some() {
+            stored.query_results.push(LogQueryResult {
+                query_result_id: query_id.clone(),
+                query_execution_id: query_id.clone(),
+                status: RESULT_STATUS_FAILED.to_string(),
+                value: None,
+                group: None,
                 at_secs: run.triggered_secs,
             });
         }
@@ -444,6 +478,7 @@ fn query_run(alarm: &LogAlarm, now_secs: f64) -> Option<LogAlarmQueryRun> {
             .unwrap_or_default(),
         start_secs,
         end_secs,
+        scheduled_query_role_arn: configuration.scheduled_query_role_arn.clone(),
         aggregation_expression: configuration.aggregation_expression.clone(),
         triggered_secs: now_secs,
     })
@@ -501,14 +536,22 @@ impl Verdict {
 
         let breaching = window
             .iter()
-            .filter(|result| (comparison.breaches)(result.value, threshold))
+            .filter_map(|result| result.value)
+            .filter(|value| (comparison.breaches)(*value, threshold))
             .count();
-        let not_breaching = window.len().saturating_sub(breaching);
+        // Only a result that CARRIES a value was compared at all: an execution that produced no
+        // aggregation fills its slot of the window with no value to grade, so the slot is missing
+        // data exactly as a slot no execution has reached yet is.
+        let graded = window
+            .iter()
+            .filter(|result| result.value.is_some())
+            .count();
+        let not_breaching = graded.saturating_sub(breaching);
         // A slot of the window no execution has produced a result for yet is missing data, and
         // "How this alarm handles missing data points. Valid values are breaching,
         // notBreaching, ignore, and missing." (`LogAlarm$TreatMissingData`) says what each one
         // of them counts as.
-        let missing = evaluate.saturating_sub(window.len());
+        let missing = evaluate.saturating_sub(graded);
         let arm = alarm.treat_missing_data.as_deref().unwrap_or(MISSING_MISSING);
         let (breaching, not_breaching) = match arm {
             MISSING_BREACHING => (breaching + missing, not_breaching),
@@ -550,8 +593,8 @@ impl Verdict {
         let deciding = state == ALARM_STATE_ALARM;
         let cited: Vec<f64> = window
             .iter()
-            .filter(|result| (comparison.breaches)(result.value, threshold) == deciding)
-            .map(|result| result.value)
+            .filter_map(|result| result.value)
+            .filter(|value| (comparison.breaches)(*value, threshold) == deciding)
             .collect();
         Some(Self {
             state: state.to_string(),
@@ -732,7 +775,11 @@ fn result_document(result: &LogQueryResult) -> Value {
         Value::from(result.query_result_id.clone()),
     );
     entry.insert("status".to_string(), Value::from(result.status.clone()));
-    entry.insert("value".to_string(), Value::from(result.value));
+    // A result no aggregation was computed for carries no value member at all: there is nothing to
+    // report for it, and a value stated for it would be one nothing measured.
+    if let Some(value) = result.value {
+        entry.insert("value".to_string(), Value::from(value));
+    }
     if let Some(group) = result.group.as_deref() {
         entry.insert("contributorGroup".to_string(), Value::from(group));
     }

@@ -54,7 +54,7 @@ fn results(values: &[f64]) -> Vec<LogQueryResult> {
             query_result_id: format!("execution-{index}"),
             query_execution_id: format!("execution-{index}"),
             status: RESULT_STATUS_COMPLETE.to_string(),
-            value: *value,
+            value: Some(*value),
             group: None,
             at_secs: 1_700_000_000.0 + index as f64,
         })

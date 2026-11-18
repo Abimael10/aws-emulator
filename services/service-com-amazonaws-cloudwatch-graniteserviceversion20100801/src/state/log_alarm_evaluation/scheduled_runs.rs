@@ -25,6 +25,14 @@
 //! one whose query it could not execute, is a different thing: the query or the aggregation the
 //! alarm is configured with is one nothing can run, which is what `EvaluationState` reports as a
 //! configuration error.
+//!
+//! A run is made UNDER AN IDENTITY: "the IAM role that CloudWatch assumes when executing the
+//! scheduled query against the configured log groups"
+//! (`ScheduledQueryConfiguration$ScheduledQueryRoleARN`), so the role is taken on BEFORE the
+//! query is started and a role the account's IAM holds that trusts none of the principals this
+//! execution is made by stops the run before it reaches the log events — the alarm's own
+//! configuration names a role nothing can execute its query under, which is the other
+//! configuration error `EvaluationState` reports.
 
 use ::smithy_server_runtime::EmbeddedEmulator;
 
@@ -95,6 +103,25 @@ async fn execute(
     run: &LogAlarmQueryRun,
     deadline: ::std::time::Instant,
 ) -> Option<LogAlarmRunOutcome> {
+    // The identity FIRST: an execution CloudWatch cannot make under the role the alarm names is
+    // one that never reaches the log events, so nothing is asked of CloudWatch Logs for it.
+    if let Some(refusal) = unassumable_role(callback, run).await {
+        ::tracing::warn!(
+            alarm = %run.alarm_name,
+            role = %run.scheduled_query_role_arn,
+            "this log alarm's scheduled query role could not be assumed"
+        );
+        return Some(LogAlarmRunOutcome {
+            failure: Some(refusal),
+            // The role the alarm is configured with is one its query cannot be executed under:
+            // the setup is what calls for review, which is the configuration-error reading of
+            // `EvaluationState`.
+            configuration_fault: true,
+            // No query was started, so the execution did not end on anything its text says.
+            execution_status: Some(super::EXECUTION_STATUS_FAILED),
+            ..LogAlarmRunOutcome::default()
+        });
+    }
     let client = logs_client(callback, &run.region);
     // ONE query: the alarm's query string and the aggregation that folds its rows, which the
     // service that holds the log events compiles, bounds and computes.
@@ -198,6 +225,7 @@ async fn execute(
                 partial,
                 failure: None,
                 configuration_fault: false,
+                execution_status: None,
             });
         }
         if status == QUERY_STATUS_FAILED || QUERY_STATUS_ENDED.contains(&status.as_str()) {
@@ -225,6 +253,76 @@ async fn execute(
         }
         ::tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Why the role this run must be made under cannot be taken on, or `None` when nothing says it
+/// cannot.
+///
+/// The question is the shared one every service that acts under a caller-supplied role asks of
+/// IAM — which role of this account the ARN names, what IAM holds under that name, and what the
+/// trust document it carries admits — asked here on a task the clock owes rather than on a
+/// request ([`service_common::iam_role::held_role_is_unassumable_by_every_through`]). Only a role
+/// IAM ANSWERED about stops a run: a value naming no role of this account, a role this account's
+/// IAM holds nothing under (such a role is routinely provisioned out of band, so its absence says
+/// nothing about it) and an emulator with no IAM to ask all leave the run to be made.
+async fn unassumable_role(callback: &EmbeddedEmulator, run: &LogAlarmQueryRun) -> Option<String> {
+    let offered = execution_principals(&run.region);
+    let principals: Vec<&str> = offered.iter().map(String::as_str).collect();
+    ::service_common::iam_role::held_role_is_unassumable_by_every_through(
+        callback,
+        &run.region,
+        &run.scheduled_query_role_arn,
+        &principals,
+    )
+    .await
+    .then(|| {
+        // UNVERIFIED WORDING: CloudWatch publishes no sentence for the state reason of an alarm
+        // whose query role cannot be assumed, so this one names the role the alarm is configured
+        // with and the trust it would need — which is what the review `EVALUATION_ERROR` calls
+        // for is about.
+        format!(
+            "the scheduled query role {} could not be assumed: its trust policy does not let {} \
+             assume it",
+            run.scheduled_query_role_arn,
+            EXECUTING_PRINCIPALS.join(" or ")
+        )
+    })
+}
+
+/// `logs.amazonaws.com`: the service principal of CloudWatch Logs, whose scheduled query RUNS the
+/// execution and whose log events it reads.
+const LOGS_SERVICE_PRINCIPAL: &str = "logs.amazonaws.com";
+
+/// The suffix every AWS service principal carries after the service's own label, which is what
+/// the Regional spelling of one is written around.
+const PRINCIPAL_SUFFIX: &str = ".amazonaws.com";
+
+/// The service principals this execution is made by.
+///
+/// "the IAM role that CloudWatch assumes when executing the scheduled query against the
+/// configured log groups" (`ScheduledQueryConfiguration$ScheduledQueryRoleARN`): the execution is
+/// the run of the service-managed CloudWatch Logs scheduled query the alarm owns — it reads that
+/// service's log events, which is why the run is made with its operations — and the alarm the
+/// query belongs to is CloudWatch's own, so a trust document naming either of them names this
+/// assume. This service's own principal is the one spelling of it this crate keeps
+/// ([`super::super::alarm_actions::CLOUDWATCH_SERVICE_PRINCIPAL`]).
+const EXECUTING_PRINCIPALS: [&str; 2] = [
+    LOGS_SERVICE_PRINCIPAL,
+    super::super::alarm_actions::CLOUDWATCH_SERVICE_PRINCIPAL,
+];
+
+/// Those principals as a trust policy may name them: each of them, and the Regional
+/// `<service>.<region>.amazonaws.com` spelling a document written for one Region's resources names
+/// the same service under — so a document admitting any of them admits the run.
+fn execution_principals(region: &str) -> Vec<String> {
+    let mut offered: Vec<String> = Vec::new();
+    for principal in EXECUTING_PRINCIPALS {
+        offered.push(principal.to_string());
+        if let Some(service) = principal.strip_suffix(PRINCIPAL_SUFFIX) {
+            offered.push(format!("{service}.{region}{PRINCIPAL_SUFFIX}"));
+        }
+    }
+    offered
 }
 
 /// What CloudWatch Logs REFUSED this request with, or `None` when it answered nothing at all —
