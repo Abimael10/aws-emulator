@@ -37,13 +37,14 @@
 //!   `inlineSessionState.returnControlInvocationResults`, which re-enter the next turn's
 //!   orchestration prompt; an `invocationId` no response of this conversation issued is the
 //!   modelled `ValidationException` (400), and a result list outside the modelled 1..5 is
-//!   refused by the model's own bound. That bound's refusal names the member and states the
-//!   requirement and quotes no value, because the constraint envelope that words it
-//!   (`aws_smithy_schema_server::constraints`, vendored and read-only) renders no value for
-//!   a COLLECTION — this service's wording for every such member, pinned across its
-//!   operations by `tests/all/collection_length_refusals.rs` — while AWS additionally quotes
-//!   the submitted list. That difference is the envelope's for every service in this
-//!   workspace, not one operation's to special-case.
+//!   refused by the model's own bound. That bound's refusal QUOTES the results the request
+//!   submitted, rendered the way a value of that shape prints — the list in brackets, each
+//!   member under its shape's name over every member that shape declares — because the value
+//!   a constraint clause states is the caller's own input; the collection the framework's
+//!   walk has no rendering for is restored by this service's own
+//!   `crate::service::submitted_collections` layer, which every operation of this service
+//!   words that one clause through, and pinned across them by
+//!   `tests/all/collection_length_refusals.rs`.
 //!
 //! NO LANGUAGE MODEL RUNS IN THIS EMULATOR, and nothing here pretends otherwise. The
 //! `chunk` events carry the notice the Bedrock Runtime plane of this same emulator answers
@@ -130,12 +131,11 @@
 use super::types::*;
 
 use aws_smithy_runtime_api::http::{Request, Response};
-use aws_smithy_schema_server::ProtocolError;
 use service_common::event_stream::{
     error_response, event_stream_response, frame_event, read_request, EventStreamOperation,
     RequestRefusal,
 };
-use smithy_server_runtime::{BoxFuture, OperationContext, Refusal, ServerHttpProtocol, Service};
+use smithy_server_runtime::{BoxFuture, OperationContext, ServerHttpProtocol, Service};
 
 use crate::state::inline_agent as inline;
 
@@ -817,12 +817,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> EventStreamOperat
             ) {
                 Ok(input) => input,
                 Err(RequestRefusal::Invalid(violations)) => {
-                    let chosen = svc.override_refusal(&Refusal::Invalid(violations.clone()));
-                    return definition.refusal_response(
-                        ProtocolError::Invalid(violations),
-                        chosen,
-                        req,
-                    );
+                    // Refused through this service's ONE refusal seam for a hand-authored
+                    // operation, so the clause about a COLLECTION member quotes the
+                    // collection the request carried — which the framework's walk has no
+                    // rendering for (see `crate::service::submitted_collections`).
+                    return crate::service::submitted_collections::quoted_refusal_response::<
+                        InvokeInlineAgentInput,
+                    >(svc, req, &InvokeInlineAgentInput::SCHEMA, violations);
                 }
                 // A body the protocol's codec could not parse has no violation form, so
                 // the reader's own sentence is what the modelled 400 carries.

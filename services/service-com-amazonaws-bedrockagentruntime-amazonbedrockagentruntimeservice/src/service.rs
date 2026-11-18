@@ -55,6 +55,11 @@ use crate::ops::retrieve_and_generate_stream::{self, RetrieveAndGenerateStream};
 /// pre-signed URL `GetDocumentContent` hands out for it, which is not an API call at all.
 pub(crate) mod ingested_content;
 
+/// See the module docs of that file: the collection a constraint clause about a COLLECTION
+/// member quotes, which [`Service::override_refusal`] cannot state because it is handed the
+/// violations alone and never the request they were found in.
+pub(crate) mod submitted_collections;
+
 /// The `@pattern` this service PUBLISHES for a member whose on-disk model records a STALE
 /// spelling of the same constraint, keyed by the stale text the generated schema carries.
 ///
@@ -133,6 +138,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// document whose bytes travelled in its ingestion; [`Service::override_operation`]
     /// hands it the requests it claims (see [`ingested_content`]).
     ingested_content: ingested_content::IngestedContentRoute<Eng>,
+    /// The same modelled operations the generated table holds, each served so that a
+    /// constraint clause about a COLLECTION member states the collection the request
+    /// carried, keyed by the routing key the protocol resolves and built from the SAME
+    /// shared engine (see [`submitted_collections`]). Held on the service because
+    /// [`Service::override_operation`] hands back a borrow of `self`.
+    quoting_submitted_collections: smithy_server_runtime::OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -150,6 +161,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             retrieve_and_generate_stream: EventStreamRoute(RetrieveAndGenerateStream::new(
                 engine.clone(),
             )),
+            quoting_submitted_collections: submitted_collections::quoting_submitted_collections(
+                &engine,
+            ),
             ingested_content: ingested_content::IngestedContentRoute::new(engine),
         }
     }
@@ -233,7 +247,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if self.ingested_content.claims(req).is_some() {
             return Some(&self.ingested_content as &dyn ErasedOperation);
         }
-        None
+        // Every other request is served by the operation the generated routing table names,
+        // through the layer that lets a constraint clause about a COLLECTION member state
+        // the collection the request carried (see [`submitted_collections`]). The routing
+        // DECISION is not overridden: the key is resolved by the model's own protocol, and a
+        // request that table cannot serve is declined here, so the framework's
+        // routing-error path stays exactly as it was.
+        let operation = self.definition().protocol().routing_key(req).ok()?;
+        self.definition().routing_table().get(operation)?;
+        self.quoting_submitted_collections.get(operation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

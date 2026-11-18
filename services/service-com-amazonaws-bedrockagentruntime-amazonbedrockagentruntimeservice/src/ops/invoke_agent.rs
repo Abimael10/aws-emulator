@@ -78,12 +78,11 @@
 use super::types::*;
 
 use aws_smithy_runtime_api::http::{Request, Response};
-use aws_smithy_schema_server::ProtocolError;
 use service_common::event_stream::{
     error_response, event_stream_response, frame_event, read_request, EventStreamOperation,
     RequestRefusal,
 };
-use smithy_server_runtime::{BoxFuture, OperationContext, Refusal, ServerHttpProtocol, Service};
+use smithy_server_runtime::{BoxFuture, OperationContext, ServerHttpProtocol, Service};
 
 use crate::state::agent_invocation as invocation;
 
@@ -380,12 +379,12 @@ impl<Eng: Send + Sync + 'static> EventStreamOperation for InvokeAgent<Eng> {
                 match read_request::<InvokeAgentInput>(protocol, req, &InvokeAgentInput::SCHEMA) {
                     Ok(input) => input,
                     Err(RequestRefusal::Invalid(violations)) => {
-                        let chosen = svc.override_refusal(&Refusal::Invalid(violations.clone()));
-                        return definition.refusal_response(
-                            ProtocolError::Invalid(violations),
-                            chosen,
-                            req,
-                        );
+                        // This service's ONE refusal seam for a hand-authored operation, so
+                        // the clause about a COLLECTION member quotes the collection the
+                        // request carried (see `crate::service::submitted_collections`).
+                        return crate::service::submitted_collections::quoted_refusal_response::<
+                            InvokeAgentInput,
+                        >(svc, req, &InvokeAgentInput::SCHEMA, violations);
                     }
                     // A body the protocol's codec could not parse has no violation form, so
                     // the reader's own sentence is what the modelled 400 carries.
