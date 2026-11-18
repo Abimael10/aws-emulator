@@ -42,3 +42,37 @@ Status and error code do not diverge (200 == 200) and there is no error message 
 3. Observe HTTP 200 with an empty ControlMappings list, instead of that control's mapping set (30 entries in the recording, spanning MappingType FRAMEWORK, COMMON_CONTROL and RELATED_CONTROL).
 4. Repeat for the other filtered control ARNs exercised by steps task#2..task#20 of the same fixture; every one returns no mappings.
 5. Also try {"Filter": {"MappingTypes": ["RELATED_CONTROL"]}} and {"Filter": {"CommonControlArns": ["arn:aws:controlcatalog:::common-control/1d01qjgc798y7qvapb22amb3a"]}} — the same empty list comes back, confirming no mapping dataset exists behind any filter arm.
+
+## Resolution
+
+The reported symptom does not reproduce on this checkout: the catalog carries its
+control-mapping dataset, and `ListControlMappings` resolves all three filter arms
+(`ControlArns`, `CommonControlArns`, `MappingTypes`) against it, with `MaxResults` /
+`NextToken` pagination — pinned by
+`services/service-com-amazonaws-controlcatalog-controlcatalog/tests/all/control_mappings.rs`
+and `.../tests/all/single_resource_filter_paging.rs`.
+
+One part of the catalog WAS wrong under the rule a FRAMEWORK mapping follows — a
+mapping names the framework by the designator the catalog publishes it under, the
+catalog cross-walks a requirement into every EDITION of a framework it publishes (each
+under its own designator), and the item beside a designator is that edition's own
+identifier for the requirement — and was fixed:
+
+* the catalog published one edition per framework, and wrote the ISO/IEC 27001:2022
+  Annex A clause numbers under the bare `ISO-IEC-27001` designator with an `A.` prefix
+  that belongs to the 2013 edition's numbering. It now publishes both editions the
+  recordings show (`FedRAMP-r4` beside `FedRAMP-r5`, `ISO-IEC-27001` beside
+  `ISO-IEC-27001:2022-Annex-A`, `SSAE-18-SOC-2` beside `SSAE-18-SOC-2-Oct-2023`), each
+  in its own numbering, with the restating edition DERIVED from the one it restates
+  (`src/state/published_controls.rs`). `tests/all/framework_cross_walk.rs` pins the
+  designator form and the per-edition numbering over every published framework.
+
+The single recorded cause is DECLINED, for the reason the resolved
+`20261023T204557Z-controlcatalog-listcontrolmappings-returns-no-framework-common-control-or.md`
+issue recorded for this same replay key: it asks for the mapping set AWS publishes for
+one opaque AWS catalog identifier — 4 to 44 FRAMEWORK, COMMON_CONTROL and
+RELATED_CONTROL rows per control — and, as this report itself states, "[t]he catalog's
+actual mapping content is recorded behavior only". No rule derives those rows from the
+request or from the model, so seeding them would be fitting the recorded instance rather
+than implementing the rule. The replay of this fixture therefore still diverges on
+`$.ControlMappings[*]`.

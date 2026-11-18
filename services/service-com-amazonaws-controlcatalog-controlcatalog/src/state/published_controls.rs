@@ -228,14 +228,29 @@ const NO_GOVERNED_RESOURCES: &[&str] = &[];
 
 // The compliance frameworks this catalog cross-walks its controls into.
 //
-// A FRAMEWORK mapping names the framework by the compact, version-bearing designator
-// the catalog publishes it under — the framework's abbreviation, the revision or
-// version it is read at, and nothing else (`NIST-CSF-v1.1`, `PCI-DSS-v4.0`) — because
-// the designator is what identifies a framework ACROSS the surfaces that cross-walk
-// into it, while a prose title is one surface's wording of it. The item beside it in a
-// mapping row is that framework's own identifier for the requirement (`PR.AC-4`). The
-// modeled `FrameworkName` admits 3..250 characters, so either form would serialize;
-// the designator is the one a client can join on.
+// A FRAMEWORK mapping names the framework by the compact designator the catalog
+// publishes it under — the framework's abbreviation, followed by the EDITION it is read
+// at where the catalog reads it at a particular one, and nothing else — because the
+// designator is what identifies a framework ACROSS the surfaces that cross-walk into it,
+// while a prose title is one surface's wording of it. The edition is whichever form that
+// framework issues its editions in: a version (`NIST-CSF-v1.1`, `PCI-DSS-v4.0`), a
+// revision (`FedRAMP-r4`), a level (`CMMC-Level2`), the part of a wider standard the
+// edition is read at (`ISO-IEC-27001:2022-Annex-A`) or the publication date of the
+// edition, for a framework that issues dated editions rather than numbered ones
+// (`SSAE-18-SOC-2-Oct-2023`).
+//
+// The catalog cross-walks a requirement into EVERY edition of a framework it publishes,
+// each under its own designator, because a client reads its compliance obligation at the
+// edition it is audited against: so the frameworks below carry more than one designator
+// for one framework where the catalog publishes more than one of its editions, and an
+// edition that restates another edition's requirements is DERIVED from it (see
+// [`framework_mappings`]) rather than transcribed. The item beside a designator is always
+// that EDITION's own identifier for the requirement — the 2013 edition of ISO/IEC 27001
+// numbers its Annex A controls `A.9.4.1` and the 2022 edition numbers its Annex A clauses
+// `8.22` — so an item is never renumbered from one edition into another's designator.
+//
+// The modeled `FrameworkName` admits 3..250 characters and no pattern, so a prose title
+// would serialize too; the designator is the one a client can join on.
 pub(super) const NIST_SP_800_53_R5: &str = "NIST-SP-800-53-r5";
 pub(super) const NIST_SP_800_171_R2: &str = "NIST-SP-800-171-r2";
 pub(super) const NIST_CSF_V1_1: &str = "NIST-CSF-v1.1";
@@ -243,11 +258,14 @@ pub(super) const PCI_DSS_V4_0: &str = "PCI-DSS-v4.0";
 pub(super) const CIS_AWS_BENCHMARK_V3_0: &str = "CIS-AWS-Benchmark-v3.0";
 pub(super) const CIS_CONTROLS_V8_0: &str = "CIS-v8.0";
 pub(super) const CIS_GCP_BENCHMARK_V2_0: &str = "CIS-GCP-Benchmark-v2.0";
+pub(super) const FEDRAMP_R4: &str = "FedRAMP-r4";
 pub(super) const FEDRAMP_R5: &str = "FedRAMP-r5";
 pub(super) const ISO_IEC_27001: &str = "ISO-IEC-27001";
+pub(super) const ISO_IEC_27001_2022_ANNEX_A: &str = "ISO-IEC-27001:2022-Annex-A";
 pub(super) const CRI_PROFILE_V2_2: &str = "CRI-Profile-v2.2";
 pub(super) const CMMC_LEVEL_2: &str = "CMMC-Level2";
 pub(super) const SSAE_18_SOC_2: &str = "SSAE-18-SOC-2";
+pub(super) const SSAE_18_SOC_2_OCT_2023: &str = "SSAE-18-SOC-2-Oct-2023";
 pub(super) const AWS_WAF_V10: &str = "AWS-WAF-v10";
 
 /// Every framework designator the catalog publishes, which is also the set a
@@ -260,11 +278,14 @@ pub(super) const PUBLISHED_FRAMEWORKS: &[&str] = &[
     CIS_AWS_BENCHMARK_V3_0,
     CIS_CONTROLS_V8_0,
     CIS_GCP_BENCHMARK_V2_0,
+    FEDRAMP_R4,
     FEDRAMP_R5,
     ISO_IEC_27001,
+    ISO_IEC_27001_2022_ANNEX_A,
     CRI_PROFILE_V2_2,
     CMMC_LEVEL_2,
     SSAE_18_SOC_2,
+    SSAE_18_SOC_2_OCT_2023,
     AWS_WAF_V10,
 ];
 
@@ -2731,7 +2752,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "An inventory of system components that are in scope is maintained".
             (PCI_DSS_V4_0, "12.5.1"),
             // "Inventory of information and other associated assets".
-            (ISO_IEC_27001, "A.5.9"),
+            (ISO_IEC_27001_2022_ANNEX_A, "5.9"),
             // "Asset inventories are maintained".
             (CRI_PROFILE_V2_2, "ID.AM-01.01"),
             // "Logical access security software, infrastructure and architectures".
@@ -2755,7 +2776,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Collect audit logs".
             (CIS_CONTROLS_V8_0, "8.2"),
             // "Logging".
-            (ISO_IEC_27001, "A.8.15"),
+            (ISO_IEC_27001_2022_ANNEX_A, "8.15"),
             // "Event logs are generated and made available for monitoring".
             (CRI_PROFILE_V2_2, "DE.CM-09.01"),
             // "Configure service and application logging".
@@ -2779,7 +2800,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Ensure adequate audit log storage".
             (CIS_CONTROLS_V8_0, "8.3"),
             // "Logging".
-            (ISO_IEC_27001, "A.8.15"),
+            (ISO_IEC_27001_2022_ANNEX_A, "8.15"),
             // "The integrity of logged data is protected".
             (CRI_PROFILE_V2_2, "PR.DS-06.01"),
             // "Monitoring of system components for anomalies".
@@ -2800,7 +2821,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Retain audit logs".
             (CIS_CONTROLS_V8_0, "8.10"),
             // "Protection of records".
-            (ISO_IEC_27001, "A.5.33"),
+            (ISO_IEC_27001_2022_ANNEX_A, "5.33"),
             // "Records are retained for the defined retention period".
             (CRI_PROFILE_V2_2, "PR.IP-04.01"),
             // "Monitoring of system components for anomalies".
@@ -2821,7 +2842,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Encrypt sensitive data at rest".
             (CIS_CONTROLS_V8_0, "3.11"),
             // "Use of cryptography".
-            (ISO_IEC_27001, "A.8.24"),
+            (ISO_IEC_27001_2022_ANNEX_A, "8.24"),
             // "Data at rest is protected by encryption".
             (CRI_PROFILE_V2_2, "PR.DS-01.01"),
             // "Enforce encryption at rest".
@@ -2845,7 +2866,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Encrypt sensitive data in transit".
             (CIS_CONTROLS_V8_0, "3.10"),
             // "Use of cryptography".
-            (ISO_IEC_27001, "A.8.24"),
+            (ISO_IEC_27001_2022_ANNEX_A, "8.24"),
             // "Data in transit is protected by encryption".
             (CRI_PROFILE_V2_2, "PR.DS-02.01"),
             // "Enforce encryption in transit".
@@ -2871,7 +2892,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Configure data access control lists".
             (CIS_CONTROLS_V8_0, "3.3"),
             // "Access control".
-            (ISO_IEC_27001, "A.5.15"),
+            (ISO_IEC_27001_2022_ANNEX_A, "5.15"),
             // "Access permissions are granted on a least-privilege basis".
             (CRI_PROFILE_V2_2, "PR.AC-04.01"),
             // "Logical access security software, infrastructure and architectures".
@@ -2893,7 +2914,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Restrict administrator privileges to dedicated administrator accounts".
             (CIS_CONTROLS_V8_0, "5.4"),
             // "Privileged access rights".
-            (ISO_IEC_27001, "A.8.2"),
+            (ISO_IEC_27001_2022_ANNEX_A, "8.2"),
             // "Privileged access is approved and recorded".
             (CRI_PROFILE_V2_2, "PR.AC-04.03"),
             // "Grant least privilege access".
@@ -2917,7 +2938,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Require MFA for administrative access".
             (CIS_CONTROLS_V8_0, "6.5"),
             // "Authentication information".
-            (ISO_IEC_27001, "A.5.17"),
+            (ISO_IEC_27001_2022_ANNEX_A, "5.17"),
             // "Multi-factor authentication is required for privileged access".
             (CRI_PROFILE_V2_2, "PR.AC-01.02"),
             // "Use strong sign-in mechanisms".
@@ -2941,7 +2962,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Use unique passwords".
             (CIS_CONTROLS_V8_0, "5.2"),
             // "Authentication information".
-            (ISO_IEC_27001, "A.5.17"),
+            (ISO_IEC_27001_2022_ANNEX_A, "5.17"),
             // "Credentials are rotated at a defined frequency".
             (CRI_PROFILE_V2_2, "PR.AC-01.03"),
             // "Use temporary credentials".
@@ -2967,7 +2988,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Use unique passwords".
             (CIS_CONTROLS_V8_0, "5.2"),
             // "Authentication information".
-            (ISO_IEC_27001, "A.5.17"),
+            (ISO_IEC_27001_2022_ANNEX_A, "5.17"),
             // "Authentication credentials meet defined strength requirements".
             (CRI_PROFILE_V2_2, "PR.AC-01.01"),
             // "Logical access security software, infrastructure and architectures".
@@ -2991,7 +3012,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Collect network traffic flow logs".
             (CIS_CONTROLS_V8_0, "13.6"),
             // "Monitoring activities".
-            (ISO_IEC_27001, "A.8.16"),
+            (ISO_IEC_27001_2022_ANNEX_A, "8.16"),
             // "Network traffic is monitored for anomalous activity".
             (CRI_PROFILE_V2_2, "DE.CM-01.01"),
             // "Monitoring of system components for anomalies".
@@ -3013,7 +3034,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Implement and manage a firewall on servers".
             (CIS_CONTROLS_V8_0, "4.4"),
             // "Networks security".
-            (ISO_IEC_27001, "A.8.20"),
+            (ISO_IEC_27001_2022_ANNEX_A, "8.20"),
             // "Network boundaries restrict administrative access".
             (CRI_PROFILE_V2_2, "PR.IR-01.03"),
             // "Create network layers".
@@ -3037,7 +3058,7 @@ pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
             // "Centralize security event alerting".
             (CIS_CONTROLS_V8_0, "13.1"),
             // "Monitoring activities".
-            (ISO_IEC_27001, "A.8.16"),
+            (ISO_IEC_27001_2022_ANNEX_A, "8.16"),
             // "Malicious activity is detected and analyzed".
             (CRI_PROFILE_V2_2, "DE.CM-01.02"),
             // "Analyze logs, findings and metrics centrally".
@@ -3084,6 +3105,104 @@ const NIST_800_171_FAMILIES: &[(&str, &str)] = &[
     ("3.14", "SI"),
 ];
 
+/// The ISO/IEC 27001:2013 Annex A controls an ISO/IEC 27001:2022 Annex A clause
+/// restates: `(the 2022 clause, the 2013 controls it corresponds to)`.
+///
+/// The 2022 edition consolidated and renumbered the 2013 Annex A controls, and the
+/// correspondence between the two numberings is published WITH the edition — so the
+/// 2013 edition's rows are derived from it rather than cross-walked a second time by
+/// hand, which is also what keeps the two editions from disagreeing about which
+/// requirement a control satisfies. A clause the 2022 edition introduced corresponds to
+/// no 2013 control and so restates nothing. Each row's comment is the 2022 clause's own
+/// title, then the titles of the 2013 controls it consolidated.
+const ANNEX_A_2013_CORRESPONDENCE: &[(&str, &[&str])] = &[
+    // "Inventory of information and other associated assets" <- "inventory of assets",
+    // "ownership of assets".
+    ("5.9", &["A.8.1.1", "A.8.1.2"]),
+    // "Access control" <- "access control policy", "information access restriction".
+    ("5.15", &["A.9.1.1", "A.9.4.1"]),
+    // "Authentication information" <- "management of secret authentication information
+    // of users", "use of secret authentication information", "password management
+    // system".
+    ("5.17", &["A.9.2.4", "A.9.3.1", "A.9.4.3"]),
+    // "Protection of records" <- "protection of records".
+    ("5.33", &["A.18.1.3"]),
+    // "Privileged access rights" <- "management of privileged access rights".
+    ("8.2", &["A.9.2.3"]),
+    // "Logging" <- "event logging", "protection of log information", "administrator and
+    // operator logs".
+    ("8.15", &["A.12.4.1", "A.12.4.2", "A.12.4.3"]),
+    // "Monitoring activities": introduced by the 2022 edition, so no 2013 control
+    // states it.
+    ("8.16", &[]),
+    // "Networks security" <- "network controls".
+    ("8.20", &["A.13.1.1"]),
+    // "Use of cryptography" <- "policy on the use of cryptographic controls", "key
+    // management".
+    ("8.24", &["A.10.1.1", "A.10.1.2"]),
+];
+
+/// The ISO/IEC 27001:2013 Annex A controls the 2022 Annex A `clause` restates, in the
+/// 2013 edition's own numbering.
+///
+/// A clause this catalog cross-walks into but does not record a correspondence for would
+/// otherwise be served at the 2022 edition only, with no signal — hence the assertion.
+fn annex_a_2013_controls(clause: &str) -> &'static [&'static str] {
+    let recorded = ANNEX_A_2013_CORRESPONDENCE
+        .iter()
+        .find(|(candidate, _)| *candidate == clause);
+    debug_assert!(
+        recorded.is_some(),
+        "{clause}: every Annex A clause the catalog cross-walks into records the 2013 \
+         controls it restates, or none where the 2022 edition introduced it"
+    );
+    recorded.map_or(&[], |(_, controls)| *controls)
+}
+
+/// The NIST SP 800-53 control identifiers this catalog cross-walks into that revision 4
+/// of the publication also carries under the same designation.
+///
+/// A FedRAMP baseline is composed of the controls of the 800-53 revision it is read at,
+/// under the identifier that publication gives them. Revision 5 is not a renaming of
+/// revision 4: it introduced control families revision 4 has none of and withdrew
+/// controls revision 4 carried, so a revision-4 baseline can only name a control both
+/// revisions publish — which is why the revision-4 rows are restricted to this list
+/// rather than derived from every revision-5 identifier. A control only revision 5
+/// publishes is served at the revision-5 baseline alone.
+const CONTROLS_IN_800_53_R4: &[&str] = &[
+    // Access control.
+    "AC-3", "AC-6",
+    // Audit and accountability.
+    "AU-2", "AU-6", "AU-9", "AU-11", "AU-12",
+    // Configuration management.
+    "CM-8",
+    // Identification and authentication.
+    "IA-2", "IA-5",
+    // System and communications protection.
+    "SC-7", "SC-8", "SC-28",
+    // System and information integrity.
+    "SI-4",
+];
+
+/// Both FedRAMP baselines the catalog publishes, for a control each of their revisions
+/// carries.
+const BOTH_FEDRAMP_BASELINES: &[&str] = &[FEDRAMP_R4, FEDRAMP_R5];
+
+/// The revision-5 baseline alone, for a control only revision 5 publishes.
+const FEDRAMP_R5_BASELINE: &[&str] = &[FEDRAMP_R5];
+
+/// The FedRAMP baselines a NIST SP 800-53 `control` is part of, as the catalog publishes
+/// them: the revision-5 baseline for every control revision 5 publishes, and the
+/// revision-4 baseline for the controls revision 4 publishes too (see
+/// [`CONTROLS_IN_800_53_R4`]).
+fn fedramp_baselines(control: &str) -> &'static [&'static str] {
+    if CONTROLS_IN_800_53_R4.contains(&control) {
+        BOTH_FEDRAMP_BASELINES
+    } else {
+        FEDRAMP_R5_BASELINE
+    }
+}
+
 /// The `CMMC-Level2` practice that restates an `NIST-SP-800-171-r2` requirement.
 ///
 /// A Level 2 practice IS an 800-171 requirement, designated `<family>.L2-<requirement>`
@@ -3103,13 +3222,23 @@ fn cmmc_practice(requirement: &str) -> Option<String> {
 /// Every framework requirement a control satisfies: its objective's cross-walk, the
 /// items naming its own check, and the restatements those imply.
 ///
-/// Two frameworks here publish another framework's requirements rather than
-/// requirements of their own, so their rows are DERIVED from the rows they restate
-/// instead of being written out: a `FedRAMP-r5` baseline is composed of
-/// `NIST-SP-800-53-r5` controls, under the same control identifier, and a
-/// `CMMC-Level2` practice is an `NIST-SP-800-171-r2` requirement (see
-/// [`cmmc_practice`]). Each `(framework, item)` pair appears once, however many of the
-/// three sources name it.
+/// An edition that publishes another edition's or another framework's requirements
+/// rather than requirements of its own is DERIVED from the rows it restates instead of
+/// being written out, each in the numbering of the edition it is served under:
+///
+/// * a FedRAMP baseline is composed of NIST SP 800-53 controls, under the control
+///   identifier the publication gives them; every control this catalog cross-walks into
+///   is in a family both published revisions carry (`AC`, `AU`, `CM`, `IA`, `SC`, `SI`),
+///   and a revision-4 baseline names only the controls revision 4 publishes too (see
+///   [`fedramp_baselines`]);
+/// * a `CMMC-Level2` practice is an `NIST-SP-800-171-r2` requirement (see
+///   [`cmmc_practice`]);
+/// * an ISO/IEC 27001:2013 Annex A control is the 2013 numbering of the 2022 Annex A
+///   clause that consolidated it (see [`annex_a_2013_controls`]);
+/// * the trust services criteria are numbered the same in each edition of SOC 2, so the
+///   dated edition restates the criterion under its own identifier.
+///
+/// Each `(framework, item)` pair appears once, however many of the sources name it.
 pub(super) fn framework_mappings(seed: &ControlSeed) -> Vec<(&'static str, String)> {
     let objective = OBJECTIVE_FRAMEWORKS
         .iter()
@@ -3120,10 +3249,18 @@ pub(super) fn framework_mappings(seed: &ControlSeed) -> Vec<(&'static str, Strin
     let mut mappings: Vec<(&'static str, String)> = Vec::new();
     for &(framework, item) in objective.iter().chain(seed.frameworks) {
         let restatements = match framework {
-            NIST_SP_800_53_R5 => vec![(FEDRAMP_R5, item.to_string())],
+            NIST_SP_800_53_R5 => fedramp_baselines(item)
+                .iter()
+                .map(|baseline| (*baseline, item.to_string()))
+                .collect(),
             NIST_SP_800_171_R2 => cmmc_practice(item)
                 .map(|practice| vec![(CMMC_LEVEL_2, practice)])
                 .unwrap_or_default(),
+            ISO_IEC_27001_2022_ANNEX_A => annex_a_2013_controls(item)
+                .iter()
+                .map(|control| (ISO_IEC_27001, (*control).to_string()))
+                .collect(),
+            SSAE_18_SOC_2 => vec![(SSAE_18_SOC_2_OCT_2023, item.to_string())],
             _ => Vec::new(),
         };
         for mapping in std::iter::once((framework, item.to_string())).chain(restatements) {
@@ -3191,5 +3328,79 @@ pub(super) fn parameter_requirement_summary(parameters: &[(&str, &str)]) -> &'st
         "REQUIRED"
     } else {
         "OPTIONAL"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every ISO/IEC 27001:2022 Annex A clause this catalog cross-walks into records
+    /// what it restates in the 2013 edition's numbering.
+    ///
+    /// The lookup guards this with a `debug_assert!`, which a release build compiles
+    /// out — so the invariant is checked here as well, where it holds for every build
+    /// profile. A clause the 2022 edition introduced records an empty list, which is a
+    /// recorded answer, not a missing one.
+    #[test]
+    fn every_cross_walked_annex_a_clause_records_its_2013_correspondence() {
+        let cross_walked = OBJECTIVE_FRAMEWORKS
+            .iter()
+            .flat_map(|(_, items)| items.iter())
+            .chain(
+                PUBLISHED_CONTROLS
+                    .iter()
+                    .flat_map(|seed| seed.frameworks.iter()),
+            )
+            .filter(|(framework, _)| *framework == ISO_IEC_27001_2022_ANNEX_A);
+        let mut covered = 0usize;
+        for (_, clause) in cross_walked {
+            assert!(
+                ANNEX_A_2013_CORRESPONDENCE
+                    .iter()
+                    .any(|(candidate, _)| candidate == clause),
+                "case clause {clause}: the catalog cross-walks into it, so it records \
+                 the 2013 controls it restates (or none, where the 2022 edition \
+                 introduced it)"
+            );
+            covered += 1;
+        }
+        assert!(
+            covered > 0,
+            "case catalog: the cross-walk names {ISO_IEC_27001_2022_ANNEX_A} clauses"
+        );
+    }
+
+    /// A FedRAMP baseline names only the NIST SP 800-53 controls the revision it is read
+    /// at publishes.
+    ///
+    /// The rows are a control both revisions carry and controls only revision 5 carries:
+    /// revision 5 introduced the supply chain risk management (`SR`) and personally
+    /// identifiable information processing and transparency (`PT`) families, which
+    /// revision 4 has none of, so a revision-4 baseline cannot name one of their
+    /// controls.
+    #[test]
+    fn a_fedramp_baseline_names_only_the_controls_its_revision_publishes() {
+        let both: &[&str] = &[FEDRAMP_R4, FEDRAMP_R5];
+        let revision_5_only: &[&str] = &[FEDRAMP_R5];
+        for (case, control, expected) in [
+            ("an access enforcement control both revisions carry", "AC-3", both),
+            (
+                "a supply chain control only revision 5 carries",
+                "SR-3",
+                revision_5_only,
+            ),
+            (
+                "a PII processing control only revision 5 carries",
+                "PT-2",
+                revision_5_only,
+            ),
+        ] {
+            let baselines = fedramp_baselines(control);
+            assert_eq!(
+                baselines, expected,
+                "case {case} ({control}): expected {expected:?}, got {baselines:?}"
+            );
+        }
     }
 }
