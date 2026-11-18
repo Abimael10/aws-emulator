@@ -152,12 +152,17 @@ pub fn crawl_target_unreadable(path: &str) -> String {
 
 /// Walk the crawler's data stores and answer what the crawl found.
 ///
+/// Each KIND of target is read through its own store's data plane — the objects under an
+/// Amazon S3 prefix here, the items of an Amazon DynamoDB table in
+/// [`super::dynamodb_crawl_source`] — and the datasets are answered in that order, with two
+/// targets that resolve to one table name describing one dataset.
+///
 /// BOUNDED in every direction a caller can grow: how many crawls walk at once
 /// ([`MAX_CONCURRENT_CRAWLS`], with a bounded wait for a permit), how long one crawl may take
 /// ([`CRAWL_BUDGET`], which the walk yields to while it matches), how many objects the whole
-/// walk lists ([`MAX_CRAWLED_OBJECTS`]), how many exclusion patterns they are matched against
-/// ([`MAX_CRAWLED_EXCLUSIONS`]) and how many bytes of one object the schema is read from
-/// ([`MAX_CRAWLED_SAMPLE_BYTES`]).
+/// walk lists ([`MAX_CRAWLED_OBJECTS`]), how many items it scans ([`MAX_CRAWLED_ITEMS`]), how
+/// many exclusion patterns they are matched against ([`MAX_CRAWLED_EXCLUSIONS`]) and how many
+/// bytes of one object the schema is read from ([`MAX_CRAWLED_SAMPLE_BYTES`]).
 pub async fn perform_crawl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -175,15 +180,33 @@ pub async fn perform_crawl<Eng: ::std::marker::Send + ::std::marker::Sync + 'sta
                 return CrawlOutcome::Failed(CRAWL_TOO_MANY_RUNNING.to_string());
             }
         };
-    let client = super::column_statistics_source::s3_client(ctx, region);
+    let objects = super::column_statistics_source::s3_client(ctx, region);
+    let tables = super::dynamodb_crawl_source::dynamodb_client(ctx, region);
     // The crawl reads its data stores AS the crawler's role, so what that role is permitted
     // is resolved — once, out of the account's own IAM records — before any of the data is
-    // asked for, and consulted before each call the walk makes.
+    // asked for, and consulted before each call the walk makes, whichever store it is made
+    // against.
     let mut authorization = CrawlReadAuthorization::of_role(engine, &plan.role);
-    let walked = ::tokio::time::timeout(
-        CRAWL_BUDGET,
-        walk_targets(&client, plan, &mut authorization),
-    )
+    let walked = ::tokio::time::timeout(CRAWL_BUDGET, async {
+        let mut discovered = walk_targets(&objects, plan, &mut authorization).await?;
+        let mut named: HashSet<String> = discovered
+            .iter()
+            .map(|dataset| dataset.name.clone())
+            .collect();
+        for dataset in super::dynamodb_crawl_source::walk_dynamodb_targets(
+            &tables,
+            region,
+            plan,
+            &authorization,
+        )
+        .await?
+        {
+            if named.insert(dataset.name.clone()) {
+                discovered.push(dataset);
+            }
+        }
+        Ok::<Vec<DiscoveredTable>, String>(discovered)
+    })
     .await;
     drop(permit);
 
@@ -493,16 +516,18 @@ async fn describe_dataset(
     };
     Ok(Some(DiscoveredTable {
         name,
-        location: s3_url(bucket, root),
         classification: schema.classification,
-        serialization_library: schema.serialization_library,
-        delimiter: schema.delimiter,
-        header_lines: schema.header_lines,
         columns: schema.columns,
         partition_keys,
         partitions,
-        object_count: u64::try_from(objects.len()).unwrap_or(u64::MAX),
+        record_count: u64::try_from(objects.len()).unwrap_or(u64::MAX),
         size_bytes: objects.iter().map(|object| object.size).sum(),
+        storage: DatasetStorage::TextObjects {
+            location: s3_url(bucket, root),
+            serialization_library: schema.serialization_library,
+            delimiter: schema.delimiter,
+            header_lines: schema.header_lines,
+        },
     }))
 }
 
@@ -777,7 +802,11 @@ fn is_header(first: &[String], second: Option<&[String]>) -> bool {
 /// The `Column$Type` one delimited cell's text reads as: a whole number, a number that is not
 /// whole, a boolean, else text — which is also what an empty cell reads as, because nothing
 /// can be inferred from it.
-fn delimited_column_type(cell: &str) -> &'static str {
+///
+/// Shared with the crawl of another store's table, where it is the reading an attribute
+/// holding a NUMBER gets ([`super::dynamodb_crawl_source`]): a number is text in both stores,
+/// so one reading of it serves both.
+pub(super) fn delimited_column_type(cell: &str) -> &'static str {
     if cell.is_empty() {
         return STRING_TYPE;
     }
@@ -837,7 +866,10 @@ fn json_column_type(value: &::serde_json::Value, depth: usize) -> String {
 ///
 /// `None` for a name there is nothing left of, which is not a name the catalog can address a
 /// column by.
-fn catalog_name(name: &str) -> Option<String> {
+///
+/// Shared with the crawl of another store's table, whose attribute names are held under the
+/// same rule ([`super::dynamodb_crawl_source`]).
+pub(super) fn catalog_name(name: &str) -> Option<String> {
     let folded: String = name
         .trim()
         .to_lowercase()

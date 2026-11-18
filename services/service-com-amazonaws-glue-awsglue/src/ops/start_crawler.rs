@@ -3,16 +3,17 @@
 //! @op StartCrawler
 //!
 //! Starts a crawl of the crawler's data stores: the crawler leaves the state with no run in
-//! it, the objects under each of its Amazon S3 targets are walked, and the datasets found
-//! behind them are written into the crawler's target database as tables — their columns read
-//! off the data, their partition keys off the folder levels below each target, and one
-//! partition per distinct value of those levels. The clock owes the crawler its way back to
+//! it, the data behind each of its targets is read — the objects under each Amazon S3 path,
+//! the items of each Amazon DynamoDB table — and the datasets found behind them are written
+//! into the crawler's target database as tables: their columns read off the data, their
+//! partition keys off the folder levels below each Amazon S3 target, and one partition per
+//! distinct value of those levels. The clock owes the crawler its way back to
 //! `READY` one span later, which is when the crawl's `LastCrawl` and its table counts become
 //! readable.
 //!
 //! What a crawl READS and how a dataset is classified live in
-//! [`crate::state::crawl_source`]; what it WRITES into the catalog in
-//! [`crate::state::ComAmazonawsGlueAwsglueState::apply_crawl`].
+//! [`crate::state::crawl_source`] and [`crate::state::dynamodb_crawl_source`]; what it WRITES
+//! into the catalog in [`crate::state::ComAmazonawsGlueAwsglueState::apply_crawl`].
 //!
 //! ## Shape of an operation
 //!
@@ -182,13 +183,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::CrawlPlan::of(crawler)
         };
 
-        // Only an Amazon S3 target is a data store this crawl reads. A crawler whose
-        // targets name another kind would have its data walked by machinery that is not
-        // written yet, and answering 200 for a crawl that read none of it would report a
-        // crawl nothing carried out — so the start says so instead.
+        // A target of a kind whose data store this crawl reads is what it needs: an Amazon S3
+        // path, or an Amazon DynamoDB table. A crawler whose targets name another kind would
+        // have its data walked by machinery that is not written yet, and answering 200 for a
+        // crawl that read none of it would report a crawl nothing carried out — so the start
+        // says so instead.
         if !plan.has_readable_target() {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "StartCrawler for a crawler whose Targets name no Amazon S3 path",
+                "StartCrawler for a crawler whose Targets name no Amazon S3 path and no Amazon \
+                 DynamoDB table",
             ));
         }
 

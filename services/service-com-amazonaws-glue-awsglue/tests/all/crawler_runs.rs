@@ -10,13 +10,15 @@
 //! The rule under test: `StartCrawler` "starts a crawl using the specified crawler" — it
 //! refuses a name no crawler in the account has (`EntityNotFoundException`) and a crawler
 //! whose crawl is already in progress (`CrawlerRunningException`); otherwise the crawler
-//! leaves the state with no run in it, the objects under each of its Amazon S3 targets are
-//! walked, and each dataset found behind them is written into the crawler's target database
-//! as one table whose columns are read off the data, whose partition keys are the folder
-//! levels below the target (named off a Hive-style `key=value` segment where the path carries
-//! one, by depth where it does not) and which carries one partition per distinct value of
-//! those levels. The clock owes the crawler its way back to `READY` one span later, which is
-//! when the crawl's `LastCrawl` and its table counts become readable.
+//! leaves the state with no run in it, the data behind each of its targets is read, and each
+//! dataset found behind them is written into the crawler's target database as one table whose
+//! columns are read off that data. For an Amazon S3 target the data is the objects under its
+//! path, whose folder levels below the target are the table's partition keys (named off a
+//! Hive-style `key=value` segment where the path carries one, by depth where it does not) with
+//! one partition per distinct value of those levels; for an Amazon DynamoDB target it is the
+//! items of the table the target names, which is one unpartitioned dataset. The clock owes the
+//! crawler its way back to `READY` one span later, which is when the crawl's `LastCrawl` and
+//! its table counts become readable.
 //!
 //! The recorded case — a crawler over one Amazon S3 prefix whose Hive-style folders are
 //! detected as partitions — is ONE row of the table below; the rows differ along what the
@@ -32,17 +34,25 @@
 //! The records those crawls leave on the crawler are what `ListCrawls` reports, which the last
 //! section of this file is about; the rule for that listing is stated there.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
+use aws_sdk_dynamodb::primitives::Blob;
+use aws_sdk_dynamodb::types::{
+    AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType, PutRequest,
+    ScalarAttributeType, WriteRequest,
+};
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    crawl_target_unreadable, fold_name, ComAmazonawsGlueAwsglueState, CLASSIFICATION_CSV,
-    CLASSIFICATION_JSON, CRAWLER_HISTORY_STATE_COMPLETED, CRAWLER_HISTORY_STATE_FAILED,
-    CRAWLER_HISTORY_STATE_RUNNING, CRAWLER_STATE_READY, CRAWLER_STATE_RUNNING,
-    CRAWL_WITHOUT_TARGET_DATABASE, DEPRECATED_BY_CRAWLER_PARAMETER, LAST_CRAWL_STATUS_FAILED,
-    LAST_CRAWL_STATUS_SUCCEEDED, MAX_CRAWLED_EXCLUSIONS, MAX_CRAWL_HISTORY,
-    UPDATED_BY_CRAWLER_PARAMETER,
+    crawl_target_past_the_item_ceiling, crawl_target_unreadable, fold_name,
+    ComAmazonawsGlueAwsglueState, AVERAGE_RECORD_SIZE_PARAMETER, CLASSIFICATION_CSV,
+    CLASSIFICATION_DYNAMODB, CLASSIFICATION_JSON, CRAWLER_HISTORY_STATE_COMPLETED,
+    CRAWLER_HISTORY_STATE_FAILED, CRAWLER_HISTORY_STATE_RUNNING, CRAWLER_STATE_READY,
+    CRAWLER_STATE_RUNNING, CRAWL_WITHOUT_TARGET_DATABASE, DEPRECATED_BY_CRAWLER_PARAMETER,
+    LAST_CRAWL_STATUS_FAILED, LAST_CRAWL_STATUS_SUCCEEDED, MAX_CRAWLED_EXCLUSIONS,
+    MAX_CRAWLED_ITEMS, MAX_CRAWL_HISTORY, RECORD_COUNT_PARAMETER, SAMPLED_CRAWLED_ITEMS,
+    SIZE_KEY_PARAMETER, TYPE_OF_DATA_PARAMETER, TYPE_OF_DATA_TABLE, UPDATED_BY_CRAWLER_PARAMETER,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -2070,4 +2080,575 @@ async fn a_crawl_listing_the_service_cannot_serve_is_refused() {
         after, before,
         "case \"after the refusals\": expected the listing to be untouched, got {after}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A crawl of an Amazon DynamoDB target
+// ---------------------------------------------------------------------------
+//
+// `DynamoDBTarget$Path` is "the name of the DynamoDB table to crawl", so the dataset behind
+// such a target is the ITEMS of that table, read through DynamoDB's own data plane: the
+// crawl writes one catalog table whose columns are the attributes those items carry, typed by
+// what each attribute holds, with the table's own key attributes leading them and every other
+// attribute after them by name. A DynamoDB table is no path, so the dataset has no partition
+// keys and no partitions.
+
+/// An emulator with Glue AND Amazon DynamoDB mounted on one shared engine, plus the engine
+/// itself so a test can move the due instant a crawl's finish falls at.
+///
+/// DynamoDB is mounted because a crawl of a `DynamoDBTarget` READS that table: it reaches it
+/// over the emulator's own in-process callback, so the items a test writes with `PutItem` are
+/// the items the crawl classifies.
+fn emulator_with_dynamodb() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(service_com_amazonaws_glue_awsglue::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    router.register_service(
+        service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService::new(Arc::clone(&engine)),
+    );
+    (router, engine)
+}
+
+/// An Amazon DynamoDB client over this emulator's own in-process callback — the seam a crawl
+/// of a `DynamoDBTarget` reads through, so what a test writes here is what the crawl reads.
+fn dynamodb(router: &MultiServiceRouter) -> aws_sdk_dynamodb::Client {
+    let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
+    let config = aws_sdk_dynamodb::Config::builder()
+        .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+        .region(aws_sdk_dynamodb::config::Region::new(REGION))
+        .endpoint_url(format!("https://dynamodb.{REGION}.amazonaws.com"))
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
+        .retry_config(aws_sdk_dynamodb::config::retry::RetryConfig::disabled())
+        .timeout_config(aws_sdk_dynamodb::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(aws_sdk_dynamodb::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            aws_sdk_dynamodb::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    aws_sdk_dynamodb::Client::from_conf(config)
+}
+
+/// How long a test waits for a DynamoDB table to leave `CREATING`.
+///
+/// Generous: the wait is for the CONDITION — the status the table reports — and never for a
+/// fixed span, so a loaded host only loops once more. `DescribeTable` is the call an SDK
+/// waiter polls, and it answers no sooner than the transition the clock owes the table.
+const TABLE_READY_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Create the DynamoDB table `name` with the key schema `keys` — `(attribute, key type,
+/// attribute type)` — and return once it reports `ACTIVE`, which is the only status its data
+/// plane serves a write on.
+async fn given_dynamodb_table(
+    client: &aws_sdk_dynamodb::Client,
+    name: &str,
+    keys: &[(&str, KeyType, ScalarAttributeType)],
+) {
+    let mut request = client
+        .create_table()
+        .table_name(name)
+        .billing_mode(BillingMode::PayPerRequest);
+    for (attribute, key_type, attribute_type) in keys {
+        request = request
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name(*attribute)
+                    .key_type(key_type.clone())
+                    .build()
+                    .expect("the key schema element is complete"),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name(*attribute)
+                    .attribute_type(attribute_type.clone())
+                    .build()
+                    .expect("the attribute definition is complete"),
+            );
+    }
+    request
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("the table {name} must be created, got {error:?}"));
+
+    let deadline = Instant::now() + TABLE_READY_DEADLINE;
+    loop {
+        let described = client
+            .describe_table()
+            .table_name(name)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("the table {name} must be described, got {error:?}"));
+        let status = described
+            .table()
+            .and_then(|table| table.table_status())
+            .map(|status| status.as_str().to_string())
+            .unwrap_or_default();
+        if status == "ACTIVE" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the table {name} must reach ACTIVE, last reported {status:?}"
+        );
+        ::tokio::task::yield_now().await;
+    }
+}
+
+/// Write `items` into the DynamoDB table `name`, through that service's own data plane.
+///
+/// In BATCHES, because a row of the tables below stages more items than a crawl scans: a
+/// batch write is the call DynamoDB serves a set of items with, so staging a large table costs
+/// a request per [`ITEMS_PER_BATCH`] items rather than one per item.
+async fn put_items(
+    client: &aws_sdk_dynamodb::Client,
+    name: &str,
+    items: &[HashMap<String, AttributeValue>],
+) {
+    for batch in items.chunks(ITEMS_PER_BATCH) {
+        let requests: Vec<WriteRequest> = batch
+            .iter()
+            .map(|item| {
+                WriteRequest::builder()
+                    .put_request(
+                        PutRequest::builder()
+                            .set_item(Some(item.clone()))
+                            .build()
+                            .expect("the put request is complete"),
+                    )
+                    .build()
+            })
+            .collect();
+        let answered = client
+            .batch_write_item()
+            .request_items(name.to_string(), requests)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("the items must be stored in {name}, got {error:?}"));
+        assert!(
+            answered.unprocessed_items().is_none_or(|unprocessed| {
+                unprocessed.values().all(|requests| requests.is_empty())
+            }),
+            "every item staged in {name} must be stored, got {answered:?}"
+        );
+    }
+}
+
+/// How many items one `BatchWriteItem` carries: "a single call can write up to 16 MB of data,
+/// which can comprise as many as 25 put or delete requests"
+/// (`BatchWriteItem`), so the staging above asks for the most a call serves.
+const ITEMS_PER_BATCH: usize = 25;
+
+/// One item from `(attribute, value)` pairs.
+fn item(attributes: Vec<(&str, AttributeValue)>) -> HashMap<String, AttributeValue> {
+    attributes
+        .into_iter()
+        .map(|(attribute, value)| (attribute.to_string(), value))
+        .collect()
+}
+
+/// A number attribute, which DynamoDB carries as the text of the number.
+fn number(value: &str) -> AttributeValue {
+    AttributeValue::N(value.to_string())
+}
+
+/// A string attribute.
+fn text(value: &str) -> AttributeValue {
+    AttributeValue::S(value.to_string())
+}
+
+/// Create one crawler whose only target is the DynamoDB table `target` describes.
+async fn given_dynamodb_crawler(
+    router: &MultiServiceRouter,
+    name: &str,
+    target: Value,
+    extra: Value,
+) {
+    let mut body = json!({
+        "Name": name,
+        "Role": ROLE,
+        "DatabaseName": DATABASE,
+        "Targets": { "DynamoDBTargets": [target] },
+    });
+    if let Some(members) = extra.as_object() {
+        for (member, value) in members {
+            body[member] = value.clone();
+        }
+    }
+    ok(router, "CreateCrawler", &body).await;
+}
+
+/// One row of the DynamoDB discovery table: the table staged, the items written into it, the
+/// target crawled, and the catalog table the crawl must write for them.
+struct ItemDiscovery {
+    /// What the row is about.
+    case: &'static str,
+    /// The DynamoDB table the row's items live in.
+    table: &'static str,
+    /// Its key schema, as `(attribute, key type, attribute type)`.
+    keys: Vec<(&'static str, KeyType, ScalarAttributeType)>,
+    /// The items written into it.
+    items: Vec<HashMap<String, AttributeValue>>,
+    /// The `DynamoDBTarget` the crawler carries.
+    target: Value,
+    /// Whatever the create adds to the crawler beside its targets.
+    extra: Value,
+    /// The name of the catalog table the crawl must write.
+    catalog_table: &'static str,
+    /// The columns that table must declare, as `(name, type)`, in order.
+    columns: Vec<(&'static str, &'static str)>,
+    /// How many records the crawl must report having read.
+    record_count: usize,
+}
+
+/// A crawl of a DynamoDB target writes one catalog table for the items of the table it names,
+/// with the columns those items carry and no partitions at all.
+///
+/// The rows differ along what the rule generalises over: which attribute types the items
+/// carry (text, numbers whole and fractional, booleans, binary, the three set types, a list,
+/// a nested map, a null), how many key attributes the table has and which attributes they are,
+/// whether two items type one attribute differently, the form of the table's name (lowercase
+/// with a hyphen, mixed case), whether the target asks for the whole table or a sample
+/// (`scanAll`), how many items sit behind it, and whether the crawler carries a `TablePrefix`.
+#[tokio::test]
+async fn a_crawl_of_a_dynamodb_target_writes_the_items_it_scanned() {
+    let sampled: Vec<HashMap<String, AttributeValue>> = (0..SAMPLED_CRAWLED_ITEMS + 5)
+        .map(|index| {
+            item(vec![
+                ("id", text(&format!("item-{index}"))),
+                ("rank", number(&index.to_string())),
+            ])
+        })
+        .collect();
+
+    let rows: Vec<ItemDiscovery> = vec![
+        ItemDiscovery {
+            case: "a string partition key and scalar attributes",
+            table: "ddb-orders",
+            keys: vec![("order_id", KeyType::Hash, ScalarAttributeType::S)],
+            items: vec![item(vec![
+                ("order_id", text("o-1")),
+                ("amount", number("10.5")),
+                ("quantity", number("3")),
+                ("paid", AttributeValue::Bool(true)),
+            ])],
+            target: json!({ "Path": "ddb-orders" }),
+            extra: json!({}),
+            // The catalog holds a crawled name the way it holds every crawled name:
+            // lowercased, with what it does not hold a name in replaced by an underscore.
+            catalog_table: "ddb_orders",
+            // The key attribute leads, then the rest by name.
+            columns: vec![
+                ("order_id", "string"),
+                ("amount", "double"),
+                ("paid", "boolean"),
+                ("quantity", "bigint"),
+            ],
+            record_count: 1,
+        },
+        ItemDiscovery {
+            case: "a hash and a range key lead the columns in key order",
+            table: "Sessions",
+            keys: vec![
+                ("user_id", KeyType::Hash, ScalarAttributeType::S),
+                ("started_at", KeyType::Range, ScalarAttributeType::N),
+            ],
+            items: vec![
+                item(vec![
+                    ("user_id", text("u-1")),
+                    ("started_at", number("1700000000")),
+                    ("ip", text("10.0.0.1")),
+                    (
+                        "tags",
+                        AttributeValue::Ss(vec!["beta".to_string(), "eu".to_string()]),
+                    ),
+                ]),
+                item(vec![
+                    ("user_id", text("u-2")),
+                    ("started_at", number("1700000600")),
+                    ("ip", text("10.0.0.2")),
+                    ("tags", AttributeValue::Ss(vec!["beta".to_string()])),
+                ]),
+            ],
+            target: json!({ "Path": "Sessions", "scanAll": true }),
+            extra: json!({}),
+            // The catalog folds a crawled name to lowercase, as it does every table name.
+            catalog_table: "sessions",
+            columns: vec![
+                ("user_id", "string"),
+                ("started_at", "bigint"),
+                ("ip", "string"),
+                ("tags", "array<string>"),
+            ],
+            record_count: 2,
+        },
+        ItemDiscovery {
+            case: "the collection, binary and null attribute types",
+            table: "ddb_shapes",
+            keys: vec![("id", KeyType::Hash, ScalarAttributeType::S)],
+            items: vec![item(vec![
+                ("id", text("a")),
+                ("blob", AttributeValue::B(Blob::new("payload".as_bytes()))),
+                (
+                    "blobs",
+                    AttributeValue::Bs(vec![Blob::new("one".as_bytes())]),
+                ),
+                ("flags", AttributeValue::L(vec![AttributeValue::Bool(false)])),
+                ("missing", AttributeValue::Null(true)),
+                (
+                    "numbers",
+                    AttributeValue::Ns(vec!["1".to_string(), "2".to_string()]),
+                ),
+                (
+                    "profile",
+                    AttributeValue::M(
+                        item(vec![("city", text("lisbon")), ("zip", number("1000"))]),
+                    ),
+                ),
+            ])],
+            target: json!({ "Path": "ddb_shapes" }),
+            extra: json!({}),
+            catalog_table: "ddb_shapes",
+            columns: vec![
+                ("id", "string"),
+                ("blob", "binary"),
+                ("blobs", "array<binary>"),
+                ("flags", "array<boolean>"),
+                ("missing", "string"),
+                ("numbers", "array<bigint>"),
+                ("profile", "struct<city:string,zip:bigint>"),
+            ],
+            record_count: 1,
+        },
+        ItemDiscovery {
+            case: "an attribute two items type differently reads as text",
+            table: "ddb_mixed",
+            keys: vec![("id", KeyType::Hash, ScalarAttributeType::S)],
+            items: vec![
+                item(vec![("id", text("1")), ("value", number("5"))]),
+                item(vec![("id", text("2")), ("value", text("five"))]),
+            ],
+            target: json!({ "Path": "ddb_mixed" }),
+            extra: json!({}),
+            catalog_table: "ddb_mixed",
+            columns: vec![("id", "string"), ("value", "string")],
+            record_count: 2,
+        },
+        ItemDiscovery {
+            case: "a target asking to be sampled reads the sample and not the whole table",
+            table: "ddb_sampled",
+            keys: vec![("id", KeyType::Hash, ScalarAttributeType::S)],
+            items: sampled,
+            target: json!({ "Path": "ddb_sampled", "scanAll": false }),
+            extra: json!({}),
+            catalog_table: "ddb_sampled",
+            columns: vec![("id", "string"), ("rank", "bigint")],
+            record_count: SAMPLED_CRAWLED_ITEMS,
+        },
+        ItemDiscovery {
+            case: "the crawler's TablePrefix names the table the crawl writes",
+            table: "ddb_prefixed",
+            keys: vec![("id", KeyType::Hash, ScalarAttributeType::S)],
+            items: vec![item(vec![("id", text("p-1"))])],
+            target: json!({ "Path": "ddb_prefixed" }),
+            extra: json!({ "TablePrefix": "staging_" }),
+            catalog_table: "staging_ddb_prefixed",
+            columns: vec![("id", "string")],
+            record_count: 1,
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let (router, engine) = emulator_with_dynamodb();
+        let client = dynamodb(&router);
+        given_dynamodb_table(&client, row.table, &row.keys).await;
+        put_items(&client, row.table, &row.items).await;
+        given_database(&router, DATABASE).await;
+        given_dynamodb_crawler(&router, "crawler", row.target.clone(), row.extra.clone()).await;
+
+        crawl(&router, &engine, "crawler").await;
+
+        let crawler = crawler_of(&router, "crawler").await;
+        assert_eq!(
+            crawler.get("State").and_then(Value::as_str),
+            Some(CRAWLER_STATE_READY),
+            "case {case:?}: the finished crawl leaves the crawler ready, got {crawler}"
+        );
+        assert_eq!(
+            crawler.pointer("/LastCrawl/Status").and_then(Value::as_str),
+            Some(LAST_CRAWL_STATUS_SUCCEEDED),
+            "case {case:?}: the crawl read its target, got {crawler}"
+        );
+
+        let table = table_of(&router, DATABASE, row.catalog_table)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the crawl must write the table {}",
+                    row.catalog_table
+                )
+            });
+        let expected_columns: Vec<(String, String)> = row
+            .columns
+            .iter()
+            .map(|(name, declared)| ((*name).to_string(), (*declared).to_string()))
+            .collect();
+        let actual_columns = columns_of(&table);
+        assert_eq!(
+            actual_columns, expected_columns,
+            "case {case:?}: expected the columns {expected_columns:?}, got {actual_columns:?}"
+        );
+        assert_eq!(
+            partition_keys_of(&table),
+            Vec::<(String, String)>::new(),
+            "case {case:?}: a DynamoDB table is one unpartitioned dataset, got {table}"
+        );
+        assert_eq!(
+            stored_partitions(&engine, DATABASE, row.catalog_table),
+            Vec::<Vec<String>>::new(),
+            "case {case:?}: a DynamoDB table holds no partition, got {table}"
+        );
+        assert_eq!(
+            parameter_of(&table, "classification").as_deref(),
+            Some(CLASSIFICATION_DYNAMODB),
+            "case {case:?}: expected the data classified as {CLASSIFICATION_DYNAMODB}, got {table}"
+        );
+        assert_eq!(
+            parameter_of(&table, TYPE_OF_DATA_PARAMETER).as_deref(),
+            Some(TYPE_OF_DATA_TABLE),
+            "case {case:?}: the data sits in another store's table, got {table}"
+        );
+        assert_eq!(
+            parameter_of(&table, UPDATED_BY_CRAWLER_PARAMETER).as_deref(),
+            Some("crawler"),
+            "case {case:?}: the table records the crawler that wrote it, got {table}"
+        );
+        assert_eq!(
+            parameter_of(&table, RECORD_COUNT_PARAMETER).as_deref(),
+            Some(row.record_count.to_string().as_str()),
+            "case {case:?}: expected {} records read, got {table}",
+            row.record_count
+        );
+        // The size and the average are of the records the crawl itself read: the average is
+        // exactly the size over the count.
+        let size: u64 = parameter_of(&table, SIZE_KEY_PARAMETER)
+            .and_then(|size| size.parse().ok())
+            .unwrap_or_else(|| panic!("case {case:?}: the table must record its size, got {table}"));
+        assert!(
+            size > 0,
+            "case {case:?}: the items the crawl read hold bytes, got {size}"
+        );
+        assert_eq!(
+            parameter_of(&table, AVERAGE_RECORD_SIZE_PARAMETER).as_deref(),
+            Some(
+                (size / u64::try_from(row.record_count).expect("the row's count fits"))
+                    .to_string()
+                    .as_str()
+            ),
+            "case {case:?}: the average record is the size over the count, got {table}"
+        );
+        // The data stays in the DynamoDB table, which is what the catalog table's location
+        // names: the resource that addresses that table in the store that owns it. There is
+        // no file layout to read it with, so neither a format nor a serde is reported.
+        assert_eq!(
+            table
+                .pointer("/StorageDescriptor/Location")
+                .and_then(Value::as_str),
+            Some(format!("arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{}", row.table).as_str()),
+            "case {case:?}: the location is the table the items sit in, got {table}"
+        );
+        for member in ["InputFormat", "OutputFormat", "SerdeInfo"] {
+            assert!(
+                table
+                    .pointer(&format!("/StorageDescriptor/{member}"))
+                    .is_none(),
+                "case {case:?}: a table-shaped dataset reports no {member}, got {table}"
+            );
+        }
+    }
+}
+
+/// One row of the table below: what the case is, the table the target names, how many items
+/// the store holds it with (`None` for a table the store does not hold at all), and the status
+/// and reason the crawl of it must report.
+type UnreadableTarget = (&'static str, &'static str, Option<usize>, &'static str, Option<String>);
+
+/// A crawl of a DynamoDB target whose table the store does not serve is a crawl that FAILED,
+/// reporting why and writing no table; a target holding more items than one crawl scans is a
+/// crawl that failed too, reporting THAT instead, because the two are different conditions —
+/// and a target whose table holds no item is a crawl that succeeded and wrote none, because
+/// there is nothing there to read a column off.
+#[tokio::test]
+async fn a_dynamodb_target_nothing_can_be_read_from_writes_no_table() {
+    let rows: Vec<UnreadableTarget> = vec![
+        (
+            "a table the store does not hold",
+            "ddb_absent",
+            None,
+            LAST_CRAWL_STATUS_FAILED,
+            Some(crawl_target_unreadable("ddb_absent")),
+        ),
+        (
+            "a table holding no item",
+            "ddb_empty",
+            Some(0),
+            LAST_CRAWL_STATUS_SUCCEEDED,
+            None,
+        ),
+        (
+            "a table holding one item more than a crawl scans",
+            "ddb_past_the_ceiling",
+            Some(MAX_CRAWLED_ITEMS + 1),
+            LAST_CRAWL_STATUS_FAILED,
+            Some(crawl_target_past_the_item_ceiling("ddb_past_the_ceiling")),
+        ),
+    ];
+
+    for (case, table, held, status, reason) in rows {
+        let (router, engine) = emulator_with_dynamodb();
+        if let Some(count) = held {
+            let client = dynamodb(&router);
+            given_dynamodb_table(
+                &client,
+                table,
+                &[("id", KeyType::Hash, ScalarAttributeType::S)],
+            )
+            .await;
+            let items: Vec<HashMap<String, AttributeValue>> = (0..count)
+                .map(|index| item(vec![("id", text(&format!("item-{index}")))]))
+                .collect();
+            put_items(&client, table, &items).await;
+        }
+        given_database(&router, DATABASE).await;
+        given_dynamodb_crawler(&router, "crawler", json!({ "Path": table }), json!({})).await;
+
+        crawl(&router, &engine, "crawler").await;
+
+        let crawler = crawler_of(&router, "crawler").await;
+        assert_eq!(
+            crawler.get("State").and_then(Value::as_str),
+            Some(CRAWLER_STATE_READY),
+            "case {case:?}: the finished crawl leaves the crawler ready, got {crawler}"
+        );
+        assert_eq!(
+            crawler.pointer("/LastCrawl/Status").and_then(Value::as_str),
+            Some(status),
+            "case {case:?}: expected the crawl to report {status}, got {crawler}"
+        );
+        assert_eq!(
+            crawler
+                .pointer("/LastCrawl/ErrorMessage")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            reason,
+            "case {case:?}: expected the crawl to report {reason:?}, got {crawler}"
+        );
+        assert!(
+            table_of(&router, DATABASE, table).await.is_none(),
+            "case {case:?}: the crawl wrote no table for data it did not read"
+        );
+    }
 }

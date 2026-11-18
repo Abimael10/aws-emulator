@@ -289,7 +289,38 @@ pub const EVENT_QUEUE_ACTIONS: [&str; 3] = [
 /// one of them has to be admitted for the crawl to read the queue at all — so a caller is told
 /// what to grant, whichever of them its policies are missing.
 pub fn event_queue_actions_clause() -> String {
-    match EVENT_QUEUE_ACTIONS.split_last() {
+    actions_clause(&EVENT_QUEUE_ACTIONS)
+}
+
+/// The Amazon DynamoDB actions a crawl of a DynamoDB target performs against the table it
+/// names: it READS the table's definition, to learn the key attributes the dataset's columns
+/// are declared from, and then SCANS its items to read those columns off the data. Listed in
+/// the order the crawl makes them, which is the order a refusal states the grant it needs in
+/// ([`dynamodb_target_actions_clause`]).
+///
+/// Each is qualified the way the table's OWN service qualifies its actions — the API name
+/// behind `dynamodb:`, the spelling its own authorization decisions carry — so the action a
+/// refusal names is spelled as the service that owns it spells it. IAM compares an action
+/// name without regard to case.
+pub const DYNAMODB_TARGET_ACTIONS: [&str; 2] = ["dynamodb:DescribeTable", "dynamodb:Scan"];
+
+/// The table calls a crawl makes, as a refusal lists them: each action in the order the crawl
+/// makes them ([`DYNAMODB_TARGET_ACTIONS`]), comma-separated and closed by `and`.
+///
+/// The REQUIREMENT clause of [`messages::dynamodb_target_grant_missing`] states the whole
+/// grant the crawl needs rather than the one call that happened to be withheld first, for the
+/// reason [`event_queue_actions_clause`] gives: every one of them has to be admitted for the
+/// crawl to read the table at all.
+pub fn dynamodb_target_actions_clause() -> String {
+    actions_clause(&DYNAMODB_TARGET_ACTIONS)
+}
+
+/// `actions` as a refusal lists them: comma-separated, with the last one closed by `and`.
+///
+/// ONE renderer, shared by every grant clause this crate states, so two refusals cannot list
+/// the calls they need in two different shapes.
+fn actions_clause(actions: &[&str]) -> String {
+    match actions.split_last() {
         Some((last, [])) => (*last).to_string(),
         Some((last, leading)) => format!("{} and {last}", leading.join(", ")),
         None => String::new(),
@@ -325,6 +356,39 @@ pub const MAX_ROLE_DOCUMENTS: usize = 32;
 /// rather than left to the request. A create past the ceiling is refused with the
 /// operation's own modelled `InvalidInputException`.
 pub const MAX_CHECKED_EVENT_QUEUES: usize = 32;
+
+/// The most Amazon DynamoDB tables one crawler write may have decided about.
+///
+/// CHOSEN, not documented, for the reason [`MAX_CHECKED_EVENT_QUEUES`] gives: the target
+/// lists carry no modelled length, so the number of distinct tables a request can name — and
+/// with it the number of policy evaluations the write pays for, each over at most
+/// [`MAX_ROLE_DOCUMENTS`] documents — is bounded here rather than left to the request. A
+/// write past the ceiling is refused with the operation's own modelled
+/// `InvalidInputException`.
+pub const MAX_CHECKED_DYNAMODB_TARGETS: usize = 32;
+
+/// Every DISTINCT Amazon DynamoDB table the crawl of `targets` reads, in order: the `Path` of
+/// each DynamoDB target, which is "the name of the DynamoDB table to crawl"
+/// (`DynamoDBTarget$Path`).
+///
+/// The list is DEDUPLICATED: the same table named by two targets is one table to decide
+/// about, and the number of decisions one request can ask for is what
+/// [`MAX_CHECKED_DYNAMODB_TARGETS`] bounds. A target naming no table at all names nothing to
+/// decide about.
+pub fn crawl_dynamodb_tables(targets: &CrawlerTargets) -> Vec<String> {
+    let mut tables: Vec<String> = targets
+        .dynamo_db_targets
+        .iter()
+        .flatten()
+        .filter_map(|target| target.path.as_deref())
+        .map(str::trim)
+        .filter(|table| !table.is_empty())
+        .map(str::to_string)
+        .collect();
+    tables.sort();
+    tables.dedup();
+    tables
+}
 
 /// The identity-based policy documents in force on the role a crawler's `Role` names: its
 /// inline role policies plus the documents of the managed policies attached to it.
@@ -406,7 +470,7 @@ pub fn event_queue_refusal(
 ) -> Option<String> {
     if EVENT_QUEUE_ACTIONS
         .iter()
-        .all(|action| admits_queue_call(prepared, action, queue_arn))
+        .all(|action| admits_call(prepared, action, queue_arn))
     {
         return None;
     }
@@ -417,20 +481,105 @@ pub fn event_queue_refusal(
     })
 }
 
-/// Whether the policies `prepared` admit the role the call `action` on the queue `queue_arn`.
+/// Why the crawler role whose policies are `prepared` cannot read a target the crawl of
+/// `targets` would walk, or `None` when those documents admit every read it makes.
+///
+/// A crawl runs AS the crawler's `Role`, so the policies in force on that role must admit the
+/// calls the crawl makes on each store it reads through: the queue operations of an S3 target
+/// crawled in event mode ([`event_queue_refusal`]) and the table reads of a DynamoDB target
+/// ([`dynamodb_target_refusal`]). The targets are decided about in that order, and the first
+/// one the documents do not admit is the refusal — the whole decision is made against the
+/// account's own IAM records through the shared evaluator, so no two services answer
+/// differently.
+///
+/// The documents are PREPARED once per request and passed in, so a request naming several
+/// targets parses them once rather than once per target, and the caller holds no IAM guard
+/// while this runs.
+pub fn crawl_target_grant_refusal(
+    prepared: &[::service_common::iam_authorization::PreparedDocument],
+    region: &str,
+    targets: &CrawlerTargets,
+) -> Option<String> {
+    crawl_event_queues(targets)
+        .iter()
+        .find_map(|queue| event_queue_refusal(prepared, queue))
+        .or_else(|| {
+            crawl_dynamodb_tables(targets)
+                .iter()
+                .find_map(|table| dynamodb_target_refusal(prepared, region, table))
+        })
+}
+
+/// Why the crawler role whose policies are `prepared` cannot read the Amazon DynamoDB table
+/// `table`, or `None` when those documents admit the whole crawl of it.
+///
+/// A crawler with a DynamoDB target reads that table AS its `Role`, so the policies in force
+/// on the role must admit the table calls the crawl makes ([`DYNAMODB_TARGET_ACTIONS`]) on the
+/// table itself ([`dynamodb_table_arn`]). The decision is made against the account's own IAM
+/// records — the ones `CreateRole`/`PutRolePolicy`/`AttachRolePolicy` wrote, collected by
+/// [`role_policy_documents`] — through the shared evaluator every service that decides
+/// authorization uses.
+///
+/// EVERY action the crawl makes has to be admitted, so one the documents do not admit settles
+/// that the write is refused; which of IAM's rules withheld it (an explicit `Deny`, or no
+/// grant at all) decides nothing, because Glue states its own refusal rather than the table
+/// service's authorization answer ([`messages::dynamodb_target_grant_missing`]).
+///
+/// A role the account holds NO document for is shown nothing about the table, so it is not
+/// refused: a role is routinely provisioned with its grant out of band, and a call no document
+/// is in force over is decided by nothing — the reading the crawl's own read authorization
+/// makes of the same records ([`CrawlReadAuthorization::withholds_table_read`]).
+pub fn dynamodb_target_refusal(
+    prepared: &[::service_common::iam_authorization::PreparedDocument],
+    region: &str,
+    table: &str,
+) -> Option<String> {
+    if prepared.is_empty() {
+        return None;
+    }
+    let resource = dynamodb_table_arn(region, table);
+    if DYNAMODB_TARGET_ACTIONS
+        .iter()
+        .all(|action| admits_call(prepared, action, &resource))
+    {
+        return None;
+    }
+    Some(messages::dynamodb_target_grant_missing(table))
+}
+
+/// The resource a policy statement about the Amazon DynamoDB table `table` names:
+/// `arn:aws:dynamodb:<region>:<account>:table/<name>`, in the Region the request reached and
+/// with this emulator's own account segment ([`::engine::emulator_arn`]) — the form that
+/// service mints every table ARN of this account in.
+pub fn dynamodb_table_arn(region: &str, table: &str) -> String {
+    ::engine::emulator_arn(
+        DYNAMODB_ARN_NAMESPACE,
+        region,
+        &format!("{DYNAMODB_TABLE_ARN_SEGMENT}/{table}"),
+    )
+}
+
+/// The ARN vendor field of an Amazon DynamoDB resource.
+const DYNAMODB_ARN_NAMESPACE: &str = "dynamodb";
+
+/// The ARN resource-type segment of an Amazon DynamoDB table.
+const DYNAMODB_TABLE_ARN_SEGMENT: &str = "table";
+
+/// Whether the policies `prepared` admit the role the call `action` on the resource
+/// `resource`.
 ///
 /// Nothing stated is an implicit deny in IAM, and the documents in force on the role ARE the
 /// authority on what it may do: a role whose policies say nothing about the call may not make
 /// it. The one reading of that question in this module, so what a refusal is decided on and
 /// what it is WORDED from cannot drift apart.
-fn admits_queue_call(
+fn admits_call(
     prepared: &[::service_common::iam_authorization::PreparedDocument],
     action: &str,
-    queue_arn: &str,
+    resource: &str,
 ) -> bool {
     use ::service_common::iam_authorization as authorization;
 
-    let request = authorization::Request::new(action, queue_arn, &[]);
+    let request = authorization::Request::new(action, resource, &[]);
     matches!(
         authorization::identity_decision_prepared(prepared, &request),
         authorization::Decision::Allowed
@@ -461,7 +610,7 @@ fn queue_is_disclosed(
 
     queue_action_names()
         .into_iter()
-        .any(|name| admits_queue_call(prepared, &format!("{prefix}:{name}"), queue_arn))
+        .any(|name| admits_call(prepared, &format!("{prefix}:{name}"), queue_arn))
 }
 
 /// The default version's document of the managed policy `arn` names, or `None` when the

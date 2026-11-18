@@ -1,29 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the check `CreateCrawler` makes on an S3 target's event queue.
+//! End-to-end tests for the checks `CreateCrawler` makes on the crawler role's access to the
+//! stores a crawl READS its targets through: the Amazon SQS queue an S3 target is crawled
+//! from, and the Amazon DynamoDB table a `DynamoDBTarget` names.
 //!
 //! Every call goes over the wire through the shared [`crate::wire`] harness, so what is
 //! asserted is the HTTP behaviour and not a direct call into a handler. The IAM records
 //! the check reads are seeded into the SAME shared engine the service reads them from —
 //! the store `CreateRole`, `PutRolePolicy` and `AttachRolePolicy` write.
 //!
-//! The rule under test: an S3 target that names an `EventQueueArn` is crawled FROM that
-//! queue, and the crawl runs as the crawler's `Role`, so `CreateCrawler` refuses the
-//! create with `InvalidInputException` (HTTP 400) — storing no crawler — when the
-//! policies in force on that role do not admit the queue operations the crawl makes on
-//! that queue, and creates the identically-shaped crawler whose role does hold them.
+//! The rule under test: a crawl runs AS the crawler's `Role`, so `CreateCrawler` refuses the
+//! create with `InvalidInputException` (HTTP 400) — storing no crawler — when the policies in
+//! force on that role do not admit the calls a crawl makes on a store one of its targets
+//! names, and creates the identically-shaped crawler whose role does hold them. A role
+//! nothing can be shown about is not refused.
 //!
-//! WHICH refusal it is follows from what those same policies show the role about the queue
-//! ITSELF: a role they admit some call of the queue's own service on it to is told the grant
-//! its crawl needs, naming the queue calls a crawl in event mode makes, because a queue it may
-//! touch is a queue that is there and a missing grant is all there is left to report; a role
-//! they admit no call on it to is shown nothing that tells an absent queue from one it may not
-//! reach, and gets exactly the sentence that conflates those two and asks for no grant.
+//! For an S3 target that names an `EventQueueArn`, those calls are the queue operations an
+//! event-mode crawl makes. WHICH refusal it is follows from what those same policies show the
+//! role about the queue ITSELF: a role they admit some call of the queue's own service on it
+//! to is told the grant its crawl needs, naming the queue calls a crawl in event mode makes,
+//! because a queue it may touch is a queue that is there and a missing grant is all there is
+//! left to report; a role they admit no call on it to is shown nothing that tells an absent
+//! queue from one it may not reach, and gets exactly the sentence that conflates those two
+//! and asks for no grant.
 //!
-//! Either refusal is Glue's OWN sentence for a queue a crawl cannot read, not the queue
-//! service's authorization answer: its one variable part is the queue the target carried, and
-//! it names neither the identity the crawl would run as nor which of IAM's rules withheld the
-//! grant.
+//! For a DynamoDB target they are the reads the crawl makes on the table it names — its
+//! definition and the scan of its items — and the refusal names that whole grant.
+//!
+//! Either refusal is Glue's OWN sentence for a store a crawl cannot read, not that store's
+//! authorization answer: its one variable part is the target the request carried, and it names
+//! neither the identity the crawl would run as nor which of IAM's rules withheld the grant.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -738,4 +744,362 @@ async fn a_role_this_account_does_not_hold_is_not_refused() {
              {status} with {body}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The DynamoDB table a DynamoDBTarget names
+// ---------------------------------------------------------------------------
+
+/// The resource a policy statement about the DynamoDB table `table` names, written out here
+/// rather than built from the crate's own helper so this suite pins the form the check decides
+/// against: `arn:aws:dynamodb:<region>:<account>:table/<name>`, which is how that service
+/// names a table.
+fn table_arn(table: &str) -> String {
+    format!("arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{table}")
+}
+
+/// The whole sentence Glue refuses a create with when the crawler's role may not read the
+/// DynamoDB table a target names: the table as the request supplied it inside fixed text that
+/// conflates the table's absence with the role's access to it, then the grant the crawl needs
+/// on it — the ACTIONS written out here in the order the crawl makes them — and last the
+/// clause naming the component that refused, its status, its code and the id of the request
+/// it refused. Written out here rather than read from the crate's own constructor, so the
+/// wording this suite pins is the test's and not the code's; the request id is the clause's
+/// one per-run field, so it is matched by [`without_request_id`] instead.
+fn expected_table_grant_missing(table: &str) -> String {
+    format!(
+        "DynamoDB table {table} does not exist or the role provided does not have access to \
+         it. Please make sure the role has dynamodb:DescribeTable and dynamodb:Scan \
+         permissions on the table. (Service: glue; Status Code: 400; Error Code: \
+         InvalidInputException; Request ID: <id>; Proxy: null)"
+    )
+}
+
+/// `message` with the id of the request the refusal names replaced by a placeholder, so the
+/// sentence a suite compares is everything BUT that per-run field.
+///
+/// The id is asserted to be there and to have the form this emulator's refusals report an id
+/// in (`service_common::query_error_envelope::is_request_id`, the 8-4-4-4-12 form), and only
+/// then taken out of the comparison.
+fn without_request_id(case: &str, message: &str) -> String {
+    let Some((head, tail)) = message.split_once("Request ID: ") else {
+        panic!("case {case:?}: the refusal must name the request it answers, got {message:?}");
+    };
+    let Some((id, rest)) = tail.split_once(';') else {
+        panic!("case {case:?}: the request id must end its clause, got {message:?}");
+    };
+    assert!(
+        service_common::query_error_envelope::is_request_id(id),
+        "case {case:?}: the refusal must name the request by an id of the form every other \
+         refusal reports, got {id:?}"
+    );
+    format!("{head}Request ID: <id>;{rest}")
+}
+
+/// A `CreateCrawler` body whose single target is the DynamoDB table `table`.
+fn dynamodb_crawler(name: &str, role: &str, table: &str) -> Value {
+    json!({
+        "Name": name,
+        "Role": role,
+        "Targets": { "DynamoDBTargets": [{ "Path": table }] },
+    })
+}
+
+/// A role whose policies do not admit the reads a crawl of a DynamoDB target makes on that
+/// table cannot back such a crawler, and the identically-shaped request whose role does admit
+/// them is created.
+///
+/// The rows differ along WHAT the role's policies grant: nothing at all, the table reads on
+/// another table, another service's action on the table's own ARN, one unrelated DynamoDB
+/// call on it, a subset of the crawl's reads (one row per read it makes, each missing in
+/// turn), an explicit `Deny` beside an `Allow` of all, and the full grant — written as the
+/// exact ARN, through a wildcard, and spread over two documents. A role the account holds no
+/// document for is shown nothing about the table, so it is admitted: only what the records
+/// SHOW refuses a create. A refused row is told which
+/// call was withheld: the first the crawl makes that the documents do not admit.
+#[tokio::test]
+async fn a_dynamodb_target_needs_its_role_to_read_the_table() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
+    let table = "crawled-items";
+    let arn = table_arn(table);
+    let every_action: Vec<&str> =
+        service_com_amazonaws_glue_awsglue::state::DYNAMODB_TARGET_ACTIONS.to_vec();
+    let first_action = every_action[0];
+    let last_action = every_action[every_action.len() - 1];
+    let deny = |actions: &[&str]| {
+        json!({
+            "Version": "2012-10-17",
+            "Statement": [{ "Effect": "Deny", "Action": actions, "Resource": arn }],
+        })
+    };
+
+    // (case, the documents the role carries, whether they admit the whole crawl)
+    let mut rows: Vec<(String, Vec<Value>, bool)> = vec![
+        // A role the account holds no document for is shown NOTHING about the table, so it
+        // grounds no refusal — the reading the crawl's own read authorization makes of the
+        // same records.
+        ("no policy at all".to_string(), Vec::new(), true),
+        (
+            "the table reads on another table".to_string(),
+            vec![allow(&every_action, &table_arn("some-other-table"))],
+            false,
+        ),
+        (
+            "another service's action on the table's own ARN".to_string(),
+            vec![allow(&["s3:GetObject"], &arn)],
+            false,
+        ),
+        (
+            "one DynamoDB call on the table, and none of the crawl's".to_string(),
+            vec![allow(&["dynamodb:PutItem"], &arn)],
+            false,
+        ),
+        (
+            "every read the crawl makes, named exactly".to_string(),
+            vec![allow(&every_action, &arn)],
+            true,
+        ),
+        (
+            "every read the crawl makes, through a wildcard".to_string(),
+            vec![allow(&["dynamodb:*"], &format!("{}*", table_arn("")))],
+            true,
+        ),
+        (
+            "every read the crawl makes, spread over two documents".to_string(),
+            vec![
+                allow(&every_action[..1], &arn),
+                allow(&every_action[1..], &arn),
+            ],
+            true,
+        ),
+        (
+            "an explicit deny of the first read beside the grant".to_string(),
+            vec![allow(&every_action, &arn), deny(&[first_action])],
+            false,
+        ),
+        (
+            "an explicit deny of the last read beside the grant".to_string(),
+            vec![allow(&every_action, &arn), deny(&[last_action])],
+            false,
+        ),
+    ];
+    // One row per read the crawl makes, each one missing from an otherwise complete grant:
+    // every one of them is required, so each omission refuses on its own.
+    for missing in service_com_amazonaws_glue_awsglue::state::DYNAMODB_TARGET_ACTIONS {
+        let granted: Vec<&str> = every_action
+            .iter()
+            .copied()
+            .filter(|action| *action != missing)
+            .collect();
+        rows.push((
+            format!("every read the crawl makes except {missing}"),
+            vec![allow(&granted, &arn)],
+            false,
+        ));
+    }
+
+    for (index, (case, documents, admitted)) in rows.iter().enumerate() {
+        let role = seed_role(&engine, &format!("ddb-crawler-role-{index}"), documents);
+        let crawler = format!("ddb-crawler-{index}");
+        let (status, body) = call(
+            &router,
+            "CreateCrawler",
+            &dynamodb_crawler(&crawler, &role, table),
+        )
+        .await;
+
+        if *admitted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the role holds the grant, so the create must be admitted, \
+                 got {status} with {body}"
+            );
+            let read = ok(&router, "GetCrawler", &json!({ "Name": crawler })).await;
+            assert_eq!(
+                read["Crawler"]["Name"].as_str(),
+                Some(crawler.as_str()),
+                "case {case:?}: the created crawler must be readable, got {read}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).contains("InvalidInputException"),
+            "case {case:?}: expected InvalidInputException, got {}",
+            error_code(&body)
+        );
+        let message = error_message(&body);
+        assert_eq!(
+            without_request_id(case, &message),
+            expected_table_grant_missing(table),
+            "case {case:?}: expected the refusal naming the table {table} and the grant the \
+             crawl needs, got {message:?}"
+        );
+        // Glue words its own refusal, so the identity the crawl would run as is not in it.
+        assert!(
+            !message.contains(&role),
+            "case {case:?}: the refusal must not disclose the role, got {message:?}"
+        );
+        // No crawler was stored: the refused create left nothing behind.
+        let (status, body) = call(&router, "GetCrawler", &json!({ "Name": crawler })).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a refused create must store no crawler, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).contains("EntityNotFoundException"),
+            "case {case:?}: expected EntityNotFoundException, got {}",
+            error_code(&body)
+        );
+    }
+}
+
+/// The check is about the table a TARGET names, so a crawler naming several is admitted only
+/// when the role may read every one of them, the same table named twice is one table to decide
+/// about, and a crawler with no DynamoDB target at all has nothing checked for it.
+#[tokio::test]
+async fn the_check_covers_every_dynamodb_table_a_target_names() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
+    let actions: Vec<&str> =
+        service_com_amazonaws_glue_awsglue::state::DYNAMODB_TARGET_ACTIONS.to_vec();
+    // A role granted the crawl's reads on ONE of the two tables below.
+    let role = seed_role(
+        &engine,
+        "one-table-role",
+        &[allow(&actions, &table_arn("readable-items"))],
+    );
+
+    // The target it may read is admitted, twice over: the same table named by two targets is
+    // one table to decide about.
+    ok(
+        &router,
+        "CreateCrawler",
+        &json!({
+            "Name": "readable-crawler",
+            "Role": role,
+            "Targets": {
+                "DynamoDBTargets": [
+                    { "Path": "readable-items" },
+                    { "Path": "readable-items", "scanAll": false },
+                ],
+            },
+        }),
+    )
+    .await;
+
+    // The second target names a table the role may not read, so the create is refused for
+    // that table and nothing is stored.
+    let (status, body) = call(
+        &router,
+        "CreateCrawler",
+        &json!({
+            "Name": "mixed-crawler",
+            "Role": role,
+            "Targets": {
+                "DynamoDBTargets": [
+                    { "Path": "readable-items" },
+                    { "Path": "closed-items" },
+                ],
+            },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case \"a second target the role may not read\": expected 400, got {status} with {body}"
+    );
+    let message = error_message(&body);
+    assert_eq!(
+        without_request_id("a second target the role may not read", &message),
+        expected_table_grant_missing("closed-items"),
+        "case \"a second target the role may not read\": the refusal names that table, got \
+         {message:?}"
+    );
+
+    // A crawler with no DynamoDB target has no table to decide about, so the same role —
+    // which grants nothing for Amazon S3 — creates one.
+    ok(
+        &router,
+        "CreateCrawler",
+        &json!({
+            "Name": "no-table-crawler",
+            "Role": role,
+            "Targets": { "S3Targets": [{ "Path": "s3://crawler-bucket/plain/" }] },
+        }),
+    )
+    .await;
+}
+
+/// The number of DynamoDB tables one create may have decided about is bounded
+/// (`MAX_CHECKED_DYNAMODB_TARGETS`): a create naming that many DISTINCT tables is served, one
+/// naming more is refused with the operation's modelled `InvalidInputException`.
+#[tokio::test]
+async fn the_number_of_checked_dynamodb_tables_is_bounded() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
+    // A role granted the crawl's reads on every table of this account, so a refusal below can
+    // only be the ceiling and never a missing grant.
+    let role = seed_role(
+        &engine,
+        "every-table-role",
+        &[allow(&["dynamodb:*"], &format!("{}*", table_arn("")))],
+    );
+
+    let ceiling = service_com_amazonaws_glue_awsglue::state::MAX_CHECKED_DYNAMODB_TARGETS;
+    let targets = |count: usize| {
+        let tables: Vec<Value> = (0..count)
+            .map(|index| json!({ "Path": format!("bounded-items-{index}") }))
+            .collect();
+        json!({ "DynamoDBTargets": tables })
+    };
+
+    // At the ceiling: served.
+    ok(
+        &router,
+        "CreateCrawler",
+        &json!({
+            "Name": "at-the-table-ceiling",
+            "Role": role,
+            "Targets": targets(ceiling),
+        }),
+    )
+    .await;
+
+    // One past it: refused, and nothing stored.
+    let (status, body) = call(
+        &router,
+        "CreateCrawler",
+        &json!({
+            "Name": "past-the-table-ceiling",
+            "Role": role,
+            "Targets": targets(ceiling + 1),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case \"one table past the ceiling\": expected 400, got {status} with {body}"
+    );
+    assert!(
+        error_code(&body).contains("InvalidInputException"),
+        "case \"one table past the ceiling\": expected InvalidInputException, got {}",
+        error_code(&body)
+    );
+    let (status, body) = call(
+        &router,
+        "GetCrawler",
+        &json!({ "Name": "past-the-table-ceiling" }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case \"one table past the ceiling\": a refused create stores nothing, got {status} \
+         with {body}"
+    );
 }

@@ -13,12 +13,12 @@
 //! with nothing persisted (see [`crate::state::glue_role_is_unassumable`]).
 //!
 //! An S3 target that names an `EventQueueArn` (or the `DlqEventQueueArn` beside it) is
-//! crawled FROM that queue, and the crawl runs as the crawler's `Role`, so the create is
-//! refused with `InvalidInputException` when the policies in force on that role do not
-//! admit the queue operations the crawl makes on that queue — the account's own IAM
-//! records are the authority, the refusal NAMES the action those policies withhold, and a
-//! role nothing can be shown about is not refused (see
-//! [`crate::state::event_queue_refusal`]).
+//! crawled FROM that queue, and a `DynamoDBTarget` names a table the crawl reads through
+//! Amazon DynamoDB; the crawl runs as the crawler's `Role`, so the create is refused with
+//! `InvalidInputException` when the policies in force on that role do not admit the calls the
+//! crawl makes on either store — the account's own IAM records are the authority, the refusal
+//! NAMES the grant those policies withhold, and a role nothing can be shown about is not
+//! refused (see [`crate::state::crawl_target_grant_refusal`]).
 //!
 //! Each S3 target's `Path` is RESOLVED against the object store, and a path whose bucket the
 //! store does not hold is refused with `InvalidInputException` with nothing persisted (see
@@ -292,18 +292,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // An S3 target that names an `EventQueueArn` is crawled FROM that queue, and the
-        // crawl runs as the crawler's `Role`, so the policies in force on that role have
-        // to admit the queue operations the crawl makes. Glue decides that at CREATE
-        // time, and this refuses only what the account's own IAM records SHOW (see
-        // `crate::state::event_queue_refusal`), so a role nothing can be read about is
+        // A target the crawl reads through ANOTHER service's data plane is read as the
+        // crawler's `Role`, so the policies in force on that role have to admit the calls
+        // the crawl makes there: the queue operations of an S3 target crawled in event mode,
+        // and the table reads of a DynamoDB target. Glue decides that at CREATE time, and
+        // this refuses only what the account's own IAM records SHOW (see
+        // `crate::state::crawl_target_grant_refusal`), so a role nothing can be read about is
         // not refused.
         //
-        // The work this costs is bounded on both factors: the number of DISTINCT queues
-        // one request may have decided about (`MAX_CHECKED_EVENT_QUEUES`), and the number
-        // of the role's documents the decision reads (`MAX_ROLE_DOCUMENTS`). The role is
-        // read ONCE, the IAM guard is dropped before anything is parsed, and the
-        // documents are prepared once for every queue rather than once per queue.
+        // The work this costs is bounded on both factors: the number of DISTINCT targets one
+        // request may have decided about (`MAX_CHECKED_EVENT_QUEUES`,
+        // `MAX_CHECKED_DYNAMODB_TARGETS`), and the number of the role's documents the
+        // decision reads (`MAX_ROLE_DOCUMENTS`). The role is read ONCE, the IAM guard is
+        // dropped before anything is parsed, and the documents are prepared once for every
+        // target rather than once per target.
         let event_queues = crate::state::crawl_event_queues(&input.targets);
         if event_queues.len() > crate::state::MAX_CHECKED_EVENT_QUEUES {
             return Err(CreateCrawlerErrorModeled::InvalidInputException(
@@ -319,16 +321,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if !event_queues.is_empty() {
+        let dynamodb_tables = crate::state::crawl_dynamodb_tables(&input.targets);
+        if dynamodb_tables.len() > crate::state::MAX_CHECKED_DYNAMODB_TARGETS {
+            return Err(CreateCrawlerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Targets name {} DynamoDB tables, more than the {} this crawler \
+                         create resolves",
+                        dynamodb_tables.len(),
+                        crate::state::MAX_CHECKED_DYNAMODB_TARGETS
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        if !event_queues.is_empty() || !dynamodb_tables.is_empty() {
             let documents = crate::state::iam_state(&*self.engine).and_then(|iam| {
                 let records = iam.lock();
                 crate::state::role_policy_documents(&input.role, &records)
             });
             if let Some(documents) = documents {
                 let prepared = ::service_common::iam_authorization::prepare_documents(&documents);
-                let refusal = event_queues
-                    .iter()
-                    .find_map(|queue| crate::state::event_queue_refusal(&prepared, queue));
+                let refusal = crate::state::crawl_target_grant_refusal(
+                    &prepared,
+                    &region,
+                    &input.targets,
+                );
                 if let Some(message) = refusal {
                     return Err(CreateCrawlerErrorModeled::InvalidInputException(
                         InvalidInputException {

@@ -7,8 +7,9 @@
 //! crawler's `Targets` name and, for each dataset it finds, writes one table whose columns
 //! are the ones the data carries and whose partition keys are the folder levels below the
 //! dataset's root, plus one partition per distinct value of those levels. WHERE the data is
-//! read from and HOW a dataset's schema is inferred live beside this
-//! ([`super::crawl_source`]); this module holds the records, the catalog write and the
+//! read from and HOW a dataset's schema is inferred live beside this — the objects under an
+//! Amazon S3 prefix in [`super::crawl_source`], the items of an Amazon DynamoDB table in
+//! [`super::dynamodb_crawl_source`]; this module holds the records, the catalog write and the
 //! lifecycle.
 //!
 //! The walk is performed where the crawl is STARTED, with no store guard held, and what it
@@ -75,9 +76,11 @@ pub const UPDATED_BY_CRAWLER_PARAMETER: &str = "UPDATED_BY_CRAWLER";
 /// tell which crawler deprecated the table.
 pub const DEPRECATED_BY_CRAWLER_PARAMETER: &str = "DEPRECATED_BY_CRAWLER";
 
-/// The table parameter holding the format a crawl classified the dataset's objects as —
-/// `csv` or `json` here ([`super::crawl_source`]). Every engine that reads a crawled table
-/// keys its reader off this property.
+/// The table parameter holding the format a crawl classified the dataset's data as — `csv`
+/// or `json` for the objects under an Amazon S3 prefix ([`super::crawl_source`]), and the
+/// store itself for data that sits in another store's table
+/// ([`super::dynamodb_crawl_source`]). Every engine that reads a crawled table keys its
+/// reader off this property.
 pub const CLASSIFICATION_PARAMETER: &str = "classification";
 
 /// The value [`CLASSIFICATION_PARAMETER`] carries for a dataset of delimited text.
@@ -107,6 +110,18 @@ pub const TYPE_OF_DATA_PARAMETER: &str = "typeOfData";
 /// The value [`TYPE_OF_DATA_PARAMETER`] carries for data that sits in objects of an object
 /// store, which is what an Amazon S3 target holds.
 pub const TYPE_OF_DATA_FILE: &str = "file";
+
+/// The value [`TYPE_OF_DATA_PARAMETER`] carries for data that sits in the items of another
+/// store's table, which is what an Amazon DynamoDB target holds. See [`TYPE_OF_DATA_FILE`].
+pub const TYPE_OF_DATA_TABLE: &str = "table";
+
+/// The table parameter holding how many RECORDS the crawl counted behind a table-shaped
+/// dataset, which is the item-side counterpart of [`OBJECT_COUNT_PARAMETER`].
+pub const RECORD_COUNT_PARAMETER: &str = "recordCount";
+
+/// The table parameter holding how many bytes one of those records holds on average: the
+/// dataset's size divided by the records the crawl counted.
+pub const AVERAGE_RECORD_SIZE_PARAMETER: &str = "averageRecordSize";
 
 /// The table parameter holding the field delimiter of a delimited-text dataset.
 pub const DELIMITER_PARAMETER: &str = "delimiter";
@@ -213,6 +228,10 @@ pub struct CrawlPlan {
     /// The Amazon S3 targets to walk: "specifies Amazon Simple Storage Service (Amazon S3)
     /// targets" (`CrawlerTargets$S3Targets`).
     pub s3_targets: Vec<S3Target>,
+    /// The Amazon DynamoDB targets to walk: "specifies Amazon DynamoDB targets"
+    /// (`CrawlerTargets$DynamoDBTargets`), each naming a table whose items are read through
+    /// that service's own data plane ([`super::dynamodb_crawl_source`]).
+    pub dynamo_db_targets: Vec<DynamoDBTarget>,
     /// The update behaviour in force, resolved from the crawler's `SchemaChangePolicy`, else
     /// [`UPDATE_BEHAVIOR_UPDATE_IN_DATABASE`].
     pub update_behavior: String,
@@ -242,6 +261,11 @@ impl CrawlPlan {
                 .s3_targets
                 .clone()
                 .unwrap_or_default(),
+            dynamo_db_targets: crawler
+                .targets
+                .dynamo_db_targets
+                .clone()
+                .unwrap_or_default(),
             update_behavior: policy
                 .and_then(|policy| policy.update_behavior.clone())
                 .unwrap_or_else(|| UPDATE_BEHAVIOR_UPDATE_IN_DATABASE.to_string()),
@@ -251,15 +275,17 @@ impl CrawlPlan {
         }
     }
 
-    /// Whether this crawler names a data store this crawl reads, i.e. at least one Amazon S3
-    /// target carrying a path.
+    /// Whether this crawler names a data store this crawl reads: at least one Amazon S3
+    /// target carrying a path, or at least one Amazon DynamoDB target naming a table.
     pub fn has_readable_target(&self) -> bool {
-        self.s3_targets.iter().any(|target| {
-            target
-                .path
-                .as_deref()
-                .is_some_and(|path| !path.trim().is_empty())
-        })
+        let named = |path: Option<&str>| path.is_some_and(|path| !path.trim().is_empty());
+        self.s3_targets
+            .iter()
+            .any(|target| named(target.path.as_deref()))
+            || self
+                .dynamo_db_targets
+                .iter()
+                .any(|target| named(target.path.as_deref()))
     }
 
     /// The table name a dataset discovered under `root_name` is written under: the
@@ -284,34 +310,71 @@ pub struct DiscoveredPartition {
     pub location: String,
 }
 
+/// WHERE a discovered dataset's data sits, which is what decides how the table the crawl
+/// writes describes it to a reader.
+#[derive(Debug, Clone)]
+pub enum DatasetStorage {
+    /// Objects holding LINES OF TEXT under an Amazon S3 prefix: the layout a reader needs —
+    /// where the data is, the serde that reads it, the field delimiter and how many leading
+    /// lines are a header — is what the crawl classified ([`super::crawl_source`]).
+    TextObjects {
+        /// The dataset's root: the location of the table.
+        location: String,
+        /// The serialization library the classified layout is read with.
+        serialization_library: String,
+        /// The field delimiter of a delimited-text dataset, as the text it is written as, or
+        /// `None` for a layout that has none.
+        delimiter: Option<String>,
+        /// How many leading lines of each object are a header rather than data.
+        header_lines: usize,
+    },
+    /// The ITEMS of another store's table, read through that store's own data plane
+    /// ([`super::dynamodb_crawl_source`]). The data stays in that table, which is no file
+    /// layout — so the table the crawl writes names no input format and no serde, WHICH
+    /// store holds it is what the dataset's classification says, and WHERE it sits is the
+    /// resource that addresses the table itself.
+    StoreItems {
+        /// The table the items sit in, as the store that owns it addresses that table: its
+        /// Amazon Resource Name, which is the dataset's `StorageDescriptor$Location`.
+        location: String,
+    },
+}
+
+impl DatasetStorage {
+    /// The `StorageDescriptor$Location` of the dataset's own root: the prefix the objects sit
+    /// under, or the resource that addresses the table the items sit in.
+    pub fn location(&self) -> Option<String> {
+        match self {
+            Self::TextObjects { location, .. } | Self::StoreItems { location } => {
+                Some(location.clone())
+            }
+        }
+    }
+}
+
 /// One DATASET a crawl found behind a target: the table it is written as.
 #[derive(Debug, Clone)]
 pub struct DiscoveredTable {
-    /// The dataset's own name, read off the last folder level of the target's path. The
-    /// crawler's `TablePrefix` is applied where the table is written
-    /// ([`CrawlPlan::table_name`]), so one name is stored in one place.
+    /// The dataset's own name — the last folder level of an Amazon S3 target's path, or the
+    /// table an Amazon DynamoDB target names. The crawler's `TablePrefix` is applied where
+    /// the table is written ([`CrawlPlan::table_name`]), so one name is stored in one place.
     pub name: String,
-    /// The dataset's root: the location of the table.
-    pub location: String,
-    /// What the objects were classified as ([`CLASSIFICATION_PARAMETER`]).
+    /// What the data was classified as ([`CLASSIFICATION_PARAMETER`]).
     pub classification: String,
-    /// The serialization library the classified layout is read with.
-    pub serialization_library: String,
-    /// The field delimiter of a delimited-text dataset, as the text it is written as, or
-    /// `None` for a layout that has none.
-    pub delimiter: Option<String>,
-    /// How many leading lines of each object are a header rather than data.
-    pub header_lines: usize,
-    /// The columns the data carries, in the order it carries them.
+    /// The columns the data carries, in the order the dataset's own store carries them.
     pub columns: Vec<Column>,
-    /// The partition keys: one per folder level below the dataset's root.
+    /// The partition keys: one per folder level below the dataset's root, and none at all for
+    /// a dataset that is not held in folders.
     pub partition_keys: Vec<Column>,
     /// Every distinct folder path at that depth.
     pub partitions: Vec<DiscoveredPartition>,
-    /// How many objects the crawl counted behind this dataset.
-    pub object_count: u64,
-    /// How many bytes those objects hold together.
+    /// How many RECORDS the crawl counted behind this dataset: the objects of an Amazon S3
+    /// prefix, or the items of a table.
+    pub record_count: u64,
+    /// How many bytes those records hold together.
     pub size_bytes: u64,
+    /// Where the data sits, which is how the table describes it.
+    pub storage: DatasetStorage,
 }
 
 impl DiscoveredTable {
@@ -322,7 +385,7 @@ impl DiscoveredTable {
             name,
             table_type: Some(CRAWLED_TABLE_TYPE.to_string()),
             parameters: Some(self.table_parameters(crawler)),
-            storage_descriptor: Some(self.storage_descriptor(self.location.clone())),
+            storage_descriptor: Some(self.storage_descriptor(self.storage.location())),
             partition_keys: Some(self.partition_keys.clone()),
             ..TableInput::default()
         }
@@ -333,32 +396,49 @@ impl DiscoveredTable {
     pub fn to_partition_input(&self, partition: &DiscoveredPartition) -> PartitionInput {
         PartitionInput {
             values: Some(partition.values.clone()),
-            storage_descriptor: Some(self.storage_descriptor(partition.location.clone())),
+            storage_descriptor: Some(self.storage_descriptor(Some(partition.location.clone()))),
             ..PartitionInput::default()
         }
     }
 
     /// The storage of this dataset at `location`: the layout its classification states, which
     /// a table and each of its partitions describe the same way — only the location differs.
-    fn storage_descriptor(&self, location: String) -> StorageDescriptor {
-        let mut serde_parameters: HashMap<String, String> = HashMap::new();
-        if let Some(delimiter) = self.delimiter.as_ref() {
-            serde_parameters.insert(
-                FIELD_DELIMITER_SERDE_PARAMETER.to_string(),
-                delimiter.clone(),
-            );
-        }
-        StorageDescriptor {
-            columns: Some(self.columns.clone()),
-            location: Some(location),
-            input_format: Some(TEXT_INPUT_FORMAT.to_string()),
-            output_format: Some(TEXT_OUTPUT_FORMAT.to_string()),
-            serde_info: Some(SerDeInfo {
-                serialization_library: Some(self.serialization_library.clone()),
-                parameters: Some(serde_parameters),
-                ..SerDeInfo::default()
-            }),
-            ..StorageDescriptor::default()
+    ///
+    /// Data that sits in another store's TABLE is described by its columns and the resource
+    /// that addresses that table: there is no file format to read it with and no serde to
+    /// read it through, so neither is reported for it.
+    fn storage_descriptor(&self, location: Option<String>) -> StorageDescriptor {
+        match &self.storage {
+            DatasetStorage::TextObjects {
+                serialization_library,
+                delimiter,
+                ..
+            } => {
+                let mut serde_parameters: HashMap<String, String> = HashMap::new();
+                if let Some(delimiter) = delimiter.as_ref() {
+                    serde_parameters.insert(
+                        FIELD_DELIMITER_SERDE_PARAMETER.to_string(),
+                        delimiter.clone(),
+                    );
+                }
+                StorageDescriptor {
+                    columns: Some(self.columns.clone()),
+                    location,
+                    input_format: Some(TEXT_INPUT_FORMAT.to_string()),
+                    output_format: Some(TEXT_OUTPUT_FORMAT.to_string()),
+                    serde_info: Some(SerDeInfo {
+                        serialization_library: Some(serialization_library.clone()),
+                        parameters: Some(serde_parameters),
+                        ..SerDeInfo::default()
+                    }),
+                    ..StorageDescriptor::default()
+                }
+            }
+            DatasetStorage::StoreItems { .. } => StorageDescriptor {
+                columns: Some(self.columns.clone()),
+                location,
+                ..StorageDescriptor::default()
+            },
         }
     }
 
@@ -367,7 +447,8 @@ impl DiscoveredTable {
     ///
     /// Every value is computed from THIS crawl's own reading, so a property is there only
     /// when the crawl produced it: a dataset with no field delimiter and no header line
-    /// records neither.
+    /// records neither, and one whose data sits in another store's table records how many
+    /// RECORDS it holds where a dataset of objects records how many objects.
     fn table_parameters(&self, crawler: &str) -> HashMap<String, String> {
         let mut parameters: HashMap<String, String> = HashMap::new();
         parameters.insert(
@@ -382,14 +463,6 @@ impl DiscoveredTable {
             COMPRESSION_TYPE_PARAMETER.to_string(),
             UNCOMPRESSED.to_string(),
         );
-        parameters.insert(
-            TYPE_OF_DATA_PARAMETER.to_string(),
-            TYPE_OF_DATA_FILE.to_string(),
-        );
-        parameters.insert(
-            OBJECT_COUNT_PARAMETER.to_string(),
-            self.object_count.to_string(),
-        );
         parameters.insert(SIZE_KEY_PARAMETER.to_string(), self.size_bytes.to_string());
         parameters.insert(
             SCHEMA_DESERIALIZER_VERSION_PARAMETER.to_string(),
@@ -399,14 +472,48 @@ impl DiscoveredTable {
             SCHEMA_SERIALIZER_VERSION_PARAMETER.to_string(),
             CRAWLER_SCHEMA_VERSION.to_string(),
         );
-        if let Some(delimiter) = self.delimiter.as_ref() {
-            parameters.insert(DELIMITER_PARAMETER.to_string(), delimiter.clone());
-        }
-        if self.header_lines > 0 {
-            parameters.insert(
-                SKIP_HEADER_LINE_COUNT_PARAMETER.to_string(),
-                self.header_lines.to_string(),
-            );
+        match &self.storage {
+            DatasetStorage::TextObjects {
+                delimiter,
+                header_lines,
+                ..
+            } => {
+                parameters.insert(
+                    TYPE_OF_DATA_PARAMETER.to_string(),
+                    TYPE_OF_DATA_FILE.to_string(),
+                );
+                parameters.insert(
+                    OBJECT_COUNT_PARAMETER.to_string(),
+                    self.record_count.to_string(),
+                );
+                if let Some(delimiter) = delimiter.as_ref() {
+                    parameters.insert(DELIMITER_PARAMETER.to_string(), delimiter.clone());
+                }
+                if *header_lines > 0 {
+                    parameters.insert(
+                        SKIP_HEADER_LINE_COUNT_PARAMETER.to_string(),
+                        header_lines.to_string(),
+                    );
+                }
+            }
+            DatasetStorage::StoreItems { .. } => {
+                parameters.insert(
+                    TYPE_OF_DATA_PARAMETER.to_string(),
+                    TYPE_OF_DATA_TABLE.to_string(),
+                );
+                parameters.insert(
+                    RECORD_COUNT_PARAMETER.to_string(),
+                    self.record_count.to_string(),
+                );
+                // The average is of the records the crawl counted, so a dataset of none
+                // records no average rather than a division by nothing.
+                if let Some(average) = self.size_bytes.checked_div(self.record_count) {
+                    parameters.insert(
+                        AVERAGE_RECORD_SIZE_PARAMETER.to_string(),
+                        average.to_string(),
+                    );
+                }
+            }
         }
         parameters
     }

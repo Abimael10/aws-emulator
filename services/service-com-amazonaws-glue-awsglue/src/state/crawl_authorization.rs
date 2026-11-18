@@ -176,6 +176,41 @@ impl CrawlReadAuthorization {
             .await
     }
 
+    /// Why the records withhold the read `action` on the TABLE `table_arn` from the crawl
+    /// role, or `None` when the crawl may make it — the decision for a target whose data sits
+    /// in another store's table ([`super::dynamodb_crawl_source`]) rather than in objects.
+    ///
+    /// The documents in force here are the ROLE's own, read once with the rest
+    /// ([`Self::of_role`]): a table of another store carries its own resource policy, served by
+    /// that store's own API, and this walk asks only what the account's IAM records show about
+    /// the role — the same half `CreateCrawler` decides a target's grant on
+    /// ([`super::dynamodb_target_refusal`]). Nothing is withheld unless a document the account
+    /// HOLDS says so, so a crawler naming no role, an emulator with no IAM to ask and a role
+    /// nothing can be read about each leave the read to go ahead, exactly as they do for an
+    /// object.
+    ///
+    /// The answer is the account of the refusal, for the crawl's own LOG, for the reason
+    /// [`Self::withholds_listing`] gives.
+    #[must_use]
+    pub fn withholds_table_read(&self, action: &str, table_arn: &str) -> Option<String> {
+        let role_arn = self.role_arn.clone()?;
+        let identity = self.identity.as_deref()?;
+        if identity.is_empty() {
+            return None;
+        }
+        let context = [(PRINCIPAL_ARN_KEY.to_string(), role_arn)];
+        let request = authorization::Request::new(action, table_arn, &self.principals)
+            .with_context(&context);
+        let by_identity = authorization::identity_decision_prepared(identity, &request);
+        if by_identity == authorization::Decision::Allowed {
+            return None;
+        }
+        Some(format!(
+            "the crawl role is not permitted to perform {action} on {table_arn}: its \
+             identity-based policies answered {by_identity:?}"
+        ))
+    }
+
     /// Why the documents in force withhold `action` on `resource` from the crawl role, or
     /// `None` when they permit it — which includes every case where nothing is in force over
     /// the call at all.

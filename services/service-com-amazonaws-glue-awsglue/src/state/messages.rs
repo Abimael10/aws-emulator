@@ -455,6 +455,35 @@ pub fn event_queue_grant_missing(queue_arn: &str) -> String {
     )
 }
 
+/// `CreateCrawler` for a DynamoDB target whose table the crawler's `Role` may not read
+/// ([`super::dynamodb_target_refusal`]).
+///
+/// Stated the way this service states the same refusal about the other store it reaches a
+/// target through ([`event_queue_grant_missing`]): one sentence that CONFLATES the table not
+/// being there with the role not being allowed to read it, because a role whose policies
+/// withhold those reads cannot be shown the table is there, then the REQUIREMENT the crawl
+/// holds the table to — the table calls a crawl makes on it
+/// ([`super::DYNAMODB_TARGET_ACTIONS`], in the order it makes them) — and last the diagnostic
+/// clause this service appends to a refusal its framework raised ([`with_diagnostic`]), which
+/// states the component, the status, the code and the id of the request it refused.
+///
+/// Its variable parts are read off the request and the clause's own per-call id: the table
+/// the target named, exactly as the request supplied it, and the request id. The identity the
+/// crawl would run as is not disclosed, and neither is which of IAM's rules withheld the
+/// grant.
+pub fn dynamodb_target_grant_missing(table: &str) -> String {
+    with_diagnostic(
+        &format!(
+            "DynamoDB table {table} does not exist or the role provided does not have access \
+             to it. Please make sure the role has {} permissions on the table.",
+            super::dynamodb_target_actions_clause()
+        ),
+        DIAGNOSTIC_SERVICE_GLUE,
+        DIAGNOSTIC_STATUS_VALIDATION,
+        DIAGNOSTIC_CODE_INVALID_INPUT,
+    )
+}
+
 /// `CreateCrawler`/`UpdateCrawler` for an S3 target whose `Path` names a bucket the object
 /// store does not hold ([`super::s3_target_refusal`]).
 ///

@@ -278,6 +278,7 @@ mod data_assets;
 mod data_catalog_export;
 mod data_quality_results;
 mod data_quality_rules;
+mod dynamodb_crawl_source;
 mod glue_etl;
 mod hive_registration;
 mod hive_types;
@@ -319,6 +320,7 @@ pub use data_assets::*;
 pub use data_catalog_export::*;
 pub use data_quality_results::*;
 pub use data_quality_rules::*;
+pub use dynamodb_crawl_source::*;
 pub use glue_etl::*;
 pub use hive_registration::*;
 pub use hive_types::*;
@@ -357,7 +359,8 @@ use crate::ops::types::{
     CodeGenConfigurationNode, Column, ColumnError, ColumnStatistics, ColumnStatisticsData,
     ColumnStatisticsTaskRun, ColumnStatisticsTaskSettings,
     DateColumnStatisticsData, DecimalColumnStatisticsData, DecimalNumber,
-    DoubleColumnStatisticsData, LongColumnStatisticsData, StringColumnStatisticsData,
+    DoubleColumnStatisticsData, DynamoDBTarget, LongColumnStatisticsData,
+    StringColumnStatisticsData,
     ConfigurationObject,
     Condition,
     Connection, ConnectionInput,
