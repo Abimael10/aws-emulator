@@ -12,6 +12,13 @@
 //! refused where the filter is created rather than quietly filtering nothing at
 //! inference time.
 //!
+//! A create is judged in three steps, in this order: the expression's INPUT (a character
+//! the language does not read is refused naming that symbol), the dataset group's own
+//! state (a group holding no INTERACTION records takes no filter —
+//! [`crate::state::holds_interaction_records`]), and only then the expression's grammar,
+//! because which datasets an expression may read is a question about what the group
+//! holds.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -194,6 +201,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group_active_at = group.active_at;
         let arn = filter_arn(&region, &input.name);
 
+        // 1. The expression's INPUT: a character this language is not written in is
+        //    refused naming that symbol, before anything about the dataset group or the
+        //    rest of the expression is judged — the text the caller sent is all this
+        //    screen needs ([`runtime::filter::unreadable_input`]).
+        if let Some(refusal) = runtime::filter::unreadable_input(&input.filter_expression) {
+            return Err(
+                CreateFilterErrorModeled::InvalidInputException(InvalidInputException {
+                    message: Some(refusal),
+                })
+                .into(),
+            );
+        }
+
+        // 2. The dataset group's own state: a filter selects what a recommendation may
+        //    return for a user, which Amazon Personalize decides from the group's
+        //    INTERACTION records, so a group holding none takes no filter at all —
+        //    whatever its expression reads. The refusal is the service's fixed sentence
+        //    for that precondition ([`crate::state::holds_interaction_records`]), and it
+        //    is answered before the expression's GRAMMAR is, because which datasets an
+        //    expression may read is a question about the group's contents.
+        if !crate::state::holds_interaction_records(&state, &input.dataset_group_arn) {
+            return Err(
+                CreateFilterErrorModeled::InvalidInputException(InvalidInputException {
+                    message: Some(crate::state::FILTER_INTERACTIONS_REQUIRED_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
         if state.filters.contains_key(&arn) {
             return Err(already_exists(&input.name));
         }
@@ -206,9 +242,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Register in the inference registry, which PARSES the expression: a filter the
-        // runtime could not apply is refused here, naming what the parser could not
-        // read, rather than accepted and silently ignored at inference time.
+        // 3. The expression's GRAMMAR, checked by the inference registry's own parser as
+        //    it registers the filter: a filter the runtime could not apply is refused
+        //    here, naming what the parser could not read, rather than accepted and
+        //    silently ignored at inference time.
         match runtime::register_filter(&*self.engine, &arn, &input.filter_expression) {
             Ok(true) => {}
             // The engine is the shared in-memory one (the mount check above), so a

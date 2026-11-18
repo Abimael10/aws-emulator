@@ -296,13 +296,17 @@ pub fn resource_not_found_message(resource: MissingResource, arn: &str) -> Strin
         MissingResource::Schema => format!("Resource Arn {arn} does not exist."),
         MissingResource::DatasetGroup => format!("The given dataset group does not exist: {arn}"),
         MissingResource::Dataset => format!("The given dataset does not exist: {arn}"),
+        // A solution and a version of one are addressed inside the SAME `solution/...`
+        // ARN — a version's ARN is its solution's with the version id appended — so an
+        // ARN of either that resolves to nothing is refused as the solution it names.
+        MissingResource::Solution | MissingResource::SolutionVersion => {
+            format!("The given solution does not exist: {arn}")
+        }
         // Every other kind this service addresses by ARN reads the same sentence: the
         // ARN the caller named is its one variable part.
         MissingResource::DatasetImportJob
         | MissingResource::DatasetExportJob
         | MissingResource::Recipe
-        | MissingResource::Solution
-        | MissingResource::SolutionVersion
         | MissingResource::Campaign
         | MissingResource::Filter
         | MissingResource::EventTracker => format!("Resource Arn {arn} does not exist."),
@@ -333,6 +337,17 @@ pub fn missing_schema_fields_message(missing: &[&str]) -> String {
 /// are, so a caller never learns the referencing ARNs from the refusal.
 pub const SCHEMA_IN_USE_MESSAGE: &str =
     "The provided schema is being referenced by one or more datasets";
+
+/// What a `CreateFilter` whose dataset group holds no interaction records answers — fixed
+/// in the same way, naming neither the group, the expression nor the datasets it holds.
+///
+/// A filter selects what a recommendation may return for a user, and what a user did is
+/// the group's INTERACTION data, so Amazon Personalize requires a group to hold some
+/// before it takes a filter for it: either bulk records a dataset import job read into the
+/// group's Interactions dataset, or the event-interactions stream an event tracker gives
+/// the group ([`holds_interaction_records`]).
+pub const FILTER_INTERACTIONS_REQUIRED_MESSAGE: &str = "Dataset group must contain an \
+     INTERACTIONS dataset with successfully completed dataset import job or EVENT_INTERACTIONS";
 
 /// What a dataset-group delete that still holds datasets answers — fixed in the same way,
 /// naming neither the group nor its datasets.
@@ -616,6 +631,46 @@ pub fn canonical_dataset_type(value: &str) -> Option<&'static str> {
 /// are one type however each was written.
 pub fn is_dataset_type(record: &DatasetRecord, value: &str) -> bool {
     record.dataset_type.eq_ignore_ascii_case(value)
+}
+
+/// The dataset type whose records are a user's interactions with the items of a group:
+/// "Interactions", one of [`DATASET_TYPE_VALUES`].
+pub const INTERACTIONS_DATASET_TYPE: &str = "Interactions";
+
+/// Whether the dataset group `dataset_group_arn` holds INTERACTION records at all.
+///
+/// Two sources put them there, and either one counts:
+///
+/// * BULK: an `Interactions` dataset of the group that a dataset import job read records
+///   into and COMPLETED — a job still running has imported nothing yet, and one that
+///   ended in failure ([`terminal_status`]) imported nothing at all;
+/// * STREAMED: the event-interactions stream an event tracker gives the group, which is
+///   what a `PutEvents` caller sends a user's events through.
+///
+/// A pure read of the store: it answers a question about the group, it changes nothing.
+pub fn holds_interaction_records(
+    store: &ComAmazonawsPersonalizeAmazonpersonalizeState,
+    dataset_group_arn: &str,
+) -> bool {
+    let imported = store
+        .datasets
+        .values()
+        .filter(|dataset| {
+            dataset.dataset_group_arn == dataset_group_arn
+                && is_dataset_type(dataset, INTERACTIONS_DATASET_TYPE)
+        })
+        .any(|dataset| {
+            store.dataset_import_jobs.values().any(|job| {
+                job.dataset_arn == dataset.dataset_arn
+                    && terminal_status(job.active_at, job.failure_reason.as_deref())
+                        == STATUS_ACTIVE
+            })
+        });
+    imported
+        || store
+            .event_trackers
+            .values()
+            .any(|tracker| tracker.dataset_group_arn == dataset_group_arn)
 }
 
 /// The fields a dataset schema of each dataset type must declare, in the order a refusal

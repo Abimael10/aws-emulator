@@ -53,6 +53,15 @@ fn dataset_not_found_message(arn: &str) -> String {
     format!("The given dataset does not exist: {arn}")
 }
 
+/// The same, for an ARN that addresses no solution — and for one that addresses no
+/// VERSION of a solution, because a solution version's ARN is its solution's with the
+/// version id appended, so either is refused as the solution it names.
+///
+/// Written out here rather than read from `crate::state` for the reason above.
+fn solution_not_found_message(arn: &str) -> String {
+    format!("The given solution does not exist: {arn}")
+}
+
 /// A row of the in-use table: the dataset types created against one schema in one group
 /// before the deletes are attempted. Each type is one from the model's documented
 /// `DatasetType` set (`DATASET_TYPE_VALUES` in `src/state.rs`), and the rows differ in how
@@ -528,3 +537,199 @@ async fn a_lookup_that_resolves_to_nothing_names_the_kind_of_resource_it_looked_
         }
     }
 }
+
+/// The operations that resolve a `solutionArn`, and so can answer the not-found class for
+/// one. Source: this crate's `OPERATIONS.md` (`DescribeSolution` reads one and
+/// `CreateSolutionVersion` references one; both name that ARN alone).
+const SOLUTION_LOOKUPS: &[(&str, &str)] = &[
+    ("DescribeSolution", "solutionArn"),
+    ("CreateSolutionVersion", "solutionArn"),
+];
+
+/// The same for a `solutionVersionArn`. `CreateCampaign` references one too and is
+/// exercised separately below, because it names a `name` as well.
+const SOLUTION_VERSION_LOOKUPS: &[(&str, &str)] =
+    &[("DescribeSolutionVersion", "solutionVersionArn")];
+
+/// A recipe the catalog holds, so the solution of the positive control below is created
+/// for a recipe that exists. Source: the recipe ARNs the control plane resolves
+/// `recipeArn` against (`state::pipeline::RECIPES`), which carry the ARNs the Amazon
+/// Personalize "Choosing a recipe" documentation publishes.
+const RECIPE: &str = "arn:aws:personalize:::recipe/aws-user-personalization";
+
+#[tokio::test]
+async fn a_solution_lookup_that_resolves_to_nothing_names_the_solution() {
+    let emulator = Emulator::new();
+
+    // A solution that DOES exist, so a row addressing an unminted VERSION of it is refused
+    // for the version's ARN and not for its container, and so the positive control at the
+    // end has something to read.
+    let setup = "solution not-found wording setup";
+    let group = create_active_group(&emulator, "present-solution-dsg", setup).await;
+    let (status, body) = emulator
+        .call(
+            "CreateSolution",
+            serde_json::json!({
+                "name": "present-solution",
+                "datasetGroupArn": group,
+                "recipeArn": RECIPE,
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {setup:?}: expected CreateSolution to answer 200, got {status} {body:?}"
+    );
+    let present_solution = body["solutionArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {setup:?}: expected a solutionArn, got {body:?}"))
+        .to_string();
+
+    // The rows vary what the rule generalises over: whether the ARN addresses a solution
+    // or one of its versions, the operation that resolves it (a read and a create that
+    // references it, for each), and the shape of the ARN itself — a plain name, every
+    // permitted character class, a long name, a version id under a solution that exists,
+    // and another region and account.
+    let absent_solutions: &[(&str, String)] = &[
+        (
+            "a solution under a plain name",
+            format!("arn:aws:personalize:{REGION}:{ACCOUNT}:solution/absent-solution"),
+        ),
+        (
+            "a solution with dashes, digits and underscores",
+            format!("arn:aws:personalize:{REGION}:{ACCOUNT}:solution/Absent-9_sol"),
+        ),
+        (
+            "a solution under a long name",
+            format!(
+                "arn:aws:personalize:{REGION}:{ACCOUNT}:solution/{}",
+                "s".repeat(63)
+            ),
+        ),
+        (
+            "a solution in another region and account",
+            "arn:aws:personalize:eu-west-1:210987654321:solution/elsewhere".to_string(),
+        ),
+    ];
+    let absent_versions: &[(&str, String)] = &[
+        (
+            "a version of a solution that does not exist",
+            format!("arn:aws:personalize:{REGION}:{ACCOUNT}:solution/absent-solution/00000001"),
+        ),
+        (
+            "a version id a solution that exists never minted",
+            format!("{present_solution}/0000002a"),
+        ),
+        (
+            "a version in another region and account",
+            "arn:aws:personalize:eu-west-1:210987654321:solution/elsewhere/00000001".to_string(),
+        ),
+    ];
+
+    for (lookups, rows) in [
+        (SOLUTION_LOOKUPS, absent_solutions),
+        (SOLUTION_VERSION_LOOKUPS, absent_versions),
+    ] {
+        for (case, arn) in rows {
+            let expected = solution_not_found_message(arn);
+            for (operation, member) in lookups {
+                assert_refused(
+                    &emulator,
+                    operation,
+                    member,
+                    arn,
+                    (400, "ResourceNotFoundException", &expected),
+                    case,
+                )
+                .await;
+            }
+        }
+    }
+
+    // `CreateCampaign` resolves a `solutionVersionArn` as well, and words it the same way
+    // a read of that version would — whatever else the request carries.
+    for (index, (case, arn)) in absent_versions.iter().enumerate() {
+        let expected = solution_not_found_message(arn);
+        let (status, body) = emulator
+            .call(
+                "CreateCampaign",
+                serde_json::json!({
+                    "name": format!("needs-a-version-{index}"),
+                    "solutionVersionArn": arn,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected CreateCampaign against an absent version to answer HTTP \
+             400, got {status} {body:?}"
+        );
+        assert!(
+            error_code(&body).contains("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        let message = error_message(&body);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+
+    // The solution that EXISTS is read, and so is the version created from it, so the
+    // wording above belongs to the lookup that found nothing rather than to every
+    // solution reference. The version's ARN is its solution's with the id appended, which
+    // is the shape the absent rows above ask about.
+    let case = "a solution and a version that exist";
+    let (status, body) = emulator
+        .call_with_arn("DescribeSolution", "solutionArn", &present_solution)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected DescribeSolution to answer 200, got {status} {body:?}"
+    );
+    let (status, body) = emulator
+        .call_with_arn("CreateSolutionVersion", "solutionArn", &present_solution)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected CreateSolutionVersion to answer 200, got {status} {body:?}"
+    );
+    let version = body["solutionVersionArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a solutionVersionArn, got {body:?}"))
+        .to_string();
+    assert_eq!(
+        version,
+        format!("{present_solution}/00000001"),
+        "case {case:?}: expected the version's ARN to extend its solution's, got {version:?}"
+    );
+    let (status, body) = emulator
+        .call_with_arn("DescribeSolutionVersion", "solutionVersionArn", &version)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected DescribeSolutionVersion to answer 200, got {status} {body:?}"
+    );
+
+    // A campaign naming that version is refused for what the version IS — it trained on a
+    // dataset group holding no interactions — and not for the version being absent.
+    let (status, body) = emulator
+        .call(
+            "CreateCampaign",
+            serde_json::json!({"name": "deploys-a-version", "solutionVersionArn": version}),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected CreateCampaign on an untrained version to answer 400, got \
+         {status} {body:?}"
+    );
+    let message = error_message(&body);
+    assert_ne!(
+        message,
+        solution_not_found_message(&version),
+        "case {case:?}: a version that exists must not be refused as one that does not, got \
+         {body:?}"
+    );
+}
+

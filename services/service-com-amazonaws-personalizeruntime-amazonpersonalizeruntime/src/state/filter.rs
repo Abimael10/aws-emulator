@@ -327,6 +327,35 @@ enum Token {
 /// Characters that start a comparison operator.
 const OPERATOR_CHARS: [char; 4] = ['=', '<', '>', '!'];
 
+/// Whether `ch` is a character a BARE word of an expression is spelled with — beside the
+/// structural characters [`tokenize`] reads on their own: whitespace, `"`, `(`, `)`, `,`
+/// and [`OPERATOR_CHARS`].
+///
+/// A word is a keyword, a `<Dataset>.<COLUMN>` reference, a `$placeholder` or a bare
+/// literal, so what spells one is a letter or a digit, the `_` and `.` of a reference,
+/// the `$` of a placeholder, and the sign, decimal point and `:` a number or a timestamp
+/// is written with. Any other character is input this language does not read at all; the
+/// text of a QUOTED literal is not a word and is not screened.
+fn reads(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '.' | '$' | '-' | '+' | ':')
+}
+
+/// The refusal for a character the expression language does not read: Amazon Personalize
+/// names the input symbol it stopped on, and nothing else.
+fn invalid_input_symbol(symbol: char) -> String {
+    format!("Invalid input symbol: '{symbol}'")
+}
+
+/// The refusal an expression carries when its INPUT is not what this language is written
+/// in — a character no token of it is spelled with, or a string literal nothing closes —
+/// or `None` when the expression reads as a stream of tokens.
+///
+/// This is the LEXICAL screen alone, and says nothing about the grammar, which [`parse`]
+/// checks: a caller with a state precondition to answer between the two runs this first.
+pub fn unreadable_input(expression: &str) -> Option<String> {
+    tokenize(expression).err()
+}
+
 /// Split `expression` into tokens.
 fn tokenize(expression: &str) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
@@ -371,6 +400,9 @@ fn tokenize(expression: &str) -> Result<Vec<Token>, String> {
                     || OPERATOR_CHARS.contains(&next)
                 {
                     break;
+                }
+                if !reads(next) {
+                    return Err(invalid_input_symbol(next));
                 }
                 word.push(next);
                 chars.next();
