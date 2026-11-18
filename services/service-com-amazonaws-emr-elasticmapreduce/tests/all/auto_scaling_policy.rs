@@ -876,3 +876,121 @@ async fn put_auto_scaling_policy_refuses_what_it_cannot_store() {
         }
     }
 }
+
+/// THE RULE on the WORDING of those refusals: both operations act on an instance group —
+/// "the instance group to which the automatic scaling policy is applied"
+/// (`PutAutoScalingPolicy$InstanceGroupId` doc) and "removes an automatic scaling policy
+/// from a specified instance group" (`RemoveAutoScalingPolicy` doc) — and reach a cluster
+/// only as the scope that group is looked up in, so a target neither of them can reach is
+/// refused in terms of the INSTANCE GROUP the request named, never in terms of the cluster
+/// id beside it: HTTP 400 `ValidationException` with the instance-group sentence, which
+/// quotes the `InstanceGroupId` exactly as the request sent it.
+///
+/// The rows span what the rule generalises over: both operations, both ways the target
+/// fails to resolve (no such cluster at all, and a live cluster carrying no such group),
+/// every form of unusable cluster id and every form of unusable group id — including, for
+/// the no-such-cluster leg, a group id the LIVE cluster really does carry, which is the
+/// case that shows the sentence is not a cluster lookup wearing a group's name.
+#[tokio::test]
+async fn an_unreachable_policy_target_is_worded_as_the_instance_group() {
+    let emr = Emr::new();
+    let cluster_id = emr.run_job_flow(launch("blamed")).await;
+    let ids = group_ids(&emr, "blamed", &cluster_id).await;
+    let core_id = ids
+        .get("CORE")
+        .expect("the launch carries a core group")
+        .clone();
+
+    let sound = policy(
+        1,
+        10,
+        vec![rule(
+            "scale-out",
+            ADJUSTMENT_TYPES[0],
+            1,
+            COMPARISON_OPERATORS[2],
+        )],
+    );
+
+    // `(the case, the cluster id, the group id)`: a cluster the account holds none of,
+    // named beside each form of group id and beside a group the live cluster carries; and
+    // the live cluster named beside each form of group id it carries none of.
+    let mut targets: Vec<(String, String, String)> = Vec::new();
+    for unknown_cluster in UNKNOWN_CLUSTER_IDS {
+        for group in UNKNOWN_GROUP_IDS
+            .iter()
+            .map(|group| (*group).to_string())
+            .chain([core_id.clone()])
+        {
+            targets.push((
+                format!("cluster {unknown_cluster:?} with group {group:?}"),
+                (*unknown_cluster).to_string(),
+                group,
+            ));
+        }
+    }
+    for unknown_group in UNKNOWN_GROUP_IDS {
+        targets.push((
+            format!("the live cluster with group {unknown_group:?}"),
+            cluster_id.clone(),
+            (*unknown_group).to_string(),
+        ));
+    }
+
+    for (label, cluster, group) in &targets {
+        let requests: Vec<(&str, Value)> = vec![
+            (
+                "PutAutoScalingPolicy",
+                json!({
+                    "ClusterId": cluster,
+                    "InstanceGroupId": group,
+                    "AutoScalingPolicy": sound.clone(),
+                }),
+            ),
+            (
+                "RemoveAutoScalingPolicy",
+                json!({ "ClusterId": cluster, "InstanceGroupId": group }),
+            ),
+        ];
+        for (operation, request) in requests {
+            let case = format!("{operation} on {label}");
+            let (status, payload) = emr.call(operation, request).await;
+            assert_refused(&case, status, &payload, "ValidationException");
+            let said = crate::input_refusals::error_message(&payload);
+            let expected = format!("Instance group id '{group}' is not valid.");
+            assert_eq!(
+                said, expected,
+                "case {case:?}: expected {expected:?}, got {payload}"
+            );
+            assert!(
+                cluster.is_empty() || group.contains(cluster.as_str()) || !said.contains(cluster),
+                "case {case:?}: the sentence names the group and not the cluster, got {said:?}"
+            );
+        }
+    }
+
+    // The control: the same two calls on the target the service DOES resolve are served,
+    // so every refusal above was a lookup of that target and not of the operation.
+    emr.ok(
+        "PutAutoScalingPolicy",
+        json!({
+            "ClusterId": &cluster_id,
+            "InstanceGroupId": &core_id,
+            "AutoScalingPolicy": sound,
+        }),
+    )
+    .await;
+    emr.ok(
+        "RemoveAutoScalingPolicy",
+        json!({ "ClusterId": &cluster_id, "InstanceGroupId": &core_id }),
+    )
+    .await;
+    let listed = groups_by_id(&emr, "the resolvable target", &cluster_id).await;
+    for (id, group) in &listed {
+        assert!(
+            reported_policy(group).is_none(),
+            "case \"the resolvable target\": the removal must take the policy off, and \
+             group {id:?} reports {group}"
+        );
+    }
+}

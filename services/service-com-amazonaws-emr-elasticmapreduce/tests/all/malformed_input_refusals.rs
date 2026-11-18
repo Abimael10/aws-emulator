@@ -155,11 +155,32 @@ fn cluster_id_requests(cluster_id: Option<&str>) -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// The instance group id the policy rows below name.
+///
+/// The automatic-scaling policy pair ACTS on an instance group — "the instance group to
+/// which the automatic scaling policy is applied" — and reaches a cluster only as the
+/// scope that group is looked up in, so a target neither resolves is blamed on THIS id
+/// rather than on the cluster id beside it ([`unresolvable_target_sentence`]).
+const POLICY_GROUP_ID: &str = "ig-ABCDEFGHIJKLM";
+
+/// The sentence `operation` answers a `ClusterId` of the identifier class it resolves no
+/// target for: the cluster-id sentence, quoting the id the request sent, except where the
+/// operation's target is another resource — the automatic-scaling policy pair, which names
+/// the instance group the request asked it to act on.
+fn unresolvable_target_sentence(operation: &str, cluster_id: &str) -> String {
+    match operation {
+        "PutAutoScalingPolicy" | "RemoveAutoScalingPolicy" => {
+            format!("Instance group id '{POLICY_GROUP_ID}' is not valid.")
+        }
+        _ => format!("Cluster id '{cluster_id}' is not valid."),
+    }
+}
+
 /// One request per operation that resolves a `ClusterId` but models NO client error, so
 /// both its refusals travel the request-validation envelope and only the SENTENCE tells
 /// them apart: the policy family. Each names `cluster_id`.
 fn no_client_error_requests(cluster_id: &str) -> Vec<(&'static str, Value)> {
-    let group = "ig-ABCDEFGHIJKLM";
+    let group = POLICY_GROUP_ID;
     vec![
         (
             "GetManagedScalingPolicy",
@@ -251,15 +272,17 @@ async fn a_cluster_id_outside_the_identifier_class_is_refused_on_its_shape() {
     }
 
     // The same operations answer the OTHER sentence for an id of that class they resolve
-    // no cluster for, so the shape refusal is not the only thing either family says.
+    // no target for, so the shape refusal is not the only thing either family says — each
+    // naming the resource that operation could not reach.
     for (operation, body) in no_client_error_requests(UNRESOLVABLE_CLUSTER_IDS[0]) {
         let case = format!("{operation} with an unresolvable cluster id");
         let (status, payload) = emr.call(operation, body).await;
         assert_refused(&case, status, &payload, REQUEST_VALIDATION);
+        let expected = unresolvable_target_sentence(operation, UNRESOLVABLE_CLUSTER_IDS[0]);
         assert_eq!(
             message(&case, &payload),
-            format!("Cluster id '{}' is not valid.", UNRESOLVABLE_CLUSTER_IDS[0]),
-            "case {case:?}: expected the cluster-id sentence, got {payload}"
+            expected,
+            "case {case:?}: expected {expected:?}, got {payload}"
         );
     }
 
@@ -369,7 +392,7 @@ async fn an_omitted_cluster_id_is_refused_by_its_operations_surface() {
     // stands there — and the SENTENCE is still the cluster surface's, with `null` where
     // the id would be. The group and policy members are supplied, so the `ClusterId` is
     // the only member missing.
-    let group = "ig-ABCDEFGHIJKLM";
+    let group = POLICY_GROUP_ID;
     let no_client_error: Vec<(&str, Value)> = vec![
         ("GetManagedScalingPolicy", json!({})),
         (

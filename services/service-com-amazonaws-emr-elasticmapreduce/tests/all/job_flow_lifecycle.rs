@@ -1849,8 +1849,9 @@ async fn set_visible_to_all_users_writes_the_value_on_every_cluster_it_names() {
 
 /// THE RULE on the refusal: a batch carrying an id the service resolves no cluster for is
 /// refused through the 400 `ValidationException` channel — this operation models no client
-/// error — with the legacy job-flow surface's CONSTANT sentence, and writes nothing,
-/// wherever the unresolvable id sits in the batch and whichever value the call asked for.
+/// error — with the sentence Amazon EMR words for THIS operation, which names the job flow
+/// it could not resolve and quotes the id the batch carried, and writes nothing, wherever
+/// the unresolvable id sits in the batch and whichever value the call asked for.
 #[tokio::test]
 async fn set_visible_to_all_users_refuses_a_batch_naming_an_unknown_job_flow() {
     let emr = Emr::new();
@@ -1888,11 +1889,10 @@ async fn set_visible_to_all_users_refuses_a_batch_naming_an_unknown_job_flow() {
                     .await;
                 assert_refused(&case, status, &payload, "ValidationException");
                 let said = crate::refusal_messages::message(&case, &payload);
+                let expected = format!("Job flow id '{unknown}' is not valid.");
                 assert_eq!(
-                    said,
-                    crate::refusal_wording::JOB_FLOW_SENTENCE,
-                    "case {case:?}: expected {:?}, got {payload}",
-                    crate::refusal_wording::JOB_FLOW_SENTENCE
+                    said, expected,
+                    "case {case:?}: expected {expected:?}, got {payload}"
                 );
 
                 let reported = visible_to_all_users(&emr, &case, &known).await;

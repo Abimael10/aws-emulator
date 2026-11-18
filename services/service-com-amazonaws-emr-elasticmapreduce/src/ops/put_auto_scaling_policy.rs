@@ -182,9 +182,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // This operation models no client error, so a request it must refuse is answered
         // with the 400 `ValidationException` channel rather than a 501 or an empty 200.
+        //
+        // The TARGET of this call is the instance group ("the instance group to which the
+        // automatic scaling policy is applied", `InstanceGroupId` doc) and the cluster is
+        // only the scope the group is looked up in, so a target that does not resolve is
+        // refused in terms of the GROUP the request named — whether the cluster carries no
+        // such group or the account holds no such cluster, which carries no group either.
         let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::unknown_cluster_message(&input.cluster_id),
+                crate::state::unknown_instance_group_message(&input.instance_group_id),
             ));
         };
         let cluster_arn = cluster.arn.clone();

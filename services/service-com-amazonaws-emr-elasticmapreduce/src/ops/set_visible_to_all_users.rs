@@ -188,12 +188,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Resolve every id BEFORE changing anything, so a request naming one unknown id
         // changes no cluster at all. This operation models no client error, so the refusal
-        // is the 400 `ValidationException` channel, and it reaches a cluster as a "job
-        // flow" — the legacy surface, whose sentence is CONSTANT: it names no id.
+        // is the 400 `ValidationException` channel, and the sentence is the one Amazon EMR
+        // words for THIS operation: it names the job flow it could not resolve, quoting
+        // the id the batch carried, so a caller batching several ids learns which one was
+        // rejected ([`crate::state::unknown_job_flow_id_message`]).
         for job_flow_id in &input.job_flow_ids {
             if !store.clusters.contains_key(job_flow_id) {
                 return Err(crate::scaffolded::Scaffolded::validation(
-                    crate::state::unknown_job_flow_message(),
+                    crate::state::unknown_job_flow_id_message(job_flow_id),
                 ));
             }
         }

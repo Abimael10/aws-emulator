@@ -524,10 +524,11 @@ async fn get_session_judges_the_session_ids_shape_before_the_cluster() {
 
 /// Every operation that refuses an id it resolves no cluster for through the
 /// `ValidationException` channel, with a body naming `cluster_id` and the sentence that
-/// operation's surface words: the legacy job-flow surface's constant, or the cluster-id
-/// sentence that quotes the id.
+/// operation words: the legacy job-flow surface's constant, the cluster-id sentence that
+/// quotes the id, or the job-flow-id sentence that quotes it.
 fn job_flow_surface_cases(cluster_id: &str) -> Vec<(&'static str, &'static str, Value, String)> {
     let cluster_sentence = format!("Cluster id '{cluster_id}' is not valid.");
+    let job_flow_id_sentence = format!("Job flow id '{cluster_id}' is not valid.");
     vec![
         (
             "a policy the service could hold",
@@ -599,20 +600,29 @@ fn job_flow_surface_cases(cluster_id: &str) -> Vec<(&'static str, &'static str, 
             cluster_sentence.clone(),
         ),
         (
-            // Takes `JobFlowIds`, yet words the refusal as a cluster id: which surface
-            // an operation belongs to is not read off its input member.
+            // Takes `JobFlowIds`, yet words the refusal as a cluster id: which sentence
+            // an operation words is not read off its input member.
             "an unhealthy-node-replacement write",
             "SetUnhealthyNodeReplacement",
             json!({ "JobFlowIds": [cluster_id], "UnhealthyNodeReplacement": true }),
             cluster_sentence,
         ),
+        (
+            // The same member again, worded a THIRD way: this one names the job flow it
+            // could not resolve and quotes the id, so a caller batching several ids
+            // learns which one was rejected.
+            "a visibility write",
+            "SetVisibleToAllUsers",
+            json!({ "JobFlowIds": [cluster_id], "VisibleToAllUsers": true }),
+            job_flow_id_sentence,
+        ),
     ]
 }
 
 /// THE RULE: an operation that resolves no cluster for the id it was given answers the
-/// sentence ITS surface words — the legacy job-flow surface's constant, which names no
-/// id, or the cluster-id sentence, which quotes the id the request sent — so two
-/// operations never share a sentence the service words differently.
+/// sentence IT words — the legacy job-flow surface's constant, which names no id, the
+/// cluster-id sentence, or the job-flow-id sentence, both of which quote the id the
+/// request sent — so two operations never share a sentence the service words differently.
 #[tokio::test]
 async fn each_operation_words_its_own_unknown_cluster_refusal() {
     let emr = Emr::new();

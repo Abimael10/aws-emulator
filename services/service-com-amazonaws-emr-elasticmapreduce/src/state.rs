@@ -820,14 +820,28 @@ pub fn is_inverted_window(
 /// operations that reach a cluster as a "job flow" answer one fixed sentence, naming
 /// neither the id nor the `ClusterId` member.
 ///
-/// Recorded behavior: the sentence is CONSTANT — no operation of this surface appends
-/// the id it rejected. Which surface an operation belongs to is not read off its input
-/// member: the managed-scaling MUTATORS take a `ClusterId` and answer this sentence,
-/// while `GetManagedScalingPolicy` beside them reports a cluster id
-/// ([`unknown_cluster_message`]), and `SetUnhealthyNodeReplacement` takes `JobFlowIds`
-/// and reports a cluster id too.
+/// Recorded behavior: the sentence is CONSTANT — no operation that answers it appends
+/// the id it rejected. Which sentence an operation words is a per-OPERATION fact and is
+/// not read off its input member: the managed-scaling MUTATORS take a `ClusterId` and
+/// answer this sentence, while `GetManagedScalingPolicy` beside them reports a cluster id
+/// ([`unknown_cluster_message`]), `SetUnhealthyNodeReplacement` takes `JobFlowIds` and
+/// reports a cluster id too, and `SetVisibleToAllUsers` takes `JobFlowIds` and names the
+/// job flow it could not resolve ([`unknown_job_flow_id_message`]).
 pub fn unknown_job_flow_message() -> String {
     "Specified job flow ID not valid.".to_string()
+}
+
+/// How an operation that reports an unresolvable id AS A JOB FLOW words it: the resource
+/// the id names — a job flow — then the id the request sent, quoted, and that it is not
+/// valid, through the same tail every quoted-identifier sentence of this service ends in
+/// ([`not_valid_message`]).
+///
+/// Recorded behavior for the text: `SetVisibleToAllUsers` answers this sentence for an id
+/// its `JobFlowIds` batch resolves no cluster for, so the caller learns WHICH of the ids
+/// it batched was rejected — which the constant sentence beside it
+/// ([`unknown_job_flow_message`]) cannot tell it.
+pub fn unknown_job_flow_id_message(job_flow_id: &str) -> String {
+    format!("Job flow id {}", not_valid_message(job_flow_id))
 }
 
 /// The refusal a LEGACY job-flow-surface operation that models the client error answers
@@ -972,13 +986,15 @@ pub fn unknown_persistent_app_ui_message(persistent_app_ui_id: &str) -> String {
     )
 }
 
-/// How an instance-group-scoped operation that models no client error refuses an
-/// `InstanceGroupId` the named cluster carries no group for.
+/// How an instance-group-scoped operation refuses an `InstanceGroupId` it resolves no
+/// group for.
 ///
-/// AWS does not document the wording, so the text is built from the request: it names
-/// the id the caller asked for, through the same tail [`unknown_cluster_message`] uses.
-/// What IS the contract is the refusal itself — HTTP 400 with the error code
-/// `ValidationException` — rather than an empty success.
+/// Recorded behavior for the text: Amazon EMR names the resource — an instance group —
+/// then the id the request sent, quoted, through the same tail
+/// [`unknown_cluster_message`] uses. It is the sentence the automatic-scaling policy
+/// operations answer for a target they cannot reach, the group being what those calls act
+/// on and the cluster only the scope it is looked up in, so a cluster the account holds
+/// none of carries no such group either and is refused the same way.
 pub fn unknown_instance_group_message(instance_group_id: &str) -> String {
     format!("Instance group id {}", not_valid_message(instance_group_id))
 }
