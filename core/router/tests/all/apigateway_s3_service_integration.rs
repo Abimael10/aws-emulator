@@ -38,7 +38,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request here is signed for, and the Region the integration ARNs name.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The long-term key every emulator publishes, which is what the setup calls are signed
 /// with. The signature itself is never checked: this router runs with request
@@ -49,11 +49,11 @@ const AMBIENT_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const BUCKET: &str = "stage-integration-shelf";
 
 /// The stage the api is deployed to.
-const STAGE: &str = "live";
+pub(crate) const STAGE: &str = "live";
 
 /// A trust policy that lets API Gateway assume the role it is attached to. It carries none
 /// of the characters that are significant in an `application/x-www-form-urlencoded` body.
-const APIGATEWAY_TRUST: &str = concat!(
+pub(crate) const APIGATEWAY_TRUST: &str = concat!(
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","#,
     r#""Principal":{"Service":"apigateway.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#
 );
@@ -76,15 +76,15 @@ const BINARY_KEY: &str = "pixel.png";
 const NESTED_KEY: &str = "notes/today.txt";
 
 /// What one call answered.
-struct Answer {
-    status: u16,
-    headers: http::HeaderMap,
-    body: Bytes,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: Bytes,
 }
 
 impl Answer {
     /// One response header's value.
-    fn header(&self, name: &str) -> Option<String> {
+    pub(crate) fn header(&self, name: &str) -> Option<String> {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -92,18 +92,18 @@ impl Answer {
     }
 
     /// The body as text, for a JSON or XML answer.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
     /// The body as JSON, `Null` when it is neither JSON nor present.
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 }
 
 /// The three services this rule spans, over ONE engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -174,7 +174,7 @@ async fn apigw(router: &MultiServiceRouter, method: &str, path: &str, body: Opti
 }
 
 /// One API Gateway control-plane call that has to succeed with `expected`.
-async fn apigw_ok(
+pub(crate) async fn apigw_ok(
     router: &MultiServiceRouter,
     case: &str,
     method: &str,
@@ -194,7 +194,7 @@ async fn apigw_ok(
 }
 
 /// One Amazon S3 REST call, path-style as the emulator serves it.
-async fn s3(
+pub(crate) async fn s3(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -243,7 +243,7 @@ async fn iam_ok(router: &MultiServiceRouter, case: &str, body: String) -> String
 /// `{rest-api-id}.execute-api.{region}.amazonaws.com`, which is the endpoint
 /// `RestApi$disableExecuteApiEndpoint` documents — carrying no credential at all, as a
 /// client of a public method sends it.
-async fn invoke(
+pub(crate) async fn invoke(
     router: &MultiServiceRouter,
     api: &str,
     verb: &str,
@@ -263,7 +263,7 @@ async fn invoke(
 }
 
 /// The member `name` of a JSON object, as text.
-fn member(case: &str, body: &Value, name: &str) -> String {
+pub(crate) fn member(case: &str, body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("setup {case:?}: no {name:?} in {body}"))
@@ -272,7 +272,7 @@ fn member(case: &str, body: &Value, name: &str) -> String {
 
 /// One IAM role: created with `trust` as its trust policy and `document` as its one inline
 /// policy, answering its ARN.
-async fn role(
+pub(crate) async fn role(
     router: &MultiServiceRouter,
     name: &str,
     trust: &str,
@@ -312,14 +312,19 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 
 /// One identity-based policy granting `actions` on `resource`, written with none of the
 /// characters a form body treats specially.
-fn policy(actions: &str, resource: &str) -> String {
+pub(crate) fn policy(actions: &str, resource: &str) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":[{actions}],"Resource":"{resource}"}}]}}"#
     )
 }
 
 /// One resource of the api under `parent`, answering its id.
-async fn resource(router: &MultiServiceRouter, api: &str, parent: &str, part: &str) -> String {
+pub(crate) async fn resource(
+    router: &MultiServiceRouter,
+    api: &str,
+    parent: &str,
+    part: &str,
+) -> String {
     let created = apigw_ok(
         router,
         &format!("CreateResource({part})"),
@@ -414,7 +419,7 @@ async fn aws_method(
 /// The integration responses every method here declares: the default (no pattern) for a
 /// success, and one per refusal class, so what a client sees is the status the service
 /// answered rather than one status for every outcome.
-const MAPPED_STATUSES: &[(&str, Option<&str>)] = &[
+pub(crate) const MAPPED_STATUSES: &[(&str, Option<&str>)] = &[
     ("200", None),
     ("403", Some("403")),
     ("404", Some("404")),
