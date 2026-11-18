@@ -6,7 +6,8 @@
 //! [`crate::state`], including the members this response shape does not carry
 //! (`tags`, `httpResponderAllowed`, `timeoutInMillis`) so `GetLink` can report them.
 //! An id that names no stored gateway -> `ResourceNotFoundException` (404); a second
-//! link for the same ordered pair -> `ConflictException` (409).
+//! link between two gateways a LIVE link already joins -> `ConflictException` (409),
+//! while a pair whose only link has reached a terminal status is free again.
 //!
 //! ## Shape of an operation
 //!
@@ -225,6 +226,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         if let Some(existing) = store.link_joining(&input.gateway_id, &input.peer_gateway_id) {
+            // A live link already joins the two: one more would be a second
+            // record for a pair that is already linked.
             return Err(CreateLinkErrorModeled::ConflictException(ConflictException {
                 message: format!(
                     "link {} already joins gateway {} to gateway {}",

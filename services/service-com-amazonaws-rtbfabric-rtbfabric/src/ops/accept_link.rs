@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers an outstanding link request in the affirmative: the stored link moves
+//! to `ACCEPTED`, the clock owes it `ACTIVE`, and the settings this call carries
+//! are what every later reader of the link reports. A link whose request is no
+//! longer outstanding cannot be accepted -> `ConflictException` (409), except a
+//! repeat of this `@idempotent` call on a link it has already accepted, which is
+//! answered with that record. An id that names no link on the addressed gateway
+//! -> `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +176,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptLink"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AcceptLinkErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        let gateway_id = input.gateway_id.clone();
+        let Some(link) = store.find_link_mut(&input.gateway_id, &input.link_id) else {
+            return Err(AcceptLinkErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        if link.request_outstanding() {
+            // The request is answered: the link is accepted now, and coming up
+            // is what the clock still owes it.
+            link.status = crate::state::LINK_STATUS_ACCEPTED.to_string();
+            link.settles_at = Some(now + crate::state::PROVISIONING_DELAY);
+            link.updated_at = now;
+            // The accepting end states the link's settings on this call, so they
+            // are stored rather than echoed: `logSettings` is required here, and
+            // an optional member replaces what the record holds only when the
+            // caller states it.
+            link.log_settings = input.log_settings.clone();
+            if input.attributes.is_some() {
+                link.attributes = input.attributes.clone();
+            }
+            if input.timeout_in_millis.is_some() {
+                link.timeout_in_millis = input.timeout_in_millis;
+            }
+        } else if !link.request_accepted() {
+            // Anything other than an outstanding request, or the acceptance this
+            // operation already recorded, is a status this call cannot move.
+            return Err(AcceptLinkErrorModeled::ConflictException(ConflictException {
+                message: link.status_conflict_message(&gateway_id, "accepted"),
+            })
+            .into());
+        }
+
+        Ok(AcceptLinkOutput {
+            // The response describes the link as addressed: the gateway in the
+            // URI, and the link's other end as its peer.
+            gateway_id,
+            peer_gateway_id: link.other_end(&input.gateway_id).to_string(),
+            status: link.status.clone(),
+            created_at: crate::state::timestamp(link.created_at),
+            updated_at: crate::state::timestamp(link.updated_at),
+            direction: Some(link.direction.clone()),
+            flow_modules: Some(link.flow_modules.clone()),
+            pending_flow_modules: Some(link.pending_flow_modules.clone()),
+            attributes: link.attributes.clone(),
+            log_settings: Some(link.log_settings.clone()),
+            connectivity_type: Some(link.connectivity_type.clone()),
+            link_id: link.link_id.clone(),
+        })
     }
 }

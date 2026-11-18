@@ -164,6 +164,12 @@ fn calls(gateway_id: &str, link_id: &str, rule_id: &str) -> Vec<(String, &'stati
             None,
         ),
         (
+            "AcceptLink".to_string(),
+            "POST",
+            format!("/gateway/{gateway_id}/link/{link_id}/accept"),
+            Some(json!({ "logSettings": log_settings() })),
+        ),
+        (
             "CreateLink".to_string(),
             "POST",
             format!("/gateway/{gateway_id}/create-link"),

@@ -202,10 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Anything other than an outstanding request, or the rejection this
             // operation already recorded, is a status this call cannot move.
             return Err(RejectLinkErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "link {} on gateway {} is {} and cannot be rejected",
-                    link.link_id, gateway_id, link.status
-                ),
+                message: link.status_conflict_message(&gateway_id, "rejected"),
             })
             .into());
         }

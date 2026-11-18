@@ -1,29 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for `RejectLink`: declining an outstanding link request.
+//! End-to-end cover for the two answers to an outstanding link request:
+//! `RejectLink` declines it, `AcceptLink` accepts it.
 //!
-//! The rule under test is about state: a link whose request is still outstanding
-//! moves to the terminal `REJECTED` status and stays there for every later
-//! reader, and a link in any other status cannot be declined at all. The tables
-//! span what the rule generalises over — which of the link's two ends addresses
-//! the call, whether the request has settled yet, and every member of the
-//! modelled `LinkStatus` enum.
+//! The rules under test are about state: a link whose request is still
+//! outstanding moves to the terminal `REJECTED` status on a decline, and on an
+//! accept to `ACCEPTED` and then to the `ACTIVE` the clock owes it, each status
+//! being what every later reader reports; a link in any other status cannot be
+//! answered at all, beyond a repeat of the call that already put it there. The
+//! tables span what the rules generalise over — which of the link's two ends
+//! addresses the call, whether the request has settled yet, which of the
+//! accept's optional members the call states, and every member of the modelled
+//! `LinkStatus` enum.
+//!
+//! The decline's own consequence is covered here too: a link that has reached a
+//! terminal status occupies the gateway pair no longer, so the two gateways can
+//! be linked again.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_rtbfabric_rtbfabric::ops::types::LINK_STATUS_VALUES;
 use service_com_amazonaws_rtbfabric_rtbfabric::state::{
-    ComAmazonawsRtbfabricRtbfabricState, LINK_STATUS_PENDING_REQUEST, LINK_STATUS_REJECTED,
-    LINK_STATUS_REQUESTED, PROVISIONING_DELAY,
+    ComAmazonawsRtbfabricRtbfabricState, LINK_STATUS_ACCEPTED, LINK_STATUS_ACTIVE,
+    LINK_STATUS_DELETED, LINK_STATUS_FAILED, LINK_STATUS_PENDING_REQUEST, LINK_STATUS_REJECTED,
+    LINK_STATUS_REQUESTED,
 };
 use service_com_amazonaws_rtbfabric_rtbfabric::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test signs for.
 const REGION: &str = "us-west-2";
+
+/// How long a poll waits for a status the clock owes before it gives up. Far
+/// above any span this service owes a transition, so a slow or loaded host
+/// changes how many times the loop looks, never whether it succeeds.
+const POLL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a poll waits between two looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// `LinkLogSettings` with its one required member, as
 /// `smithy_query(query="shape", shape="LinkLogSettings")` declares it.
@@ -53,6 +70,18 @@ impl Fabric {
 
     /// Send one restJson1 request and return `(status, parsed body)`.
     async fn send(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        let (status, _, answered) = self.send_with_code(method, path, body).await;
+        (status, answered)
+    }
+
+    /// [`send`](Self::send), with the wire error code from `x-amzn-errortype`: a
+    /// refusal is a status AND a code, and a caller's SDK dispatches on the code.
+    async fn send_with_code(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, String, Value) {
         let bytes = match body {
             Some(body) => Bytes::from(serde_json::to_vec(&body).expect("serialize the body")),
             None => Bytes::new(),
@@ -72,12 +101,53 @@ impl Fabric {
             .expect("build the request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let code = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let parsed = if response.body().is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(response.body()).unwrap_or(Value::Null)
         };
-        (status, parsed)
+        (status, code, parsed)
+    }
+
+    /// Read the link through `GetLink` until it reports `expected`, and answer
+    /// with that reading.
+    ///
+    /// A settled status is owed by the clock, so the test waits for the
+    /// CONDITION rather than for a span: it looks again until the status holds,
+    /// giving up only once [`POLL_DEADLINE`] has passed.
+    async fn poll_link_status(&self, gateway_id: &str, link_id: &str, expected: &str) -> Value {
+        let path = format!("/gateway/{gateway_id}/link/{link_id}");
+        let deadline = Instant::now() + POLL_DEADLINE;
+        loop {
+            let (status, body) = self.send("GET", &path, None).await;
+            assert_eq!(
+                status, 200,
+                "expected GetLink on {path:?} to answer 200, got {status} {body:?}"
+            );
+            if text(&body, "status") == expected {
+                return body;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {path:?} to reach {expected:?}, got {:?}",
+                body["status"]
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Whether the clock still owes any stored link a status transition.
+    fn settlement_owed(&self) -> bool {
+        let state = self.engine.state::<ComAmazonawsRtbfabricRtbfabricState>();
+        let store = state.lock();
+        let owed = store.links.values().any(|link| link.settles_at.is_some());
+        owed
     }
 
     /// A requester gateway, a responder gateway and a link opened from the
@@ -201,7 +271,17 @@ async fn rejecting_an_outstanding_request_moves_the_link_to_rejected_for_every_r
         };
 
         let expected_before = if row.settle_first {
-            tokio::time::sleep(PROVISIONING_DELAY + Duration::from_millis(250)).await;
+            // The move to REQUESTED is owed by the clock: poll for it rather
+            // than wait a span.
+            let settled = fabric
+                .poll_link_status(addressed, &pair.link_id, LINK_STATUS_REQUESTED)
+                .await;
+            assert_eq!(
+                text(&settled, "status"),
+                LINK_STATUS_REQUESTED,
+                "case {case:?}: expected REQUESTED before the reject, got {:?}",
+                settled["status"]
+            );
             LINK_STATUS_REQUESTED
         } else {
             LINK_STATUS_PENDING_REQUEST
@@ -275,9 +355,12 @@ async fn rejecting_an_outstanding_request_moves_the_link_to_rejected_for_every_r
             "case {case:?}: expected the repeat to answer the first reject's record, got {repeat:?}"
         );
 
-        // REJECTED is terminal and persisted: both ends read it back, and the
-        // clock never moves it on, however long nobody looks.
-        tokio::time::sleep(PROVISIONING_DELAY + Duration::from_millis(250)).await;
+        // REJECTED is terminal and persisted: nothing further is owed on the
+        // link, so the clock never moves it on, and both ends read it back.
+        assert!(
+            !fabric.settlement_owed(),
+            "case {case:?}: expected nothing further to be owed on a REJECTED link"
+        );
         for (end, gateway_id) in [("addressed end", addressed), ("other end", other)] {
             let (status, read_back) = fabric
                 .send("GET", &format!("/gateway/{gateway_id}/link/{}", pair.link_id), None)
@@ -395,4 +478,402 @@ async fn a_reject_of_a_link_the_gateway_is_not_an_end_of_is_not_found() {
         "expected a refused reject to leave the link's status alone, got {:?}",
         read_back["status"]
     );
+}
+
+/// One accept row: which end answers the request, whether the clock has settled
+/// `PENDING_REQUEST` -> `REQUESTED` first, and which of `AcceptLink`'s optional
+/// members the call states.
+struct AcceptRow {
+    name: &'static str,
+    /// `true` for the gateway the request was put to (the end the operation's
+    /// documentation describes as accepting it), `false` for the opener.
+    from_peer: bool,
+    settle_first: bool,
+    /// The `customerProvidedId` of the `attributes` the accept states, or `None`
+    /// to leave the attributes the create stored in place.
+    customer_provided_id: Option<&'static str>,
+    /// A `timeoutInMillis`, or `None` to state none. The values stated here are
+    /// the published bounds of the modelled range (100..5000).
+    timeout_in_millis: Option<i64>,
+    /// The `errorLog` sampling of the `logSettings` this call requires, at and
+    /// between the published bounds of the modelled range (0..100).
+    error_log: f64,
+}
+
+const ACCEPT_ROWS: &[AcceptRow] = &[
+    AcceptRow {
+        name: "the peer accepts an unsettled request with only the required settings",
+        from_peer: true,
+        settle_first: false,
+        customer_provided_id: None,
+        timeout_in_millis: None,
+        error_log: 0.0,
+    },
+    AcceptRow {
+        name: "the peer accepts a settled request, stating every optional member",
+        from_peer: true,
+        settle_first: true,
+        customer_provided_id: Some("accepted-fabric"),
+        timeout_in_millis: Some(100),
+        error_log: 100.0,
+    },
+    AcceptRow {
+        name: "the peer accepts a settled request, stating attributes only",
+        from_peer: true,
+        settle_first: true,
+        customer_provided_id: Some("fabric_2"),
+        timeout_in_millis: None,
+        error_log: 12.5,
+    },
+    AcceptRow {
+        name: "the opener accepts its own settled request, stating the timeout only",
+        from_peer: false,
+        settle_first: true,
+        customer_provided_id: None,
+        timeout_in_millis: Some(5000),
+        error_log: 50.0,
+    },
+];
+
+/// The body one accept row sends: the required `logSettings`, plus the optional
+/// members the row states.
+fn accept_body(row: &AcceptRow) -> Value {
+    let mut body = json!({
+        "logSettings": {
+            "applicationLogs": { "sampling": { "errorLog": row.error_log, "filterLog": 0.0 } }
+        }
+    });
+    if let Some(customer_provided_id) = row.customer_provided_id {
+        body["attributes"] = json!({ "customerProvidedId": customer_provided_id });
+    }
+    if let Some(timeout_in_millis) = row.timeout_in_millis {
+        body["timeoutInMillis"] = json!(timeout_in_millis);
+    }
+    body
+}
+
+#[tokio::test]
+async fn accepting_an_outstanding_request_drives_the_link_to_accepted_and_then_active() {
+    for row in ACCEPT_ROWS {
+        let case = row.name;
+        let fabric = Fabric::new();
+        let pair = fabric.linked_pair("token").await;
+        let (addressed, other) = if row.from_peer {
+            (&pair.responder_id, &pair.requester_id)
+        } else {
+            (&pair.requester_id, &pair.responder_id)
+        };
+        if row.settle_first {
+            // The move to REQUESTED is owed by the clock: poll for it.
+            fabric
+                .poll_link_status(addressed, &pair.link_id, LINK_STATUS_REQUESTED)
+                .await;
+        }
+
+        let body = accept_body(row);
+        let accept = format!("/gateway/{addressed}/link/{}/accept", pair.link_id);
+        let (status, accepted) = fabric.send("POST", &accept, Some(body.clone())).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected AcceptLink to answer 200, got {status} {accepted:?}"
+        );
+        assert_eq!(
+            text(&accepted, "status"),
+            LINK_STATUS_ACCEPTED,
+            "case {case:?}: expected the accepted link to be ACCEPTED, got {:?}",
+            accepted["status"]
+        );
+        assert_eq!(
+            text(&accepted, "linkId"),
+            pair.link_id,
+            "case {case:?}: expected link {:?}, got {:?}",
+            pair.link_id,
+            accepted["linkId"]
+        );
+        assert_eq!(
+            text(&accepted, "gatewayId").as_str(),
+            addressed.as_str(),
+            "case {case:?}: expected the addressed gateway {addressed:?} as gatewayId, got {:?}",
+            accepted["gatewayId"]
+        );
+        assert_eq!(
+            text(&accepted, "peerGatewayId").as_str(),
+            other.as_str(),
+            "case {case:?}: expected the other end {other:?} as peerGatewayId, got {:?}",
+            accepted["peerGatewayId"]
+        );
+        // The settings this call states are the link's from now on; the facts
+        // the create left are unchanged by the accept.
+        let expected_attributes = match row.customer_provided_id {
+            Some(customer_provided_id) => json!({ "customerProvidedId": customer_provided_id }),
+            // What `linked_pair`'s CreateLink stored, left in place by an accept
+            // that states no attributes.
+            None => json!({ "customerProvidedId": "spot-fabric" }),
+        };
+        let expected_timeout = match row.timeout_in_millis {
+            Some(timeout_in_millis) => json!(timeout_in_millis),
+            None => Value::Null,
+        };
+        for (member, expected) in [
+            ("createdAt", pair.created_at.clone()),
+            ("direction", json!("REQUEST")),
+            ("connectivityType", json!("DEFAULT")),
+            ("logSettings", body["logSettings"].clone()),
+            ("attributes", expected_attributes.clone()),
+        ] {
+            assert_eq!(
+                accepted[member], expected,
+                "case {case:?}: expected {member} {expected:?}, got {:?}",
+                accepted[member]
+            );
+        }
+
+        // A repeat of this `@idempotent` call asks for the state the link is
+        // already in, so it answers the record rather than refusing it.
+        let (status, repeat) = fabric.send("POST", &accept, Some(body.clone())).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected a repeated AcceptLink to answer 200, got {status} {repeat:?}"
+        );
+        let repeated_status = text(&repeat, "status");
+        assert!(
+            [LINK_STATUS_ACCEPTED, LINK_STATUS_ACTIVE].contains(&repeated_status.as_str()),
+            "case {case:?}: expected the repeat to answer an accepted link, got {repeated_status:?}"
+        );
+
+        // The accepted link comes up, and every reader reads the accepted
+        // record back: both ends, through `GetLink`.
+        for (end, gateway_id) in [("addressed end", addressed), ("other end", other)] {
+            let read_back = fabric
+                .poll_link_status(gateway_id, &pair.link_id, LINK_STATUS_ACTIVE)
+                .await;
+            for (member, expected) in [
+                ("createdAt", pair.created_at.clone()),
+                ("logSettings", body["logSettings"].clone()),
+                ("attributes", expected_attributes.clone()),
+                ("timeoutInMillis", expected_timeout.clone()),
+            ] {
+                assert_eq!(
+                    read_back[member], expected,
+                    "case {case:?}: expected the {end} to read {member} {expected:?} back, got {:?}",
+                    read_back[member]
+                );
+            }
+        }
+        // ACTIVE is where the accept leaves the link: nothing further is owed,
+        // so no later reader sees it move on to FAILED or anything else.
+        assert!(
+            !fabric.settlement_owed(),
+            "case {case:?}: expected nothing further to be owed on an ACTIVE link"
+        );
+    }
+}
+
+#[tokio::test]
+async fn only_an_outstanding_or_an_already_accepted_request_can_be_accepted() {
+    // The whole modelled catalog, from `LINK_STATUS_VALUES` (this service's
+    // `LinkStatus` enum), so a status no operation reaches yet is covered too.
+    for status_value in LINK_STATUS_VALUES {
+        let case = *status_value;
+        let fabric = Fabric::new();
+        let pair = fabric.linked_pair("token").await;
+        fabric.force_link_status(status_value);
+        let link = format!("/gateway/{}/link/{}", pair.responder_id, pair.link_id);
+
+        let (status, code, body) = fabric
+            .send_with_code(
+                "POST",
+                &format!("{link}/accept"),
+                Some(accept_body(&ACCEPT_ROWS[0])),
+            )
+            .await;
+
+        if [LINK_STATUS_PENDING_REQUEST, LINK_STATUS_REQUESTED].contains(status_value) {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected this status to be acceptable, got {status} {body:?}"
+            );
+            assert_eq!(
+                text(&body, "status"),
+                LINK_STATUS_ACCEPTED,
+                "case {case:?}: expected the accepted link to be ACCEPTED, got {:?}",
+                body["status"]
+            );
+        } else if [LINK_STATUS_ACCEPTED, LINK_STATUS_ACTIVE].contains(status_value) {
+            // The accept this operation already recorded: a repeat answers the
+            // record it left, so the status it reports is the stored one.
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected an already accepted link to answer 200, got {status} {body:?}"
+            );
+            assert_eq!(
+                text(&body, "status"),
+                case,
+                "case {case:?}: expected the stored status, got {:?}",
+                body["status"]
+            );
+        } else {
+            assert_eq!(
+                status, 409,
+                "case {case:?}: expected this status to conflict with 409, got {status} {body:?}"
+            );
+            assert_eq!(
+                code, "ConflictException",
+                "case {case:?}: expected ConflictException, got {code:?}"
+            );
+            // The refusal names the link and the gateway the call addressed,
+            // and the status that refuses it.
+            let message = text(&body, "message");
+            for value in [pair.link_id.as_str(), pair.responder_id.as_str(), case] {
+                assert!(
+                    message.contains(value),
+                    "case {case:?}: expected the refusal to name {value:?}, got {message:?}"
+                );
+            }
+            // The refused call left the link exactly as it was.
+            let (_, read_back) = fabric.send("GET", &link, None).await;
+            assert_eq!(
+                text(&read_back, "status"),
+                case,
+                "case {case:?}: expected the refused accept to leave the status alone, got {:?}",
+                read_back["status"]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_accept_of_a_link_the_gateway_is_not_an_end_of_is_not_found() {
+    let fabric = Fabric::new();
+    let pair = fabric.linked_pair("token-a").await;
+    // A second pair, so there is a gateway that is no end of the first link.
+    let other = fabric.linked_pair("token-b").await;
+
+    for (case, gateway_id, link_id) in [
+        ("neither exists", "rtb-gw-unknown", "link-unknown"),
+        (
+            "a stored gateway, a link id nothing minted",
+            pair.requester_id.as_str(),
+            "link-unknown",
+        ),
+        (
+            "a stored link, addressed from a gateway that is not one of its ends",
+            other.responder_id.as_str(),
+            pair.link_id.as_str(),
+        ),
+    ] {
+        let (status, code, body) = fabric
+            .send_with_code(
+                "POST",
+                &format!("/gateway/{gateway_id}/link/{link_id}/accept"),
+                Some(accept_body(&ACCEPT_ROWS[0])),
+            )
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected AcceptLink to answer 404, got {status} {body:?}"
+        );
+        assert_eq!(
+            code, "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {code:?}"
+        );
+    }
+
+    // The link that was NOT addressable by those calls is untouched by them.
+    let (status, read_back) = fabric
+        .send(
+            "GET",
+            &format!("/gateway/{}/link/{}", pair.requester_id, pair.link_id),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected the untouched link to still be readable, got {status} {read_back:?}"
+    );
+    let untouched = text(&read_back, "status");
+    assert!(
+        [LINK_STATUS_PENDING_REQUEST, LINK_STATUS_REQUESTED].contains(&untouched.as_str()),
+        "expected a refused accept to leave the link's request outstanding, got {untouched:?}"
+    );
+}
+
+#[tokio::test]
+async fn only_a_live_link_occupies_the_gateway_pair_it_joins() {
+    // The whole modelled catalog again, from `LINK_STATUS_VALUES`, crossed with
+    // the orientation of the fresh request: a link joins two gateways in both
+    // directions, so which end opens the new one cannot change the answer.
+    for status_value in LINK_STATUS_VALUES {
+        for reversed in [false, true] {
+            let case = format!(
+                "{status_value}, opened from the {}",
+                if reversed { "responder" } else { "requester" }
+            );
+            let fabric = Fabric::new();
+            let pair = fabric.linked_pair("token").await;
+            fabric.force_link_status(status_value);
+            let (opener, peer) = if reversed {
+                (&pair.responder_id, &pair.requester_id)
+            } else {
+                (&pair.requester_id, &pair.responder_id)
+            };
+
+            let (status, code, body) = fabric
+                .send_with_code(
+                    "POST",
+                    &format!("/gateway/{opener}/create-link"),
+                    Some(json!({
+                        "peerGatewayId": peer,
+                        "logSettings": log_settings(),
+                    })),
+                )
+                .await;
+
+            if [
+                LINK_STATUS_REJECTED,
+                LINK_STATUS_FAILED,
+                LINK_STATUS_DELETED,
+            ]
+            .contains(status_value)
+            {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected a terminal link to leave the pair free, got {status} {body:?}"
+                );
+                let fresh = text(&body, "linkId");
+                assert_ne!(
+                    fresh, pair.link_id,
+                    "case {case:?}: expected a link of its own, got the terminal link's id"
+                );
+                // The fresh link is a record of its own: the terminal one is
+                // still there, in the status it ended in.
+                let (status, ended) = fabric
+                    .send(
+                        "GET",
+                        &format!("/gateway/{}/link/{}", pair.requester_id, pair.link_id),
+                        None,
+                    )
+                    .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the terminal link to still be readable, got {status} {ended:?}"
+                );
+                assert_eq!(
+                    text(&ended, "status"),
+                    *status_value,
+                    "case {case:?}: expected the terminal link to keep its status, got {:?}",
+                    ended["status"]
+                );
+            } else {
+                assert_eq!(
+                    status, 409,
+                    "case {case:?}: expected a live link to occupy the pair, got {status} {body:?}"
+                );
+                assert_eq!(
+                    code, "ConflictException",
+                    "case {case:?}: expected ConflictException, got {code:?}"
+                );
+            }
+        }
+    }
 }

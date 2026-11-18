@@ -117,10 +117,15 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource was not fou
 pub const LINK_STATUS_PENDING_REQUEST: &str = "PENDING_REQUEST";
 /// `LinkStatus` member: the link request is outstanding against the peer.
 pub const LINK_STATUS_REQUESTED: &str = "REQUESTED";
+/// `LinkStatus` member: the peer has accepted the request and the link is
+/// coming up.
+pub const LINK_STATUS_ACCEPTED: &str = "ACCEPTED";
 /// `LinkStatus` member: the link carries traffic.
 pub const LINK_STATUS_ACTIVE: &str = "ACTIVE";
 /// `LinkStatus` member: terminal, the peer declined the link request.
 pub const LINK_STATUS_REJECTED: &str = "REJECTED";
+/// `LinkStatus` member: terminal, the link could not be established.
+pub const LINK_STATUS_FAILED: &str = "FAILED";
 /// `LinkStatus` member: terminal, the link is gone.
 pub const LINK_STATUS_DELETED: &str = "DELETED";
 
@@ -241,13 +246,29 @@ pub struct Link {
 }
 
 impl Link {
-    /// Materialise the `PENDING_REQUEST` -> `REQUESTED` transition the clock has
-    /// already made due: the request has reached the peer and is waiting on it.
+    /// The status the clock owes a link in `status`, if any: a request this
+    /// service has taken but not yet put to the peer is owed `REQUESTED`, and a
+    /// request the peer has accepted is owed `ACTIVE` once the link is up. Every
+    /// other status is settled, so nothing is owed on it.
+    fn owed_status(status: &str) -> Option<&'static str> {
+        match status {
+            LINK_STATUS_PENDING_REQUEST => Some(LINK_STATUS_REQUESTED),
+            LINK_STATUS_ACCEPTED => Some(LINK_STATUS_ACTIVE),
+            _ => None,
+        }
+    }
+
+    /// Materialise the transition the clock has already made due — the request
+    /// reaching the peer, or the accepted link coming up — dated at the instant
+    /// it was owed rather than now, so the record does not depend on when it was
+    /// next read.
     pub fn settle(&mut self, now: SystemTime) {
         if let Some(due) = self.settles_at.filter(|due| *due <= now) {
-            self.status = LINK_STATUS_REQUESTED.to_string();
+            if let Some(next) = Self::owed_status(&self.status) {
+                self.status = next.to_string();
+                self.updated_at = due;
+            }
             self.settles_at = None;
-            self.updated_at = due;
         }
     }
 
@@ -275,6 +296,33 @@ impl Link {
     /// the peer can still accept or decline the request.
     pub fn request_outstanding(&self) -> bool {
         self.status == LINK_STATUS_PENDING_REQUEST || self.status == LINK_STATUS_REQUESTED
+    }
+
+    /// Whether this link's request has already been accepted — the status an
+    /// accept leaves, and the one the clock then moves it on to. A repeat of the
+    /// accept asks for the state the link is already in, so it is answered with
+    /// this record rather than refused.
+    pub fn request_accepted(&self) -> bool {
+        self.status == LINK_STATUS_ACCEPTED || self.status == LINK_STATUS_ACTIVE
+    }
+
+    /// Whether this link has reached a status nothing moves it out of: the peer
+    /// declined the request, the link could not be established, or it is gone.
+    pub fn terminal(&self) -> bool {
+        self.status == LINK_STATUS_REJECTED
+            || self.status == LINK_STATUS_FAILED
+            || self.status == LINK_STATUS_DELETED
+    }
+
+    /// The message this service's `ConflictException` carries when the link's
+    /// current status does not admit the transition a call asks for: the link
+    /// and the gateway the call addressed, from the request, and the status that
+    /// refuses it, from the record.
+    pub fn status_conflict_message(&self, gateway_id: &str, transition: &str) -> String {
+        format!(
+            "link {} on gateway {} is {} and cannot be {}",
+            self.link_id, gateway_id, self.status, transition
+        )
     }
 }
 
@@ -460,13 +508,16 @@ impl ComAmazonawsRtbfabricRtbfabricState {
         Some(released)
     }
 
-    /// Whether a link already joins these two gateways, in either orientation: a
-    /// link is one record with two ends, readable and deletable from both, so the
-    /// reverse create would be a second record for the same pair.
+    /// Whether a LIVE link already joins these two gateways, in either
+    /// orientation: a link is one record with two ends, readable and deletable
+    /// from both, so the reverse create would be a second record for the same
+    /// pair. A link that has reached a terminal status joins them no longer —
+    /// nothing moves it back out of that status — so the pair is free for a
+    /// fresh request, which is a link of its own beside the terminal record.
     pub fn link_joining(&self, gateway_id: &str, peer_gateway_id: &str) -> Option<&Link> {
-        self.links
-            .values()
-            .find(|link| link.has_end(gateway_id) && link.has_end(peer_gateway_id))
+        self.links.values().find(|link| {
+            !link.terminal() && link.has_end(gateway_id) && link.has_end(peer_gateway_id)
+        })
     }
 
     /// Count the stored links `gateway_id` is an end of, by status.
