@@ -40,7 +40,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_ec2_amazonec2::state as ec2;
 
-use crate::support::{borrowed, ec2_query, emulator, p, query, tag_value, tag_values, REGION};
+use crate::support::{
+    activity_causes, borrowed, ec2_query, emulator, p, query, tag_value, tag_values, REGION,
+};
 
 /// The launch source every group in this suite is created from — a launch TEMPLATE,
 /// because no account can create a launch configuration (see
@@ -157,23 +159,9 @@ async fn group_instances(router: &MultiServiceRouter, group: &str) -> (Vec<Strin
     )
 }
 
-/// The causes of the scaling activities the group has recorded, newest first.
-async fn activity_causes(router: &MultiServiceRouter, group: &str) -> Vec<String> {
-    let (status, body) = query(
-        router,
-        "DescribeScalingActivities",
-        &[("AutoScalingGroupName", group)],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "DescribeScalingActivities for {group:?} expected 200, got {status}: {body}"
-    );
-    tag_values(&body, "Cause")
-        .iter()
-        .map(|cause| crate::support::xml_unescape(cause))
-        .collect()
-}
+// The causes of the scaling activities the group has recorded, newest first, come from the
+// harness's own reader (`crate::support::activity_causes`), so this suite and the others
+// that assert on a cause share one copy of that read.
 
 /// Wait until the group reports `wanted` as its `DesiredCapacity`, or the deadline passes;
 /// answer what it last reported.

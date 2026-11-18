@@ -269,6 +269,15 @@ pub mod ec2_health;
 
 pub use ec2_health::{EC2_INSTANCE_GONE_REASON, UNHEALTHY_REPLACEMENT_REASON};
 
+/// The health of a group's instances as a CALLER records it — `SetInstanceHealth` — and
+/// when the group's health check acts on an instance recorded unhealthy.
+pub mod instance_health;
+
+pub use instance_health::{
+    absent_instance_message, health_status_violation_message, HealthRefusal, HEALTH_STATUS_VALUES,
+    UNHEALTHY_INSTANCE_REPLACEMENT, USER_HEALTH_CHECK_REASON,
+};
+
 /// The instance type a group's attribute-based launch source launches, and the unit the
 /// group's `DesiredCapacityType` counts its capacity in.
 pub mod instance_requirements;
@@ -746,6 +755,11 @@ pub struct StoredInstance {
     /// ([`Self::pending_lifecycle_actions`]): nothing the clock owes moves a held instance
     /// on, only the resolution of the hold does.
     pub transition_due: Option<SystemTime>,
+    /// When the group's health check acts on this instance, for one a failed check has
+    /// recorded unhealthy: the instant it is taken out of service and the group launches
+    /// its replacement ([`instance_health`]). `None` for an instance no check has failed
+    /// for, which is every instance the group launches.
+    pub health_check_due: Option<SystemTime>,
     /// The lifecycle actions the group's own lifecycle hooks are holding this instance at,
     /// one per hook configured for the transition it is taking ([`lifecycle_actions`]).
     /// Empty for an instance no hook is holding, which is every instance of a group that
@@ -1897,6 +1911,10 @@ impl AutoScalingState {
         // like everything else in this pass ([`ec2_health`]). Before the refreshes below, so
         // a refresh reads the instances its group actually holds.
         self.reconcile_terminated_instances(engine, now);
+        // And the members a failed health check has recorded unhealthy, which the group's
+        // own check acts on as the clock makes it due ([`instance_health`]): the same
+        // replacement, owed for the same reason, whichever check failed.
+        self.reconcile_unhealthy_instances(engine, now);
         // Before the lifecycle pass below, so an instance a replacement launched at
         // an instant already past leaves its transient state in this same call.
         self.advance_instance_refreshes(engine, now);
@@ -2445,6 +2463,9 @@ impl AutoScalingState {
                 launch_sequence: first_sequence
                     .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX)),
                 transition_due: Some(request.due),
+                // A freshly launched instance has failed no health check, so the group's
+                // check owes nothing on it.
+                health_check_due: None,
                 // A launch into the GROUP may be held by the group's own launch lifecycle
                 // hooks, which is applied once the instances are placed below
                 // ([`lifecycle_actions`]).
@@ -3651,19 +3672,24 @@ pub fn instance_not_in_group_message(instance_id: &str, group_name: &str) -> Str
     format!("Instance {instance_id}{NOT_PART_OF_GROUP_CLAUSE}{group_name}.")
 }
 
+/// The fixed text every refusal of a request naming an instance Amazon EC2 Auto Scaling
+/// does not manage starts with. What follows it is the DETAIL the operation reports, which
+/// is that operation's own — the same `<subject> not found - <detail>` shape this service's
+/// absent-group refusals carry ([`ABSENT_GROUP_PREFIX`]).
+pub const ABSENT_INSTANCE_PREFIX: &str = "Instance Id not found - ";
+
 /// The message an instance-scoped request that names NO Auto Scaling group is refused with
 /// when no group of the account manages the instance it names.
 ///
 /// Such a request carries one instance id and nothing else that identifies a group, so the
 /// refusal is about the INSTANCE: the subject is not findable among the instances Amazon EC2
 /// Auto Scaling manages, whether the account holds no Amazon EC2 instance of that id at all
-/// or holds one that is simply in no group. The fixed text is `Instance Id not found - No
-/// managed instance found for instance ID: ` — the same `<subject> not found - <detail>`
-/// shape this service's absent-group refusal carries
-/// ([`ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL`]) — and its ONE variable part is the instance id
-/// the request carried.
+/// or holds one that is simply in no group. The detail form here is the TERMINATION's own —
+/// `No managed instance found for instance ID: ` after the prefix — and its ONE variable
+/// part is the instance id the request carried; the health status's own detail form is
+/// [`instance_health::absent_instance_message`].
 pub fn instance_managed_by_no_group_message(instance_id: &str) -> String {
-    format!("Instance Id not found - No managed instance found for instance ID: {instance_id}")
+    format!("{ABSENT_INSTANCE_PREFIX}No managed instance found for instance ID: {instance_id}")
 }
 
 /// The message a request that would bring an instance into a group which is ALREADY an

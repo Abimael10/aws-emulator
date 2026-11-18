@@ -111,35 +111,67 @@ impl AutoScalingState {
             if lost.is_empty() {
                 continue;
             }
-            let Some(group) = self.groups.get(&group_name) else {
-                continue;
-            };
-            let arn = group.arn.clone();
-            // The capacity the group is configured for does not change: the instances went
-            // away under it, so what it is short of is what it launches.
-            let desired_capacity = group.desired_capacity;
-            let cause = format!("{EC2_INSTANCE_GONE_REASON}.");
-            let replacement_cause = format!("{UNHEALTHY_REPLACEMENT_REASON}.");
-            let due = now + LIFECYCLE_TRANSITION;
-            self.terminate_group_instances(engine, &group_name, &lost, now, due);
-            for instance_id in &lost {
-                self.record_instance_lifecycle_change(
-                    engine,
-                    &InstanceLifecycleChange {
-                        kind: InstanceLifecycle::Terminated,
-                        group_name: &group_name,
-                        group_arn: &arn,
-                        instance_id,
-                        cause: &cause,
-                        start_time: now,
-                        due,
-                    },
-                );
-            }
-            // The same convergence every change to a group's size goes through, which is
-            // what launches the replacements the group is now short of — recorded under its
-            // own cause, since what it did was launch an instance rather than take one out.
-            self.apply_capacity(engine, &group_name, desired_capacity, &replacement_cause, now);
+            self.replace_unhealthy_instances(
+                engine,
+                &group_name,
+                &lost,
+                EC2_INSTANCE_GONE_REASON,
+                now,
+            );
         }
+    }
+
+    /// Take the instances `instance_ids` names out of `group_name` because a HEALTH CHECK
+    /// of the group found them unhealthy, and let the group converge on the capacity it is
+    /// configured for — which launches a replacement for every unit they were providing.
+    ///
+    /// THE ONE path a failed health check takes a member of a group out by, whichever check
+    /// failed: the Amazon EC2 state change this module notices
+    /// ([`EC2_INSTANCE_GONE_REASON`]) and the status a caller records
+    /// ([`super::instance_health`]) are the same replacement, so the instance leaves and is
+    /// replaced identically for both. `reason` is what the check that failed records as
+    /// having taken the instance out of service; the launch that follows records its OWN
+    /// ([`UNHEALTHY_REPLACEMENT_REASON`]), since what it did was launch an instance rather
+    /// than take one out.
+    ///
+    /// Does nothing for a name no group answers to, and nothing for an id the group does
+    /// not hold or is already taking out of service.
+    pub(super) fn replace_unhealthy_instances<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        group_name: &str,
+        instance_ids: &[String],
+        reason: &str,
+        now: SystemTime,
+    ) {
+        let Some(group) = self.groups.get(group_name) else {
+            return;
+        };
+        let arn = group.arn.clone();
+        // The capacity the group is configured for does not change: the instances went out
+        // of service under it, so what it is short of is what it launches.
+        let desired_capacity = group.desired_capacity;
+        let cause = format!("{reason}.");
+        let replacement_cause = format!("{UNHEALTHY_REPLACEMENT_REASON}.");
+        let due = now + LIFECYCLE_TRANSITION;
+        self.terminate_group_instances(engine, group_name, instance_ids, now, due);
+        for instance_id in instance_ids {
+            self.record_instance_lifecycle_change(
+                engine,
+                &InstanceLifecycleChange {
+                    kind: InstanceLifecycle::Terminated,
+                    group_name,
+                    group_arn: &arn,
+                    instance_id,
+                    cause: &cause,
+                    start_time: now,
+                    due,
+                },
+            );
+        }
+        // The same convergence every change to a group's size goes through, which is what
+        // launches the replacements the group is now short of — recorded under its own
+        // cause, since what it did was launch an instance rather than take one out.
+        self.apply_capacity(engine, group_name, desired_capacity, &replacement_cause, now);
     }
 }

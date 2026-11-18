@@ -40,6 +40,15 @@ use crate::support::{
     ec2_query, p, query, seed_subnets, tag_value, tag_values, xml_unescape, REGION,
 };
 
+/// The health of a group's members, in its own file beside this one: the status a caller
+/// records for one of them and the replacement an unhealthy member is owed, which is the
+/// other way this group's membership is decided and so this suite's sibling concern.
+/// `tests/all.rs` declares one module per suite FILE, and this is that file's module; the
+/// `#[path]` points it into this suite's own directory, as that file's own declaration
+/// points into `tests/all/`.
+#[path = "scale_out_launches_ec2_instances/instance_health.rs"]
+mod instance_health;
+
 /// Wait until every clock-owed transition started before now has certainly fallen due —
 /// this service's own lifecycle span and Amazon EC2's, whichever is longer, plus a
 /// margin. Derived from the services' own spans, not written out, so the three cannot

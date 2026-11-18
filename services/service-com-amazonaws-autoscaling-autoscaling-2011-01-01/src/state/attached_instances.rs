@@ -287,6 +287,9 @@ impl AutoScalingState {
                     launch_sequence: first_sequence
                         .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX)),
                     transition_due: Some(due),
+                    // An instance the group has just taken in has failed no health check,
+                    // so the group's check owes nothing on it.
+                    health_check_due: None,
                     // The group's own launch lifecycle hooks are put in front of the
                     // attached instance once it is placed below
                     // ([`super::lifecycle_actions`]).

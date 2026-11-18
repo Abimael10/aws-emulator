@@ -523,6 +523,28 @@ pub fn tag_value(xml: &str, tag: &str) -> String {
     tag_values(xml, tag).first().cloned().unwrap_or_default()
 }
 
+/// The causes of the scaling activities a group has recorded, newest first, unescaped.
+///
+/// THE ONE COPY for every suite here that reads WHY a group moved an instance: the cause is
+/// what a client reads the reason off, so the read is defined once and each suite asserts
+/// the sentence it is about.
+pub async fn activity_causes(router: &MultiServiceRouter, group: &str) -> Vec<String> {
+    let (status, body) = query(
+        router,
+        "DescribeScalingActivities",
+        &[("AutoScalingGroupName", group)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DescribeScalingActivities for {group:?} expected 200, got {status}: {body}"
+    );
+    tag_values(&body, "Cause")
+        .iter()
+        .map(|cause| xml_unescape(cause))
+        .collect()
+}
+
 /// POST one `awsJson` RPC call against a service mounted BESIDE Auto Scaling, the way a
 /// client makes it: `POST /` with `X-Amz-Target: <target_prefix>.<operation>` and a
 /// credential scoped to `signing_name`, which is what the router picks the service from.

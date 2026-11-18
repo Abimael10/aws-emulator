@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetInstanceHealth
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetInstanceHealth`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetInstanceHealth::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the health status of ONE instance of the account: the status the request states
+//! becomes the `HealthStatus` the group holding that instance reports for it, and an
+//! instance recorded unhealthy is taken out of service and replaced by the group's own
+//! health check as the clock makes it due ([`crate::state::instance_health`], which holds
+//! the rule and the grace period this call respects).
+//!
+//! The request names no group, so the instance is resolved against the group that HOLDS
+//! it: an id no group of the account manages is refused and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +166,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetInstanceHealth` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetInstanceHealthErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetInstanceHealth"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SetInstanceHealthErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let instance_id = input.instance_id;
+        let health_status = input.health_status;
+        // "If the Auto Scaling group of the specified instance has a
+        // `HealthCheckGracePeriod` specified for the group, by default, this call respects
+        // the grace period" (`SetInstanceHealthQuery$ShouldRespectGracePeriod`): a request
+        // that states nothing about it respects it.
+        let respect_grace_period = input.should_respect_grace_period.unwrap_or(true);
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        match state.set_instance_health(&instance_id, &health_status, respect_grace_period, now) {
+            Ok(group_name) => {
+                crate::state::audit(
+                    ctx.parts(),
+                    "SetInstanceHealth",
+                    &group_name,
+                    &format!("instance health recorded as {health_status}"),
+                );
+                Ok(SetInstanceHealthOutput)
+            }
+            // Neither situation is one this operation models an error for, so both are
+            // refused the way this service refuses a request it cannot satisfy: HTTP 400
+            // `ValidationError`, carrying the sentence the refusal's own class states.
+            Err(refusal) => Err(crate::scaffolded::Scaffolded::validation_error(
+                refusal.message(),
+            )),
+        }
     }
 }
