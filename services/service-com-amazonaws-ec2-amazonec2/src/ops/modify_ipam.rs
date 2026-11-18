@@ -186,7 +186,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .flatten()
                 .map(|added| added.region_name.as_deref()),
-            "addOperatingRegion",
         )?;
         let remove_operating_regions = state::ipam_operating_region_names(
             input
@@ -194,7 +193,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .flatten()
                 .map(|removed| removed.region_name.as_deref()),
-            "removeOperatingRegion",
         )?;
 
         // One Region both added and removed asks for two incompatible things of the same

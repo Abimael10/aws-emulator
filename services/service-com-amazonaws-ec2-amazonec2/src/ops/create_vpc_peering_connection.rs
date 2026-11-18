@@ -209,10 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 peer_region.to_string()
             }
             Some(peer_region) => {
-                return Err(state::invalid_parameter_value(format!(
-                    "Value ({peer_region}) for parameter peerRegion is invalid. \
-                     This is not a valid Region name."
-                )))
+                return Err(crate::scaffolded::Scaffolded::invalid_region_name(
+                    peer_region,
+                ))
             }
         };
 

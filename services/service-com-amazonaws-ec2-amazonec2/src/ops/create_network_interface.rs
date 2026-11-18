@@ -503,8 +503,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // neither with one this request already took nor with one another resource holds.
         while addresses.len() < wanted {
             let Some(free) = store.mint_private_ip_in_cidr(&cidr_block) else {
-                // "The subnet does not have enough free private IPv4 addresses to satisfy
-                // the request" — EC2's `InsufficientFreeAddressesInSubnet`.
+                // "The specified subnet does not have enough free addresses to satisfy
+                // the request." — EC2's `InsufficientFreeAddressesInSubnet`.
                 store.release_private_ips(&addresses);
                 return Err(Scaffolded::insufficient_free_addresses());
             };

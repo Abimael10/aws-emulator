@@ -301,10 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             || (is_catalog_region(&source_region)
                 && regions_in_partition_of(&region).contains(&source_region.as_str()));
         if !names_a_region {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Value ({source_region}) for parameter sourceRegion is invalid. \
-                 This is not a valid Region name."
-            )));
+            return Err(Scaffolded::invalid_region_name(&source_region));
         }
 
         // "Only one of DestinationAvailabilityZone, DestinationAvailabilityZoneId, or

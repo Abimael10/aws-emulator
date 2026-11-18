@@ -664,7 +664,7 @@ async fn an_id_that_names_no_path_of_the_account_is_refused() {
         );
         assert_eq!(
             error_message(&body),
-            format!("The network insights path ID '{named}' does not exist"),
+            format!("{named} does not exist"),
             "case {case:?}: expected the refusal to name {named}, got {body}"
         );
         assert!(

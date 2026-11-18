@@ -488,7 +488,7 @@ async fn an_afi_id_and_an_attribute_are_resolved_in_one_order() {
 
     // The wording of the not-found refusal is the ONE this service answers for an AFI,
     // whichever operation resolved the id, and it names the id the REQUEST carried.
-    let expected_message = format!("The fpga-image ID '{UNKNOWN_FPGA_IMAGE_ID}' does not exist");
+    let expected_message = format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' not found.");
     let resolver_rows: [(&str, Params); 3] = [
         (
             "DescribeFpgaImageAttribute",

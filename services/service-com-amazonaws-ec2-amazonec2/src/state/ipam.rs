@@ -705,8 +705,10 @@ pub fn ipam_id_not_found<E>(ipam_id: &str) -> Scaffolded<E> {
 /// `RemoveIpamOperatingRegionSet` goes through — `CreateIpam`'s `OperatingRegions` and
 /// `ModifyIpam`'s `AddOperatingRegions` and `RemoveOperatingRegions` — so no two of them can
 /// disagree about which Region names an IPAM may operate in, the same contract
-/// [`tags_from_specifications`] has for a tag payload. `member` is the parameter the refusal
-/// names, since that is all that differs between them.
+/// [`tags_from_specifications`] has for a tag payload. A name that is no Region's is refused
+/// in the sentence this service answers EVERY member that has to name a Region with
+/// ([`Scaffolded::invalid_region_name`]), which names the value rather than the member, so
+/// the three lists above cannot word one cause three ways.
 ///
 /// "The name of the operating Region" (`AddIpamOperatingRegion$RegionName` /
 /// `RemoveIpamOperatingRegion$RegionName`) is the only member either shape has, so an entry
@@ -719,7 +721,6 @@ pub fn ipam_id_not_found<E>(ipam_id: &str) -> Scaffolded<E> {
 /// mention does not and is kept once, in the order the request named them.
 pub fn ipam_operating_region_names<'a, E>(
     requested: impl IntoIterator<Item = Option<&'a str>>,
-    member: &str,
 ) -> Result<Vec<String>, Scaffolded<E>> {
     let catalog = commercial_regions();
     let mut regions: Vec<String> = Vec::new();
@@ -730,10 +731,7 @@ pub fn ipam_operating_region_names<'a, E>(
             ));
         };
         if !catalog.contains(&region_name) {
-            return Err(invalid_parameter_value(format!(
-                "Value ({region_name}) for parameter {member} is invalid. \
-                 This is not a valid Region name."
-            )));
+            return Err(Scaffolded::invalid_region_name(region_name));
         }
         if !regions.iter().any(|held| held == region_name) {
             regions.push(region_name.to_string());

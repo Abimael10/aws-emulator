@@ -58,8 +58,8 @@ const SOURCE_REGION: &str = REGION;
 ///
 /// `CopyFpgaImage` is in the list because it takes an AFI id too — it reads the id of its
 /// SOURCE — and it is the one operation here whose subject does not live in the Region the
-/// call is made in, so it answers every id it cannot resolve with the malformed answer. The
-/// other three resolve an AFI of their own Region and so keep the two answers apart.
+/// call is made in, though it reads that id in the same malformed-before-not-found order the
+/// other three keep.
 fn resolver_params(action: &str, fpga_image_id: &str) -> Params {
     match action {
         "ResetFpgaImageAttribute" | "DescribeFpgaImageAttribute" => vec![
@@ -75,7 +75,7 @@ fn resolver_params(action: &str, fpga_image_id: &str) -> Params {
 }
 
 /// The operations that resolve an AFI id of the Region they are called in: each keeps the
-/// malformed answer apart from the not-found one.
+/// malformed answer apart from the not-found one, as the copy does.
 const REGIONAL_RESOLVERS: [&str; 3] = [
     "DeleteFpgaImage",
     "ResetFpgaImageAttribute",
@@ -229,8 +229,8 @@ async fn an_afi_id_outside_the_issued_form_is_refused_as_malformed() {
 }
 
 /// RULE: an id INSIDE the issued form that names no stored AFI is the other answer —
-/// `InvalidFpgaImageID.NotFound` from the operations that resolve an AFI of their own Region,
-/// and the copy's one answer from the copy.
+/// `InvalidFpgaImageID.NotFound`, from the copy and from the operations that resolve an AFI
+/// of their own Region alike.
 #[tokio::test]
 async fn an_afi_id_inside_the_issued_form_is_answered_as_not_found() {
     let (router, _engine) = emulator();
@@ -252,7 +252,7 @@ async fn an_afi_id_inside_the_issued_form_is_answered_as_not_found() {
             );
             // The missing-resource wording is the one this service answers for an AFI, and it
             // names the id the REQUEST carried rather than the malformed sentence.
-            let expected_message = format!("The fpga-image ID '{fpga_image_id}' does not exist");
+            let expected_message = format!("Image ID '{fpga_image_id}' not found.");
             let message = error_message(&body);
             assert_eq!(
                 message, expected_message,
@@ -261,8 +261,8 @@ async fn an_afi_id_inside_the_issued_form_is_answered_as_not_found() {
             );
         }
 
-        // `CopyFpgaImage` has ONE answer for a source it cannot resolve, so a well-formed id
-        // naming no AFI is the malformed answer there — the same sentence, naming the same id.
+        // `CopyFpgaImage` resolves its source in the same order: a well-formed id naming no
+        // AFI is the not-found answer there too, in the same sentence naming the same id.
         let params = resolver_params("CopyFpgaImage", &fpga_image_id);
         let (status, body) = op(&router, "CopyFpgaImage", &params).await;
         assert_eq!(
@@ -272,11 +272,11 @@ async fn an_afi_id_inside_the_issued_form_is_answered_as_not_found() {
         );
         let answered_code = error_code(&body);
         assert_eq!(
-            answered_code, INVALID_FPGA_IMAGE_ID_MALFORMED,
+            answered_code, INVALID_FPGA_IMAGE_ID_NOT_FOUND,
             "case {case:?} on CopyFpgaImage: expected the code \
-             {INVALID_FPGA_IMAGE_ID_MALFORMED:?}, got {answered_code:?} in {body}"
+             {INVALID_FPGA_IMAGE_ID_NOT_FOUND:?}, got {answered_code:?} in {body}"
         );
-        let expected_message = format!("Image ID '{fpga_image_id}' is invalid.");
+        let expected_message = format!("Image ID '{fpga_image_id}' not found.");
         let message = error_message(&body);
         assert_eq!(
             message, expected_message,
@@ -328,7 +328,7 @@ async fn a_stored_afi_id_resolves_until_the_delete_removes_it() {
 
     // The id is still inside the form, so what changed is the resource: both readers answer
     // the missing AFI, not a malformed id.
-    let expected_message = format!("The fpga-image ID '{fpga_image_id}' does not exist");
+    let expected_message = format!("Image ID '{fpga_image_id}' not found.");
     for action in ["DeleteFpgaImage", "DescribeFpgaImageAttribute"] {
         let params = resolver_params(action, &fpga_image_id);
         let (status, body) = op(&router, action, &params).await;

@@ -532,7 +532,7 @@ async fn instance_associations_begin_monitoring_and_report_one_row_per_instance(
                 reasons[0]
             );
             assert!(
-                reasons[1].contains(MALFORMED_INSTANCE) && reasons[1].contains("Invalid id"),
+                reasons[1].contains(MALFORMED_INSTANCE) && reasons[1].contains("is malformed"),
                 "case {label:?}: expected the reason to say the value is no instance id, \
                  got {:?}",
                 reasons[1]

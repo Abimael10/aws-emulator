@@ -1001,11 +1001,19 @@ pub fn network_insights_analysis_payload_bytes(spec: &NetworkInsightsAnalysisSpe
 
 /// Refuse a path id a request named that the account holds no path under: HTTP 400
 /// [`INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND`].
+///
+/// AWS words this refusal as the id the REQUEST named and nothing else — `<id> does not
+/// exist`, naming neither the resource kind nor the member that carried the id, the way the
+/// transit gateway family's refusals name their resource bare
+/// ([`invalid_transit_gateway_id_not_found`]). The ONE place it is worded, so every
+/// operation that resolves a `NetworkInsightsPathId` it holds no path for answers the same
+/// sentence. The id is the one the REQUEST sent, bounded by [`echoed_resource_id`] the way
+/// every refusal of this crate that echoes a caller-chosen id is.
 pub fn invalid_network_insights_path_id_not_found<E>(path_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND,
         400,
-        format!("The network insights path ID '{path_id}' does not exist"),
+        format!("{} does not exist", echoed_resource_id(path_id)),
     )
 }
 

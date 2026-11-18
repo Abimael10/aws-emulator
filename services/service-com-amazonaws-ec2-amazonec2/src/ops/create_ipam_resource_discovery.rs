@@ -181,7 +181,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .flatten()
                 .map(|requested| requested.region_name.as_deref()),
-            "operatingRegion",
         )? {
             if !operating_regions.contains(&region_name) {
                 operating_regions.push(region_name);

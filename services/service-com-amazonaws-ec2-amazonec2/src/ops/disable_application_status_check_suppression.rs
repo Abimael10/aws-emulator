@@ -200,8 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what makes this loop the last thing that can refuse the call. Malformed before
         // unknown, the order this service asks the two questions in; the malformed half is
         // worded the way THIS operation's validator words it — "The instance ID '<id>' is
-        // malformed", which is what its recorded refusal carries — rather than the bare
-        // "Invalid id" of the operations that answer `require_known_instance`.
+        // malformed", which is what its recorded refusal carries, and the sentence
+        // `require_known_instance` answers for the same half.
         for instance_id in &instance_ids {
             if !instance_id_is_well_formed(instance_id) {
                 return Err(Scaffolded::instance_id_is_malformed(instance_id));

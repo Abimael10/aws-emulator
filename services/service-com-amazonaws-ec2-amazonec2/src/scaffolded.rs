@@ -326,8 +326,13 @@ impl<E> Scaffolded<E> {
     /// `InvalidInstanceID.Malformed` (HTTP 400): the request named something that is
     /// not an instance id at all, so there is nothing to look up.
     ///
-    /// The message is [`crate::state::invalid_id_message`] — the one template this service
-    /// words an unreadable resource id with, whatever kind of id it is.
+    /// The message is [`crate::state::invalid_id_message`] — the template this service words
+    /// an unreadable resource id with at the REQUEST BOUNDARY, whatever kind of id it is.
+    /// This is the wording of the describes that DECODE a long-form instance id before they
+    /// look anything up ([`crate::state::require_decoded_instance_record`]) and of the
+    /// console reads' own first check, each on its recorded refusal; an operation that
+    /// RESOLVES the one instance it was given answers
+    /// [`Self::instance_id_is_malformed`] instead.
     pub fn invalid_instance_id_malformed(instance_id: &str) -> Self {
         Self::service_error(
             "InvalidInstanceID.Malformed",
@@ -343,10 +348,17 @@ impl<E> Scaffolded<E> {
     /// a second named constructor rather than a literal at a call site so both wordings are
     /// visible here: EC2's per-operation validators do not agree about an unresolvable
     /// instance id, and the operations that answer this one say "The instance ID '<id>' is
-    /// malformed" where the syntax check above says [`crate::state::invalid_id_message`].
-    /// WHICH of the two
-    /// an operation answers is a fact of that operation, recorded by its caller:
+    /// malformed" where the boundary's id parser says [`crate::state::invalid_id_message`].
+    /// This sentence names the resource KIND and the id the request sent, the shape every
+    /// other id kind of this crate words an unreadable value with ("The volume ID '<id>' is
+    /// malformed", "The subnet ID '<id>' is malformed"), so it is the wording of the
+    /// operations that resolve the ONE instance they were given — which is what
+    /// [`crate::state::require_instance_record`] answers for the malformed half. WHICH of
+    /// the two an operation answers is a fact of that operation, recorded by its caller:
     ///
+    /// * `crate::ops::stop_instances` and `crate::ops::get_password_data` resolve a named
+    ///   instance through that helper and are recorded answering this sentence for an id
+    ///   outside the form EC2 issues;
     /// * `crate::ops::create_replace_root_volume_task` refuses EVERY id it cannot resolve
     ///   as malformed, so it never reaches the not-found half at all;
     /// * `crate::ops::report_instance_status` DOES tell a value outside the id form from a
@@ -358,14 +370,16 @@ impl<E> Scaffolded<E> {
     ///   and word the malformed half this way too, which is what their recorded refusals
     ///   carry — including under `DryRun`, which they answer AFTER this one.
     ///
-    /// So an operation that draws the distinction and has no recorded wording of its own
-    /// keeps using [`crate::state::require_known_instance`], which answers the constructor
-    /// above for the malformed half.
+    /// The describes that DECODE a long-form id first keep the boundary wording above, on
+    /// their own recorded refusals ([`crate::state::require_decoded_instance_record`]).
     pub fn instance_id_is_malformed(instance_id: &str) -> Self {
         Self::service_error(
             "InvalidInstanceID.Malformed",
             400,
-            format!("The instance ID '{instance_id}' is malformed"),
+            format!(
+                "The instance ID '{}' is malformed",
+                crate::state::echoed_resource_id(instance_id)
+            ),
         )
     }
 
@@ -446,15 +460,36 @@ impl<E> Scaffolded<E> {
         Self::service_error("InstanceLimitExceeded", 400, message)
     }
 
-    /// `InsufficientFreeAddressesInSubnet` (HTTP 400): no primary private address
-    /// is left to give the instance.
+    /// `InsufficientFreeAddressesInSubnet` (HTTP 400): the subnet the request named has no
+    /// free address left to give what the call would place in it.
+    ///
+    /// AWS's sentence for this class is fixed text end to end — it names neither the subnet
+    /// nor how many addresses were asked for — so every operation that runs a subnet out of
+    /// addresses answers exactly this one.
     pub fn insufficient_free_addresses() -> Self {
         Self::service_error(
             "InsufficientFreeAddressesInSubnet",
             400,
-            "The subnet does not have enough free private IPv4 addresses to \
-             satisfy the request",
+            "The specified subnet does not have enough free addresses to \
+             satisfy the request.",
         )
+    }
+
+    /// `InvalidParameterValue` (HTTP 400): a request member that has to name an AWS Region
+    /// carried a value that is no Region's name.
+    ///
+    /// AWS words this class with a sentence about the VALUE rather than about the member it
+    /// arrived in — `Region name '<value>' is invalid.`, the trailing period included — so a
+    /// caller reads the same sentence whichever member carried the Region, and the value is
+    /// the one the REQUEST sent. The ONE place that sentence lives, so every member of this
+    /// service that has to name a Region refuses one it cannot resolve identically. The value
+    /// is bounded by [`crate::state::echoed_resource_id`] the way every refusal of this crate
+    /// that echoes a caller-chosen value is.
+    pub fn invalid_region_name(region_name: &str) -> Self {
+        Self::invalid_parameter_value(format!(
+            "Region name '{}' is invalid.",
+            crate::state::echoed_resource_id(region_name)
+        ))
     }
 
     /// `InvalidIPAddress.InUse` (HTTP 400): the address the request asked for is already

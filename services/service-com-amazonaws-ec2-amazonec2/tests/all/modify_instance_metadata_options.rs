@@ -38,7 +38,7 @@ use ec2::ops::types::{
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, HTTP_TOKENS_OPTIONAL, HTTP_TOKENS_REQUIRED,
     InstanceStateName, MAX_METADATA_HOP_LIMIT, METADATA_OPTIONS_STATE_APPLIED,
-    METADATA_OPTIONS_STATE_PENDING, MIN_METADATA_HOP_LIMIT, TRANSITION_DELAY, invalid_id_message,
+    METADATA_OPTIONS_STATE_PENDING, MIN_METADATA_HOP_LIMIT, TRANSITION_DELAY,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -502,7 +502,7 @@ const REFUSALS: &[Refused] = &[
         names: &[("HttpTokens", HTTP_TOKENS_OPTIONAL)],
         status: 400,
         code: "InvalidInstanceID.Malformed",
-        message: |named| invalid_id_message(named),
+        message: |named| format!("The instance ID '{named}' is malformed"),
     },
     Refused {
         case: "a well-formed instance id this account holds no instance for",

@@ -657,11 +657,8 @@ async fn a_copy_source_region_has_to_name_a_region() {
         );
         assert_eq!(
             error_message(&body),
-            format!(
-                "Value ({source_region}) for parameter sourceRegion is invalid. \
-                 This is not a valid Region name."
-            ),
-            "case {case:?}: the refusal names the parameter and the value, got {:?}",
+            format!("Region name '{source_region}' is invalid."),
+            "case {case:?}: the refusal names the value that is no Region's name, got {:?}",
             error_message(&body)
         );
     }

@@ -8,13 +8,14 @@
 //!
 //! Three rules this handler keeps:
 //!
-//! 1. a source AFI this copy cannot resolve is refused with ONE answer — 400
-//!    `InvalidFpgaImageID.Malformed` naming the id ([`unresolvable_source_fpga_image_id`]) —
-//!    whether the id is not an AFI id at all or is well formed and names no AFI, because the
-//!    copy's subject lives in the Region `SourceRegion` names rather than in the Region this
-//!    call is made in, so it validates the id instead of resolving a resource of its own
-//!    Region (which is what `DeleteFpgaImage` and `ResetFpgaImageAttribute` do, keeping the
-//!    malformed-before-not-found pair);
+//! 1. a source AFI this copy cannot resolve is refused in the malformed-before-not-found
+//!    order every AFI reader of this service keeps: a value that is not an AFI id at all is
+//!    400 `InvalidFpgaImageID.Malformed` before any lookup
+//!    ([`crate::state::invalid_fpga_image_id_malformed`]), while a well-formed id the
+//!    account holds no AFI under is 400 `InvalidFpgaImageID.NotFound`
+//!    ([`crate::state::invalid_fpga_image_id_not_found`]) — the pair `DeleteFpgaImage` and
+//!    `ResetFpgaImageAttribute` keep, so a caller that mistyped an id is never told the AFI
+//!    is missing and one whose AFI has gone is never told its id is unreadable;
 //! 2. "The Region that contains the source AFI" (`CopyFpgaImageRequest$SourceRegion`) has
 //!    to name a Region of the account's partition, so a value that names no Region is
 //!    refused with `InvalidParameterValue` rather than copied from. It is VALIDATED ONLY:
@@ -120,24 +121,16 @@ impl From<CopyFpgaImageErrorModeled> for CopyFpgaImageError {
     }
 }
 
-/// Refuse a copy whose SOURCE AFI could not be resolved: HTTP 400
-/// `InvalidFpgaImageID.Malformed`, naming the id the copy could not resolve.
+/// Refuse a copy whose SOURCE id is not an AFI id at all: HTTP 400
+/// `InvalidFpgaImageID.Malformed`, naming the id the request sent, BEFORE any lookup.
 ///
-/// This operation is the one here whose subject does not live in the Region the call is made
-/// in — "the Region that contains the source AFI" (`CopyFpgaImageRequest$SourceRegion`) — so
-/// it VALIDATES the source id rather than resolving a resource of its own Region, and it has
-/// ONE answer for a source id it cannot resolve: an id that is not an AFI id at all and a
-/// well-formed id no AFI is stored under are refused alike. That is why this is not the
-/// malformed-before-not-found pair `crate::state::invalid_fpga_image_id_malformed` /
-/// `crate::state::invalid_fpga_image_id_not_found` that every operation resolving an AFI of
-/// its own Region keeps: the recorded service answers a copy whose well-formed source id
-/// names no AFI with the MALFORMED answer, whichever way the id failed to resolve.
-///
-/// What it answers with is the one `crate::state::invalid_fpga_image_id_malformed` every AFI
+/// What it answers with is the one [`crate::state::invalid_fpga_image_id_malformed`] every AFI
 /// refusal of this service words — the code and the `Image ID '<id>' is invalid.` sentence of
 /// the FPGA-image id kind, built from the request's own id — so the copy path cannot word an
-/// unreadable AFI id a second way. Only the CHOICE of that answer for a source nothing is
-/// stored under is this operation's own, which is why the choice lives here.
+/// unreadable AFI id a second way. A well-formed source id the store holds no AFI under is
+/// the OTHER half of that order, [`crate::state::invalid_fpga_image_id_not_found`]: the two
+/// mean different things to a caller, one a permanent defect in the request and the other an
+/// AFI that is not there.
 fn unresolvable_source_fpga_image_id(fpga_image_id: &str) -> CopyFpgaImageError {
     crate::state::invalid_fpga_image_id_malformed(fpga_image_id)
 }
@@ -208,20 +201,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same catalog, so text that is no Region's code is refused without building the
         // partition's list; only a real Region is then narrowed to this account's partition.
         //
-        // The refusal is EC2's parameter-validation sentence, in the form and with the
-        // reason clause this crate already gives a parameter that has to name a Region
-        // (`crate::ops::create_ipam`'s `operatingRegion`), so one wording covers the class;
-        // the parameter name is the request member's own and the value is the request's.
+        // The refusal is the sentence EC2 answers a value that names no Region with,
+        // wherever that value arrived (`crate::scaffolded::Scaffolded::invalid_region_name`):
+        // it names the value the request sent, which is what a caller has to correct.
         let region = request_region(ctx.parts());
         let source_region = input.source_region.as_str();
         let names_a_region = source_region == region
             || (crate::state::is_catalog_region(source_region)
                 && regions_in_partition_of(&region).contains(&source_region));
         if !names_a_region {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Value ({source_region}) for parameter sourceRegion is invalid. \
-                 This is not a valid Region name."
-            )));
+            return Err(Scaffolded::invalid_region_name(source_region));
         }
 
         if input
@@ -286,12 +275,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // alone — "an AFI carries no Region member of its own", so nothing about resolving
         // one depends on a Region: the `SourceRegion` checked above is validated, not
         // resolved against, since this emulator keeps no per-Region AFI store. An id the
-        // store holds no AFI under is one this copy cannot resolve, and is refused with the
-        // same answer as an id that is not an AFI id at all.
+        // store holds no AFI under names an AFI that is not there, which is the not-found
+        // half of the order this operation reads ids in — the form was already checked
+        // above, so nothing malformed reaches here.
         let source = store
             .fpga_images
             .get(&input.source_fpga_image_id)
-            .ok_or_else(|| unresolvable_source_fpga_image_id(&input.source_fpga_image_id))?
+            .ok_or_else(|| {
+                crate::state::invalid_fpga_image_id_not_found(&input.source_fpga_image_id)
+            })?
             .clone();
 
         // "The name for the new AFI. The default is the name of the source AFI"

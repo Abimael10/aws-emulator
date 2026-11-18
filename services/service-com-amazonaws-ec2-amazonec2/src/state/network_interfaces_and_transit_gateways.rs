@@ -1863,6 +1863,11 @@ pub fn needs_default_transit_gateway_route_table(options: Option<&TransitGateway
 
 /// Refuse a request that named a transit gateway id no transit gateway of the account has:
 /// HTTP 400 `InvalidTransitGatewayID.NotFound`.
+///
+/// This is the sentence the operations that act on the GATEWAY itself — read it, modify it,
+/// delete it, create something under it — are recorded answering. An operation that resolves
+/// a transit gateway as the TARGET of a route it is writing words the same code the way the
+/// route's other targets are worded ([`transit_gateway_route_target_not_found`]).
 pub fn invalid_transit_gateway_id_not_found<E>(transit_gateway_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND,
@@ -1870,6 +1875,40 @@ pub fn invalid_transit_gateway_id_not_found<E>(transit_gateway_id: &str) -> Scaf
         format!("Transit Gateway {transit_gateway_id} was deleted or does not exist."),
     )
 }
+
+/// Refuse a ROUTE whose transit gateway target names no transit gateway of the account: HTTP
+/// 400 `InvalidTransitGatewayID.NotFound`, worded the way a route's targets are worded.
+///
+/// A route's target is reported by the MEMBER that carried it — "The <member> ID '<id>' does
+/// not exist" ([`id_not_found_message`], the sentence `gatewayId` and `routeTableId` already
+/// answer in `crate::ops::create_route`) — so the gateway the route points at is named as
+/// the request's `transitGatewayId` rather than as the gateway the transit-gateway
+/// operations above act on, and the sentence closes with a full stop as the recorded refusal
+/// of a route to a gateway that is not there does.
+///
+/// The ONE place that sentence lives: `crate::ops::create_route` and
+/// `crate::ops::replace_route` resolve a target through one function, so neither can word an
+/// unreachable gateway differently from the other. The id is the one the REQUEST sent,
+/// bounded by [`echoed_resource_id`] the way every refusal of this crate that echoes a
+/// caller-chosen id is.
+pub fn transit_gateway_route_target_not_found<E>(transit_gateway_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND,
+        400,
+        format!(
+            "{}.",
+            id_not_found_message(
+                TRANSIT_GATEWAY_ROUTE_TARGET_KIND,
+                &echoed_resource_id(transit_gateway_id)
+            )
+        ),
+    )
+}
+
+/// How a route's refusal NAMES the transit gateway it could not reach: the request member
+/// that carried the id, the way the route's other targets name theirs (`gateway ID`,
+/// `routeTable ID`).
+pub const TRANSIT_GATEWAY_ROUTE_TARGET_KIND: &str = "transitGateway ID";
 
 /// Refuse a value that is no transit gateway id at all: HTTP 400
 /// `InvalidTransitGatewayID.Malformed`, in the sentence EC2 words for this resource —

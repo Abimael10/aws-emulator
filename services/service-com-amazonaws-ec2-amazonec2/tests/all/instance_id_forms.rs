@@ -52,13 +52,29 @@ const NOT_FOUND: &str = "InvalidInstanceID.NotFound";
 
 /// One operation that resolves an instance id: the action, the form fields that name one
 /// id and nothing else of consequence, whether its OUTPUT reports the id it resolved —
-/// a reboot answers the envelope's success flag and no id of its own — and whether it
-/// DECODES a long-form id before looking anything up.
+/// a reboot answers the envelope's success flag and no id of its own — whether it
+/// DECODES a long-form id before looking anything up, and the sentence its validator words
+/// an id it could not read with.
 struct Resolver {
     action: &'static str,
     fields: fn(&str) -> Vec<Param>,
     reports_the_id: bool,
     decodes_long_form: bool,
+    malformed_sentence: fn(&str) -> String,
+}
+
+/// The sentence an operation that RESOLVES the one instance it was given words an id it
+/// cannot read with: the resource KIND and the id the request sent, the shape every other id
+/// kind of this service words an unreadable value with.
+fn kind_sentence(instance_id: &str) -> String {
+    format!("The instance ID '{instance_id}' is malformed")
+}
+
+/// The sentence the describes that DECODE a long-form id before any lookup carry instead:
+/// the request boundary's own template, the value quoted back as one the id space could not
+/// read.
+fn boundary_sentence(instance_id: &str) -> String {
+    format!("Invalid id: \"{instance_id}\"")
 }
 
 /// The operations each row is driven through — a describe, a password read and a reboot, so
@@ -73,18 +89,21 @@ const RESOLVERS: [Resolver; 3] = [
         fields: |instance_id| vec![param("InstanceId.1", instance_id)],
         reports_the_id: true,
         decodes_long_form: true,
+        malformed_sentence: boundary_sentence,
     },
     Resolver {
         action: "GetPasswordData",
         fields: |instance_id| vec![param("InstanceId", instance_id)],
         reports_the_id: true,
         decodes_long_form: false,
+        malformed_sentence: kind_sentence,
     },
     Resolver {
         action: "RebootInstances",
         fields: |instance_id| vec![param("InstanceId.1", instance_id)],
         reports_the_id: false,
         decodes_long_form: false,
+        malformed_sentence: kind_sentence,
     },
 ];
 
@@ -254,12 +273,14 @@ async fn an_instance_id_is_read_in_either_published_form_before_it_is_looked_up(
                 row.instance_id
             );
             // Which sentence the refusal carries is the other half of telling the two
-            // apart: the not-found half names the id as an instance ID, the malformed half
-            // quotes the value back as one the id space could not read.
+            // apart: the not-found half names the id as an instance ID, and the malformed
+            // half is the sentence this operation's own validator words — the resource kind
+            // for an operation that resolves the one instance it was given, the request
+            // boundary's quoted template for the describe that decodes the id first.
             let expected_message = if expected_code == NOT_FOUND {
                 format!("The instance ID '{}' does not exist", row.instance_id)
             } else {
-                format!("Invalid id: \"{}\"", row.instance_id)
+                (resolver.malformed_sentence)(row.instance_id)
             };
             assert_eq!(
                 error_message(&body),

@@ -348,6 +348,9 @@ pub fn instance_id_filter_value_is_readable(
 
 /// Refuse an instance id the request named that this service cannot resolve: a
 /// malformed one before an unknown one, the way the service orders the two.
+///
+/// The malformed half is worded [`crate::scaffolded::Scaffolded::instance_id_is_malformed`],
+/// the sentence [`require_instance_record`] beneath it answers.
 pub fn require_known_instance<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     instance_id: &str,
@@ -424,6 +427,14 @@ pub fn require_decoded_instance_record_worded<'store, E>(
 /// exactly as [`require_known_instance`] does — the ONE reading of those two refusals,
 /// for a caller that needs the record it resolved and not only the fact that it
 /// resolves, so no handler has to look the same id up twice.
+///
+/// The malformed half is worded with the resource KIND —
+/// [`crate::scaffolded::Scaffolded::instance_id_is_malformed`], "The instance ID '<id>' is
+/// malformed" — the sentence an operation that resolves the ONE instance it was given
+/// answers: the recorded refusals of `StopInstances` and `GetPasswordData` carry it, and it
+/// is the shape every other id kind of this crate words an unreadable value with. The
+/// describes that DECODE a long-form id before any lookup keep the request boundary's own
+/// template instead ([`require_decoded_instance_record`]), on their own recorded refusals.
 pub fn require_instance_record<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     instance_id: &str,
@@ -431,7 +442,7 @@ pub fn require_instance_record<'store, E>(
     require_instance_record_worded(
         store,
         instance_id,
-        crate::scaffolded::Scaffolded::invalid_instance_id_malformed,
+        crate::scaffolded::Scaffolded::instance_id_is_malformed,
     )
 }
 

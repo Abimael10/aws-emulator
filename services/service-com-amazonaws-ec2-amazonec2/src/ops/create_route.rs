@@ -472,7 +472,9 @@ pub(crate) fn resolve_target<E>(
         }
         "transitGatewayId" => {
             if !store.transit_gateways.contains_key(value) {
-                return Err(state::invalid_transit_gateway_id_not_found(value));
+                // A target the account does not hold is reported by the member that
+                // carried it, like the route's other targets.
+                return Err(state::transit_gateway_route_target_not_found(value));
             }
             Ok(RouteTarget::TransitGateway(value.to_string()))
         }

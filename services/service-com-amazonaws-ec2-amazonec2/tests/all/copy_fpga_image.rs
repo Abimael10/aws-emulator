@@ -5,16 +5,16 @@
 //!
 //! The rules under test are:
 //!
-//! 1. A SOURCE AFI THE COPY CANNOT RESOLVE IS REFUSED WITH ONE ANSWER: 400
-//!    `InvalidFpgaImageID.Malformed` naming the id, whether that id is not an AFI id at all
-//!    or is well formed and names no AFI — the copy's subject lives in the Region
-//!    `SourceRegion` names rather than in the Region the call is made in, so it validates
-//!    the id instead of resolving a resource of its own Region. The operations that DO
-//!    resolve an AFI of their own Region keep the malformed-before-not-found pair, which
-//!    the same id table is run through to pin the contrast.
+//! 1. A SOURCE AFI THE COPY CANNOT RESOLVE IS REFUSED IN ITS OWN CLASS, in the
+//!    malformed-before-not-found order every AFI reader of this service keeps: a value that
+//!    is not an AFI id at all is 400 `InvalidFpgaImageID.Malformed` with the id kind's
+//!    `Image ID '<id>' is invalid.`, while an id inside the issued form that names no AFI is
+//!    400 `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not found.` — the same pair
+//!    the operations that resolve an AFI of their own Region answer, which the same id table
+//!    is run through.
 //! 2. `SourceRegion` HAS TO NAME A REGION of the account's partition — "the Region that
 //!    contains the source AFI" — so a value that names none is refused with
-//!    `InvalidParameterValue` naming the parameter.
+//!    `InvalidParameterValue` naming the value that is no Region's name.
 //! 3. A COPY IS A NEW AFI COMPUTED FROM THE STORED SOURCE: its own ids, the name the
 //!    request gave it or the source's name as the default, the bitstream facts the source
 //!    reports, no load permission and no tag; it is handed back `pending` and its copy then
@@ -50,8 +50,11 @@ type Params = Vec<(String, String)>;
 /// The HTTP status EC2 answers a `DryRun` request with: 412, carrying `DryRunOperation`.
 const DRY_RUN_STATUS: u16 = 412;
 
-/// The one answer `CopyFpgaImage` has for a source AFI it cannot resolve.
+/// The answer `CopyFpgaImage` has for a source id that is no AFI id at all.
 const UNRESOLVABLE_SOURCE_CODE: &str = "InvalidFpgaImageID.Malformed";
+
+/// The answer it has for a source id inside the issued form that names no stored AFI.
+const UNKNOWN_SOURCE_CODE: &str = "InvalidFpgaImageID.NotFound";
 
 /// A well-formed AFI id, in the long (17 hex digit) form EC2 mints today, that the account
 /// holds no AFI for.
@@ -101,21 +104,21 @@ fn stored_afi_count(engine: &engine::InMemoryEngine) -> usize {
 // RULE 1: a source the copy cannot resolve
 // ---------------------------------------------------------------------------
 
-/// `(case, the source id, the code the operations that resolve an AFI of their own Region
-/// answer it with)`. The ids differ along prefix, suffix length and alphabet, and the two
-/// accepted id FORMS (8 and 17 hex digits) are the rows those operations answer as not
-/// found — `CopyFpgaImage` answers every row alike.
+/// `(case, the source id, the code every operation that resolves an AFI answers it with)`.
+/// The ids differ along prefix, suffix length and alphabet, and the two accepted id FORMS (8
+/// and 17 hex digits) are the rows answered as not found — the copy and the Region-local
+/// readers alike.
 fn unresolvable_source_rows() -> [(&'static str, &'static str, &'static str); 9] {
     [
         (
             "the long id form, which nothing is stored under",
             UNKNOWN_FPGA_IMAGE_ID,
-            "InvalidFpgaImageID.NotFound",
+            UNKNOWN_SOURCE_CODE,
         ),
         (
             "the short id form, which nothing is stored under",
             "afi-01234567",
-            "InvalidFpgaImageID.NotFound",
+            UNKNOWN_SOURCE_CODE,
         ),
         ("no prefix at all", "0123456789abcdef0", UNRESOLVABLE_SOURCE_CODE),
         (
@@ -143,14 +146,14 @@ fn unresolvable_source_rows() -> [(&'static str, &'static str, &'static str); 9]
     ]
 }
 
-/// Every source id `CopyFpgaImage` cannot resolve is refused with the ONE answer the copy
-/// path has for one — 400 `InvalidFpgaImageID.Malformed` naming that id — and nothing is
-/// stored by a refusal.
+/// Every source id `CopyFpgaImage` cannot resolve is refused in its own class — the id kind's
+/// malformed sentence for a value that is no AFI id, its not-found sentence for an id inside
+/// the issued form nothing is stored under — and nothing is stored by a refusal.
 #[tokio::test]
-async fn a_source_the_copy_cannot_resolve_is_refused_with_one_answer() {
+async fn a_source_the_copy_cannot_resolve_is_refused_in_its_own_class() {
     let (router, engine) = emulator();
 
-    for (case, source_fpga_image_id, _) in unresolvable_source_rows() {
+    for (case, source_fpga_image_id, expected_code) in unresolvable_source_rows() {
         let (status, body) = op(&router, "CopyFpgaImage", &copy_params(source_fpga_image_id)).await;
         assert_eq!(
             status, 400,
@@ -158,14 +161,18 @@ async fn a_source_the_copy_cannot_resolve_is_refused_with_one_answer() {
         );
         assert_eq!(
             error_code(&body),
-            UNRESOLVABLE_SOURCE_CODE,
-            "case {case:?}: expected {UNRESOLVABLE_SOURCE_CODE}, got {body}"
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
         );
         let message = unescaped(&element(&body, "Message").unwrap_or_default());
+        let expected_message = if expected_code == UNRESOLVABLE_SOURCE_CODE {
+            format!("Image ID '{source_fpga_image_id}' is invalid.")
+        } else {
+            format!("Image ID '{source_fpga_image_id}' not found.")
+        };
         assert_eq!(
-            message,
-            format!("Image ID '{source_fpga_image_id}' is invalid."),
-            "case {case:?}: the refusal names the id it could not resolve, got {message:?}"
+            message, expected_message,
+            "case {case:?}: expected the message {expected_message:?}, got {message:?}"
         );
     }
 
@@ -177,8 +184,8 @@ async fn a_source_the_copy_cannot_resolve_is_refused_with_one_answer() {
     );
 }
 
-/// The copy's one answer is the copy's own: the operations that resolve an AFI of the Region
-/// they are called in still answer the same id table malformed BEFORE not found.
+/// The classes are the id kind's, not one operation's: the operations that resolve an AFI of
+/// the Region they are called in answer the same id table the same way the copy does.
 #[tokio::test]
 async fn resolving_an_afi_of_this_region_still_answers_malformed_before_not_found() {
     let (router, _engine) = emulator();
@@ -272,18 +279,15 @@ async fn a_copy_source_region_has_to_name_a_region() {
             "InvalidParameterValue",
             "case {case:?}: expected InvalidParameterValue, got {body}"
         );
-        // The whole sentence, not just the parameter name: the refusal is EC2's
-        // parameter-validation form, carrying the value the request sent and the member's
-        // own name, in the wording this crate gives every parameter that has to name a
-        // Region (`create_ipam`'s `operatingRegion` refusal is the same sentence).
+        // The whole sentence, not just the value: the refusal is the one this service
+        // answers for every member that has to name a Region, and it names the value the
+        // request sent (`create_ipam`'s operating Regions are refused with the same one).
         let message = unescaped(&element(&body, "Message").unwrap_or_default());
         assert_eq!(
             message,
-            format!(
-                "Value ({source_region}) for parameter sourceRegion is invalid. \
-                 This is not a valid Region name."
-            ),
-            "case {case:?}: the refusal names the parameter and the value, got {message:?}"
+            format!("Region name '{source_region}' is invalid."),
+            "case {case:?}: the refusal names the value that is no Region's name, got \
+             {message:?}"
         );
     }
 
