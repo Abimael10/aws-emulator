@@ -7,173 +7,158 @@
 //! results … the first page contains the most recent results, closest to the end
 //! of the time frame"
 //! (`smithy_query(query="shape",shape="GetTraceSummariesResult")`), so the pages
-//! of one query are SLICES OF ITS WINDOW walked from the end of the window
-//! backwards, not one list of everything the window holds: each page is one
-//! hour-long slice ([`TRACE_PAGE_SECONDS`]) of `[StartTime, EndTime)`, the first
-//! page is the slice the window ends in, and a token is due while an earlier
-//! slice of the window remains — whether or not the slice just served held
-//! anything, because a page holding nothing says nothing about what the rest of
-//! the window holds, and a client that stops at the first empty page has read
-//! only the last hour of the range it asked about.
+//! of one query are STEPS OF ITS OWN WINDOW walked from the end of that window
+//! backwards: the first page serves the last [`TRACE_PAGE_SECONDS`] of
+//! `[StartTime, EndTime)`, each further page the step before it, and the step
+//! that reaches `StartTime` is the last page the query has.
 //!
-//! The slices are cut on the hour GRID rather than from the requested bounds, so
-//! the start of a page is the top of the hour that begins it: two queries over
-//! overlapping windows place the same trace on the same boundary, and the
-//! instant a page reports is a time a reader can place in the range it asked
-//! about rather than an artefact of when it asked. Every page reports an instant
-//! inside the requested window, because a slice is clipped to that window before
-//! it is reported.
+//! The steps are measured FROM THE REQUESTED BOUNDS, never from an absolute
+//! epoch grid nobody named: a window no longer than one step is therefore ONE
+//! page carrying every trace that window holds, whatever the clock happens to
+//! read, so a trace accepted a moment ago is in the answer to the minutes-wide
+//! window that covers it instead of being deferred to a page the caller had no
+//! reason to ask for. What a query answers is thereby a function of the window
+//! asked about — the same window answers the same way whenever it is asked —
+//! rather than of where that window falls between two boundaries.
 //!
-//! One concern, one file: the slicing, the instant a page reports and the form
+//! Every page's own step lies inside the requested window by construction (it is
+//! clipped to `StartTime`), so the instant a page reports is a time the reader
+//! can place in the range it asked about, and the page a single-step window is
+//! answered in reports the requested `StartTime`.
+//!
+//! One concern, one file: the stepping, the instant a page reports and the form
 //! of the token that resumes it are stated once here, so the handler that serves
-//! a page and the one that resumes one cannot disagree about which slice a token
+//! a page and the one that resumes one cannot disagree about which step a token
 //! names.
 
-/// How long one page of a trace query's window is, in seconds.
+/// How long one page's step of a trace query's window is, in seconds.
 ///
-/// The hour the service pages a multi-hour window by: the model declares no page
-/// size for `GetTraceSummaries`, so the slice is the service's own, and it is
-/// stated here as the one place that decides both the boundaries a window is cut
-/// on and the instant each page reports.
+/// The model declares no page size for `GetTraceSummaries`, so the step is the
+/// service's own, and it is stated here as the one place that decides both how a
+/// window is cut into pages and the instant each page reports.
 pub const TRACE_PAGE_SECONDS: i64 = 60 * 60;
 
-/// The separator between the two parts of a page token: the slice the next page
-/// serves, and — when that slice still has summaries left in it — the trace the
+/// The separator between the two parts of a page token: the step the next page
+/// serves, and — when that step still has summaries left in it — the trace the
 /// next page resumes at. A trace id carries no colon
 /// (`smithy_query(query="shape",shape="TraceId")`), so the split is unambiguous.
 const TOKEN_SEPARATOR: char = ':';
 
 /// The most pages one window is cut into: the widest window a trace query serves
-/// ([`super::MAX_TRACE_SUMMARIES_WINDOW_HOURS`]) covers that many whole hours
-/// plus the part-hour it starts in. A wider window is refused before any page is
-/// cut, so the cap only bounds the walk below; it never decides an answer.
-const MAX_WINDOW_PAGES: usize = super::MAX_TRACE_SUMMARIES_WINDOW_HOURS as usize + 1;
+/// ([`super::MAX_TRACE_SUMMARIES_WINDOW_HOURS`]) is that many steps long. A
+/// wider window is refused before any page is cut, so the cap only bounds the
+/// walk below; it never decides an answer.
+const MAX_WINDOW_PAGES: usize = super::MAX_TRACE_SUMMARIES_WINDOW_HOURS as usize;
 
-/// One page of a `[start, end)` window: the slice of that window it serves.
+/// One page of a `[start, end)` window: the step of that window it serves.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowPage {
-    /// The hour boundary this page is cut on, which is what a token names it by.
-    pub boundary: i64,
-    /// Where the page's own slice starts: the boundary, or the start of the
-    /// requested window when the window starts inside this slice. This is "the
-    /// start time of this page of results".
+    /// Which step of the window this page serves, counted back from the end of
+    /// the window: `0` is the step the window ends in, which is the first page.
+    /// This is what a token names a page by.
+    pub index: usize,
+    /// Where the page's own step starts: one step before it ends, or the start
+    /// of the requested window for the page that reaches it. This is "the start
+    /// time of this page of results".
     pub start: f64,
-    /// Where the page's own slice ends, exclusive: the next boundary, or the end
-    /// of the requested window when the window ends inside this slice.
+    /// Where the page's own step ends, exclusive: the end of the requested
+    /// window for the first page, and the start of the page before it after
+    /// that.
     pub end: f64,
-    /// The boundary of the next page — the slice before this one — while the
-    /// requested window reaches into one, and `None` for the earliest slice of
-    /// the window, after which the query has nothing left to serve.
-    pub earlier: Option<i64>,
+    /// The index of the next page — the step before this one — while the
+    /// requested window reaches into one, and `None` for the step that reaches
+    /// the start of the window, after which the query has nothing left to serve.
+    pub earlier: Option<usize>,
 }
 
-/// The hour boundary at or before `seconds`: the top of the hour `seconds` falls
-/// in.
+/// The instant `steps` steps back from `end`.
 ///
-/// Every arithmetic step of this module is saturating or checked, because both
-/// bounds of a window are the caller's: a window naming an instant at the far
-/// edge of the range the modelled timestamp holds answers rather than ending the
-/// request, which is the same belt [`super::timestamp_of`] puts on a stored
-/// instant.
-#[must_use]
-pub fn hour_boundary_at_or_before(seconds: f64) -> i64 {
+/// Both the start and the end of every page are read from this one expression,
+/// so the instant one page ends at is bit-for-bit the instant the page before it
+/// starts at: a trace sitting exactly on a step boundary is served by exactly one
+/// page of the query.
+///
+/// Every arithmetic step of this module is taken on instants converted from a
+/// modelled timestamp, which this service bounds
+/// ([`super::MAX_SEGMENT_EPOCH_SECONDS`]), so a window naming an instant at the
+/// far edge of that range answers rather than ending the request.
+fn step_back(end: f64, steps: usize) -> f64 {
     #[allow(clippy::cast_precision_loss)]
-    let hour = TRACE_PAGE_SECONDS as f64;
-    // A float-to-integer cast saturates, and the quotient of a finite instant by
-    // an hour is far inside `i64`; a non-finite one cannot reach here, because
-    // every instant a window carries is converted from a modelled timestamp.
-    #[allow(clippy::cast_possible_truncation)]
-    let whole = (seconds / hour).floor() as i64;
-    whole.saturating_mul(TRACE_PAGE_SECONDS)
+    let seconds = TRACE_PAGE_SECONDS as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let steps = steps as f64;
+    end - seconds * steps
 }
 
-/// The hour boundaries the window `[start, end)` is paged by, MOST RECENT FIRST
-/// — the order the pages are served in.
+/// How many pages the window `[start, end)` is served in: one per step of the
+/// window, with the last step clipped to the start of the window.
 ///
-/// Empty for a window that names no interval (an `EndTime` at or before the
-/// `StartTime`): there is no slice to serve, which the caller answers as the one
+/// Zero for a window that names no interval (an `EndTime` at or before the
+/// `StartTime`): there is no step to serve, which the caller answers as the one
 /// empty page such a window has.
 #[must_use]
-pub fn window_page_boundaries(start: f64, end: f64) -> Vec<i64> {
-    if end <= start {
-        return Vec::new();
+pub fn window_page_count(start: f64, end: f64) -> usize {
+    // A window that names no interval — and one naming an instant that is no
+    // instant at all, which compares with nothing — has no step to serve.
+    if end <= start || end.is_nan() || start.is_nan() {
+        return 0;
     }
-    let first = hour_boundary_at_or_before(start);
-    let mut last = hour_boundary_at_or_before(end);
-    #[allow(clippy::cast_precision_loss)]
-    if last as f64 >= end {
-        // `end` is exclusive, so a window ending exactly on the hour ends where
-        // that hour's slice begins: the slice itself is not part of the window.
-        last = last.saturating_sub(TRACE_PAGE_SECONDS);
-    }
-    let mut boundaries = Vec::new();
-    let mut at = last;
-    while at >= first && boundaries.len() < MAX_WINDOW_PAGES {
-        boundaries.push(at);
-        // The step down the grid is CHECKED, because both bounds are
-        // request-derived and the conversion above saturates: a window naming an
-        // instant at the far negative end of the range would otherwise step past
-        // what the type holds. A step that cannot be taken ends the walk, which
-        // is the same answer as reaching the window's first slice.
-        let Some(earlier) = at.checked_sub(TRACE_PAGE_SECONDS) else {
-            break;
-        };
-        at = earlier;
-    }
-    boundaries
+    // The smallest number of steps that reaches back to the start of the
+    // window. Walked rather than divided, so the count cannot disagree with the
+    // boundaries [`step_back`] produces and a sliver of the window be left on
+    // no page at all.
+    (1..MAX_WINDOW_PAGES)
+        .find(|steps| step_back(end, *steps) <= start)
+        .unwrap_or(MAX_WINDOW_PAGES)
 }
 
-/// The page of the window `[start, end)` cut on `boundary`.
+/// The `index`th page of the window `[start, end)`, or `None` when the window is
+/// served in fewer pages than that — which is what a token naming a page of some
+/// other window looks like here.
 ///
-/// The slice is clipped to the requested window at both ends, so a page never
+/// The step is clipped to the requested window at its start, so a page never
 /// reports an instant outside the range the caller asked about and never selects
 /// a trace the window excludes.
 #[must_use]
-pub fn window_page(start: f64, end: f64, boundary: i64) -> WindowPage {
-    #[allow(clippy::cast_precision_loss)]
-    let opens = boundary as f64;
-    #[allow(clippy::cast_precision_loss)]
-    let closes = boundary.saturating_add(TRACE_PAGE_SECONDS) as f64;
-    WindowPage {
-        boundary,
-        start: start.max(opens),
-        end: end.min(closes),
-        earlier: (boundary > hour_boundary_at_or_before(start))
-            .then(|| boundary.checked_sub(TRACE_PAGE_SECONDS))
-            .flatten(),
+pub fn window_page(start: f64, end: f64, index: usize) -> Option<WindowPage> {
+    let pages = window_page_count(start, end);
+    if index >= pages {
+        return None;
     }
+    Some(WindowPage {
+        index,
+        start: step_back(end, index + 1).max(start),
+        end: step_back(end, index),
+        earlier: (index + 1 < pages).then_some(index + 1),
+    })
 }
 
-/// The token that resumes a query at `boundary`, at `trace` when that slice
-/// still holds summaries past the page just served.
+/// The token that resumes a query at the page `index`, at `trace` when that
+/// page's step still holds summaries past the page just served.
 #[must_use]
-pub fn page_token(boundary: i64, trace: Option<&str>) -> String {
+pub fn page_token(index: usize, trace: Option<&str>) -> String {
     match trace {
-        Some(trace) => format!("{boundary}{TOKEN_SEPARATOR}{trace}"),
-        None => boundary.to_string(),
+        Some(trace) => format!("{index}{TOKEN_SEPARATOR}{trace}"),
+        None => index.to_string(),
     }
 }
 
-/// The slice and the trace a token issued by [`page_token`] names, or `None` for
+/// The page and the trace a token issued by [`page_token`] names, or `None` for
 /// a value no page of any window ever handed out — which the caller refuses as
 /// the uninterpretable token it is
 /// ([`super::invalid_next_token_message`]).
 ///
-/// A boundary off the hour grid is rejected here: no page is cut anywhere else,
-/// so such a value is not a cursor this read issued, however numeric it looks.
-/// So is one outside the instants this service can convert to the modelled
-/// timestamp at all ([`super::MAX_SEGMENT_EPOCH_SECONDS`]), which no page of any
-/// window could have reported.
+/// Whether the page it names is one the REQUESTED window has is the caller's
+/// check ([`window_page`]): a token is a cursor into the query that issued it, so
+/// one naming a page beyond the window now being asked about did not come from
+/// it, however well formed it looks.
 #[must_use]
-pub fn parse_page_token(token: &str) -> Option<(i64, Option<&str>)> {
-    let (boundary, trace) = match token.split_once(TOKEN_SEPARATOR) {
+pub fn parse_page_token(token: &str) -> Option<(usize, Option<&str>)> {
+    let (index, trace) = match token.split_once(TOKEN_SEPARATOR) {
         Some((_, "")) => return None,
-        Some((boundary, trace)) => (boundary, Some(trace)),
+        Some((index, trace)) => (index, Some(trace)),
         None => (token, None),
     };
-    let boundary: i64 = boundary.parse().ok()?;
-    #[allow(clippy::cast_possible_truncation)]
-    let reach = super::MAX_SEGMENT_EPOCH_SECONDS as i64;
-    let on_the_grid = boundary % TRACE_PAGE_SECONDS == 0;
-    (on_the_grid && (-reach..=reach).contains(&boundary)).then_some((boundary, trace))
+    let index: usize = index.parse().ok()?;
+    (index < MAX_WINDOW_PAGES).then_some((index, trace))
 }

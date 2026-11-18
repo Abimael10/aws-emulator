@@ -631,9 +631,9 @@ async fn an_unreadable_document_is_reported_and_the_rest_of_the_batch_still_land
             "case {label:?}: the well-formed document in the same batch must still be stored, got {traces:?}"
         );
         // A window inside the widest one this read serves, holding the stored
-        // document's own instant. The window spans several of the hour-long
-        // slices a query pages by, so the whole of it is read by following the
-        // tokens the query issues.
+        // document's own instant. The window is longer than one of the steps a
+        // query pages by, so the whole of it is read by following the tokens
+        // the query issues.
         let summaries = xray.paged_summaries(0.0, 86_400.0, None).await;
         assert_eq!(
             summaries.len(),
@@ -677,18 +677,22 @@ async fn the_time_window_is_half_open_and_selects_on_the_stored_start_time() {
     ];
 
     for (label, start, end, expected_rows) in rows {
-        // A window wider than one of the hour-long slices a query pages by is
-        // served over several pages, so what the WINDOW selects is read by
-        // following the tokens the query issues.
+        // A window longer than one of the steps a query pages by is served over
+        // several pages, so what the WINDOW selects is read by following the
+        // tokens the query issues. The pages come newest step first, so the ids
+        // are compared as the SET the window selects: which page each lands on
+        // is the paging rule's business, not this one's.
         let selected = xray.paged_summaries(start, end, None).await;
-        let ids: Vec<&str> = selected
+        let mut ids: Vec<&str> = selected
             .iter()
             .filter_map(|summary| summary.get("Id").and_then(Value::as_str))
             .collect();
-        let expected: Vec<&str> = expected_rows
+        ids.sort_unstable();
+        let mut expected: Vec<&str> = expected_rows
             .iter()
             .map(|row| at[*row].0.as_str())
             .collect();
+        expected.sort_unstable();
         assert_eq!(
             ids, expected,
             "case {label:?}: window [{start}, {end}) must select {expected:?}, got {ids:?}"

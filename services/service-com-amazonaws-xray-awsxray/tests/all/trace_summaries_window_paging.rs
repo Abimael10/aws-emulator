@@ -4,33 +4,32 @@
 //! the wire (the `Xray` harness in [`super::xray_wire`]).
 //!
 //! One rule, asserted over tables that span what it generalises over rather than
-//! over one request: the pages of one query are hour-long slices of
-//! `[StartTime, EndTime)` walked from the end of the window backwards, so
+//! over one request: the pages of one query are steps of `[StartTime, EndTime)`
+//! measured back from the window's OWN `EndTime` — never cut on the absolute
+//! epoch-hour grid — so
 //!
+//! * a window no longer than one step ([`TRACE_PAGE_SECONDS`]) is answered in
+//!   ONE page carrying every trace it holds, wherever its bounds fall relative
+//!   to the top of an hour, and that page carries no `NextToken`;
 //! * `ApproximateTime` ("the start time of this page of results") is the start of
-//!   the slice the page served — the top of the hour that begins it when that
-//!   boundary is inside the requested window, and the window's own start for the
-//!   slice the window starts inside — reported as whole seconds and always inside
-//!   the window asked about;
+//!   the step the page served — one step before that page ends, and the requested
+//!   `StartTime` for the page that reaches it — so it always lies inside the
+//!   window asked about;
 //! * a `NextToken` is due while the query has anything left to serve: the rest of
-//!   a slice holding more summaries than one page carries, or the slice before
-//!   this one while the window reaches into it — whether or not the slice just
-//!   served held anything;
-//! * resuming from that token serves the next slice, so following the tokens
-//!   walks the whole window exactly once, newest slice first — which is how a
-//!   reader learns what a WINDOW holds, because the slices are cut on the hour
-//!   grid rather than on the window's own bounds, so a window of a few minutes
-//!   that straddles a boundary answers an empty first page and reports its
-//!   traces on the next one;
-//! * a token naming a slice the requested window is not paged by, or no slice at
+//!   a step holding more summaries than one page carries, or the step before this
+//!   one while the window reaches into it;
+//! * resuming from that token serves the next step, so following the tokens walks
+//!   the whole window exactly once, newest step first;
+//! * a token naming a page the requested window is not served in, or no page at
 //!   all, is refused with the service's one wording for an uninterpretable
 //!   pagination token.
 //!
 //! The rows differ along what the rule generalises over: the WIDTH of the window
-//! (nothing, part of an hour, an hour, several hours, the widest window the read
-//! serves), where its bounds fall relative to the hour GRID (on the hour, inside
-//! one hour, spanning a boundary), how many traces a slice holds (none, some, more
-//! than one page), and which slice of the window a trace falls in.
+//! (nothing, a second, part of an hour, an hour, several hours, the widest window
+//! the read serves), where its bounds fall relative to the absolute hour GRID (on
+//! the hour, inside one hour, straddling a boundary), how many traces a step holds
+//! (none, some, more than one page), and which step of the window a trace falls
+//! in.
 
 use serde_json::{json, Value};
 
@@ -39,15 +38,16 @@ use service_com_amazonaws_xray_awsxray::state::TRACE_PAGE_SECONDS;
 
 use super::xray_wire::{reported, reported_trace_ids, root_document, trace_id, Answer, Xray};
 
-/// One hour in the epoch seconds every instant on this wire travels as — the
-/// length of one page of a query's window, read from the service's own statement
-/// of it so the test cannot drift from the implementation's grid.
+/// One step of a query's window in the epoch seconds every instant on this wire
+/// travels as, read from the service's own statement of it so the test cannot
+/// drift from the implementation.
 #[allow(clippy::cast_precision_loss)]
 const HOUR: f64 = TRACE_PAGE_SECONDS as f64;
 
-/// An instant well in the past that falls exactly on the hour grid
-/// (1_700_002_800 = 472_223 * 3600), so a case can place a bound on a boundary or
-/// deliberately off it. Far enough behind the clock that no window below reaches
+/// An instant well in the past that falls exactly on the absolute hour grid
+/// (1_700_002_800 = 472_223 * 3600), so a case can place a window's bounds on a
+/// boundary of that grid or deliberately off it — which is what shows the pages
+/// no longer follow it. Far enough behind the clock that no window below reaches
 /// the skew allowance the window check applies.
 const ALIGNED: f64 = 1_700_002_800.0;
 
@@ -66,8 +66,9 @@ fn next_token(answer: &Answer) -> Option<String> {
     answer.get("NextToken").as_str().map(str::to_string)
 }
 
-/// Store `count` traces, the `index`th of them starting `offsets[index]` seconds
-/// from [`ALIGNED`], and answer their ids in the order the ids sort.
+/// Store one trace per entry of `offsets`, the `index`th of them starting
+/// `offsets[index]` seconds from [`ALIGNED`], and answer their ids in the order
+/// the ids sort.
 async fn seed(xray: &Xray, offsets: &[f64]) -> Vec<String> {
     let mut stored = Vec::new();
     for (index, offset) in offsets.iter().enumerate() {
@@ -93,20 +94,21 @@ async fn seed(xray: &Xray, offsets: &[f64]) -> Vec<String> {
 }
 
 // =============================================================================
-// 1. The first page reports the start of the slice the window ends in, and a
-//    token while an earlier slice of the window remains
+// 1. The first page reports the start of the window's last step, and a token
+//    only while an earlier step of the window remains
 // =============================================================================
 
 /// One window, and what the rule says the first page of a query over it reports:
-/// the start of the slice the window ends in, and whether a token is due.
+/// the start of the step the window ends in, and whether a token is due.
 struct WindowCase {
     label: &'static str,
     start: f64,
     end: f64,
-    /// `ApproximateTime` the rule requires: the start of the page's own slice.
+    /// `ApproximateTime` the rule requires: the start of the page's own step,
+    /// which is the requested `StartTime` for a window no longer than one step.
     page_start: f64,
-    /// Whether the window reaches into a slice before the one it ends in.
-    earlier_slice: bool,
+    /// Whether the window reaches into a step before the one it ends in.
+    earlier_step: bool,
 }
 
 fn window_cases() -> Vec<WindowCase> {
@@ -116,69 +118,83 @@ fn window_cases() -> Vec<WindowCase> {
             start: ALIGNED,
             end: ALIGNED,
             page_start: ALIGNED,
-            earlier_slice: false,
+            earlier_step: false,
+        },
+        WindowCase {
+            label: "a window one second wide, ending on the hour",
+            start: ALIGNED - 1.0,
+            end: ALIGNED,
+            page_start: ALIGNED - 1.0,
+            earlier_step: false,
         },
         WindowCase {
             label: "part of an hour, starting on the hour",
             start: ALIGNED,
             end: ALIGNED + 42.0 * 60.0,
             page_start: ALIGNED,
-            earlier_slice: false,
+            earlier_step: false,
         },
         WindowCase {
             label: "part of an hour, starting inside it",
             start: ALIGNED + 600.0,
             end: ALIGNED + 1_200.0,
             page_start: ALIGNED + 600.0,
-            earlier_slice: false,
+            earlier_step: false,
         },
         WindowCase {
-            label: "a window spanning one hour boundary",
+            label: "minutes wide, straddling the top of an hour",
             start: ALIGNED + HOUR - 600.0,
             end: ALIGNED + HOUR + 600.0,
-            page_start: ALIGNED + HOUR,
-            earlier_slice: true,
+            page_start: ALIGNED + HOUR - 600.0,
+            earlier_step: false,
         },
         WindowCase {
-            label: "exactly one hour, on the grid",
+            label: "exactly one step, on the grid",
             start: ALIGNED,
             end: ALIGNED + HOUR,
             page_start: ALIGNED,
-            earlier_slice: false,
+            earlier_step: false,
         },
         WindowCase {
-            label: "exactly one hour, off the grid",
+            label: "exactly one step, off the grid",
             start: ALIGNED + 600.0,
             end: ALIGNED + HOUR + 600.0,
-            page_start: ALIGNED + HOUR,
-            earlier_slice: true,
+            page_start: ALIGNED + 600.0,
+            earlier_step: false,
         },
         WindowCase {
-            label: "a window ending a second into the next slice",
+            label: "one second longer than a step",
             start: ALIGNED,
             end: ALIGNED + HOUR + 1.0,
-            page_start: ALIGNED + HOUR,
-            earlier_slice: true,
+            page_start: ALIGNED + 1.0,
+            earlier_step: true,
         },
         WindowCase {
-            label: "several hours, on the grid",
+            label: "several steps, on the grid",
             start: ALIGNED,
             end: ALIGNED + 6.0 * HOUR,
             page_start: ALIGNED + 5.0 * HOUR,
-            earlier_slice: true,
+            earlier_step: true,
+        },
+        WindowCase {
+            label: "several steps, off the grid",
+            start: ALIGNED + 600.0,
+            end: ALIGNED + 3.0 * HOUR + 600.0,
+            page_start: ALIGNED + 2.0 * HOUR + 600.0,
+            earlier_step: true,
         },
         WindowCase {
             label: "the widest window this read serves",
             start: ALIGNED,
             end: ALIGNED + 24.0 * HOUR,
             page_start: ALIGNED + 23.0 * HOUR,
-            earlier_slice: true,
+            earlier_step: true,
         },
     ]
 }
 
 #[tokio::test]
-async fn the_first_page_reports_the_start_of_the_slice_the_window_ends_in() {
+async fn the_first_page_reports_the_start_of_the_windows_last_step() {
     for case in window_cases() {
         // A store holding nothing in any of these windows: what the envelope
         // reports is a property of the WINDOW, so an empty page states it as
@@ -193,9 +209,11 @@ async fn the_first_page_reports_the_start_of_the_slice_the_window_ends_in() {
         let at = approximate_time(&answered);
         assert!(
             at.is_some_and(|at| (at - case.page_start).abs() < 1e-6),
-            "case {label:?}: expected ApproximateTime {} (the page's own slice start), got {at:?}",
+            "case {label:?}: expected ApproximateTime {} (the page's own step start), got {at:?}",
             case.page_start
         );
+        // Every bound in this table is a whole second, so the instant derived
+        // from it is one too.
         assert!(
             at.is_some_and(|at| at.fract() == 0.0),
             "case {label:?}: ApproximateTime is whole seconds, got {at:?}"
@@ -208,64 +226,65 @@ async fn the_first_page_reports_the_start_of_the_slice_the_window_ends_in() {
         );
         assert_eq!(
             next_token(&answered).is_some(),
-            case.earlier_slice,
-            "case {label:?}: a token is due only while an earlier slice of the window remains, \
+            case.earlier_step,
+            "case {label:?}: a token is due only while an earlier step of the window remains, \
              got {answered:?}"
         );
     }
 }
 
 // =============================================================================
-// 2. Following the tokens walks the window newest slice first, exactly once
+// 2. Following the tokens walks the window one step at a time, newest first
 // =============================================================================
 
 #[tokio::test]
-async fn the_pages_walk_the_window_one_slice_at_a_time_newest_first() {
+async fn the_pages_walk_the_window_one_step_at_a_time_newest_first() {
     let xray = Xray::new();
-    // One trace in each of the three slices of the window, plus one the window
-    // excludes: the slices are cut on the hour grid, so which page a trace
-    // appears on follows from its own start time.
+    // A window whose bounds sit OFF the absolute hour grid, with one trace in
+    // each of its three steps and one the window excludes: which page a trace
+    // appears on follows from the window's own end, so the steps here are
+    // half-hour offsets from the grid.
     let stored = seed(
         &xray,
         &[
-            10.0,
-            HOUR + 10.0,
-            2.0 * HOUR + 10.0,
-            3.0 * HOUR + 10.0,
+            1_810.0,
+            HOUR + 1_810.0,
+            2.0 * HOUR + 1_810.0,
+            3.0 * HOUR + 1_810.0,
         ],
     )
     .await;
-    let (start, end) = (ALIGNED, ALIGNED + 3.0 * HOUR);
+    let (start, end) = (ALIGNED + 1_800.0, ALIGNED + 1_800.0 + 3.0 * HOUR);
 
-    // The pages, newest slice first: each slice's own start, and the trace that
-    // slice holds.
+    // The pages, newest step first: each step's own start, and the trace that
+    // step holds.
     let expected: Vec<(f64, Vec<String>)> = vec![
-        (ALIGNED + 2.0 * HOUR, vec![stored[2].clone()]),
-        (ALIGNED + HOUR, vec![stored[1].clone()]),
-        (ALIGNED, vec![stored[0].clone()]),
+        (end - HOUR, vec![stored[2].clone()]),
+        (end - 2.0 * HOUR, vec![stored[1].clone()]),
+        (end - 3.0 * HOUR, vec![stored[0].clone()]),
     ];
 
     let mut token: Option<String> = None;
     let mut seen: Vec<String> = Vec::new();
-    for (page, (slice_start, holds)) in expected.iter().enumerate() {
+    for (page, (step_start, holds)) in expected.iter().enumerate() {
         let answered = xray.summaries(start, end, token.as_deref()).await;
         assert_eq!(
             answered.status, 200,
-            "page {page}: the slice must be served, got {answered:?}"
+            "page {page}: the step must be served, got {answered:?}"
         );
         assert!(
-            approximate_time(&answered).is_some_and(|at| (at - slice_start).abs() < 1e-6),
-            "page {page}: expected ApproximateTime {slice_start} (that slice's start), got \
+            approximate_time(&answered).is_some_and(|at| (at - step_start).abs() < 1e-6),
+            "page {page}: expected ApproximateTime {step_start} (that step's start), got \
              {answered:?}"
         );
         assert_eq!(
             &reported(&answered),
             holds,
-            "page {page}: the slice [{slice_start}, {}) holds {holds:?}, got {answered:?}",
-            slice_start + HOUR
+            "page {page}: the step [{step_start}, {}) holds {holds:?}, got {answered:?}",
+            step_start + HOUR
         );
         // The count is of the traces the WINDOW holds, so it is the same on
-        // every page of the one query — never of the slice just served.
+        // every page of the one query — never of the step just served.
         assert_eq!(
             answered.get("TracesProcessedCount").as_i64(),
             Some(3),
@@ -276,27 +295,27 @@ async fn the_pages_walk_the_window_one_slice_at_a_time_newest_first() {
         assert_eq!(
             token.is_some(),
             page + 1 < expected.len(),
-            "page {page}: a token is due only while an earlier slice remains, got {token:?}"
+            "page {page}: a token is due only while an earlier step remains, got {token:?}"
         );
     }
     assert_eq!(
         seen,
         vec![stored[2].clone(), stored[1].clone(), stored[0].clone()],
-        "the walk must yield every trace of the window exactly once, newest slice first, got \
+        "the walk must yield every trace of the window exactly once, newest step first, got \
          {seen:?}"
     );
 }
 
 // =============================================================================
-// 3. A slice holding more than one page is served over several pages, each
-//    reporting that same slice's start
+// 3. A step holding more than one page is served over several pages, each
+//    reporting that same step's start
 // =============================================================================
 
 #[tokio::test]
-async fn a_slice_holding_more_than_one_page_is_served_over_several_pages() {
+async fn a_step_holding_more_than_one_page_is_served_over_several_pages() {
     let xray = Xray::new();
-    // Two traces more than a page carries, all inside the one slice the window
-    // covers, so the slice itself is what has to be paged.
+    // Two traces more than a page carries, all inside the one step the window
+    // covers, so the step itself is what has to be paged.
     let total = TRACE_SUMMARIES_PAGE_SIZE + 2;
     let offsets: Vec<f64> = (0..total)
         .map(|index| {
@@ -323,12 +342,12 @@ async fn a_slice_holding_more_than_one_page_is_served_over_several_pages() {
             "page {pages}: a page carries at most {TRACE_SUMMARIES_PAGE_SIZE} summaries, got \
              {ids:?}"
         );
-        // Every page of one slice reports that slice's own start: the instant
-        // reported says WHICH slice was served, not how far into it the page
+        // Every page of one step reports that step's own start: the instant
+        // reported says WHICH step was served, not how far into it the page
         // reached.
         assert!(
             approximate_time(&answered).is_some_and(|at| (at - ALIGNED).abs() < 1e-6),
-            "page {pages}: expected ApproximateTime {ALIGNED} (the slice's start), got \
+            "page {pages}: expected ApproximateTime {ALIGNED} (the step's start), got \
              {answered:?}"
         );
         seen.extend(ids);
@@ -336,7 +355,7 @@ async fn a_slice_holding_more_than_one_page_is_served_over_several_pages() {
         assert_eq!(
             token.is_some(),
             seen.len() < stored.len(),
-            "page {pages}: a token is due while the slice has summaries left, got {token:?} \
+            "page {pages}: a token is due while the step has summaries left, got {token:?} \
              after {} of {}",
             seen.len(),
             stored.len()
@@ -344,7 +363,7 @@ async fn a_slice_holding_more_than_one_page_is_served_over_several_pages() {
         pages += 1;
         assert!(
             pages <= total,
-            "paging one slice must terminate, stopped after {pages} pages"
+            "paging one step must terminate, stopped after {pages} pages"
         );
         if token.is_none() {
             break;
@@ -352,36 +371,40 @@ async fn a_slice_holding_more_than_one_page_is_served_over_several_pages() {
     }
     assert_eq!(
         seen, stored,
-        "paging one slice must yield every trace of it exactly once, got {seen:?}"
+        "paging one step must yield every trace of it exactly once, got {seen:?}"
     );
 }
 
 // =============================================================================
-// 4. A token that names no slice of the requested window is not a cursor of it
+// 4. A token that names no page of the requested window is not a cursor of it
 // =============================================================================
 
 #[tokio::test]
 async fn a_token_outside_the_requested_window_is_refused_with_the_one_wording() {
     let xray = Xray::new();
     let stored = seed(&xray, &[10.0, HOUR + 10.0]).await;
+    // Two steps long, so the query has pages 0 and 1 and nothing else.
     let (start, end) = (ALIGNED, ALIGNED + 2.0 * HOUR);
 
-    // Rows differ along HOW the token misses a slice of this window: a slice
-    // before the window, a slice after it, an instant off the hour grid, a
-    // boundary with nothing after the separator, and a slice of the window
-    // naming a trace past every stored one.
+    // Rows differ along HOW the token misses a page of this window: the page
+    // after the last one the window has, a page far past it, a page past the
+    // most any window is served in, a value that is no page index at all
+    // (negative, fractional, textual, an instant of the kind an internal
+    // boundary once was), a page index with nothing after the separator, and a
+    // page of this window naming a trace past every stored one.
     let rows: Vec<(&str, String)> = vec![
-        ("a slice before the requested window", format!("{:.0}", ALIGNED - HOUR)),
+        ("the page after the window's last", "2".to_string()),
+        ("a page far past the window's last", "7".to_string()),
         (
-            "a slice after the requested window",
-            format!("{:.0}", ALIGNED + 2.0 * HOUR),
+            "a page past the most any window is served in",
+            "24".to_string(),
         ),
-        ("an instant off the hour grid", format!("{:.0}", ALIGNED + 60.0)),
-        ("a boundary with no trace after it", format!("{ALIGNED:.0}:")),
-        (
-            "a trace past every stored one",
-            format!("{ALIGNED:.0}:{}", trace_id(99)),
-        ),
+        ("a negative page index", "-1".to_string()),
+        ("a fractional page index", "0.5".to_string()),
+        ("no page index at all", "not-a-token".to_string()),
+        ("an epoch instant rather than a page", format!("{ALIGNED:.0}")),
+        ("a page index with no trace after it", "0:".to_string()),
+        ("a trace past every stored one", format!("0:{}", trace_id(99))),
     ];
 
     for (label, token) in rows {
@@ -402,16 +425,16 @@ async fn a_token_outside_the_requested_window_is_refused_with_the_one_wording() 
         );
     }
 
-    // And the token this query DID issue resumes it: the slice before the one
-    // the window ends in, holding the trace that slice holds.
+    // And the token this query DID issue resumes it: the step before the one
+    // the window ends in, holding the trace that step holds.
     let first = xray.summaries(start, end, None).await;
     let issued = next_token(&first)
-        .unwrap_or_else(|| panic!("a two-slice window must issue a token, got {first:?}"));
+        .unwrap_or_else(|| panic!("a two-step window must issue a token, got {first:?}"));
     let resumed = xray.summaries(start, end, Some(&issued)).await;
     assert_eq!(
         (resumed.status, reported(&resumed)),
         (200, vec![stored[0].clone()]),
-        "the issued token must serve the earlier slice, got {resumed:?}"
+        "the issued token must serve the earlier step, got {resumed:?}"
     );
 }
 
@@ -447,7 +470,7 @@ async fn a_window_at_the_edge_of_the_timestamp_range_is_answered() {
             json!(-1e300_f64),
         ),
         (
-            "a window reaching back from the hour grid's origin",
+            "a window reaching back from the epoch",
             json!(-3_600.0_f64),
             json!(0.0_f64),
         ),
@@ -473,16 +496,16 @@ async fn a_window_at_the_edge_of_the_timestamp_range_is_answered() {
     }
 }
 
-
 // =============================================================================
-// 6. A window reports every trace it holds, wherever its bounds fall on the
-//    grid — which is what following the tokens is for
+// 6. A window reports every trace it holds, wherever its bounds fall relative
+//    to the absolute hour grid — and a window no longer than one step reports
+//    them all on its FIRST page
 // =============================================================================
 
-/// One window over the store [`grid_cases`] seeds, and what the rule says a
-/// reader of it sees: the trace ids the WHOLE query reports (newest slice
-/// first), and the ids its FIRST page carries — which differ exactly when the
-/// window straddles a boundary and holds something before it.
+/// One window over the store [`GRID_OFFSETS`] seeds, and what the rule says a
+/// reader of it sees: the trace ids the WHOLE query reports (newest step first),
+/// and the ids its FIRST page carries — which differ only when the window is
+/// longer than one step.
 struct GridCase {
     label: &'static str,
     start: f64,
@@ -491,32 +514,32 @@ struct GridCase {
     first_page: Vec<String>,
 }
 
-/// The windows the rule is asserted over, against a store holding one trace in
-/// each of three adjacent slices: `stored` is the ids of the traces seeded at
-/// [`GRID_OFFSETS`], in that order.
+/// The windows the rule is asserted over, against a store holding one trace just
+/// before an absolute hour boundary, one just after it, and one an hour later:
+/// `stored` is the ids of the traces seeded at [`GRID_OFFSETS`], in that order.
 fn grid_cases(stored: &[String]) -> Vec<GridCase> {
     let (before, inside, later) = (stored[0].clone(), stored[1].clone(), stored[2].clone());
     vec![
         GridCase {
-            label: "a window wholly inside one slice",
+            label: "a window wholly inside one absolute hour",
             start: ALIGNED,
             end: ALIGNED + 60.0,
             whole: vec![inside.clone()],
             first_page: vec![inside.clone()],
         },
         GridCase {
-            label: "a window straddling a boundary, its trace before it",
+            label: "a minutes-wide window straddling a boundary, its trace before it",
             start: ALIGNED - 60.0,
             end: ALIGNED + 1.0,
             whole: vec![before.clone()],
-            first_page: Vec::new(),
+            first_page: vec![before.clone()],
         },
         GridCase {
-            label: "a window straddling a boundary, with a trace each side",
+            label: "a minutes-wide window straddling a boundary, a trace each side",
             start: ALIGNED - 60.0,
             end: ALIGNED + 60.0,
-            whole: vec![inside.clone(), before.clone()],
-            first_page: vec![inside.clone()],
+            whole: vec![before.clone(), inside.clone()],
+            first_page: vec![before.clone(), inside.clone()],
         },
         GridCase {
             label: "a window ending exactly on a boundary",
@@ -526,7 +549,14 @@ fn grid_cases(stored: &[String]) -> Vec<GridCase> {
             first_page: vec![before.clone()],
         },
         GridCase {
-            label: "a window spanning three slices",
+            label: "two steps, cut off the grid",
+            start: ALIGNED + 30.0,
+            end: ALIGNED + HOUR + 31.0,
+            whole: vec![later.clone(), inside.clone()],
+            first_page: vec![later.clone()],
+        },
+        GridCase {
+            label: "a window spanning three steps",
             start: ALIGNED - HOUR,
             end: ALIGNED + 2.0 * HOUR,
             whole: vec![later.clone(), inside, before],
@@ -543,8 +573,8 @@ fn grid_cases(stored: &[String]) -> Vec<GridCase> {
 }
 
 /// Where the three traces the grid cases are read over start, relative to
-/// [`ALIGNED`]: one in the slice before that boundary, one just after it, and
-/// one a slice later.
+/// [`ALIGNED`]: one in the absolute hour before that boundary, one just after it,
+/// and one an hour later.
 const GRID_OFFSETS: [f64; 3] = [-30.0, 30.0, HOUR + 30.0];
 
 #[tokio::test]
@@ -557,8 +587,7 @@ async fn a_window_reports_every_trace_it_holds_wherever_its_bounds_fall_on_the_g
         let body = json!({"StartTime": case.start, "EndTime": case.end});
 
         // Following the tokens reports every trace the window holds, exactly
-        // once, newest slice first — whatever the window's position on the hour
-        // grid.
+        // once, newest step first.
         let pages = xray.trace_summary_pages(&body).await;
         assert_eq!(
             reported_trace_ids(&pages),
@@ -570,21 +599,20 @@ async fn a_window_reports_every_trace_it_holds_wherever_its_bounds_fall_on_the_g
             reported_trace_ids(&pages)
         );
 
-        // And what the FIRST page of that same walk carries is the slice the
-        // window ends in — so a window that straddles a boundary and holds its
-        // traces before it answers an empty first page, with a token for the
-        // slice that holds them.
+        // And what the FIRST page of that same walk carries is the step the
+        // window ends in — which for a window no longer than one step is the
+        // whole window, so a client that never paginates still reads it all.
         let first = pages
             .first()
             .expect("every window is answered by at least one page");
         assert_eq!(
             reported(first),
             case.first_page,
-            "case {label:?}: the first page carries the slice the window ends in, got {first:?}"
+            "case {label:?}: the first page carries the step the window ends in, got {first:?}"
         );
 
         // The count is of the WINDOW, so every page of the one query reports
-        // the same one however the window is sliced.
+        // the same one however many steps the window is served in.
         let held = i64::try_from(case.whole.len()).expect("the case is small");
         for (page, answered) in pages.iter().enumerate() {
             assert_eq!(
@@ -598,14 +626,14 @@ async fn a_window_reports_every_trace_it_holds_wherever_its_bounds_fall_on_the_g
 }
 
 #[tokio::test]
-async fn a_window_positioned_by_the_clock_reports_its_trace_across_its_pages() {
+async fn a_just_accepted_trace_is_on_the_first_page_of_a_minutes_wide_window() {
     let xray = Xray::new();
-    // The one range type whose instant is the clock's: `Event` windows on when
-    // this service last accepted a segment for the trace, so a window drawn
-    // around NOW is the shape a dashboard asks for — and where that window sits
-    // on the hour grid is not the client's to choose. This one is built to
-    // straddle the boundary the current hour began on, so the walk is the only
-    // way to read the whole of it.
+    // The read-after-write shape: submit a segment, then ask for the few
+    // minutes around it. The one range type whose instant is the clock's is
+    // `Event` — it windows on when this service last accepted a segment for the
+    // trace — so this window is positioned by the clock rather than by the
+    // caller, and where it happens to sit relative to the top of an hour must
+    // not decide what it answers.
     let id = trace_id(31);
     // The instant the segment is ACCEPTED is the clock's, so it is bracketed
     // around the call: the trace's update time lies between these two readings
@@ -618,52 +646,54 @@ async fn a_window_positioned_by_the_clock_reports_its_trace_across_its_pages() {
     assert_eq!(put.status, 200, "seeding the trace must succeed, got {put:?}");
     let accepted_to = service_com_amazonaws_xray_awsxray::state::now_epoch_seconds();
 
-    // The window reaches back over the boundary the hour the trace was accepted
-    // in began on, so it always straddles one — and it holds every instant the
-    // trace could have been accepted at, so what it selects is not the clock's
-    // to decide.
-    #[allow(clippy::cast_precision_loss)]
-    let boundary =
-        service_com_amazonaws_xray_awsxray::state::hour_boundary_at_or_before(accepted_to) as f64;
+    // Five minutes back from now: shorter than one step, holding every instant
+    // the trace could have been accepted at — and, run at some point in any
+    // hour, a window that straddles the top of one about one time in twelve.
+    let start = accepted_from - 300.0;
+    let end = accepted_to + 1.0;
     let body = json!({
-        "StartTime": boundary.min(accepted_from) - 60.0,
-        "EndTime": accepted_to + 1.0,
+        "StartTime": start,
+        "EndTime": end,
         "TimeRangeType": "Event",
     });
 
-    let pages = xray.trace_summary_pages(&body).await;
-    assert!(
-        pages.len() >= 2,
-        "a window reaching back over the hour boundary is cut into at least two slices, got {} \
-         page(s) for {body}",
-        pages.len()
+    let answered = xray.call("/TraceSummaries", &body).await;
+    assert_eq!(
+        answered.status, 200,
+        "the window around the accepted trace must be answered, got {answered:?}"
     );
     assert_eq!(
-        reported_trace_ids(&pages),
+        reported(&answered),
         vec![id.clone()],
-        "the window around the instant the trace was accepted must report it exactly once, got \
-         {:?}",
-        reported_trace_ids(&pages)
+        "a window shorter than one step must report the trace it holds on its first page, got \
+         {answered:?}"
     );
-    for (page, answered) in pages.iter().enumerate() {
-        assert_eq!(
-            answered.get("TracesProcessedCount").as_i64(),
-            Some(1),
-            "page {page}: the window holds the one accepted trace, got {answered:?}"
-        );
-    }
+    assert_eq!(
+        answered.get("TracesProcessedCount").as_i64(),
+        Some(1),
+        "the window holds the one accepted trace, got {answered:?}"
+    );
+    assert!(
+        next_token(&answered).is_none(),
+        "the complete answer to a window shorter than one step carries no token, got \
+         {answered:?}"
+    );
+    assert!(
+        approximate_time(&answered).is_some_and(|at| (at - start).abs() < 1e-6),
+        "the only page of that window begins at the requested StartTime {start}, got {answered:?}"
+    );
 }
 
 // =============================================================================
-// 7. The window the slices are cut from is the one the request asks about,
+// 7. The window the steps are cut from is the one the request asks about,
 //    whichever instant of a trace the window is applied to
 // =============================================================================
 
 #[tokio::test]
-async fn the_slices_are_cut_on_the_instant_the_request_windows_on() {
+async fn the_steps_are_cut_on_the_instant_the_request_windows_on() {
     let xray = Xray::new();
-    // One trace that STARTS in the window's first slice and ENDS in its second,
-    // so the slice it falls in follows from the `TimeRangeType` the request
+    // One trace that STARTS in the window's earlier step and ENDS in its later
+    // one, so the step it falls in follows from the `TimeRangeType` the request
     // names rather than from the trace alone.
     let id = trace_id(7);
     let start_time = ALIGNED + HOUR - 10.0;
@@ -678,14 +708,14 @@ async fn the_slices_are_cut_on_the_instant_the_request_windows_on() {
     let put = xray.put_segments(&[document]).await;
     assert_eq!(put.status, 200, "seeding the trace must succeed, got {put:?}");
 
-    // Rows: the range type, and which slice of the window the trace then falls
+    // Rows: the range type, and which step of the window the trace then falls
     // in — the one holding its start time, or the one holding its segment end
     // time. (`Event` windows on the trace's UPDATE time, which is when this
     // service accepted the segment rather than an instant the document carries,
     // so it has no place in a table of windows in the past.)
     let rows: [(&str, f64); 2] = [("TraceId", ALIGNED), ("Service", ALIGNED + HOUR)];
 
-    for (range_type, slice_start) in rows {
+    for (range_type, step_start) in rows {
         let body = json!({
             "StartTime": ALIGNED,
             "EndTime": ALIGNED + 2.0 * HOUR,
@@ -696,8 +726,8 @@ async fn the_slices_are_cut_on_the_instant_the_request_windows_on() {
             first.status, 200,
             "case {range_type:?}: the window must be answered, got {first:?}"
         );
-        let newest_slice = ALIGNED + HOUR;
-        let on_first_page = (slice_start - newest_slice).abs() < 1e-6;
+        let newest_step = ALIGNED + HOUR;
+        let on_first_page = (step_start - newest_step).abs() < 1e-6;
         assert_eq!(
             reported(&first),
             if on_first_page {
@@ -705,13 +735,13 @@ async fn the_slices_are_cut_on_the_instant_the_request_windows_on() {
             } else {
                 Vec::new()
             },
-            "case {range_type:?}: the trace belongs to the slice at {slice_start}, got {first:?}"
+            "case {range_type:?}: the trace belongs to the step at {step_start}, got {first:?}"
         );
 
-        // And the page of the slice it does belong to reports it, whichever page
+        // And the page of the step it does belong to reports it, whichever page
         // that is.
         let mut token = next_token(&first);
-        let mut found_on: Option<f64> = on_first_page.then_some(newest_slice);
+        let mut found_on: Option<f64> = on_first_page.then_some(newest_step);
         while let Some(resume) = token {
             let page = xray
                 .call(
@@ -733,9 +763,9 @@ async fn the_slices_are_cut_on_the_instant_the_request_windows_on() {
             token = next_token(&page);
         }
         assert!(
-            found_on.is_some_and(|at| (at - slice_start).abs() < 1e-6),
-            "case {range_type:?}: the trace must be served on the page of the slice at \
-             {slice_start}, got {found_on:?}"
+            found_on.is_some_and(|at| (at - step_start).abs() < 1e-6),
+            "case {range_type:?}: the trace must be served on the page of the step at \
+             {step_start}, got {found_on:?}"
         );
     }
 }

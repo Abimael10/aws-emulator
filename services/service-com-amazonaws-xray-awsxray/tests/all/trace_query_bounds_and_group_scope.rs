@@ -518,8 +518,8 @@ async fn sampled_ids(xray: &Xray, window: (f64, f64), rate: f64) -> Vec<String> 
         );
     }
     // What the WINDOW reports, walked across every page the query serves it in:
-    // the pages are hour-grid slices of the window, so a window positioned by
-    // the clock can straddle a boundary and report its traces on a later page.
+    // the pages are steps of the window measured back from its end, so a window
+    // longer than one step reports its earlier traces on a later page.
     reported_trace_ids(&pages)
 }
 
@@ -721,10 +721,10 @@ async fn a_query_scoped_to_a_stored_group_is_narrowed_by_that_group() {
             "case {label:?}: the window holds both traces however the query is scoped, got \
              {answered:?}"
         );
-        // "The start time of this page of results": where this page's own slice
-        // of the requested window starts, which for a window inside one slice is
-        // the window's own start — not the selected trace's instant, and not the
-        // clock.
+        // "The start time of this page of results": where this page's own step
+        // of the requested window starts, which for a window no longer than one
+        // step is the window's own start — not the selected trace's instant, and
+        // not the clock.
         assert!(
             answered
                 .get("ApproximateTime")

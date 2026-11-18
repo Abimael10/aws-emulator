@@ -596,8 +596,8 @@ async fn the_time_range_type_chooses_the_instant_the_window_is_applied_to() {
         }
         // What the WINDOW selects, which is what a `TimeRangeType` decides —
         // walked across every page the query serves it in, because the pages of
-        // one query are hour-grid slices of its own window and which slice an
-        // instant falls in is not what this rule is about.
+        // one query are steps of its own window and which step an instant falls
+        // in is not what this rule is about.
         let pages = xray.trace_summary_pages(&body).await;
         let ids = reported_trace_ids(&pages);
         assert_eq!(

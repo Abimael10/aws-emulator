@@ -292,10 +292,10 @@ impl Xray {
     }
 
     /// Every `TraceSummary` the window `[start, end)` holds, walked across the
-    /// pages the query serves it in: a query's pages are SLICES of its own
-    /// window, so a reader that wants the whole window follows `NextToken`
-    /// until the service stops issuing one. `filter` is the optional filter
-    /// expression every page is queried with.
+    /// pages the query serves it in: a query's pages are STEPS of its own
+    /// window, so a reader that wants a window longer than one step follows
+    /// `NextToken` until the service stops issuing one. `filter` is the optional
+    /// filter expression every page is queried with.
     pub async fn paged_summaries(&self, start: f64, end: f64, filter: Option<&str>) -> Vec<Value> {
         let body = summaries_body(start, end, filter);
         let mut summaries: Vec<Value> = Vec::new();
@@ -308,11 +308,11 @@ impl Xray {
     /// Every page of the `GetTraceSummaries` query `query`, in the order the
     /// service serves them.
     ///
-    /// The pages of one query are SLICES of its own window walked from the end
-    /// of the window backwards, and which slice a trace falls in follows from
-    /// the hour grid rather than from the window's own bounds — so a reader
-    /// asking what a WINDOW holds follows `NextToken` until the service stops
-    /// issuing one, whatever the window's position on that grid. `query` is the
+    /// The pages of one query are STEPS of its own window measured back from
+    /// the window's own end, so which page a trace falls on follows from the
+    /// window the request asks about — a reader asking what a WINDOW holds
+    /// follows `NextToken` until the service stops issuing one, which for a
+    /// window no longer than one step is after the first page. `query` is the
     /// request body every page is asked with, carrying whatever else the query
     /// states (a `TimeRangeType`, a `SamplingStrategy`, a filter expression);
     /// the token is the only member this walk sets.
