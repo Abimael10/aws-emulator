@@ -3,10 +3,13 @@
 //! End-to-end tests for the ACME HTTP surface an ACM ACME endpoint publishes: the URL
 //! `AcmeEndpoint$EndpointUrl` advertises, and what answers at it.
 //!
-//! RULE 1: a server-managed URL this service hands a client is minted on the host the
-//! service PUBLISHES for that Region — for an ACME endpoint the ACME enrollment host,
-//! `acm-acme-enroll.<region>.<dns suffix>` — with the resource's own id in the PATH,
-//! never as a DNS label of a host form the service does not publish.
+//! RULE 1: a server-managed URL this service hands a client is minted on the address the
+//! service PUBLISHES to THAT caller, with the resource's own id in the PATH, never as a DNS
+//! label. Every caller in this suite addresses no host at all, which is the client that
+//! resolves AWS's own hostnames: it is told the Region's ACME enrollment host,
+//! `acm-acme-enroll.<region>.<dns suffix>`. What a caller that reached THIS emulator is
+//! published — an address of this emulator, which is the only thing such a client can dial
+//! — is [`crate::acme_endpoint_url_reaches_the_caller`].
 //!
 //! RULE 2: a URL this service advertises is a URL it SERVES. A plain `GET` of the
 //! `EndpointUrl` of an `ACTIVE` endpoint answers the RFC 8555 §7.1.1 directory

@@ -3,18 +3,19 @@
 //! Where the ACME surface of an ACM ACME endpoint is PUBLISHED, end to end over the wire.
 //!
 //! RULE: a server-managed URL this service hands a client names an address that client
-//! can reach, and the address this emulator SERVES that resource at. `AcmeEndpoint$EndpointUrl`
-//! is the single handle an ACME client (certbot, lego, acme.sh, the python `acme` library)
-//! is configured with — it fetches that URL verbatim and follows the resource map the body
-//! carries — so the URL is minted on the Region's ACME enrollment host, whose leading two
-//! labels are the enrollment label and the Region: in AWS's own DNS zone for a caller that
-//! resolves AWS's hostnames, and, for a caller that reached this emulator directly, in the
-//! zone a resolver answers with this machine's loopback interface and on the port this
-//! emulator serves that surface on (`state::acme_socket`, whose answers carry the field
-//! names RFC 8555 spells). The endpoint's own id and the resource are the whole path either
-//! way. Every URL the ACME surface then answers with — the resource map inside the
-//! directory, an account's own URL — is on the authority the client fetched it from, so the
-//! whole account lifecycle is reachable for a client that rewrites no host.
+//! can DIAL, and the address this emulator SERVES that resource at.
+//! `AcmeEndpoint$EndpointUrl` is the single handle an ACME client (certbot, lego, acme.sh,
+//! the python `acme` library) is configured with — it fetches that URL verbatim, resolves
+//! its authority and follows the resource map the body carries — so for a caller that
+//! reached this emulator the URL is minted on the `host:port` this emulator serves that
+//! surface at (`state::acme_socket`, whose answers carry the field names RFC 8555 spells),
+//! and for a caller that resolves AWS's own hostnames on the Region's ACME enrollment host
+//! in AWS's own DNS zone. A name of this service's own composing is published to nobody:
+//! nothing resolves a name this emulator invented. The endpoint's own id and the resource
+//! are the whole path either way. Every URL the ACME surface then answers with — the
+//! resource map inside the directory, an account's own URL — is on the authority the client
+//! fetched it from, so the whole account lifecycle is reachable for a client that rewrites
+//! no host.
 //!
 //! The tables span what the rule generalises over: the shape of the endpoint a caller
 //! reached (an IPv4 loopback address with and without a port, a loopback NAME, an IPv6
@@ -27,9 +28,14 @@
 //! Every URL fetched here is one a DIFFERENT operation (`DescribeAcmeEndpoint`,
 //! `ListAcmeEndpoints`) advertised, fetched with that URL's own host and path and no
 //! credential of any kind — exactly what a client holding it does — so an answer that is
-//! not computed from the persisted endpoint record cannot pass.
+//! not computed from the persisted endpoint record cannot pass. The last suite adds what
+//! the published authority has to BE for that client to get anywhere: an address of this
+//! emulator, never a name it composed, because nothing resolves a name this emulator
+//! invented. That the address itself accepts a connection and answers these resources over
+//! a real socket is [`crate::acme_nonce_field_name`].
 
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -45,14 +51,12 @@ use crate::acme_directory_endpoint::{
 use crate::acme_external_account_binding_lifecycle::create_binding;
 use crate::certificate_lifecycle::{call, router_with_engine, ACCOUNT, REGION};
 
-/// The DNS zone a resolver answers with this machine's loopback interface, which RFC 6761
-/// reserves `localhost` and every name under it for — the zone this emulator may announce a
-/// name of its own in when it is reached at an ADDRESS.
-///
-/// Written out here rather than read from the service, so this test pins the published
-/// form: a name in this zone leads back to the interface this emulator's listeners are
-/// bound on, and nowhere else.
-const LOOPBACK_ZONE: &str = "localhost";
+/// The host AWS itself publishes the Region's ACME endpoints on, which is what a caller
+/// that resolves AWS's own hostnames is told — the one published authority that is a NAME
+/// rather than an address of this emulator.
+fn aws_enrollment_host(region: &str) -> String {
+    format!("{ENROLLMENT_LABEL}.{region}.{DNS_SUFFIX}")
+}
 
 /// The Regions the first table spans: the recorded one and one in another geography, so
 /// the published authority is asserted for more than one Region's enrollment host.
@@ -372,7 +376,7 @@ async fn assert_directory_served(router: &MultiServiceRouter, case: &str, url: &
 }
 
 /// RULE: the advertised `EndpointUrl` is the address this emulator SERVES that endpoint's
-/// ACME surface at and the caller can reach — and a plain `GET` of it, exactly as returned,
+/// ACME surface at and the caller can DIAL — and a plain `GET` of it, exactly as returned,
 /// serves the RFC 8555 directory whose resources are on that same address.
 #[tokio::test]
 async fn the_advertised_endpoint_url_is_on_the_endpoint_the_caller_reached() {
@@ -382,30 +386,22 @@ async fn the_advertised_endpoint_url_is_on_the_endpoint_the_caller_reached() {
         activate_endpoints_now(&engine);
         let id = endpoint_id(&arn).to_string();
         // The address the store says this emulator serves the ACME surface at, read from
-        // the state the create opened it on rather than written here, and the enrollment
-        // authority announced for it: the enrollment label and the Region as the leading
-        // labels, the loopback zone behind them, and that address's own port.
+        // the state the create opened it on rather than written here: an address of this
+        // machine, with the port that socket answers on.
         let served = served_acme_address(&engine, region);
-        let port = served
-            .rsplit_once(':')
-            .unwrap_or_else(|| panic!("{region}: the served address names no port: {served}"))
-            .1
-            .to_string();
-        let announced = format!("{ENROLLMENT_LABEL}.{region}.{LOOPBACK_ZONE}:{port}");
 
         for (what, host) in ADDRESSES {
             let case = format!("{region}, a caller that reached {what}");
             let url = advertised_url(&router, &case, *host, region, &arn).await;
             let (authority, path) = split_url(&case, &url);
 
-            // The authority is the Region's enrollment host, label by label, in the zone
-            // that leads to this machine — and on the port this emulator serves that
-            // surface at, so it is an address this caller reaches, whichever endpoint
-            // shape it addressed.
+            // The authority is the address this emulator serves that surface at, port
+            // included, so it is an address this caller can open a connection to —
+            // whichever endpoint shape it addressed.
             assert_eq!(
-                authority, announced,
-                "case {case:?}: expected the enrollment authority announced for the address \
-                 this emulator serves the ACME surface at ({announced}), got {url:?}"
+                authority, served,
+                "case {case:?}: expected the address this emulator serves the ACME surface \
+                 at ({served}), got {url:?}"
             );
             // Everything that identifies the resource is in the PATH, and nothing else is:
             // the endpoint's own id, then the directory resource.
@@ -469,7 +465,7 @@ async fn the_advertised_endpoint_url_is_on_the_endpoint_the_caller_reached() {
             let url = advertised_url(&router, &case, host.as_deref(), region, &arn).await;
             assert_eq!(
                 url,
-                format!("https://{ENROLLMENT_LABEL}.{region}.{DNS_SUFFIX}/{id}/directory"),
+                format!("https://{}/{id}/directory", aws_enrollment_host(region)),
                 "case {case:?}: expected the Region's published enrollment host"
             );
             assert_directory_served(&router, &case, &url).await;
@@ -650,11 +646,17 @@ const COMPOSITION_REGIONS: &[&str] = &[
     "us-gov-west-1",
 ];
 
-/// Assert `url` is composed as the rule states for `region`, `id` and `resource`, and
-/// answer its authority: `https://`, the enrollment label and the Region as the leading two
-/// labels of a host of at least three non-empty labels, the id and the resource as the
-/// whole path, and no query or fragment anywhere.
-fn assert_composition(case: &str, url: &str, region: &str, id: &str, resource: &str) -> String {
+/// Assert `url` is composed as the rule states for `expected_authority`, `id` and
+/// `resource`, and answer its authority: `https://`, that authority as the whole authority
+/// — an address this emulator serves, or AWS's own published host — the id and the resource
+/// as the whole path, and no query or fragment anywhere.
+fn assert_composition(
+    case: &str,
+    url: &str,
+    expected_authority: &str,
+    id: &str,
+    resource: &str,
+) -> String {
     assert!(
         url.starts_with("https://"),
         "case {case:?}: an ACME URL is https (RFC 8555 §6.1), got {url:?}"
@@ -664,21 +666,10 @@ fn assert_composition(case: &str, url: &str, region: &str, id: &str, resource: &
         "case {case:?}: the published URL carries no query and no fragment, got {url:?}"
     );
     let (authority, path) = split_url(case, url);
-    // The port is part of the authority, not of the host name the labels are read off.
-    let host = authority
-        .rsplit_once(':')
-        .map_or(authority.as_str(), |(host, _port)| host);
-    let labels: Vec<&str> = host.split('.').collect();
-    assert!(
-        labels.len() > 2 && labels.iter().all(|label| !label.is_empty()),
-        "case {case:?}: expected a host of at least three non-empty labels, got {host:?} from \
-         {url:?}"
-    );
     assert_eq!(
-        &labels[..2],
-        &[ENROLLMENT_LABEL, region],
-        "case {case:?}: expected {url:?} on {ENROLLMENT_LABEL}.{region}.<zone>, got host \
-         {host:?}"
+        authority, expected_authority,
+        "case {case:?}: expected {url:?} on {expected_authority}, got the authority \
+         {authority:?}"
     );
     assert_eq!(
         path,
@@ -701,12 +692,12 @@ fn assert_composition(case: &str, url: &str, region: &str, id: &str, resource: &
 }
 
 /// RULE: every `EndpointUrl` this service publishes — to a caller that reached this
-/// emulator at any shape of its own endpoint, to one that addressed an AWS host, and to one
-/// that addressed no host at all — is composed on the Region's ACME enrollment host with
-/// the endpoint's own id and the `directory` resource as its whole path; it is the same from
-/// both readers and on every read, and unique per endpoint.
+/// emulator at any shape of its own endpoint, and to one that addressed no host at all — is
+/// composed on an authority that caller can dial, with the endpoint's own id and the
+/// `directory` resource as its whole path; it is the same from both readers and on every
+/// read, and unique per endpoint.
 #[tokio::test]
-async fn every_published_endpoint_url_is_composed_on_the_region_enrollment_host() {
+async fn every_published_endpoint_url_is_composed_on_an_authority_the_caller_can_dial() {
     for region in COMPOSITION_REGIONS {
         let (router, engine) = router_with_engine();
         // Two endpoints per Region, created from identical requests: one host serves many
@@ -717,6 +708,7 @@ async fn every_published_endpoint_url_is_composed_on_the_region_enrollment_host(
             endpoints.push(create_endpoint(&router, &case, region, MARKER).await);
         }
         activate_endpoints_now(&engine);
+        let served = served_acme_address(&engine, region);
 
         let mut callers: Vec<(String, Option<&str>)> = ADDRESSES
             .iter()
@@ -725,6 +717,13 @@ async fn every_published_endpoint_url_is_composed_on_the_region_enrollment_host(
         callers.push(("a caller that addressed no host at all".to_string(), None));
 
         for (what, host) in &callers {
+            // The authority such a caller is published: the served address for one that
+            // reached this emulator, and AWS's own published host for one that resolves
+            // AWS's hostnames (a request that names no host at all).
+            let expected = match host {
+                Some(_) => served.clone(),
+                None => aws_enrollment_host(region),
+            };
             // Every endpoint of the Region is published to this caller on ONE authority,
             // and told apart by the id in its path.
             let mut authorities: BTreeSet<String> = BTreeSet::new();
@@ -734,7 +733,7 @@ async fn every_published_endpoint_url_is_composed_on_the_region_enrollment_host(
                 let case = format!("{region}, {what}");
                 let id = endpoint_id(arn).to_string();
                 let url = advertised_url(&router, &case, *host, region, arn).await;
-                authorities.insert(assert_composition(&case, &url, region, &id, "directory"));
+                authorities.insert(assert_composition(&case, &url, &expected, &id, "directory"));
 
                 // The same URL from the listing, and on every later read: a server-managed
                 // value is one the service decided once.
@@ -758,7 +757,7 @@ async fn every_published_endpoint_url_is_composed_on_the_region_enrollment_host(
             assert_eq!(
                 authorities.len(),
                 1,
-                "case {region:?}, {what}: one enrollment authority serves every endpoint of \
+                "case {region:?}, {what}: one authority serves every endpoint of \
                  the Region, got {authorities:?}"
             );
             assert_eq!(
@@ -781,11 +780,12 @@ async fn the_published_url_serves_a_directory_whose_resources_share_its_authorit
         let arn = create_endpoint(&router, region, region, MARKER).await;
         activate_endpoints_now(&engine);
         let id = endpoint_id(&arn).to_string();
+        let served = served_acme_address(&engine, region);
 
         for (what, host) in ADDRESSES {
             let case = format!("{region}, a caller that reached {what}");
             let url = advertised_url(&router, &case, *host, region, &arn).await;
-            let authority = assert_composition(&case, &url, region, &id, "directory");
+            let authority = assert_composition(&case, &url, &served, &id, "directory");
 
             // Fetched exactly as a client holding it does: its own host, its own path, and
             // no credential of any kind.
@@ -802,7 +802,7 @@ async fn the_published_url_serves_a_directory_whose_resources_share_its_authorit
                     .as_str()
                     .unwrap_or_else(|| panic!("case {case:?}: no {member} in {document}"))
                     .to_string();
-                let on = assert_composition(&case, &named, region, &id, resource);
+                let on = assert_composition(&case, &named, &served, &id, resource);
                 assert_eq!(
                     on, authority,
                     "case {case:?}: every resource the directory names must be on the \
@@ -817,9 +817,109 @@ async fn the_published_url_serves_a_directory_whose_resources_share_its_authorit
         let url = advertised_url(&router, &case, None, region, &arn).await;
         assert_eq!(
             url,
-            format!("https://{ENROLLMENT_LABEL}.{region}.{DNS_SUFFIX}/{id}/directory"),
+            format!("https://{}/{id}/directory", aws_enrollment_host(region)),
             "case {case:?}: expected the Region's published enrollment host"
         );
         assert_directory_served(&router, &case, &url).await;
+    }
+}
+
+/// The one NAME a stock resolver answers with this machine's loopback interface, which
+/// RFC 6761 reserves for exactly that — the only name an address of this emulator may be
+/// published under, beside an IP literal.
+const LOOPBACK_NAME: &str = "localhost";
+
+/// Assert `authority` is an ADDRESS of this emulator rather than a name it composed: its
+/// host is an IP literal (bracketed, for IPv6) or that one reserved loopback name, and it
+/// names a port — the two things the core reports a listener as dialable at.
+///
+/// A name this emulator composes around a local one resolves NOWHERE: a stock resolver
+/// answers `localhost` and the addresses of this machine's interfaces, and nothing at all
+/// for a label somebody put in front of them, so a client handed such an authority opens no
+/// connection whatever is served behind the port.
+fn assert_an_address_of_this_emulator(case: &str, authority: &str) {
+    let (host, port) = authority.rsplit_once(':').unwrap_or_else(|| {
+        panic!("case {case:?}: a published address names its port, got {authority:?}")
+    });
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    assert!(
+        literal.parse::<IpAddr>().is_ok() || host.eq_ignore_ascii_case(LOOPBACK_NAME),
+        "case {case:?}: a published address is an address of this emulator (an IP literal, \
+         or {LOOPBACK_NAME:?}), never a name this emulator composed, got {host:?} in \
+         {authority:?}"
+    );
+    assert!(
+        !host.contains(ENROLLMENT_LABEL),
+        "case {case:?}: the enrollment label belongs to the host AWS publishes, which no \
+         resolver answers with this machine, got {authority:?}"
+    );
+    assert!(
+        port.parse::<u16>().is_ok_and(|port| port > 0),
+        "case {case:?}: a published address names the port it answers on, got {authority:?}"
+    );
+}
+
+/// RULE, taken at its word: the address published to a caller that reached this emulator is
+/// an ADDRESS of this emulator — one a client that resolves the authority it was handed can
+/// open a connection to — and it serves the endpoint's own ACME directory, whose resources
+/// are published on that same authority, so the rest of the protocol is reachable too.
+///
+/// The rows span the Region the endpoint lives in and the shape of the endpoint the caller
+/// reached. Every row is read back by the authority the control plane published and nothing
+/// else; that the ADDRESS itself accepts a connection and answers these resources over a
+/// real socket is [`crate::acme_nonce_field_name`], which dials the published port and
+/// asserts the published host is one of this machine's own.
+#[tokio::test]
+async fn the_published_address_is_the_authority_it_was_published_as() {
+    for region in COMPOSITION_REGIONS {
+        let (router, engine) = router_with_engine();
+        let case = format!("{region}: an endpoint a client enrols with");
+        let arn = create_endpoint(&router, &case, region, MARKER).await;
+        activate_endpoints_now(&engine);
+        let id = endpoint_id(&arn).to_string();
+        let mut published: BTreeSet<String> = BTreeSet::new();
+
+        for (what, host) in ADDRESSES {
+            let case = format!("{region}, a caller that reached {what}");
+            let url = advertised_url(&router, &case, *host, region, &arn).await;
+            let (authority, path) = split_url(&case, &url);
+            published.insert(authority.clone());
+            assert_an_address_of_this_emulator(&case, &authority);
+            assert_eq!(
+                path,
+                format!("/{id}/directory"),
+                "case {case:?}: the endpoint's own id and the directory resource are the \
+                 whole path, got {url:?}"
+            );
+
+            // Read back by the published authority and path, with no credential of any
+            // kind — exactly what a client holding the URL sends.
+            let response = fetch(&router, &case, "GET", &url).await;
+            let status = response.status().as_u16();
+            let document = body_json(&case, &response);
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the published address must serve the ACME directory, got \
+                 {status} {document}"
+            );
+            for (member, resource) in DIRECTORY_MEMBERS {
+                let named = document[*member]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case:?}: no {member} in {document}"));
+                assert_eq!(
+                    named,
+                    format!("https://{authority}/{id}/{resource}"),
+                    "case {case:?}: every resource the directory names must be on the address \
+                     the client addressed, got {named:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            published.len(),
+            1,
+            "case {region:?}: one address serves every caller on this machine, got \
+             {published:?}"
+        );
     }
 }

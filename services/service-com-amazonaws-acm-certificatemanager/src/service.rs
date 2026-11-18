@@ -54,17 +54,15 @@
 //! than the control-plane resolver, which cannot name a service from the enrollment
 //! label and answers `404 UnknownService` — for a URL this service handed out.
 //!
-//! A caller that reached this emulator resolves no hostname of AWS's, so the enrollment
-//! name it is announced sits in the zone THIS emulator may announce a name of its own in
-//! and on the port the surface is served on
-//! ([`crate::state::announced_acme_enrollment_authority`]) — the same host FORM, which is
-//! what an ACME client that dials the advertised URL verbatim reaches.
+//! A caller that reached this emulator resolves no hostname of AWS's, so what it is
+//! announced is an ADDRESS of this emulator: the `host:port` this emulator serves that
+//! surface at ([`crate::state::announced_acme_authority`]), which is what an ACME client
+//! that dials the advertised URL verbatim can open a connection to.
 //!
 //! Three seams carry it, and nothing else changes:
 //!
 //! - [`Service::can_handle`] also claims a request addressed to that surface
-//!   ([`acme_http::addresses_acme_surface_of_parts`]), which is what routes it here at
-//!   all.
+//!   ([`acme_http::AcmeHttpSurface::claims_parts`]), which is what routes it here at all.
 //! - [`Service::override_routing_error`] serves the request that presents NO
 //!   credential. An ACME client holds none, and an ACME interaction names no modelled
 //!   operation by construction, so the router reaches exactly this seam for it — BEFORE
@@ -610,12 +608,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return true;
         }
         // And a request addressed to this service's ACME surface — the enrollment host
-        // this service PUBLISHES in every ACME endpoint's `EndpointUrl`, whose first
-        // label is not this service's signing name, or the reserved path that surface is
-        // published at on the emulator's OWN endpoint. Neither can be named by a route
-        // key. See the module docs: without this the router answers `404 UnknownService`
-        // for a URL this service handed out.
-        acme_http::addresses_acme_surface_of_parts(parts)
+        // this service PUBLISHES in an ACME endpoint's `EndpointUrl` for a caller that
+        // resolves AWS's own hostnames, whose first label is not this service's signing
+        // name, or the address this emulator SERVES that surface at. Neither can be named
+        // by a route key. See the module docs: without this the router answers
+        // `404 UnknownService` for a URL this service handed out.
+        self.acme_http.claims_parts(parts)
     }
 
     fn override_operation(
@@ -630,7 +628,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // authentication, so an ACME client — which holds no AWS credential at all —
         // still gets this service's own answer rather than the emulator's "sign this
         // request".
-        if acme_http::carries_sigv4_credential(req) && acme_http::addresses_acme_surface(req) {
+        if acme_http::carries_sigv4_credential(req) && self.acme_http.claims(req) {
             return Some(&self.acme_http);
         }
         // Everything else resolves through the generated routing table.
@@ -677,7 +675,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // operation only for the credentialed ones), so this is where an unsigned
         // client's fetch of a published ACME URL is served. Anything else keeps the
         // framework's protocol-correct default (awsJson -> 404).
-        acme_http::addresses_acme_surface(req).then(|| self.acme_http.serve(req))
+        self.acme_http
+            .claims(req)
+            .then(|| self.acme_http.serve(req))
     }
 
     fn override_framework_error(

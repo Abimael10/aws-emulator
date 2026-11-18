@@ -361,18 +361,81 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AcmeHttpSurface<Eng> {
 }
 
 impl<Eng: Send + Sync + 'static> AcmeHttpSurface<Eng> {
+    /// Whether this surface serves the request `parts` came from — read by
+    /// `Service::can_handle`, so a request addressed to an ACME URL this service published
+    /// reaches this service instead of the front door's `UnknownService`.
+    pub fn claims_parts(&self, parts: &http::request::Parts) -> bool {
+        self.claims_addressing(addressed_host_of_parts(parts), parts.uri.path())
+    }
+
+    /// [`Self::claims_parts`] for the runtime-API request the serving seams are handed,
+    /// decided by the same rule, so the claim and the answer cannot disagree about which
+    /// requests this surface serves.
+    pub fn claims(&self, req: &RtRequest) -> bool {
+        self.claims_addressing(addressed_host_of_request(req), request_path(req.uri()))
+    }
+
+    /// The one reading of that claim. Three addressings resolve, and each one is an address
+    /// this service PUBLISHED ([`crate::state::acme_resource_url_at`]):
+    ///
+    /// * an ACME ENROLLMENT host, whatever the path — the host form
+    ///   `AcmeEndpoint$EndpointUrl` carries for a caller that resolves AWS's own hostnames,
+    ///   which no other service of this emulator is reached under, so even a path this
+    ///   surface publishes nothing at is answered with an ACME problem document rather than
+    ///   the front door's "unknown service";
+    /// * the address this emulator SERVES this surface at
+    ///   ([`crate::state::addresses_served_acme_address`]) — a socket of this plane's own;
+    /// * the emulator's own endpoint carrying an ACME path whose endpoint id names an
+    ///   endpoint this service HOLDS, which is the address published while no socket of this
+    ///   plane's own is open. It is narrowed to a held endpoint, read from the one shared
+    ///   store, rather than to a path shape, so one request keeps one claimant — and to a
+    ///   host that names NO service, because a host that names one (this service's own
+    ///   control plane, or another service's endpoint) keeps answering as that service.
+    ///
+    /// The two addressings that are not the enrollment host carry the endpoint's id and the
+    /// resource as the whole path, so a request whose path is not one of those is declined
+    /// before the shared store is read at all — which is every request the front door offers
+    /// this service that is not an ACME one.
+    fn claims_addressing(&self, addressed: Option<&str>, path: &str) -> bool {
+        let Some(addressed) = addressed else {
+            return false;
+        };
+        if state::acme_enrollment_region(addressed).is_some() {
+            return true;
+        }
+        let Some(route) = state::parse_acme_request_path(path) else {
+            return false;
+        };
+        if ::service_common::data_plane_addressing::names_a_service(addressed) {
+            return false;
+        }
+        let Some(shared) = state::service_state(&*self.engine) else {
+            return false;
+        };
+        let store = shared.lock();
+        store
+            .served_acme_address()
+            .is_some_and(|served| state::addresses_served_acme_address(&served, addressed))
+            || store.acme_endpoint_region_of(&route.endpoint_id).is_some()
+    }
+
     /// Serve one request to a published ACME URL.
     ///
-    /// The host names the Region, the path names the endpoint and the resource, and the
-    /// method names the interaction — which is how an ACME server is addressed; there
-    /// is no operation name on this wire.
+    /// The path names the endpoint and the resource, the method names the interaction, and
+    /// the address the request arrived at says which Region's endpoints are reachable on it
+    /// — which is how an ACME server is addressed; there is no operation name on this wire.
     pub fn serve(&self, req: &RtRequest) -> RtResponse {
-        // Which endpoint's resource this request addresses, and the authority it addressed
-        // this surface at.
-        let Some(addressed) = addressed_acme_resource(req) else {
+        // The address this request ADDRESSED, which SELECTS the authority the answer's URLs
+        // are minted on and is never itself published.
+        let Some(addressed_at) = addressed_host_of_request(req) else {
             return problem(404, MALFORMED, NO_SUCH_RESOURCE);
         };
-        let (region, route) = (addressed.region.as_str(), &addressed.route);
+        // Which endpoint's resource this request addresses: the endpoint's own id as the
+        // first path segment and the resource beneath it
+        // ([`crate::state::acme_resource_url_on`]).
+        let Some(route) = state::parse_acme_request_path(request_path(req.uri())) else {
+            return problem(404, MALFORMED, NO_SUCH_RESOURCE);
+        };
         let Some(resource) = resource_of(&route.resource) else {
             return problem(404, MALFORMED, NO_SUCH_RESOURCE);
         };
@@ -388,6 +451,19 @@ impl<Eng: Send + Sync + 'static> AcmeHttpSurface<Eng> {
         // create owed it was due at this instant whether or not anybody called, which
         // is what makes a client that waited for activation able to enrol.
         store.materialize_due(now);
+        // The Region the addressed endpoint lives in: the one an enrollment host NAMES, for
+        // a caller that resolves AWS's own hostnames, and otherwise the one the record of
+        // the endpoint the path names is keyed under — the address this emulator serves this
+        // surface at names no Region, because one socket serves every endpoint
+        // ([`crate::state::ComAmazonawsAcmCertificatemanagerState::acme_endpoint_region_of`]).
+        let Some(region) = state::acme_enrollment_region(addressed_at)
+            .map(str::to_string)
+            .or_else(|| store.acme_endpoint_region_of(&route.endpoint_id))
+        else {
+            return problem(404, MALFORMED, NO_ACTIVE_ENDPOINT);
+        };
+        let addressed = AddressedAcmeResource { region, route };
+        let (region, route) = (addressed.region.as_str(), &addressed.route);
         let serving = store
             .acme_endpoint_in(region, &route.endpoint_id)
             .is_some_and(|endpoint| endpoint.status == state::ACME_ENDPOINT_STATUS_ACTIVE);
@@ -396,13 +472,13 @@ impl<Eng: Send + Sync + 'static> AcmeHttpSurface<Eng> {
         }
 
         // The authority every URL this answer carries is minted on: one this service
-        // COMPOSED — the name it announces for the address it serves this surface at, or
-        // the authority it publishes that the request addressed — never the `Host` the
-        // request wrote ([`crate::state::minting_acme_authority`]).
+        // PUBLISHED — the address it serves this surface at, or the enrollment host it
+        // publishes that the request addressed — never the `Host` the request wrote
+        // ([`crate::state::minting_acme_authority`]).
         let authority = state::minting_acme_authority(
             region,
             store.served_acme_address().as_deref(),
-            &addressed.authority,
+            addressed_at,
         );
         let authority = authority.as_str();
 
@@ -1213,51 +1289,12 @@ fn bounded(value: &str) -> String {
         .collect()
 }
 
-/// Whether `req` addresses this service's ACME surface: an ACME ENROLLMENT host, which is
-/// the only host form `AcmeEndpoint$EndpointUrl` is published on — AWS's own for the
-/// Region, or the one this emulator announces for it.
-pub fn addresses_acme_surface(req: &RtRequest) -> bool {
-    addresses_acme_surface_at(addressed_host_of_request(req))
-}
-
-/// [`addresses_acme_surface`] for the buffered request parts `Service::can_handle` is
-/// handed, read by the same rule, so the claim and the answer cannot disagree about which
-/// requests this surface serves.
-pub fn addresses_acme_surface_of_parts(parts: &http::request::Parts) -> bool {
-    addresses_acme_surface_at(addressed_host_of_parts(parts))
-}
-
-/// The one reading of that claim: an enrollment host, whatever the path — a request to one
-/// is this service's to answer, including one whose path names no resource it publishes,
-/// which is answered with an ACME problem document rather than the front door's "unknown
-/// service".
-fn addresses_acme_surface_at(host: Option<&str>) -> bool {
-    host.and_then(state::acme_enrollment_region).is_some()
-}
-
-/// What an ACME request addresses: the endpoint and resource it names, the Region that
-/// endpoint lives in, and the authority it addressed this surface at — which SELECTS the
-/// authority the answer's URLs are minted on ([`crate::state::minting_acme_authority`]) and
-/// is never itself published.
+/// What an ACME request addresses: the endpoint and resource it names, and the Region that
+/// endpoint lives in.
 #[derive(Debug)]
 struct AddressedAcmeResource {
     region: String,
     route: state::AcmeRequestPath,
-    authority: String,
-}
-
-/// Which endpoint's ACME resource `req` addresses, or `None` when it addresses none.
-///
-/// The addressing is the one this surface publishes
-/// ([`crate::state::acme_resource_url_at`]): the Region's enrollment authority as the host,
-/// with the endpoint's id as the first path segment and the resource beneath it.
-fn addressed_acme_resource(req: &RtRequest) -> Option<AddressedAcmeResource> {
-    let host = addressed_host_of_request(req)?;
-    Some(AddressedAcmeResource {
-        region: state::acme_enrollment_region(host)?.to_string(),
-        route: state::parse_acme_request_path(request_path(req.uri()))?,
-        authority: host.to_string(),
-    })
 }
 
 /// The host a runtime-API request addressed: its `Host` header, else the authority an

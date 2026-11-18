@@ -225,26 +225,18 @@ async fn dialled(
 }
 
 /// The `host:port` and the path of a published `https://` URL, with the authority asserted
-/// to be the Region's enrollment host in a zone that leads to THIS machine — the only
-/// address a client here can reach. The zone is read through the core's own loopback
-/// predicate, so the assertion holds under any loopback spelling.
+/// to be an ADDRESS of this machine — the only kind of authority a client here can open a
+/// connection to. The host is read through the core's own loopback predicate, so the
+/// assertion holds under any spelling of the bound interface.
 fn address(case: &str, url: &str) -> (String, String) {
     let (authority, path) = split_url(case, url);
     let (host, port) = authority
         .rsplit_once(':')
         .unwrap_or_else(|| panic!("case {case:?}: the published authority names no port: {authority}"));
-    let zone = host
-        .strip_prefix(&format!("{ENROLLMENT_LABEL}.{REGION}."))
-        .unwrap_or_else(|| {
-            panic!(
-                "case {case:?}: expected the published ACME host on \
-                 {ENROLLMENT_LABEL}.{REGION}.<zone>, got {host:?}"
-            )
-        });
     assert!(
-        emulator_server::is_loopback_host(zone),
-        "case {case:?}: the published ACME host must sit in a zone that leads to this \
-         machine, got {authority:?}"
+        emulator_server::is_loopback_host(host),
+        "case {case:?}: the published ACME address must be an address of this machine, got \
+         {authority:?}"
     );
     assert!(
         port.parse::<u16>().is_ok_and(|port| port > 0),

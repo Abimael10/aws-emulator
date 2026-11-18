@@ -25,10 +25,10 @@
 //! `hyper` server its sibling planes are served by, with the encoder's title-case option
 //! set, so every field name is written in the canonical spelling its specification states
 //! (`Replay-Nonce`, `Cache-Control`, `Location`, `Link`, `Content-Type`). The published
-//! `EndpointUrl` of every endpoint names that socket's PORT, under the Region's enrollment
-//! name in the zone this emulator may announce in
-//! ([`crate::state::announced_acme_enrollment_authority`]), so a client that is handed it
-//! reads the fields RFC 8555 names under the names RFC 8555 gives them.
+//! `EndpointUrl` of every endpoint names that socket's ADDRESS — the `host:port` the core
+//! reports it as dialable at ([`crate::state::announced_acme_authority`]) — so a client that
+//! is handed it opens a connection and reads the fields RFC 8555 names under the names
+//! RFC 8555 gives them.
 //!
 //! The encryption is negotiated IN BAND ([`::service_common::in_band_tls`]), so the one
 //! address serves both the `https://` an ACME client dials and a request made in the clear,
@@ -349,14 +349,11 @@ fn refused_before_dispatch(
     let Some(host) = sent("host").or_else(|| parts.uri.host()) else {
         return Some(plain(421, HOST_REQUIRED));
     };
-    // The addresses of the interface this emulator's listeners are bound on, and the
-    // enrollment name this service ANNOUNCES on this machine, which RFC 6761 reserves to
-    // that same interface ([`crate::state::addresses_announced_acme_host`]) — the name the
-    // published `EndpointUrl` carries. Any other host is one somebody else's resolver
-    // decides, which is what the rebinding guard refuses.
-    if !::service_common::data_plane_addressing::host_names_the_bound_interface(host)
-        && !crate::state::addresses_announced_acme_host(host)
-    {
+    // The addresses of the interface this emulator's listeners are bound on, which is the
+    // interface this socket itself is bound on and the host form its published `EndpointUrl`
+    // carries. Any other host is one somebody else's resolver decides, which is what the
+    // rebinding guard refuses.
+    if !::service_common::data_plane_addressing::host_names_the_bound_interface(host) {
         return Some(plain(421, HOST_NOT_ALLOWED));
     }
     if ::emulator_server::is_websocket_upgrade(sent("connection"), sent("upgrade"), sent(":protocol"))

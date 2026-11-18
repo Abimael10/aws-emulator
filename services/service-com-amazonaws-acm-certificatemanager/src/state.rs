@@ -64,15 +64,16 @@
 //! records the instant of
 //! ([`acme_external_account_binding_revoked_message`]).
 //!
-//! Every URL those two records carry is minted here, on ONE address form
-//! ([`acme_resource_url_at`]): the Region's ACME enrollment host — the label
-//! [`ACME_ENROLLMENT_HOST_LABEL`], the Region, and the DNS zone of whoever serves it
-//! ([`announced_acme_enrollment_authority`]) — with the endpoint's own id and the resource
-//! beneath it as the whole path ([`acme_endpoint_url`], [`acme_account_url`]). A caller
-//! that resolves AWS's own hostnames is told the zone AWS publishes that host in; a caller
-//! that reached THIS emulator is told the zone this emulator may announce a name of its own
-//! in, and the port the surface is served on. Both are read back by
-//! [`acme_enrollment_region`] and [`parse_acme_request_path`], so the ACME HTTP surface
+//! Every URL those two records carry is minted here ([`acme_resource_url_at`]), with the
+//! endpoint's own id and the resource beneath it as the whole path ([`acme_endpoint_url`],
+//! [`acme_account_url`]) and the AUTHORITY decided by who is being answered
+//! ([`announced_acme_authority`]): a caller that resolves AWS's own hostnames is told the
+//! Region's ACME enrollment host ([`ACME_ENROLLMENT_HOST_LABEL`]) in the zone AWS publishes
+//! it in, and a caller that reached THIS emulator is told the `host:port` this emulator
+//! SERVES that surface at ([`acme_socket`]), which is the only address such a client can
+//! open a connection to. Both are read back — the enrollment host by
+//! [`acme_enrollment_region`], the served address by [`addresses_served_acme_address`] and
+//! the path by [`parse_acme_request_path`] — so the ACME HTTP surface
 //! `crate::service::acme_http` serves resolves a published URL to the record behind it
 //! whichever of them a client holds.
 //!
@@ -2018,12 +2019,11 @@ impl ComAmazonawsAcmCertificatemanagerState {
     /// surface is served on ([`acme_socket`]) when one is open, and the endpoint the
     /// caller reached otherwise.
     ///
-    /// It is the address the announced enrollment authority is read off
-    /// ([`announced_acme_enrollment_authority`]): the zone this emulator may announce a
-    /// name of its own in, and the port the surface answers on. An ACME client dials the
-    /// published URL verbatim and reads the FIELD NAMES of the answers at it as they were
-    /// served, so what is announced is the address this emulator serves that surface at
-    /// under the names RFC 8555 gives them — not merely an address that resolves. `None`
+    /// It is the authority such a caller's URLs are announced at
+    /// ([`announced_acme_authority`]), taken whole. An ACME client dials the published URL
+    /// verbatim and reads the FIELD NAMES of the answers at it as they were served, so what
+    /// is announced is the address this emulator serves that surface at under the names
+    /// RFC 8555 gives them — not merely an address that resolves. `None`
     /// stays `None`: a caller that resolves AWS's own hostnames is told the Region's
     /// enrollment host in AWS's own zone, which is no address of this process.
     pub fn published_acme_address(&self, reached: Option<String>) -> Option<String> {
@@ -2038,9 +2038,13 @@ impl ComAmazonawsAcmCertificatemanagerState {
     /// surface is served on ([`acme_socket`]) when one is open, and `None` before any
     /// endpoint has opened one (and for an engine that vends no listener at all).
     ///
-    /// The address the announced enrollment authority is read off
-    /// ([`announced_acme_enrollment_authority`], [`minting_acme_authority`]), so the
-    /// control plane and the ACME surface announce one name.
+    /// The authority the control plane publishes and the ACME surface mints its own URLs on
+    /// ([`announced_acme_authority`], [`minting_acme_authority`]), so both announce one
+    /// address.
+    ///
+    /// It is also what a request to that surface is CLAIMED by
+    /// ([`addresses_served_acme_address`]): the port is this plane's address and nothing
+    /// else's.
     pub fn served_acme_address(&self) -> Option<String> {
         self.acme_socket
             .as_ref()
@@ -2130,10 +2134,12 @@ impl ComAmazonawsAcmCertificatemanagerState {
     /// this account holds no such endpoint there.
     ///
     /// How a request to an endpoint's published ACME URL
-    /// ([`acme_endpoint_url`]) resolves to the record behind it: the Region comes off
-    /// the enrollment host the request addressed and the id off its path, and together
-    /// they are the ARN this map is keyed by — so one Region's enrollment host serves
-    /// only that Region's endpoints.
+    /// ([`acme_endpoint_url`]) resolves to the record behind it: the id comes off the
+    /// path, and the Region off the enrollment host a caller that resolves AWS's own
+    /// hostnames addressed ([`acme_enrollment_region`]) or off the record itself for one
+    /// that reached this emulator's own address ([`Self::acme_endpoint_region_of`]) —
+    /// together they are the ARN this map is keyed by, so one Region's enrollment host
+    /// serves only that Region's endpoints.
     pub fn acme_endpoint_in(&self, region: &str, endpoint_id: &str) -> Option<&AcmeEndpointRecord> {
         self.acme_endpoints
             .get(&acme_endpoint_arn(region, endpoint_id))
@@ -2148,6 +2154,24 @@ impl ComAmazonawsAcmCertificatemanagerState {
     ) -> Option<&mut AcmeEndpointRecord> {
         self.acme_endpoints
             .get_mut(&acme_endpoint_arn(region, endpoint_id))
+    }
+
+    /// The Region the stored ACME endpoint `endpoint_id` lives in, or `None` when this
+    /// account holds no endpoint with that id.
+    ///
+    /// How a request that arrived on the ADDRESS this emulator serves the ACME surface at
+    /// resolves to the record behind it: that address names no Region — one socket serves
+    /// every endpoint, because the endpoint is named by the path
+    /// ([`acme_resource_url_on`]) — so the id the path carries identifies the endpoint and
+    /// the Region is read off the ARN its record is keyed by ([`acme_endpoint_arn`]). An id
+    /// is minted once per endpoint and is unique across the store, so at most one record
+    /// answers to one; the records are walked in ARN order, so the reading is deterministic
+    /// whatever the store holds.
+    pub fn acme_endpoint_region_of(&self, endpoint_id: &str) -> Option<String> {
+        self.acme_endpoints
+            .keys()
+            .filter(|arn| acme_endpoint_id_from_arn(arn) == Some(endpoint_id))
+            .find_map(|arn| acm_arn_region(arn).map(str::to_string))
     }
 
     /// The tag map of the non-certificate ACM resource `arn` names, or `None` when
@@ -2709,13 +2733,11 @@ pub fn acme_enrollment_host(region: &str) -> String {
 }
 
 /// The Region's ACME enrollment host in `zone`: the enrollment label, the Region, and the
-/// DNS zone of whoever serves it — which is the one host FORM this surface is published
-/// under, whether that zone is the one AWS publishes its endpoints in
-/// ([`acme_enrollment_host`]) or the one THIS emulator may announce a name of its own in
-/// ([`announced_acme_enrollment_authority`]).
+/// DNS zone of whoever serves it — the host FORM AWS publishes this surface under
+/// ([`acme_enrollment_host`]).
 ///
-/// The leading two labels are fixed by the form; only the zone behind them varies, so a
-/// host this emulator announces is read back by the same reader as AWS's own
+/// The leading two labels are fixed by the form; only the zone behind them varies, so the
+/// host of another partition is read back by the same reader as the commercial one's
 /// ([`acme_enrollment_region`]).
 pub fn acme_enrollment_host_in(region: &str, zone: &str) -> String {
     format!("{ACME_ENROLLMENT_HOST_LABEL}.{region}.{zone}")
@@ -2726,45 +2748,53 @@ pub fn acme_enrollment_host_in(region: &str, zone: &str) -> String {
 /// enrollment host when there is no such address, which is the caller that resolves AWS's
 /// own hostnames.
 ///
-/// The FORM is the published one either way ([`acme_enrollment_host_in`]): the enrollment
-/// label and the Region are the leading labels, because an ACME client derives the
-/// enrollment host from the URL's authority and anything host-based built around that host
-/// — TLS/SNI, routing, an allow-list — matches on those labels. What changes is the zone
-/// behind them and the port: the zone is the one this emulator may announce a name of its
-/// own in (`service_common::data_plane_addressing::announced_zone_of_authority` — the
-/// loopback zone for an emulator reached at an ADDRESS, which RFC 6761 reserves for the
-/// interface its listeners are bound on), and the port is the one that surface answers on,
-/// so a client that dials the announced name as it stands reaches THIS process rather than
-/// infrastructure of AWS's.
-pub fn announced_acme_enrollment_authority(region: &str, served: Option<&str>) -> String {
-    use ::service_common::data_plane_addressing as addressing;
-
-    let Some(served) = served else {
-        return acme_enrollment_host(region);
-    };
-    let host = acme_enrollment_host_in(region, &addressing::announced_zone_of_authority(served));
-    match addressing::addressed_port(Some(served)) {
-        Some(port) => format!("{host}:{port}"),
-        None => host,
+/// A published URL is DIALLED as it stands: an ACME client is a library that takes the
+/// directory URL, resolves its authority and connects, and rewrites no host. So a caller
+/// that reached this emulator is told an ADDRESS of this emulator, taken whole — the
+/// `host:port` the core reports the socket this surface is served on as dialable at
+/// ([`acme_socket`], read through
+/// `service_common::data_plane_addressing::listener_authority`). A name this service
+/// composed is never announced, however local the zone it is composed in looks: nothing
+/// resolves a name this emulator invented, so a client handed one opens no connection at
+/// all. The endpoint's own id stays in the PATH either way ([`acme_resource_url_on`]), so
+/// one address serves every endpoint of every Region.
+pub fn announced_acme_authority(region: &str, served: Option<&str>) -> String {
+    match served {
+        Some(served) => served.to_string(),
+        None => acme_enrollment_host(region),
     }
 }
 
-/// Whether `host` is an ACME enrollment host this emulator ANNOUNCES on the machine it runs
-/// on: the enrollment form ([`acme_enrollment_region`]) in the zone a resolver answers with
-/// the loopback interface, which RFC 6761 reserves for exactly that.
+/// Whether the authority `addressed` addresses the address this emulator SERVES the ACME
+/// surface at (`served`): that authority itself, or its PORT reached by another spelling of
+/// the one host that address names.
 ///
-/// Such a name leads to this machine and nowhere else, so it is a `Host` the socket this
-/// surface is served on may admit beside the addresses of that interface — while a name in
-/// any other zone is one somebody else's resolver decides, which is what the rebinding
-/// guard on that socket refuses.
-pub fn addresses_announced_acme_host(host: &str) -> bool {
-    let host = ::service_common::data_plane_addressing::host_only(host);
-    acme_enrollment_region(host).is_some_and(|region| {
-        host.eq_ignore_ascii_case(&acme_enrollment_host_in(
-            region,
-            ::service_common::data_plane_addressing::LOOPBACK_ZONE,
-        ))
-    })
+/// A request that arrived on this plane's own socket is this plane's whichever spelling of
+/// that host the client wrote — the loopback address, a loopback name or a bracketed IPv6
+/// literal all name the interface a default bind is on — so the port is compared with the
+/// served one and the host is held to the served host, or to another name of the LOOPBACK
+/// interface when that is the interface the address names. A request carrying some other
+/// host is not read as this plane's however its port reads: a `Host` is text the caller
+/// wrote, and on a wildcard bind nothing else would hold it to this address at all. It is
+/// what `crate::service::acme_http` claims such a request by, and what SELECTS the authority
+/// an answer's URLs are minted on ([`minting_acme_authority`]) — the authority this service
+/// published, never the text the request wrote.
+pub fn addresses_served_acme_address(served: &str, addressed: &str) -> bool {
+    use ::service_common::data_plane_addressing as addressing;
+
+    if addressed.eq_ignore_ascii_case(served) {
+        return true;
+    }
+    let Some(port) = addressing::addressed_port(Some(addressed)) else {
+        return false;
+    };
+    if addressing::addressed_port(Some(served)) != Some(port) {
+        return false;
+    }
+    let (serving_host, host) = (addressing::host_only(served), addressing::host_only(addressed));
+    host.eq_ignore_ascii_case(serving_host)
+        || (::emulator_server::is_loopback_host(serving_host)
+            && ::emulator_server::is_loopback_host(host))
 }
 
 /// The DNS zone the Region's enrollment host `host` names — the labels behind the
@@ -2777,32 +2807,35 @@ fn acme_enrollment_zone(host: &str) -> Option<&str> {
     labels.next()
 }
 
-/// The authority an ANSWER on this surface mints its URLs on: the name this emulator
-/// announces for the address it serves that surface at
-/// ([`announced_acme_enrollment_authority`]), or — when the request addressed that Region's
-/// enrollment host in one of the zones this service publishes in, AWS's own
-/// ([`AWS_DNS_SUFFIX`]) or the zone a resolver answers with this machine's loopback
-/// interface — that host, so the map a client follows stays on the address it is already
-/// talking to.
+/// The authority an ANSWER on this surface mints its URLs on: the address this emulator
+/// SERVES that surface at, when the request arrived there
+/// ([`addresses_served_acme_address`]); the Region's enrollment host in the zone AWS
+/// publishes it in, when the request addressed that host; and the authority this service
+/// announces to the caller otherwise ([`announced_acme_authority`]). The map a client
+/// follows therefore stays on the address it is already talking to.
 ///
-/// Every authority this returns is one this service COMPOSED, from the Region, a zone
-/// CONSTANT the addressed host matched, and the port the request named as a number: a
-/// request's `Host` therefore SELECTS between the authorities this service publishes and
-/// none of its own text is ever reflected into a URL. That is what keeps a caller's string
-/// out of a value this service publishes — and, for an account's own URL
-/// ([`acme_account_url_on`]), out of the state that records it.
+/// Every authority this returns is one this service PUBLISHED — the address the core bound
+/// for this plane, or the Region and the zone CONSTANT the addressed host matched, with the
+/// port the request named as a number: a request's `Host` therefore SELECTS between the
+/// authorities this service publishes and none of its own text is ever reflected into a URL.
+/// That is what keeps a caller's string out of a value this service publishes — and, for an
+/// account's own URL ([`acme_account_url_on`]), out of the state that records it.
 pub fn minting_acme_authority(region: &str, served: Option<&str>, addressed: &str) -> String {
     use ::service_common::data_plane_addressing as addressing;
 
+    if let Some(served) = served {
+        if addresses_served_acme_address(served, addressed) {
+            return served.to_string();
+        }
+    }
     if addressing::is_host_shaped(addressed) {
         let host = addressing::host_only(addressed);
-        let published = acme_enrollment_region(host)
+        let publishes = acme_enrollment_region(host)
             .filter(|named| named.eq_ignore_ascii_case(region))
             .and_then(|_| acme_enrollment_zone(host))
-            .map(str::to_ascii_lowercase)
-            .filter(|zone| zone == AWS_DNS_SUFFIX || zone == addressing::LOOPBACK_ZONE);
-        if let Some(zone) = published {
-            let host = acme_enrollment_host_in(region, &zone);
+            .is_some_and(|zone| zone.eq_ignore_ascii_case(AWS_DNS_SUFFIX));
+        if publishes {
+            let host = acme_enrollment_host(region);
             return match addressing::addressed_port(Some(addressed))
                 .and_then(|port| u16::try_from(port).ok())
             {
@@ -2811,7 +2844,7 @@ pub fn minting_acme_authority(region: &str, served: Option<&str>, addressed: &st
             };
         }
     }
-    announced_acme_enrollment_authority(region, served)
+    announced_acme_authority(region, served)
 }
 
 /// The Region whose ACME enrollment host `host` is, or `None` for any other host.
@@ -2959,9 +2992,9 @@ pub fn parse_acme_request_path(path: &str) -> Option<AcmeRequestPath> {
 /// A URL this service hands a client has to lead back to where that client is already
 /// talking, or it names an address the client cannot reach: an ACME client is a library
 /// that takes the directory URL and dials it, and rewrites no host. A caller that reached
-/// this emulator at its own endpoint resolves no AWS hostname, so what it is told is a name
-/// of THIS emulator's — the Region's enrollment host in the zone this emulator may announce
-/// in, on the port the surface is served on ([`announced_acme_enrollment_authority`]).
+/// this emulator at its own endpoint resolves no AWS hostname, so what it is told is an
+/// ADDRESS of this emulator's — the `host:port` the surface is served at
+/// ([`announced_acme_authority`]).
 pub fn reached_emulator_endpoint_of_parts(parts: &::http::request::Parts) -> Option<String> {
     ::service_common::data_plane_addressing::reached_emulator_endpoint(
         &parts.uri.to_string(),
@@ -2972,16 +3005,14 @@ pub fn reached_emulator_endpoint_of_parts(parts: &::http::request::Parts) -> Opt
     )
 }
 
-/// The URL of one ACME resource of one endpoint, on the enrollment authority this service
-/// announces to the caller being answered ([`announced_acme_enrollment_authority`]): the
-/// Region's enrollment host in the zone and on the port this emulator serves that surface
-/// at for a caller that reached this emulator, and the host AWS publishes for the Region
-/// for one that resolves AWS's own hostnames.
+/// The URL of one ACME resource of one endpoint, on the authority this service announces to
+/// the caller being answered ([`announced_acme_authority`]): the `host:port` this emulator
+/// serves that surface at for a caller that reached this emulator, and the host AWS
+/// publishes for the Region for one that resolves AWS's own hostnames.
 ///
 /// Every URL this service publishes — `AcmeEndpoint$EndpointUrl`, the resource map inside
 /// the directory, and an account's own URL — is minted through this one function, so the
-/// authority the client is told carries the enrollment label and the Region whichever
-/// caller it is, and the path is the endpoint's id and the resource and nothing else.
+/// path is the endpoint's id and the resource and nothing else whichever caller it is.
 pub fn acme_resource_url_at(
     served: Option<&str>,
     region: &str,
@@ -2989,7 +3020,7 @@ pub fn acme_resource_url_at(
     resource: &str,
 ) -> String {
     acme_resource_url_on(
-        &announced_acme_enrollment_authority(region, served),
+        &announced_acme_authority(region, served),
         endpoint_id,
         resource,
     )
