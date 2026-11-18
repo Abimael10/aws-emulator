@@ -26,6 +26,8 @@
 //! while the stack is in review, that a re-submitted plan moves the answer to the newest
 //! change set, and that the answer survives the execution.
 
+use std::sync::Arc;
+
 use service_com_amazonaws_cloudformation_cloudformation::state::{
     change_set_status, execution_status, status,
 };
@@ -35,7 +37,8 @@ use crate::change_set_lifecycle::{
     create_change_set, describe_change_set, execute_change_set, settle_the_store,
 };
 use crate::harness::{
-    call, get_template, member, router_with_engine, xml_blocks, xml_text, xml_texts,
+    call, get_template, member, refusal, router_with_engine, still_running, store, xml_blocks,
+    xml_text, xml_texts,
 };
 use crate::stack_lifecycle::describe_stack;
 
@@ -391,6 +394,217 @@ async fn a_stack_in_review_serves_the_template_of_the_change_set_that_created_it
              declares",
             row.case
         );
+    }
+}
+
+/// Hold every stack operation this store has in flight, by pushing the instant its terminal
+/// status is due out of reach.
+///
+/// A stack operation's terminal status is due at an INSTANT this service records, so the window
+/// BEFORE that instant — the one a client reads in while the deploy is still running — is reached
+/// by moving the instant rather than by racing the machine to read first.
+fn hold_the_operations_in_flight(engine: &Arc<engine::InMemoryEngine>) {
+    let state = store(engine);
+    let mut held = state.lock();
+    let out_of_reach = still_running();
+    for stack in &mut held.stacks {
+        if let Some(pending) = stack.pending.as_mut() {
+            pending.due_at = out_of_reach;
+        }
+    }
+}
+
+/// The `StackStatus` the stack reports now.
+async fn stack_status(case: &str, router: &MultiServiceRouter, stack: &str) -> String {
+    let (code, body) = describe_stack(router, stack).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: the stack must be readable, got {code} {body}"
+    );
+    xml_text(&body, "StackStatus")
+        .unwrap_or_else(|| panic!("case {case:?}: DescribeStacks reported no StackStatus: {body}"))
+}
+
+#[tokio::test]
+async fn every_window_of_a_change_set_deploy_serves_the_stacks_template() {
+    for row in rows() {
+        // One store per row, so no row can read another's stack.
+        let (router, engine) = router_with_engine();
+
+        let (code, created) = create_the_stacks_change_set(
+            &router,
+            row.stack,
+            row.change_set,
+            &row.template,
+            &row.parameters,
+        )
+        .await;
+        assert_eq!(
+            code, 200,
+            "case {:?}: expected CreateChangeSet to succeed, got {code} {created}",
+            row.case
+        );
+        let stack_id = xml_text(&created, "StackId").unwrap_or_else(|| {
+            panic!(
+                "case {:?}: CreateChangeSet answered no StackId: {created}",
+                row.case
+            )
+        });
+        let identifiers = [row.stack.to_string(), stack_id.clone()];
+
+        // Window 1: the plan's own creation is still in flight, so the stack is in review and
+        // the change set is not executable yet. The document the stack would be deployed from
+        // is already the one its template read answers.
+        assert_eq!(
+            stack_status(row.case, &router, row.stack).await,
+            status::REVIEW_IN_PROGRESS,
+            "case {:?}: a stack a CREATE change set registered is in review",
+            row.case
+        );
+        assert_the_stack_serves(row.case, &router, &identifiers, &row.template).await;
+
+        // Window 2: the plan is complete and executable, and nothing has executed it.
+        settle_the_store(&router, &engine).await;
+        assert_eq!(
+            stack_status(row.case, &router, row.stack).await,
+            status::REVIEW_IN_PROGRESS,
+            "case {:?}: creating the plan does not take the stack out of review",
+            row.case
+        );
+        assert_the_stack_serves(row.case, &router, &identifiers, &row.template).await;
+
+        // Window 3: the execution is in flight. The stack has left review for the create it is
+        // carrying out, and the template it is being deployed from is readable throughout —
+        // which is the read a deploying client makes while it waits for the create.
+        let (code, executed) = execute_change_set(&router, row.change_set, Some(row.stack)).await;
+        assert_eq!(
+            code, 200,
+            "case {:?}: expected ExecuteChangeSet to succeed, got {code} {executed}",
+            row.case
+        );
+        hold_the_operations_in_flight(&engine);
+        assert_eq!(
+            stack_status(row.case, &router, row.stack).await,
+            status::CREATE_IN_PROGRESS,
+            "case {:?}: executing the plan starts the stack's create",
+            row.case
+        );
+        assert_the_stack_serves(row.case, &router, &identifiers, &row.template).await;
+
+        // Window 4: the create has completed.
+        settle_the_store(&router, &engine).await;
+        assert_eq!(
+            stack_status(row.case, &router, row.stack).await,
+            status::CREATE_COMPLETE,
+            "case {:?}: the executed plan creates the stack",
+            row.case
+        );
+        assert_the_stack_serves(row.case, &router, &identifiers, &row.template).await;
+    }
+}
+
+/// One row of the discarded-plan table: a stack registered by a `CREATE` change set whose plan
+/// is then deleted, so the stack is left in review carrying no template at all.
+struct Discarded {
+    case: &'static str,
+    stack: &'static str,
+    change_set: &'static str,
+    template: &'static str,
+}
+
+/// The class: any stack whose only plan has been deleted before it was executed, whatever the
+/// plan was.
+fn discarded_plans() -> Vec<Discarded> {
+    vec![
+        Discarded {
+            case: "a one-resource JSON plan",
+            stack: "rev-dropped",
+            change_set: "rev-dropped-set",
+            template: r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic"}}}"#,
+        },
+        Discarded {
+            case: "a two-resource YAML plan",
+            stack: "rev-dropped-yaml",
+            change_set: "rev-dropped-yaml-set",
+            template: "Resources:\n  Group:\n    Type: AWS::Logs::LogGroup\n  Handle:\n    Type: AWS::CloudFormation::WaitConditionHandle\n",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_stack_whose_plan_was_deleted_is_refused_the_documented_validation_error() {
+    for row in discarded_plans() {
+        let (router, engine) = router_with_engine();
+
+        let (code, created) =
+            create_the_stacks_change_set(&router, row.stack, row.change_set, row.template, &[])
+                .await;
+        assert_eq!(
+            code, 200,
+            "case {:?}: expected CreateChangeSet to succeed, got {code} {created}",
+            row.case
+        );
+        let stack_id = xml_text(&created, "StackId").unwrap_or_else(|| {
+            panic!(
+                "case {:?}: CreateChangeSet answered no StackId: {created}",
+                row.case
+            )
+        });
+
+        // A plan is deletable once its creation has concluded, which is the state a client
+        // abandoning a deploy finds it in.
+        settle_the_store(&router, &engine).await;
+        let (code, deleted) = call(
+            &router,
+            "DeleteChangeSet",
+            &[
+                member("ChangeSetName", row.change_set),
+                member("StackName", row.stack),
+            ],
+        )
+        .await;
+        assert_eq!(
+            code, 200,
+            "case {:?}: expected DeleteChangeSet to succeed, got {code} {deleted}",
+            row.case
+        );
+
+        // Deleting the plan does not take the stack away: it is still in review, and now there
+        // is no document anywhere that it would be deployed from — the one state "if the
+        // template doesn't exist, a ValidationError is returned" is about.
+        assert_eq!(
+            stack_status(row.case, &router, row.stack).await,
+            status::REVIEW_IN_PROGRESS,
+            "case {:?}: the stack stays in review once its plan is gone",
+            row.case
+        );
+        for identifier in [row.stack.to_string(), stack_id.clone()] {
+            for stage in STAGES {
+                let named = stage.unwrap_or("the service's default");
+                let (code, body) = get_template(&router, &identifier, stage).await;
+                assert_eq!(
+                    code, 400,
+                    "case {:?}: GetTemplate({identifier}, {named}) must be refused once no \
+                     template exists, got {code} {body}",
+                    row.case
+                );
+                // The variable parts of the refusal are the stack as the REQUEST named it and
+                // the status the STORE holds for it; the rest of the sentence is fixed.
+                assert_eq!(
+                    refusal(&body),
+                    (
+                        "ValidationError".to_string(),
+                        format!(
+                            "Template does not exist for stack [{identifier}] in {} state",
+                            status::REVIEW_IN_PROGRESS
+                        )
+                    ),
+                    "case {:?}: GetTemplate({identifier}, {named}) must be refused naming the \
+                     stack as asked for and the status it is in, got {body}",
+                    row.case
+                );
+            }
+        }
     }
 }
 
