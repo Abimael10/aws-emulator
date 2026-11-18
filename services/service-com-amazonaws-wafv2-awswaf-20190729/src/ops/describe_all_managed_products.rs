@@ -2,9 +2,10 @@
 
 //! @op DescribeAllManagedProducts
 //! Reports every managed product the service publishes in the requested `Scope`:
-//! one `ManagedProductDescriptor` per managed rule group in this service's
-//! catalogue ([`crate::state::MANAGED_RULE_GROUP_CATALOGUE`]), in the order that
-//! catalogue publishes them.
+//! one `ManagedProductDescriptor` per product of EITHER vendor family
+//! ([`crate::state::managed_products`]) — the Amazon Web Services Marketplace
+//! sellers' listings and the Amazon Web Services Managed Rules rule groups — in the
+//! order the catalogue publishes them.
 //!
 //! A managed product is a VENDOR's publication, not a resource of this account —
 //! nothing creates, updates or deletes one — so this reporting call reads the
@@ -164,13 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Every catalogued group is published in both scopes, and what a describe
-        // reports about one is its publisher's (see
-        // `ManagedRuleGroupDescriptor::product`), so the scope narrows nothing here.
-        let managed_products = crate::state::MANAGED_RULE_GROUP_CATALOGUE
-            .iter()
-            .map(crate::state::ManagedRuleGroupDescriptor::product)
-            .collect();
+        // Every catalogued product is published in both scopes, and what a describe
+        // reports about one is its publisher's (see `crate::state::managed_products`),
+        // so the scope narrows nothing here.
+        let managed_products = crate::state::managed_products();
 
         Ok(DescribeAllManagedProductsOutput {
             managed_products: Some(managed_products),

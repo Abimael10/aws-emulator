@@ -408,6 +408,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
         let mut state = state.lock();
 
+        // A Marketplace seller's managed rule group is PUBLISHED but takes a
+        // subscription to use, and nothing in this API subscribes this account to a
+        // seller, so a rule that runs one is refused with the modelled
+        // `WAFSubscriptionNotFoundException` and nothing is stored — judged before
+        // the reference resolution below, which answers for a pair no vendor
+        // publishes at all.
+        if let Some(unsubscribed) = crate::state::unsubscribed_managed_rule_group(
+            input.rules.as_deref().unwrap_or_default(),
+        ) {
+            crate::state::audit(
+                "CreateWebACL",
+                &input.scope,
+                &input.name,
+                "",
+                &format!(
+                    "WAFSubscriptionNotFoundException: {}",
+                    unsubscribed.message.clone().unwrap_or_default()
+                ),
+            );
+            return Err(
+                CreateWebACLErrorModeled::WAFSubscriptionNotFoundException(unsubscribed).into(),
+            );
+        }
+
         // Every reference the rule tree carries must name an entity this service
         // holds, in this scope: a dangling reference is refused, not stored.
         if let Some(reason) =

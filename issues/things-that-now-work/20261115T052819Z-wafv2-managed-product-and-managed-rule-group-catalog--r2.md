@@ -87,3 +87,39 @@ Cause 2 (ListAvailableManagedRuleGroups stale Descriptions):
 2. Locate the entries whose Name is AWSManagedRulesATPRuleSet, AWSManagedRulesACFPRuleSet and AWSManagedRulesAntiDDoSRuleSet.
 3. Compare each Description against the vendor-published text AWS returns for that VendorName+Name: all three differ, each rewording the clause naming what the protection prevents (the AntiDDoS entry diverges wholesale). Every other group's Description matches.
 4. Or replay fixture wafv2-catalog-list-available-managed-rule-groups step task#1 (also wafv2-catalog-list-available-managed-rule-groups-cloudfront#task#1, wafv2-managed-rule-group-and-marketplace-product-discovery#task#1, wafv2-webacl-full-lifecycle-with-managed-rules#task#1).
+
+## Resolution
+
+Cause 1 — FIXED as to the rule, with the Marketplace family's MEMBERSHIP limited to the listings any
+source available here states. The rule: `DescribeAllManagedProducts` reports one descriptor per managed
+product of EITHER vendor family — the Amazon Web Services Managed Rules rule groups and the Amazon Web
+Services Marketplace sellers' managed rule groups — each carrying its publishing vendor's identity: a
+`ProductId` that identifies the product independently of its `ManagedRuleSetName`, the ARN of the
+topic that VENDOR announces its changes on, and, for a Marketplace product only, the `ProductLink` to
+its product page; what a web ACL may RUN stays the narrower set, because
+`ListAvailableManagedRuleGroups` lists only the Amazon Web Services Managed Rules groups and the
+Marketplace groups the account is SUBSCRIBED to. The product catalogue in
+`services/service-com-amazonaws-wafv2-awswaf-20190729/src/state/managed_products.rs` now carries the
+Marketplace family beside the Amazon Web Services Managed Rules rule sets, and both describes project
+that one catalogue. A seller's group is published but takes a subscription to use, and nothing in this
+API subscribes this account to a seller, so a rule that runs one earns the modelled
+`WAFSubscriptionNotFoundException` on `CreateWebACL`, `UpdateWebACL` and `CheckCapacity` — a pair no
+vendor publishes stays `WAFNonexistentItemException` — and `ListAvailableManagedRuleGroups` still lists
+only the groups this account may run.
+
+Every Marketplace entry is CITED rather than composed: the two listings this report's evidence states
+(`CyberSecurityCloud-HighSecurityOWASPSet-` and `CyberSecurityCloud-APIGatewayServerless-`), with the
+seller's vendor name, each group's name, each product page's listing code, the seller's notification
+topic and whatever of the listing's own text the report states — a title or summary it does not state
+is omitted rather than worded by this emulator. The catalogue publishes, per entry, the product's
+identifier (derived from the pair that identifies it: stable per product, distinct per product, never
+the rule-set name) and the ARN of its seller's topic through the emulator's own ARN builder, because a
+seller's GUIDs and account are not observable here. The rest of AWS's 46-entry membership is NOT
+served: it is a snapshot of third-party seller inventory no rule of the service produces and no source
+available here states, so the replay key for this operation stays red rather than being closed with an
+invented inventory. Adding a seller's listing is a data change in that one list.
+
+Cause 2 — FIXED. A catalogue entry's `Description` is the sentence the group's publisher states for
+that entry, carried per group and reported verbatim; `src/state/catalog.rs` now holds the publisher's
+wording for `AWSManagedRulesATPRuleSet`, `AWSManagedRulesACFPRuleSet` and
+`AWSManagedRulesAntiDDoSRuleSet`, and all three replay keys pass.

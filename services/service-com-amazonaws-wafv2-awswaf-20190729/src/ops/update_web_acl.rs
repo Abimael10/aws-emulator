@@ -442,6 +442,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A Marketplace seller's managed rule group is PUBLISHED but takes a
+        // subscription to use, and nothing in this API subscribes this account to a
+        // seller, so a rule that runs one is refused with the modelled
+        // `WAFSubscriptionNotFoundException` and the stored web ACL and its lock
+        // token are left untouched.
+        if let Some(unsubscribed) = crate::state::unsubscribed_managed_rule_group(
+            input.rules.as_deref().unwrap_or_default(),
+        ) {
+            crate::state::audit(
+                "UpdateWebACL",
+                &input.scope,
+                &input.name,
+                &input.id,
+                &format!(
+                    "WAFSubscriptionNotFoundException: {}",
+                    unsubscribed.message.clone().unwrap_or_default()
+                ),
+            );
+            return Err(
+                UpdateWebACLErrorModeled::WAFSubscriptionNotFoundException(unsubscribed).into(),
+            );
+        }
+
         // Every reference the new rule tree carries must name an entity this service
         // holds, in this scope: a dangling reference is refused, and the stored web
         // ACL and its lock token are left untouched.

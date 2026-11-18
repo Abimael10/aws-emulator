@@ -247,6 +247,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A Marketplace seller's managed rule group is PUBLISHED but takes a
+        // subscription to use, and nothing in this API subscribes this account to a
+        // seller — so a rule list that runs one cannot be priced for this account at
+        // all: it is refused with the modelled `WAFSubscriptionNotFoundException`,
+        // the way the save path refuses it, before the reference resolution that
+        // answers for a pair no vendor publishes. Read from the published catalogue,
+        // so the store is not touched.
+        if let Some(unsubscribed) = crate::state::unsubscribed_managed_rule_group(&input.rules) {
+            return Err(
+                CheckCapacityErrorModeled::WAFSubscriptionNotFoundException(unsubscribed).into(),
+            );
+        }
+
         // WAF prices a statement that runs a rule group from that group's own reported
         // capacity, so a reference naming an entity this service does not hold in this
         // scope cannot be priced at all: it is refused the way the save path refuses it,

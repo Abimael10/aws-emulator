@@ -178,19 +178,21 @@ impl ManagedRuleGroupDescriptor {
     /// out of step with it: the `(VendorName, ManagedRuleSetName)` pair that
     /// identifies the group, its title and description, and its two flags.
     ///
-    /// `ProductId` is "a unique identifier for the rule group", and a
-    /// vendor-published group is identified by its name within its vendor, so the
-    /// name is that identifier. `ProductLink` is left off: it is "for Amazon Web
-    /// Services Marketplace managed rule groups only", and this catalogue
-    /// publishes no marketplace group. `SnsTopicArn` is the topic "used to provide
-    /// notification of changes to the managed rule group": one topic per group, in
-    /// the region the group's `scope` is reached through, minted through the
-    /// emulator's own ARN builder like every other ARN this service answers.
+    /// `ProductId` is "a unique identifier for the rule group", which is the
+    /// product's OWN identifier rather than the name a caller writes in a
+    /// `ManagedRuleGroupStatement` — see [`managed_product_id`], which publishes
+    /// one per product for both vendor families. `ProductLink` is left off: it is
+    /// "for Amazon Web Services Marketplace managed rule groups only", and these
+    /// are the groups Amazon Web Services Managed Rules publish, not a
+    /// Marketplace seller's ([`MARKETPLACE_MANAGED_PRODUCT_CATALOGUE`] carries
+    /// those). `SnsTopicArn` is the topic "used to provide notification of changes
+    /// to the managed rule group": the one its publishing vendor announces its
+    /// changes on ([`Self::sns_topic_arn`]).
     pub fn product(&self) -> ManagedProductDescriptor {
         ManagedProductDescriptor {
             vendor_name: Some(self.vendor_name.to_string()),
             managed_rule_set_name: Some(self.name.to_string()),
-            product_id: Some(self.name.to_string()),
+            product_id: Some(managed_product_id(self.vendor_name, self.name)),
             product_link: None,
             product_title: Some(self.product_title.to_string()),
             product_description: Some(self.product_description.to_string()),
@@ -209,13 +211,11 @@ impl ManagedRuleGroupDescriptor {
     /// Its publisher announces every change to its managed rule groups on ONE topic,
     /// in the one region that topic lives in, so the ARN carries neither the group nor
     /// the scope nor the caller's region: see
-    /// [`AWS_MANAGED_RULE_NOTIFICATION_TOPIC`].
+    /// [`AWS_MANAGED_RULE_NOTIFICATION_TOPIC`]. One topic per VENDOR is the same
+    /// reading a Marketplace seller's listing is reported under
+    /// ([`managed_product_topic_arn`], which mints both).
     pub fn sns_topic_arn(&self) -> String {
-        ::engine::emulator_arn(
-            "sns",
-            AWS_MANAGED_RULE_NOTIFICATION_REGION,
-            AWS_MANAGED_RULE_NOTIFICATION_TOPIC,
-        )
+        managed_product_topic_arn(AWS_MANAGED_RULE_NOTIFICATION_TOPIC)
     }
 
     /// The version of this group `requested` names, or the vendor's default when a
@@ -715,10 +715,9 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         ATP_RETIRED_VERSIONS,
         "Provides protection for your login page against stolen credentials, \
          credential stuffing attacks, brute force login attempts, and other \
-         anomalous login activities. With AWS WAF Fraud Control account takeover \
-         prevention (ATP), you can prevent unauthorized access that might lead to \
-         fraudulent activities, or inform legitimate users to take a preventive \
-         action.",
+         anomalous login activities. With account takeover prevention, you can \
+         prevent unauthorized access that may lead to fraudulent activities, or \
+         inform legitimate users to take a preventive action.",
         "Account takeover prevention",
         "Detects and manages requests that are part of malicious account takeover \
          attempts against your login pages.",
@@ -732,9 +731,8 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         ACFP_VERSIONS,
         NO_RETIRED_VERSIONS,
         "Provides protection against the creation of fraudulent accounts on your \
-         site. Fraudulent accounts can be used for activities such as abusing \
-         promotion and sign-up bonuses, impersonating someone, and to carry out \
-         phishing and spam attacks.",
+         site. Fraudulent accounts can be used for activities such as obtaining \
+         sign-up bonuses and impersonating legitimate users.",
         "Account creation fraud prevention",
         "Detects and manages requests that are part of malicious account creation \
          attempts against your account registration pages.",
@@ -747,10 +745,8 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
         50,
         ANTI_DDOS_VERSIONS,
         NO_RETIRED_VERSIONS,
-        "Provides protection against distributed denial of service (DDoS) events. \
-         This rule group contains rules that detect requests that are \
-         contributing to a DDoS event against your protected resources and \
-         challenge or block them.",
+        "Provides protection against DDoS attacks targeting the application layer, \
+         also known as Layer 7 attacks.",
         "Anti-DDoS",
         "Detects and manages requests that are part of a distributed \
          denial-of-service event against your protected resources.",

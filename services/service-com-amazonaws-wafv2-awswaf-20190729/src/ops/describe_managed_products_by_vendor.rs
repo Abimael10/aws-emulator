@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeManagedProductsByVendor
-//! Reports the managed products published by ONE vendor: the entries of this
-//! service's catalogue ([`crate::state::MANAGED_RULE_GROUP_CATALOGUE`]) whose
-//! publishing vendor is the requested `VendorName`, as the same
-//! `ManagedProductDescriptor` projection `DescribeAllManagedProducts` reports for
-//! the whole catalogue, in the order that catalogue publishes them.
+//! Reports the managed products published by ONE vendor: the products of this
+//! service's catalogue ([`crate::state::managed_products`]) whose publishing vendor
+//! is the requested `VendorName`, as the same `ManagedProductDescriptor` projection
+//! `DescribeAllManagedProducts` reports for the whole catalogue, in the order that
+//! catalogue publishes them.
 //!
 //! The vendor is matched exactly, like the `(VendorName, Name)` pair that
 //! identifies a managed rule group ([`crate::state::managed_rule_group`]): a
@@ -173,20 +173,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Every catalogued group is published in both scopes, and what a describe
+        // Every catalogued product is published in both scopes, and what a describe
         // reports about one is its publisher's (see
-        // `ManagedRuleGroupDescriptor::product`), so the scope narrows nothing here.
+        // `crate::state::managed_products`), so the scope narrows nothing here.
         // `VendorName` is the one filter this call adds: it is "the name of the
         // managed rule group vendor.
         // You use this, along with the rule group name, to identify a rule group"
-        // (the member's own doc), so it is matched exactly against each group's
+        // (the member's own doc), so it is matched exactly against each product's
         // publishing vendor, and a vendor that publishes nothing here reports an
         // empty list rather than a refusal.
-        let managed_products = crate::state::MANAGED_RULE_GROUP_CATALOGUE
-            .iter()
-            .filter(|group| group.vendor_name == input.vendor_name)
-            .map(crate::state::ManagedRuleGroupDescriptor::product)
-            .collect();
+        let managed_products = crate::state::managed_products_of_vendor(&input.vendor_name);
 
         Ok(DescribeManagedProductsByVendorOutput {
             managed_products: Some(managed_products),

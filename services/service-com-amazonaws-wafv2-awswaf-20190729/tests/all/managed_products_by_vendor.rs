@@ -4,8 +4,8 @@
 //!
 //! The rule asserted here: `DescribeManagedProductsByVendor` reports exactly the
 //! managed products whose publishing vendor is the requested `VendorName` — the
-//! entries of the published catalogue
-//! (`service_…::state::MANAGED_RULE_GROUP_CATALOGUE`) matched on that name, in
+//! products of the published catalogue
+//! (`service_…::state::managed_products`) matched on that name, in
 //! published order, each carrying the same descriptor
 //! `DescribeAllManagedProducts` reports for it — so a vendor that publishes
 //! nothing here is reported with an empty list, and the report is the same in
@@ -20,7 +20,10 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_wafv2_awswaf_20190729::state::MANAGED_RULE_GROUP_CATALOGUE;
+use service_com_amazonaws_wafv2_awswaf_20190729::state::{
+    managed_products_of_vendor, MANAGED_RULE_GROUP_CATALOGUE,
+    MARKETPLACE_MANAGED_PRODUCT_CATALOGUE,
+};
 
 use crate::managed_rule_groups::managed_statement;
 use crate::web_acl_lifecycle::{create_web_acl, visibility, Waf};
@@ -33,11 +36,16 @@ fn reported(response: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// Every vendor the catalogue publishes a group under.
+/// Every vendor the catalogue publishes a product under, of either vendor family.
 fn publishing_vendors() -> BTreeSet<&'static str> {
     MANAGED_RULE_GROUP_CATALOGUE
         .iter()
         .map(|group| group.vendor_name)
+        .chain(
+            MARKETPLACE_MANAGED_PRODUCT_CATALOGUE
+                .iter()
+                .map(|listing| listing.seller.vendor_name),
+        )
         .collect()
 }
 
@@ -105,14 +113,11 @@ async fn a_vendor_is_reported_exactly_the_products_it_publishes() {
                 expected.len()
             );
 
-            let catalogued = MANAGED_RULE_GROUP_CATALOGUE
-                .iter()
-                .filter(|group| group.vendor_name == vendor.as_str())
-                .count();
+            let catalogued = managed_products_of_vendor(vendor).len();
             assert_eq!(
                 products.len(),
                 catalogued,
-                "case {case:?}: expected one product per catalogued group of this \
+                "case {case:?}: expected one product per catalogued product of this \
                  vendor ({catalogued}), got {}: {response}",
                 products.len()
             );
@@ -193,10 +198,7 @@ async fn a_vendor_name_outside_the_modelled_length_is_refused() {
             .await;
         assert_eq!(
             reported(&response).len(),
-            MANAGED_RULE_GROUP_CATALOGUE
-                .iter()
-                .filter(|group| group.vendor_name == vendor.as_str())
-                .count(),
+            managed_products_of_vendor(&vendor).len(),
             "case {case:?}: a name on the bound must be answered with that vendor's \
              products, got {response}"
         );

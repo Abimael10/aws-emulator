@@ -32,7 +32,8 @@ use crate::ops::types::{
     WAFDuplicateItemException, WAFExpiredManagedRuleGroupVersionException,
     WAFFeatureNotIncludedInPricingPlanException, WAFInvalidOperationException,
     WAFInvalidParameterException, WAFInvalidPermissionPolicyException, WAFLimitsExceededException,
-    WAFNonexistentItemException, WAFOptimisticLockException, WAFTagOperationException,
+    WAFNonexistentItemException, WAFOptimisticLockException, WAFSubscriptionNotFoundException,
+    WAFTagOperationException,
     WAFUnsupportedAggregateKeyTypeException, WebACL, BLOCKCHAIN_CHAIN_VALUES,
     CURRENCY_MODE_VALUES, CURRENCY_VALUES, PLATFORM_VALUES, SETTLEMENT_STATUS_VALUES,
 };
@@ -53,6 +54,9 @@ mod description;
 mod identifier_refusals;
 /// The notation and the order an IP set holds its `Addresses` in.
 mod ip_set_addresses;
+/// The managed PRODUCTS this service publishes: both vendor families of managed
+/// rule group, and what one of them is reported as.
+mod managed_products;
 /// The caller-supplied regular expressions a save carries, and the refusal one that
 /// is not something that matches draws.
 mod patterns;
@@ -67,6 +71,7 @@ pub use constraint_clauses::*;
 pub use description::*;
 pub use identifier_refusals::*;
 pub use ip_set_addresses::*;
+pub use managed_products::*;
 pub use patterns::*;
 pub use rule_set::*;
 pub use scope::*;
@@ -2905,27 +2910,28 @@ pub(crate) fn fresh_entropy() -> [u8; 32] {
 /// (`^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$`, from
 /// `smithy_query(query="shape",shape="LockToken")`).
 ///
-/// The 128 bits come from [`fresh_entropy`] and are hex-encoded (the `hex` crate).
-/// The version nibble and the variant bits RFC 4122 §4.4 fixes are then set, so
-/// the value is a well-formed version-4 UUID. An id or a lock token names a
-/// resource; a credential would come from `ctx.credential_store()`, never here.
+/// The 128 bits come from [`fresh_entropy`] and are rendered by the ONE renderer
+/// this workspace holds for them
+/// ([`::service_common::uuid_from_random_bytes`], which sets the version and
+/// variant bits RFC 9562 fixes), so no service spells out those masks again. An id
+/// or a lock token names a resource; a credential would come from
+/// `ctx.credential_store()`, never here.
 pub fn new_uuid() -> String {
     let digest = fresh_entropy();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
-    // RFC 4122 §4.4: the version nibble is 4, and the variant's two top bits are
-    // `10`.
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let rendered = ::hex::encode(bytes);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &rendered[..8],
-        &rendered[8..12],
-        &rendered[12..16],
-        &rendered[16..20],
-        &rendered[20..]
-    )
+    uuid_text(bytes)
+}
+
+/// The lowercase, hyphenated UUID text `bytes` spells, in the form every
+/// `EntityId` and `LockToken` of this model takes.
+///
+/// One call into the workspace's own renderer, whichever source the bytes came
+/// from: fresh entropy for an id a mutation mints ([`new_uuid`]), or the digest of
+/// the pair that identifies a published managed product ([`managed_product_id`])
+/// for an identifier the catalogue publishes.
+pub(crate) fn uuid_text(bytes: [u8; 16]) -> String {
+    ::service_common::uuid_from_random_bytes(bytes)
 }
 
 /// Record what a state-changing WAFv2 call did, as the audit trail a mutation

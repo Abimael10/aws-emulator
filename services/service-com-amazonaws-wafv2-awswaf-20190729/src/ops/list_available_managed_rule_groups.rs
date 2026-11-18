@@ -14,6 +14,14 @@
 //! by calling ListAvailableManagedRuleGroups" (`ManagedRuleGroupStatement`'s own
 //! doc).
 //!
+//! That catalogue is the narrower of the two families a managed-product describe
+//! reports ([`crate::state::managed_products`]): this call lists "all Amazon Web
+//! Services Managed Rules rule groups and all of the Amazon Web Services
+//! Marketplace managed rule groups that you're SUBSCRIBED to" (the operation's own
+//! doc), and nothing subscribes this account to a Marketplace seller, so a seller's
+//! listing ([`crate::state::MARKETPLACE_MANAGED_PRODUCT_CATALOGUE`]) is published as
+//! a product without being available here.
+//!
 //! Nothing here writes: the response is a reading of published data, so two
 //! identical calls answer identically and a call changes nothing a later caller
 //! sees.
