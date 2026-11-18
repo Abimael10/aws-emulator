@@ -111,8 +111,8 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// response no operation produced still names the request it answers. Identity, the
     /// protocol and the operations are the generated entry's untouched.
     entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
-    /// One [`CatalogNameValidation`] per operation whose name members this service words
-    /// its own refusal for, keyed by the routing key the model names that operation by
+    /// One [`GlueInputValidation`] per operation whose own input validation this service
+    /// words itself, keyed by the routing key the model names that operation by
     /// ([`Operation::NAME`], the key the generated routing table uses). Built once here,
     /// never per request; each entry is zero-sized, so this is a table of NAMES rather
     /// than a second set of operations — the operation that serves a request is still the
@@ -121,7 +121,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// Each wrapper is composed inside [`RequestIdReportingOperation::header`], so the
     /// refusal it words names the request it answered exactly as every other response of
     /// this service does.
-    name_refusals: HashMap<&'static str, Box<dyn ErasedOperation>>,
+    input_refusals: HashMap<&'static str, Box<dyn ErasedOperation>>,
     /// Serves every OTHER modelled operation exactly as the generated routing table would,
     /// and names the request its response answers. Held, not built per request:
     /// `override_operation` hands back a borrow of it.
@@ -135,7 +135,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(engine)),
-            name_refusals: catalog_name_validation_table::<Eng>(),
+            input_refusals: glue_input_validation_table::<Eng>(),
             request_id: RequestIdHeaderOperation,
         }
     }
@@ -166,8 +166,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Serve the catalog operations whose name members this service judges itself
-        // through their [`CatalogNameValidation`] wrapper, so a request that leaves one of
+        // Serve the operations whose own input validation this service words itself
+        // through their [`GlueInputValidation`] wrapper, so a request that leaves one of
         // those members ABSENT is refused in the operation's own modelled
         // `InvalidInputException` instead of the framework's refusal body — the same
         // answer an EMPTY name earns inside the handler, because the catalog's sentence
@@ -179,7 +179,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // operation for resolves to nothing here and keeps the framework's routing
         // failure.
         let key = self.entry.protocol().routing_key(req).ok()?;
-        if let Some(wrapper) = self.name_refusals.get(key) {
+        if let Some(wrapper) = self.input_refusals.get(key) {
             return Some(&**wrapper);
         }
         // NOT a re-route: every other request is served by the operation this service's
@@ -247,12 +247,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 /// `ValidationException`, whose lowercase `message` carries
 /// `N validation error(s) detected: Value '<value>' at '<member path>' failed to satisfy
 /// constraint: <requirement>`, with a `@pattern` requirement quoted WITHOUT the anchoring
-/// pair the model wraps it in, which is the text AWS publishes for it. The one thing this
-/// service adds is the MEMBER PATH: Glue states the path of its own request model
-/// ([`api_request_path`]), which spells the member carrying a resource definition for the
-/// resource it carries. Everything else — which refusals are restated, the code, the
-/// envelope, the clause order and every other requirement — stays the shared renderer's
-/// and the framework's, so two Glue refusal paths cannot drift apart.
+/// pair the model wraps it in, which is the text AWS publishes for it. Two things this
+/// service adds, both in [`as_glue_clause`]: the MEMBER PATH, because Glue states the path
+/// of its own request model ([`api_request_path`]), which spells the member carrying a
+/// resource definition for the resource it carries; and the ORDER an enumerated type's
+/// admissible value set is listed in, which is the order the layer in front of this service
+/// enumerates its own table of those values. Everything else — which refusals are restated,
+/// the code, the envelope, the clause order and every other requirement — stays the shared
+/// renderer's and the framework's, so two Glue refusal paths cannot drift apart.
 ///
 /// Both paths that answer a boundary refusal in this service go through here: this
 /// service's [`Service::override_refusal`], and the pre-handler wrapper at the end of this
@@ -261,24 +263,100 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 /// the request — so a clause stated through `override_refusal` carries the framework's own
 /// elision of a value past its echo ceiling.
 fn glue_constraint_refusal(refusal: &Refusal) -> Option<Refused> {
-    ::service_common::validation_message::aws_validation_refusal(&at_api_request_paths(refusal))
+    ::service_common::validation_message::aws_validation_refusal(&as_glue_states_it(refusal))
 }
 
-/// `refusal` with every violation's member path spelled the way Glue's own API spells it
-/// ([`api_request_path`]).
-fn at_api_request_paths(refusal: &Refusal) -> Refusal {
+/// [`glue_constraint_refusal`] for a caller holding the operation's INPUT SHAPE as well as
+/// the violations: the same refusal, with each clause's value half additionally written the
+/// way the member's modelled TYPE is written ([`in_floating_point_form`]).
+///
+/// The extra rendering needs the shape and the refusal seam is handed neither — only the
+/// violations — so the pre-handler wrapper at the end of this file, which knows the
+/// operation it serves, is the path that states it. Everything else is
+/// [`glue_constraint_refusal`]'s.
+fn glue_constraint_refusal_of(
+    input_schema: &'static ::aws_smithy_schema::Schema,
+    violations: &[Violation],
+) -> Option<Refused> {
+    let stated: Vec<Violation> = in_floating_point_form(input_schema, violations);
+    glue_constraint_refusal(&Refusal::Invalid(stated))
+}
+
+/// [`glue_constraint_refusal_of`], with the value half of every clause DROPPED — the
+/// rendering of an operation whose recorded clauses name the member and the requirement and
+/// quote no value ([`JSON_ENVELOPE_OPERATIONS`]).
+///
+/// The drop is the shared renderer's own
+/// (`service_common::validation_message::aws_validation_refusal_withholding`), so a clause
+/// that states no value reads exactly like one that does minus that half.
+fn glue_constraint_refusal_withholding(
+    input_schema: &'static ::aws_smithy_schema::Schema,
+    violations: &[Violation],
+) -> Option<Refused> {
+    let stated = in_floating_point_form(input_schema, violations);
+    ::service_common::validation_message::aws_validation_refusal_withholding(
+        &as_glue_states_it(&Refusal::Invalid(stated)),
+        |_| true,
+    )
+}
+
+/// `refusal` with every violation stated the way Glue states one ([`as_glue_clause`]).
+fn as_glue_states_it(refusal: &Refusal) -> Refusal {
     match refusal {
-        Refusal::Invalid(violations) => Refusal::Invalid(
-            violations
-                .iter()
-                .map(|violation| Violation {
-                    path: api_request_path(&violation.path),
-                    ..violation.clone()
-                })
-                .collect(),
-        ),
+        Refusal::Invalid(violations) => {
+            Refusal::Invalid(violations.iter().map(as_glue_clause).collect())
+        }
         other => other.clone(),
     }
+}
+
+/// One violation as Glue's own clause states it: at the member path Glue's API spells
+/// ([`api_request_path`]), and with an enumerated type's admissible value set listed in the
+/// order the layer in front of this service enumerates that set
+/// (`service_common::validation_message::in_hashed_enum_order` — the order of its own hash
+/// table over the value texts, which is neither the model's declaration order nor
+/// alphabetical).
+///
+/// The clause, the requirement and the envelope stay the shared renderer's and the
+/// framework's: only the member path and the ORDER of a value set move, so every Glue
+/// refusal path words one constraint identically.
+fn as_glue_clause(violation: &Violation) -> Violation {
+    let stated = ::service_common::validation_message::in_hashed_enum_order(violation);
+    Violation {
+        path: api_request_path(&stated.path),
+        ..stated
+    }
+}
+
+/// `violations` with the value half of each clause about a FLOATING-POINT member of
+/// `input_schema` written the way that type is written — a whole `150` as `150.0` — rather
+/// than as the decimal expansion the framework's numeric rendering produces.
+///
+/// WHICH members are floating point is read off the MODEL
+/// (`service_common::validation_message::floating_point_member_paths` over the operation's
+/// own input shape), so a member added to the model reaches this with the model and nothing
+/// is named by hand. The rendering itself is the shared one
+/// (`service_common::validation_message::in_float_value_rendering`), so two services cannot
+/// quote one double differently.
+///
+/// Read only when there is something to state, so a request that satisfies the model pays
+/// nothing for it.
+fn in_floating_point_form(
+    input_schema: &'static ::aws_smithy_schema::Schema,
+    violations: &[Violation],
+) -> Vec<Violation> {
+    let floating = ::service_common::validation_message::floating_point_member_paths(&[(
+        "",
+        input_schema,
+    )]);
+    violations
+        .iter()
+        .map(|violation| {
+            ::service_common::validation_message::in_float_value_rendering(violation, |path| {
+                floating.contains(path)
+            })
+        })
+        .collect()
 }
 
 /// The suffix the WIRE spells a member carrying a resource definition with
@@ -399,18 +477,144 @@ pub fn attribute_outside_set(attributes: &[String], admitted: &[&str]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// The name refusal the framework boundary would answer instead
+// The `@pattern` the framework boundary cannot apply
+// ---------------------------------------------------------------------------
+
+/// The expression `HashString` and `NameString` — the shapes nearly every Glue id and name
+/// member targets — declare, as the model writes it
+/// (`smithy_query(query="shape",shape="HashString")`).
+pub const HASH_STRING_PATTERN: &str =
+    r"^[\u0020-\uD7FF\uE000-\uFFFD\uD800\uDC00-\uDBFF\uDFFF\t]*$";
+
+/// Whether `value` satisfies [`HASH_STRING_PATTERN`].
+///
+/// The expression admits a tab and the three Unicode ranges it spells: U+0020..U+D7FF,
+/// U+E000..U+FFFD, and the astral planes, which it writes as the UTF-16 surrogate pair
+/// range `\uD800\uDC00-\uDBFF\uDFFF` and which a Rust `char` holds directly
+/// (U+10000..U+10FFFF). So every other character is outside it: a control character below
+/// U+0020 other than a tab — a newline, a carriage return — and the two non-characters
+/// U+FFFE and U+FFFF.
+///
+/// It is checked HERE, in the operation that reads the member, because the boundary
+/// validator cannot: the framework's regex engine does not compile an expression spelling a
+/// surrogate range, and a pattern it cannot compile admits every value
+/// (`vendor/smithy-schema-server/src/constraints.rs`).
+#[must_use]
+pub fn is_modelled_hash_string(value: &str) -> bool {
+    value.chars().all(|character| {
+        matches!(character,
+            '\t' | '\u{0020}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+    })
+}
+
+/// The constraint refusal a value outside [`HASH_STRING_PATTERN`] earns at `member_path`,
+/// or `None` for a value the expression admits.
+///
+/// AWS's own validation-error envelope over the one clause that fired, naming the value the
+/// caller submitted, the member path it was sent at and the expression it had to satisfy —
+/// built through [`glue_constraint_refusal`], so a clause this service states itself reads
+/// exactly like one the boundary states for a pattern it CAN compile.
+///
+/// Which error a handler carries it in is the operation's own: the recordings show the
+/// operations modelling `InvalidInputException` answering that, and the ones that do not
+/// answering the framework's `ValidationException` channel.
+#[must_use]
+pub fn hash_string_pattern_refusal(member_path: &str, value: &str) -> Option<String> {
+    if is_modelled_hash_string(value) {
+        return None;
+    }
+    glue_constraint_refusal(&Refusal::Invalid(vec![Violation {
+        path: member_path.to_string(),
+        kind: ViolationKind::Pattern(HASH_STRING_PATTERN.to_string()),
+        value: Some(value.to_string()),
+        sensitive: false,
+    }]))
+    .map(|refused| refused.message)
+}
+
+// ---------------------------------------------------------------------------
+// The members Glue states a requirement for in its own error
 // ---------------------------------------------------------------------------
 //
-// A required name member supplied as null or empty is GLUE's refusal, not the constraint
-// validator's, but neither half of it can be made inside a handler: an ABSENT member is
+// The same layering as the catalog's name members above, over the OTHER members whose
+// requirement Glue states itself: a request that carries no value at all for one of them —
+// the member absent, or a collection member supplied EMPTY, which is the same "you gave me
+// none" to the service — is the operation's own modelled `InvalidInputException` carrying
+// Glue's sentence for that check, never the boundary's `ValidationException`.
+
+/// The sentence `PutDataCatalogExportConfiguration` states its `ExportSetting` requirement
+/// with.
+///
+/// RECORDED constant, and nothing in it comes from the request. The JSON envelope the
+/// recording shows around it is not part of the sentence: that envelope is this operation's
+/// own rendering of EVERY refusal of its input ([`JSON_ENVELOPE_OPERATIONS`]), so it is
+/// applied in one place rather than baked into one message.
+const EXPORT_SETTING_REQUIRED: &str = "ExportSetting is required.";
+
+/// The sentence `StartDataQualityRulesetEvaluationRun` states its `RulesetNames`
+/// requirement with.
+///
+/// RECORDED constant, and the whole message: it states the requirement as a count rather
+/// than naming the member, so one wording answers both an absent list and an empty one —
+/// which is exactly the pair of violations this check covers.
+const AT_LEAST_ONE_RULESET_NAME: &str = "At least one ruleset name must be provided.";
+
+/// The operations whose API states a missing required member as `<Member> is required for
+/// <Operation>` ([`member_required_for`]): the TABLE OPTIMIZER family, every operation of
+/// which addresses an optimizer by the same four `@required` members
+/// (`CatalogId`, `DatabaseName`, `TableName`, `Type`).
+///
+/// The sentence names the member and the operation and nothing else, so it covers every
+/// required member of every operation in the family rather than the one member a recording
+/// happened to omit.
+const MEMBER_REQUIRED_OPERATIONS: [&str; 5] = [
+    "CreateTableOptimizer",
+    "DeleteTableOptimizer",
+    "GetTableOptimizer",
+    "ListTableOptimizerRuns",
+    "UpdateTableOptimizer",
+];
+
+/// The sentence [`MEMBER_REQUIRED_OPERATIONS`] state a requirement with: the member as the
+/// MODEL spells it, then the operation that requires it.
+///
+/// RECORDED template: fixed text plus two variable parts, both read off the request's own
+/// model — the member the request left out and the operation it called.
+fn member_required_for(member: &str, operation: &str) -> String {
+    format!("{member} is required for {operation}")
+}
+
+/// A TOP-LEVEL violation path as the MODEL spells the member it names: the path's own
+/// spelling with its first letter upper-cased, which is the inverse of the lowerCamel casing
+/// the framework's walk applies to a member name
+/// (`aws_smithy_schema_server::constraints::path::member`).
+///
+/// `None` for a path naming a member INSIDE another member: every segment under the first
+/// is a member of a definition shape, and re-casing only the first letter of a dotted path
+/// would spell half of it as the model does and half as the walk does. A nested omission is
+/// therefore left to the boundary, which spells the whole path itself.
+fn as_modelled_member(path: &str) -> Option<String> {
+    if path.contains('.') {
+        return None;
+    }
+    let mut characters = path.chars();
+    let first = characters.next()?;
+    Some(first.to_uppercase().chain(characters).collect())
+}
+
+// ---------------------------------------------------------------------------
+// The refusal the framework boundary would answer instead
+// ---------------------------------------------------------------------------
+//
+// A member supplied as null or empty is GLUE's refusal, not the constraint validator's, but
+// neither half of it can be made inside a handler: an ABSENT member is
 // found while the request is being READ, so no input value ever exists to judge (the
 // model makes such a member non-`Option` on the generated input struct), and an EMPTY one
 // breaks the member's modelled `@length` minimum, which the boundary walk answers before
 // any handler runs. Taking the member off that walk is not the answer either, because the
 // SAME `@length` carries the maximum the validator does answer. So the wrapper below runs
 // the framework's own boundary walk first, answers exactly those two violations in the
-// catalog's own error, and leaves every other violation — the `@length` maximum included
+// operation's own error, and leaves every other violation — the `@length` maximum included
 // — to the boundary.
 
 /// `InvalidInputException`'s wire error code and its modelled `@httpError`
@@ -426,24 +630,58 @@ const INVALID_INPUT_EXCEPTION_STATUS: u16 = 400;
 /// (`crate::scaffolded::Scaffolded::ValidationException`).
 const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 
-/// The catalog operations whose name members Glue judges itself, each wrapped so a name
-/// supplied as null or empty is answered in the catalog's own error.
+/// The operations whose own input validation Glue words itself, each wrapped so a member
+/// the request supplied no value for is answered in the operation's own modelled error, and
+/// so a constraint clause quotes the value the request carried in its modelled form.
 ///
-/// Exactly the database and table operations whose name members the sentences above word a
-/// refusal for: an operation added to that set is wrapped by adding one line here, and one
-/// that judges no name member is served straight from the generated routing table.
-fn catalog_name_validation_table<Eng: Send + Sync + 'static>(
+/// Exactly the operations the sentences above word a refusal for: one added to that set is
+/// wrapped by adding one line here, and one that judges no member of its own is served
+/// straight from the generated routing table.
+fn glue_input_validation_table<Eng: Send + Sync + 'static>(
 ) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
     let mut refusals: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
-    register_name_validation::<crate::ops::create_database::CreateDatabase<Eng>>(&mut refusals);
-    register_name_validation::<crate::ops::update_database::UpdateDatabase<Eng>>(&mut refusals);
-    register_name_validation::<crate::ops::get_database::GetDatabase<Eng>>(&mut refusals);
-    register_name_validation::<crate::ops::delete_database::DeleteDatabase<Eng>>(&mut refusals);
-    register_name_validation::<crate::ops::create_table::CreateTable<Eng>>(&mut refusals);
-    register_name_validation::<crate::ops::update_table::UpdateTable<Eng>>(&mut refusals);
-    register_name_validation::<crate::ops::get_table::GetTable<Eng>>(&mut refusals);
-    register_name_validation::<crate::ops::get_tables::GetTables<Eng>>(&mut refusals);
-    register_name_validation::<crate::ops::delete_table::DeleteTable<Eng>>(&mut refusals);
+    register_input_validation::<crate::ops::create_database::CreateDatabase<Eng>>(&mut refusals);
+    register_input_validation::<crate::ops::update_database::UpdateDatabase<Eng>>(&mut refusals);
+    register_input_validation::<crate::ops::get_database::GetDatabase<Eng>>(&mut refusals);
+    register_input_validation::<crate::ops::delete_database::DeleteDatabase<Eng>>(&mut refusals);
+    register_input_validation::<crate::ops::create_table::CreateTable<Eng>>(&mut refusals);
+    register_input_validation::<crate::ops::update_table::UpdateTable<Eng>>(&mut refusals);
+    register_input_validation::<crate::ops::get_table::GetTable<Eng>>(&mut refusals);
+    register_input_validation::<crate::ops::get_tables::GetTables<Eng>>(&mut refusals);
+    register_input_validation::<crate::ops::delete_table::DeleteTable<Eng>>(&mut refusals);
+    // The TABLE OPTIMIZER family, whose API states every required member it was given none
+    // of as `<Member> is required for <Operation>` ([`MEMBER_REQUIRED_OPERATIONS`]).
+    register_input_validation::<crate::ops::create_table_optimizer::CreateTableOptimizer<Eng>>(
+        &mut refusals,
+    );
+    register_input_validation::<crate::ops::delete_table_optimizer::DeleteTableOptimizer<Eng>>(
+        &mut refusals,
+    );
+    register_input_validation::<crate::ops::get_table_optimizer::GetTableOptimizer<Eng>>(
+        &mut refusals,
+    );
+    register_input_validation::<crate::ops::list_table_optimizer_runs::ListTableOptimizerRuns<Eng>>(
+        &mut refusals,
+    );
+    register_input_validation::<crate::ops::update_table_optimizer::UpdateTableOptimizer<Eng>>(
+        &mut refusals,
+    );
+    // The catalog's export configuration and the data quality run start, whose own
+    // requirement sentences sit beside the family's above.
+    register_input_validation::<
+        crate::ops::put_data_catalog_export_configuration::PutDataCatalogExportConfiguration<Eng>,
+    >(&mut refusals);
+    register_input_validation::<
+        crate::ops::start_data_quality_ruleset_evaluation_run::StartDataQualityRulesetEvaluationRun<
+            Eng,
+        >,
+    >(&mut refusals);
+    // Judges no member of its own: wrapped so a clause about its FLOATING-POINT member
+    // quotes the submitted value in that member's modelled form
+    // ([`in_floating_point_form`]), which the refusal seam cannot do.
+    register_input_validation::<
+        crate::ops::update_column_statistics_task_settings::UpdateColumnStatisticsTaskSettings<Eng>,
+    >(&mut refusals);
     refusals
 }
 
@@ -453,21 +691,23 @@ fn catalog_name_validation_table<Eng: Send + Sync + 'static>(
 ///
 /// The wrapper is composed inside the shared request-id report, so the refusal it words
 /// names the request it answered exactly as the generated operation's own answers do.
-fn register_name_validation<Op: Operation>(
+fn register_input_validation<Op: Operation>(
     refusals: &mut HashMap<&'static str, Box<dyn ErasedOperation>>,
 ) {
     refusals.insert(
         Op::NAME,
         Box::new(RequestIdReportingOperation::header(
-            CatalogNameValidation::<Op>::new(),
+            GlueInputValidation::<Op>::new(),
         )),
     );
 }
 
-/// One modelled operation, served so that a request leaving one of its name members ABSENT
-/// is answered in the operation's own modelled `InvalidInputException` rather than in the
-/// framework's refusal body, which carries an error code and a lowercase `message` and
-/// nothing else (`smithy_server_runtime::Refused`).
+/// One modelled operation, served so that a request supplying no value for one of the
+/// members whose requirement Glue states itself is answered in the operation's own modelled
+/// `InvalidInputException` rather than in the framework's refusal body, which carries an
+/// error code and a lowercase `message` and nothing else
+/// (`smithy_server_runtime::Refused`) — and so that a constraint clause about any OTHER
+/// member of it quotes the submitted value in that member's own modelled form.
 ///
 /// Zero-sized: the wrapper holds no engine and no operation instance. It carries the
 /// operation TYPE, which is all it needs — the input shape to read the request into and
@@ -479,11 +719,11 @@ fn register_name_validation<Op: Operation>(
 /// operation's own sequence, because the framework hands no already-built input to an
 /// operation. That cost is deliberate, bounded by the body limits the framework already
 /// enforces, and paid only by the few operations the table above names.
-struct CatalogNameValidation<Op> {
+struct GlueInputValidation<Op> {
     operation: PhantomData<fn() -> Op>,
 }
 
-impl<Op> CatalogNameValidation<Op> {
+impl<Op> GlueInputValidation<Op> {
     const fn new() -> Self {
         Self {
             operation: PhantomData,
@@ -491,7 +731,7 @@ impl<Op> CatalogNameValidation<Op> {
     }
 }
 
-impl<Op: Operation> ErasedOperation for CatalogNameValidation<Op> {
+impl<Op: Operation> ErasedOperation for GlueInputValidation<Op> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -514,11 +754,17 @@ impl<Op: Operation> ErasedOperation for CatalogNameValidation<Op> {
                 // framework's own rendering elides a long value, and AWS quotes it whole.
                 let violations =
                     ::service_common::validation::refusing_violations::<Op>(protocol, req);
-                match absent_name_exception(Op::NAME, &violations) {
-                    // Glue's own refusal of a name it was given none of.
-                    Some(modelled) => serialized_refusal::<Op>(
+                match stated_refusal::<Op>(&violations) {
+                    // Glue's own refusal, in the operation's own modelled error: a member
+                    // it was given no value for, or — for an operation that reports every
+                    // refusal of its input that way — the constraint envelope inside that
+                    // operation's JSON envelope.
+                    Some(StatedRefusal::Modelled(message)) => serialized_refusal::<Op>(
                         protocol,
-                        &modelled,
+                        &crate::ops::types::InvalidInputException {
+                            message: Some(message),
+                            from_federation_source: None,
+                        },
                         &crate::ops::types::SCHEMA_INVALID_INPUT_EXCEPTION,
                         INVALID_INPUT_EXCEPTION,
                         INVALID_INPUT_EXCEPTION_STATUS,
@@ -526,24 +772,24 @@ impl<Op: Operation> ErasedOperation for CatalogNameValidation<Op> {
                     // Every other violation is the constraint validator's, and is stated
                     // the way AWS states one: the envelope and clauses the shared renderer
                     // owns, over the restored values above, at the member paths Glue's own
-                    // API spells ([`glue_constraint_refusal`]).
-                    None => glue_constraint_refusal(&Refusal::Invalid(violations)).and_then(
-                        |stated| {
-                            serialized_refusal::<Op>(
-                                protocol,
-                                &crate::scaffolded::ValidationException::new(stated.message),
-                                &crate::scaffolded::VALIDATION_EXCEPTION_SCHEMA,
-                                &stated.code,
-                                VALIDATION_EXCEPTION_STATUS,
-                            )
-                        },
-                    ),
+                    // API spells and in the member's own modelled form
+                    // ([`glue_constraint_refusal_of`]).
+                    Some(StatedRefusal::Constraint { code, message }) => {
+                        serialized_refusal::<Op>(
+                            protocol,
+                            &crate::scaffolded::ValidationException::new(message),
+                            &crate::scaffolded::VALIDATION_EXCEPTION_SCHEMA,
+                            &code,
+                            VALIDATION_EXCEPTION_STATUS,
+                        )
+                    }
+                    None => None,
                 }
             };
             if let Some(response) = refused {
                 // The row the framework sequence would have recorded for this request, so
                 // a refused one is not a hole in the telemetry series.
-                record_name_refusal::<Op>(ctx, started.elapsed());
+                record_input_refusal::<Op>(ctx, started.elapsed());
                 return response;
             }
             // Nothing to state: the request is served by the generated operation, which
@@ -594,46 +840,134 @@ fn serialized_refusal<Op: Operation>(
     }
 }
 
-/// The modelled refusal for a request that supplied no value for one of `operation`'s name
-/// members, or `None` for every other violation set — which keeps the framework's own
-/// envelope.
+/// Glue's own sentence for a request that supplied NO VALUE for one of `operation`'s
+/// members whose requirement Glue states itself, or `None` for every other violation set —
+/// which keeps the constraint validator's envelope.
 ///
-/// Only a name supplied as null or empty is answered here: those are the two violations
-/// Glue words itself ([`DATABASE_NAME_NULL_OR_EMPTY`] and the sentences beside it). A
-/// violation of any other member, or of any other class — a name PAST the member's
-/// modelled maximum, a value outside a `@range` — is left to the boundary, which answers
-/// it in the constraint envelope the recordings show the validator answering.
-fn absent_name_exception(
-    operation: &str,
-    violations: &[Violation],
-) -> Option<crate::ops::types::InvalidInputException> {
+/// Only a member the request gave no value for is answered here: absent, or a string or
+/// collection supplied empty, which the service reads as the same omission
+/// ([`supplies_no_value`]). A violation of any other class — a value PAST a member's
+/// modelled maximum, a value outside a `@range` or an enum's value set — is left to the
+/// boundary, which answers it in the constraint envelope the recordings show the validator
+/// answering.
+fn supplies_no_value_message(operation: &str, violations: &[Violation]) -> Option<String> {
     // Every violation of the set has to be one of these, so a request that ALSO broke a
     // constraint the validator answers keeps the validator's envelope rather than losing
     // that clause to this sentence. The first one states the refusal, as a service that
     // checks its members one at a time states it.
-    if violations.is_empty() || !violations.iter().all(supplies_no_name) {
+    if violations.is_empty() || !violations.iter().all(supplies_no_value) {
         return None;
     }
-    let message = violations
+    violations
         .iter()
-        .find_map(|violation| name_refusal_message(operation, &violation.path))?;
-    Some(crate::ops::types::InvalidInputException {
-        message: Some(message.to_string()),
-        from_federation_source: None,
-    })
+        .find_map(|violation| required_member_message(operation, &violation.path))
+}
+
+/// The operations that state every refusal the PRE-HANDLER walk words for them in their own
+/// modelled `InvalidInputException`, whose `Message` carries the refusal text inside a JSON
+/// object of one member ([`json_enveloped`]) — and whose constraint clauses therefore
+/// WITHHOLD the value the request submitted, which is what the recorded clauses of this
+/// surface do.
+///
+/// RECORDED, per operation: the envelope is a property of the surface in front of the
+/// operation and not of the constraint that fired, so a requirement this service states and
+/// a modelled constraint the validator states reach a caller the same way.
+const JSON_ENVELOPE_OPERATIONS: [&str; 1] = ["PutDataCatalogExportConfiguration"];
+
+/// `text` inside the JSON object [`JSON_ENVELOPE_OPERATIONS`] carry their refusals in.
+///
+/// Built with the JSON serializer rather than by formatting braces, so a sentence carrying a
+/// quote or a backslash — a clause quoting a caller's own value — is escaped as JSON
+/// requires and the envelope stays one well-formed object.
+fn json_enveloped(text: &str) -> String {
+    ::serde_json::json!({ "Message": text }).to_string()
+}
+
+/// How this service states ONE pre-handler refusal: in which error, and with what text.
+enum StatedRefusal {
+    /// The operation's own modelled `InvalidInputException` (HTTP 400, prose in the
+    /// `Message` member the model declares).
+    Modelled(String),
+    /// The constraint validator's envelope, under the error code the shared renderer states
+    /// for it.
+    Constraint { code: String, message: String },
+}
+
+/// How `Op` states the refusal `violations` carry, or `None` when there is nothing to state
+/// — which leaves the request to the operation itself.
+///
+/// The one place the two layers are chosen between, so a wrapped operation cannot word one
+/// of them differently from another: Glue's own requirement sentence when the request
+/// supplied no value for a member Glue states one for, else the constraint envelope; and,
+/// for an operation that reports every refusal of its input as its own error
+/// ([`JSON_ENVELOPE_OPERATIONS`]), either of those inside that operation's JSON envelope.
+fn stated_refusal<Op: Operation>(violations: &[Violation]) -> Option<StatedRefusal> {
+    let own = supplies_no_value_message(Op::NAME, violations);
+    if JSON_ENVELOPE_OPERATIONS.contains(&Op::NAME) {
+        let text = match own {
+            Some(sentence) => sentence,
+            // The value half is dropped: this surface's recorded constraint clauses name
+            // the member and the requirement and quote no value at all.
+            None => {
+                glue_constraint_refusal_withholding(Op::INPUT_SCHEMA, violations)?.message
+            }
+        };
+        return Some(StatedRefusal::Modelled(json_enveloped(&text)));
+    }
+    match own {
+        Some(sentence) => Some(StatedRefusal::Modelled(sentence)),
+        None => {
+            let stated = glue_constraint_refusal_of(Op::INPUT_SCHEMA, violations)?;
+            Some(StatedRefusal::Constraint {
+                code: stated.code,
+                message: stated.message,
+            })
+        }
+    }
 }
 
 /// Whether this violation says the request supplied NO value for the member: it carried
-/// none at all, or carried one shorter than the member's modelled `@length` minimum, which
-/// for every name member of the catalog (`NameString`, min 1) means the empty string.
+/// none at all, or carried one the member's modelled `@length` MINIMUM rules out as empty —
+/// the empty string for a string member, and the empty list or map for a collection one,
+/// which the framework's walk renders as `0 items` / `0 entries`
+/// (`service_common::validation_message::list_item_count` and its sibling read those
+/// renderings, so the two layers cannot disagree about which is which).
 ///
 /// A value that merely breaks a different bound is not this refusal, so nothing else is
 /// folded into it.
-fn supplies_no_name(violation: &Violation) -> bool {
+fn supplies_no_value(violation: &Violation) -> bool {
     match violation.kind {
         ViolationKind::MissingRequiredMember => true,
-        ViolationKind::MinLength(_) => violation.value.as_deref() == Some(""),
+        ViolationKind::MinLength(_) => violation.value.as_deref().is_some_and(|stored| {
+            stored.is_empty()
+                || ::service_common::validation_message::list_item_count(stored) == Some(0)
+                || ::service_common::validation_message::map_entry_count(stored) == Some(0)
+        }),
         _ => false,
+    }
+}
+
+/// Glue's sentence for the member at `path` of `operation` that the request supplied no
+/// value for, or `None` when Glue states no requirement of its own for that member — which
+/// leaves the refusal to the boundary.
+///
+/// The member paths are the ones the model declares, spelled as the framework spells a
+/// violation path (lowerCamel, a nested member under its enclosing member).
+fn required_member_message(operation: &str, path: &str) -> Option<String> {
+    match (operation, path) {
+        ("PutDataCatalogExportConfiguration", "exportSetting") => {
+            Some(EXPORT_SETTING_REQUIRED.to_string())
+        }
+        ("StartDataQualityRulesetEvaluationRun", "rulesetNames") => {
+            Some(AT_LEAST_ONE_RULESET_NAME.to_string())
+        }
+        _ if MEMBER_REQUIRED_OPERATIONS.contains(&operation) => {
+            Some(member_required_for(&as_modelled_member(path)?, operation))
+        }
+        // The CATALOG's own name sentences, which several operations share and which are
+        // asked last: an operation stating its own requirement above states that one, and
+        // the catalog's `databaseName` is not every surface's `DatabaseName`.
+        _ => name_refusal_message(operation, path).map(str::to_string),
     }
 }
 
@@ -664,7 +998,7 @@ fn name_refusal_message(operation: &str, path: &str) -> Option<&'static str> {
 /// folded handle (this service's signing name and the operation's own name), and the same
 /// already-sanitized request metadata. Everything is gated on a client collecting, exactly
 /// as the framework gates it.
-fn record_name_refusal<Op: Operation>(ctx: &OperationContext<'_>, latency: std::time::Duration) {
+fn record_input_refusal<Op: Operation>(ctx: &OperationContext<'_>, latency: std::time::Duration) {
     if !emulator_telemetry::recording_active() {
         return;
     }

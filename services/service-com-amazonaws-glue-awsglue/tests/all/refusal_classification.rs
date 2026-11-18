@@ -873,3 +873,627 @@ async fn each_refusal_class_keeps_its_own_error_code() {
         "the table must exercise all three refusal classes, got {seen:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A member the request supplied no value for
+// ---------------------------------------------------------------------------
+
+/// `HashString`/`NameString`/`CatalogIdString`'s modelled `@pattern`, as the model writes it
+/// (`smithy_query(query="shape",shape="HashString")`) — the expression every Glue id and
+/// name member below targets. Written here independently of the handler, so the suite pins
+/// the expression and not the code.
+const ID_PATTERN: &str = r"^[\u0020-\uD7FF\uE000-\uFFFD\uD800\uDC00-\uDBFF\uDFFF\t]*$";
+
+/// The requirement clause a value outside [`ID_PATTERN`] breaks.
+fn id_pattern_requirement() -> String {
+    format!(
+        "Member must satisfy regular expression pattern: {}",
+        stated_pattern(ID_PATTERN)
+    )
+}
+
+/// A `TableOptimizerConfiguration` every table-optimizer request below carries, so the one
+/// member a row leaves out is the only one missing.
+fn optimizer_configuration() -> Value {
+    json!({ "roleArn": "arn:aws:iam::000000000000:role/glue-table-optimizer", "enabled": true })
+}
+
+/// A `DataSource` naming a Glue table, for the data quality run start below.
+fn evaluation_data_source() -> Value {
+    json!({ "GlueTable": { "DatabaseName": "dq_db", "TableName": "dq_table" } })
+}
+
+/// A request that supplies NO VALUE for a member whose requirement Glue states itself — the
+/// member absent, or a string supplied empty, or a list supplied empty — is refused with
+/// that operation's modelled `InvalidInputException` carrying Glue's own sentence for the
+/// check, never with the boundary's `ValidationException`.
+///
+/// The rows differ along what the rule generalises over: which operation read the request,
+/// which of its required members carried no value, and HOW it carried none (absent, the
+/// empty string, the empty list).
+#[tokio::test]
+async fn a_member_the_request_supplies_no_value_for_is_glues_own_requirement() {
+    let router = emulator();
+
+    // (case, operation, request, the sentence the refusal must carry).
+    let rows: Vec<(&str, &str, Value, String)> = vec![
+        (
+            "an absent enum member of the catalog's export configuration",
+            "PutDataCatalogExportConfiguration",
+            json!({}),
+            r#"{"Message":"ExportSetting is required."}"#.to_string(),
+        ),
+        (
+            "an absent list member of a data quality run start",
+            "StartDataQualityRulesetEvaluationRun",
+            json!({ "DataSource": evaluation_data_source(), "Role": "dq-role" }),
+            "At least one ruleset name must be provided.".to_string(),
+        ),
+        (
+            "the same list member supplied EMPTY",
+            "StartDataQualityRulesetEvaluationRun",
+            json!({
+                "DataSource": evaluation_data_source(),
+                "Role": "dq-role",
+                "RulesetNames": [],
+            }),
+            "At least one ruleset name must be provided.".to_string(),
+        ),
+        (
+            "an absent CatalogId of an optimizer update",
+            "UpdateTableOptimizer",
+            json!({
+                "DatabaseName": "opt_db",
+                "TableName": "opt_table",
+                "Type": "compaction",
+                "TableOptimizerConfiguration": optimizer_configuration(),
+            }),
+            "CatalogId is required for UpdateTableOptimizer".to_string(),
+        ),
+        (
+            "the same CatalogId supplied as the empty string",
+            "UpdateTableOptimizer",
+            json!({
+                "CatalogId": "",
+                "DatabaseName": "opt_db",
+                "TableName": "opt_table",
+                "Type": "compaction",
+                "TableOptimizerConfiguration": optimizer_configuration(),
+            }),
+            "CatalogId is required for UpdateTableOptimizer".to_string(),
+        ),
+        (
+            "an absent DatabaseName of an optimizer run listing",
+            "ListTableOptimizerRuns",
+            json!({ "CatalogId": ACCOUNT_ID, "TableName": "opt_table", "Type": "compaction" }),
+            "DatabaseName is required for ListTableOptimizerRuns".to_string(),
+        ),
+        (
+            "an absent TableName of the same listing",
+            "ListTableOptimizerRuns",
+            json!({ "CatalogId": ACCOUNT_ID, "DatabaseName": "opt_db", "Type": "compaction" }),
+            "TableName is required for ListTableOptimizerRuns".to_string(),
+        ),
+        (
+            "an absent Type of the same listing",
+            "ListTableOptimizerRuns",
+            json!({
+                "CatalogId": ACCOUNT_ID,
+                "DatabaseName": "opt_db",
+                "TableName": "opt_table",
+            }),
+            "Type is required for ListTableOptimizerRuns".to_string(),
+        ),
+        (
+            "an absent CatalogId of an optimizer read",
+            "GetTableOptimizer",
+            json!({ "DatabaseName": "opt_db", "TableName": "opt_table", "Type": "retention" }),
+            "CatalogId is required for GetTableOptimizer".to_string(),
+        ),
+        (
+            "an absent Type of an optimizer delete",
+            "DeleteTableOptimizer",
+            json!({
+                "CatalogId": ACCOUNT_ID,
+                "DatabaseName": "opt_db",
+                "TableName": "opt_table",
+            }),
+            "Type is required for DeleteTableOptimizer".to_string(),
+        ),
+        (
+            "an absent DatabaseName of an optimizer create",
+            "CreateTableOptimizer",
+            json!({
+                "CatalogId": ACCOUNT_ID,
+                "TableName": "opt_table",
+                "Type": "orphan_file_deletion",
+                "TableOptimizerConfiguration": optimizer_configuration(),
+            }),
+            "DatabaseName is required for CreateTableOptimizer".to_string(),
+        ),
+    ];
+
+    for (case, operation, request, expected) in &rows {
+        let (status, body) = call(&router, operation, request).await;
+        assert_eq!(
+            status, 400,
+            "case {case}: a member with no value is refused with 400, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("InvalidInputException"),
+            "case {case}: expected Glue's own InvalidInputException, got {} in {body}",
+            error_code(&body)
+        );
+        assert_eq!(
+            error_message(&body),
+            *expected,
+            "case {case}: unexpected wording for the missing member"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The form a clause quotes the submitted value in
+// ---------------------------------------------------------------------------
+
+/// A constraint clause quotes the value the request carried in the form the member's
+/// modelled TYPE is written in: a FLOATING-POINT member's value always carries a fractional
+/// part or an exponent, where a string member's value is quoted as the text it is.
+///
+/// The rows differ along which bound was broken, the magnitude and sign of the submitted
+/// value, whether the caller wrote it with a fractional part at all, and — on the other side
+/// of the rule — a member of another type whose value is quoted unchanged.
+#[tokio::test]
+async fn a_clause_quotes_the_submitted_value_in_the_members_modelled_form() {
+    let router = emulator();
+
+    // `SampleSizePercentage`'s modelled bounds ("range 0..100", type double,
+    // `smithy_query(query="shape",shape="SampleSizePercentage")`).
+    let above = "Member must have value less than or equal to 100";
+    let below = "Member must have value greater than or equal to 0";
+    let over_long = "d".repeat(MAX_NAME_CHARS + 1);
+
+    // (case, the request, the member path, the value the clause must quote, the requirement).
+    let rows: Vec<(&str, Value, &str, String, &str)> = vec![
+        (
+            "a whole value above the maximum, written without a point",
+            json!({ "DatabaseName": "s_db", "TableName": "s_t", "SampleSize": 150 }),
+            "sampleSize",
+            "150.0".to_string(),
+            above,
+        ),
+        (
+            "a fractional value above the maximum",
+            json!({ "DatabaseName": "s_db", "TableName": "s_t", "SampleSize": 150.5 }),
+            "sampleSize",
+            "150.5".to_string(),
+            above,
+        ),
+        (
+            "a whole negative value below the minimum",
+            json!({ "DatabaseName": "s_db", "TableName": "s_t", "SampleSize": -3 }),
+            "sampleSize",
+            "-3.0".to_string(),
+            below,
+        ),
+        (
+            "a magnitude small enough to be written with an exponent",
+            json!({ "DatabaseName": "s_db", "TableName": "s_t", "SampleSize": -0.0001 }),
+            "sampleSize",
+            "-1.0E-4".to_string(),
+            below,
+        ),
+        (
+            "a STRING member, whose value is quoted as the text it is",
+            json!({ "DatabaseName": over_long.clone(), "TableName": "s_t" }),
+            "databaseName",
+            over_long.clone(),
+            "Member must have length less than or equal to 255",
+        ),
+    ];
+
+    for (case, request, member_path, quoted, requirement) in &rows {
+        let (status, body) = call(&router, "UpdateColumnStatisticsTaskSettings", request).await;
+        assert_constraint_refusal(
+            case,
+            status,
+            &body,
+            &one_clause(quoted, member_path, requirement),
+        );
+    }
+}
+
+/// A constraint clause about a COLLECTION member quotes the collection the request carried —
+/// the elements in order, comma-separated, in brackets — and not the walk's own count
+/// summary of it.
+///
+/// The rows differ along how many elements the list carried past its modelled maximum and
+/// how the elements themselves are spelled.
+#[tokio::test]
+async fn a_clause_about_a_collection_member_quotes_the_collection_submitted() {
+    let router = emulator();
+
+    // `RulesetNames`'s modelled maximum ("length 1..10",
+    // `smithy_query(query="shape",shape="RulesetNames")`).
+    let requirement = "Member must have length less than or equal to 10";
+
+    // (case, the ruleset names the start carries).
+    let rows: Vec<(&str, Vec<String>)> = vec![
+        (
+            "one name past the maximum",
+            (1..=11).map(|index| format!("r{index}")).collect(),
+        ),
+        (
+            "two names past the maximum, spelled differently",
+            (1..=12)
+                .map(|index| format!("ruleset-{index:02}"))
+                .collect(),
+        ),
+        (
+            "five names past the maximum, carrying dots and underscores",
+            (1..=15)
+                .map(|index| format!("dq.set_{index}"))
+                .collect(),
+        ),
+    ];
+
+    for (case, names) in &rows {
+        let (status, body) = call(
+            &router,
+            "StartDataQualityRulesetEvaluationRun",
+            &json!({
+                "DataSource": evaluation_data_source(),
+                "Role": "dq-role",
+                "RulesetNames": names,
+            }),
+        )
+        .await;
+        assert_constraint_refusal(
+            case,
+            status,
+            &body,
+            &one_clause(
+                &format!("[{}]", names.join(", ")),
+                "rulesetNames",
+                requirement,
+            ),
+        );
+    }
+}
+
+/// An enum constraint clause lists the values the member admits in the order the layer in
+/// front of this service enumerates them — which is neither the order the model declares
+/// them in nor alphabetical order.
+///
+/// The rows differ along which enumerated type the member targets and which operation
+/// carried it, and the three types' sets are listed in three different orders relative to
+/// their declarations: one that happens to agree with alphabetical order, one that agrees
+/// with neither, and one that reverses a two-value declaration.
+#[tokio::test]
+async fn an_enum_clause_lists_the_value_set_in_the_order_the_front_door_states_it() {
+    let router = emulator();
+
+    // (case, operation, request, the member path, the submitted value, the stated set). The
+    // declared sets, as the model writes them
+    // (`smithy_query(query="shape",shape="TableOptimizerType,SourceControlProvider,
+    // SourceControlAuthStrategy")`), are: `compaction, retention, orphan_file_deletion`;
+    // `GITHUB, GITLAB, BITBUCKET, AWS_CODE_COMMIT`; `PERSONAL_ACCESS_TOKEN,
+    // AWS_SECRETS_MANAGER`.
+    let rows: Vec<(&str, &str, Value, &str, &str, &str)> = vec![
+        (
+            "the optimizer type of a run listing",
+            "ListTableOptimizerRuns",
+            json!({
+                "CatalogId": ACCOUNT_ID,
+                "DatabaseName": "opt_db",
+                "TableName": "opt_table",
+                "Type": "nonsense-optimizer-type",
+            }),
+            "type",
+            "nonsense-optimizer-type",
+            "[compaction, orphan_file_deletion, retention]",
+        ),
+        (
+            "the same type on another operation of the family",
+            "GetTableOptimizer",
+            json!({
+                "CatalogId": ACCOUNT_ID,
+                "DatabaseName": "opt_db",
+                "TableName": "opt_table",
+                "Type": "COMPACTION",
+            }),
+            "type",
+            "COMPACTION",
+            "[compaction, orphan_file_deletion, retention]",
+        ),
+        (
+            "the source control provider of a job update",
+            "UpdateJobFromSourceControl",
+            json!({ "JobName": "sourced-job", "Provider": "NOT_A_REAL_PROVIDER" }),
+            "provider",
+            "NOT_A_REAL_PROVIDER",
+            "[GITHUB, AWS_CODE_COMMIT, BITBUCKET, GITLAB]",
+        ),
+        (
+            "the source control auth strategy of the same update",
+            "UpdateJobFromSourceControl",
+            json!({ "JobName": "sourced-job", "AuthStrategy": "NO_SUCH_STRATEGY" }),
+            "authStrategy",
+            "NO_SUCH_STRATEGY",
+            "[AWS_SECRETS_MANAGER, PERSONAL_ACCESS_TOKEN]",
+        ),
+    ];
+
+    for (case, operation, request, member_path, submitted, stated) in &rows {
+        let (status, body) = call(&router, operation, request).await;
+        assert_constraint_refusal(
+            case,
+            status,
+            &body,
+            &one_clause(
+                submitted,
+                member_path,
+                &format!("Member must satisfy enum value set: {stated}"),
+            ),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A malformed address, told apart from a miss
+// ---------------------------------------------------------------------------
+
+/// A `ResultId` outside its member's `@pattern` is a MALFORMED request — the operation's
+/// modelled `InvalidInputException` carrying AWS's constraint envelope — and it is refused
+/// BEFORE the store is consulted, so it is never reported as a result that could not be
+/// found. A value the pattern admits is a well-formed address and does reach the lookup.
+///
+/// The rows differ along which character outside the pattern the value carries and where it
+/// carries it, and — on the other side of the rule — which characters INSIDE the pattern a
+/// value carries.
+#[tokio::test]
+async fn a_result_id_outside_the_members_pattern_is_refused_before_the_lookup() {
+    let router = emulator();
+
+    // (case, the id the request carries). Every row carries a character below U+0020 that is
+    // not a tab, or one of the two non-characters the pattern's ranges stop short of.
+    let malformed: Vec<(&str, String)> = vec![
+        ("newlines inside the id", "bad\nresult\nid".to_string()),
+        ("a trailing carriage return", "result-id\r".to_string()),
+        ("a leading newline", "\nresult-id".to_string()),
+        ("a vertical tab", "result\u{000B}id".to_string()),
+        ("a NUL", "result\u{0000}id".to_string()),
+        (
+            "the non-character just past the pattern's last admitted character",
+            "result\u{FFFE}id".to_string(),
+        ),
+    ];
+
+    for (case, result_id) in &malformed {
+        let (status, body) = call(
+            &router,
+            "GetDataQualityResult",
+            &json!({ "ResultId": result_id }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: a malformed id must be refused, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("InvalidInputException"),
+            "case {case}: expected InvalidInputException for {result_id:?}, got {} in {body}",
+            error_code(&body)
+        );
+        assert_eq!(
+            error_message(&body),
+            one_clause(result_id, "resultId", &id_pattern_requirement()),
+            "case {case}: unexpected wording for {result_id:?}"
+        );
+    }
+
+    // A value the pattern admits is well formed, so it reaches the lookup and misses there.
+    for (case, result_id) in [
+        ("a plain id", "dqresult-0123456789"),
+        ("an id carrying a tab", "dqresult\t0123"),
+        ("the shortest id the model admits", "r"),
+    ] {
+        let (status, body) = call(
+            &router,
+            "GetDataQualityResult",
+            &json!({ "ResultId": result_id }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: an id no run published misses, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("EntityNotFoundException"),
+            "case {case}: a well-formed id must reach the lookup, got {} in {body}",
+            error_code(&body)
+        );
+    }
+}
+
+/// An operation whose surface reports every refusal the pre-handler walk words for it as its
+/// OWN modelled `InvalidInputException` answers both layers that way: the requirement this
+/// service states and the modelled constraint the validator states, each inside the one JSON
+/// envelope that surface wraps a refusal in, and each with the submitted value withheld.
+///
+/// The rows differ along which layer refused the request and which constraint class fired.
+#[tokio::test]
+async fn an_operations_own_refusal_envelope_covers_both_refusal_layers() {
+    let router = emulator();
+
+    // (case, the request, the refusal text the envelope must carry).
+    let rows: Vec<(&str, Value, String)> = vec![
+        (
+            "the requirement this service states",
+            json!({}),
+            "ExportSetting is required.".to_string(),
+        ),
+        (
+            "a value outside the member's enum value set",
+            json!({ "ExportSetting": "MAYBE" }),
+            "1 validation error detected: Value at 'exportSetting' failed to satisfy \
+             constraint: Member must satisfy enum value set: [ENABLED, DISABLED]"
+                .to_string(),
+        ),
+        (
+            "a value below another member's length minimum",
+            json!({ "ExportSetting": "ENABLED", "ClientToken": "" }),
+            "1 validation error detected: Value at 'clientToken' failed to satisfy \
+             constraint: Member must have length greater than or equal to 1"
+                .to_string(),
+        ),
+        (
+            "a value past that member's length maximum",
+            json!({ "ExportSetting": "ENABLED", "ClientToken": "t".repeat(MAX_NAME_CHARS + 1) }),
+            "1 validation error detected: Value at 'clientToken' failed to satisfy \
+             constraint: Member must have length less than or equal to 255"
+                .to_string(),
+        ),
+    ];
+
+    for (case, request, text) in &rows {
+        let (status, body) = call(&router, "PutDataCatalogExportConfiguration", request).await;
+        assert_eq!(
+            status, 400,
+            "case {case}: the request is refused with 400, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("InvalidInputException"),
+            "case {case}: expected the operation's own InvalidInputException, got {} in {body}",
+            error_code(&body)
+        );
+        assert_eq!(
+            error_message(&body),
+            json!({ "Message": text }).to_string(),
+            "case {case}: unexpected refusal envelope"
+        );
+    }
+}
+
+/// A data quality run `RunId` that is no run id of this service is a MALFORMED request, not
+/// a miss: it is refused with the operation's modelled `InvalidInputException` stating the
+/// grammar a run id has, before the store is consulted. An id OF that grammar is a
+/// well-formed address, so it reaches the lookup, and the id a start minted has that grammar
+/// and serves its run.
+///
+/// The rows differ along which operation addressed the run and how the id departs from the
+/// grammar.
+#[tokio::test]
+async fn a_run_id_outside_the_data_quality_grammar_is_refused_before_the_lookup() {
+    let router = emulator();
+    let stated_grammar = "Invalid RunId: must start with 'dqrun-'";
+
+    for operation in [
+        "GetDataQualityRuleRecommendationRun",
+        "CancelDataQualityRuleRecommendationRun",
+    ] {
+        for (case, run_id) in [
+            ("an id of no recognisable form", "not-a-run-id"),
+            ("the prefix in the wrong case", "DQRUN-0123456789abcdef"),
+            ("a prefix of the prefix", "dqru"),
+            ("the prefix carried in the middle", "run-dqrun-0123"),
+            ("a bare hexadecimal id", "ffffffffffffffffffffffffffffffff"),
+        ] {
+            let (status, body) = call(&router, operation, &json!({ "RunId": run_id })).await;
+            assert_eq!(
+                status, 400,
+                "case {operation}/{case}: a malformed run id is refused, got {status} with {body}"
+            );
+            assert!(
+                error_code(&body).ends_with("InvalidInputException"),
+                "case {operation}/{case}: expected InvalidInputException for {run_id:?}, got {} \
+                 in {body}",
+                error_code(&body)
+            );
+            assert_eq!(
+                error_message(&body),
+                stated_grammar,
+                "case {operation}/{case}: unexpected wording for {run_id:?}"
+            );
+        }
+
+        // A value the member's own `@pattern` rules out is the CONSTRAINT refusal instead,
+        // because it is not even a value the member admits.
+        let (status, body) = call(&router, operation, &json!({ "RunId": "dqrun-\nbad" })).await;
+        assert_eq!(
+            status, 400,
+            "case {operation}: an id outside the member's pattern is refused, got {status} with \
+             {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            one_clause("dqrun-\nbad", "runId", &id_pattern_requirement()),
+            "case {operation}: a value outside the member's pattern states the constraint"
+        );
+
+        // An id OF the grammar is well formed, so it reaches the lookup and misses there.
+        let well_formed = format!("dqrun-{}", "f".repeat(32));
+        let (status, body) = call(&router, operation, &json!({ "RunId": &well_formed })).await;
+        assert_eq!(
+            status, 400,
+            "case {operation}: an id nothing minted misses, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("EntityNotFoundException"),
+            "case {operation}: a well-formed id must reach the lookup, got {} in {body}",
+            error_code(&body)
+        );
+    }
+
+    // And the id a start mints HAS that grammar, so a run this service created is readable
+    // through the same check.
+    ok(
+        &router,
+        "CreateDatabase",
+        &json!({ "DatabaseInput": { "Name": "grammar_db" } }),
+    )
+    .await;
+    ok(
+        &router,
+        "CreateTable",
+        &json!({
+            "DatabaseName": "grammar_db",
+            "TableInput": {
+                "Name": "grammar_table",
+                "TableType": "EXTERNAL_TABLE",
+                "StorageDescriptor": { "Columns": [{ "Name": "a", "Type": "string" }] },
+            },
+        }),
+    )
+    .await;
+    let started = ok(
+        &router,
+        "StartDataQualityRuleRecommendationRun",
+        &json!({
+            "DataSource": {
+                "GlueTable": { "DatabaseName": "grammar_db", "TableName": "grammar_table" },
+            },
+            "Role": "arn:aws:iam::000000000000:role/glue-dq-role",
+        }),
+    )
+    .await;
+    let minted = started["RunId"]
+        .as_str()
+        .expect("a started run reports its RunId")
+        .to_string();
+    assert!(
+        minted.starts_with("dqrun-"),
+        "a minted run id must carry the grammar the reads require, got {minted:?}"
+    );
+    let read = ok(
+        &router,
+        "GetDataQualityRuleRecommendationRun",
+        &json!({ "RunId": &minted }),
+    )
+    .await;
+    assert_eq!(
+        read["RunId"].as_str(),
+        Some(minted.as_str()),
+        "the minted id must serve its own run, got {read}"
+    );
+}

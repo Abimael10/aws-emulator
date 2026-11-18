@@ -66,6 +66,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The member path a constraint clause names `RunId` by: the member as the wire spells it,
+/// lower-camel-cased, which is how the boundary validator's own clauses read.
+const RUN_ID_MEMBER_PATH: &str = "runId";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -138,6 +142,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // A malformed address is refused BEFORE anything is read, in the operation's own
+        // modelled `InvalidInputException`: a `RunId` outside the `@pattern` its member
+        // declares, or one that is no data quality run id at all, names no run that could
+        // ever exist — so answering "no such run" would tell the caller the request was
+        // well-formed, and nothing of the store is touched.
+        if let Some(message) =
+            crate::service::hash_string_pattern_refusal(RUN_ID_MEMBER_PATH, &input.run_id)
+        {
+            return Err(
+                CancelDataQualityRuleRecommendationRunErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+        if !crate::state::is_data_quality_run_id(&input.run_id) {
+            return Err(
+                CancelDataQualityRuleRecommendationRunErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::invalid_data_quality_run_id(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models no store fault of its own, so an unreachable store is
             // reported as its timeout error, the way the catalog's other handlers report it.
@@ -158,8 +194,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due_data_quality_rule_recommendation_runs(now);
 
         // `RunId` is `@required` with `length 1..255`, so an absent or over-long one is
-        // refused at the boundary: reaching here, the only question is whether this account
-        // holds a run under that id.
+        // refused at the boundary, and its grammar was applied above: reaching here, the
+        // only question is whether this account holds a run under that id.
         let Some(run) = store.data_quality_rule_recommendation_run_mut(&input.run_id) else {
             return Err(
                 CancelDataQualityRuleRecommendationRunErrorModeled::EntityNotFoundException(

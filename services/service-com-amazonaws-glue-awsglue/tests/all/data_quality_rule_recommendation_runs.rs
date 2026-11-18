@@ -368,12 +368,14 @@ async fn a_started_run_is_read_back_through_get_data_quality_rule_recommendation
     {
         store_table(&router, database, table, columns).await;
         let run_id = start_run(&router, &start_body(&data_source, extra.clone())).await;
+        let minted = run_id.strip_prefix("dqrun-").unwrap_or_default();
         assert!(
-            run_id.len() == 32
-                && run_id
+            minted.len() == 32
+                && minted
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-            "case {case:?}: the run id must be 32 lowercase hex characters, got {run_id:?}"
+            "case {case:?}: the run id must be 'dqrun-' and 32 lowercase hex characters, got \
+             {run_id:?}"
         );
 
         // Hold the owed transition open, so the run is read in its transient status.
@@ -909,11 +911,11 @@ async fn a_cancel_stops_the_run_it_addresses() {
         "a run that already finished"
     );
 
-    // A run nothing minted.
+    // A run nothing minted, under an id of the grammar a minted one has.
     let (status, parsed) = call(
         &router,
         "CancelDataQualityRuleRecommendationRun",
-        &json!({ "RunId": "ffffffffffffffffffffffffffffffff" }),
+        &json!({ "RunId": "dqrun-ffffffffffffffffffffffffffffffff" }),
     )
     .await;
     assert_eq!(
@@ -1073,9 +1075,9 @@ async fn a_request_that_addresses_nothing_is_refused() {
         (
             "a run id nothing minted",
             "GetDataQualityRuleRecommendationRun",
-            json!({ "RunId": "ffffffffffffffffffffffffffffffff" }),
+            json!({ "RunId": "dqrun-ffffffffffffffffffffffffffffffff" }),
             "EntityNotFoundException",
-            "ffffffffffffffffffffffffffffffff",
+            "dqrun-ffffffffffffffffffffffffffffffff",
         ),
         (
             "a data source naming neither kind of table",

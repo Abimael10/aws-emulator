@@ -1177,7 +1177,7 @@ async fn a_read_of_a_run_nothing_minted_is_refused() {
         );
         assert_eq!(
             error_message(&parsed),
-            format!("Data quality ruleset evaluation run with id {run_id} does not exist"),
+            format!("Cannot find Data Quality Run in account 000000000000 with id {run_id}"),
             "case {case:?}: expected the run miss naming the requested id, got {:?}",
             error_message(&parsed)
         );

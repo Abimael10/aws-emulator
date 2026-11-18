@@ -495,18 +495,39 @@ pub(super) static MINTED_DATA_QUALITY_RULE_RECOMMENDATION_RUN_IDS: AtomicU64 = A
 /// A fresh `RunId`: the id the service assigns a data quality rule recommendation run when
 /// it starts.
 ///
-/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is inside `HashString`'s
-/// `length 1..255`. The bits come from [`mint_hex_id`], so two runs started in the same
-/// nanosecond cannot be given the same id. It is stored on the run, so every later read of
-/// that run reports the same id.
+/// [`DATA_QUALITY_RUN_ID_PREFIX`] followed by 32 lowercase hexadecimal characters, i.e. 128
+/// bits, which is inside `HashString`'s `length 1..255`. The bits come from [`mint_hex_id`],
+/// so two runs started in the same nanosecond cannot be given the same id. It is stored on
+/// the run, so every later read of that run reports the same id.
 ///
 /// This names a RESOURCE, not a credential: a credential would come from the credential
 /// store, never from here.
 pub fn new_data_quality_rule_recommendation_run_id() -> String {
-    mint_hex_id(
-        &MINTED_DATA_QUALITY_RULE_RECOMMENDATION_RUN_IDS,
-        DATA_QUALITY_RUN_ID_WORDS,
+    format!(
+        "{DATA_QUALITY_RUN_ID_PREFIX}{}",
+        mint_hex_id(
+            &MINTED_DATA_QUALITY_RULE_RECOMMENDATION_RUN_IDS,
+            DATA_QUALITY_RUN_ID_WORDS,
+        )
     )
+}
+
+/// What every data quality rule recommendation run id begins with.
+///
+/// RECORDED grammar: the service states the requirement itself
+/// ([`crate::state::messages::invalid_data_quality_run_id`]), so the ids this store MINTS
+/// carry it and an id that does not is refused before any lookup — one prefix, read by both
+/// halves, so a minted id can never be one the reads reject.
+pub const DATA_QUALITY_RUN_ID_PREFIX: &str = "dqrun-";
+
+/// Whether `run_id` has the grammar a data quality rule recommendation run id has
+/// ([`DATA_QUALITY_RUN_ID_PREFIX`]).
+///
+/// The one question the reads ask before they look anything up: an id outside the grammar
+/// names no run that could ever exist, so it is a malformed request rather than a miss.
+#[must_use]
+pub fn is_data_quality_run_id(run_id: &str) -> bool {
+    run_id.starts_with(DATA_QUALITY_RUN_ID_PREFIX)
 }
 
 /// How many 64-bit words a data quality run id carries: two, i.e. 128 bits rendered as 32
@@ -860,9 +881,15 @@ pub(super) static MINTED_DATA_QUALITY_RULESET_EVALUATION_RUN_IDS: AtomicU64 = At
 /// starts.
 ///
 /// 32 lowercase hexadecimal characters, i.e. 128 bits, which is inside `HashString`'s
-/// `length 1..255`, exactly as [`new_data_quality_rule_recommendation_run_id`] mints a
-/// recommendation run's. It is stored on the run, so every later read of that run reports
-/// the same id.
+/// `length 1..255`, drawn from the same [`mint_hex_id`] source a recommendation run's id is
+/// ([`new_data_quality_rule_recommendation_run_id`]). It carries no
+/// [`DATA_QUALITY_RUN_ID_PREFIX`]: the grammar is stated by the operations that address a
+/// RECOMMENDATION run, which are the ones a recording shows stating it, so nothing refuses
+/// an evaluation run id for the want of it. An evaluation-run recording that shows the same
+/// grammar is what would move this id onto that prefix and put the check on the operations
+/// that read one.
+///
+/// It is stored on the run, so every later read of that run reports the same id.
 ///
 /// This names a RESOURCE, not a credential: a credential would come from the credential
 /// store, never from here.

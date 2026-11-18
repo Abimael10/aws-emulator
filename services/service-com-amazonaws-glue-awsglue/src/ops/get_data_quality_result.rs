@@ -20,6 +20,11 @@
 //! which is what publishes the results of a run whose terminal status was owed: an id no run
 //! has published is this operation's modelled `EntityNotFoundException`.
 //!
+//! A `ResultId` outside the `@pattern` its member declares is a MALFORMED request rather
+//! than a miss, so it is refused with this operation's modelled `InvalidInputException` —
+//! carrying AWS's constraint envelope for the clause that fired — BEFORE the store is read
+//! at all ([`crate::service::hash_string_pattern_refusal`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -117,6 +122,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The member path a constraint clause names `ResultId` by: the member as the wire spells
+/// it, lower-camel-cased, which is how the boundary validator's own clauses read.
+const RESULT_ID_MEMBER_PATH: &str = "resultId";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -188,6 +197,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A malformed address is refused BEFORE anything is read: a `ResultId` outside the
+        // `@pattern` its member declares is a bad request, and no result could ever have
+        // been stored under it, so answering "no such result" would tell the caller the
+        // request was well-formed. This operation models `InvalidInputException`, which is
+        // what carries a constraint refusal of its own input.
+        if let Some(message) =
+            crate::service::hash_string_pattern_refusal(RESULT_ID_MEMBER_PATH, &input.result_id)
+        {
+            return Err(GetDataQualityResultErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models a server fault, so an unreachable store is reported as
             // that rather than as a client error the caller could act on.
@@ -206,8 +232,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at the same instant whether or not anybody read them.
         store.settle_due_data_quality_ruleset_evaluation_runs(now);
 
-        // `ResultId` is `@required` with `length 1..255` and its `@pattern` is refused at the
-        // boundary, so reaching here the only question is whether this account holds a result
+        // `ResultId` is `@required` with `length 1..255`, and its `@pattern` was applied
+        // above, so reaching here the only question is whether this account holds a result
         // under it.
         let Some(result) = store.data_quality_result(&input.result_id) else {
             return Err(GetDataQualityResultErrorModeled::EntityNotFoundException(

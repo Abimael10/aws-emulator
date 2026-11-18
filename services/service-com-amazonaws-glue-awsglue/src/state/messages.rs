@@ -1458,12 +1458,53 @@ pub fn concurrent_workflow_runs_exceeded(name: &str) -> String {
 }
 
 /// A data quality rule recommendation run lookup
-/// (`GetDataQualityRuleRecommendationRun`) for an id no run in this account has. NOT
-/// recorded: the sentence follows the per-resource template of
-/// [`column_statistics_task_run_not_found`], built from the requested id, which is the
-/// whole address of a run.
+/// (`GetDataQualityRuleRecommendationRun`, `CancelDataQualityRuleRecommendationRun`) for an
+/// id no run in this account has.
+///
+/// RECORDED template, built through [`data_quality_not_found`]: a recommendation run is one
+/// of the service's DATA QUALITY RUNS, which is the resource class the sentence names.
 pub fn data_quality_rule_recommendation_run_not_found(run_id: &str) -> String {
-    format!("Data quality rule recommendation run with id {run_id} does not exist")
+    data_quality_not_found(DATA_QUALITY_RUN, run_id)
+}
+
+/// The resource class a data quality RUN miss names — both a rule recommendation run and a
+/// ruleset evaluation run, which are the two kinds of run this surface starts, so one miss
+/// cannot read one way for the first and another way for the second. It says nothing about
+/// either id's GRAMMAR, which is stated by the operations that address a run
+/// (`crate::state::DATA_QUALITY_RUN_ID_PREFIX`, applied where a recording shows it).
+const DATA_QUALITY_RUN: &str = "Data Quality Run";
+
+/// The resource class a data quality RESULT miss names.
+const DATA_QUALITY_RESULT: &str = "Data Quality Result";
+
+/// The sentence every data quality miss is worded with: the resource class the request
+/// addressed, the account whose namespace holds no such record, and the id the request
+/// itself sent, which is the whole address of one.
+///
+/// RECORDED template, one wording, so a miss cannot read one way for a run and another for
+/// a result. It is the same SHAPE a machine learning transform miss takes
+/// ([`ml_transform_not_found`]) and not the same sentence: that one names the handle a
+/// transform is addressed by (`… with handle <id>`) where this one names an id, so the two
+/// are kept apart rather than folded into a template neither recording shows.
+fn data_quality_not_found(resource: &str, id: &str) -> String {
+    format!(
+        "Cannot find {resource} in account {} with id {id}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// A `RunId` that is no data quality run id at all
+/// (`GetDataQualityRuleRecommendationRun`, `CancelDataQualityRuleRecommendationRun`).
+///
+/// RECORDED constant apart from the grammar it quotes, which is the one prefix the store
+/// MINTS a run id with ([`crate::state::DATA_QUALITY_RUN_ID_PREFIX`]) rather than a second
+/// spelling of it — so the stated grammar and the minted one cannot disagree. It echoes
+/// nothing of the request, so one wording answers every value outside the grammar.
+pub fn invalid_data_quality_run_id() -> String {
+    format!(
+        "Invalid RunId: must start with '{}'",
+        crate::state::DATA_QUALITY_RUN_ID_PREFIX
+    )
 }
 
 /// A machine learning transform lookup (`GetMLTransform`, `UpdateMLTransform`,
@@ -1531,20 +1572,21 @@ pub fn idempotent_start_with_token(client_token: &str) -> String {
 }
 
 /// A data quality ruleset evaluation run lookup
-/// (`GetDataQualityRulesetEvaluationRun`) for an id no run in this account has. NOT
-/// recorded: the sentence follows the per-resource template of
-/// [`data_quality_rule_recommendation_run_not_found`], built from the requested id,
-/// which is the whole address of a run.
+/// (`GetDataQualityRulesetEvaluationRun`) for an id no run in this account has.
+///
+/// The same recorded template as [`data_quality_rule_recommendation_run_not_found`] and the
+/// same resource class: both are data quality RUNS of this surface, so one miss cannot be
+/// worded one way by a recommendation run's read and another by an evaluation run's.
 pub fn data_quality_ruleset_evaluation_run_not_found(run_id: &str) -> String {
-    format!("Data quality ruleset evaluation run with id {run_id} does not exist")
+    data_quality_not_found(DATA_QUALITY_RUN, run_id)
 }
 
 /// A data quality RESULT lookup (`GetDataQualityResult`) for an id no result in this
-/// account has. NOT recorded: the sentence follows the per-resource template of
-/// [`data_quality_ruleset_evaluation_run_not_found`], built from the requested id,
-/// which is the whole address of a result.
+/// account has.
+///
+/// RECORDED template, built through [`data_quality_not_found`].
 pub fn data_quality_result_not_found(result_id: &str) -> String {
-    format!("Data quality result with id {result_id} does not exist")
+    data_quality_not_found(DATA_QUALITY_RESULT, result_id)
 }
 
 /// A data quality run start whose `DataSource` carries neither kind of Glue table. NOT
