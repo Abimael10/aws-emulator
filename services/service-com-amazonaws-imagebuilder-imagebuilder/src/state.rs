@@ -4621,9 +4621,8 @@ pub fn incomplete_filter_message() -> String {
 ///
 /// The sentence every missing-resource report of this service carries except where
 /// [`resource_arn_not_found_message`] states otherwise: the components, recipes, pipelines,
-/// images and workflows are reported this way whether the call reads one, deletes one,
-/// updates one or resolves a reference to one, and so is any call that resolves a reference
-/// to a configuration or updates one.
+/// images, workflows and the DISTRIBUTION configuration are reported this way whether the
+/// call reads one, deletes one, updates one, tags one or resolves a reference to one.
 #[must_use]
 pub fn required_resource_not_found_message(arn: &str) -> String {
     missing_resource_message(&arn_resource_type(arn), arn)
@@ -4641,14 +4640,16 @@ pub fn missing_resource_message(resource_type: &str, identifier: &str) -> String
     format!("The following required resource '{resource_type}' cannot be found: '{identifier}'.")
 }
 
-/// Why a READ of a configuration resource this Region holds nothing under reports it missing.
+/// Why a call addressing the INFRASTRUCTURE configuration this Region holds nothing under
+/// reports it missing.
 ///
-/// The sentence the two CONFIGURATION resources carry when a call addresses one by its own
-/// ARN to read it — the infrastructure and the distribution configuration alike: it quotes
-/// the ARN the request carried and names no kind. The INFRASTRUCTURE configuration carries it
-/// for its delete as well. Every other missing-resource report of this service — the
-/// versioned families, a reference a create or an update has to resolve, a tagging write —
-/// names the kind through [`required_resource_not_found_message`], see the note there.
+/// The sentence that ONE resource of this service carries when a call addresses it by its own
+/// ARN, to read it or to delete it: it quotes the ARN the request carried and names no kind.
+/// Every other missing-resource report of this service — the versioned families, the
+/// distribution configuration (its read included), a reference a create or an update has to
+/// resolve, a tagging write — names the kind the ARN identifies through
+/// [`required_resource_not_found_message`], so this is a per-resource template rather than a
+/// service-wide one; see the note there.
 #[must_use]
 pub fn resource_arn_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")

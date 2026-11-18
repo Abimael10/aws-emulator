@@ -904,8 +904,10 @@ async fn an_arn_nothing_was_stored_under_is_reported_missing() {
         let arn = arn_of(REGION, name);
         let (status, read) = get(&router, &arn).await;
         assert_refused(case, status, &read, 404, "ResourceNotFoundException");
-        // The read of a configuration quotes the ARN the request carried and names no kind.
-        let expected = format!("The resource ARN '{arn}' was not found.");
+        // A missing distribution configuration is reported as the required resource it is,
+        // naming the kind its ARN identifies.
+        let expected =
+            format!("The following required resource 'DistributionConfiguration' cannot be found: '{arn}'.");
         let actual = error_message(case, &read);
         assert_eq!(
             actual, expected,

@@ -1,30 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for the sentence a READ of one of this service's CONFIGURATION
+//! End-to-end HTTP tests for the sentence a call naming one of this service's CONFIGURATION
 //! resources carries when the ARN it names holds nothing.
 //!
 //! Every case drives the real wire path — the production `MultiServiceRouter`, restJson1
 //! serialization, the modelled-constraint walk and the handlers — so what is asserted is
 //! what a signed AWS SDK request observes.
 //!
-//! The rule under test: a read that ADDRESSES one of the two configuration resources this
-//! service names by a plain, unversioned `<kind>/<name>` ARN — the infrastructure
-//! configuration and the distribution configuration — and finds nothing stored under that
-//! ARN in the calling Region is refused with the not-found error this service models
-//! (`ResourceNotFoundException`, HTTP 404) whose message QUOTES the ARN the request carried
-//! and names no kind: "The resource ARN '<arn>' was not found."
+//! The rule under test: a call that finds nothing stored under the ARN it names in the
+//! calling Region is refused with the not-found error this service models
+//! (`ResourceNotFoundException`, HTTP 404), and the message that refusal carries is the
+//! template of the RESOURCE KIND the ARN identifies, not of the operation that looked it up:
 //!
-//! Its boundary, asserted beside it: the reads of the VERSIONED families, a mutation of the
-//! distribution configuration (its delete and its update), a tagging write and a reference a
-//! create has to resolve all name the kind the ARN identifies instead — "The following
-//! required resource '<Kind>' cannot be found: '<arn>'." (The infrastructure
-//! configuration's delete carries the ARN-quoting sentence as well as its read, which
-//! `resource_not_found.rs` pins.)
+//! * the INFRASTRUCTURE configuration is reported by the ARN the request carried, quoted,
+//!   naming no kind — "The resource ARN '<arn>' was not found." — for its read and for its
+//!   delete alike;
+//! * every other resource of this service, the DISTRIBUTION configuration included, is
+//!   reported as the required resource it is, naming the kind its ARN identifies — "The
+//!   following required resource '<Kind>' cannot be found: '<arn>'." — whether the call
+//!   reads one, deletes one, updates one, tags one or resolves a reference to one.
 //!
-//! The rows span what the rule generalises over: which of the two configuration families the
-//! ARN names, which operation performs the read, the form of the configuration name the ARN
-//! carries, and why the ARN resolves to nothing (never created, deleted, a name that only
-//! resembles a stored one, a stored configuration reached from another Region's endpoint).
+//! The rows span what the rule generalises over: which configuration family the ARN names,
+//! which operation performs the lookup, the form of the configuration name the ARN carries,
+//! and why the ARN resolves to nothing (never created, deleted, a name that only resembles a
+//! stored one, a stored configuration reached from another Region's endpoint).
 
 use std::sync::Arc;
 
@@ -153,7 +152,7 @@ fn assert_ok(case: &str, status: u16, body: Value) -> Value {
 /// Which of this service's two missing-resource sentences an answer has to carry.
 #[derive(Clone, Copy)]
 enum Sentence {
-    /// The one a READ of a configuration carries: the ARN the request named, quoted.
+    /// The one the infrastructure configuration carries: the ARN the request named, quoted.
     Arn,
     /// The one every other report carries: the kind the ARN identifies, and the ARN.
     Kind(&'static str),
@@ -285,6 +284,8 @@ struct Family {
     read: &'static str,
     /// The delete that clears one, up to the ARN it takes in its query string.
     delete: &'static str,
+    /// The sentence a report of this family's missing resource carries.
+    sentence: Sentence,
 }
 
 /// The infrastructure configuration, as the model addresses it.
@@ -296,6 +297,7 @@ const INFRASTRUCTURE: Family = Family {
     minted: "infrastructureConfigurationArn",
     read: "/GetInfrastructureConfiguration?infrastructureConfigurationArn=",
     delete: "/DeleteInfrastructureConfiguration?infrastructureConfigurationArn=",
+    sentence: Sentence::Arn,
 };
 
 /// The distribution configuration, as the model addresses it.
@@ -307,6 +309,7 @@ const DISTRIBUTION: Family = Family {
     minted: "distributionConfigurationArn",
     read: "/GetDistributionConfiguration?distributionConfigurationArn=",
     delete: "/DeleteDistributionConfiguration?distributionConfigurationArn=",
+    sentence: Sentence::Kind("DistributionConfiguration"),
 };
 
 /// The ARN a configuration of `family` named `name` carries in `region`, as the modelled
@@ -321,7 +324,8 @@ fn arn_of(family: Family, region: &str, name: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_read_of_a_configuration_this_region_holds_nothing_under_quotes_the_arn() {
+async fn a_read_of_a_configuration_this_region_holds_nothing_under_carries_its_kinds_sentence()
+{
     for family in [INFRASTRUCTURE, DISTRIBUTION] {
         let router = emulator();
 
@@ -395,7 +399,7 @@ async fn a_read_of_a_configuration_this_region_holds_nothing_under_quotes_the_ar
                 uri: format!("{}{arn}", family.read),
                 body: None,
                 arn,
-                sentence: Sentence::Arn,
+                sentence: family.sentence,
             };
             assert_reports_missing(&router, &probe).await;
         }

@@ -228,9 +228,9 @@ fn required_resource_message(resource_type: &str, arn: &str) -> String {
     format!("The following required resource '{resource_type}' cannot be found: '{arn}'.")
 }
 
-/// The not-found report a READ of a CONFIGURATION carries — the infrastructure and the
-/// distribution configuration alike — quoting the ARN the request named. The infrastructure
-/// configuration carries it for its delete as well.
+/// The not-found report the INFRASTRUCTURE configuration carries, quoting the ARN the request
+/// named: the one resource of this service reported by its ARN alone, for its read and for
+/// its delete alike.
 fn configuration_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
 }
@@ -653,9 +653,8 @@ struct Row {
     dependency: String,
     /// The report a READ answers once it is gone.
     missing: String,
-    /// The report a REPEAT DELETE answers once it is gone. The same sentence as the read's
-    /// for every kind but the distribution configuration, whose read quotes the ARN while
-    /// its mutations name the kind.
+    /// The report a REPEAT DELETE answers once it is gone: the same sentence as the read's,
+    /// because the template follows the resource's kind rather than the operation.
     missing_on_delete: String,
 }
 
@@ -813,7 +812,10 @@ async fn a_dependency_refusal_quotes_only_the_arn_the_request_asked_to_delete() 
                     echoed: "distributionConfigurationArn",
                     delete_referrer: "/DeleteImagePipeline?imagePipelineArn=",
                     dependency: dependency_message(&distribution),
-                    missing: configuration_not_found_message(&distribution),
+                    missing: required_resource_message(
+                        "DistributionConfiguration",
+                        &distribution,
+                    ),
                     missing_on_delete: required_resource_message(
                         "DistributionConfiguration",
                         &distribution,

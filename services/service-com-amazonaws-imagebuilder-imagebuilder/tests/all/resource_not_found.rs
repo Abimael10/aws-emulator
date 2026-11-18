@@ -10,19 +10,17 @@
 //! The rule under test: when an ARN a request carries resolves to no resource of the
 //! calling Region — because it was deleted, or was never created, or belongs to another
 //! Region — the call is answered with the not-found error this service models
-//! (`ResourceNotFoundException`, HTTP 404), and WHICH SENTENCE it carries is:
+//! (`ResourceNotFoundException`, HTTP 404), and WHICH SENTENCE it carries follows the KIND
+//! the ARN identifies rather than the operation that looked it up:
 //!
-//! * for a READ of one of the two CONFIGURATION resources — the infrastructure and the
-//!   distribution configuration, the resources this service addresses by a plain,
-//!   unversioned `<kind>/<name>` ARN — the ARN the request carried, quoted: "The resource
-//!   ARN '<arn>' was not found.", which names no kind. The INFRASTRUCTURE configuration
-//!   carries that sentence for its delete as well.
-//! * everywhere else — the components, recipes, pipelines, images and workflows, whether the
-//!   call reads one, deletes one, updates one, writes its policy or resolves a reference to
-//!   one, and a configuration a call MUTATES (the distribution configuration's delete and
-//!   either configuration's update) or a create resolves a reference to — the required
-//!   resource it is: "The following required resource '<Kind>' cannot be found: '<arn>'.",
-//!   naming the kind the ARN identifies.
+//! * for the INFRASTRUCTURE configuration — the one resource this service reports by the ARN
+//!   alone — the ARN the request carried, quoted: "The resource ARN '<arn>' was not found.",
+//!   which names no kind, for its read and for its delete alike.
+//! * everywhere else — the components, recipes, pipelines, images, workflows and the
+//!   DISTRIBUTION configuration, whether the call reads one, deletes one, updates one,
+//!   writes its policy, tags one or resolves a reference to one — the required resource it
+//!   is: "The following required resource '<Kind>' cannot be found: '<arn>'.", naming the
+//!   kind the ARN identifies.
 //!
 //! The TAG LISTING is the one lookup answered by another layer and so by another class: it
 //! reports an ARN that resolves to nothing as the resource-tagging layer's own
@@ -170,9 +168,9 @@ fn assert_reported_missing(
     );
 }
 
-/// Assert `status` and the answer are the not-found report the rule requires for a
-/// CONFIGURATION a call addresses by its ARN to read: HTTP 404, the same modelled error type,
-/// and the message that quotes `arn` and names no kind.
+/// Assert `status` and the answer are the not-found report the rule requires for the
+/// INFRASTRUCTURE configuration: HTTP 404, the same modelled error type, and the message that
+/// quotes `arn` and names no kind.
 fn assert_arn_not_found(case: &str, status: u16, body: &Value, arn: &str) {
     assert_not_found_shape(case, status, body);
     let expected = format!("The resource ARN '{arn}' was not found.");
@@ -363,9 +361,8 @@ fn distribution_arn(region: &str, normalized: &str) -> String {
 /// Which not-found class a lookup's answer carries.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MissingReport {
-    /// This service's own modelled not-found error for a CONFIGURATION a call addresses by
-    /// its ARN to read it (and for the infrastructure configuration's delete), quoting the
-    /// ARN the request carried.
+    /// This service's own modelled not-found error for the INFRASTRUCTURE configuration,
+    /// whether a call reads it or deletes it, quoting the ARN the request carried.
     ConfigurationArn,
     /// This service's own modelled not-found error everywhere else, naming the kind and the
     /// ARN.
@@ -507,14 +504,14 @@ fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn
             );
         }
         "DistributionConfiguration" => {
-            // The READ of this configuration quotes the ARN, as the sibling configuration
-            // family's read does; the delete and the update below name the kind.
+            // Every lookup of this kind names the kind its ARN identifies — its read as much
+            // as its delete and its update.
             push(
                 "GetDistributionConfiguration",
                 "GET",
                 format!("/GetDistributionConfiguration?distributionConfigurationArn={arn}"),
                 None,
-                MissingReport::ConfigurationArn,
+                MissingReport::RequiredResource,
             );
             push(
                 "DeleteDistributionConfiguration",
