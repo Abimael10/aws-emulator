@@ -1687,16 +1687,20 @@ impl Database {
                     |table| self.declared_column(table, &stored_as),
                 );
                 let table_name = declared.as_ref().and(reads_from);
+                // The declaration of a column whose values the ENGINE assigns, when
+                // this is one: a column declared with a sequence is declared to the
+                // engine as the plain integer key it is, so the sequence is the
+                // DATABASE's own record of the declaration and not the engine's.
+                let sequence = self.declared_sequence(table_name.as_deref(), &stored_as);
                 let (pg, named_type) = match declared_type.as_deref() {
                     Some(declared_type) => {
                         // A column the engine reports as an integer may be one
                         // this database declared with a sequence, which is the
                         // type the catalog holds for it.
-                        let mut pg =
-                            match self.declared_sequence(table_name.as_deref(), &stored_as) {
-                                Some(sequence) => postgres::pg_type(&sequence),
-                                None => postgres::pg_type(declared_type),
-                            };
+                        let mut pg = match &sequence {
+                            Some(sequence) => postgres::pg_type(sequence),
+                            None => postgres::pg_type(declared_type),
+                        };
                         // A refusal the STATEMENT's own text determines stands even where
                         // the table names the column's type: it is about the VALUE this
                         // statement puts in that column, not about the declaration.
@@ -1723,13 +1727,12 @@ impl Database {
                         Some(column) if column.not_null || column.primary_key => COLUMN_NO_NULLS,
                         _ => COLUMN_NULLABLE,
                     },
-                    // A `serial` declaration carries a sequence, and the engine
-                    // also assigns the value of an integer primary key an INSERT
-                    // leaves out.
-                    auto_increment: pg.auto_increment
-                        || declared.as_ref().is_some_and(|declared| {
-                            declared.primary_key && declared.type_name.eq_ignore_ascii_case("INTEGER")
-                        }),
+                    // A column increments automatically exactly where its own
+                    // DECLARATION carries a sequence — whichever engine's spelling
+                    // declared it. Being the table's key is not such a declaration,
+                    // whatever type the key has, and a column no table declares has no
+                    // declaration at all.
+                    auto_increment: sequence.is_some() || pg.auto_increment,
                     pg,
                 }
             })
@@ -1755,7 +1758,7 @@ impl Database {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT info.type, info.\"notnull\", info.pk \
+                "SELECT info.\"notnull\", info.pk \
                  FROM sqlite_master AS m JOIN pragma_table_info(m.name) AS info \
                  WHERE m.type = 'table' \
                    AND m.name = ?1 COLLATE NOCASE \
@@ -1765,9 +1768,8 @@ impl Database {
         statement
             .query_row(rusqlite::params![table, stored_as], |row| {
                 Ok(DeclaredColumn {
-                    type_name: row.get::<_, String>(0)?,
-                    not_null: row.get::<_, i64>(1)? != 0,
-                    primary_key: row.get::<_, i64>(2)? != 0,
+                    not_null: row.get::<_, i64>(0)? != 0,
+                    primary_key: row.get::<_, i64>(1)? != 0,
                 })
             })
             .ok()
@@ -2426,7 +2428,6 @@ impl Default for RequestBudget {
 /// A column as the table declares it.
 #[derive(Debug, Clone)]
 struct DeclaredColumn {
-    type_name: String,
     not_null: bool,
     primary_key: bool,
 }

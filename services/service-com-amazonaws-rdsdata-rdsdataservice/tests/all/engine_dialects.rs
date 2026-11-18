@@ -146,6 +146,155 @@ async fn an_identity_column_is_declared_in_either_engines_spelling() {
     }
 }
 
+/// RULE: `ColumnMetadata.isAutoIncrement` ("A value that indicates whether the column
+/// increments automatically", `Boolean` with the modelled default `false`) describes one
+/// result column by the DECLARATION backing it: it is true only where that declaration
+/// carries an identity property in the dialect it was written in — PostgreSQL's `serial`
+/// family or MySQL's `AUTO_INCREMENT` attribute, the two spellings that give a column a
+/// sequence the engine draws its value from — and false for every other result column,
+/// whatever its type, its position in the projection or its being its table's key, a
+/// `PRIMARY KEY` being no sequence at all.
+///
+/// The rows differ along the declaration: each spelling of an identity column and each
+/// width it is declared at, against plain keys of the integer, character and
+/// floating-point types, and the flag is read both under the column's own name and under
+/// an alias, because an alias renames a result column without detaching it from the
+/// column it reads.
+#[tokio::test]
+async fn a_result_columns_auto_increment_flag_comes_from_its_declaration() {
+    // (case, the key column's declaration, whether the declaration carries a sequence)
+    let declarations = [
+        ("PostgreSQL's sequence column", "serial", true),
+        ("PostgreSQL's wide sequence column", "bigserial", true),
+        ("PostgreSQL's narrow sequence column", "smallserial", true),
+        ("MySQL's identity attribute", "INT AUTO_INCREMENT", true),
+        (
+            "MySQL's identity attribute in lower case",
+            "bigint auto_increment",
+            true,
+        ),
+        ("a plain integer key", "integer", false),
+        ("a plain integer key, abbreviated", "INT", false),
+        ("a plain integer key, by catalog name", "int4", false),
+        ("a wide integer key", "bigint", false),
+        ("a narrow integer key", "smallint", false),
+        ("a character key", "varchar(16)", false),
+        ("a text key", "text", false),
+        ("a floating-point key", "double precision", false),
+    ];
+
+    for (index, (case, declared, carries_a_sequence)) in declarations.into_iter().enumerate() {
+        let api = DataApi::new();
+        let table = format!("flagged_{index}");
+        let (status, created) = api
+            .execute(json!({
+                "sql": format!("CREATE TABLE {table} (id {declared} PRIMARY KEY, label text)"),
+            }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the declaration must be accepted, got {status} {created}"
+        );
+
+        for projection in ["id", "id AS pk"] {
+            let described = api
+                .run(json!({
+                    "sql": format!("SELECT {projection} FROM {table}"),
+                    "includeResultMetadata": true,
+                }))
+                .await;
+            let entry = list(&described, "columnMetadata")
+                .first()
+                .cloned()
+                .unwrap_or(Value::Null);
+            assert_eq!(
+                entry["isAutoIncrement"],
+                json!(carries_a_sequence),
+                "case {case:?} projected as {projection:?}: expected isAutoIncrement \
+                 {carries_a_sequence}, got {entry}"
+            );
+        }
+
+        // The column beside it declares no sequence in any of these tables.
+        let described = api
+            .run(json!({
+                "sql": format!("SELECT label FROM {table}"),
+                "includeResultMetadata": true,
+            }))
+            .await;
+        let entry = list(&described, "columnMetadata")
+            .first()
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            entry["isAutoIncrement"],
+            json!(false),
+            "case {case:?}, the column beside the key: expected isAutoIncrement false, \
+             got {entry}"
+        );
+    }
+
+    // WHERE the column sits decides nothing: a sequence column that is not its table's
+    // key reports the flag, and the key in front of it does not.
+    let api = DataApi::new();
+    api.run(json!({
+        "sql": "CREATE TABLE tickets (label text PRIMARY KEY, id bigserial)",
+    }))
+    .await;
+    let described = api
+        .run(json!({
+            "sql": "SELECT label, id FROM tickets",
+            "includeResultMetadata": true,
+        }))
+        .await;
+    let metadata = list(&described, "columnMetadata");
+    for (position, (case, expected)) in [
+        ("the text key, in front of the sequence column", false),
+        ("the sequence column, behind the key", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let entry = metadata.get(position).cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            entry["isAutoIncrement"],
+            json!(expected),
+            "case {case:?}: expected isAutoIncrement {expected}, got {entry}"
+        );
+    }
+
+    // And a column no table declares — one the statement computes — carries the modelled
+    // default, even where the value it computes is read FROM a sequence column.
+    let api = DataApi::new();
+    api.run(json!({"sql": "CREATE TABLE notes (id serial PRIMARY KEY, body text)"}))
+        .await;
+    api.run(json!({"sql": "INSERT INTO notes (body) VALUES ('first')"}))
+        .await;
+    for (case, projection) in [
+        ("an expression over the sequence column", "id + 1 AS next_id"),
+        ("an aggregate over it", "max(id) AS highest"),
+        ("a count of the rows", "count(*) AS total"),
+        ("a literal the statement spells", "7 AS seven"),
+    ] {
+        let described = api
+            .run(json!({
+                "sql": format!("SELECT {projection} FROM notes"),
+                "includeResultMetadata": true,
+            }))
+            .await;
+        let entry = list(&described, "columnMetadata")
+            .first()
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            entry["isAutoIncrement"],
+            json!(false),
+            "case {case:?}: a computed column has no declaration to carry a sequence, \
+             expected isAutoIncrement false, got {entry}"
+        );
+    }
+}
+
 /// RULE: a statement about the cluster's DATABASES is applied to the cluster, so
 /// `CREATE DATABASE <name>` makes a database the cluster HAS — one a later call selects
 /// with its `database` member, whose tables are its own and invisible to every other
