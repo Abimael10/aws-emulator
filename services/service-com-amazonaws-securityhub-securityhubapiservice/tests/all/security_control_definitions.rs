@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP coverage of `ListSecurityControlDefinitions`: the published
-//! security-control catalog, the `StandardsArn` and `Providers` selections,
-//! `MaxResults`/`NextToken` paging, and how a customizable control reports its
-//! parameters.
+//! End-to-end HTTP coverage of the published security-control catalog:
+//! `ListSecurityControlDefinitions`' listing — the `StandardsArn` and `Providers`
+//! selections, `MaxResults`/`NextToken` paging, and how a customizable control reports
+//! its parameters — and `GetSecurityControlDefinition`'s single-control read of that
+//! same catalog.
 //!
 //! Every case drives the real restJson1 wire path through `MultiServiceRouter`, so a
 //! route, a status code or a serialized member that is wrong on the wire fails here.
@@ -93,6 +94,16 @@ impl Harness {
         } else {
             format!("/securityControls/definitions?{query}")
         };
+        self.call("GET", &path, None).await
+    }
+
+    /// `GetSecurityControlDefinition` for one `SecurityControlId`, as the modelled
+    /// `GET /securityControl/definition?SecurityControlId=…` binding carries it. The
+    /// ids the rows below use carry no query delimiter (`&`, `=`, `#`), so they travel
+    /// in the query string as written — a row that needs one would have to encode it.
+    async fn definition(&self, security_control_id: &str) -> (u16, Value) {
+        let path =
+            format!("/securityControl/definition?SecurityControlId={security_control_id}");
         self.call("GET", &path, None).await
     }
 }
@@ -858,6 +869,323 @@ async fn the_catalog_is_served_whatever_the_account_has_enabled() {
         assert_eq!(
             &body, expected,
             "query {query:?}: disabling the hub must not change the catalog, got {body}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GetSecurityControlDefinition — the single-control read of the same catalog
+// ---------------------------------------------------------------------------
+
+/// RULE: `GetSecurityControlDefinition` answers with the published definition of the
+/// one control its `SecurityControlId` names — byte for byte the definition the listing
+/// reports for that control, since both reads render the same catalog entry.
+///
+/// The case list is the WHOLE published catalog, so every control is asked for
+/// individually: AWS and Azure providers, customizable controls and controls that
+/// support nothing. Two Regions, because the catalog is service metadata that cannot
+/// vary with the Region a request was signed for.
+#[tokio::test]
+async fn one_control_definition_is_reported_exactly_as_the_listing_reports_it() {
+    for region in ["us-east-1", "ap-southeast-2"] {
+        let harness = Harness::subscribed(region).await;
+        let (status, listed) = harness.list("MaxResults=100").await;
+        assert_eq!(
+            status, 200,
+            "region {region:?}: the listing expected 200, got {status} with {listed}"
+        );
+
+        for entry in SECURITY_CONTROL_CATALOG.iter() {
+            let id = entry.control.control_id;
+            let (status, body) = harness.definition(id).await;
+            assert_eq!(
+                status, 200,
+                "control {id} in {region:?}: expected 200, got {status} with {body}"
+            );
+            let reported = body["SecurityControlDefinition"].clone();
+            let from_listing = entry_for(&listed, id)
+                .unwrap_or_else(|| panic!("control {id}: the listing must report it"));
+            assert_eq!(
+                reported, from_listing,
+                "control {id} in {region:?}: the single read must report the same definition as the listing, got {body}"
+            );
+            assert_eq!(
+                reported["SecurityControlId"].as_str(),
+                Some(id),
+                "control {id} in {region:?}: a definition answers under the id it was asked for, got {body}"
+            );
+            assert_eq!(
+                reported["Title"].as_str(),
+                Some(entry.control.title),
+                "control {id} in {region:?}: unexpected Title in {body}"
+            );
+            assert_eq!(
+                reported["Description"].as_str(),
+                Some(entry.control.description),
+                "control {id} in {region:?}: unexpected Description in {body}"
+            );
+            assert_eq!(
+                reported["RemediationUrl"].as_str(),
+                Some(standards_control_remediation_url(id).as_str()),
+                "control {id} in {region:?}: a remediation link carries the control's own id, got {body}"
+            );
+            // Independently of the shared renderer: a remediation link is an HTTPS
+            // documentation address carrying this control's own id, so a renderer
+            // change that broke both reads identically still fails here.
+            let remediation = reported["RemediationUrl"].as_str().unwrap_or_default();
+            assert!(
+                remediation.starts_with("https://") && remediation.contains(id),
+                "control {id} in {region:?}: expected an https link naming {id}, got {remediation:?}"
+            );
+            assert_eq!(
+                reported["SeverityRating"].as_str(),
+                Some(entry.control.severity_rating),
+                "control {id} in {region:?}: unexpected SeverityRating in {body}"
+            );
+            assert_eq!(
+                reported["Provider"].as_str(),
+                Some(entry.provider),
+                "control {id} in {region:?}: unexpected Provider in {body}"
+            );
+            assert_eq!(
+                reported["CurrentRegionAvailability"].as_str(),
+                Some("AVAILABLE"),
+                "control {id} in {region:?}: a published control is available in the Region it is asked for, got {body}"
+            );
+
+            // The definition is a REPORT: asking twice answers the same thing, so the
+            // read changes nothing a later caller sees.
+            let (repeat_status, repeat_body) = harness.definition(id).await;
+            assert_eq!(
+                (repeat_status, &repeat_body),
+                (status, &body),
+                "control {id} in {region:?}: a second read must answer identically, got {repeat_body}"
+            );
+        }
+    }
+}
+
+/// RULE: a control that supports custom parameters reports, in a single read, the same
+/// `Parameters` customizable property and `ParameterDefinitions` entries the catalog
+/// publishes for it; a control that supports none reports an empty
+/// `CustomizableProperties` and no `ParameterDefinitions` at all.
+///
+/// The rows differ along what the rule generalises over: the configuration TYPE of the
+/// published parameter (an integer parameter with bounds and a default, a string-list
+/// parameter with a pattern and no default) and a control with no parameter at all. The
+/// loop then spans every published control, so a control the rows did not name is
+/// covered too.
+#[tokio::test]
+async fn a_single_read_reports_the_parameters_the_control_publishes() {
+    let harness = Harness::new("eu-west-1");
+
+    // (case, control id) — one row per ParameterConfiguration variant the catalog
+    // uses, plus a control with none.
+    let rows: [(&str, &str); 3] = [
+        ("an integer parameter", "ACM.1"),
+        ("a string-list parameter", "ECS.13"),
+        ("no parameter at all", "SageMaker.1"),
+    ];
+    for (case, id) in rows {
+        let entry = catalog_entry(id);
+        let (status, body) = harness.definition(id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {body}"
+        );
+        let reported = &body["SecurityControlDefinition"];
+        match entry.parameters.first().map(|parameter| parameter.configuration) {
+            None => assert!(
+                reported["CustomizableProperties"]
+                    .as_array()
+                    .is_some_and(|properties| properties.is_empty()),
+                "case {case:?}: a control with no custom property reports an empty array, got {body}"
+            ),
+            Some(ParameterConfiguration::Integer { .. }) => assert!(
+                reported["ParameterDefinitions"][entry.parameters[0].name]["ConfigurationOptions"]
+                    ["Integer"]
+                    .is_object(),
+                "case {case:?}: an integer parameter reports integer options, got {body}"
+            ),
+            Some(ParameterConfiguration::StringList { .. }) => assert!(
+                reported["ParameterDefinitions"][entry.parameters[0].name]["ConfigurationOptions"]
+                    ["StringList"]
+                    .is_object(),
+                "case {case:?}: a string-list parameter reports string-list options, got {body}"
+            ),
+        }
+    }
+
+    // And for EVERY published control, the single read's parameter report matches the
+    // published catalog entry.
+    for entry in SECURITY_CONTROL_CATALOG.iter() {
+        let id = entry.control.control_id;
+        let (status, body) = harness.definition(id).await;
+        assert_eq!(
+            status, 200,
+            "control {id}: expected 200, got {status} with {body}"
+        );
+        let reported = &body["SecurityControlDefinition"];
+        if entry.parameters.is_empty() {
+            assert_eq!(
+                reported["CustomizableProperties"].as_array().map(Vec::len),
+                Some(0),
+                "control {id}: expected an empty CustomizableProperties, got {body}"
+            );
+            assert!(
+                reported.get("ParameterDefinitions").is_none(),
+                "control {id}: ParameterDefinitions is excluded for a control without parameters, got {body}"
+            );
+            continue;
+        }
+        let definitions = reported["ParameterDefinitions"]
+            .as_object()
+            .unwrap_or_else(|| panic!("control {id}: ParameterDefinitions must be a map"));
+        assert_eq!(
+            definitions.len(),
+            entry.parameters.len(),
+            "control {id}: expected one entry per published parameter, got {body}"
+        );
+        for parameter in entry.parameters {
+            assert_eq!(
+                definitions[parameter.name]["Description"].as_str(),
+                Some(parameter.description),
+                "control {id}: unexpected description for {}, got {body}",
+                parameter.name
+            );
+        }
+        assert_eq!(
+            reported["CustomizableProperties"].as_array().map(Vec::len),
+            Some(1),
+            "control {id}: a customizable control reports its one customizable property, got {body}"
+        );
+    }
+}
+
+/// RULE: a `SecurityControlId` the service publishes no control under names no
+/// resource, so the read is refused `ResourceNotFoundException` (404) stating that
+/// nothing answers to the id the request carried — never an empty success.
+///
+/// The rows span the forms such an id takes: a control id of a service the catalog
+/// publishes nothing for, a published control's id with another suffix, a differently
+/// cased published id, a legacy standard's numbered requirement id (which is not a
+/// security control id, so the catalog holds none of them), a security-control ARN
+/// (this field accepts no ARN), and ids that are not control ids at all.
+#[tokio::test]
+async fn an_id_no_control_is_published_under_is_refused_as_not_found() {
+    let region = "us-west-2";
+    let harness = Harness::subscribed(region).await;
+
+    // (case, SecurityControlId)
+    let rows: [(&str, String); 8] = [
+        (
+            "a service the catalog publishes nothing for",
+            "Redshift.1".to_string(),
+        ),
+        (
+            "a published control's id with another number",
+            "ACM.999".to_string(),
+        ),
+        ("a published id, lower-cased", "acm.1".to_string()),
+        (
+            "a legacy standard's requirement id",
+            "CIS.1.1".to_string(),
+        ),
+        (
+            "a PCI requirement id",
+            "PCI.CloudTrail.1".to_string(),
+        ),
+        (
+            "a security control ARN rather than an id",
+            format!("arn:aws:securityhub:{region}::security-control/ACM.1"),
+        ),
+        ("a standards control id with a trailing dot", "ACM.1.".to_string()),
+        ("a value that is no control id", "not-a-control".to_string()),
+    ];
+
+    for (case, security_control_id) in rows {
+        let (status, body) = harness.definition(&security_control_id).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?} ({security_control_id}): expected 404, got {status} with {body}"
+        );
+        for member in ["Code", "Type"] {
+            assert_eq!(
+                body[member].as_str(),
+                Some("ResourceNotFoundException"),
+                "case {case:?}: expected {member} ResourceNotFoundException, got {body}"
+            );
+        }
+        let message = body["Message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message,
+            format!(
+                "A security control with the provided SecurityControlId: {security_control_id} does not exist."
+            ),
+            "case {case:?}: unexpected refusal message, got {body}"
+        );
+        assert!(
+            body.get("SecurityControlDefinition").is_none(),
+            "case {case:?}: a refusal reports no definition, got {body}"
+        );
+    }
+
+    // A refusal leaves the published controls answering: the lookup wrote nothing.
+    let (status, body) = harness.definition("ACM.1").await;
+    assert_eq!(
+        status, 200,
+        "a published control must still answer, got {status} with {body}"
+    );
+}
+
+/// RULE: a control definition is the service's own published metadata, so it is served
+/// to every caller — an account with no hub included — and enabling or disabling a hub
+/// does not change what a single read answers.
+#[tokio::test]
+async fn a_definition_is_served_whatever_the_account_has_enabled() {
+    let region = "ca-central-1";
+    // One customizable control and one that supports nothing, so neither side of the
+    // parameter report can depend on the hub.
+    let ids = ["ACM.1", "IAM.4", "AzureStorage.1"];
+
+    let unsubscribed = Harness::new(region);
+    let mut before: Vec<(&str, Value)> = Vec::new();
+    for id in ids {
+        let (status, body) = unsubscribed.definition(id).await;
+        assert_eq!(
+            status, 200,
+            "control {id} without a hub: expected 200, got {status} with {body}"
+        );
+        before.push((id, body));
+    }
+
+    let subscribed = Harness::subscribed(region).await;
+    for (id, expected) in &before {
+        let (status, body) = subscribed.definition(id).await;
+        assert_eq!(
+            status, 200,
+            "control {id} with a hub: expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            &body, expected,
+            "control {id}: the published definition must not depend on the hub, got {body}"
+        );
+    }
+
+    let (status, body) = subscribed.call("DELETE", "/accounts", None).await;
+    assert_eq!(
+        status, 200,
+        "DisableSecurityHub must succeed, got {status} with {body}"
+    );
+    for (id, expected) in &before {
+        let (status, body) = subscribed.definition(id).await;
+        assert_eq!(
+            status, 200,
+            "control {id} after disable: expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            &body, expected,
+            "control {id}: disabling the hub must not change the definition, got {body}"
         );
     }
 }

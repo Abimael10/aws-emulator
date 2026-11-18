@@ -269,6 +269,16 @@ pub fn security_control_by_id(security_control_id: &str) -> Option<&'static Secu
         .find(|entry| entry.control.control_id == security_control_id)
 }
 
+/// The message an operation addressed by a `SecurityControlId` is refused with when
+/// the catalog publishes no control under it: the fixed statement that nothing answers
+/// to the id, with the id quoted back as the request supplied it. One wording here, so
+/// a control-id-addressed operation added later refuses an unpublished id identically.
+pub fn security_control_does_not_exist_message(security_control_id: &str) -> String {
+    format!(
+        "A security control with the provided SecurityControlId: {security_control_id} does not exist."
+    )
+}
+
 /// Whether `standard` applies `entry`: a standard applies a security control when the
 /// control set it publishes addresses that control by the control's own id.
 pub fn standard_applies_security_control(
