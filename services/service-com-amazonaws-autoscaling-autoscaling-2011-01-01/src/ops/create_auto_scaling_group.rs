@@ -921,7 +921,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Those instances are targets of the target groups the group was created attached
         // to: "instances are registered as targets in a target group, and traffic is routed
         // to the target group".
-        crate::state::elbv2_targets::settle_group(&*self.engine, &name);
+        crate::state::settle_group_load_balancers(&*self.engine, &name);
         crate::state::drive_lifecycle_clock(ctx, &self.engine);
         Ok(CreateAutoScalingGroupOutput)
     }

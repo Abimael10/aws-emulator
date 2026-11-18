@@ -415,7 +415,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         drop(state);
         // Those instances are also targets of the target groups the group is attached to, so
         // each one launched is registered there.
-        crate::state::elbv2_targets::settle_group(&*self.engine, &name);
+        crate::state::settle_group_load_balancers(&*self.engine, &name);
         crate::state::drive_lifecycle_clock(ctx, &self.engine);
         Ok(launch_instances_output(&name, &input.client_token, outcome))
     }

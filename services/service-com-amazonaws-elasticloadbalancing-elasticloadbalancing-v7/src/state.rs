@@ -861,6 +861,30 @@ impl LoadBalancer {
         self.instances.insert(instance_id, at)
     }
 
+    /// Register `instance_id` as of `at` on behalf of the workload `workload` another
+    /// emulated service's SCHEDULER runs — an Auto Scaling group's instance, say — keeping
+    /// the set deduplicated and in registration order. Answers whether the id is registered
+    /// now.
+    ///
+    /// Bounded by the same published quota a caller's own registration is
+    /// ([`MAX_INSTANCES_PER_LOAD_BALANCER`]): a load balancer holds no more registrations for
+    /// a scheduler than for anybody else, so one past the quota is not stored — and the
+    /// answer says so rather than reporting a registration that was not made.
+    pub fn register_instance_for(
+        &mut self,
+        instance_id: &str,
+        workload: &str,
+        at: SystemTime,
+    ) -> bool {
+        if self.instances.contains(instance_id) {
+            return true;
+        }
+        if self.instances.len() >= MAX_INSTANCES_PER_LOAD_BALANCER {
+            return false;
+        }
+        self.instances.insert_for(instance_id, at, workload)
+    }
+
     /// The health of `instance_id` with respect to this load balancer: the OUTCOME of the
     /// checks this load balancer has run against it.
     ///

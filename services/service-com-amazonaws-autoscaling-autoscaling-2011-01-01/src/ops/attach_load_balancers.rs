@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachLoadBalancers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachLoadBalancers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachLoadBalancers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches Classic Load Balancers to one Auto Scaling group, as a WHOLE: the attachment is
+//! additive — "this operation is additive and does not detach existing Classic Load Balancers
+//! or target groups from the Auto Scaling group" — so the names the request carries join the
+//! ones the group already holds, each held once however many times it is named, in the order
+//! the group came to hold them.
+//!
+//! An attachment is what puts the group's instances behind that load balancer: "Amazon EC2
+//! Auto Scaling registers the running instances with these Classic Load Balancers". So this
+//! call also brings the Elastic Load Balancing registrations the group owes in line with its
+//! new attachments ([`crate::state::elb_classic_instances`]), which is what
+//! `DescribeInstanceHealth` then reports.
+//!
+//! Every name the request carries therefore has to RESOLVE to a Classic Load Balancer of the
+//! Region the call is addressed to: a load balancer's name identifies it within one Region
+//! and account, and one Elastic Load Balancing holds no load balancer under names nothing at
+//! all, so the call is refused whole — nothing is attached and nothing is registered.
+//!
+//! Whether the CALLER may attach anything to the group at all is decided first, against the
+//! group's own ARN ([`crate::service::authorization`]): a request IAM does not permit changes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +165,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachLoadBalancers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachLoadBalancersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachLoadBalancers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AttachLoadBalancersErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        let requested = input.load_balancer_names;
+        // Whether IAM lets this caller change THIS group, decided against the group's own
+        // ARN before anything is read or written ([`crate::service::authorization`]): a
+        // caller the policies in force do not permit to attach load balancers to it attaches
+        // none, and the group is left exactly as it was.
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            crate::state::audit(ctx.parts(), Self::NAME, &name, "refused: not authorized");
+            return Err(refusal);
+        }
+        // The member's own documented bound, which the model does not express as a length, so
+        // it is checked here rather than at the boundary — the same bound, and the same
+        // refusal, the detach of a load balancer is held to.
+        if requested.len() > crate::state::MAX_LOAD_BALANCERS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_load_balancers_message(),
+            ));
+        }
+        // Every name has to RESOLVE to a Classic Load Balancer of the Region this request is
+        // addressed to: a load balancer is identified within one Region, and the group is in
+        // the Region the request is signed for, so a name Elastic Load Balancing holds no
+        // load balancer under names nothing this endpoint could register an instance with.
+        // Checked on the INPUT, before the group is looked up or touched, so the attachment
+        // the group would then claim can never be one that cannot resolve.
+        let region = crate::state::request_region(ctx.parts());
+        if crate::state::elb_classic_instances::first_unresolvable_load_balancer(
+            &*self.engine,
+            &region,
+            requested.iter().map(String::as_str),
+        )
+        .is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::elb_classic_instances::UNRESOLVABLE_LOAD_BALANCERS_MESSAGE
+                    .to_string(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        {
+            let mut state = state.lock();
+            state.materialize_due(&*self.engine, now);
+
+            let Some(group) = state.groups.get_mut(&name) else {
+                // A name no group answers to is refused with the wording this service's
+                // group-scoped mutations answer with, its detail field left unfilled.
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                ));
+            };
+
+            // Additive, and each load balancer held ONCE: a name the group already holds
+            // keeps the position it has, so attaching one twice leaves the attachments
+            // exactly as one call did.
+            let mut attached: Vec<String> = group.attached_load_balancers().to_vec();
+            for load_balancer_name in requested {
+                if !attached.contains(&load_balancer_name) {
+                    attached.push(load_balancer_name);
+                }
+            }
+            // What the group would then HOLD, which is what this process bounds: the per-call
+            // bound above says nothing about a run of calls, and every instance of the group
+            // owes a registration in every attachment. The ceiling is this service's own, so
+            // it is refused the way every refusal this operation models no error for is —
+            // `ValidationError`.
+            if crate::state::attachment_count_past_ceiling(&[attached.len()]).is_some() {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::too_many_attached_load_balancers_message(),
+                ));
+            }
+            group.load_balancer_names = Some(attached);
+        }
+
+        crate::state::audit(ctx.parts(), Self::NAME, &name, "load balancers attached");
+        // The instances of the group are registered with what it is now attached to, which is
+        // the whole point of the attachment. The store's lock is released above: the reconcile
+        // takes it itself.
+        crate::state::settle_group_load_balancers(&*self.engine, &name);
+        Ok(AttachLoadBalancersOutput {})
     }
 }

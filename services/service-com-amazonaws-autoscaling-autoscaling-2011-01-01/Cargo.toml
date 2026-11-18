@@ -38,6 +38,11 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # there, through that service's own seam, so `DescribeTargetHealth` reports it
 # (`state::elbv2_targets`).
 service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { workspace = true }
+# The Elastic Load Balancing store holds the Classic Load Balancers a group is attached to and
+# the instances registered with them: an instance of an attached group is registered there,
+# through that service's own seam, so `DescribeInstanceHealth` reports it
+# (`state::elb_classic_instances`).
+service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7 = { workspace = true }
 # The account's own IAM store holds the identity-based policies and the permissions
 # boundary in force on the principal a request speaks for, which is what the authorization
 # gate decides an account-wide read from (`service::authorization`). A launch template's

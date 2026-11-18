@@ -43,7 +43,8 @@
 //! owes the registrations of that group and of no other, and a pass claims only the
 //! registrations whose workload names it ([`Scope::claims`]), so one group's reconcile
 //! cannot touch another's. The clock pump, whose wake-up can move an instance of any group,
-//! walks the groups one at a time ([`settle_every_group`]) for the same reason — so the
+//! walks the groups one at a time ([`crate::state::settle_every_group_load_balancers`]) for
+//! the same reason — so the
 //! registrations ONE group's instances need is the most that is ever computed at once,
 //! bounded by that group's own attachments ([`crate::state::MAX_TARGET_GROUPS_PER_GROUP`])
 //! times its own instances ([`crate::state::MAX_GROUP_CAPACITY`]).
@@ -178,6 +179,19 @@ impl Scope {
             }
         }
     }
+}
+
+/// Whether a registration standing for `workload` ([`workload`]) is one the group
+/// `group_name` owns — what lets a reconcile of that group take its own registrations out
+/// and leave every other registration alone.
+///
+/// THE ONE reading of that form for every registration this service makes in another
+/// service's store, whichever load balancer kind holds it
+/// ([`crate::state::elb_classic_instances`] claims a Classic Load Balancer's registrations
+/// through this), so no two of them disagree about whose a registration is. It claims the
+/// group's registrations whether or not the group still exists, so a deleted group's drain.
+pub fn belongs_to_group(workload: &str, group_name: &str) -> bool {
+    Scope::of_group(group_name).claims(workload)
 }
 
 /// Every Elastic Load Balancing v2 target group the group `group` is ATTACHED to, in
@@ -459,7 +473,7 @@ const HEALTH_CHECK_TYPE_ELB: &str = "ELB";
 /// Whether Elastic Load Balancing health checks are enabled for the group: its
 /// `HealthCheckType` names `ELB`, which the member admits beside the other types as a
 /// comma-separated list ([`crate::state::is_valid_health_check_type`]).
-fn elb_health_checks_enabled(group: &StoredGroup) -> bool {
+pub fn elb_health_checks_enabled(group: &StoredGroup) -> bool {
     group
         .health_check_type
         .split(',')
@@ -664,23 +678,6 @@ pub fn settle_group<Eng: Send + Sync + 'static>(engine: &Eng, group_name: &str) 
     // statement, so nothing below holds it.
     let wanted = wanted_of(&state.lock(), group_name);
     reconcile(engine, group_name, &wanted, SystemTime::now());
-}
-
-/// Settle every group this store holds, ONE GROUP AT A TIME: what the clock pump owes, whose
-/// wake-up can have moved an instance of any group.
-///
-/// The group names are read under this store's lock and the guard released before the first
-/// reconcile, and each group is then settled on its own — so the registrations of one group
-/// is the most this pass ever computes at once, however many groups the store holds (itself
-/// bounded by [`crate::state::MAX_GROUPS`]).
-pub fn settle_every_group<Eng: Send + Sync + 'static>(engine: &Eng) {
-    let Some(state) = crate::state::service_state(engine) else {
-        return;
-    };
-    let names: Vec<String> = state.lock().groups.keys().cloned().collect();
-    for name in names {
-        settle_group(engine, &name);
-    }
 }
 
 /// Make the Elastic Load Balancing v2 registrations of the group `group_name` exactly

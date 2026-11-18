@@ -22,6 +22,15 @@ pub struct Registration {
     pub registered_at: SystemTime,
     /// What this registration's health checks have observed and decided.
     pub probe: HealthProbe,
+    /// The WORKLOAD another emulated service's scheduler made this registration on behalf
+    /// of, and `None` for one a caller of this service made itself
+    /// (`RegisterInstancesWithLoadBalancer`).
+    ///
+    /// A scheduler that registers an instance it runs owns that registration: it is the one
+    /// that takes it out again when the workload stops needing it
+    /// ([`InstanceSet::scheduler_registrations`]), and a caller's own registration is never
+    /// claimed by one — which is what keeps the two kinds apart in one set.
+    pub registered_for: Option<String>,
 }
 
 impl Registration {
@@ -30,6 +39,16 @@ impl Registration {
         Self {
             registered_at: at,
             probe: HealthProbe::starting_at(at),
+            registered_for: None,
+        }
+    }
+
+    /// The registration a SCHEDULER made at `at` for the workload `workload`: the same
+    /// registration, carrying what made it.
+    pub fn starting_at_for(at: SystemTime, workload: &str) -> Self {
+        Self {
+            registered_for: Some(workload.to_string()),
+            ..Self::starting_at(at)
         }
     }
 }
@@ -56,13 +75,46 @@ impl InstanceSet {
     /// call restates a registration that already happened, so the health checks it
     /// started do not restart.
     pub fn insert(&mut self, instance_id: &str, at: SystemTime) -> bool {
+        self.insert_registration(instance_id, Registration::starting_at(at))
+    }
+
+    /// Add `instance_id` as a registration another emulated service's scheduler made at `at`
+    /// for the workload `workload`, unless it is already registered. Answers whether it was
+    /// added.
+    ///
+    /// An instance the set already holds keeps the registration it already has, exactly as
+    /// [`InstanceSet::insert`] leaves it: a scheduler restating a registration that already
+    /// happened does not restart the health checks it started.
+    pub fn insert_for(&mut self, instance_id: &str, at: SystemTime, workload: &str) -> bool {
+        self.insert_registration(instance_id, Registration::starting_at_for(at, workload))
+    }
+
+    /// The one insertion both forms above go through, so a registration is held in the set
+    /// and in its order exactly once however it was made.
+    fn insert_registration(&mut self, instance_id: &str, registration: Registration) -> bool {
         if self.registered.contains_key(instance_id) {
             return false;
         }
-        self.registered
-            .insert(instance_id.to_string(), Registration::starting_at(at));
+        self.registered.insert(instance_id.to_string(), registration);
         self.order.push(instance_id.to_string());
         true
+    }
+
+    /// Every registration of this set another service's scheduler made, as
+    /// `(instance id, workload)` pairs in registration order: what a scheduler reads to find
+    /// the registrations it owns, including the ones it no longer owes.
+    ///
+    /// A registration a CALLER of this service made carries no workload and is not reported
+    /// here, so nothing a scheduler does can take it out.
+    pub fn scheduler_registrations(&self) -> Vec<(String, String)> {
+        self.order
+            .iter()
+            .filter_map(|instance_id| {
+                let registration = self.registered.get(instance_id)?;
+                let workload = registration.registered_for.clone()?;
+                Some((instance_id.clone(), workload))
+            })
+            .collect()
     }
 
     /// Remove every id in `ids` in ONE pass over the ordered set, so a batch costs

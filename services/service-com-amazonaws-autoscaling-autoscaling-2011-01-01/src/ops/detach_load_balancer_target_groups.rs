@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deregistering the instances in the group". The store's lock is released first:
         // the reconcile takes it itself.
         drop(state);
-        crate::state::elbv2_targets::settle_group(&*self.engine, &name);
+        crate::state::settle_group_load_balancers(&*self.engine, &name);
         Ok(DetachLoadBalancerTargetGroupsOutput {})
     }
 }

@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachLoadBalancers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachLoadBalancers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachLoadBalancers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaches Classic Load Balancers from one Auto Scaling group, as a WHOLE: the request is
+//! one unit of work, so one name the group does not hold refuses the whole call and leaves
+//! the attachments it does hold in place.
+//!
+//! Detaching is what takes the group's instances out from behind that load balancer: "when
+//! you detach a load balancer, it enters the Removing state while deregistering the instances
+//! in the group … the instances remain running". So this call also brings the Elastic Load
+//! Balancing registrations the group owes in line with what it is still attached to
+//! ([`crate::state::elb_classic_instances`]) — the deregistration runs as this call does, so
+//! the load balancer it took off the group is gone from `DescribeLoadBalancers` once the call
+//! answers, and the instances it held are left running in Amazon EC2.
+//!
+//! Whether the CALLER may change the group's attachments at all is decided first, against the
+//! group's own ARN ([`crate::service::authorization`]): a request IAM does not permit changes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +153,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachLoadBalancers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachLoadBalancersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachLoadBalancers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DetachLoadBalancersErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        let requested = input.load_balancer_names;
+        // Whether IAM lets this caller change THIS group's attachments, decided against the
+        // group's own ARN before anything is read or written
+        // ([`crate::service::authorization`]): a request the policies in force do not permit
+        // detaches nothing.
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            crate::state::audit(ctx.parts(), Self::NAME, &name, "refused: not authorized");
+            return Err(refusal);
+        }
+        // The member's own documented bound, which the model does not express as a length, so
+        // it is checked here rather than at the boundary.
+        if requested.len() > crate::state::MAX_LOAD_BALANCERS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_load_balancers_message(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        {
+            let mut state = state.lock();
+            state.materialize_due(&*self.engine, now);
+
+            let Some(group) = state.groups.get_mut(&name) else {
+                // A name no group answers to is refused with the wording this service's
+                // group-scoped mutations answer with, its detail field left unfilled — the
+                // same refusal the attach of a load balancer answers.
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                ));
+            };
+
+            // Checked for EVERY named load balancer before any of them is removed: the
+            // request is one unit of work, so one name this group never held refuses the whole
+            // call and leaves the attachments it does hold in place.
+            let unattached: Vec<String> = requested
+                .iter()
+                .filter(|load_balancer_name| {
+                    !group.attached_load_balancers().contains(load_balancer_name)
+                })
+                .cloned()
+                .collect();
+            if !unattached.is_empty() {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::unattached_load_balancers_message(&unattached),
+                ));
+            }
+
+            let remaining: Vec<String> = group
+                .attached_load_balancers()
+                .iter()
+                .filter(|load_balancer_name| !requested.contains(load_balancer_name))
+                .cloned()
+                .collect();
+            group.load_balancer_names = Some(remaining);
+        }
+
+        crate::state::audit(ctx.parts(), Self::NAME, &name, "load balancers detached");
+        // A load balancer the group is no longer attached to deregisters the group's
+        // instances — "it enters the Removing state while deregistering the instances in the
+        // group". The store's lock is released above: the reconcile takes it itself.
+        crate::state::settle_group_load_balancers(&*self.engine, &name);
+        Ok(DetachLoadBalancersOutput {})
     }
 }

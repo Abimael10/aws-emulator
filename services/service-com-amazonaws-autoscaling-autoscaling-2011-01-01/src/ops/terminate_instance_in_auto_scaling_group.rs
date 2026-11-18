@@ -310,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         drop(state);
         // An instance taken out of service is no longer a target of the target groups the
         // group is attached to, and a replacement it launched is one.
-        crate::state::elbv2_targets::settle_group(&*self.engine, &group_name);
+        crate::state::settle_group_load_balancers(&*self.engine, &group_name);
         crate::state::drive_lifecycle_clock(ctx, &self.engine);
         // One member or the other, never both: a request naming one instance answers with
         // the one activity its termination recorded, and a list request with the

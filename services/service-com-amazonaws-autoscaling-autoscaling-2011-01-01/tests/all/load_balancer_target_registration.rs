@@ -75,6 +75,15 @@ const TARGET_TYPE_INSTANCE: &str = "instance";
 /// (`smithy_query(query="doc",shape="TrafficSourceIdentifier",member="Type")`).
 const TRAFFIC_SOURCE_TYPE_ELBV2: &str = "elbv2";
 
+/// The CLASSIC Load Balancers a group is attached to, in their own file beside this one: the
+/// same rule — an instance of an attached group is registered with what it is attached to —
+/// through the other load balancer kind's own operations, which is this suite's sibling
+/// concern. `tests/all.rs` declares one module per suite FILE, and this is that file's
+/// module; the `#[path]` points it into this suite's own directory, as that file's own
+/// declaration points into `tests/all/`.
+#[path = "load_balancer_target_registration/classic_load_balancers.rs"]
+mod classic_load_balancers;
+
 /// How a group names the target groups it is created attached to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachedAs {

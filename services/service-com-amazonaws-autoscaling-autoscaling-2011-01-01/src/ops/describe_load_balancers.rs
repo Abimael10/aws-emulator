@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLoadBalancers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLoadBalancers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLoadBalancers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Classic Load Balancers one Auto Scaling group is attached to, and the state
+//! each attachment is in — "to determine the attachment status of the load balancer, use the
+//! State element in the response".
+//!
+//! What it reports is the group's own `LoadBalancerNames`, which `CreateAutoScalingGroup` and
+//! `AttachLoadBalancers` write and `DetachLoadBalancers` takes entries out of, each held once
+//! and in attachment order by the write that put it there — so this read neither reorders nor
+//! de-duplicates them. The STATE is derived, every time it is asked for, from the
+//! registrations the attachment owes and the ones Elastic Load Balancing holds
+//! ([`crate::state::elb_classic_instances::attachment_states`]): nothing is stored beside the
+//! attachment to say so, and reading it moves nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +176,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLoadBalancers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLoadBalancersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLoadBalancers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeLoadBalancersErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let group_name = input.auto_scaling_group_name;
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        // The group is resolved BEFORE the rest of the request is read: this read reports the
+        // load balancers of the group it names, so a name no group answers to is refused for
+        // the group whatever else the request carries, in the detail form this read serves —
+        // the group could not be found under the name the request quoted.
+        let Some(group) = state.groups.get(&group_name) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message_as_not_findable(&group_name),
+            ));
+        };
+
+        // The load balancers attached THROUGH THIS API — the group's own `LoadBalancerNames`,
+        // which `CreateAutoScalingGroup` and `AttachLoadBalancers` write: "you can use both
+        // the original DescribeLoadBalancers API operation and DescribeTrafficSources on the
+        // same Auto Scaling group" (this operation's own documentation), so a traffic source
+        // attached through the newer API is that read's to report rather than this one's.
+        let attached = group.attached_load_balancers().to_vec();
+        let states = crate::state::elb_classic_instances::attachment_states(
+            &*self.engine,
+            group,
+            &attached,
+            now,
+        );
+        let reported: Vec<LoadBalancerState> = attached
+            .into_iter()
+            .zip(states)
+            .map(|(load_balancer_name, attachment_state)| LoadBalancerState {
+                load_balancer_name: Some(load_balancer_name),
+                state: Some(attachment_state.to_string()),
+            })
+            .collect();
+
+        // The page this read resumes at, from the token a previous one issued: a token this
+        // read did not issue is a bad VALUE for the member that carried it, which this read
+        // answers the service-common `ValidationError` for, naming the member and the value
+        // submitted for it. The token itself is kept so a later refusal names the one the
+        // caller actually submitted.
+        let (offset, token) = match input.next_token.clone() {
+            None => (0, String::new()),
+            Some(token) => match crate::state::decode_next_token(&token) {
+                Some(offset) => (offset, token),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::next_token_value_violation_message(&token),
+                    ));
+                }
+            },
+        };
+        // "The maximum number of items to return with this call. The default value is 100 and
+        // the maximum value is 100" (`DescribeLoadBalancersRequest$MaxRecords`): the member
+        // carries no modelled range, so a page size outside it is refused here rather than
+        // quietly reshaped.
+        if let Some(max_records) = crate::state::max_records_out_of_range(input.max_records) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::max_records_violation_message(max_records),
+            ));
+        }
+
+        // A token this service issued always points inside the list it was issued for; one
+        // that points past the end was not issued for this list. Only a decoded token reaches
+        // a non-zero offset, so `token` is the one submitted.
+        if offset > 0 && offset >= reported.len() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::next_token_value_violation_message(&token),
+            ));
+        }
+        let (load_balancers, next_token) = crate::state::page(
+            &reported,
+            offset,
+            // This operation's own documented default page size, which is larger than the one
+            // the name-ordered describes take.
+            Some(
+                input
+                    .max_records
+                    .unwrap_or(crate::state::DEFAULT_ATTACHMENT_MAX_RECORDS),
+            ),
+        );
+
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &group_name,
+            "load balancer attachments read",
+        );
+        Ok(DescribeLoadBalancersOutput {
+            // A collection of the group is reported as a LIST, empty when the group holds
+            // nothing in it, rather than leaving the member out: "attached to nothing" and
+            // "this service does not report attachments" are not the same answer.
+            load_balancers: Some(load_balancers),
+            next_token,
+        })
     }
 }

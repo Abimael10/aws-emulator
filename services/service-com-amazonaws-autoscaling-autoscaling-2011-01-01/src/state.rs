@@ -82,6 +82,11 @@ pub use group_tags::{
 /// target of that target group, not a reference this service keeps to itself.
 pub mod elbv2_targets;
 
+/// The Classic Load Balancer registrations a group's instances hold in the load balancers it
+/// is attached to, in Elastic Load Balancing's own store: an instance of an attached group is
+/// a registered instance of that load balancer, not a reference this service keeps to itself.
+pub mod elb_classic_instances;
+
 /// The IAM instance profile the launch templates of a group name, resolved against the
 /// account's own IAM store: a reference Amazon EC2 stores verbatim and this service, as
 /// the consumer of the template, is what resolves.
@@ -578,9 +583,17 @@ pub const ACCOUNT_MAX_CALL_RATE_BUCKET_SIZE: i32 = 30;
 /// service's own and is checked by the handler.
 pub const MAX_TARGET_GROUPS_PER_CALL: usize = 10;
 
+/// The most Classic Load Balancers ONE call may name, which bounds both the legacy
+/// load-balancer attach and the legacy detach.
+///
+/// From the model's own documentation for `AttachLoadBalancersType$LoadBalancerNames`: "You
+/// can specify up to 10 load balancers." The member carries no modelled length, so the bound
+/// is the service's own and is checked by the handler.
+pub const MAX_LOAD_BALANCERS_PER_CALL: usize = 10;
+
 /// The most load-balancer attachments this emulator will hold for ONE Auto Scaling group —
-/// its `TargetGroupARNs`, and the traffic sources naming a target group — however many calls
-/// put them there.
+/// its `TargetGroupARNs`, its `LoadBalancerNames`, and the traffic sources naming either —
+/// however many calls put them there, counted per collection.
 ///
 /// A BOUND ON THIS PROCESS, like [`MAX_GROUP_CAPACITY`], rather than a figure AWS documents:
 /// [`MAX_TARGET_GROUPS_PER_CALL`] bounds what ONE attach may name and nothing else, so a run
@@ -1149,6 +1162,13 @@ impl StoredGroup {
     /// attachments" from an absent member.
     pub fn attached_target_groups(&self) -> &[String] {
         self.target_group_arns.as_deref().unwrap_or_default()
+    }
+
+    /// The Classic Load Balancers attached to this group, as the group itself holds them:
+    /// empty for a group that has none, so a caller never distinguishes "no attachments"
+    /// from an absent member.
+    pub fn attached_load_balancers(&self) -> &[String] {
+        self.load_balancer_names.as_deref().unwrap_or_default()
     }
 
     /// The instances `instance_ids` names that a termination would take out of service:
@@ -3359,6 +3379,46 @@ pub fn too_many_attached_target_groups_message() -> String {
     )
 }
 
+/// The message a request that would leave one group holding more Classic Load Balancer
+/// attachments than [`MAX_TARGET_GROUPS_PER_GROUP`] is refused with, in the same shape this
+/// service states its other per-collection ceilings in: the fixed sentence and the ceiling.
+pub fn too_many_attached_load_balancers_message() -> String {
+    format!(
+        "You have already reached the limit of {MAX_TARGET_GROUPS_PER_GROUP} load balancers per \
+         Auto Scaling group"
+    )
+}
+
+/// Bring every load-balancing registration the group `group_name` owes in line with what it
+/// now holds: its targets in the Elastic Load Balancing v2 target groups it is attached to
+/// ([`elbv2_targets`]), and its registrations with the Classic Load Balancers it is attached
+/// to ([`elb_classic_instances`]).
+///
+/// THE ONE call every write that moved a group's instances or its attachments makes for it,
+/// so neither kind of attachment is settled by some operations and not others. Called with
+/// NO guard of this store held: each reconcile takes this store's lock to read what the group
+/// owes, releases it, and only then writes the other service's store.
+pub fn settle_group_load_balancers<Eng: Send + Sync + 'static>(engine: &Eng, group_name: &str) {
+    elbv2_targets::settle_group(engine, group_name);
+    elb_classic_instances::settle_group(engine, group_name);
+}
+
+/// Settle every group this store holds, ONE GROUP AT A TIME: what the clock pump owes, whose
+/// wake-up can have moved an instance of any group.
+///
+/// The group names are read under this store's lock and the guard released before the first
+/// reconcile, so the registrations of one group is the most this pass ever computes at once,
+/// however many groups the store holds (itself bounded by [`MAX_GROUPS`]).
+pub fn settle_every_group_load_balancers<Eng: Send + Sync + 'static>(engine: &Eng) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    let names: Vec<String> = state.lock().groups.keys().cloned().collect();
+    for name in names {
+        settle_group_load_balancers(engine, &name);
+    }
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -3487,6 +3547,34 @@ pub fn too_many_target_groups_message() -> String {
     format!(
         "Trying to update too many Target Groups at once. The limit is \
          {MAX_TARGET_GROUPS_PER_CALL}"
+    )
+}
+
+/// The message a call naming more Classic Load Balancers than
+/// [`MAX_LOAD_BALANCERS_PER_CALL`] is refused with, which quotes the bound the caller has to
+/// come back under.
+///
+/// The same sentence this service refuses too many target groups at once with
+/// ([`too_many_target_groups_message`]), over the resource THIS call updates: fixed text
+/// apart from that bound, which is the documented per-call limit rather than a value from the
+/// request.
+pub fn too_many_load_balancers_message() -> String {
+    format!(
+        "Trying to update too many Load Balancers at once. The limit is \
+         {MAX_LOAD_BALANCERS_PER_CALL}"
+    )
+}
+
+/// The message Amazon EC2 Auto Scaling refuses a legacy load-balancer detach that names a
+/// load balancer the group does not hold with, which names those load balancers.
+///
+/// The refusal is for the request as a WHOLE: a call that mixes attached load balancers with
+/// one that is not attached detaches none of them, so the message says what was wrong with
+/// the request rather than reporting a partial result.
+pub fn unattached_load_balancers_message(names: &[String]) -> String {
+    format!(
+        "Trying to remove Load Balancers that are not part of the group: {}",
+        names.join(", ")
     )
 }
 

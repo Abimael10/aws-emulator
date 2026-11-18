@@ -285,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The instances of the group are targets of what it is now attached to, which is the
         // whole point of the attachment. The store's lock is released above: the reconcile
         // takes it itself.
-        crate::state::elbv2_targets::settle_group(&*self.engine, &name);
+        crate::state::settle_group_load_balancers(&*self.engine, &name);
         Ok(AttachTrafficSourcesOutput {})
     }
 }

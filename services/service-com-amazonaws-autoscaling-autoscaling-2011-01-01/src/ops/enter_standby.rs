@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         drop(state);
         // A parked instance is out of service, so it is no longer a target of the target
         // groups the group is attached to, and a replacement launched for it is one.
-        crate::state::elbv2_targets::settle_group(&*self.engine, &name);
+        crate::state::settle_group_load_balancers(&*self.engine, &name);
         crate::state::drive_lifecycle_clock(ctx, &self.engine);
         Ok(EnterStandbyOutput {
             activities: Some(activities),

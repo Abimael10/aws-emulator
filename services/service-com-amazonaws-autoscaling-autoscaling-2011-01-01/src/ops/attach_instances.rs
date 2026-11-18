@@ -236,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An instance of the group is a target of the target groups the group is attached
         // to, which is what "the instances are also registered with the target groups"
         // means for an instance the group was given rather than launched.
-        crate::state::elbv2_targets::settle_group(&*self.engine, &name);
+        crate::state::settle_group_load_balancers(&*self.engine, &name);
         crate::state::drive_lifecycle_clock(ctx, &self.engine);
         Ok(AttachInstancesOutput)
     }

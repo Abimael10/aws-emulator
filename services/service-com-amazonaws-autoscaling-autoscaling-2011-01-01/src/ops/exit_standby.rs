@@ -211,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         drop(state);
         // An instance back in service is a target of the target groups the group is
         // attached to again.
-        crate::state::elbv2_targets::settle_group(&*self.engine, &name);
+        crate::state::settle_group_load_balancers(&*self.engine, &name);
         crate::state::drive_lifecycle_clock(ctx, &self.engine);
         Ok(ExitStandbyOutput {
             activities: Some(activities),
