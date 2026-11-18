@@ -658,3 +658,135 @@ async fn a_restore_replayed_with_one_token_creates_one_file_system() {
          IncompatibleParameterError, got {status} {code} with message {message:?}"
     );
 }
+
+/// RULE: the resource a restore is taken FROM is resolved before the members that PLACE the
+/// restored file system are validated, so a `BackupId` the account has no backup for is the
+/// modelled `BackupNotFound` — naming that id — whatever the request's networking members
+/// say. The networking validation itself is unchanged: it still refuses the same subnets for
+/// a backup that does exist, and admits the request both guards accept.
+///
+/// The table spans both axes the rule generalises over: the modelled `BackupId` shape (its
+/// shortest and longest legal forms, differing hex payloads) and the form of the networking
+/// members (one absent subnet, several, an absent one beside a real one, an absent preferred
+/// subnet, an absent security group, and the empty list the modelled `length min 0` admits).
+#[tokio::test]
+async fn a_restore_resolves_the_backup_before_it_validates_the_networking_members() {
+    let router = emulator().await;
+    let subnet = router.subnet_a().to_string();
+
+    // (case, the networking members a restore request carries)
+    let networking: &[(&str, Value)] = &[
+        ("one absent subnet", json!({ "SubnetIds": ["subnet-deadbeef"] })),
+        (
+            "two absent subnets",
+            json!({ "SubnetIds": ["subnet-deadbeef", "subnet-00000000deadbeef"] }),
+        ),
+        (
+            "an absent subnet beside a real one",
+            json!({ "SubnetIds": [subnet.clone(), "subnet-00000000deadbeef"] }),
+        ),
+        (
+            "an absent preferred subnet",
+            json!({
+                "SubnetIds": [subnet.clone()],
+                "WindowsConfiguration": {
+                    "ThroughputCapacity": 32,
+                    "PreferredSubnetId": "subnet-deadbeef",
+                },
+            }),
+        ),
+        ("no subnets at all", json!({ "SubnetIds": [] })),
+    ];
+
+    for backup_id in ABSENT_BACKUP_IDS {
+        for (networking_case, members) in networking {
+            let mut request = members.clone();
+            request["BackupId"] = json!(backup_id);
+            let case = format!("absent {backup_id} with {networking_case}");
+            let (status, code, message) = error_of(
+                &router,
+                "CreateFileSystemFromBackup",
+                &with_client_request_token(&request),
+            )
+            .await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "BackupNotFound"),
+                "case {case:?}: expected HTTP 400 BackupNotFound, got {status} {code} with \
+                 message {message:?}"
+            );
+            assert_eq!(
+                message,
+                format!("Backup '{backup_id}' does not exist."),
+                "case {case:?}: expected the refusal to name the requested backup, got \
+                 {message:?}"
+            );
+        }
+    }
+
+    // The very same networking members, for a backup the account HAS, still fail the
+    // networking validation: the guard ORDER decides which refusal comes first, not whether
+    // the networking members are validated at all. (A restore does not wait on the backup's
+    // lifecycle, so nothing here waits on the clock.)
+    let source = ok(
+        &router,
+        "CreateFileSystem",
+        &with_client_request_token(&json!({
+            "FileSystemType": "WINDOWS",
+            "StorageCapacity": 64,
+            "SubnetIds": [subnet],
+            "WindowsConfiguration": { "ThroughputCapacity": 32 },
+        })),
+    )
+    .await;
+    let taken = ok(
+        &router,
+        "CreateBackup",
+        &with_client_request_token(&json!({
+            "FileSystemId": source["FileSystem"]["FileSystemId"],
+        })),
+    )
+    .await;
+    let backup_id = taken["Backup"]["BackupId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !backup_id.is_empty(),
+        "CreateBackup must answer with a BackupId, got {taken}"
+    );
+    for (networking_case, members) in networking {
+        let mut request = members.clone();
+        request["BackupId"] = json!(backup_id);
+        let case = format!("stored backup with {networking_case}");
+        let (status, code, message) = error_of(
+            &router,
+            "CreateFileSystemFromBackup",
+            &with_client_request_token(&request),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "InvalidNetworkSettings"),
+            "case {case:?}: expected HTTP 400 InvalidNetworkSettings, got {status} {code} with \
+             message {message:?}"
+        );
+    }
+
+    // And the request both guards admit is accepted, so neither one refuses a restore of a
+    // stored backup into a subnet the account has.
+    let restored = ok(
+        &router,
+        "CreateFileSystemFromBackup",
+        &with_client_request_token(&json!({
+            "BackupId": backup_id,
+            "SubnetIds": [subnet],
+        })),
+    )
+    .await;
+    assert_eq!(
+        restored["FileSystem"]["SubnetIds"],
+        json!([subnet]),
+        "a restore into a subnet the account has must be accepted, got {restored}"
+    );
+}

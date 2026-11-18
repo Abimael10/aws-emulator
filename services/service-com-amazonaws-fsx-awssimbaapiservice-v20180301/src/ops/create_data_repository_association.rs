@@ -273,14 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // An association is created ON a file system the account HAS.
             let Some(file_system) = store.file_systems.get(&input.file_system_id) else {
-                return Err(CreateDataRepositoryAssociationErrorModeled::FileSystemNotFound(
-                    FileSystemNotFound {
-                        // Built from the id the caller asked about, so the response says
-                        // WHICH file system was missing.
-                        message: Some(file_system_not_found_message(&input.file_system_id)),
-                    },
-                )
-                .into());
+                return Err(file_system_does_not_exist(&input.file_system_id));
             };
 
             // "Data repository associations are supported on all FSx for Lustre 2.12 and
@@ -318,12 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // being asked, and an association of a file system that is gone would belong to
         // nothing.
         if !store.file_systems.contains_key(&input.file_system_id) {
-            return Err(CreateDataRepositoryAssociationErrorModeled::FileSystemNotFound(
-                FileSystemNotFound {
-                    message: Some(file_system_not_found_message(&input.file_system_id)),
-                },
-            )
-            .into());
+            return Err(file_system_does_not_exist(&input.file_system_id));
         }
 
         // "Two data repository associations cannot have overlapping file system paths", and
@@ -402,6 +390,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             association: Some(record.to_data_repository_association()),
         })
     }
+}
+
+/// The modelled refusal for a request naming a file system the account does not have: the
+/// generic client-request error (`BadRequest`, client, HTTP 400), whose `Message` names the
+/// `FileSystemId` the request carried.
+///
+/// This operation links a directory of a file system the CALLER states to a data repository,
+/// so a `FileSystemId` that resolves to nothing makes the REQUEST wrong rather than reporting
+/// a file system that went missing: Amazon FSx answers it with `BadRequest`, the error it
+/// models for "a failure with a client request", so the caller corrects the request instead
+/// of waiting for or recreating a file system.
+fn file_system_does_not_exist(file_system_id: &str) -> CreateDataRepositoryAssociationError {
+    CreateDataRepositoryAssociationErrorModeled::BadRequest(BadRequest {
+        // Built from the id the caller asked about, so the response says WHICH file system
+        // was missing.
+        message: Some(file_system_not_found_message(file_system_id)),
+    })
+    .into()
 }
 
 /// The modelled refusal for a file system that can hold no data repository association:

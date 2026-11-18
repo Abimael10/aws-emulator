@@ -101,13 +101,11 @@
 use super::types::*;
 
 use crate::state::{
-    data_repository_association_not_found_message, data_repository_associations_page_scope,
-    decode_page_token, page_size, unsupported_data_repository_association_filter_name_message,
-    DataRepositoryAssociationRecord, DATA_REPOSITORY_ASSOCIATION_FILTER_DATA_REPOSITORY_TYPE,
-    DATA_REPOSITORY_ASSOCIATION_FILTER_NAMES, DATA_REPOSITORY_TYPES,
+    data_repository_associations_page_scope, decode_page_token, page_size,
+    unsupported_data_repository_association_filter_name_message,
+    DataRepositoryAssociationRecord, DATA_REPOSITORY_ASSOCIATION_FILTER_NAMES,
     MAX_DATA_REPOSITORY_ASSOCIATIONS_PER_PAGE,
 };
-use crate::state::unsupported_data_repository_type_message;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -217,12 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let keys: Vec<String> = if requested.is_empty() {
-            // Only the filter NAME is validated, and the one filter whose VALUES the model
-            // bounds: "use the data-repository-type filter with a value of S3 or NFS", so a
-            // value outside those two is the modelled `InvalidDataRepositoryType` ("you have
-            // filtered the response to a data repository type that is not supported"). Every
-            // other filter value is a selector, not an assertion that what it names exists:
-            // one naming no stored record matches nothing and leaves the page empty.
+            // Only the SHAPE of the request is refused: a `Filter` whose name this listing
+            // does not select by cannot be read as a selection at all, so it is the modelled
+            // `BadRequest`. Every filter VALUE is a selector, not an assertion that what it
+            // names exists or that some stored association carries it: one matching no stored
+            // record selects nothing and leaves the page that much shorter.
             if let Some((unsupported, _)) = filters
                 .iter()
                 .find(|(name, _)| !DATA_REPOSITORY_ASSOCIATION_FILTER_NAMES.contains(&name.as_str()))
@@ -238,23 +235,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            if let Some(unsupported) = filters
-                .iter()
-                .filter(|(name, _)| {
-                    name == DATA_REPOSITORY_ASSOCIATION_FILTER_DATA_REPOSITORY_TYPE
-                })
-                .flat_map(|(_, values)| values)
-                .find(|value| !DATA_REPOSITORY_TYPES.contains(&value.as_str()))
-            {
-                return Err(
-                    DescribeDataRepositoryAssociationsErrorModeled::InvalidDataRepositoryType(
-                        InvalidDataRepositoryType {
-                            message: Some(unsupported_data_repository_type_message(unsupported)),
-                        },
-                    )
-                    .into(),
-                );
-            }
             store
                 .data_repository_associations
                 .iter()
@@ -262,26 +242,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|(id, _)| id.clone())
                 .collect()
         } else {
-            // An id the store holds no association for is the modelled
-            // `DataRepositoryAssociationNotFound` ("no data repository associations were
-            // found based upon the supplied parameters"), rather than a silently shorter
-            // list.
-            if let Some(missing) = requested
+            // An `AssociationIds` entry is a SELECTOR too, not an assertion that what it
+            // names exists: this operation reports the associations that MATCH the request,
+            // so an id the store holds nothing for selects nothing and leaves the page that
+            // much shorter — a selection matching nothing is a successful empty page rather
+            // than a refused read.
+            selected
                 .iter()
-                .find(|id| !store.data_repository_associations.contains_key(*id))
-            {
-                return Err(
-                    DescribeDataRepositoryAssociationsErrorModeled::DataRepositoryAssociationNotFound(
-                        DataRepositoryAssociationNotFound {
-                            // Built from the id the caller asked about, so the response says
-                            // WHICH of the requested ids is missing.
-                            message: Some(data_repository_association_not_found_message(missing)),
-                        },
-                    )
-                    .into(),
-                );
-            }
-            selected.clone()
+                .filter(|id| store.data_repository_associations.contains_key(*id))
+                .cloned()
+                .collect()
         };
 
         // The page token is scoped to the SELECTION it was minted for, so a token from an

@@ -251,6 +251,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Every ARN and DNS name is built for the region the caller signed for.
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        let fingerprint = restore_parameter_fingerprint(&input);
+
+        {
+            let mut store = state.lock();
+            store.settle_due_transitions();
+
+            // `@idempotencyToken`, as AWS documents it for this operation: "If a file system
+            // with the specified client request token exists and the parameters match, this
+            // operation returns the description of the file system. If a file system with the
+            // specified client request token exists but the parameters don't match, this call
+            // returns IncompatibleParameterError." The token is documented as a string the CLI
+            // and the SDKs fill in rather than as a requirement of the call (unlike
+            // `CreateFileSystem`, whose documentation requires one), so a request carrying none
+            // simply replays nothing. It is the same token space file-system creation uses, so
+            // one token cannot stand for two different file systems.
+            if let Some(token) = input.client_request_token.as_deref() {
+                if let Some(previous) = store.idempotency_tokens.get(token).cloned() {
+                    match store.file_systems.get(&previous.file_system_id) {
+                        Some(_) if previous.fingerprint != fingerprint => {
+                            return Err(
+                                CreateFileSystemFromBackupErrorModeled::IncompatibleParameterError(
+                                    IncompatibleParameterError {
+                                        parameter: "ClientRequestToken".to_string(),
+                                        message: Some(format!(
+                                            "the client request token {token} was already used to \
+                                             create {} with different parameters",
+                                            previous.file_system_id
+                                        )),
+                                    },
+                                )
+                                .into(),
+                            );
+                        }
+                        Some(record) => {
+                            return Ok(CreateFileSystemFromBackupOutput {
+                                file_system: Some(record.to_file_system()),
+                            });
+                        }
+                        // The file system that token created is gone, so the token replays
+                        // nothing: drop it and restore a new file system below.
+                        None => store.forget_idempotency_token(token),
+                    }
+                }
+            }
+
+            // The resource this operation restores FROM is resolved BEFORE the members that
+            // place the restored file system are validated, so a request naming a backup the
+            // account does not have is answered with that backup's own not-found error
+            // whatever else the request carries.
+            if !store.backups.contains_key(&input.backup_id) {
+                return Err(backup_does_not_exist(&input.backup_id));
+            }
+        }
+
         // The modelled `SubnetIds` list declares `length min 0`, so an EMPTY list satisfies
         // the boundary validator and reaches here, but the restored file system has to be
         // reachable from at least one subnet.
@@ -264,9 +321,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Every ARN and DNS name is built for the region the caller signed for.
-        let region = crate::state::request_region(&ctx.parts().headers);
-
         // The restored file system is placed in the subnets THIS request names — the
         // backup's own subnets are a record of where the source lived — so each identifier
         // is resolved against the subnets the account has, exactly as `CreateFileSystem`
@@ -277,57 +331,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Err(invalid) => return Err(subnet_does_not_exist(&invalid)),
             };
 
-        let fingerprint = restore_parameter_fingerprint(&input);
-
         let mut store = state.lock();
         store.settle_due_transitions();
 
-        // `@idempotencyToken`, as AWS documents it for this operation: "If a file system
-        // with the specified client request token exists and the parameters match, this
-        // operation returns the description of the file system. If a file system with the
-        // specified client request token exists but the parameters don't match, this call
-        // returns IncompatibleParameterError." The token is documented as a string the CLI
-        // and the SDKs fill in rather than as a requirement of the call (unlike
-        // `CreateFileSystem`, whose documentation requires one), so a request carrying none
-        // simply replays nothing. It is the same token space file-system creation uses, so
-        // one token cannot stand for two different file systems.
-        if let Some(token) = input.client_request_token.as_deref() {
-            if let Some(previous) = store.idempotency_tokens.get(token).cloned() {
-                match store.file_systems.get(&previous.file_system_id) {
-                    Some(_) if previous.fingerprint != fingerprint => {
-                        return Err(
-                            CreateFileSystemFromBackupErrorModeled::IncompatibleParameterError(
-                                IncompatibleParameterError {
-                                    parameter: "ClientRequestToken".to_string(),
-                                    message: Some(format!(
-                                        "the client request token {token} was already used to \
-                                         create {} with different parameters",
-                                        previous.file_system_id
-                                    )),
-                                },
-                            )
-                            .into(),
-                        );
-                    }
-                    Some(record) => {
-                        return Ok(CreateFileSystemFromBackupOutput {
-                            file_system: Some(record.to_file_system()),
-                        });
-                    }
-                    // The file system that token created is gone, so the token replays
-                    // nothing: drop it and restore a new file system below.
-                    None => store.forget_idempotency_token(token),
-                }
-            }
-        }
-
         // A restore is OF a backup the account has, and the file-system metadata that
         // backup recorded is what every member the request does not override comes from.
+        // Read again after the hop above: the backup may have been deleted while the owner
+        // of the subnets was being asked.
         let Some(backup) = store.backups.get(&input.backup_id).cloned() else {
-            return Err(CreateFileSystemFromBackupErrorModeled::BackupNotFound(BackupNotFound {
-                message: Some(backup_not_found_message(&input.backup_id)),
-            })
-            .into());
+            return Err(backup_does_not_exist(&input.backup_id));
         };
         let source = backup.file_system;
         let recorded_volumes = backup.volumes;
@@ -600,6 +612,15 @@ fn storage_capacity_refusal(
         })
         .into(),
     )
+}
+
+/// The modelled refusal for a request naming a backup the account does not have:
+/// `BackupNotFound` (client, HTTP 400) whose `Message` names the id the request carried.
+fn backup_does_not_exist(backup_id: &str) -> CreateFileSystemFromBackupError {
+    CreateFileSystemFromBackupErrorModeled::BackupNotFound(BackupNotFound {
+        message: Some(backup_not_found_message(backup_id)),
+    })
+    .into()
 }
 
 /// The modelled refusal for a request naming a subnet the account does not have:

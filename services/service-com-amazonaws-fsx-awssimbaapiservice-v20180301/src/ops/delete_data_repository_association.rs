@@ -198,11 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteDataRepositoryAssociationErrorModeled::DataRepositoryAssociationNotFound(
                     DataRepositoryAssociationNotFound {
-                        // Built from the id the caller asked about, so the response says WHICH
-                        // association could not be found.
-                        message: Some(data_repository_association_not_found_message(
-                            &input.association_id,
-                        )),
+                        // The fixed sentence Amazon FSx words this error class with: it
+                        // names no association id.
+                        message: Some(data_repository_association_not_found_message()),
                     },
                 )
                 .into(),

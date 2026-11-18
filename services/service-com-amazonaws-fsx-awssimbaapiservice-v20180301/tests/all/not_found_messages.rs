@@ -49,7 +49,7 @@ const ABSENT_RESOURCES: &[(&str, &str)] = &[
 ];
 
 /// Dispatch one operation, require a failure, and return `(status, error code, Message)`.
-async fn error_of(
+pub(crate) async fn error_of(
     router: &MultiServiceRouter,
     operation: &str,
     body: &Value,

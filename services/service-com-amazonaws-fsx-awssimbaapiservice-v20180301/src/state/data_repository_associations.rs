@@ -83,12 +83,10 @@ pub const DATA_REPOSITORY_ASSOCIATION_FILTER_FILE_CACHE_ID: &str = "file-cache-i
 /// See [`DATA_REPOSITORY_ASSOCIATION_FILTER_NAMES`].
 pub const DATA_REPOSITORY_ASSOCIATION_FILTER_DATA_REPOSITORY_TYPE: &str = "data-repository-type";
 
-/// The data-repository types the `data-repository-type` filter admits, from the same
-/// sentence: "a value of S3 or NFS". A value outside them is the modelled
-/// `InvalidDataRepositoryType`.
-pub const DATA_REPOSITORY_TYPES: &[&str] = &[DATA_REPOSITORY_TYPE_S3, "NFS"];
-/// See [`DATA_REPOSITORY_TYPES`]. Every association this slice stores links an S3 bucket or
-/// prefix, so this is the type each of them is selected by.
+/// The data-repository type every association this slice stores is selected by, from the
+/// same sentence ("a value of S3 or NFS"): each of them links an S3 bucket or prefix. A
+/// `data-repository-type` filter value is a SELECTOR, so any other value simply selects none
+/// of them.
 pub const DATA_REPOSITORY_TYPE_S3: &str = "S3";
 
 /// Whether an import metadata task runs after a create that states nothing, from
@@ -387,14 +385,15 @@ pub fn data_repository_associations_page_scope(
     super::filtered_page_scope("data-repository-associations", selected, filters)
 }
 
-/// The `DataRepositoryAssociationNotFound$Message` for an `AssociationIds` entry this store
-/// holds no association for: a sentence naming the id the caller asked about, by the same
-/// rule as every other not-found message here (see
-/// [`super::file_system_not_found_message`]).
-pub fn data_repository_association_not_found_message(association_id: &str) -> String {
-    within_error_message_length(format!(
-        "Data repository association '{association_id}' does not exist."
-    ))
+/// The `DataRepositoryAssociationNotFound$Message` for an association id this store holds
+/// nothing for.
+///
+/// Amazon FSx words this error class as one FIXED sentence with no variable part: unlike the
+/// not-found messages that name the resource they were asked about (see
+/// [`super::file_system_not_found_message`]), it does not echo the requested association id
+/// back, so neither does this.
+pub fn data_repository_association_not_found_message() -> String {
+    within_error_message_length("Data repository association does not exist.".to_string())
 }
 
 /// The `BadRequest$Message` a refused association insert is reported with: which bound it
@@ -414,17 +413,6 @@ pub fn data_repository_association_limit_message(
              repository associations in this Region."
         )),
     }
-}
-
-/// The `InvalidDataRepositoryType$Message` for a `data-repository-type` filter value
-/// `DescribeDataRepositoryAssociations` does not select by: the value the request carried,
-/// and the types it accepts, rendered from [`DATA_REPOSITORY_TYPES`] rather than written out
-/// again so the sentence cannot drift from what the handler applies.
-pub fn unsupported_data_repository_type_message(value: &str) -> String {
-    within_error_message_length(format!(
-        "The data repository type '{value}' is not supported. The supported types are {}.",
-        DATA_REPOSITORY_TYPES.join(", ")
-    ))
 }
 
 /// The ARN of a stored association, through the one canonical builder

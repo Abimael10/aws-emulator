@@ -18,6 +18,7 @@
 //! holds the bucket at all.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
@@ -25,6 +26,14 @@ use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 use crate::file_system_lifecycle::{
     call, ec2_client, ok, with_client_request_token, PAST_TRANSITION, REGION,
 };
+use crate::not_found_messages::error_of;
+
+/// How long a wait below gives a clock-owed removal to be materialised: far longer than the
+/// service's own transition span, so what the wait is bounded by is the CONDITION and not how
+/// fast the host runs.
+const REMOVAL_DEADLINE: Duration = Duration::from_secs(60);
+/// How long a wait below pauses between two looks.
+const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(25);
 
 /// A SigV4 `Authorization` header in the `s3` scope — the routing signal that picks the S3
 /// service for a request to the bucket front door.
@@ -444,7 +453,9 @@ async fn a_create_is_refused_for_a_file_system_that_cannot_hold_the_association(
     );
     let path = format!("s3://{bucket}");
 
-    // An id matching the modelled `FileSystemId` pattern that names no file system.
+    // An id matching the modelled `FileSystemId` pattern that names no file system: the
+    // request itself is wrong, which this operation reports as `BadRequest` (the table over
+    // that rule is `an_association_for_a_file_system_the_account_lacks_is_a_bad_request`).
     let (status, answered) = create_association(
         &emulator.router,
         "fs-0000000000000dead",
@@ -454,8 +465,8 @@ async fn a_create_is_refused_for_a_file_system_that_cannot_hold_the_association(
     .await;
     assert_eq!(
         (status, error_code(&answered)),
-        (400, "FileSystemNotFound"),
-        "case unknown file system: expected 400 FileSystemNotFound, got {status} with body \
+        (400, "BadRequest"),
+        "case unknown file system: expected 400 BadRequest, got {status} with body \
          {answered}"
     );
 
@@ -552,8 +563,8 @@ async fn a_create_is_refused_for_a_file_system_that_cannot_hold_the_association(
 }
 
 /// RULE: the listing selects by the filter names the operation documents and refuses any
-/// other, bounds the `data-repository-type` values to the two it documents, and answers
-/// `DataRepositoryAssociationNotFound` for an `AssociationIds` entry it holds nothing for.
+/// other; every SELECTOR it carries (a filter value, an `AssociationIds` entry) selects, so
+/// one matching nothing narrows the page instead of refusing the read.
 #[tokio::test]
 async fn the_listing_selects_only_by_the_documented_filters() {
     let emulator = emulator().await;
@@ -593,18 +604,18 @@ async fn the_listing_selects_only_by_the_documented_filters() {
         );
     }
 
-    // A type outside the two the operation documents is the modelled error for exactly that.
-    let (status, answered) = call(
+    // A type no stored association carries is a selector that matches nothing, not a
+    // refusal.
+    let listed = ok(
         &emulator.router,
         "DescribeDataRepositoryAssociations",
         &json!({ "Filters": [{ "Name": "data-repository-type", "Values": ["GLACIER"] }] }),
     )
     .await;
     assert_eq!(
-        (status, error_code(&answered)),
-        (400, "InvalidDataRepositoryType"),
-        "case \"GLACIER\": expected 400 InvalidDataRepositoryType, got {status} with body \
-         {answered}"
+        listed["Associations"],
+        json!([]),
+        "case \"GLACIER\": expected an empty page, got {listed}"
     );
 
     // A filter name this listing does not select by is a client error, not an empty page.
@@ -621,18 +632,32 @@ async fn the_listing_selects_only_by_the_documented_filters() {
          select by, got {status} with body {answered}"
     );
 
-    // An id the store holds no association for.
-    let (status, answered) = call(
+    // An id the store holds no association for selects nothing, so it narrows the page
+    // rather than refusing the read: alone it leaves the page empty, and beside the stored
+    // association it leaves just that one.
+    let listed = ok(
         &emulator.router,
         "DescribeDataRepositoryAssociations",
         &json!({ "AssociationIds": ["dra-0000000000000dead"] }),
     )
     .await;
     assert_eq!(
-        (status, error_code(&answered)),
-        (400, "DataRepositoryAssociationNotFound"),
-        "case unknown association: expected 400 DataRepositoryAssociationNotFound, got {status} \
-         with body {answered}"
+        listed["Associations"],
+        json!([]),
+        "case unknown association: expected an empty page, got {listed}"
+    );
+    let stored = associations_of(&emulator.router, &file_system_id).await;
+    let stored_id = stored[0]["AssociationId"].clone();
+    let listed = ok(
+        &emulator.router,
+        "DescribeDataRepositoryAssociations",
+        &json!({ "AssociationIds": ["dra-0000000000000dead", stored_id] }),
+    )
+    .await;
+    assert_eq!(
+        listed["Associations"].as_array().map(Vec::len),
+        Some(1),
+        "case one stored and one absent id: expected just the stored association, got {listed}"
     );
 
     // An unfiltered listing reports what the store holds.
@@ -728,18 +753,31 @@ async fn deleting_an_association_unlinks_it_and_the_clock_removes_it() {
              {described}"
         );
 
-        tokio::time::sleep(PAST_TRANSITION).await;
-        let (status, answered) = call(
-            &emulator.router,
-            "DescribeDataRepositoryAssociations",
-            &json!({ "AssociationIds": [association_id] }),
-        )
-        .await;
+        // The clock then removes the record. Waited for by looking again until the listing
+        // reports it gone, so what bounds the wait is the CONDITION and not how fast the host
+        // runs.
+        let started = Instant::now();
+        let listed = loop {
+            let listed = ok(
+                &emulator.router,
+                "DescribeDataRepositoryAssociations",
+                &json!({ "AssociationIds": [association_id] }),
+            )
+            .await;
+            if listed["Associations"].as_array().is_some_and(Vec::is_empty) {
+                break listed;
+            }
+            assert!(
+                started.elapsed() < REMOVAL_DEADLINE,
+                "case {case:?}: expected the association {association_id} to be removed, last \
+                 read {listed}"
+            );
+            tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+        };
         assert_eq!(
-            (status, error_code(&answered)),
-            (400, "DataRepositoryAssociationNotFound"),
-            "case {case:?}: the removed association must be gone, got {status} with body \
-             {answered}"
+            listed["Associations"],
+            json!([]),
+            "case {case:?}: the removed association must be gone, got {listed}"
         );
         assert_eq!(
             associations_of(&emulator.router, &file_system_id).await,
@@ -876,5 +914,275 @@ async fn a_client_request_token_replays_the_association_it_created() {
         (400, "IncompatibleParameterError"),
         "case same token, different parameters: expected 400 IncompatibleParameterError, got \
          {status} with body {answered}"
+    );
+}
+
+/// File system ids spanning the modelled `FileSystemId` shape (`length 11..21`, pattern
+/// `^(fs-[0-9a-f]{8,})$`) that name no file system of the account: the shortest legal id, a
+/// mid-length one and the longest legal id, with differing hex payloads.
+const ABSENT_FILE_SYSTEM_IDS: &[&str] = &[
+    "fs-deadbeef",
+    "fs-00000000deadbeef",
+    "fs-0123456789abcdef0",
+    "fs-ffffffffffffffffff",
+];
+
+/// Association ids spanning the modelled `DataRepositoryAssociationId` shape (`length
+/// 13..23`, pattern `^(dra-[0-9a-f]{8,})$`) that name no association of the account: the
+/// shortest legal id, two mid-length ones and the longest legal id.
+const ABSENT_ASSOCIATION_IDS: &[&str] = &[
+    "dra-deadbeef0",
+    "dra-00000000deadbeef",
+    "dra-0123456789abcdef0",
+    "dra-fffffffffffffffffff",
+];
+
+/// The FIXED sentence Amazon FSx refuses an association id it holds nothing for with. The
+/// whole sentence is fixed text: no part of it comes from the request.
+const ASSOCIATION_NOT_FOUND: &str = "Data repository association does not exist.";
+
+/// RULE: `CreateDataRepositoryAssociation` links a directory of the file system the REQUEST
+/// names, so a `FileSystemId` that resolves to nothing makes the request itself wrong: it is
+/// refused with the generic client-request error the operation models (`BadRequest`, HTTP
+/// 400), whose `Message` names the requested id. A file system that DOES exist but can hold
+/// no association is a different refusal — the modelled `UnsupportedOperation`.
+///
+/// The table spans the modelled `FileSystemId` shape and the other members a create carries,
+/// so what decides the refusal is the file system and not the path a row happens to name.
+#[tokio::test]
+async fn an_association_for_a_file_system_the_account_lacks_is_a_bad_request() {
+    let emulator = emulator().await;
+
+    // (case, the members a create carries beside its FileSystemId)
+    let requests: &[(&str, Value)] = &[
+        ("bucket only", json!({ "DataRepositoryPath": "s3://some-bucket" })),
+        (
+            "bucket and prefix",
+            json!({
+                "DataRepositoryPath": "s3://some-bucket/exports/",
+                "FileSystemPath": "/ns1",
+            }),
+        ),
+        (
+            "a deep prefix and every optional member",
+            json!({
+                "DataRepositoryPath": "s3://some-bucket/a/b/c/",
+                "FileSystemPath": "/ns1/subdir/",
+                "BatchImportMetaDataOnCreate": true,
+                "ImportedFileChunkSize": 512,
+                "S3": { "AutoImportPolicy": { "Events": ["NEW"] } },
+            }),
+        ),
+        (
+            "a path no bucket could be named by",
+            json!({ "DataRepositoryPath": "not-a-repository-path" }),
+        ),
+    ];
+
+    for file_system_id in ABSENT_FILE_SYSTEM_IDS {
+        for (request_case, members) in requests {
+            let mut request = members.clone();
+            request["FileSystemId"] = json!(file_system_id);
+            let case = format!("absent {file_system_id} with {request_case}");
+            let (status, code, message) = error_of(
+                &emulator.router,
+                "CreateDataRepositoryAssociation",
+                &with_client_request_token(&request),
+            )
+            .await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "BadRequest"),
+                "case {case:?}: expected 400 BadRequest, got {status} {code} with message \
+                 {message:?}"
+            );
+            assert_eq!(
+                message,
+                format!("File system '{file_system_id}' does not exist."),
+                "case {case:?}: expected the refusal to name the requested file system, got \
+                 {message:?}"
+            );
+        }
+    }
+
+    // The same create against a file system the account HAS, naming a bucket it holds, is
+    // accepted: `BadRequest` answers a MISSING file system and not every create. (A file
+    // system that exists but can hold no association is the modelled `UnsupportedOperation`,
+    // tabled in `a_create_is_refused_for_a_file_system_that_cannot_hold_the_association`.)
+    let bucket = "fsx-existing-file-system-repository";
+    assert_eq!(
+        create_bucket(&emulator.router, bucket).await,
+        200,
+        "the account must hold the bucket"
+    );
+    let file_system_id = lustre_file_system(&emulator).await;
+    let (status, answered) = create_association(
+        &emulator.router,
+        &file_system_id,
+        "/data",
+        &format!("s3://{bucket}"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case existing file system: a create on a file system the account has must be \
+         accepted, got {status} with body {answered}"
+    );
+}
+
+/// RULE: `DescribeDataRepositoryAssociations` is a read over a list — every selector the
+/// request carries (an `AssociationIds` entry, a `Filter` value) SELECTS, so a selection
+/// matching nothing is HTTP 200 with an empty `Associations` list, always serialized, rather
+/// than a refusal. Only a request whose shape cannot be read as a selection — a `Filter`
+/// name the operation does not define — is refused.
+///
+/// The table spans the forms of selection the rule generalises over: no selection at all,
+/// one id, several ids, a repeated id, each documented filter name, a filter value no stored
+/// association carries, two filters together, and both published page-size bounds.
+#[tokio::test]
+async fn a_listing_that_matches_nothing_is_an_empty_page() {
+    let emulator = emulator().await;
+
+    // (case, the listing request) — the store holds no association at all, so every row
+    // matches nothing.
+    let cases: &[(&str, Value)] = &[
+        ("no selection", json!({})),
+        ("one absent id", json!({ "AssociationIds": [ABSENT_ASSOCIATION_IDS[0]] })),
+        ("several absent ids", json!({ "AssociationIds": ABSENT_ASSOCIATION_IDS })),
+        (
+            "the same absent id twice",
+            json!({ "AssociationIds": [ABSENT_ASSOCIATION_IDS[1], ABSENT_ASSOCIATION_IDS[1]] }),
+        ),
+        (
+            // The filter names the operation documents: "use the file-system-id filter with
+            // the ID of the file system ... the file-cache-id filter with the ID of the cache
+            // ... the data-repository-type filter with a value of S3 or NFS".
+            "the file-system-id filter on an absent file system",
+            json!({
+                "Filters": [{ "Name": "file-system-id", "Values": [ABSENT_FILE_SYSTEM_IDS[0]] }],
+            }),
+        ),
+        (
+            "the file-cache-id filter",
+            json!({ "Filters": [{ "Name": "file-cache-id", "Values": ["fc-0123456789abcdef0"] }] }),
+        ),
+        (
+            "the data-repository-type filter on S3",
+            json!({ "Filters": [{ "Name": "data-repository-type", "Values": ["S3"] }] }),
+        ),
+        (
+            "the data-repository-type filter on NFS",
+            json!({ "Filters": [{ "Name": "data-repository-type", "Values": ["NFS"] }] }),
+        ),
+        (
+            "a data-repository-type no association carries",
+            json!({
+                "Filters": [{
+                    "Name": "data-repository-type",
+                    "Values": ["NOT_A_REPOSITORY_TYPE"],
+                }],
+            }),
+        ),
+        (
+            "two filters together",
+            json!({
+                "Filters": [
+                    { "Name": "file-system-id", "Values": [ABSENT_FILE_SYSTEM_IDS[1]] },
+                    { "Name": "data-repository-type", "Values": ["S3"] },
+                ],
+            }),
+        ),
+        // `MaxResults` targets `LimitedMaxResults`, `range 1..25`: both published bounds.
+        ("the smallest page", json!({ "MaxResults": 1 })),
+        ("the largest page", json!({ "MaxResults": 25 })),
+    ];
+
+    for case in cases {
+        let (label, request) = case;
+        let listed = ok(&emulator.router, "DescribeDataRepositoryAssociations", request).await;
+        assert_eq!(
+            listed["Associations"],
+            json!([]),
+            "case {label:?}: expected HTTP 200 with an empty Associations list, got {listed}"
+        );
+        assert_eq!(
+            listed.get("NextToken"),
+            None,
+            "case {label:?}: an empty page is the last page, got {listed}"
+        );
+    }
+
+    // A filter NAME the operation does not define cannot be read as a selection at all, so
+    // it stays a client error rather than an empty page.
+    for unsupported in ["volume-id", "backup-type", ""] {
+        let (status, code, message) = error_of(
+            &emulator.router,
+            "DescribeDataRepositoryAssociations",
+            &json!({ "Filters": [{ "Name": unsupported, "Values": ["anything"] }] }),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "BadRequest"),
+            "case {unsupported:?}: expected 400 BadRequest for a filter name this listing does \
+             not select by, got {status} {code} with message {message:?}"
+        );
+    }
+}
+
+/// RULE: the refusal for an association id this service holds nothing for is worded as one
+/// FIXED sentence — it echoes no identifier back, unlike the not-found messages that name the
+/// resource they were asked about.
+///
+/// The table spans the modelled `DataRepositoryAssociationId` shape and the request forms a
+/// delete takes, so what it asserts is that the sentence does not vary with the request at
+/// all.
+#[tokio::test]
+async fn an_unknown_association_is_refused_with_one_fixed_sentence() {
+    let emulator = emulator().await;
+    let mut seen: Vec<String> = Vec::new();
+
+    for association_id in ABSENT_ASSOCIATION_IDS {
+        for (case, request) in [
+            ("a plain delete", json!({ "AssociationId": association_id })),
+            (
+                "a delete taking the file system's data with it",
+                json!({ "AssociationId": association_id, "DeleteDataInFileSystem": true }),
+            ),
+        ] {
+            let label = format!("{case} of absent {association_id}");
+            let (status, code, message) = error_of(
+                &emulator.router,
+                "DeleteDataRepositoryAssociation",
+                &with_client_request_token(&request),
+            )
+            .await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "DataRepositoryAssociationNotFound"),
+                "case {label:?}: expected 400 DataRepositoryAssociationNotFound, got {status} \
+                 {code} with message {message:?}"
+            );
+            assert_eq!(
+                message, ASSOCIATION_NOT_FOUND,
+                "case {label:?}: expected the fixed sentence {ASSOCIATION_NOT_FOUND:?}, got \
+                 {message:?}"
+            );
+            assert!(
+                !message.contains(association_id),
+                "case {label:?}: the sentence must not echo the requested id, got {message:?}"
+            );
+            seen.push(message);
+        }
+    }
+
+    // Every id the store holds nothing for produces the SAME sentence.
+    let mut distinct = seen.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "every absent association id must produce one sentence, got {seen:?}"
     );
 }
