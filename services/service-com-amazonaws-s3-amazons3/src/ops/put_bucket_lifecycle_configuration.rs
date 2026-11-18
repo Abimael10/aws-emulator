@@ -223,6 +223,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The DOCUMENT is judged first, from the bytes the request carried: the payload IS
+        // the configuration, and a codec reads an element it does not know by ignoring it, so
+        // a document that misspells, misnests or invents one — a tag predicate inside a
+        // container the schema does not declare, say — parses to a rule missing the member
+        // that element was meant to carry, and one missing a child the schema requires parses
+        // to a rule carrying that member's default. What S3 answers such a document is that
+        // it did not validate against the published schema, not that the configuration it
+        // parsed to is wrong ([`crate::state::lifecycle_document_rejection`]). Before the
+        // store is reached, which is where the boundary's own refusal of this document would
+        // have been answered too.
+        if let Some(rejection) = crate::service::wire::request_document()
+            .as_deref()
+            .and_then(crate::state::lifecycle_document_rejection)
+        {
+            return Err(refusal(&rejection));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The store is unreachable only when this service is mounted on an engine
             // that is not the shared `InMemoryEngine`; nothing can then be persisted, and
@@ -262,11 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(rejection) =
             crate::state::validate_lifecycle_configuration(&configuration.rules)
         {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                rejection.code(),
-                LIFECYCLE_REFUSAL_STATUS,
-                rejection.message(),
-            ));
+            return Err(refusal(&rejection));
         }
 
         // "Indicates which default minimum object size behavior is applied to the lifecycle
@@ -313,3 +326,29 @@ const ACCESS_DENIED_STATUS: u16 = 403;
 /// 400 in Amazon S3's "Error responses" list, as is the `MissingRequestBodyError` a request
 /// that carries no configuration at all answers.
 const LIFECYCLE_REFUSAL_STATUS: u16 = 400;
+
+/// `rejection` as the refusal this operation answers it with: its code, the one status above
+/// and its sentence — plus, for a refusal that is about one argument of the request, the
+/// `<ArgumentName>` / `<ArgumentValue>` pair naming that argument and the value it carried
+/// ([`crate::state::LifecycleConfigurationRejection::argument`]).
+///
+/// One construction for every rejection this handler can answer, so the document check and
+/// the rule validator cannot word the same class of refusal two ways.
+fn refusal(
+    rejection: &crate::state::LifecycleConfigurationRejection,
+) -> PutBucketLifecycleConfigurationError {
+    match rejection.argument() {
+        Some((argument, value)) if rejection.code() == crate::state::INVALID_ARGUMENT_CODE => {
+            crate::scaffolded::Scaffolded::invalid_argument(
+                argument,
+                Some(&value),
+                rejection.message(),
+            )
+        }
+        _ => crate::scaffolded::Scaffolded::unmodeled(
+            rejection.code(),
+            LIFECYCLE_REFUSAL_STATUS,
+            rejection.message(),
+        ),
+    }
+}

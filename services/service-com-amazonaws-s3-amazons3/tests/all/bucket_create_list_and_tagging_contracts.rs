@@ -436,18 +436,18 @@ async fn every_instant_a_document_reports_is_in_the_fixed_width_millisecond_form
 
 #[test]
 fn the_document_timestamp_catalog_matches_the_model() {
-    // Every element an operation's RESPONSE DOCUMENT reports a `timestamp` in and no REQUEST
-    // document carries, read from the model itself rather than from a second hand-written
-    // list: each shape's own members and the members of the shapes those reach, under the
-    // element name restXml writes each with (its `@xmlName`, else the member's own name). A
-    // member bound to a response HEADER is not in the document at all — such a header goes
-    // out in the format its own binding states — so it is left out, as is an `@httpPayload`
-    // whose target is a scalar, which IS the body rather than a document.
+    // Every element an operation's RESPONSE DOCUMENT reports a `timestamp` in, read from the
+    // model itself rather than from a second hand-written list: each shape's own members and
+    // the members of the shapes those reach, under the element name restXml writes each with
+    // (its `@xmlName`, else the member's own name). A member bound to a response HEADER is
+    // not in the document at all — such a header goes out in the format its own binding
+    // states — so it is left out, as is an `@httpPayload` whose target is a scalar, which IS
+    // the body rather than a document.
     //
-    // The subtraction is the rule's own: an element a request document carries is a value the
-    // CALLER sent and the service stored (a lifecycle rule's `Date`, an Object Lock
-    // `RetainUntilDate`), and a stored configuration reads back as the caller wrote it, so
-    // only the instants S3 itself records are rendered in S3's own form.
+    // Nothing is subtracted: the form is a property of the DOCUMENT S3 writes rather than of
+    // where the instant came from, so an element a REQUEST document also carries (a lifecycle
+    // rule's `Date`, an Object Lock `RetainUntilDate`) is reported in the same fixed-width
+    // form as one S3 recorded itself.
     let model_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/smithy-model/com-amazonaws-s3-amazons3.json"
@@ -539,11 +539,7 @@ fn the_document_timestamp_catalog_matches_the_model() {
         found
     }
 
-    let stored_by_the_caller = timestamp_elements(shapes, "input");
-    let derived: BTreeSet<String> = timestamp_elements(shapes, "output")
-        .into_iter()
-        .filter(|element| !stored_by_the_caller.contains(element))
-        .collect();
+    let derived: BTreeSet<String> = timestamp_elements(shapes, "output");
 
     let declared: BTreeSet<String> = DOCUMENT_TIMESTAMP_ELEMENTS
         .iter()
@@ -552,7 +548,7 @@ fn the_document_timestamp_catalog_matches_the_model() {
     assert_eq!(
         declared, derived,
         "DOCUMENT_TIMESTAMP_ELEMENTS must name exactly the elements the model reports an \
-         instant S3 itself recorded in; declared {declared:?}, the model reports {derived:?}"
+         instant in; declared {declared:?}, the model reports {derived:?}"
     );
 }
 

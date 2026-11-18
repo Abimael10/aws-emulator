@@ -3032,7 +3032,7 @@ fn without_unbound_body(mut response: Response, output_schema: &Schema) -> Respo
 /// [`as_second_resolution_date_time`]). Fixed text, so the form is fixed-width.
 const SECOND_RESOLUTION_FRACTION: &str = ".000";
 
-/// The elements a response DOCUMENT of this service reports an instant S3 ITSELF RECORDED in.
+/// The elements a response DOCUMENT of this service reports an instant in.
 ///
 /// The generated schemas carry an operation's own members and not the shapes they reach, so
 /// which elements a document reports a timestamp in cannot be walked at serialization time;
@@ -3041,17 +3041,18 @@ const SECOND_RESOLUTION_FRACTION: &str = ".000";
 /// shapes those outputs reach, under the element name restXml writes it with — so a model
 /// update that reports another instant cannot quietly keep the framework's rendering of it.
 ///
-/// A timestamp a REQUEST document also carries is deliberately NOT here: a lifecycle rule's
-/// `Date` and an Object Lock `RetainUntilDate` are values the CALLER sent and the service
-/// stored, and a stored configuration reads back as the caller wrote it. The form below is the
-/// one S3 renders the instants IT records in, which is why the catalog is the output-only
-/// half.
+/// A timestamp the CALLER sent and the service stored is here too, for the reason every other
+/// one is: the form is a property of the DOCUMENT S3 writes rather than of where the instant
+/// came from, so a lifecycle rule's `Date` reads back in the same fixed-width form a bucket's
+/// `CreationDate` does, however the request that stored it happened to spell it.
 pub const DOCUMENT_TIMESTAMP_ELEMENTS: &[&str] = &[
     "CreationDate",
+    "Date",
     "Expiration",
     "Initiated",
     "LastModified",
     "RestoreExpiryDate",
+    "RetainUntilDate",
 ];
 
 /// Whether `output_schema`'s response body is one of this service's XML DOCUMENTS.

@@ -488,7 +488,10 @@ async fn a_bucket_a_stack_declares_carries_the_lifecycle_configuration_it_declar
             status: "Enabled".to_string(),
             scope: scope(None, &[], None, (Some(2048), Some(8192)), true),
             expiration_days: None,
-            expiration_date: Some("2030-01-01T00:00:00Z".to_string()),
+            // The instant the declaration fixed, in the fixed-width form every instant of an
+            // Amazon S3 document is written in — the stored date is reported the way that
+            // service renders one, not as the text the declaration spelled it with.
+            expiration_date: Some("2030-01-01T00:00:00.000Z".to_string()),
             transitions: Vec::new(),
             noncurrent_transitions: Vec::new(),
             noncurrent_expiration: None,

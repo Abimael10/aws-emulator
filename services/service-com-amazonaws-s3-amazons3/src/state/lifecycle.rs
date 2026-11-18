@@ -124,6 +124,11 @@ pub struct BucketLifecycle {
 /// request's wording. [`Self::code`] is the wire error code each one goes out with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleConfigurationRejection {
+    /// The DOCUMENT the configuration arrived in does not validate against the schema S3
+    /// publishes for it: an element the schema does not declare where it arrived, a
+    /// container missing a child it requires, or bytes no XML reader can walk
+    /// ([`lifecycle_document_rejection`] decides it).
+    MalformedDocument,
     /// A configuration naming no rule at all: `BucketLifecycleConfiguration$Rules` is a
     /// REQUIRED member, so a document naming none does not validate against the schema S3
     /// publishes.
@@ -139,6 +144,8 @@ pub enum LifecycleConfigurationRejection {
         rule: usize,
         /// How many characters it carried.
         length: usize,
+        /// The identifier itself, which the refusal names as the argument's value.
+        id: String,
     },
     /// Two rules carrying the same `ID`, which is "unique identifier for the rule".
     DuplicateId {
@@ -222,6 +229,8 @@ pub enum LifecycleConfigurationRejection {
         member: &'static str,
         /// The action that member belongs to.
         action: &'static str,
+        /// The count that member carried, which the refusal names as the argument's value.
+        value: i64,
     },
     /// A `Transition$Days` below zero: that one "can be `0` or any positive integer".
     NegativeDays {
@@ -229,6 +238,8 @@ pub enum LifecycleConfigurationRejection {
         member: &'static str,
         /// The action that member belongs to.
         action: &'static str,
+        /// The count that member carried, which the refusal names as the argument's value.
+        value: i64,
     },
     /// A `Date` whose time of day is not midnight UTC. See [`is_utc_midnight`].
     DateNotMidnight {
@@ -236,6 +247,9 @@ pub enum LifecycleConfigurationRejection {
         rule: usize,
         /// The member that carried it.
         member: &'static str,
+        /// The instant it carried, as this service renders a refused timestamp
+        /// ([`refused_timestamp_text`]) — what the refusal names as the argument's value.
+        value: String,
     },
     /// One rule mixing `Date`-based and `Days`-based actions: a rule is written against
     /// one clock or the other, since a day count is measured from each object's own
@@ -366,7 +380,9 @@ impl LifecycleConfigurationRejection {
     /// [`INVALID_REQUEST_CODE`].
     pub fn code(&self) -> &'static str {
         match self {
-            Self::NoRules
+            Self::MalformedDocument
+            | Self::MixedDateAndDays { .. }
+            | Self::NoRules
             | Self::TooManyRules { .. }
             | Self::PrefixAndFilter { .. }
             | Self::NoPrefixOrFilter { .. }
@@ -391,7 +407,6 @@ impl LifecycleConfigurationRejection {
             Self::MixedPrefixAndFilterRules { .. }
             | Self::ObjectSizeRangeEmpty { .. }
             | Self::NoAction { .. }
-            | Self::MixedDateAndDays { .. }
             | Self::DuplicateTagKey { .. }
             | Self::TagFilteredAction { .. }
             | Self::DuplicateTransitionStorageClass { .. } => INVALID_REQUEST_CODE,
@@ -412,11 +427,63 @@ impl LifecycleConfigurationRejection {
         }
         self.to_string()
     }
+
+    /// The `<ArgumentName>` / `<ArgumentValue>` pair this refusal names the argument it is
+    /// about by, or `None` for one that is about no single argument.
+    ///
+    /// S3's `InvalidArgument` document carries that pair beside its code and message, and the
+    /// MESSAGE of a refused day count states the rule the value broke rather than the value —
+    /// the same sentence for every count that breaks it — so the pair is the only part of the
+    /// refusal that says which member the caller has to change and what it sent. The name is
+    /// the member as the API publishes it and the value is the count that member carried, so
+    /// neither is invented here.
+    ///
+    /// A refusal about a SET of members (a rule mixing two clocks, a chain running the wrong
+    /// way) names no single argument and answers `None`, and so does one S3 answers a code of
+    /// its own rather than [`INVALID_ARGUMENT_CODE`].
+    pub fn argument(&self) -> Option<(&'static str, String)> {
+        match self {
+            Self::NonPositiveDays { member, value, .. }
+            | Self::NegativeDays { member, value, .. } => Some((member, value.to_string())),
+            Self::IdTooLong { id, .. } | Self::DuplicateId { id, .. } => {
+                Some((RULE_ID_ARGUMENT, id.clone()))
+            }
+            Self::DateNotMidnight { value, .. } => Some((DATE_ARGUMENT, value.clone())),
+            Self::NegativeObjectSize { member, bytes, .. } => {
+                Some((member, bytes.to_string()))
+            }
+            Self::TooManyNewerNoncurrentVersions { count, .. } => {
+                Some((NEWER_NONCURRENT_VERSIONS_ARGUMENT, count.to_string()))
+            }
+            _ => None,
+        }
+    }
 }
+
+/// The rule identifier as the API publishes it (`LifecycleRule$ID`), which is how a refusal
+/// about one names the argument the caller has to change.
+pub const RULE_ID_ARGUMENT: &str = "ID";
+
+/// The same for the date an action is measured from (`LifecycleExpiration$Date` and
+/// `Transition$Date` are both spelled `Date` in the document).
+pub const DATE_ARGUMENT: &str = "Date";
+
+/// And for the count of noncurrent versions a rule retains
+/// (`NoncurrentVersionExpiration$NewerNoncurrentVersions`).
+pub const NEWER_NONCURRENT_VERSIONS_ARGUMENT: &str = "NewerNoncurrentVersions";
 
 impl std::fmt::Display for LifecycleConfigurationRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // The code's own FIXED published text: the document did not validate against the
+            // published schema, and that schema is the same for every document, so this
+            // variant's sentence is never read (see
+            // [`LifecycleConfigurationRejection::message`]) and states the rule only.
+            Self::MalformedDocument => write!(
+                f,
+                "the document does not validate against the published lifecycle \
+                 configuration schema"
+            ),
             Self::NoRules => write!(
                 f,
                 "LifecycleConfiguration.Rules names no Rule; a lifecycle configuration \
@@ -482,13 +549,16 @@ impl std::fmt::Display for LifecycleConfigurationRejection {
                 "Rule {rule}: Expiration names {named} of Days, Date and \
                  ExpiredObjectDeleteMarker; an expiration names exactly one of them"
             ),
-            Self::NonPositiveDays { member, action } => write!(
+            Self::NonPositiveDays { member, action, .. } => write!(
                 f,
                 "'{member}' for {action} action must be a positive integer"
             ),
-            Self::NegativeDays { member, action } => write!(
+            // S3's own wording for the floor a transition's day count has — "the value can be
+            // `0` or any positive integer" (`Transition$Days`) — which it states as the value
+            // being nonnegative rather than as the two cases it admits.
+            Self::NegativeDays { member, action, .. } => write!(
                 f,
-                "'{member}' for {action} action must be 0 or a positive integer"
+                "'{member}' in {action} action must be nonnegative"
             ),
             Self::DateNotMidnight { .. } => write!(f, "'Date' must be at midnight GMT"),
             Self::MixedDateAndDays { rule } => write!(
@@ -557,10 +627,7 @@ impl std::fmt::Display for LifecycleConfigurationRejection {
             Self::DuplicateTagKey { .. } => {
                 write!(f, "Duplicate Tag Keys are not allowed.")
             }
-            Self::TagKeyOutsideBounds { .. } => write!(
-                f,
-                "A Tag's Key must be a length between 1 and {MAX_TAG_KEY_CHARS}."
-            ),
+            Self::TagKeyOutsideBounds { .. } => write!(f, "{}", tag_key_bounds_message()),
             Self::TagValueTooLong { .. } => write!(
                 f,
                 "A Tag's Value must be a length between 0 and {MAX_TAG_VALUE_CHARS}."
@@ -615,6 +682,7 @@ pub fn validate_lifecycle_configuration(
                 return Err(Rejection::IdTooLong {
                     rule: position,
                     length,
+                    id: id.to_string(),
                 });
             }
             if !ids.insert(id) {
@@ -848,6 +916,7 @@ pub(super) fn validate_lifecycle_actions(
                 return Err(Rejection::NonPositiveDays {
                     member: "Days",
                     action: "Expiration",
+                    value: i64::from(days),
                 });
             }
             days_based = true;
@@ -858,6 +927,7 @@ pub(super) fn validate_lifecycle_actions(
                 return Err(Rejection::DateNotMidnight {
                     rule: position,
                     member: "Expiration.Date",
+                    value: refused_timestamp_text(date),
                 });
             }
             date_based = true;
@@ -891,6 +961,7 @@ pub(super) fn validate_lifecycle_actions(
                     return Err(Rejection::NegativeDays {
                         member: "Days",
                         action: "Transition",
+                        value: i64::from(days),
                     });
                 }
                 // No FLOOR is checked here. A transition's `Days` "can be 0 or any
@@ -908,6 +979,7 @@ pub(super) fn validate_lifecycle_actions(
                     return Err(Rejection::DateNotMidnight {
                         rule: position,
                         member: "Transition.Date",
+                        value: refused_timestamp_text(date),
                     });
                 }
                 date_based = true;
@@ -923,6 +995,7 @@ pub(super) fn validate_lifecycle_actions(
                 return Err(Rejection::NonPositiveDays {
                     member: "NoncurrentDays",
                     action: "NoncurrentVersionExpiration",
+                    value: i64::from(days),
                 });
             }
             named += 1;
@@ -932,6 +1005,7 @@ pub(super) fn validate_lifecycle_actions(
                 return Err(Rejection::NonPositiveDays {
                     member: "NewerNoncurrentVersions",
                     action: "NoncurrentVersionExpiration",
+                    value: i64::from(count),
                 });
             }
             if count > MAX_NEWER_NONCURRENT_VERSIONS {
@@ -967,6 +1041,7 @@ pub(super) fn validate_lifecycle_actions(
             return Err(Rejection::NonPositiveDays {
                 member: "NoncurrentDays",
                 action: "NoncurrentVersionTransition",
+                value: i64::from(days),
             });
         }
         if let Some(count) = transition.newer_noncurrent_versions {
@@ -974,6 +1049,7 @@ pub(super) fn validate_lifecycle_actions(
                 return Err(Rejection::NonPositiveDays {
                     member: "NewerNoncurrentVersions",
                     action: "NoncurrentVersionTransition",
+                    value: i64::from(count),
                 });
             }
             if count > MAX_NEWER_NONCURRENT_VERSIONS {
@@ -997,6 +1073,7 @@ pub(super) fn validate_lifecycle_actions(
             return Err(Rejection::NonPositiveDays {
                 member: "DaysAfterInitiation",
                 action: "AbortIncompleteMultipartUpload",
+                value: i64::from(days),
             });
         }
         actions += 1;

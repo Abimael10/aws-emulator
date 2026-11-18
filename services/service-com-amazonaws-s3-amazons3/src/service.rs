@@ -843,17 +843,51 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
         // one member of it the model can refuse by itself, because `TransitionStorageClass`
         // names the six classes a rule may move an object INTO
         // (`smithy_query(query="shape",shape="TransitionStorageClass")`) and `STANDARD` is
-        // not among them — an object is already in it. S3 reports that as a target class
-        // that is not valid for the action naming it, which is an `InvalidArgument` about
-        // the VALUE rather than the generic schema refusal: the caller has to change the
-        // class, not the shape of its document.
+        // not among them — an object is already in it. S3 reports a value that IS one of its
+        // storage classes (`smithy_query(query="shape",shape="StorageClass")`) but not a
+        // transition target as a target class that is not valid for the action naming it,
+        // which is an `InvalidArgument` about the VALUE rather than the generic schema
+        // refusal: the caller has to change the class, not the shape of its document. A value
+        // that names no storage class of this service AT ALL is a different fault — the
+        // element's text is outside the vocabulary the published schema declares for it, so
+        // the DOCUMENT is what did not validate, which is the refusal this function falls
+        // through to.
         //
         // Nothing else in the container is refused here: every other rule it breaks is one
         // the model cannot state, which the handler's own validator refuses
         // ([`crate::state::validate_lifecycle_configuration`]).
         "lifecycleConfiguration" => {
+            // A tag predicate's KEY, which the model constrains at one end (`Tag$Key` targets
+            // `ObjectKey`, `length {min 1}`, and is itself `@required`): a key of no
+            // characters — the element spelled empty, or left out of a predicate that names
+            // its value — is a key outside the published bounds on one, which S3 reports with
+            // the sentence those bounds publish rather than as a document whose shape is
+            // wrong. The same refusal the handler's own validator answers a key it was handed
+            // empty with ([`crate::state::tag_key_bounds_message`]), so the two layers cannot
+            // word one refusal two ways.
+            //
+            // Only for a document the published schema otherwise ADMITS, judged by the one
+            // reading of that question ([`crate::state::lifecycle_document_rejection`], which
+            // the operation itself judges every document by): a predicate whose key element
+            // is misspelled or misnested reaches here as a predicate naming no key, and what
+            // is wrong with that document is its SHAPE, which is the refusal below.
+            if matches!(
+                violation.kind,
+                ViolationKind::MinLength(_) | ViolationKind::MissingRequiredMember
+            ) && violation.path.split('.').any(|segment| segment == "key")
+                && wire::request_document()
+                    .as_deref()
+                    .and_then(crate::state::lifecycle_document_rejection)
+                    .is_none()
+            {
+                return Some(Refused {
+                    code: crate::state::INVALID_REQUEST_CODE.to_string(),
+                    message: crate::state::tag_key_bounds_message(),
+                });
+            }
             let invalid_target = matches!(violation.kind, ViolationKind::EnumValue(_))
-                && segments.any(|segment| segment == "storageClass");
+                && segments.any(|segment| segment == "storageClass")
+                && crate::ops::types::STORAGE_CLASS_VALUES.contains(&rejected);
             if !invalid_target {
                 return None;
             }

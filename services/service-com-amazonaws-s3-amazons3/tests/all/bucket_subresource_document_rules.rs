@@ -602,15 +602,20 @@ fn lifecycle_rows() -> Vec<LifecycleRow> {
             )),
         },
         LifecycleRow {
-            // The FLOOR is a modelled constraint (`Tag$Key` targets `ObjectKey`,
-            // `length {min 1}`), so the request boundary refuses it as a document that does
-            // not validate against the published schema before the rule validator runs.
+            // The floor is a modelled constraint (`Tag$Key` targets `ObjectKey`,
+            // `length {min 1}`), so the request boundary is what refuses a key spelled empty
+            // — with the sentence the published bounds on a tag key state, the same one the
+            // rule validator answers a key of no characters with, so a client reads one
+            // refusal for a key outside those bounds at either end.
             case: "a tag key below the published floor",
             body: "<ID>empty-key</ID><Status>Enabled</Status><Filter><And>\
                    <Prefix>logs/</Prefix><Tag><Key></Key><Value>yes</Value></Tag></And></Filter>\
                    <Expiration><Days>30</Days></Expiration>"
                 .to_string(),
-            refusal: Some((MALFORMED_XML_CODE, MALFORMED_XML_MESSAGE.to_string())),
+            refusal: Some((
+                "InvalidRequest",
+                format!("A Tag's Key must be a length between 1 and {MAX_TAG_KEY_CHARS}."),
+            )),
         },
         LifecycleRow {
             case: "a tag key exactly at the published bound",

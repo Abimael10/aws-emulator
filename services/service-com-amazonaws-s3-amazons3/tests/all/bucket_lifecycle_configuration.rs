@@ -35,12 +35,18 @@
 //!   (`CreateMultipartUploadOutput$AbortDate`), with "the x-amz-abort-rule-id header that
 //!   provides the ID of the lifecycle configuration rule that defines this action".
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
+use service_com_amazonaws_s3_amazons3::ops::types::{
+    STORAGE_CLASS_VALUES, TRANSITION_STORAGE_CLASS_VALUES,
+};
 use service_com_amazonaws_s3_amazons3::state::{
-    DEFAULT_TRANSITION_MINIMUM_OBJECT_SIZE, MALFORMED_XML_MESSAGE, MAX_LIFECYCLE_RULES,
-    MAX_LIFECYCLE_RULE_ID_CHARS, MAX_NEWER_NONCURRENT_VERSIONS,
-    NO_SUCH_LIFECYCLE_CONFIGURATION_CODE, NO_SUCH_LIFECYCLE_CONFIGURATION_MESSAGE,
+    tag_key_bounds_message, DEFAULT_TRANSITION_MINIMUM_OBJECT_SIZE,
+    LIFECYCLE_DOCUMENT_REQUIRED_ELEMENTS, LIFECYCLE_DOCUMENT_SCHEMA, MALFORMED_XML_MESSAGE,
+    MAX_LIFECYCLE_RULES, MAX_LIFECYCLE_RULE_ID_CHARS, MAX_NEWER_NONCURRENT_VERSIONS,
+    MAX_TAG_KEY_CHARS, NO_SUCH_LIFECYCLE_CONFIGURATION_CODE,
+    NO_SUCH_LIFECYCLE_CONFIGURATION_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -723,6 +729,11 @@ fn refusal_rows() -> Vec<RefusalRow> {
             message: None,
         },
         RefusalRow {
+            // A rule measures every action from one clock or the other, and a document mixing
+            // them is one the published schema does not admit: the fault is the SHAPE of the
+            // document, so it carries the fixed schema sentence rather than a clause about
+            // the two actions. Pinned over the pairs of actions that can mix them by
+            // [`a_rule_measuring_its_actions_from_both_clocks_is_refused_as_malformed`].
             case: "one rule mixing a date-based and a day-based action",
             document: configuration(&[rule(
                 "<ID>mixed-clocks</ID><Filter><Prefix>a/</Prefix></Filter>\
@@ -731,9 +742,9 @@ fn refusal_rows() -> Vec<RefusalRow> {
                  <StorageClass>GLACIER</StorageClass></Transition>\
                  <Expiration><Days>400</Days></Expiration>",
             )]),
-            code: "InvalidRequest",
+            code: "MalformedXML",
             status: 400,
-            message: None,
+            message: Some(MALFORMED_XML_MESSAGE.to_string()),
         },
         RefusalRow {
             case: "two rules carrying the same identifier",
@@ -1239,4 +1250,837 @@ async fn an_incomplete_upload_reports_the_rule_that_aborts_it() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// How a refusal of a lifecycle configuration is CLASSIFIED, and the form a read reports a
+// stored instant in.
+//
+// * A document whose SHAPE the published schema does not admit — an element the schema does
+//   not declare where it arrived, or a container missing a child it requires — is refused
+//   `MalformedXML` with that code's own fixed sentence, whatever the document says; a document
+//   the schema admits whose one member's VALUE is outside what that member accepts is refused
+//   `InvalidArgument` naming that argument. The schema is the
+//   `BucketLifecycleConfiguration` closure
+//   (`smithy_query(query="closure",operation="PutBucketLifecycleConfiguration")`), which is
+//   where `LIFECYCLE_DOCUMENT_SCHEMA` and `LIFECYCLE_DOCUMENT_REQUIRED_ELEMENTS` come from and
+//   what the last test here re-derives them against.
+// * A transition's target is a `TransitionStorageClass`
+//   (`smithy_query(query="shape",shape="TransitionStorageClass")`), so a value that IS one of
+//   this service's storage classes (`smithy_query(query="shape",shape="StorageClass")`) but
+//   not one of those six is refused for the VALUE, while a value that names no storage class
+//   at all is text the published schema does not admit for that element.
+// * An `InvalidArgument` about one day count names it: S3's envelope carries `<ArgumentName>`
+//   and `<ArgumentValue>` beside the code and the message, the message stating the rule the
+//   count broke and the pair saying which member carried which value.
+// * `LifecycleExpiration$Date` and `Transition$Date` are timestamps a read reports inside the
+//   document it answers, so each is rendered in the fixed-width form every instant of an S3
+//   document carries.
+// ---------------------------------------------------------------------------------------
+
+/// The code S3 answers a document that did not validate against the published schema.
+const MALFORMED_XML: &str = "MalformedXML";
+
+/// The code S3 answers one member's value that is outside what that member accepts.
+const INVALID_ARGUMENT: &str = "InvalidArgument";
+
+/// A tag predicate the published schema DOES declare, as a filter's own `Tag`.
+const TAG_PREDICATE: &str = "<Tag><Key>team</Key><Value>data</Value></Tag>";
+
+/// The expiration action the document rows below carry, so what each row varies is the SHAPE
+/// of the document around it rather than the action.
+const ONE_EXPIRATION: &str = "<Expiration><Days>30</Days></Expiration>";
+
+/// Assert `answer` is the 400 refusal carrying `code` and `message`.
+fn assert_refused(case: &str, answer: &Answer, code: &str, message: &str) {
+    assert_eq!(
+        answer.status,
+        400,
+        "case {case:?}: expected HTTP 400, got {} with body {:?}",
+        answer.status,
+        text(answer)
+    );
+    assert_eq!(
+        answer.error_code(),
+        code,
+        "case {case:?}: expected the code {code:?}, got {:?}",
+        answer.error_code()
+    );
+    assert_eq!(
+        answer.error_message(),
+        message,
+        "case {case:?}: expected the message {message:?}, got {:?}",
+        answer.error_message()
+    );
+}
+
+/// The documents the published schema does not admit, each as (the case, the whole document).
+///
+/// The rows differ along the KIND of shape fault — an element the schema declares nowhere, a
+/// declared element in a position the schema does not declare it in, a container missing a
+/// child it requires, and a root that is not the published container — and along WHERE in the
+/// document it sits, the tag-filter containers included, since the rule is about the
+/// document's shape rather than about one element.
+fn malformed_documents() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "a tag predicate inside a container the schema declares nowhere",
+            configuration(&[rule(&format!(
+                "<ID>wrapped-tags</ID><Status>Enabled</Status>\
+                 <Filter><Tags>{TAG_PREDICATE}</Tags></Filter>{ONE_EXPIRATION}"
+            ))]),
+        ),
+        (
+            "a tag predicate where the schema declares no element of that name",
+            configuration(&[rule(&format!(
+                "<ID>tag-beside-the-filter</ID><Status>Enabled</Status>\
+                 {TAG_PREDICATE}{ONE_EXPIRATION}"
+            ))]),
+        ),
+        (
+            "a tag predicate naming no Value, a child Tag requires",
+            configuration(&[rule(&format!(
+                "<ID>valueless-tag</ID><Status>Enabled</Status>\
+                 <Filter><Tag><Key>team</Key></Tag></Filter>{ONE_EXPIRATION}"
+            ))]),
+        ),
+        (
+            "a tag predicate inside an And whose key element is misspelled",
+            configuration(&[rule(&format!(
+                "<ID>misspelled-key</ID><Status>Enabled</Status>\
+                 <Filter><And><Prefix>logs/</Prefix>\
+                 <Tag><Name>team</Name><Value>data</Value></Tag></And></Filter>\
+                 {ONE_EXPIRATION}"
+            ))]),
+        ),
+        (
+            "an object-size bound nested inside the tag predicate",
+            configuration(&[rule(&format!(
+                "<ID>misnested-size</ID><Status>Enabled</Status>\
+                 <Filter><Tag><Key>team</Key><Value>data</Value>\
+                 <ObjectSizeGreaterThan>1</ObjectSizeGreaterThan></Tag></Filter>\
+                 {ONE_EXPIRATION}"
+            ))]),
+        ),
+        (
+            "a rule naming no Status, the child a rule requires",
+            configuration(&[rule(&format!(
+                "<ID>statusless</ID><Filter>{TAG_PREDICATE}</Filter>{ONE_EXPIRATION}"
+            ))]),
+        ),
+        (
+            "an expiration whose day element is misspelled",
+            configuration(&[rule(
+                "<ID>misspelled-days</ID><Status>Enabled</Status>\
+                 <Filter><Prefix>logs/</Prefix></Filter>\
+                 <Expiration><Day>30</Day></Expiration>",
+            )]),
+        ),
+        (
+            "a rule element one level too deep",
+            format!(
+                "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Rules>{}</Rules></LifecycleConfiguration>",
+                rule(&format!(
+                    "<ID>nested-rule</ID><Status>Enabled</Status>\
+                     <Filter>{TAG_PREDICATE}</Filter>{ONE_EXPIRATION}"
+                ))
+            ),
+        ),
+        (
+            "a root element that is not the published container",
+            format!(
+                "<Lifecycle>{}</Lifecycle>",
+                rule(&format!(
+                    "<ID>wrong-root</ID><Status>Enabled</Status>\
+                     <Filter>{TAG_PREDICATE}</Filter>{ONE_EXPIRATION}"
+                ))
+            ),
+        ),
+    ]
+}
+
+/// The documents the published schema DOES admit, each as (the case, the document, a fragment
+/// a later read must report back).
+///
+/// The rows differ along the filter's form — the filter's own tag predicate, several
+/// predicates inside an `And`, a filter left empty, and the legacy `Prefix` form — so what the
+/// table above refuses is the document's shape rather than a tag predicate being there at all.
+fn admitted_documents() -> Vec<(&'static str, String, &'static str)> {
+    vec![
+        (
+            "a filter naming one tag predicate",
+            configuration(&[rule(&format!(
+                "<ID>one-tag</ID><Status>Enabled</Status>\
+                 <Filter>{TAG_PREDICATE}</Filter>{ONE_EXPIRATION}"
+            ))]),
+            "<ID>one-tag</ID>",
+        ),
+        (
+            "an And of a prefix and two tag predicates",
+            configuration(&[rule(&format!(
+                "<ID>and-tags</ID><Status>Enabled</Status><Filter><And>\
+                 <Prefix>logs/</Prefix>{TAG_PREDICATE}\
+                 <Tag><Key>tier</Key><Value>cold</Value></Tag></And></Filter>{ONE_EXPIRATION}"
+            ))]),
+            "<ID>and-tags</ID>",
+        ),
+        (
+            "a filter left empty, which applies to every object",
+            configuration(&[rule(&format!(
+                "<ID>every-object</ID><Status>Enabled</Status><Filter></Filter>{ONE_EXPIRATION}"
+            ))]),
+            "<ID>every-object</ID>",
+        ),
+        (
+            "the legacy Prefix form, with no filter at all",
+            configuration(&[rule(&format!(
+                "<ID>legacy-prefix</ID><Status>Enabled</Status>\
+                 <Prefix>logs/</Prefix>{ONE_EXPIRATION}"
+            ))]),
+            "<ID>legacy-prefix</ID>",
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_lifecycle_document_the_published_schema_does_not_admit_is_refused_as_malformed() {
+    let router = router();
+    let name = "lifecycle-document-shape";
+    bucket(&router, name).await;
+
+    for (case, document) in malformed_documents() {
+        let refused = put_lifecycle(&router, name, &[], &document).await;
+        assert_refused(case, &refused, MALFORMED_XML, MALFORMED_XML_MESSAGE);
+
+        // Nothing was stored, so the read answers the code the operation publishes for a
+        // bucket carrying no configuration — and names the bucket it was addressed to.
+        let read = get_lifecycle(&router, name).await;
+        assert_eq!(
+            read.status,
+            404,
+            "case {case:?}: a refused put must leave the bucket with no configuration, got \
+             {} with body {:?}",
+            read.status,
+            text(&read)
+        );
+        assert_eq!(
+            read.error_code(),
+            NO_SUCH_LIFECYCLE_CONFIGURATION_CODE,
+            "case {case:?}: expected the code {NO_SUCH_LIFECYCLE_CONFIGURATION_CODE:?}, got {:?}",
+            read.error_code()
+        );
+        assert_eq!(
+            read.error_message(),
+            NO_SUCH_LIFECYCLE_CONFIGURATION_MESSAGE,
+            "case {case:?}: expected the message \
+             {NO_SUCH_LIFECYCLE_CONFIGURATION_MESSAGE:?}, got {:?}",
+            read.error_message()
+        );
+        assert_eq!(
+            read.element("BucketName").as_deref(),
+            Some(name),
+            "case {case:?}: the refusal must name the bucket addressed, got {:?} in {:?}",
+            read.element("BucketName"),
+            text(&read)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_lifecycle_document_the_published_schema_admits_is_stored() {
+    let router = router();
+    let name = "lifecycle-document-admitted";
+    bucket(&router, name).await;
+
+    for (case, document, reads_back) in admitted_documents() {
+        let stored = put_lifecycle(&router, name, &[], &document).await;
+        assert_eq!(
+            stored.status,
+            200,
+            "case {case:?}: expected the configuration to be stored, got {} with body {:?}",
+            stored.status,
+            text(&stored)
+        );
+        let read = get_lifecycle(&router, name).await;
+        let reported = text(&read);
+        assert!(
+            reported.contains(reads_back),
+            "case {case:?}: the stored configuration must report {reads_back:?}, got \
+             {reported:?}"
+        );
+    }
+}
+
+/// One row of the tag-key table: the case and the rule body.
+///
+/// The rows differ along HOW the key misses the published bounds — the element spelled empty,
+/// the element left out, a predicate that names neither half, and a key one character past the
+/// published maximum — and along WHERE the predicate sits (the filter's own `Tag` and the one
+/// inside its `And`), since the bounds belong to the tag rather than to its container.
+fn tag_key_rows() -> Vec<(&'static str, String)> {
+    let over_long = "k".repeat(MAX_TAG_KEY_CHARS + 1);
+    vec![
+        (
+            "a tag predicate whose key element is spelled empty",
+            format!(
+                "<ID>empty-key</ID><Status>Enabled</Status>\
+                 <Filter><Tag><Key></Key><Value>data</Value></Tag></Filter>{ONE_EXPIRATION}"
+            ),
+        ),
+        (
+            "a tag predicate naming no key element at all",
+            format!(
+                "<ID>keyless-tag</ID><Status>Enabled</Status>\
+                 <Filter><Tag><Value>data</Value></Tag></Filter>{ONE_EXPIRATION}"
+            ),
+        ),
+        (
+            "a self-closing tag predicate, which names neither half of the pair",
+            format!(
+                "<ID>empty-tag</ID><Status>Enabled</Status>\
+                 <Filter><Tag/></Filter>{ONE_EXPIRATION}"
+            ),
+        ),
+        (
+            "an empty key inside an And",
+            format!(
+                "<ID>empty-key-and</ID><Status>Enabled</Status><Filter><And>\
+                 <Prefix>logs/</Prefix><Tag><Key></Key><Value>data</Value></Tag></And>\
+                 </Filter>{ONE_EXPIRATION}"
+            ),
+        ),
+        (
+            "a key one character past the published maximum",
+            format!(
+                "<ID>over-long-key</ID><Status>Enabled</Status>\
+                 <Filter><Tag><Key>{over_long}</Key><Value>data</Value></Tag></Filter>\
+                 {ONE_EXPIRATION}"
+            ),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_tag_predicate_key_outside_the_published_bounds_states_those_bounds() {
+    let router = router();
+    let name = "lifecycle-tag-key-bounds";
+    bucket(&router, name).await;
+
+    for (case, body) in tag_key_rows() {
+        let document = configuration(&[rule(&body)]);
+        let refused = put_lifecycle(&router, name, &[], &document).await;
+        assert_refused(
+            case,
+            &refused,
+            "InvalidRequest",
+            &tag_key_bounds_message(),
+        );
+    }
+
+    // The shortest and the longest key the bounds admit are both stored, so the rows above
+    // are refused for missing those bounds rather than for naming a tag at all.
+    for (case, key) in [
+        ("the shortest key the bounds admit", "k".to_string()),
+        (
+            "the longest key the bounds admit",
+            "k".repeat(MAX_TAG_KEY_CHARS),
+        ),
+    ] {
+        let document = configuration(&[rule(&format!(
+            "<ID>bounded-key-{}</ID><Status>Enabled</Status>\
+             <Filter><Tag><Key>{key}</Key><Value>data</Value></Tag></Filter>{ONE_EXPIRATION}",
+            key.chars().count()
+        ))]);
+        let stored = put_lifecycle(&router, name, &[], &document).await;
+        assert_eq!(
+            stored.status,
+            200,
+            "case {case:?}: expected the configuration to be stored, got {} with body {:?}",
+            stored.status,
+            text(&stored)
+        );
+    }
+}
+
+/// The two transition actions, each as (the action's element, the element carrying its day
+/// count, the day count a row sends) — the pair S3 names a bad target class by.
+const TRANSITION_ACTIONS: [(&str, &str, &str); 2] = [
+    ("Transition", "Days", "30"),
+    ("NoncurrentVersionTransition", "NoncurrentDays", "30"),
+];
+
+/// A rule whose only action is `action`, moving the object to `storage_class`.
+fn transition_rule(action: (&str, &str, &str), storage_class: &str) -> String {
+    let (action, days_member, days) = action;
+    rule(&format!(
+        "<ID>target-{storage_class}</ID><Status>Enabled</Status>\
+         <Filter><Prefix>tiered/</Prefix></Filter>\
+         <{action}><{days_member}>{days}</{days_member}>\
+         <StorageClass>{storage_class}</StorageClass></{action}>"
+    ))
+}
+
+#[tokio::test]
+async fn a_transition_target_outside_the_published_set_is_classified_by_what_it_names() {
+    let router = router();
+    let name = "lifecycle-transition-target";
+    bucket(&router, name).await;
+
+    // A value that IS one of this service's storage classes but not a transition target: the
+    // VALUE is what the caller has to change, so the refusal names the action it belongs to.
+    // Every such value of the model's own `StorageClass` set is a row, not just the one an
+    // object sits in by default.
+    let not_a_target = STORAGE_CLASS_VALUES
+        .iter()
+        .copied()
+        .filter(|value| !TRANSITION_STORAGE_CLASS_VALUES.contains(value));
+    for storage_class in not_a_target {
+        for action in TRANSITION_ACTIONS {
+            let case = format!("{storage_class} as a {} target", action.0);
+            let document = configuration(&[transition_rule(action, storage_class)]);
+            let refused = put_lifecycle(&router, name, &[], &document).await;
+            assert_refused(
+                &case,
+                &refused,
+                INVALID_ARGUMENT,
+                &format!("Invalid target Storage class for {} action", action.0),
+            );
+        }
+    }
+
+    // A value that names NO storage class of this service: the element's text is outside the
+    // vocabulary the published schema declares for it, so the DOCUMENT is what did not
+    // validate. The rows differ along how the text misses the set — a class spelled in
+    // another case, a plausible name the service has no such class for, a published target
+    // with its words run together, and no text at all.
+    for storage_class in ["standard_ia", "ARCHIVE", "GLACIERIR", ""] {
+        for action in TRANSITION_ACTIONS {
+            let case = format!("{storage_class:?} as a {} target", action.0);
+            let document = configuration(&[transition_rule(action, storage_class)]);
+            let refused = put_lifecycle(&router, name, &[], &document).await;
+            assert_refused(&case, &refused, MALFORMED_XML, MALFORMED_XML_MESSAGE);
+        }
+    }
+
+    // And every published target IS stored, so the two tables above refuse what the set
+    // excludes rather than the element itself.
+    for storage_class in TRANSITION_STORAGE_CLASS_VALUES.iter().copied() {
+        for action in TRANSITION_ACTIONS {
+            let case = format!("{storage_class} as a {} target", action.0);
+            let document = configuration(&[transition_rule(action, storage_class)]);
+            let stored = put_lifecycle(&router, name, &[], &document).await;
+            assert_eq!(
+                stored.status,
+                200,
+                "case {case:?}: a published target must be stored, got {} with body {:?}",
+                stored.status,
+                text(&stored)
+            );
+        }
+    }
+}
+
+/// One row of the day-count table: the case, the rule body, the member the refusal names, the
+/// value as sent, and the sentence the refusal carries.
+struct DayCountRow {
+    case: &'static str,
+    body: String,
+    argument: &'static str,
+    value: &'static str,
+    message: String,
+}
+
+/// The sentence S3 refuses a day count that has to be a non-zero positive integer with.
+fn must_be_positive(member: &str, action: &str) -> String {
+    format!("'{member}' for {action} action must be a positive integer")
+}
+
+/// Every day count a lifecycle rule carries, each sent a value its member does not accept.
+///
+/// The rows differ along WHICH member carries the count (the two expirations, the two
+/// transitions, the abort action and the retained-version count), the FLOOR that member
+/// publishes — a transition's day count "can be `0` or any positive integer"
+/// (`Transition$Days`), while every other count must be "a non-zero positive integer" — and
+/// the value sent (zero, minus one and counts further below the floor).
+fn day_count_rows() -> Vec<DayCountRow> {
+    vec![
+        DayCountRow {
+            case: "a transition one day before the object exists",
+            body: "<ID>negative-transition</ID><Status>Enabled</Status>\
+                   <Filter><Prefix>tiered/</Prefix></Filter>\
+                   <Transition><Days>-1</Days><StorageClass>GLACIER</StorageClass></Transition>"
+                .to_string(),
+            argument: "Days",
+            value: "-1",
+            message: "'Days' in Transition action must be nonnegative".to_string(),
+        },
+        DayCountRow {
+            case: "a transition a week before the object exists",
+            body: "<ID>negative-transition-week</ID><Status>Enabled</Status>\
+                   <Filter><Prefix>tiered/</Prefix></Filter>\
+                   <Transition><Days>-7</Days><StorageClass>GLACIER</StorageClass></Transition>"
+                .to_string(),
+            argument: "Days",
+            value: "-7",
+            message: "'Days' in Transition action must be nonnegative".to_string(),
+        },
+        DayCountRow {
+            case: "an expiration on the day the object is created",
+            body: "<ID>zero-expiration</ID><Status>Enabled</Status>\
+                   <Filter><Prefix>logs/</Prefix></Filter>\
+                   <Expiration><Days>0</Days></Expiration>"
+                .to_string(),
+            argument: "Days",
+            value: "0",
+            message: must_be_positive("Days", "Expiration"),
+        },
+        DayCountRow {
+            case: "an expiration before the object is created",
+            body: "<ID>negative-expiration</ID><Status>Enabled</Status>\
+                   <Filter><Prefix>logs/</Prefix></Filter>\
+                   <Expiration><Days>-30</Days></Expiration>"
+                .to_string(),
+            argument: "Days",
+            value: "-30",
+            message: must_be_positive("Days", "Expiration"),
+        },
+        DayCountRow {
+            case: "a noncurrent expiration on the day the version became noncurrent",
+            body: "<ID>zero-noncurrent</ID><Status>Enabled</Status>\
+                   <Filter><Prefix>logs/</Prefix></Filter>\
+                   <NoncurrentVersionExpiration><NoncurrentDays>0</NoncurrentDays>\
+                   </NoncurrentVersionExpiration>"
+                .to_string(),
+            argument: "NoncurrentDays",
+            value: "0",
+            message: must_be_positive("NoncurrentDays", "NoncurrentVersionExpiration"),
+        },
+        DayCountRow {
+            case: "a noncurrent transition on the day the version became noncurrent",
+            body: "<ID>zero-noncurrent-transition</ID><Status>Enabled</Status>\
+                   <Filter><Prefix>tiered/</Prefix></Filter>\
+                   <NoncurrentVersionTransition><NoncurrentDays>0</NoncurrentDays>\
+                   <StorageClass>GLACIER</StorageClass></NoncurrentVersionTransition>"
+                .to_string(),
+            argument: "NoncurrentDays",
+            value: "0",
+            message: must_be_positive("NoncurrentDays", "NoncurrentVersionTransition"),
+        },
+        DayCountRow {
+            case: "an abort action on the day the upload is initiated",
+            body: "<ID>zero-abort</ID><Status>Enabled</Status>\
+                   <Filter><Prefix>uploads/</Prefix></Filter>\
+                   <AbortIncompleteMultipartUpload><DaysAfterInitiation>0\
+                   </DaysAfterInitiation></AbortIncompleteMultipartUpload>"
+                .to_string(),
+            argument: "DaysAfterInitiation",
+            value: "0",
+            message: must_be_positive("DaysAfterInitiation", "AbortIncompleteMultipartUpload"),
+        },
+        DayCountRow {
+            case: "a noncurrent expiration retaining no version at all",
+            body: "<ID>zero-retained</ID><Status>Enabled</Status>\
+                   <Filter><Prefix>logs/</Prefix></Filter>\
+                   <NoncurrentVersionExpiration><NoncurrentDays>10</NoncurrentDays>\
+                   <NewerNoncurrentVersions>0</NewerNoncurrentVersions>\
+                   </NoncurrentVersionExpiration>"
+                .to_string(),
+            argument: "NewerNoncurrentVersions",
+            value: "0",
+            message: must_be_positive("NewerNoncurrentVersions", "NoncurrentVersionExpiration"),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_refused_day_count_is_named_with_the_value_the_request_sent() {
+    let router = router();
+    let name = "lifecycle-day-counts";
+    bucket(&router, name).await;
+
+    for row in day_count_rows() {
+        let case = row.case;
+        let document = configuration(&[rule(&row.body)]);
+        let refused = put_lifecycle(&router, name, &[], &document).await;
+        assert_refused(case, &refused, INVALID_ARGUMENT, &row.message);
+        assert_eq!(
+            refused.element("ArgumentName").as_deref(),
+            Some(row.argument),
+            "case {case:?}: the envelope must name the member it refused, got {:?} in {:?}",
+            refused.element("ArgumentName"),
+            text(&refused)
+        );
+        assert_eq!(
+            refused.element("ArgumentValue").as_deref(),
+            Some(row.value),
+            "case {case:?}: the envelope must carry the value as sent, got {:?} in {:?}",
+            refused.element("ArgumentValue"),
+            text(&refused)
+        );
+    }
+}
+
+/// The rules that measure their actions from BOTH clocks, each as (the case, the rule body).
+///
+/// The rows differ along which pair of actions mixes the two scales, and on whether one single
+/// action carries both: an object's expiration and its transitions are measured from the one
+/// clock the rule is written against, so a document naming both is one the published schema
+/// does not admit. The counts an action measures on a scale of ITS OWN — how long a version
+/// has been noncurrent, how long an upload has been incomplete — are not in it.
+fn mixed_clock_rules() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "a dated transition beside a counted expiration",
+            "<ID>date-transition-day-expiration</ID><Status>Enabled</Status>\
+             <Filter><Prefix>tiered/</Prefix></Filter>\
+             <Transition><Date>2030-01-01T00:00:00Z</Date>\
+             <StorageClass>GLACIER</StorageClass></Transition>\
+             <Expiration><Days>400</Days></Expiration>"
+                .to_string(),
+        ),
+        (
+            "a counted transition beside a dated expiration",
+            "<ID>day-transition-date-expiration</ID><Status>Enabled</Status>\
+             <Filter><Prefix>tiered/</Prefix></Filter>\
+             <Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition>\
+             <Expiration><Date>2030-01-01T00:00:00Z</Date></Expiration>"
+                .to_string(),
+        ),
+        (
+            "one transition naming both a date and a day count",
+            "<ID>transition-both</ID><Status>Enabled</Status>\
+             <Filter><Prefix>tiered/</Prefix></Filter>\
+             <Transition><Days>30</Days><Date>2030-01-01T00:00:00Z</Date>\
+             <StorageClass>GLACIER</StorageClass></Transition>"
+                .to_string(),
+        ),
+        (
+            "a dated transition beside a counted one",
+            "<ID>date-and-day-transitions</ID><Status>Enabled</Status>\
+             <Filter><Prefix>tiered/</Prefix></Filter>\
+             <Transition><Date>2030-01-01T00:00:00Z</Date>\
+             <StorageClass>GLACIER</StorageClass></Transition>\
+             <Transition><Days>30</Days><StorageClass>STANDARD_IA</StorageClass></Transition>"
+                .to_string(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_rule_measuring_its_actions_from_both_clocks_is_refused_as_malformed() {
+    let router = router();
+    let name = "lifecycle-mixed-clocks";
+    bucket(&router, name).await;
+
+    for (case, body) in mixed_clock_rules() {
+        let document = configuration(&[rule(&body)]);
+        let refused = put_lifecycle(&router, name, &[], &document).await;
+        assert_refused(case, &refused, MALFORMED_XML, MALFORMED_XML_MESSAGE);
+    }
+}
+
+/// One row of the date-rendering table: the case, the date as the request spells it, and the
+/// date a read must report.
+struct DateRow {
+    case: &'static str,
+    spelled: &'static str,
+    reported: &'static str,
+}
+
+/// The spellings one midnight may arrive in, and the one form a read reports it in.
+///
+/// The rows differ along the FRACTION the request spells — none, three zero digits, and a
+/// fraction of another width — and along the date itself, so what is pinned is the form the
+/// document is written in rather than an echo of the request's text.
+fn date_rows() -> Vec<DateRow> {
+    vec![
+        DateRow {
+            case: "a midnight spelled with no fraction",
+            spelled: "2030-01-01T00:00:00Z",
+            reported: "2030-01-01T00:00:00.000Z",
+        },
+        DateRow {
+            case: "the same midnight spelled with three zero digits",
+            spelled: "2030-01-01T00:00:00.000Z",
+            reported: "2030-01-01T00:00:00.000Z",
+        },
+        DateRow {
+            case: "a midnight on a leap day",
+            spelled: "2032-02-29T00:00:00Z",
+            reported: "2032-02-29T00:00:00.000Z",
+        },
+        DateRow {
+            case: "a midnight spelled with a one-digit fraction",
+            spelled: "2041-12-31T00:00:00.0Z",
+            reported: "2041-12-31T00:00:00.000Z",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_stored_date_reads_back_in_the_form_every_s3_document_carries() {
+    let router = router();
+    let name = "lifecycle-date-form";
+    bucket(&router, name).await;
+
+    for row in date_rows() {
+        let case = row.case;
+        // Both members the model reports a lifecycle instant in, in one configuration: the
+        // expiration's own `Date` and a transition's, each measured from the same clock.
+        let document = configuration(&[
+            rule(&format!(
+                "<ID>expires-on-{}</ID><Status>Enabled</Status>\
+                 <Filter><Prefix>logs/</Prefix></Filter>\
+                 <Expiration><Date>{}</Date></Expiration>",
+                row.spelled, row.spelled
+            )),
+            rule(&format!(
+                "<ID>transitions-on-{}</ID><Status>Enabled</Status>\
+                 <Filter><Prefix>tiered/</Prefix></Filter>\
+                 <Transition><Date>{}</Date><StorageClass>GLACIER</StorageClass></Transition>",
+                row.spelled, row.spelled
+            )),
+        ]);
+        let stored = put_lifecycle(&router, name, &[], &document).await;
+        assert_eq!(
+            stored.status,
+            200,
+            "case {case:?}: the configuration must be stored, got {} with body {:?}",
+            stored.status,
+            text(&stored)
+        );
+
+        let read = get_lifecycle(&router, name).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: the stored configuration must read back, got {} with body {:?}",
+            read.status,
+            text(&read)
+        );
+        let dates = read.elements("Date");
+        assert_eq!(
+            dates,
+            vec![row.reported.to_string(), row.reported.to_string()],
+            "case {case:?}: both instants must be reported as {:?}, got {dates:?} in {:?}",
+            row.reported,
+            text(&read)
+        );
+    }
+}
+
+/// Both tables the lifecycle document schema is walked against, re-derived from the model
+/// itself: every element one declares is a member of the `BucketLifecycleConfiguration`
+/// closure under the name restXml spells it with, and every required child is a member that
+/// closure marks `@required`.
+///
+/// Source: the model this crate ships, read here rather than restated — so a model update that
+/// renames, adds or removes an element of the closure cannot leave the tables behind.
+#[test]
+fn the_lifecycle_document_schema_tables_match_the_model() {
+    let model_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-s3-amazons3.json"
+    );
+    let model: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(model_path).expect("the service's Smithy model must be readable"),
+    )
+    .expect("the Smithy model must parse as JSON");
+    let shapes = model["shapes"]
+        .as_object()
+        .expect("the model must carry a shapes object");
+
+    /// The element a member is written under: its `@xmlName`, else its own name.
+    fn element_of(name: &str, member: &serde_json::Value) -> String {
+        member["traits"]["smithy.api#xmlName"]
+            .as_str()
+            .unwrap_or(name)
+            .to_string()
+    }
+
+    /// The shape a member's element really carries: a LIST is flattened into the element its
+    /// own member name gives it, so what arrives under that element is the list's member
+    /// shape.
+    fn carried_shape<'m>(
+        shapes: &'m serde_json::Map<String, serde_json::Value>,
+        target: &str,
+    ) -> Option<&'m serde_json::Value> {
+        let shape = shapes.get(target)?;
+        match shape["type"].as_str() {
+            Some("list") => shapes.get(shape["member"]["target"].as_str()?),
+            _ => Some(shape),
+        }
+    }
+
+    // The payload container, under the element name the operation's own member spells it with
+    // (`PutBucketLifecycleConfigurationRequest$LifecycleConfiguration`, `@xmlName`).
+    let payload = &shapes["com.amazonaws.s3#PutBucketLifecycleConfigurationRequest"]["members"]
+        ["LifecycleConfiguration"];
+    let root = element_of("LifecycleConfiguration", payload);
+    let mut pending: Vec<(String, String)> = vec![(
+        root.clone(),
+        payload["target"]
+            .as_str()
+            .expect("the payload member names a shape")
+            .to_string(),
+    )];
+    let mut derived_elements: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut derived_required: BTreeSet<(String, String)> = BTreeSet::new();
+    while let Some((element, target)) = pending.pop() {
+        if derived_elements.contains_key(&element) {
+            continue;
+        }
+        let Some(members) = carried_shape(shapes, &target).and_then(|shape| {
+            shape["members"]
+                .as_object()
+                .filter(|_| shape["type"] == "structure")
+        }) else {
+            continue;
+        };
+        let children = derived_elements.entry(element.clone()).or_default();
+        for (name, member) in members {
+            let child = element_of(name, member);
+            children.insert(child.clone());
+            if member["traits"].get("smithy.api#required").is_some() {
+                derived_required.insert((element.clone(), child.clone()));
+            }
+            if let Some(target) = member["target"].as_str() {
+                pending.push((child, target.to_string()));
+            }
+        }
+    }
+    // A LEAF carries text rather than elements, so the tables declare no row for it: the
+    // derivation above adds a row only for a structure.
+    derived_elements.retain(|_, children| !children.is_empty());
+
+    assert_eq!(
+        LIFECYCLE_DOCUMENT_SCHEMA[0].0, root,
+        "the schema's first row is the payload container, got {:?}",
+        LIFECYCLE_DOCUMENT_SCHEMA[0].0
+    );
+    let declared_elements: BTreeMap<String, BTreeSet<String>> = LIFECYCLE_DOCUMENT_SCHEMA
+        .iter()
+        .map(|(element, children)| {
+            (
+                (*element).to_string(),
+                children.iter().map(|child| (*child).to_string()).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        declared_elements, derived_elements,
+        "LIFECYCLE_DOCUMENT_SCHEMA must declare exactly the closure's own elements; declared \
+         {declared_elements:?}, the model reports {derived_elements:?}"
+    );
+
+    let declared_required: BTreeSet<(String, String)> = LIFECYCLE_DOCUMENT_REQUIRED_ELEMENTS
+        .iter()
+        .map(|(container, child)| ((*container).to_string(), (*child).to_string()))
+        .collect();
+    assert_eq!(
+        declared_required, derived_required,
+        "LIFECYCLE_DOCUMENT_REQUIRED_ELEMENTS must name exactly the closure's required \
+         members; declared {declared_required:?}, the model reports {derived_required:?}"
+    );
 }

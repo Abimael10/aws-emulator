@@ -790,6 +790,18 @@ pub const MAX_TAGS_PER_OBJECT: usize = 10;
 /// already refused at the boundary, before any handler runs.
 pub const MAX_TAG_KEY_CHARS: usize = 128;
 
+/// The sentence S3 refuses a tag key outside [`MAX_TAG_KEY_CHARS`] and its floor of one
+/// character with, stating the published bounds rather than echoing the key.
+///
+/// ONE sentence for a key of no characters however the document spells it — the element left
+/// empty, which the model's own `length {min 1}` refuses at the request boundary
+/// (`crate::service::published_refusal`), and the element left out, which the owning
+/// container's own validator refuses — so the two layers cannot word the same refusal two
+/// ways.
+pub fn tag_key_bounds_message() -> String {
+    format!("A Tag's Key must be a length between 1 and {MAX_TAG_KEY_CHARS}.")
+}
+
 /// The longest tag value a tag set may carry, in Unicode characters.
 ///
 /// Same source as [`MAX_TAG_KEY_CHARS`]. `Tag$Value` targets the unconstrained `Value`
@@ -4633,6 +4645,9 @@ mod configuration_tokens;
 mod inline_tagging;
 // What a bucket's stored lifecycle configuration is, and which ones S3 admits.
 mod lifecycle;
+// The schema a lifecycle configuration document has to validate against before any of it is
+// read.
+mod lifecycle_document;
 // Where a metadata configuration's tables are really created: the S3 Tables store that owns
 // them.
 pub mod metadata_table_provisioning;
@@ -4669,6 +4684,7 @@ pub use document_schema::*;
 pub use configuration_tokens::*;
 pub use inline_tagging::*;
 pub use lifecycle::*;
+pub use lifecycle_document::*;
 pub use metadata_table_provisioning::{
     managing_service_principal, ManagedTableBucket, MetadataTableIdentity,
 };
