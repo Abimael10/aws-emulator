@@ -60,21 +60,21 @@ use crate::query_wire::{form_encode, outputs_of, physical_ids_of};
 const REGION: &str = "us-east-1";
 
 /// The `StackStatus` a completed create reports.
-const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+pub(crate) const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 
 /// The `State` AWS Lambda reports a function it takes calls on in.
 const ACTIVE: &str = "Active";
 
 /// The prefix of the default log group of a function whose `LoggingConfig` names none: "a
 /// default log group named `/aws/lambda/<function name>`" (`LoggingConfig$LogGroup`).
-const DEFAULT_GROUP_PREFIX: &str = "/aws/lambda/";
+pub(crate) const DEFAULT_GROUP_PREFIX: &str = "/aws/lambda/";
 
 /// The fixed framing AWS Lambda writes for every run it finishes, which is what says the log
 /// of a run really was delivered beside what the handler printed.
-const REPORT_PREFIX: &str = "REPORT RequestId: ";
+pub(crate) const REPORT_PREFIX: &str = "REPORT RequestId: ";
 
 /// How long one invocation of the handler below is given, as the function's own `Timeout`.
-const FUNCTION_TIMEOUT: u64 = 30;
+pub(crate) const FUNCTION_TIMEOUT: u64 = 30;
 
 /// How long to wait between polls of something another service owes, and how many polls to
 /// make. The budget is far longer than any span these services choose, so a loaded host is
@@ -84,7 +84,7 @@ const POLLS: usize = 400;
 
 /// How many records ONE run leaves in its group at least: the line the handler printed, and
 /// the runtime's own closing frame.
-const RECORDS_PER_RUN: usize = 2;
+pub(crate) const RECORDS_PER_RUN: usize = 2;
 
 /// The logical ids the templates below declare.
 const FUNCTION_ID: &str = "Logger";
@@ -93,14 +93,19 @@ const GROUP_ID: &str = "Group";
 
 /// The handler every row deploys: it prints the marker the event carries and answers it, so
 /// what one run left in a group can be told apart from any other run's records.
-const HANDLER_SOURCE: &str = r#"
+pub(crate) const HANDLER_SOURCE: &str = r#"
 def handler(event, context):
     print("logged %s" % event["marker"])
     return {"logged": event["marker"]}
 "#;
 
+/// The header AWS Lambda reports a failed handler under: `FunctionError` is bound to
+/// `X-Amz-Function-Error` (`smithy_query(query="operation",operation="Invoke")`), so a run
+/// whose handler returned normally carries no such header at all.
+const FUNCTION_ERROR_HEADER: &str = "x-amz-function-error";
+
 /// The trust policy the execution role carries: AWS Lambda assumes it to run the function.
-fn trust_policy() -> Value {
+pub(crate) fn trust_policy() -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -125,25 +130,28 @@ fn logs_policy() -> Value {
     })
 }
 
-/// One answered request: its status and its body verbatim.
-struct Answered {
-    status: u16,
-    body: Bytes,
+/// One answered request: its status, the one response header a caller asserts on, and its
+/// body verbatim.
+pub(crate) struct Answered {
+    pub(crate) status: u16,
+    /// What AWS Lambda reported in `X-Amz-Function-Error`, where it reported one at all.
+    pub(crate) function_error: Option<String>,
+    pub(crate) body: Bytes,
 }
 
 impl Answered {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 }
 
 /// The emulator as it is ASSEMBLED, on one engine: the function the stack creates, the role it
 /// runs as and the group its run writes to are all held by the services mounted there.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = aws_emulator_router::build_router(engine);
     // The suite exercises the services, not SigV4: each call carries a credential scope so the
@@ -183,14 +191,20 @@ async fn dispatch(
         .dispatch(builder.body(body).expect("a well-formed request"))
         .await;
     let (parts, body) = response.into_parts();
+    let function_error = parts
+        .headers
+        .get(FUNCTION_ERROR_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     Answered {
         status: parts.status.as_u16(),
+        function_error,
         body,
     }
 }
 
 /// Call one CloudFormation operation over its awsQuery wire.
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
@@ -214,7 +228,7 @@ async fn cloudformation(
 }
 
 /// One AWS Lambda call over its `restJson1` wire.
-async fn lambda(
+pub(crate) async fn lambda(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -233,7 +247,7 @@ async fn lambda(
 }
 
 /// One Amazon CloudWatch Logs call over its `awsJson1_1` wire.
-async fn logs(router: &MultiServiceRouter, operation: &str, body: Value) -> Answered {
+pub(crate) async fn logs(router: &MultiServiceRouter, operation: &str, body: Value) -> Answered {
     dispatch(
         router,
         "logs",
@@ -250,7 +264,11 @@ async fn logs(router: &MultiServiceRouter, operation: &str, body: Value) -> Answ
 
 /// Every group `DescribeLogGroups` resolves for the prefix `name` whose own `logGroupName` is
 /// exactly `name`: what a client holding that name can find by it.
-async fn groups_named(router: &MultiServiceRouter, case: &str, name: &str) -> Vec<Value> {
+pub(crate) async fn groups_named(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> Vec<Value> {
     let answered = logs(
         router,
         "DescribeLogGroups",
@@ -280,8 +298,8 @@ async fn groups_named(router: &MultiServiceRouter, case: &str, name: &str) -> Ve
 /// Every message CloudWatch Logs holds in `group` right now. A group nothing has written to
 /// yet does not exist, which that service answers as a refusal rather than as an empty list,
 /// so such an answer reads here as no records.
-async fn messages_in(router: &MultiServiceRouter, group: &str) -> Vec<String> {
-    let answered = logs(router, "FilterLogEvents", json!({ "logGroupName": group })).await;
+pub(crate) async fn messages_in(router: &MultiServiceRouter, group: &str) -> Vec<String> {
+    let answered = filtered(router, group).await;
     if answered.status != 200 {
         return Vec::new();
     }
@@ -302,7 +320,7 @@ async fn messages_in(router: &MultiServiceRouter, group: &str) -> Vec<String> {
 /// The messages `group` holds, polled until it holds at least `at_least` of them or the polls
 /// run out. The delivery of a run's log is not part of the invocation's answer, so this waits
 /// for the CONDITION rather than for a span.
-async fn messages_at_least(
+pub(crate) async fn messages_at_least(
     router: &MultiServiceRouter,
     group: &str,
     at_least: usize,
@@ -321,7 +339,11 @@ async fn messages_at_least(
 /// Poll `GetFunctionConfiguration` until AWS Lambda first reports the function `Active`, and
 /// answer the configuration it reported then. The span is that service's own, so nothing here
 /// sleeps a fixed span on its behalf.
-async fn wait_until_active(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
+pub(crate) async fn wait_until_active(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> Value {
     let path = format!("/2015-03-31/functions/{name}/configuration");
     let mut last = Value::Null;
     for _ in 0..POLLS {
@@ -466,8 +488,18 @@ impl Row {
     }
 }
 
-/// Invoke the function `name` with a marker of its own, and answer what the handler returned.
-async fn invoke(router: &MultiServiceRouter, case: &str, name: &str, marker: &str) {
+/// `FilterLogEvents` on `group`, as it was answered: a group that does not exist is a refusal
+/// rather than an empty list, so a caller that knows which of the two to expect can tell them
+/// apart.
+pub(crate) async fn filtered(router: &MultiServiceRouter, group: &str) -> Answered {
+    logs(router, "FilterLogEvents", json!({ "logGroupName": group })).await
+}
+
+/// Invoke the function `name` with a marker of its own, and assert the invocation itself was
+/// clean: HTTP 200, no `FunctionError`, and the handler's own answer in the payload. Whatever
+/// became of the run's log is not part of this — a withheld delivery is not an invocation
+/// failure.
+pub(crate) async fn invoke(router: &MultiServiceRouter, case: &str, name: &str, marker: &str) {
     let invoked = lambda(
         router,
         "POST",
@@ -479,6 +511,12 @@ async fn invoke(router: &MultiServiceRouter, case: &str, name: &str, marker: &st
         invoked.status, 200,
         "case {case:?}: expected HTTP 200 from Invoke of {name:?}, got {} with {:?}",
         invoked.status,
+        invoked.text()
+    );
+    assert_eq!(
+        invoked.function_error, None,
+        "case {case:?}: expected no FunctionError from Invoke of {name:?}, got {:?} with {:?}",
+        invoked.function_error,
         invoked.text()
     );
     assert_eq!(
