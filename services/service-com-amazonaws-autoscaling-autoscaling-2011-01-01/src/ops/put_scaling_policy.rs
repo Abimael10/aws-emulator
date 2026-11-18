@@ -441,6 +441,34 @@ fn check_policy_input(
             "scalingAdjustment",
         )));
     }
+    // "The minimum value to scale by when the adjustment type is PercentChangeInCapacity"
+    // (`PutScalingPolicyType$MinAdjustmentMagnitude`, and `$MinAdjustmentStep` which it
+    // replaced): a floor under the number of instances a PERCENTAGE of the capacity comes
+    // to, so there is nothing for it to put a floor under beside an adjustment type that
+    // reads its number as a count of instances — such a pairing is refused rather than
+    // stored as a member the policy's own adjustment never consults. Checked for the types
+    // that own the adjustment members at all; a type that owns none carries neither the
+    // adjustment type nor the magnitude into the policy.
+    if members.adjustment
+        && input.adjustment_type.as_deref() != Some(policies::MIN_ADJUSTMENT_ADJUSTMENT_TYPE)
+    {
+        for (value, member) in [
+            (
+                input.min_adjustment_magnitude,
+                policies::MIN_ADJUSTMENT_MAGNITUDE_MEMBER,
+            ),
+            (
+                input.min_adjustment_step,
+                policies::MIN_ADJUSTMENT_STEP_MEMBER,
+            ),
+        ] {
+            if value.is_some() {
+                return Err(refuse(policies::min_adjustment_not_supported_message(
+                    member,
+                )));
+            }
+        }
+    }
     // "Required if the policy type is StepScaling": with no step, no breach selects an
     // adjustment, so the policy could never scale.
     if members.step

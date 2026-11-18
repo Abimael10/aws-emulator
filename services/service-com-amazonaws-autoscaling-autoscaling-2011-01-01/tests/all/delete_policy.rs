@@ -316,14 +316,14 @@ async fn a_delete_that_names_no_policy_is_refused() {
     create_group(&router, "elsewhere").await;
     put_policy(&router, "elsewhere", "kept-elsewhere", &simple_policy()).await;
 
-    let cases: [RefusalCase<'_>; 3] = [
+    let cases: [RefusalCase<'_>; 5] = [
         (
             "a policy name nothing answers to",
             vec![
                 p("AutoScalingGroupName", "refusing"),
                 p("PolicyName", "no-such-policy"),
             ],
-            "Policy name not found - no-such-policy".to_string(),
+            "Policy no-such-policy not found".to_string(),
         ),
         (
             "a policy name of ANOTHER group than the one the request names",
@@ -331,7 +331,33 @@ async fn a_delete_that_names_no_policy_is_refused() {
                 p("AutoScalingGroupName", "refusing"),
                 p("PolicyName", "kept-elsewhere"),
             ],
-            "Policy name not found - kept-elsewhere".to_string(),
+            "Policy kept-elsewhere not found".to_string(),
+        ),
+        // The name is the sentence's only variable part, so the rows below differ in its
+        // FORM: an ARN spelling, which "The name or Amazon Resource Name (ARN) of the
+        // policy" (`DeletePolicyType$PolicyName`) admits, and a name carrying the spaces
+        // and punctuation the member's pattern allows.
+        (
+            "a policy ARN nothing answers to",
+            vec![
+                p("AutoScalingGroupName", "refusing"),
+                p(
+                    "PolicyName",
+                    "arn:aws:autoscaling:us-west-2:000000000000:scalingPolicy:abc:\
+                     autoScalingGroupName/refusing:policyName/ghost",
+                ),
+            ],
+            "Policy arn:aws:autoscaling:us-west-2:000000000000:scalingPolicy:abc:\
+             autoScalingGroupName/refusing:policyName/ghost not found"
+                .to_string(),
+        ),
+        (
+            "a policy name carrying spaces and punctuation",
+            vec![
+                p("AutoScalingGroupName", "refusing"),
+                p("PolicyName", "scale out (peak hours)"),
+            ],
+            "Policy scale out (peak hours) not found".to_string(),
         ),
         (
             "a group the account does not hold",

@@ -855,11 +855,11 @@ pub struct PendingCapacity {
     pub due: SystemTime,
     pub cause: String,
     /// The cooldown, in seconds, this change leaves the group in once it is applied, where
-    /// the change carries one of its OWN rather than the group's `DefaultCooldown`: a
-    /// performed scaling policy's `Cooldown` "overrides the default cooldown period defined
-    /// for the Auto Scaling group" ([`policy_execution`]), and a deferred execution owes that
-    /// override exactly as an immediate one does. `None` for a change that leaves the
-    /// group's own default in force.
+    /// the change carries one of its OWN rather than the group's `DefaultCooldown`. `None`
+    /// for a change that leaves the group's own default in force, which is what every
+    /// deferral this service stores carries today: a capacity set outright
+    /// (`SetDesiredCapacity`) states no cooldown of its own, and neither does the retry a
+    /// launch owes ([`requested_launches`]).
     pub cooldown_override: Option<i32>,
 }
 

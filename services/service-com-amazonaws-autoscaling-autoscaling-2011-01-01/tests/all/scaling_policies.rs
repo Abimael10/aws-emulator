@@ -932,6 +932,98 @@ async fn a_put_that_cannot_describe_a_policy_is_refused_and_stores_nothing() {
     );
 }
 
+/// RULE 3, the adjustment-type half: "The minimum value to scale by when the adjustment
+/// type is PercentChangeInCapacity" (`PutScalingPolicyType$MinAdjustmentMagnitude`, and
+/// the `MinAdjustmentStep` that documents itself as available for backward compatibility
+/// with it) — a floor under the instances a PERCENTAGE comes to, so a put that pairs
+/// either member with an adjustment type whose number is already a count of instances is
+/// refused and stores nothing, while the same member beside the percentage type is stored
+/// and reported.
+#[tokio::test]
+async fn a_minimum_adjustment_member_belongs_to_the_percentage_adjustment_type() {
+    let router = router();
+    create_group(&router, "asg-min-adjustment").await;
+
+    // The rows are the service's OWN catalog of adjustment types
+    // (`autoscaling::state::ADJUSTMENT_TYPES`) crossed with the two members this rule
+    // covers and the two policy types that own an adjustment at all, so they span every
+    // pairing rather than one — each adjustment type, each member, each policy type.
+    let members = [("MinAdjustmentMagnitude", "2"), ("MinAdjustmentStep", "3")];
+    let policy_types = ["SimpleScaling", "StepScaling"];
+    let mut index = 0_usize;
+    for adjustment_type in autoscaling::state::ADJUSTMENT_TYPES {
+        for (member, value) in members {
+            for policy_type in policy_types {
+                index += 1;
+                let policy_name = format!("min-adjustment-{index}");
+                let case =
+                    format!("a {policy_type} policy by {adjustment_type} carrying {member}");
+                let mut params = vec![
+                    p("PolicyType", policy_type),
+                    p("AdjustmentType", *adjustment_type),
+                    p(member, value),
+                ];
+                if policy_type == "StepScaling" {
+                    params.push(p("StepAdjustments.member.1.MetricIntervalLowerBound", "0"));
+                    params.push(p("StepAdjustments.member.1.ScalingAdjustment", "1"));
+                } else {
+                    params.push(p("ScalingAdjustment", "1"));
+                }
+                let served =
+                    *adjustment_type == autoscaling::state::ADJUSTMENT_TYPE_PERCENT_CHANGE_IN_CAPACITY;
+                let (status, body) =
+                    put_policy(&router, "asg-min-adjustment", &policy_name, &params).await;
+                let (read_status, read) = describe_policies(
+                    &router,
+                    &[
+                        p("AutoScalingGroupName", "asg-min-adjustment"),
+                        p("PolicyNames.member.1", &policy_name),
+                    ],
+                )
+                .await;
+                assert_eq!(
+                    read_status, 200,
+                    "case {case:?}: the read-back must succeed, got {read_status} with {read:?}"
+                );
+                if served {
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?}: the percentage adjustment type is what this member \
+                         belongs to, so the put must be served: got {status} with {body:?}"
+                    );
+                    assert_eq!(
+                        tag_value(&read, member),
+                        value,
+                        "case {case:?}: expected the stored policy to report {member} as \
+                         {value:?}, got {read:?}"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected HTTP 400, got {status} with {body:?}"
+                );
+                let (code, message) = refusal(&body);
+                assert_eq!(
+                    code, "ValidationError",
+                    "case {case:?}: expected the ValidationError code, got {code:?} with \
+                     {message:?}"
+                );
+                let expected = format!("{member} is not supported by the specified adjustment type.");
+                assert_eq!(
+                    message, expected,
+                    "case {case:?}: expected the message {expected:?}, got {message:?}"
+                );
+                let reported = tag_values(&read, "PolicyName");
+                assert!(
+                    reported.is_empty(),
+                    "case {case:?}: a refused put must store no policy, got {reported:?}"
+                );
+            }
+        }
+    }
+}
+
 /// RULE 3, the quota half: a step policy carries at most the published number of step
 /// adjustments ("Step adjustments per scaling policy: 20", the Amazon EC2 Auto Scaling
 /// quota) — the bound itself is accepted and one past it is refused with the sentence the

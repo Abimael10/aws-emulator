@@ -21,9 +21,10 @@
 //!    names the same policy, and a name nothing answers to — or a group the account does
 //!    not hold — is refused with HTTP 400 `ValidationError`, leaving the group as it was.
 //! 4. The two cooldowns the model states: `HonorCooldown` makes a `SimpleScaling` policy
-//!    "wait for the cooldown period to complete before executing the policy", so the change
-//!    falls due at that cooldown's end instead of being applied at once; and the policy's
-//!    own `Cooldown` "overrides the default cooldown period defined for the Auto Scaling
+//!    "wait for the cooldown period to complete before executing the policy", so an
+//!    execution asked for while the group is still inside a cooldown is REFUSED with the
+//!    modelled `ScalingActivityInProgress` fault and moves nothing; and the policy's own
+//!    `Cooldown` "overrides the default cooldown period defined for the Auto Scaling
 //!    group" for the cooldown the performed policy leaves behind.
 //! 5. A policy type that states no adjustment of its own cannot be performed, and the two
 //!    metric members are "Required if the policy type is StepScaling and not supported
@@ -175,6 +176,60 @@ async fn wait_for_desired_capacity(
         let held = desired_capacity(router, group).await;
         if held == wanted || Instant::now() >= deadline {
             return held;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The sentence the service refuses an execution blocked by the group's running cooldown
+/// with: entirely fixed text, naming neither the group, nor the policy, nor the cooldown.
+const COOLDOWN_IN_PROGRESS_MESSAGE: &str =
+    "Scaling activity is in progress and blocks the execution of this policy";
+
+/// A cooldown far longer than a test can run, so what the suite observes while it runs is
+/// decided by the behaviour under test rather than by how fast the host is.
+const LONG_COOLDOWN: i32 = 3_600;
+
+/// A cooldown a poll loop can wait OUT, for the cases that need one to run out; nothing is
+/// asserted about what the service answers WHILE it runs, so no case turns on how fast the
+/// host is.
+const SHORT_COOLDOWN: i32 = 3;
+
+/// Ask for the same execution until the service SERVES it, or the deadline passes; answer
+/// the status and body of the last answer, and check every answer on the way.
+///
+/// The condition waited on is the group leaving the cooldown that blocks the execution,
+/// which is the clock's to make due; the ask itself is what reports whether it has. An ask
+/// the service does NOT serve has to be the cooldown refusal — status, code and sentence —
+/// so an ask refused for any other reason fails here rather than being waited out.
+async fn execute_until_served(
+    case: &str,
+    router: &MultiServiceRouter,
+    members: &[(String, String)],
+) -> (u16, String) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let (status, body) = execute_policy(router, members).await;
+        if status == 200 {
+            return (status, body);
+        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: an ask the service does not serve must be the cooldown refusal, \
+             got {status}: {body}"
+        );
+        assert!(
+            body.contains("<Code>ScalingActivityInProgress</Code>"),
+            "case {case:?}: expected the ScalingActivityInProgress code, got {body}"
+        );
+        let message = crate::support::xml_unescape(&tag_value(&body, "Message"));
+        assert_eq!(
+            message, COOLDOWN_IN_PROGRESS_MESSAGE,
+            "case {case:?}: expected the message {COOLDOWN_IN_PROGRESS_MESSAGE:?}, got \
+             {message:?}"
+        );
+        if Instant::now() >= deadline {
+            return (status, body);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -629,7 +684,35 @@ async fn an_unperformable_request_is_refused_and_changes_nothing() {
                 p("AutoScalingGroupName", "refusing"),
                 p("PolicyName", "no-such-policy"),
             ],
-            message: "Policy name not found - no-such-policy".to_string(),
+            message: "Policy no-such-policy not found".to_string(),
+        },
+        // The policy name is that sentence's only variable part, so these two rows differ
+        // in its FORM rather than in the rule: "The name or ARN of the policy"
+        // (`ExecutePolicyType$PolicyName`) admits an ARN spelling, and the member's
+        // pattern admits spaces and punctuation.
+        RefusalCase {
+            case: "a policy ARN nothing answers to",
+            policy: None,
+            request: vec![
+                p("AutoScalingGroupName", "refusing"),
+                p(
+                    "PolicyName",
+                    "arn:aws:autoscaling:us-west-2:000000000000:scalingPolicy:abc:\
+                     autoScalingGroupName/refusing:policyName/ghost",
+                ),
+            ],
+            message: "Policy arn:aws:autoscaling:us-west-2:000000000000:scalingPolicy:abc:\
+                      autoScalingGroupName/refusing:policyName/ghost not found"
+                .to_string(),
+        },
+        RefusalCase {
+            case: "a policy name carrying spaces and punctuation",
+            policy: None,
+            request: vec![
+                p("AutoScalingGroupName", "refusing"),
+                p("PolicyName", "scale out (peak hours)"),
+            ],
+            message: "Policy scale out (peak hours) not found".to_string(),
         },
         RefusalCase {
             case: "a group the account does not hold",
@@ -648,8 +731,7 @@ async fn an_unperformable_request_is_refused_and_changes_nothing() {
                 p("AutoScalingGroupName", "refusing"),
                 p("PolicyName", "tracking"),
             ],
-            message: "ExecutePolicy is not supported for scaling policies of type \
-                      TargetTrackingScaling."
+            message: "ExecutePolicy is not allowed for policy type TargetTrackingScaling"
                 .to_string(),
         },
         RefusalCase {
@@ -659,8 +741,7 @@ async fn an_unperformable_request_is_refused_and_changes_nothing() {
                 p("AutoScalingGroupName", "refusing"),
                 p("PolicyName", "predicting"),
             ],
-            message: "ExecutePolicy is not supported for scaling policies of type \
-                      PredictiveScaling."
+            message: "ExecutePolicy is not allowed for policy type PredictiveScaling"
                 .to_string(),
         },
         RefusalCase {
@@ -670,9 +751,7 @@ async fn an_unperformable_request_is_refused_and_changes_nothing() {
                 p("AutoScalingGroupName", "refusing"),
                 p("PolicyName", "stepping"),
             ],
-            message: "1 validation error detected: Value null at 'metricValue' failed to \
-                      satisfy constraint: Member must not be null"
-                .to_string(),
+            message: "Metric value must be specified for policy type StepScaling".to_string(),
         },
         RefusalCase {
             case: "a step policy graded against no breach threshold",
@@ -682,8 +761,7 @@ async fn an_unperformable_request_is_refused_and_changes_nothing() {
                 p("PolicyName", "stepping"),
                 p("MetricValue", "59"),
             ],
-            message: "1 validation error detected: Value null at 'breachThreshold' failed to \
-                      satisfy constraint: Member must not be null"
+            message: "Breach threshold must be specified for policy type StepScaling"
                 .to_string(),
         },
         RefusalCase {
@@ -755,16 +833,12 @@ async fn an_unperformable_request_is_refused_and_changes_nothing() {
     }
 }
 
-/// Rule 4: `HonorCooldown` waits the group's running cooldown out instead of performing the
-/// policy at once, and without it the policy is performed straight away.
+/// Rule 4: `HonorCooldown` on a `SimpleScaling` policy whose group is still inside a
+/// cooldown REFUSES the execution with the modelled `ScalingActivityInProgress` fault and
+/// moves nothing, and without it — or for a policy type that honours no cooldown at all —
+/// the policy is performed straight away.
 #[tokio::test]
-async fn honor_cooldown_waits_for_the_groups_cooldown() {
-    // A cooldown far longer than this test can run, so "not applied yet" is decided by the
-    // behaviour under test rather than by how fast the host is.
-    const LONG_COOLDOWN: i32 = 3_600;
-    // One a poll loop can wait out.
-    const SHORT_COOLDOWN: i32 = 1;
-
+async fn honoring_a_running_cooldown_refuses_the_execution() {
     let (router, _engine) = emulator();
     for (group, cooldown) in [
         ("waiting", LONG_COOLDOWN),
@@ -794,7 +868,8 @@ async fn honor_cooldown_waits_for_the_groups_cooldown() {
         );
     }
 
-    // Honoured while the cooldown runs: the call succeeds and the change is not applied.
+    // Honoured while the cooldown runs: the scaling activity that started the cooldown
+    // blocks this execution, so the call is refused and the capacity does not move.
     let (status, body) = execute_policy(
         &router,
         &[
@@ -805,21 +880,60 @@ async fn honor_cooldown_waits_for_the_groups_cooldown() {
     )
     .await;
     assert_eq!(
-        status, 200,
-        "case {:?}: ExecutePolicy expected 200, got {status}: {body}",
+        status, 400,
+        "case {:?}: ExecutePolicy expected 400, got {status}: {body}",
+        "honoured during a long cooldown"
+    );
+    assert!(
+        body.contains("<Code>ScalingActivityInProgress</Code>"),
+        "case {:?}: expected the ScalingActivityInProgress code, got {body}",
+        "honoured during a long cooldown"
+    );
+    let message = crate::support::xml_unescape(&tag_value(&body, "Message"));
+    assert_eq!(
+        message, COOLDOWN_IN_PROGRESS_MESSAGE,
+        "case {:?}: expected the message {COOLDOWN_IN_PROGRESS_MESSAGE:?}, got {message:?}",
         "honoured during a long cooldown"
     );
     let held = desired_capacity(&router, "waiting").await;
     assert_eq!(
         held, "1",
-        "case {:?}: the change waits for the cooldown, so the capacity is still the one the \
-         group held, got {held:?}",
+        "case {:?}: a refused execution leaves the capacity the group held, got {held:?}",
         "honoured during a long cooldown"
     );
 
-    // Honoured over a cooldown that does elapse: the change falls due at its end and is
-    // applied with no further call.
-    let (status, body) = execute_policy(
+    // The same ask repeated inside ONE cooldown window is refused every time, so the
+    // adjustment is applied once however often it is asked for.
+    for attempt in 1..=3 {
+        let (status, body) = execute_policy(
+            &router,
+            &[
+                p("AutoScalingGroupName", "waiting"),
+                p("PolicyName", "scale-out"),
+                p("HonorCooldown", "true"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: ask {attempt} expected 400, got {status}: {body}",
+            "the same ask repeated inside one cooldown window"
+        );
+        let held = desired_capacity(&router, "waiting").await;
+        assert_eq!(
+            held, "1",
+            "case {:?}: ask {attempt} must leave the capacity alone, got {held:?}",
+            "the same ask repeated inside one cooldown window"
+        );
+    }
+
+    // Honoured over a cooldown that does elapse: the refusal lasts only as long as the
+    // cooldown, so the same ask is served once it has run out — and it is THAT ask that
+    // moves the capacity, by ONE adjustment, because the refused ones kept nothing back.
+    // Every answer on the way is checked by the poll loop, so nothing here depends on
+    // whether the cooldown is still running at any particular moment.
+    let (status, body) = execute_until_served(
+        "honoured over a cooldown that elapses",
         &router,
         &[
             p("AutoScalingGroupName", "waited-out"),
@@ -830,14 +944,15 @@ async fn honor_cooldown_waits_for_the_groups_cooldown() {
     .await;
     assert_eq!(
         status, 200,
-        "case {:?}: ExecutePolicy expected 200, got {status}: {body}",
+        "case {:?}: once the cooldown has run out the same ask must be served, got \
+         {status}: {body}",
         "honoured over a cooldown that elapses"
     );
     let held = wait_for_desired_capacity(&router, "waited-out", "2").await;
     assert_eq!(
         held, "2",
-        "case {:?}: the deferred change must be applied once the cooldown has elapsed, got \
-         {held:?}",
+        "case {:?}: the served execution applies ONE adjustment and the refused asks none, \
+         got {held:?}",
         "honoured over a cooldown that elapses"
     );
 
@@ -897,18 +1012,19 @@ async fn honor_cooldown_waits_for_the_groups_cooldown() {
 
 /// Rule 4 again, the other cooldown: the cooldown a performed policy LEAVES BEHIND is the
 /// policy's own when it states one, and the group's `DefaultCooldown` otherwise — which is
-/// observable through a second execution that honours it.
+/// observable through a second execution that honours it, since a cooldown still running is
+/// what blocks one.
 #[tokio::test]
 async fn the_policys_own_cooldown_overrides_the_groups_default() {
+    // The rows differ in the cooldown the policy states — none, so the group's own long
+    // default stands and the next honoured execution is blocked; and a zero one, which
+    // overrides that default and leaves nothing to block it.
     let cases = [
-        // A policy that states no cooldown leaves the group's own long one in force, so the
-        // next honoured execution waits.
-        ("the group's default stands", None, "1"),
-        // One that states none at all leaves nothing to wait for, so it is applied at once.
-        ("the policy's own overrides it", Some(0), "2"),
+        ("the group's default stands", None, 400, "1"),
+        ("the policy's own overrides it", Some(0), 200, "2"),
     ];
 
-    for (case, cooldown, expected) in cases {
+    for (case, cooldown, expected_status, expected) in cases {
         let (router, _engine) = emulator();
         create_group(&router, "cooling", (0, 4, 0), Some(3_600)).await;
         let mut members = simple_policy("ChangeInCapacity", 1);
@@ -947,8 +1063,9 @@ async fn the_policys_own_cooldown_overrides_the_groups_default() {
         )
         .await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: the second ExecutePolicy expected 200, got {status}: {body}"
+            status, expected_status,
+            "case {case:?}: the second ExecutePolicy expected {expected_status}, got {status}: \
+             {body}"
         );
         let held = desired_capacity(&router, "cooling").await;
         assert_eq!(
@@ -958,28 +1075,28 @@ async fn the_policys_own_cooldown_overrides_the_groups_default() {
     }
 }
 
-/// Rule 4, the two cooldowns TOGETHER: a deferred execution leaves behind the cooldown the
-/// POLICY states, exactly as one applied at once does — so once the deferral has been applied
-/// a further honoured execution has nothing left to wait for.
+/// Rule 4, the refusal's own invariant: a blocked execution keeps NOTHING back — the
+/// capacity it asked for does not arrive when the cooldown that blocked it runs out, and
+/// only a call the service serves moves the group.
 ///
-/// The group's own `DefaultCooldown` is the short one the deferral waits out, and the policy
-/// states none at all; if the deferred application fell back to the group's default instead of
-/// the policy's own, the second execution below would be deferred too and the capacity it asks
-/// for would not be there when the call answers.
+/// The group's `DefaultCooldown` is short enough for the test to see both sides of it, and
+/// the policy states one of its own of zero so the execution that IS served leaves nothing
+/// behind: if the blocked asks had been kept for later, the capacity below would climb past
+/// the one adjustment the one served execution applies.
 #[tokio::test]
-async fn a_deferred_execution_leaves_the_policys_own_cooldown_behind() {
+async fn a_blocked_execution_keeps_nothing_back_for_later() {
     let (router, _engine) = emulator();
-    create_group(&router, "deferring", (0, 4, 0), Some(1)).await;
+    create_group(&router, "blocked", (0, 4, 0), Some(SHORT_COOLDOWN)).await;
     let mut members = simple_policy("ChangeInCapacity", 1);
     members.push(p("Cooldown", "0"));
-    put_policy(&router, "deferring", "scale-out", &members).await;
+    put_policy(&router, "blocked", "scale-out", &members).await;
 
     // The change that puts the group in its own (short) cooldown.
     let (status, body) = query(
         &router,
         "SetDesiredCapacity",
         &[
-            ("AutoScalingGroupName", "deferring"),
+            ("AutoScalingGroupName", "blocked"),
             ("DesiredCapacity", "1"),
         ],
     )
@@ -989,44 +1106,40 @@ async fn a_deferred_execution_leaves_the_policys_own_cooldown_behind() {
         "the cooldown-starting change expected 200, got {status}: {body}"
     );
 
-    // Honoured while that cooldown runs, so the change falls due at its end.
-    let (status, body) = execute_policy(
-        &router,
-        &[
-            p("AutoScalingGroupName", "deferring"),
-            p("PolicyName", "scale-out"),
-            p("HonorCooldown", "true"),
-        ],
-    )
-    .await;
+    // Asks honouring that cooldown, repeated until one is served: each answer the service
+    // does not serve has to be the cooldown refusal, which the poll loop checks, so nothing
+    // here turns on whether the cooldown is still running at any particular moment. The ask
+    // that IS served is the only one that moves the capacity — by one adjustment, not by one
+    // per ask.
+    let request = vec![
+        p("AutoScalingGroupName", "blocked"),
+        p("PolicyName", "scale-out"),
+        p("HonorCooldown", "true"),
+    ];
+    let (status, body) =
+        execute_until_served("asks honouring a cooldown that runs out", &router, &request).await;
     assert_eq!(
         status, 200,
-        "the deferred ExecutePolicy expected 200, got {status}: {body}"
+        "once the cooldown has run out the same ask must be served, got {status}: {body}"
     );
-    let held = wait_for_desired_capacity(&router, "deferring", "2").await;
+    let held = wait_for_desired_capacity(&router, "blocked", "2").await;
     assert_eq!(
         held, "2",
-        "the deferred change must be applied once the cooldown has elapsed, got {held:?}"
+        "the served execution applies ONE adjustment and the refused asks none, so the group \
+         holds 2: got {held:?}"
     );
 
-    // The policy's own cooldown is what it left behind, so this one is applied at once.
-    let (status, body) = execute_policy(
-        &router,
-        &[
-            p("AutoScalingGroupName", "deferring"),
-            p("PolicyName", "scale-out"),
-            p("HonorCooldown", "true"),
-        ],
-    )
-    .await;
+    // The policy's own cooldown is what the served execution left behind, so a further
+    // honoured ask has nothing blocking it and moves the capacity again.
+    let (status, body) = execute_policy(&router, &request).await;
     assert_eq!(
         status, 200,
         "the following ExecutePolicy expected 200, got {status}: {body}"
     );
-    let held = desired_capacity(&router, "deferring").await;
+    let held = desired_capacity(&router, "blocked").await;
     assert_eq!(
         held, "3",
-        "a deferred execution leaves the policy's own cooldown behind, so the next honoured \
-         execution waits for nothing: expected DesiredCapacity 3, got {held:?}"
+        "a served execution leaves the policy's own cooldown behind, so the next honoured one \
+         is not blocked: expected DesiredCapacity 3, got {held:?}"
     );
 }

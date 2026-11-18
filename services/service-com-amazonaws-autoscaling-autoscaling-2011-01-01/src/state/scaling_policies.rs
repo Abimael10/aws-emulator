@@ -357,6 +357,30 @@ pub const VALID_ADJUSTMENT_TYPES_MESSAGE: &str =
 pub const STEP_ADJUSTMENT_REQUIRED_MESSAGE: &str =
     "You should specify at least one StepAdjustment with a StepScaling policy.";
 
+/// `MinAdjustmentMagnitude` as the model names it, for the sentence that refuses it beside
+/// an adjustment type that reads no percentage.
+pub const MIN_ADJUSTMENT_MAGNITUDE_MEMBER: &str = "MinAdjustmentMagnitude";
+
+/// `MinAdjustmentStep` as the model names it: "Available for backward compatibility. Use
+/// MinAdjustmentMagnitude instead" (`PutScalingPolicyType$MinAdjustmentStep`), so it is
+/// scoped to the same adjustment type and refused by the same sentence.
+pub const MIN_ADJUSTMENT_STEP_MEMBER: &str = "MinAdjustmentStep";
+
+/// The adjustment type a minimum magnitude belongs to: "The minimum value to scale by when
+/// the adjustment type is PercentChangeInCapacity"
+/// (`PutScalingPolicyType$MinAdjustmentMagnitude`) — the one type whose adjustment is a
+/// share of the capacity and so has a magnitude to put a floor under.
+pub const MIN_ADJUSTMENT_ADJUSTMENT_TYPE: &str =
+    super::ADJUSTMENT_TYPE_PERCENT_CHANGE_IN_CAPACITY;
+
+/// The sentence a put pairing a minimum magnitude with another adjustment type is refused
+/// with: the member asked for is its only variable part, and the sentence names the
+/// adjustment type only as "the specified" one — it quotes nothing from the request.
+#[must_use]
+pub fn min_adjustment_not_supported_message(member: &str) -> String {
+    format!("{member} is not supported by the specified adjustment type.")
+}
+
 /// The most step adjustments one scaling policy may carry: the published Amazon EC2 Auto
 /// Scaling quota "Step adjustments per scaling policy", whose value is 20.
 pub const MAX_STEP_ADJUSTMENTS: usize = 20;

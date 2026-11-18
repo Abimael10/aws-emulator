@@ -40,13 +40,14 @@
 //! * `HonorCooldown` — "Indicates whether Amazon EC2 Auto Scaling waits for the cooldown
 //!   period to complete before executing the policy. Valid only if the policy type is
 //!   SimpleScaling" — so a simple policy performed with it while the group is still in the
-//!   cooldown of its last change is WAITED OUT: the capacity change is stored as due at
-//!   that cooldown's own end instant and materialised there
-//!   ([`AutoScalingState::materialize_due`]), exactly as a deferred `SetDesiredCapacity`
-//!   is, rather than being applied at once. A policy of any OTHER type honours no cooldown,
-//!   so the member holds its change back for nothing and is not refused: "valid only if" is
-//!   the same sentence `PutScalingPolicyType$Cooldown` carries, and a member of that class
-//!   is kept by the type that owns it and ignored by the types that do not
+//!   cooldown of its last change is NOT performed: the request is REFUSED with the
+//!   modelled `ScalingActivityInProgressFault`
+//!   ([`PolicyExecutionRefusal::CooldownInProgress`]) and nothing of the group is touched,
+//!   so a policy asked for N times inside one cooldown window moves the capacity once and
+//!   the caller is told each further ask was blocked. A policy of any OTHER type honours no
+//!   cooldown, so the member holds its change back for nothing and is not refused: "valid
+//!   only if" is the same sentence `PutScalingPolicyType$Cooldown` carries, and a member of
+//!   that class is kept by the type that owns it and ignored by the types that do not
 //!   ([`super::scaling_policies::policy_members_of_type`]) rather than refusing the
 //!   request. The members this operation documents as "not supported otherwise" ARE
 //!   refused — that is a different sentence.
@@ -59,7 +60,7 @@
 use std::time::SystemTime;
 
 use super::scaling_policies::{POLICY_TYPE_SIMPLE_SCALING, POLICY_TYPE_STEP_SCALING};
-use super::{AutoScalingState, PendingCapacity, PolicyKey};
+use super::{AutoScalingState, PolicyKey};
 
 /// The policy types a request can perform: the ones whose own configuration states the
 /// adjustment to apply, in the order [`super::scaling_policies::POLICY_TYPES`] lists them.
@@ -128,17 +129,13 @@ pub struct PolicyExecutionRequest {
     pub breach_threshold: Option<f64>,
 }
 
-/// What performing a policy did: the capacity the group moved between, and the instant the
-/// change was deferred to when the cooldown was honoured.
+/// What performing a policy did: the capacity the group moved between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyExecution {
     /// The desired capacity the group held before the policy was performed.
     pub from: i32,
     /// The desired capacity the policy asks for, inside the group's own bounds.
     pub to: i32,
-    /// When the change falls due, for a change that waited for the group's cooldown to
-    /// complete; `None` for one applied straight away.
-    pub deferred_until: Option<SystemTime>,
 }
 
 /// Why a policy could not be performed, for the operation to state the refusal each
@@ -149,9 +146,14 @@ pub enum PolicyExecutionRefusal {
     NoSuchPolicy,
     /// The policy's type states no adjustment to apply; carries that type.
     UnexecutablePolicyType(String),
-    /// A member this policy's type needs is absent; carries the wire path the service
-    /// reports that member under.
-    MemberRequired(&'static str),
+    /// A member this policy's type needs is absent; carries the member as the service names
+    /// it in that refusal, and the policy's type.
+    MemberRequired {
+        /// The member the request left out, as the service names it in the sentence.
+        member: &'static str,
+        /// The type of the policy that needs it.
+        policy_type: String,
+    },
     /// A member this policy's type does not use was supplied; carries the member as the
     /// model names it, and the policy's type.
     MemberNotSupported {
@@ -168,14 +170,18 @@ pub enum PolicyExecutionRefusal {
     /// The group still holds instances from an earlier scaling activity, so the launches
     /// this change needs do not fit beside them yet.
     InstancesStillTerminating,
+    /// The request asked for the group's cooldown to be honoured and the group is still
+    /// inside one, so this execution is blocked by the activity that started it.
+    CooldownInProgress,
 }
 
-/// The wire path `MetricValue` is reported under in a constraint sentence, as
-/// [`super::scaling_policies::COOLDOWN_MEMBER_PATH`] is for a cooldown.
-pub const METRIC_VALUE_MEMBER_PATH: &str = "metricValue";
+/// `MetricValue` as the service names it in the sentence that asks for it on a policy whose
+/// type needs one: the member's own words rather than its wire path, because the rule this
+/// refusal states is the policy TYPE's and not the request shape's.
+pub const METRIC_VALUE_SUBJECT: &str = "Metric value";
 
-/// The wire path `BreachThreshold` is reported under in a constraint sentence.
-pub const BREACH_THRESHOLD_MEMBER_PATH: &str = "breachThreshold";
+/// `BreachThreshold` in the same form, for the same sentence.
+pub const BREACH_THRESHOLD_SUBJECT: &str = "Breach threshold";
 
 /// `MetricValue` as the model names it, for the sentence that refuses it on a policy whose
 /// type does not use it.
@@ -186,13 +192,13 @@ pub const BREACH_THRESHOLD_MEMBER: &str = "BreachThreshold";
 
 /// The refusal of a policy name nothing in the account answers to.
 ///
-/// The service's own absent-resource sentence, in the form that carries the asked-for name
-/// as its detail (`super::absent_group_message_as_name` is the group's): the resource word
-/// is the policy's, the name is the only part taken from the request, and the rest is fixed
-/// text.
+/// The service's own absent-policy sentence: the resource word, then the name asked for,
+/// then that nothing answers to it. The name — "The name or Amazon Resource Name (ARN) of
+/// the policy" (`DeletePolicyType$PolicyName`), taken verbatim from the request — is its
+/// only variable part, and the rest is fixed text.
 #[must_use]
 pub fn absent_policy_message(policy_name: &str) -> String {
-    format!("Policy name not found - {policy_name}")
+    format!("Policy {policy_name} not found")
 }
 
 /// The refusal of a plain policy NAME that more than one Auto Scaling group holds a policy
@@ -219,6 +225,37 @@ pub fn ambiguous_policy_message(policy_name: &str) -> String {
 pub fn not_supported_for_policy_type_message(subject: &str, policy_type: &str) -> String {
     format!("{subject} is not supported for scaling policies of type {policy_type}.")
 }
+
+/// The refusal of the OPERATION for a policy whose type states no adjustment to perform:
+/// the operation is not allowed for a policy of that type at all, which is a different
+/// sentence from a member that type does not take
+/// ([`not_supported_for_policy_type_message`]).
+///
+/// The stored policy's type is its only variable part.
+#[must_use]
+pub fn execute_policy_not_allowed_message(policy_type: &str) -> String {
+    format!("ExecutePolicy is not allowed for policy type {policy_type}")
+}
+
+/// The refusal of a request that leaves out a member the policy's TYPE needs: "Required if
+/// the policy type is StepScaling and not supported otherwise"
+/// (`ExecutePolicyType$MetricValue`, `$BreachThreshold`).
+///
+/// The rule is the policy type's rather than the request shape's — the model declares both
+/// members optional — so the sentence names the member in the service's own words and the
+/// type that requires it, instead of the model-level null-member constraint sentence
+/// ([`super::scaling_policies::member_must_not_be_null_message`]). Both parts are variable:
+/// the member asked for and the type of the stored policy the request named.
+#[must_use]
+pub fn member_required_for_policy_type_message(member: &str, policy_type: &str) -> String {
+    format!("{member} must be specified for policy type {policy_type}")
+}
+
+/// The sentence an execution blocked by the group's running cooldown is refused with: the
+/// scaling activity that started the cooldown is what blocks this one. Entirely fixed text
+/// — it names neither the group, nor the policy, nor the cooldown's length.
+pub const COOLDOWN_IN_PROGRESS_MESSAGE: &str =
+    "Scaling activity is in progress and blocks the execution of this policy";
 
 /// The refusal of a metric value no step of the policy covers: "If you specify a metric
 /// value that doesn't correspond to a step adjustment for the policy, the call returns an
@@ -247,11 +284,12 @@ impl PolicyExecutionRefusal {
         match self {
             Self::NoSuchPolicy => absent_policy_message(policy_name),
             Self::UnexecutablePolicyType(policy_type) => {
-                not_supported_for_policy_type_message("ExecutePolicy", policy_type)
+                execute_policy_not_allowed_message(policy_type)
             }
-            Self::MemberRequired(member_path) => {
-                super::scaling_policies::member_must_not_be_null_message(member_path)
-            }
+            Self::MemberRequired {
+                member,
+                policy_type,
+            } => member_required_for_policy_type_message(member, policy_type),
             Self::MemberNotSupported {
                 member,
                 policy_type,
@@ -261,6 +299,7 @@ impl PolicyExecutionRefusal {
             Self::InstancesStillTerminating => {
                 super::instances_still_terminating_message(group_name)
             }
+            Self::CooldownInProgress => COOLDOWN_IN_PROGRESS_MESSAGE.to_string(),
         }
     }
 }
@@ -383,45 +422,22 @@ impl AutoScalingState {
             return Err(PolicyExecutionRefusal::InstancesStillTerminating);
         }
         let in_cooldown = group.in_cooldown(now);
-        let cooldown_until = group.cooldown_until;
-        let cause = policy_execution_cause(&key.policy_name, from, to);
 
-        // "Valid only if the policy type is SimpleScaling": only a simple policy waits for
-        // the group's cooldown, and only while one is still running — which is the cooldown's
-        // own end instant, the one the change then falls due at.
-        let waits_for = cooldown_until.filter(|_| {
-            request.honor_cooldown && policy_type == POLICY_TYPE_SIMPLE_SCALING && in_cooldown
-        });
-        if let Some(due) = waits_for {
-            if let Some(group) = self.groups.get_mut(&key.auto_scaling_group_name) {
-                group.pending_capacity = Some(PendingCapacity {
-                    desired_capacity: to,
-                    due,
-                    cause,
-                    // The cooldown this execution leaves behind is the POLICY's when it
-                    // carries one, whether the change is applied now or when the deferral
-                    // comes due, so it travels with the deferred change.
-                    cooldown_override: policy.cooldown,
-                });
-            }
-            return Ok(PolicyExecution {
-                from,
-                to,
-                deferred_until: Some(due),
-            });
+        // "Valid only if the policy type is SimpleScaling": only a simple policy honours the
+        // group's cooldown, and a request that asks for it while one is still running is
+        // BLOCKED by the scaling activity that started that cooldown — the change is not
+        // applied now and not kept for later, so nothing of the group is touched.
+        if request.honor_cooldown && policy_type == POLICY_TYPE_SIMPLE_SCALING && in_cooldown {
+            return Err(PolicyExecutionRefusal::CooldownInProgress);
         }
+        let cause = policy_execution_cause(&key.policy_name, from, to);
 
         self.apply_capacity(engine, &key.auto_scaling_group_name, to, &cause, now);
         // The cooldown the change leaves behind is the POLICY's when it carries one, which
         // "overrides the default cooldown period defined for the Auto Scaling group" the
-        // convergence above started — through the one writer of that override, which is also
-        // what applies it to a deferred execution.
+        // convergence above started — through the one writer of that override.
         self.override_cooldown(&key.auto_scaling_group_name, policy.cooldown, now);
-        Ok(PolicyExecution {
-            from,
-            to,
-            deferred_until: None,
-        })
+        Ok(PolicyExecution { from, to })
     }
 }
 
@@ -449,14 +465,16 @@ fn metric_breach(
         return Ok(None);
     }
     let Some(metric_value) = request.metric_value else {
-        return Err(PolicyExecutionRefusal::MemberRequired(
-            METRIC_VALUE_MEMBER_PATH,
-        ));
+        return Err(PolicyExecutionRefusal::MemberRequired {
+            member: METRIC_VALUE_SUBJECT,
+            policy_type: policy_type.to_string(),
+        });
     };
     let Some(breach_threshold) = request.breach_threshold else {
-        return Err(PolicyExecutionRefusal::MemberRequired(
-            BREACH_THRESHOLD_MEMBER_PATH,
-        ));
+        return Err(PolicyExecutionRefusal::MemberRequired {
+            member: BREACH_THRESHOLD_SUBJECT,
+            policy_type: policy_type.to_string(),
+        });
     };
     Ok(Some(MetricBreach {
         metric_value,

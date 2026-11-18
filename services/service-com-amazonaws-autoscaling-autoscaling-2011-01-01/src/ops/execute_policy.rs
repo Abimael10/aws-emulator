@@ -252,42 +252,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.materialize_due(&*self.engine, now);
         let outcome = state.execute_scaling_policy(&*self.engine, &key, request, now);
-        let performed = match outcome {
-            Ok(performed) => performed,
-            Err(refusal) => {
-                let message = refusal.message(&policy_name, &group_name);
-                crate::state::audit(ctx.parts(), Self::NAME, &group_name, "refused");
-                // The one refusal of this operation the model declares an error for: the
-                // group is still taking instances out of service for an earlier change, so
-                // this one cannot be started yet. Every other one is the service's own
-                // `ValidationError` about the request or the policy it names.
-                return Err(match refusal {
-                    execution::PolicyExecutionRefusal::InstancesStillTerminating => {
-                        ExecutePolicyErrorModeled::ScalingActivityInProgressFault(
-                            ScalingActivityInProgressFault {
-                                message: Some(message),
-                            },
-                        )
-                        .into()
-                    }
-                    _ => crate::scaffolded::Scaffolded::validation_error(message),
-                });
-            }
-        };
+        if let Err(refusal) = outcome {
+            let message = refusal.message(&policy_name, &group_name);
+            crate::state::audit(ctx.parts(), Self::NAME, &group_name, "refused");
+            // The refusals of this operation the model declares an error for: the group is
+            // still taking instances out of service for an earlier change, or it is still
+            // inside the cooldown this request asked to be honoured, so this change cannot
+            // be started. Every other one is the service's own `ValidationError` about the
+            // request or the policy it names.
+            return Err(match refusal {
+                execution::PolicyExecutionRefusal::InstancesStillTerminating
+                | execution::PolicyExecutionRefusal::CooldownInProgress => {
+                    ExecutePolicyErrorModeled::ScalingActivityInProgressFault(
+                        ScalingActivityInProgressFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into()
+                }
+                _ => crate::scaffolded::Scaffolded::validation_error(message),
+            });
+        }
         crate::state::audit(
             ctx.parts(),
             Self::NAME,
             &group_name,
-            if performed.deferred_until.is_some() {
-                "capacity change deferred until the cooldown has elapsed"
-            } else {
-                "scaling policy executed"
-            },
+            "scaling policy executed",
         );
 
-        // The instances this change launched or scaled in settle on the clock, as do a
-        // deferred change and the events that report either, with no further call from
-        // anybody. The store's lock is released first: the pump takes it itself.
+        // The instances this change launched or scaled in settle on the clock, as do the
+        // events that report them, with no further call from anybody. The store's lock is
+        // released first: the pump takes it itself.
         drop(state);
         // Those instances are also targets of the target groups the group is attached to, so
         // one launched is registered and one scaled in deregisters.
