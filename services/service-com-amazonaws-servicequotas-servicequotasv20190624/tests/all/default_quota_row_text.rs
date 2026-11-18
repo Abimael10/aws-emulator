@@ -16,7 +16,9 @@
 //!   (`smithy_query(query="shape", shape="ServiceQuota")`: length 0..350, pattern
 //!   `^.{0,350}$`, so one line), and is never empty when present;
 //! * the rows a service publishes read back one by one under their own `QuotaCode`,
-//!   with the members AWS publishes for each.
+//!   with the members AWS publishes for each;
+//! * a published row is a usable KEY — its code resolves both read planes and is taken
+//!   by the increase request — in every Region.
 //!
 //! The harness (`client`, `emulator`, `default_quotas`, `service_inventory`,
 //! `whole_default_catalog`) is the one `quota_workflow.rs` owns.
@@ -59,11 +61,14 @@ struct PublishedRow {
 /// Amazon MSK's published default quotas, as the catalog serves them for `ServiceCode`
 /// `kafka`.
 ///
-/// SOURCE: the recorded `ListAWSDefaultServiceQuotas` response for `kafka`, which
-/// states each row's `QuotaCode`, `QuotaName` and default `Value` and the published
-/// description of the broker quota; `src/state.rs::seed_quota_catalog` is where the
-/// table lives and says which description text is the service's own and which is this
-/// catalog's wording in AWS's form.
+/// SOURCE: the recorded `ListAWSDefaultServiceQuotas` response for `kafka`, which states
+/// each row's `QuotaCode`, `QuotaName`, default `Value` and published `Description`;
+/// `src/state.rs::seed_quota_catalog` is where the table lives.
+///
+/// The rows span what the description rule generalises over: the plane a quota is counted
+/// on (a cluster, a KRaft cluster, an account, a configuration), the default value, and
+/// rows whose wording shares a prefix ("Number of brokers per …") so a row cannot be
+/// matched by its name alone.
 const KAFKA_ROWS: &[PublishedRow] = &[
     PublishedRow {
         service_code: "kafka",
@@ -77,21 +82,44 @@ const KAFKA_ROWS: &[PublishedRow] = &[
         quota_code: "L-B2FDE22A",
         quota_name: "Number of configurations per account",
         value: 100.0,
-        description: "The maximum number of configurations that an account can contain.",
+        description: "The maximum number of custom configurations that can be created per \
+                      account.",
     },
     PublishedRow {
         service_code: "kafka",
         quota_code: "L-36D29E8C",
         quota_name: "Number of revisions per configuration",
         value: 50.0,
-        description: "The maximum number of revisions that a configuration can contain.",
+        description: "The maximum number of revisions that can be made to a custom \
+                      configuration.",
     },
     PublishedRow {
         service_code: "kafka",
         quota_code: "L-8F940D28",
         quota_name: "Number of replicators per account",
         value: 15.0,
-        description: "The maximum number of replicators that an account can contain.",
+        description: "The maximum number of replicators that can be created per account.",
+    },
+    PublishedRow {
+        service_code: "kafka",
+        quota_code: "L-9B45E609",
+        quota_name: "Number of data channels per cluster",
+        value: 50.0,
+        description: "The maximum number of data channels that can be created per cluster.",
+    },
+    PublishedRow {
+        service_code: "kafka",
+        quota_code: "L-03FD6822",
+        quota_name: "Number of brokers per KRaft cluster",
+        value: 60.0,
+        description: "The maximum number of brokers that a KRaft cluster can contain.",
+    },
+    PublishedRow {
+        service_code: "kafka",
+        quota_code: "L-EDD31C36",
+        quota_name: "Number of brokers per account",
+        value: 90.0,
+        description: "The maximum number of brokers that can be created per account.",
     },
 ];
 
@@ -346,15 +374,92 @@ async fn the_msk_catalog_publishes_the_rows_it_cites() {
         );
     }
 
-    // The rows differ in their published default value, so the table spans more than
-    // one shape of row rather than repeating one.
+    // The rows span more than one published default value and more than one counting
+    // plane, so the table is not one shape of row repeated.
     let values: BTreeSet<String> = listed
         .iter()
         .map(|quota| quota["Value"].to_string())
         .collect();
-    assert_eq!(
-        values.len(),
-        KAFKA_ROWS.len(),
-        "case kafka: each cited row carries its own default value, got {values:?}"
+    assert!(
+        values.len() > 1,
+        "case kafka: the cited rows carry more than one published default value, got {values:?}"
     );
+    let names: BTreeSet<&str> = KAFKA_ROWS.iter().map(|row| row.quota_name).collect();
+    assert_eq!(
+        names.len(),
+        KAFKA_ROWS.len(),
+        "case kafka: each cited row names its own quota, got {names:?}"
+    );
+}
+
+/// A published default-quota row is a usable KEY: the code the listing publishes resolves
+/// on both read planes and is accepted by the write that asks for an increase, and the
+/// catalog text it carries is the same wherever it is read.
+///
+/// This is what a client enumerating a service's limits does with the listing, so a row
+/// the catalog omits is a limit no caller can read or ask about. The services span a
+/// catalog of counted resource quotas, one of metered request rates and one keyed
+/// entirely on AWS codes; the rows come off the wire, so they include codes no issue
+/// cited.
+#[tokio::test]
+async fn a_published_row_is_a_usable_key_in_every_region() {
+    let engine = emulator();
+
+    for region in ["us-west-2", "eu-west-1"] {
+        let client = client(&engine, region);
+
+        for service_code in ["kafka", "kms", "access-analyzer"] {
+            let listed = defaults(&client, service_code).await;
+            assert!(
+                !listed.is_empty(),
+                "case {region} {service_code}: the service must publish its default quotas"
+            );
+
+            for row in &listed {
+                let quota_code = row["QuotaCode"].as_str().unwrap_or_else(|| {
+                    panic!("case {region} {service_code}: a row without a code: {row}")
+                });
+                let case = format!("{region} {service_code}/{quota_code}");
+                let pair = json!({"ServiceCode": service_code, "QuotaCode": quota_code});
+
+                let default = client.ok("GetAWSDefaultServiceQuota", pair.clone()).await;
+                assert_eq!(
+                    default["Quota"], *row,
+                    "case {case}: the published code must resolve the listed row, got {default}"
+                );
+
+                let applied = client.ok("GetServiceQuota", pair.clone()).await;
+                assert_eq!(
+                    (
+                        &applied["Quota"]["Description"],
+                        &applied["Quota"]["QuotaName"]
+                    ),
+                    (&row["Description"], &row["QuotaName"]),
+                    "case {case}: the applied plane must report the same catalog text, got \
+                     {applied}"
+                );
+
+                // An adjustable row is also a key the increase request takes, which is
+                // the only way a caller asks for more of that limit.
+                if row["Adjustable"].as_bool() == Some(true) {
+                    let mut body = pair.clone();
+                    body["DesiredValue"] = json!(row["Value"].as_f64().unwrap_or_default() + 1.0);
+                    let requested = client.ok("RequestServiceQuotaIncrease", body).await
+                        ["RequestedQuota"]
+                        .clone();
+                    assert_eq!(
+                        (&requested["QuotaCode"], &requested["ServiceCode"]),
+                        (&row["QuotaCode"], &row["ServiceCode"]),
+                        "case {case}: the request must be recorded against the quota asked for, \
+                         got {requested}"
+                    );
+                    assert_eq!(
+                        requested["Status"],
+                        json!("PENDING"),
+                        "case {case}: a new request is PENDING, got {requested}"
+                    );
+                }
+            }
+        }
+    }
 }

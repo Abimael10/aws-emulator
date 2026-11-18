@@ -3583,33 +3583,42 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             // [`SEED_SERVICE_CATALOG`], which names this code (so this string is only
             // the fallback for a code that table does not carry).
             "Amazon Managed Streaming for Kafka (MSK)",
-            // The rows whose `QuotaCode`, name and default value the recorded
-            // default-quota listing of this service states, each published under AWS's
-            // own code. The rest of the service's published catalog names no code this
-            // catalog can cite for the quota it names (or no value for the quota a code
-            // names, such as the per-cluster data-channel quota), so it is left to the
-            // default-quota-set gap rather than published with a member this catalog
-            // would be inventing.
+            // The rows whose `QuotaCode`, name, default value and `Description` the
+            // recorded default-quota listing of this service states, each published
+            // under AWS's own code and with the service's own published sentence. The
+            // rest of the service's published catalog names no code this catalog can
+            // cite for the quota it names, so it is left to the default-quota-set gap
+            // rather than published with a member this catalog would be inventing.
             vec![
-                // This row's `Description` is the service's own published sentence, as
-                // the recorded listing carries it; the three below publish this
-                // catalog's own wording in the form AWS's quota descriptions take
-                // ("The maximum number of <what the quota counts>."), because the
-                // service's text for them is not among the data available here.
                 quota("Number of brokers per cluster", 30.0)
                     .code("L-FAB9E493")
                     .describe("The maximum number of brokers that a cluster can contain."),
                 quota("Number of configurations per account", 100.0)
                     .code("L-B2FDE22A")
-                    .describe("The maximum number of configurations that an account can contain."),
+                    .describe(
+                        "The maximum number of custom configurations that can be created per \
+                         account.",
+                    ),
                 quota("Number of revisions per configuration", 50.0)
                     .code("L-36D29E8C")
                     .describe(
-                        "The maximum number of revisions that a configuration can contain.",
+                        "The maximum number of revisions that can be made to a custom \
+                         configuration.",
                     ),
                 quota("Number of replicators per account", 15.0)
                     .code("L-8F940D28")
-                    .describe("The maximum number of replicators that an account can contain."),
+                    .describe("The maximum number of replicators that can be created per account."),
+                quota("Number of data channels per cluster", 50.0)
+                    .code("L-9B45E609")
+                    .describe(
+                        "The maximum number of data channels that can be created per cluster.",
+                    ),
+                quota("Number of brokers per KRaft cluster", 60.0)
+                    .code("L-03FD6822")
+                    .describe("The maximum number of brokers that a KRaft cluster can contain."),
+                quota("Number of brokers per account", 90.0)
+                    .code("L-EDD31C36")
+                    .describe("The maximum number of brokers that can be created per account."),
             ],
         ),
         service(
