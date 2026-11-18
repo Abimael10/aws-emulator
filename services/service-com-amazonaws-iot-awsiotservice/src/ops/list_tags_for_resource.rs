@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags of the resource its `resourceArn` names, read from the record of
+//! that resource ([`crate::state::resource_tags`]) — the same field the create that
+//! carried tags and the tagging writes store them in, so this read cannot disagree with
+//! either.
+//!
+//! A pure READ: nothing here writes, so what a later caller sees is what this one saw.
+//! An ARN naming no resource this account holds is SERVED rather than refused — the read
+//! answers the tags held for the ARN presented, and nothing is held for one no resource
+//! answers to, which is what the recorded behaviour of this operation shows — while a
+//! `resourceArn` that addresses no resource of this service's namespace is refused
+//! `InvalidRequestException` (400), before any lookup.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +148,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+
+        // The ARN is resolved BEFORE the store is reached, and so is the continuation
+        // token: a request this listing could not have issued a token for is refused
+        // whatever the account holds.
+        let resource = crate::state::parse_tagged_resource(&input.resource_arn).map_err(
+            |message| -> Self::Error {
+                ListTagsForResourceErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: Some(message),
+                })
+                .into()
+            },
+        )?;
+        if input.next_token.is_some() {
+            // This listing issues NO continuation token: a resource carries at most
+            // `TagMap`'s modelled maximum of tags
+            // (`crate::state::MAX_RESOURCE_TAGS`), the operation models no
+            // `maxResults`, and so every answer is the whole tag set in one page. A
+            // token therefore belongs to no page of this listing, which is a request to
+            // be fixed rather than retried: `InvalidRequestException` ("The request is
+            // not valid", HTTP 400).
+            return Err(
+                ListTagsForResourceErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: Some(
+                        "nextToken is not a continuation token of this listing".to_string(),
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The resource's own tag set, reached through the ONE accessor the tagging
+        // writes use, and nothing here writes through it: a read leaves the record
+        // exactly as the last write left it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // An ARN that names no resource the account holds is NOT refused here, which is
+        // what separates this read from the two writes: a write has a resource to change
+        // and refuses when there is none, while the read answers the tags held for the
+        // ARN it was given and nothing is held for one no resource answers to. The
+        // recorded behaviour of this operation is that answer — the tag read of an ARN
+        // whose resource was never created is SERVED, not refused — so a resource the
+        // account does not hold reports the same empty set a resource carrying no tag
+        // does.
+        let mut store = state.lock();
+        let tags = resource
+            .tag_set_mut(&mut store)
+            .map(|tags| tags.tags())
+            .unwrap_or_default();
+
+        Ok(ListTagsForResourceOutput {
+            // `TagList` carries no length constraint, so a resource carrying no tag is
+            // reported with an EMPTY list rather than an absent member: "this resource
+            // has no tags" is an answer, not a missing one.
+            tags: Some(
+                tags.into_iter()
+                    .map(|(key, value)| Tag { key, value })
+                    .collect(),
+            ),
+            // "The token to use to get the next set of results, or null if there are no
+            // additional results": the whole tag set is this one page, so there are
+            // none.
+            next_token: None,
+        })
     }
 }

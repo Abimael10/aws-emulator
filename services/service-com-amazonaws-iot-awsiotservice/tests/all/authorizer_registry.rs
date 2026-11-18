@@ -39,6 +39,15 @@ use service_com_amazonaws_iot_awsiotservice::state::{
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// The RESOURCE TAGGING plane — `TagResource`, `UntagResource` and `ListTagsForResource`
+/// over the tag set every resource family of this account stores, an authorizer's among
+/// them, which is why it is a child of this suite rather than a second suite beside it.
+/// The `#[path]` is what keeps it one: this crate's `tests/all.rs` declares the suites
+/// directly under `tests/all/`, and a module of a `#[path]`-declared file resolves next to
+/// that file unless it says otherwise.
+#[path = "authorizer_registry/resource_tagging.rs"]
+mod resource_tagging;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds to or MODIFIES the tags of the resource its `resourceArn` names, in the record
+//! of that resource ([`crate::state::resource_tags`]), and reports no members at all;
+//! `ListTagsForResource` reads the tag set back.
+//!
+//! A tag key already on the resource is replaced rather than duplicated, an ARN naming
+//! no resource this account holds is refused `ResourceNotFoundException` (404) with that
+//! resource family's own sentence, a `resourceArn` that addresses no resource of this
+//! service's namespace is refused `InvalidRequestException` (400), and a request that
+//! would leave the resource carrying more than
+//! [`crate::state::MAX_RESOURCE_TAGS`] tags is refused `LimitExceededException` (410)
+//! and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +143,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // WHICH resource the request acts on is read from the ARN alone — this operation
+        // addresses its resource by no other member — and a value that addresses no
+        // resource of this service's namespace is refused BEFORE the store is reached:
+        // such a request has to be fixed rather than retried, which is what separates it
+        // from an ARN that is well formed and names nothing.
+        let resource = crate::state::parse_tagged_resource(&input.resource_arn).map_err(
+            |message| -> Self::Error {
+                TagResourceErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: Some(message),
+                })
+                .into()
+            },
+        )?;
+
+        // `Tag$Key` is `@required` and keys a resource's tag set, so a key the request
+        // repeats keeps the LAST value given for it — collecting into a map keyed by the
+        // key is that rule — and the merge below is then one entry per key.
+        let requested: ::std::collections::BTreeMap<String, Option<String>> = input
+            .tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let mut store = state.lock();
+        let Some(mut tags) = resource.tag_set_mut(&mut store) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(resource.missing_message()),
+                },
+            )
+            .into());
+        };
+
+        // How many tags the resource would then carry is what the limit is about: the
+        // keys it already has plus the new ones the request adds, counted ONCE over the
+        // union because a key the request modifies adds no tag. Past the ceiling the
+        // modelled `LimitExceededException` ("A limit has been exceeded", HTTP 410) is
+        // the answer, and nothing is written — a partially tagged resource would be a
+        // state no single call could produce.
+        let mut keys: ::std::collections::BTreeSet<String> = tags.keys().into_iter().collect();
+        keys.extend(requested.keys().cloned());
+        if keys.len() > crate::state::MAX_RESOURCE_TAGS {
+            return Err(TagResourceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "a resource may carry at most {} tags; this request would leave it \
+                         carrying {}",
+                        crate::state::MAX_RESOURCE_TAGS,
+                        keys.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Adds to or modifies the tags of the given resource": every key the request
+        // carries is written into the resource's own tag set, and every key it does not
+        // name is left exactly as it was.
+        for (key, value) in requested {
+            tags.put(key, value);
+        }
+
+        // `TagResourceResponse` declares no members, so a successful write is an empty
+        // 200 and what it stored is read back through `ListTagsForResource`.
+        Ok(TagResourceOutput {})
     }
 }

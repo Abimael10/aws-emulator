@@ -2360,13 +2360,16 @@ pub struct RegisteredTopicRule {
     /// `None` for a statement that names no topic filter: the pattern is then
     /// unknown, and a reader reports the member as absent rather than inventing one.
     pub topic_pattern: Option<String>,
-    /// The `x-amz-tagging` query string the create request carried, verbatim.
+    /// `Tag$Key` -> `Tag$Value` for the tags the create request carried, keyed by tag
+    /// key for the reason every other family's record is
+    /// ([`RegisteredAuthorizer::tags`]), and read and written from there by the
+    /// resource tagging operations ([`resource_tags`]).
     ///
-    /// `CreateTopicRule$tags` is a raw `key1=value1&key2=value2` string rather than a
-    /// tag list, and no implemented operation reads a rule's tags yet
-    /// (`ListTagsForResource` is its own issue), so it is kept exactly as supplied
-    /// instead of being parsed into a shape nothing consumes.
-    pub tags: Option<String>,
+    /// `CreateTopicRule$tags` carries them as the raw `key1=value1&key2=value2` query
+    /// string rather than as a tag list, which [`tags_of_tag_query`] reads into this
+    /// keyed set, so a rule's tags are ONE value the create and the tagging operations
+    /// share.
+    pub tags: BTreeMap<String, Option<String>>,
 }
 
 impl RegisteredTopicRule {
@@ -2378,7 +2381,7 @@ impl RegisteredTopicRule {
         rule_arn: String,
         created_at: SystemTime,
         payload: TopicRulePayload,
-        tags: Option<String>,
+        tags: BTreeMap<String, Option<String>>,
     ) -> Self {
         let payload_sql = payload.sql;
         Self {
@@ -3203,6 +3206,16 @@ pub use policy_evaluation::{
     evaluate_authorization, iot_action_for_action_type, AuthorizationDecision, PolicyInEffect,
     PolicyReference, AUTH_DECISION_ALLOWED, AUTH_DECISION_EXPLICIT_DENY,
     AUTH_DECISION_IMPLICIT_DENY, CLIENT_ID_CONTEXT_KEY, MAX_AUTHORIZED_RESOURCES,
+};
+
+// WHICH resource of this account a caller-supplied `resourceArn` names, and WHERE that
+// resource's tags live — the one resolution the resource tagging operations
+// (`TagResource`, `UntagResource`, `ListTagsForResource`) share — lives in
+// `state/resource_tags.rs`, beside the records that own those tags. Its names are
+// re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod resource_tags;
+pub use resource_tags::{
+    parse_tagged_resource, tags_of_tag_query, ResourceTagSet, TaggedResource, MAX_RESOURCE_TAGS,
 };
 
 // What a ROLE ALIAS is — the record one holds, the ARN minted for it and what every

@@ -242,7 +242,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rule_arn,
             ::std::time::SystemTime::now(),
             input.topic_rule_payload,
-            input.tags,
+            // `tags` is the raw `key1=value1&key2=value2` query string this operation
+            // takes a rule's tags as, read into the keyed tag set every family stores so
+            // the tagging operations and this create write one value.
+            crate::state::tags_of_tag_query(input.tags.as_deref()),
         );
         store.topic_rules.insert(rule.rule_name.clone(), rule);
 
