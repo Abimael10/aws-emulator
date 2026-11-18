@@ -61,6 +61,7 @@
 pub mod authorization;
 pub mod connector_delivery;
 pub mod home_directory_mappings;
+pub mod identity_provider;
 pub mod vended_log_group;
 pub mod connector_plane;
 pub mod connector_protocol;
@@ -818,12 +819,25 @@ const IDENTITY_PROVIDER_NAMES_NO_ENDPOINT: &str = "The server's IdentityProvider
      names no endpoint for its IdentityProviderType, so there is no identity provider \
      for this test to authenticate against.";
 
-/// `Message` for a test of a server whose identity provider IS named: the test got as
-/// far as the authentication request itself, which is what this emulator does not make.
+/// `Message` for a test of a server whose identity provider IS named, and is an endpoint
+/// OUTSIDE this emulator: an API Gateway REST endpoint or a directory, both customer-run.
+/// The test got as far as the authentication request itself, which is what this emulator
+/// does not make to an endpoint it does not serve.
 const IDENTITY_PROVIDER_NOT_INVOKED: &str = "The stored identity provider \
      configuration is complete, but the authentication request could not be made: this \
      emulator opens no outbound connection and runs no customer identity provider, so \
      the provider returned no response.";
+
+/// `Message` for a test whose authentication request WAS made against a provider this
+/// emulator serves and got no answer back: the function the server names could not be
+/// invoked, or never answered.
+///
+/// Fixed for that condition, like every other text here, and it claims no outcome: a
+/// request that was not answered has no status and no body, so the answer carries
+/// [`IDENTITY_PROVIDER_NO_RESPONSE_STATUS`] and no `Response` beside it.
+pub const IDENTITY_PROVIDER_NO_ANSWER: &str = "The authentication request was made \
+     against the identity provider the server names, and it returned no response: the \
+     function could not be invoked, or did not answer.";
 
 /// The endpoint of the service `server` authenticates its users against, as
 /// `TestIdentityProvider`'s required `Url` reports it ("the endpoint of the service used

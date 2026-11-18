@@ -103,6 +103,14 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # The CloudWatch Logs service, mounted beside this one by the suite that asserts the
 # service-managed log group a server's logging configuration provisions. TEST-ONLY.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# The Lambda service, mounted beside this one by the suites that drive a provider or a
+# workflow step whose function this emulator itself holds: the identity provider a
+# server's `IdentityProviderDetails.Function` names, and the `Target` of a workflow's
+# CUSTOM step. TEST-ONLY.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# Writes the .zip deployment package those suites create their function from — the form
+# `FunctionCode$ZipFile` carries. TEST-ONLY.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

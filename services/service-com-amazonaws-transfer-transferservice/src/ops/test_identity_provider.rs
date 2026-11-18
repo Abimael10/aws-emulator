@@ -12,11 +12,18 @@
 //! Gateway endpoint, a Lambda function, a directory), and this operation's answer is
 //! the OUTCOME of an authentication request against it: the provider's endpoint, the
 //! HTTP status it answered, its response body and a message saying whether the test
-//! succeeded. This emulator opens no outbound connection and runs no customer identity
-//! provider, so no such request is made: the answer reports the endpoint the server is
-//! configured with, `StatusCode`'s modelled default — the value for an answer that
-//! carries no HTTP status (`crate::state::IDENTITY_PROVIDER_NO_RESPONSE_STATUS`) — no
-//! `Response`, as the operation documents for a test that got none, and the message
+//! succeeded.
+//!
+//! One of those provider kinds is served INSIDE this emulator: an `AWS_LAMBDA` server's
+//! `IdentityProviderDetails.Function` names a function the Lambda emulation beside this
+//! service holds, so the authentication request is really made against it over the
+//! in-process callback ([`crate::state::identity_provider`]) and the status that
+//! invocation answered and the payload it returned are what `StatusCode` and `Response`
+//! carry. For a provider endpoint this emulator does NOT serve — an API Gateway REST
+//! endpoint, a directory — no request is made: the answer reports the endpoint the
+//! server is configured with, `StatusCode`'s modelled default — the value for an answer
+//! that carries no HTTP status (`crate::state::IDENTITY_PROVIDER_NO_RESPONSE_STATUS`) —
+//! no `Response`, as the operation documents for a test that got none, and the message
 //! `crate::state::identity_provider_test_message` decides from the stored
 //! configuration. Nothing here claims an outcome for a request nothing sent.
 //!
@@ -193,51 +200,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
-        // This operation reads no request metadata; the engine comes from `self`.
-        let _ = ctx;
         let state = st::service_state(&*self.engine).ok_or_else(|| {
             TestIdentityProviderErrorModeled::InternalServiceError(InternalServiceError {
                 message: "the transfer service state is unavailable".to_string(),
             })
         })?;
 
-        let guard = state.lock();
+        // What the STORED server says about its identity provider, taken out from under
+        // the lock: the authentication request below must not hold it, because the
+        // provider's function is a call into another service of this emulator.
+        let (identity_provider_type, endpoint, no_request_message) = {
+            let guard = state.lock();
 
-        // "If you enter a Server ID for the --server-id parameter that does not
-        // identify an actual Transfer server, you receive the following error: ...
-        // (ResourceNotFoundException) ... Unknown server."
-        let Some(server) = guard.servers.get(&input.server_id) else {
-            return Err(st::not_found(
-                TestIdentityProviderErrorModeled::ResourceNotFoundException(st::unknown_server(
-                    &input.server_id,
-                )),
-            ));
+            // "If you enter a Server ID for the --server-id parameter that does not
+            // identify an actual Transfer server, you receive the following error: ...
+            // (ResourceNotFoundException) ... Unknown server."
+            let Some(server) = guard.servers.get(&input.server_id) else {
+                return Err(st::not_found(
+                    TestIdentityProviderErrorModeled::ResourceNotFoundException(
+                        st::unknown_server(&input.server_id),
+                    ),
+                ));
+            };
+
+            // The gate is the server's IdentityProviderType, and nothing else about the
+            // request: "You cannot use TestIdentityProvider if the IdentityProviderType
+            // of your server is SERVICE_MANAGED" — there is no customer identity
+            // provider to call — so every other member of the request is irrelevant to
+            // this refusal.
+            if !st::is_external_identity_provider(&server.identity_provider_type) {
+                return Err(TestIdentityProviderErrorModeled::InvalidRequestException(
+                    st::not_configured_for_external_auth(&input.server_id),
+                )
+                .into());
+            }
+
+            (
+                server.identity_provider_type.clone(),
+                st::identity_provider_endpoint(server),
+                st::identity_provider_test_message(server),
+            )
         };
 
-        // The gate is the server's IdentityProviderType, and nothing else about the
-        // request: "You cannot use TestIdentityProvider if the IdentityProviderType of
-        // your server is SERVICE_MANAGED" — there is no customer identity provider to
-        // call — so every other member of the request is irrelevant to this refusal.
-        if !st::is_external_identity_provider(&server.identity_provider_type) {
-            return Err(TestIdentityProviderErrorModeled::InvalidRequestException(
-                st::not_configured_for_external_auth(&input.server_id),
-            )
-            .into());
-        }
+        // Past the gate the server delegates authentication to a provider, and what this
+        // operation reports is the OUTCOME of an authentication request against it. The
+        // request is made wherever the provider is one this emulator serves — an
+        // `AWS_LAMBDA` server's function is held by the Lambda emulation beside this
+        // service — and then the status it answered and the body it returned are the
+        // answer (`crate::state::identity_provider`).
+        let answered = st::identity_provider::authenticate(
+            ctx,
+            &st::request_region(ctx.parts()),
+            &identity_provider_type,
+            &endpoint,
+            &st::identity_provider::AuthenticationRequest {
+                server_id: &input.server_id,
+                user_name: &input.user_name,
+                user_password: input.user_password.as_deref(),
+                source_ip: input.source_ip.as_deref(),
+                protocol: input.server_protocol.as_deref(),
+            },
+        )
+        .await;
 
-        // Past the gate the server delegates authentication to a customer-run provider,
-        // and what this operation reports is the outcome of an authentication request
-        // against it. None is made here, so the answer carries the endpoint the server
-        // names, the modelled default status for an answer with no HTTP status in it,
-        // and the message that says why — decided from the STORED configuration alone.
-        Ok(TestIdentityProviderOutput {
-            url: st::identity_provider_endpoint(server),
-            status_code: st::IDENTITY_PROVIDER_NO_RESPONSE_STATUS,
-            // "If you provide any incorrect values for any parameters, the `Response`
-            // field is empty": no provider answered, so there is no response body to
-            // report and none may be invented.
-            response: None,
-            message: Some(st::identity_provider_test_message(server).to_string()),
+        Ok(match answered {
+            Some(answer) => TestIdentityProviderOutput {
+                url: endpoint,
+                status_code: answer.status_code,
+                response: answer.response,
+                message: Some(answer.message),
+            },
+            // The provider is an endpoint OUTSIDE this emulator, so no authentication
+            // request was made: the answer carries the endpoint the server names, the
+            // modelled default status for an answer with no HTTP status in it, and the
+            // message that says why — decided from the STORED configuration alone.
+            None => TestIdentityProviderOutput {
+                url: endpoint,
+                status_code: st::IDENTITY_PROVIDER_NO_RESPONSE_STATUS,
+                // "If you provide any incorrect values for any parameters, the
+                // `Response` field is empty": no provider answered, so there is no
+                // response body to report and none may be invented.
+                response: None,
+                message: Some(no_request_message.to_string()),
+            },
         })
     }
 }

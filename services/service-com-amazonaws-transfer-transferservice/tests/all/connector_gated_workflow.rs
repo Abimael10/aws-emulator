@@ -30,6 +30,11 @@
 //! 4. The execution records rule 3 creates are RELEASED with the workflow they belong
 //!    to: nothing can address a run of a workflow that no longer exists
 //!    ([`deleting_a_workflow_releases_its_executions`]).
+//! 5. Each `CUSTOM` step of the workflow rule 3 starts has its Lambda `Target` really
+//!    INVOKED, with an event carrying that step's own callback token and the run's
+//!    execution details, so the function's own side effects happen and the callback it
+//!    makes with that token is accepted once
+//!    ([`an_upload_invokes_each_custom_steps_function_with_its_callback_token`]).
 //!
 //! The rows differ along what each rule generalises over: which part of the connector's
 //! configuration or of the target is at fault, the form of the remote destination (a path
@@ -39,7 +44,9 @@
 //! Secrets Manager and Amazon S3 are MOUNTED beside the transfer service
 //! ([`Emulator::with_connector_peers`]), because the connector data plane calls them: the
 //! credentials a session authenticates with and the bytes a transfer moves are the real
-//! emulated ones, over the same in-process callback the handlers use.
+//! emulated ones, over the same in-process callback the handlers use. Rule 5 mounts AWS
+//! Lambda with them ([`Emulator::with_connector_peers_and_lambda`]), because a workflow
+//! step's `Target` is a function this emulator holds.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -65,6 +72,9 @@ pub(crate) const FAILED: &str = "FAILED";
 /// `ExecutionStatus` values this suite asserts (the enum is
 /// `[IN_PROGRESS, COMPLETED, EXCEPTION, HANDLING_EXCEPTION]`).
 const IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`IN_PROGRESS`]: the status a run whose every custom step reported `SUCCESS`
+/// reports, named apart from the per-file [`COMPLETED`] of `TransferTableStatus`.
+const EXECUTION_COMPLETED: &str = "COMPLETED";
 
 /// Wait out the span an accepted transfer takes before its outcome is reported,
 /// whatever `src/state.rs` sets it to.
@@ -200,7 +210,26 @@ impl Target {
         home_directory: &str,
         mappings: Value,
     ) -> Self {
-        let emulator = Emulator::with_connector_peers();
+        Self::stand_up_on(
+            Emulator::with_connector_peers(),
+            user_name,
+            home_directory_type,
+            home_directory,
+            mappings,
+        )
+        .await
+    }
+
+    /// Stand the target up on an emulator the caller mounted, for a suite that needs a
+    /// peer beyond the connector data plane's two — the Lambda emulation a workflow
+    /// step's `Target` is held by.
+    pub(crate) async fn stand_up_on(
+        emulator: Emulator,
+        user_name: &str,
+        home_directory_type: &str,
+        home_directory: &str,
+        mappings: Value,
+    ) -> Self {
         let bucket = "transfer-connector-bucket".to_string();
         s3(&emulator)
             .create_bucket()
@@ -1353,4 +1382,419 @@ fn stored_execution_ids(emulator: &Emulator, workflow_id: &str) -> Vec<String> {
         .executions_of(workflow_id)
         .map(|execution| execution.execution_id.clone())
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Rule 5: the CUSTOM step's function is really INVOKED with its callback token.
+// ---------------------------------------------------------------------------
+
+/// The role the step target runs as, and the grants its own calls are judged against:
+/// the object it writes and the callback it makes. Spliced into the policy below.
+const STEP_FUNCTION_ROLE: &str = "arn:aws:iam::000000000000:role/transfer-custom-step";
+
+/// Where the step target records what it was handed: one object per callback token, so
+/// a run's effects are read back through Amazon S3 the way a client reads them.
+const TOKEN_PREFIX: &str = "tokens/";
+
+/// The step target: it writes down the token and the execution details it was handed,
+/// then reports that step's outcome with the SAME token — the documented callback, "you
+/// must include those with their callback as well as providing a status"
+/// (`SendWorkflowStepState`). Both halves are made through the AWS SDK its runtime
+/// supplies, so each is a real call into this emulator.
+const STEP_HANDLER: &str = r#"
+import json
+
+import boto3
+
+S3 = boto3.client("s3")
+TRANSFER = boto3.client("transfer")
+
+
+def lambda_handler(event, context):
+    token = event["token"]
+    details = event["serviceMetadata"]["executionDetails"]
+    S3.put_object(
+        Bucket="{{BUCKET}}",
+        Key="{{PREFIX}}" + token + ".json",
+        Body=json.dumps({
+            "token": token,
+            "workflowId": details["workflowId"],
+            "executionId": details["executionId"],
+            "fileLocation": event.get("fileLocation"),
+            "transferDetails": event["serviceMetadata"].get("transferDetails"),
+        }).encode("utf-8"),
+    )
+    TRANSFER.send_workflow_step_state(
+        WorkflowId=details["workflowId"],
+        ExecutionId=details["executionId"],
+        Token=token,
+        Status="SUCCESS",
+    )
+    return {"reported": token}
+"#;
+
+/// How long the suite waits for the step target's own effects to appear, and how often it
+/// looks. The invocation is another service's work, so this is a client's patience rather
+/// than a span read out of either crate: generous enough that a loaded host cannot decide
+/// the outcome, and bounded so a step that is never invoked fails the suite instead of
+/// hanging it. Nothing is asserted about how long the wait took.
+const STEP_EFFECT_DEADLINE: Duration = Duration::from_secs(120);
+/// See [`STEP_EFFECT_DEADLINE`].
+const STEP_LOOK: Duration = Duration::from_millis(50);
+
+/// What the step target wrote down for one token.
+struct StepEffect {
+    token: String,
+    recorded: Value,
+}
+
+/// RULE: a file that lands on a server whose `WorkflowDetails.OnUpload` names a workflow
+/// does not merely START an execution — each `CUSTOM` step of that workflow has its
+/// Lambda `Target` INVOKED, with an event carrying that step's own callback token and the
+/// `serviceMetadata.executionDetails` of the run, so the function's own side effects
+/// really happen and the callback it makes with that token is accepted exactly once.
+///
+/// That is the whole documented managed-workflow pattern, asserted end to end: the
+/// invocation is observed through the function's OWN effects, read back through Amazon S3
+/// (one object per token), and the run then reports the status its callbacks made due. A
+/// replay of a consumed token is refused with the modelled 404 and leaves
+/// `DescribeExecution` answering exactly as before.
+///
+/// The rows differ along how many `CUSTOM` steps the workflow holds — one, and two, which
+/// is two tokens and two invocations of the same target — and along whether the step
+/// names a `TimeoutSeconds` of its own.
+#[tokio::test]
+async fn an_upload_invokes_each_custom_steps_function_with_its_callback_token() {
+    // (case, how many CUSTOM steps the workflow holds, the step's TimeoutSeconds)
+    let rows: [(&str, usize, Option<i64>); 2] = [
+        ("one CUSTOM step naming a timeout", 1, Some(300)),
+        ("two CUSTOM steps, neither naming a timeout", 2, None),
+    ];
+
+    for (case, steps, timeout_seconds) in rows {
+        let target = Target::stand_up_on(
+            Emulator::with_connector_peers_and_lambda(),
+            DEFAULT_SESSION_USER,
+            "PATH",
+            "",
+            Value::Null,
+        )
+        .await;
+
+        // The step target: a function this emulator holds, running as a role that may
+        // write the object it writes and make the callback it makes.
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:PutObject", "s3:GetObject"],
+                    "Resource": format!("arn:aws:s3:::{}/*", target.bucket),
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": ["transfer:SendWorkflowStepState"],
+                    "Resource": "*",
+                },
+            ],
+        })
+        .to_string();
+        let function_arn = target
+            .emulator
+            .deploy_python_function(
+                "transfer-custom-step",
+                STEP_FUNCTION_ROLE,
+                &policy,
+                &STEP_HANDLER
+                    .replace("{{BUCKET}}", &target.bucket)
+                    .replace("{{PREFIX}}", TOKEN_PREFIX),
+            )
+            .await;
+
+        // The workflow the upload starts, and its attachment to the server.
+        let step = |index: usize| {
+            let mut details = json!({
+                "Name": format!("report-{index}"),
+                "Target": &function_arn,
+                "SourceFileLocation": "${original.file}",
+            });
+            if let Some(seconds) = timeout_seconds {
+                details["TimeoutSeconds"] = json!(seconds);
+            }
+            json!({"Type": "CUSTOM", "CustomStepDetails": details})
+        };
+        let definition: Vec<Value> = (0..steps).map(step).collect();
+        let created = target
+            .emulator
+            .call("CreateWorkflow", json!({"Steps": definition}))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected CreateWorkflow 200, got {} with body {}",
+            created.status, created.body
+        );
+        let workflow_id = created
+            .get("WorkflowId")
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a WorkflowId, got {}", created.body))
+            .to_string();
+        let attached = target
+            .emulator
+            .call(
+                "UpdateServer",
+                json!({
+                    "ServerId": &target.server_id,
+                    "WorkflowDetails": {"OnUpload": [{
+                        "WorkflowId": &workflow_id,
+                        "ExecutionRole": format!("arn:aws:iam::{ACCOUNT}:role/transfer-workflow"),
+                    }]},
+                }),
+            )
+            .await;
+        assert_eq!(
+            attached.status, 200,
+            "case {case:?}: expected UpdateServer 200, got {} with body {}",
+            attached.status, attached.body
+        );
+
+        // The upload: one file carried onto that server through a connector.
+        let secret = target
+            .store_secret(
+                "aws/transfer/partner",
+                &target.user_name,
+                &target.user_key.private,
+            )
+            .await;
+        let connector_id = target
+            .create_connector(
+                case,
+                json!({"UserSecretId": &secret, "TrustedHostKeys": [&target.host_key]}),
+                None,
+            )
+            .await;
+        let source_key = "outbox/trigger.txt";
+        let landing_key = "landing/trigger.txt";
+        target.put_object(source_key, FILE_BODY).await;
+        let accepted = target
+            .emulator
+            .call(
+                "StartFileTransfer",
+                json!({
+                    "ConnectorId": &connector_id,
+                    "SendFilePaths": [format!("/{}/{source_key}", target.bucket)],
+                    "RemoteDirectoryPath": format!("/{}/landing", target.bucket),
+                }),
+            )
+            .await;
+        assert_eq!(
+            accepted.status, 200,
+            "case {case:?}: expected StartFileTransfer 200, got {} with body {}",
+            accepted.status, accepted.body
+        );
+
+        // The step target's OWN effects: one object per callback token, which only a
+        // function that really ran can have written.
+        let effects = step_effects(&target, case, steps).await;
+
+        // ONE execution of the attached workflow, whose id every invocation was handed.
+        let listed = target
+            .emulator
+            .call("ListExecutions", json!({"WorkflowId": &workflow_id}))
+            .await;
+        let executions = listed.get("Executions").as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            executions.len(),
+            1,
+            "case {case:?}: expected the delivered file to start one execution, got {}",
+            listed.body
+        );
+        let execution_id = member_of(&executions[0], "ExecutionId")
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected an ExecutionId, got {}", listed.body))
+            .to_string();
+
+        for effect in &effects {
+            let recorded = &effect.recorded;
+            assert_eq!(
+                member_of(recorded, "workflowId").as_str(),
+                Some(workflow_id.as_str()),
+                "case {case:?}: expected the event to name the workflow that ran, got {recorded}"
+            );
+            assert_eq!(
+                member_of(recorded, "executionId").as_str(),
+                Some(execution_id.as_str()),
+                "case {case:?}: expected the event to name the execution that ran, got {recorded}"
+            );
+            let location = member_of(recorded, "fileLocation").clone();
+            assert_eq!(
+                (
+                    member_of(&location, "bucket").as_str(),
+                    member_of(&location, "key").as_str(),
+                ),
+                (Some(target.bucket.as_str()), Some(landing_key)),
+                "case {case:?}: expected the event to name the file that landed, got {recorded}"
+            );
+            let session = member_of(recorded, "transferDetails").clone();
+            assert_eq!(
+                (
+                    member_of(&session, "serverId").as_str(),
+                    member_of(&session, "userName").as_str(),
+                ),
+                (
+                    Some(target.server_id.as_str()),
+                    Some(target.user_name.as_str()),
+                ),
+                "case {case:?}: expected the event to carry the session the file arrived on, \
+                 got {recorded}"
+            );
+        }
+
+        // Every token the steps were handed reported SUCCESS from inside the function,
+        // so the run has nothing left to wait for.
+        let settled = poll_execution_status(&target, case, &workflow_id, &execution_id).await;
+        assert_eq!(
+            settled, EXECUTION_COMPLETED,
+            "case {case:?}: expected the run whose every custom step reported SUCCESS to be \
+             {EXECUTION_COMPLETED}, got {settled:?}"
+        );
+
+        // A REPLAY of a consumed token addresses no running execution, and changes
+        // nothing a reader sees.
+        let before = target.describe_execution(&workflow_id, &execution_id).await;
+        let replay = target
+            .callback(&workflow_id, &execution_id, &effects[0].token, "SUCCESS")
+            .await;
+        assert_eq!(
+            (replay.status, replay.error_code().as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected the replayed token to be refused 404 \
+             ResourceNotFoundException, got {} with body {}",
+            replay.status,
+            replay.body
+        );
+        assert_eq!(
+            member_of(&replay.body, "Message").as_str(),
+            Some(st::NOT_FOUND_EXECUTION.message),
+            "case {case:?}: expected the fixed execution not-found message, got {}",
+            replay.body
+        );
+        let after = target.describe_execution(&workflow_id, &execution_id).await;
+        assert_eq!(
+            (before.status, &before.body),
+            (after.status, &after.body),
+            "case {case:?}: expected DescribeExecution to answer identically before and after \
+             the replay, got {} {} then {} {}",
+            before.status,
+            before.body,
+            after.status,
+            after.body
+        );
+    }
+}
+
+/// Wait until the step target has recorded `expected` tokens and answer what it wrote for
+/// each, in key order.
+///
+/// The wait is on the CONDITION — the objects the function writes — looked for through
+/// Amazon S3's own listing, so a step that is never invoked fails here with what the
+/// bucket was still holding.
+async fn step_effects(target: &Target, case: &str, expected: usize) -> Vec<StepEffect> {
+    let started = std::time::Instant::now();
+    let mut keys: Vec<String> = Vec::new();
+    while started.elapsed() < STEP_EFFECT_DEADLINE {
+        let listed = s3(&target.emulator)
+            .list_objects_v2()
+            .bucket(&target.bucket)
+            .prefix(TOKEN_PREFIX)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case {case:?}: the emulated S3 must list the bucket, got {}",
+                    aws_smithy_types::error::display::DisplayErrorContext(&error)
+                )
+            });
+        keys = listed
+            .contents()
+            .iter()
+            .filter_map(|object| object.key().map(str::to_string))
+            .collect();
+        keys.sort();
+        if keys.len() >= expected {
+            break;
+        }
+        tokio::time::sleep(STEP_LOOK).await;
+    }
+    assert_eq!(
+        keys.len(),
+        expected,
+        "case {case:?}: expected the upload to invoke each CUSTOM step's function with its \
+         own callback token, so {expected} object(s) under {TOKEN_PREFIX:?}; the bucket holds \
+         {keys:?}"
+    );
+
+    let mut effects = Vec::new();
+    for key in keys {
+        let body = target
+            .object(&key)
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: expected the object {key:?} to be readable"));
+        let recorded: Value = serde_json::from_slice(&body).unwrap_or_else(|error| {
+            panic!(
+                "case {case:?}: expected the step's own JSON record at {key:?}, got {error} for \
+                 {:?}",
+                String::from_utf8_lossy(&body)
+            )
+        });
+        let token = member_of(&recorded, "token")
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected the token at {key:?}, got {recorded}"))
+            .to_string();
+        assert_eq!(
+            key,
+            format!("{TOKEN_PREFIX}{token}.json"),
+            "case {case:?}: expected each record to be named after the token it carries"
+        );
+        effects.push(StepEffect { token, recorded });
+    }
+    effects
+}
+
+/// The `Status` the run reports, once it reports a terminal one.
+async fn poll_execution_status(
+    target: &Target,
+    case: &str,
+    workflow_id: &str,
+    execution_id: &str,
+) -> String {
+    let started = std::time::Instant::now();
+    let mut reported = String::new();
+    while started.elapsed() < STEP_EFFECT_DEADLINE {
+        let listed = target
+            .emulator
+            .call("ListExecutions", json!({"WorkflowId": workflow_id}))
+            .await;
+        reported = listed
+            .get("Executions")
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|execution| member_of(execution, "ExecutionId").as_str() == Some(execution_id))
+            .map(|execution| {
+                member_of(execution, "Status")
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .unwrap_or_default();
+        if reported != IN_PROGRESS {
+            break;
+        }
+        tokio::time::sleep(STEP_LOOK).await;
+    }
+    assert!(
+        !reported.is_empty(),
+        "case {case:?}: expected the run to be listed, got nothing for {execution_id}"
+    );
+    reported
 }

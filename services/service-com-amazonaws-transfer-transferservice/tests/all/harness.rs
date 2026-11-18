@@ -136,6 +136,11 @@ pub(crate) enum Peer {
     /// CloudWatch Logs, which `CreateServer` / `UpdateServer` call to provision the
     /// service-managed log group a server configured with a `LoggingRole` publishes to.
     Logs,
+    /// AWS Lambda, which holds the functions this service INVOKES over the in-process
+    /// callback: the identity provider an `AWS_LAMBDA` server's
+    /// `IdentityProviderDetails.Function` names, and the `Target` of a workflow's
+    /// `CUSTOM` step.
+    Lambda,
 }
 
 /// One HTTP answer, decoded.
@@ -222,6 +227,21 @@ impl Emulator {
         Self::mounting(&[Peer::Logs])
     }
 
+    /// One emulator that also mounts AWS Lambda: a suite that drives a provider or a
+    /// workflow step whose function this emulator holds needs the real Lambda emulation
+    /// beside this service, because that is what the handlers invoke.
+    pub(crate) fn with_lambda() -> Self {
+        Self::mounting(&[Peer::Lambda])
+    }
+
+    /// One emulator mounting the connector data plane's peers AND Lambda: the connector
+    /// delivery reads its secret and moves its bytes through the first two, and the
+    /// workflow a delivered file starts invokes its `CUSTOM` step's function through the
+    /// third.
+    pub(crate) fn with_connector_peers_and_lambda() -> Self {
+        Self::mounting(&[Peer::SecretsManager, Peer::S3, Peer::Lambda])
+    }
+
     /// The transfer service, plus each `peers` entry, over ONE shared engine.
     fn mounting(peers: &[Peer]) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -252,6 +272,13 @@ impl Emulator {
                 Peer::Logs => {
                     router.register_service(
                         service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(
+                            Arc::clone(&engine),
+                        ),
+                    );
+                }
+                Peer::Lambda => {
+                    router.register_service(
+                        service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(
                             Arc::clone(&engine),
                         ),
                     );
@@ -909,6 +936,152 @@ pub(crate) fn unix_seconds(at: std::time::SystemTime) -> f64 {
     at.duration_since(std::time::SystemTime::UNIX_EPOCH)
         .expect("the test clock is past the Unix epoch")
         .as_secs_f64()
+}
+
+// ---------------------------------------------------------------------------
+// The Lambda functions this service invokes, as a suite deploys them
+// ---------------------------------------------------------------------------
+
+/// The runtime and the handler attribute every function a suite of this crate deploys
+/// is created with: `Runtime` names the managed runtime that runs the package, and
+/// `Handler` is "the name of the method within your code that Lambda calls", which for a
+/// python package is `<module>.<function>`.
+pub(crate) const PYTHON_RUNTIME: &str = "python3.12";
+pub(crate) const PYTHON_HANDLER: &str = "lambda_function.lambda_handler";
+
+/// How long a suite waits for AWS Lambda to report a created function `Active`, and how
+/// often it looks.
+///
+/// The span is ANOTHER service's, so this is a client's patience rather than a span read
+/// out of either crate: generous enough that a loaded host cannot decide the outcome,
+/// and bounded so a function that never provisions fails the suite instead of hanging
+/// it. Nothing is asserted about how long the wait took.
+const FUNCTION_ACTIVE_DEADLINE: Duration = Duration::from_secs(120);
+/// See [`FUNCTION_ACTIVE_DEADLINE`].
+const FUNCTION_LOOK: Duration = Duration::from_millis(50);
+
+/// The `State` an invocation needs the function to be in ("`Active`: the function is
+/// ready to be invoked").
+const FUNCTION_STATE_ACTIVE: &str = "Active";
+
+/// A .zip deployment package holding `source` as the module [`PYTHON_HANDLER`] names,
+/// written in memory the way a caller uploads one through `FunctionCode$ZipFile`.
+pub(crate) fn python_package(source: &str) -> Vec<u8> {
+    use std::io::Write as _;
+
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+        let module = PYTHON_HANDLER
+            .split_once('.')
+            .map(|(module, _)| module)
+            .expect("the handler names a module and a function");
+        writer
+            .start_file(format!("{module}.py"), options)
+            .expect("the package entry starts");
+        writer
+            .write_all(source.as_bytes())
+            .expect("the package entry takes the handler's source");
+        writer.finish().expect("a finished archive");
+    }
+    buffer.into_inner()
+}
+
+impl Emulator {
+    /// A Lambda client over this emulator's own in-process callback — the same seam the
+    /// handlers invoke a function over, so a function a suite creates through it is the
+    /// one they reach.
+    pub(crate) fn lambda(&self) -> aws_sdk_lambda::Client {
+        let callback = self.callback();
+        let config = aws_sdk_lambda::Config::builder()
+            .behavior_version(aws_sdk_lambda::config::BehaviorVersion::latest())
+            .region(aws_sdk_lambda::config::Region::new(REGION))
+            .endpoint_url(format!("https://lambda.{REGION}.amazonaws.com"))
+            .credentials_provider(callback.aws_credentials_provider())
+            .http_client(callback.http_client())
+            .retry_config(aws_sdk_lambda::config::retry::RetryConfig::disabled())
+            .timeout_config(aws_sdk_lambda::config::timeout::TimeoutConfig::disabled())
+            .identity_cache(aws_sdk_lambda::config::IdentityCache::no_cache())
+            .stalled_stream_protection(
+                aws_sdk_lambda::config::StalledStreamProtectionConfig::disabled(),
+            )
+            .build();
+        aws_sdk_lambda::Client::from_conf(config)
+    }
+
+    /// Deploy `source` as a python function named `function_name`, running as the role
+    /// `role_arn` — seeded into the account's IAM store with `role_policy`, the grants
+    /// its own SDK calls are judged against — wait until Lambda reports it `Active`, and
+    /// answer the `FunctionArn` that service published for it.
+    ///
+    /// The function is a real one of the Lambda emulation mounted beside this service
+    /// ([`Peer::Lambda`]), so what a transfer handler invokes is a function that runs.
+    pub(crate) async fn deploy_python_function(
+        &self,
+        function_name: &str,
+        role_arn: &str,
+        role_policy: &str,
+        source: &str,
+    ) -> String {
+        self.seed_role(role_arn, role_policy);
+        let lambda = self.lambda();
+        let created = lambda
+            .create_function()
+            .function_name(function_name)
+            .runtime(aws_sdk_lambda::types::Runtime::from(PYTHON_RUNTIME))
+            .role(role_arn)
+            .handler(PYTHON_HANDLER)
+            .code(
+                aws_sdk_lambda::types::FunctionCode::builder()
+                    .zip_file(aws_sdk_lambda::primitives::Blob::new(python_package(source)))
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "setup: CreateFunction({function_name:?}) must succeed, got {}",
+                    aws_smithy_types::error::display::DisplayErrorContext(&error)
+                )
+            });
+        let function_arn = created
+            .function_arn()
+            .unwrap_or_else(|| panic!("setup: Lambda must publish an ARN for {function_name:?}"))
+            .to_string();
+
+        // An invocation needs the function `Active`, which the clock owes: waited for by
+        // LOOKING at what Lambda reports rather than by sleeping a span of this suite's
+        // own choosing.
+        let started = std::time::Instant::now();
+        let mut last = String::new();
+        while started.elapsed() < FUNCTION_ACTIVE_DEADLINE {
+            let read = lambda
+                .get_function()
+                .function_name(function_name)
+                .send()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "setup: GetFunction({function_name:?}) must succeed, got {}",
+                        aws_smithy_types::error::display::DisplayErrorContext(&error)
+                    )
+                });
+            last = read
+                .configuration()
+                .and_then(|configuration| configuration.state())
+                .map(|state| state.as_str().to_string())
+                .unwrap_or_default();
+            if last == FUNCTION_STATE_ACTIVE {
+                return function_arn;
+            }
+            tokio::time::sleep(FUNCTION_LOOK).await;
+        }
+        panic!(
+            "setup: Lambda must report {function_name:?} {FUNCTION_STATE_ACTIVE}, last reported \
+             {last:?}"
+        )
+    }
 }
 
 /// Re-read one stage of a flow until `probe` reports it settled, and answer what it

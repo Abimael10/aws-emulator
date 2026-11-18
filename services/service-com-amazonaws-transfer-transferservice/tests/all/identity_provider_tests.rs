@@ -2,7 +2,7 @@
 
 //! What `TestIdentityProvider` answers for a stored server.
 //!
-//! Two rules:
+//! Three rules:
 //!
 //! 1. The gate is the SERVER's `IdentityProviderType` and nothing else about the request:
 //!    a server that delegates authentication to nothing — Transfer's own
@@ -16,16 +16,25 @@
 //!    through; the `StatusCode` is "the HTTP status code that is the response from your
 //!    API Gateway or your Lambda function", which is the member's modelled default `0`
 //!    when no response came back; no `Response` is reported, as the operation documents
-//!    for a test that got none; and the `Message` says why the test did not succeed. The
-//!    emulator opens no outbound connection and runs no customer identity provider, so
-//!    nothing here reports a status for a request nothing sent.
+//!    for a test that got none; and the `Message` says why no outcome came back. That is
+//!    the answer for a provider endpoint this emulator does not serve — an API Gateway
+//!    REST endpoint, a directory — and for a Lambda provider whose function nothing
+//!    answered for.
+//! 3. For the one provider kind this emulator DOES serve — an `AWS_LAMBDA` server whose
+//!    `IdentityProviderDetails.Function` names a function the Lambda emulation holds —
+//!    the authentication request is really made, with the documented authentication
+//!    event, and the answer carries that invocation's own HTTP status and the provider's
+//!    own response body
+//!    ([`testing_a_lambda_backed_provider_reports_what_the_function_answered`]).
 //!
 //! The rows differ along what the rules generalise over: the `IdentityProviderType`
 //! (each of the three external ones, and the service-managed one), whether the details
-//! name the provider's endpoint at all, and the request members the gate ignores
-//! (`ServerProtocol`, `SourceIp`, `UserPassword`).
+//! name the provider's endpoint at all, the request members the gate ignores
+//! (`ServerProtocol`, `SourceIp`, `UserPassword`) — which for an invoked provider are the
+//! members the event carries — and whether the provider answers, fails or is absent.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_transfer_transferservice::state as st;
 
 use crate::harness::{member_of, Emulator};
 
@@ -282,5 +291,294 @@ async fn a_test_leaves_the_server_as_it_found_it() {
         member_of(&before, "IdentityProviderDetails"),
         member_of(&after, "IdentityProviderDetails"),
         "expected a test to leave the server's identity provider untouched, got {after}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The provider this emulator SERVES: a Lambda function it holds
+// ---------------------------------------------------------------------------
+
+/// The role the provider's function runs as, and the role its handler hands back as the
+/// user's `Role` — so the `Response` the test reports can be compared with what the
+/// function returned. Spliced into the handler's source in place of `{{ROLE}}`, so the
+/// one value is written once.
+const PROVIDER_ROLE: &str = "arn:aws:iam::000000000000:role/transfer-idp-function";
+
+/// A policy granting nothing: the provider's handler makes no call of its own, so what it
+/// may do decides nothing here.
+const NO_GRANTS: &str = r#"{"Version":"2012-10-17","Statement":[]}"#;
+
+/// The identity provider's handler: it answers the documented authentication answer — a
+/// `Role` for the user, the `HomeDirectory` it is given and an empty `Policy` — and
+/// reports back WHICH members of the documented authentication event it was handed, so a
+/// row can assert the request really reached it. The password itself is never echoed:
+/// that it was offered at all is what the event's shape is asserted on.
+const PROVIDER_HANDLER: &str = r#"
+def lambda_handler(event, context):
+    return {
+        "Role": "{{ROLE}}",
+        "HomeDirectory": "/home/" + event["username"],
+        "Policy": "",
+        "observed": {
+            "serverId": event.get("serverId"),
+            "protocol": event.get("protocol"),
+            "sourceIp": event.get("sourceIp"),
+            "passwordOffered": "password" in event,
+            "members": sorted(event.keys()),
+        },
+    }
+"#;
+
+/// A provider handler that FAILS: a function that raises returns no authentication
+/// answer, and Lambda reports that on the invocation itself.
+const FAILING_HANDLER: &str = r#"
+def lambda_handler(event, context):
+    raise RuntimeError("the provider rejected this authentication")
+"#;
+
+/// The HTTP status a synchronous invocation that ran answers with ("for the
+/// RequestResponse invocation type, this status code is 200", Lambda's `Invoke`).
+const INVOKED_STATUS: i64 = 200;
+
+/// One row of the invocation table: the request members the test sends, beside what the
+/// provider must have been handed.
+struct Invoked {
+    case: &'static str,
+    /// The `TestIdentityProvider` members beyond `ServerId`.
+    request: fn() -> Value,
+    user_name: &'static str,
+    protocol: Value,
+    source_ip: Value,
+    password_offered: bool,
+}
+
+/// RULE: a server whose identity provider is one this emulator itself serves — an
+/// `AWS_LAMBDA` server whose `IdentityProviderDetails.Function` names a function the
+/// Lambda emulation holds — has the authentication request REALLY made against that
+/// provider, with the documented authentication event, and the answer reports that
+/// invocation's own outcome: `StatusCode` is the HTTP status it answered and `Response`
+/// is the provider's response body verbatim.
+///
+/// The rows differ along what the rule generalises over: the user name authenticated,
+/// which of the optional request members are sent (`ServerProtocol`, `SourceIp`,
+/// `UserPassword`) and which protocol is named — each of which travels in the event and
+/// comes back inside the provider's own body.
+#[tokio::test]
+async fn testing_a_lambda_backed_provider_reports_what_the_function_answered() {
+    let emulator = Emulator::with_lambda();
+    let function_arn = emulator
+        .deploy_python_function(
+            "transfer-idp-probe",
+            PROVIDER_ROLE,
+            NO_GRANTS,
+            &PROVIDER_HANDLER.replace("{{ROLE}}", PROVIDER_ROLE),
+        )
+        .await;
+    let server_id = emulator
+        .create_server(json!({
+            "Protocols": ["SFTP"],
+            "Domain": "S3",
+            "EndpointType": "PUBLIC",
+            "IdentityProviderType": "AWS_LAMBDA",
+            "IdentityProviderDetails": {"Function": &function_arn},
+        }))
+        .await;
+
+    let rows: &[Invoked] = &[
+        Invoked {
+            case: "the required members alone",
+            request: || json!({}),
+            user_name: USER,
+            protocol: Value::Null,
+            source_ip: Value::Null,
+            password_offered: false,
+        },
+        Invoked {
+            case: "a password and the SFTP protocol",
+            request: || {
+                json!({"UserPassword": "not-a-real-password", "ServerProtocol": "SFTP"})
+            },
+            user_name: USER,
+            protocol: json!("SFTP"),
+            source_ip: Value::Null,
+            password_offered: true,
+        },
+        Invoked {
+            case: "another user, a source IP and the FTP protocol",
+            request: || json!({"SourceIp": "10.0.0.1", "ServerProtocol": "FTP"}),
+            user_name: "other_user",
+            protocol: json!("FTP"),
+            source_ip: json!("10.0.0.1"),
+            password_offered: false,
+        },
+        Invoked {
+            case: "an IPv6 source address and the AS2 protocol",
+            request: || {
+                json!({"SourceIp": "2001:db8::1", "ServerProtocol": "AS2",
+                       "UserPassword": "not-a-real-password"})
+            },
+            user_name: "partner.account",
+            protocol: json!("AS2"),
+            source_ip: json!("2001:db8::1"),
+            password_offered: true,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let mut request = json!({"ServerId": &server_id, "UserName": row.user_name});
+        for (member, value) in (row.request)()
+            .as_object()
+            .expect("the row's request is an object")
+        {
+            request[member] = value.clone();
+        }
+        let answer = emulator.call("TestIdentityProvider", request).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected TestIdentityProvider 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.get("StatusCode").as_i64(),
+            Some(INVOKED_STATUS),
+            "case {case:?}: expected the status the provider's invocation answered, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.get("Url").as_str(),
+            Some(function_arn.as_str()),
+            "case {case:?}: expected the endpoint the server names, got {}",
+            answer.body
+        );
+        let response = answer
+            .get("Response")
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the provider's own response body, got {}",
+                    answer.body
+                )
+            })
+            .to_string();
+        let returned: Value = serde_json::from_str(&response).unwrap_or_else(|error| {
+            panic!("case {case:?}: expected the provider's JSON body, got {error} for {response:?}")
+        });
+        assert_eq!(
+            member_of(&returned, "Role").as_str(),
+            Some(PROVIDER_ROLE),
+            "case {case:?}: expected the Role the provider returned, got {returned}"
+        );
+        assert_eq!(
+            member_of(&returned, "HomeDirectory").as_str(),
+            Some(format!("/home/{}", row.user_name).as_str()),
+            "case {case:?}: expected the home directory the provider computed for the user \
+             it was handed, got {returned}"
+        );
+        // The event the provider was handed carried the request's own members.
+        let observed = member_of(&returned, "observed").clone();
+        assert_eq!(
+            member_of(&observed, "serverId").as_str(),
+            Some(server_id.as_str()),
+            "case {case:?}: expected the event to name the server tested, got {observed}"
+        );
+        assert_eq!(
+            member_of(&observed, "protocol"),
+            &row.protocol,
+            "case {case:?}: expected the event to carry the protocol the request named, got \
+             {observed}"
+        );
+        assert_eq!(
+            member_of(&observed, "sourceIp"),
+            &row.source_ip,
+            "case {case:?}: expected the event to carry the source address the request named, \
+             got {observed}"
+        );
+        assert_eq!(
+            member_of(&observed, "passwordOffered").as_bool(),
+            Some(row.password_offered),
+            "case {case:?}: expected the password the request offered to reach the provider, \
+             got {observed}"
+        );
+    }
+}
+
+/// RULE (the same one, where the provider itself fails or is absent): the answer stays
+/// the INVOCATION's own outcome — a provider that ran and reported an error answers with
+/// that invocation's status, its error document as the `Response` and the error it
+/// reported as the `Message`, while a function the Lambda emulation does not hold leaves
+/// the authentication request unanswered, which is the no-status answer with no
+/// `Response` at all.
+#[tokio::test]
+async fn a_provider_that_fails_or_is_absent_reports_the_invocations_own_outcome() {
+    let emulator = Emulator::with_lambda();
+    let failing = emulator
+        .deploy_python_function(
+            "transfer-idp-failing",
+            PROVIDER_ROLE,
+            NO_GRANTS,
+            FAILING_HANDLER,
+        )
+        .await;
+
+    let case = "a provider whose function raises";
+    let server_id = emulator
+        .create_server(json!({"IdentityProviderType": "AWS_LAMBDA",
+                              "IdentityProviderDetails": {"Function": &failing}}))
+        .await;
+    let answer = emulator
+        .call(
+            "TestIdentityProvider",
+            json!({"ServerId": &server_id, "UserName": USER, "ServerProtocol": "SFTP"}),
+        )
+        .await;
+    assert_eq!(
+        (answer.status, answer.get("StatusCode").as_i64()),
+        (200, Some(INVOKED_STATUS)),
+        "case {case:?}: expected the status the invocation answered, got {} with body {}",
+        answer.status,
+        answer.body
+    );
+    let response = answer.get("Response").as_str().unwrap_or_default().to_string();
+    assert!(
+        response.contains("errorMessage"),
+        "case {case:?}: expected the error document the provider returned, got {response:?}"
+    );
+    assert!(
+        !answer.get("Message").as_str().unwrap_or_default().is_empty(),
+        "case {case:?}: expected the error the provider reported, got {}",
+        answer.body
+    );
+
+    // A function the Lambda emulation does not hold: the request was made and nothing
+    // answered it, so there is no status and no body to report.
+    let case = "a provider naming a function that does not exist";
+    let absent = emulator
+        .create_server(json!({"IdentityProviderType": "AWS_LAMBDA",
+                              "IdentityProviderDetails": {"Function": FUNCTION}}))
+        .await;
+    let answer = emulator
+        .call(
+            "TestIdentityProvider",
+            json!({"ServerId": &absent, "UserName": USER}),
+        )
+        .await;
+    assert_eq!(
+        (answer.status, answer.get("StatusCode").as_i64()),
+        (200, Some(NO_RESPONSE_STATUS)),
+        "case {case:?}: expected the no-status answer, got {} with body {}",
+        answer.status,
+        answer.body
+    );
+    assert!(
+        answer.get("Response").is_null(),
+        "case {case:?}: expected no Response for a request nothing answered, got {}",
+        answer.body
+    );
+    assert_eq!(
+        answer.get("Message").as_str(),
+        Some(st::IDENTITY_PROVIDER_NO_ANSWER),
+        "case {case:?}: expected the fixed text for an unanswered request, got {}",
+        answer.body
     );
 }
