@@ -24,6 +24,9 @@
 //! SQL workgroup, one named by a single character, one named by the longest name the model
 //! admits, and the account's own default workgroup), so a sentence that must not vary with
 //! the request is seen not to; for rule 2, along the shape of the id that names no notebook.
+//!
+//! Both rules span every notebook operation that states them, the two readers of a
+//! workgroup's notebook files included.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
@@ -147,6 +150,11 @@ async fn a_non_spark_workgroup_is_refused_with_the_fixed_engine_version_sentence
             "StartSession",
             json!({ "WorkGroup": work_group, "EngineConfiguration": {} }),
         ));
+        rows.push((
+            format!("ListNotebookMetadata of the {kind}"),
+            "ListNotebookMetadata",
+            json!({ "WorkGroup": work_group }),
+        ));
     }
 
     let mut sentences: Vec<String> = Vec::new();
@@ -217,6 +225,7 @@ async fn a_notebook_id_that_names_no_notebook_is_refused_with_the_not_found_clas
         // that resolves ONE `NotebookId`.
         let requests: Vec<(&str, Value)> = vec![
             ("ExportNotebook", json!({ "NotebookId": id })),
+            ("GetNotebookMetadata", json!({ "NotebookId": id })),
             ("ListNotebookSessions", json!({ "NotebookId": id })),
             (
                 "StartSession",
@@ -256,6 +265,21 @@ async fn a_notebook_id_that_names_no_notebook_is_refused_with_the_not_found_clas
         exported["Payload"].as_str(),
         Some("{}"),
         "the held notebook's content must be unchanged, got {exported:?}"
+    );
+    let (status, read) = call(
+        &router,
+        "GetNotebookMetadata",
+        &json!({ "NotebookId": held }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the held notebook's metadata must still read, got {status} with {read:?}"
+    );
+    assert_eq!(
+        read["NotebookMetadata"]["NotebookId"].as_str(),
+        Some(held.as_str()),
+        "the metadata read back must be the held notebook's, got {read:?}"
     );
     let (status, listed) = call(
         &router,

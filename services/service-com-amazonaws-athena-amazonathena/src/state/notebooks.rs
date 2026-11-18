@@ -218,6 +218,49 @@ impl NotebookRegistry {
         }
         self.notebooks.insert(record.id.clone(), record);
     }
+
+    /// The notebooks `work_group` holds that the search `filter` reports, most recently
+    /// created first.
+    ///
+    /// ONE projection for every reader of a workgroup's notebooks, so a listing and a page
+    /// of it walk the same notebooks in the same order. The order is total whatever the
+    /// clock's resolution — two notebooks created in the same instant are ordered by the id
+    /// they were minted under — so a page boundary falls in the same place on every call.
+    ///
+    /// `filter` is the search a request narrowed the listing by
+    /// ([`notebook_name_matches`]); `None` lists every notebook of the workgroup.
+    pub fn notebooks_in(&self, work_group: &str, filter: Option<&str>) -> Vec<&NotebookRecord> {
+        let mut found: Vec<&NotebookRecord> = self
+            .notebooks
+            .values()
+            .filter(|record| record.work_group == work_group)
+            .filter(|record| notebook_name_matches(&record.name, filter))
+            .collect();
+        found.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        found
+    }
+}
+
+/// Whether the notebook called `name` is one the search `filter` reports.
+///
+/// `FilterDefinition` is "A string for searching notebook names", whose one member is "The
+/// name of the notebook to search for" — a SEARCH rather than an exact-name lookup, which is
+/// also why the operation that takes it is paginated: a name is unique within a workgroup
+/// ([`NotebookRegistry::holds_name`]), so an exact match could never report more than one
+/// notebook and would need no pages. So a notebook is reported when the string occurs
+/// anywhere in its name, and a request carrying no filter reports every notebook of the
+/// workgroup.
+///
+/// Case-sensitive, as every other comparison of a `NotebookName` in this service is (a
+/// create and an import tell two names apart by case), so the search reports exactly the
+/// notebooks whose stored names carry the string the caller wrote.
+pub fn notebook_name_matches(name: &str, filter: Option<&str>) -> bool {
+    filter.is_none_or(|searched| name.contains(searched))
 }
 
 /// A fresh `NotebookId`: a version-4 UUID in its hyphenated, lower-case form, which is
@@ -379,6 +422,34 @@ pub fn notebook_file_at<Eng: Send + Sync + 'static>(engine: &Eng, uri: &str) -> 
         // document, and the modelled `Payload` length starts at 1.
         Ok("") | Err(_) => NotebookFile::NotText,
         Ok(content) => NotebookFile::Content(content.to_string()),
+    }
+}
+
+/// The cursor a `ListNotebookMetadata` page hands back: the workgroup whose notebooks it is
+/// listing and the position to resume at.
+///
+/// Scoped by workgroup, as every other listing of this service's cursors is: the operation
+/// "Displays the notebook files for the specified workgroup", so a token minted while
+/// listing one workgroup names no page of another's listing.
+fn notebook_metadata_cursor(work_group: &str, position: usize) -> String {
+    format!("notebookmetadata{CURSOR_SEPARATOR}{work_group}{CURSOR_SEPARATOR}{position}")
+}
+
+impl ComAmazonawsAthenaAmazonathenaState {
+    /// The `NextToken` a `ListNotebookMetadata` page of `work_group` resumed at `position`
+    /// hands back.
+    pub fn notebook_metadata_page_token(&self, work_group: &str, position: usize) -> String {
+        ::hex::encode(
+            self.page_token_key
+                .mint(&notebook_metadata_cursor(work_group, position)),
+        )
+    }
+
+    /// The position `token` resumes a notebook listing of `work_group` at, or `None` for a
+    /// token this store did not mint for THAT workgroup's listing.
+    pub fn notebook_metadata_page_position(&self, work_group: &str, token: &str) -> Option<usize> {
+        let cursor = self.page_cursor(token)?;
+        cursor_position(&cursor, "notebookmetadata", work_group)
     }
 }
 

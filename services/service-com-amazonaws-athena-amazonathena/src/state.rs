@@ -107,6 +107,10 @@ mod runtime_statistics;
 mod notebooks;
 pub use notebooks::*;
 
+/// The address a client opens a notebook at, and the token that authenticates it.
+mod notebook_urls;
+pub use notebook_urls::*;
+
 /// The sessions this account's workgroups run, the executors each one runs on, and the
 /// notebook a notebook session was started in.
 mod sessions;
@@ -2264,6 +2268,12 @@ pub struct ComAmazonawsAthenaAmazonathenaState {
     /// this store did not mint names no page. Drawn from the system's randomness when
     /// the store is created and never reported.
     page_token_key: PageTokenKey,
+    /// The secret the authentication token a notebook's address carries is computed under,
+    /// so a token this store did not mint names no session. Its own secret rather than
+    /// [`Self::page_token_key`]: a page token and a notebook's authenticator are handed out
+    /// for different purposes, and neither can be made to stand in for the other. Drawn
+    /// from the system's randomness when the store is created and never reported.
+    notebook_address_key: PageTokenKey,
 }
 
 impl Default for ComAmazonawsAthenaAmazonathenaState {
@@ -2285,6 +2295,7 @@ impl Default for ComAmazonawsAthenaAmazonathenaState {
             prepared_statements: PreparedStatementRegistry::default(),
             named_queries: NamedQueryRegistry::default(),
             page_token_key: PageTokenKey::new(),
+            notebook_address_key: PageTokenKey::new(),
         }
     }
 }

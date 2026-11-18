@@ -152,11 +152,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "A reservation must be cancelled before it can be deleted", so a reservation in
         // any other status — one still allocating, an allocated one, one whose
-        // cancellation is still in progress — is refused rather than removed.
+        // cancellation is still in progress — is refused rather than removed, and the
+        // refusal names the status that refused it, read off the stored reservation.
         let status = record.status_at(now);
         if status != crate::state::CAPACITY_RESERVATION_STATUS_CANCELLED {
             return Err(invalid_request(
-                crate::state::capacity_reservation_not_cancelled(),
+                crate::state::capacity_reservation_not_cancelled(status),
             ));
         }
 

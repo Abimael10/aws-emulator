@@ -262,3 +262,37 @@ pub fn message(body: &Value) -> String {
         .unwrap_or("<no Message>")
         .to_string()
 }
+
+/// One answer to a [`fetch`] of an absolute address this service handed out: the status, the
+/// media type it was served under, and its exact bytes.
+pub struct Fetched {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+/// Follow an ABSOLUTE URL this service handed out, the way a client follows one: a bare
+/// `GET` of the address itself, with no `Authorization` header and no body — so what is
+/// driven is the request a browser or `curl` sends, not an SDK call.
+///
+/// Shared here because the dispatch path is the router's own: a suite that follows an
+/// address this emulator published needs no transport of its own.
+pub async fn fetch(router: &MultiServiceRouter, url: &str) -> Fetched {
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(url)
+        .body(bytes::Bytes::new())
+        .expect("a test fetch builds");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    Fetched {
+        status,
+        content_type,
+        body: response.body().to_vec(),
+    }
+}

@@ -555,11 +555,10 @@ async fn a_cancelled_reservation_can_be_deleted_and_is_then_gone() {
 
 /// The message the slice refuses `operation` with when the reservation it addressed is in
 /// `status`: a call that would have CHANGED the reservation states the state that refused
-/// it, and a delete states the rule it needs instead — a reservation must be cancelled
-/// before it can be deleted, whatever state it is in.
+/// it, and a delete states the state it met beside the one state it can be served from.
 fn status_refusal(operation: &str, status: &str) -> String {
     if operation == "DeleteCapacityReservation" {
-        state::capacity_reservation_not_cancelled()
+        state::capacity_reservation_not_cancelled(status)
     } else {
         state::capacity_reservation_wrong_state(status)
     }
@@ -1058,8 +1057,9 @@ async fn each_refusal_class_states_its_own_sentence() {
     .await;
     assert_eq!(
         message(&body),
-        "Reservation must be cancelled before it can be deleted",
-        "the delete refusal must state the rule the delete needs, got {:?}",
+        "Reservation state is PENDING. Reservation can only be deleted when state is \
+         CANCELLED",
+        "the delete refusal must state the state it met and the one it needs, got {:?}",
         message(&body)
     );
 

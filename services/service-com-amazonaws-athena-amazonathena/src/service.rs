@@ -76,6 +76,11 @@
 
 pub mod input_validation;
 
+/// Serves the signed addresses `CreatePresignedNotebookUrl` hands out for a session's
+/// notebook. See the module docs of that file: the notebook file is an artifact an API
+/// member points at rather than an API call, so no modelled route can serve it.
+pub(crate) mod notebook_editor;
+
 use service_common::query_error_envelope::{
     RequestIdEnvelopeDefinition, RequestIdReportingOperation,
 };
@@ -99,6 +104,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// whatever that wrapper answered names the request it answered. Held, not built per
     /// request: `override_operation` returns a reference to it.
     refusal_body: RequestIdReportingOperation<RestatedRefusalOperation>,
+    /// Serves the signed addresses `CreatePresignedNotebookUrl` hands out for a session's
+    /// notebook. Claimed through [`Service::override_operation`], which hands it the
+    /// requests it claims (see [`notebook_editor`]).
+    notebook_editor: notebook_editor::NotebookEditorRoute<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -107,8 +116,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(engine)),
+            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(
+                Arc::clone(&engine),
+            )),
             refusal_body: RequestIdReportingOperation::header(input_validation::REFUSAL_BODY),
+            notebook_editor: notebook_editor::NotebookEditorRoute::new(engine),
         }
     }
 }
@@ -150,6 +162,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // answer without naming the request it answered (see the module docs).
         if service_common::restated_refusal::routes(self.definition(), req) {
             return Some(&self.refusal_body);
+        }
+
+        // The open of a session's NOTEBOOK, which the generated table cannot serve: the model
+        // binds no operation to that path, because the notebook file is the artifact a
+        // `CreatePresignedNotebookUrlResponse` member points at rather than an API call (see
+        // [`notebook_editor`]).
+        if self.notebook_editor.claims(req).is_some() {
+            return Some(&self.notebook_editor as &dyn ErasedOperation);
         }
         None
     }

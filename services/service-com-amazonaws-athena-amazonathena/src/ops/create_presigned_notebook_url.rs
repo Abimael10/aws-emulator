@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePresignedNotebookUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePresignedNotebookUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePresignedNotebookUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The address a client opens one session's notebook at, and the token that authenticates
+//! it, built from the session this account holds and the notebook that session was started
+//! in — see [`crate::state::notebook_url`], where the address is signed against this
+//! emulator and the token is minted, and whose module states what each part of the answer
+//! is.
+//!
+//! Minting that grant is what this operation DOES ("Gets an authentication token and the URL
+//! at which the notebook can be accessed"), so each call answers with a token of its own;
+//! nothing about the session changes, and a later read of it sees exactly what the previous
+//! caller saw.
+//!
+//! `AuthTokenExpirationTime` reports the token's LIFETIME in seconds rather than the instant
+//! it expires: that is the recorded wire form of this operation, and
+//! [`crate::state::auth_token_expiration_time`] states it beside the member's own prose,
+//! which says otherwise.
+//!
+//! A session started in no notebook still gets an address — the model words no refusal for
+//! one, and the recording shows none — and that address serves no notebook file, because
+//! there is none to open: following it answers "nothing here" the way every other address
+//! this emulator serves nothing at does (`crate::service::notebook_editor`).
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +160,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePresignedNotebookUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePresignedNotebookUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePresignedNotebookUrl"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreatePresignedNotebookUrlErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("Athena state is not reachable on this engine".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        // A read of the session, and a MINT of the grant this call's caller asked for:
+        // "Gets an authentication token and the URL at which the notebook can be accessed"
+        // is what this operation does, and the token it answers with carries everything
+        // needed to resolve it, so nothing is written to the store below either.
+        let store = state.lock();
+
+        // The id names a session this account holds, or it names nothing this service will
+        // act on — the one sentence every session-addressed operation of this service
+        // states for that miss (`crate::state::SESSION_NOT_FOUND`).
+        let Some(session) = store.sessions.session(&input.session_id) else {
+            return Err(invalid_request(crate::state::SESSION_NOT_FOUND));
+        };
+
+        // The URL "points directly to the opened notebook", which the session's own engine
+        // serves: a session that is no longer one of the states a session runs calculations
+        // in — one shutting down, one whose resources are gone, one that ended badly — serves
+        // no notebook, so there is no address to hand out.
+        if !session.is_active_at(now) {
+            return Err(invalid_request(crate::state::NOTEBOOK_SESSION_NOT_OPEN));
+        }
+
+        // "The URL includes the authentication token and notebook file name": which notebook
+        // the session serves is the one it was STARTED in, read off the stored session, and
+        // its name off that notebook — never off this request, which carries neither. A
+        // session started in none names none, and its address serves no notebook file
+        // (see the module docs).
+        let notebook_name = session
+            .notebook_id
+            .as_deref()
+            .and_then(|notebook_id| store.notebooks.notebook(notebook_id))
+            .map(|notebook| notebook.name.clone());
+
+        // A fresh token per issue, so a re-issue refreshes it rather than handing back the
+        // same value: the store's own authenticator over the session this address names.
+        let auth_token = store.notebook_auth_token(&session.id);
+        let session_id = session.id.clone();
+        // Nothing below reads or writes the store: the signing is the caller's answer.
+        drop(store);
+
+        let Some(notebook_url) = crate::state::notebook_url(
+            &ctx.url_signer(),
+            &session_id,
+            notebook_name.as_deref(),
+            &auth_token,
+        ) else {
+            return Err(
+                CreatePresignedNotebookUrlErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "no notebook URL can be signed for this request".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(CreatePresignedNotebookUrlOutput {
+            notebook_url,
+            auth_token,
+            // What this member carries is the LIFETIME of the token just minted, in seconds —
+            // the recorded wire form of this operation, which differs from the member's own
+            // prose; `crate::state::auth_token_expiration_time` states that and why, and the
+            // span itself is the one the operation publishes for refreshing the token, which
+            // is also the window the address above was signed for.
+            auth_token_expiration_time: crate::state::auth_token_expiration_time(),
+        })
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Both refusals above are bad requests rather than an unwritten operation, and
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request." Each one is caused by the request
+/// itself, which is the class [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+fn invalid_request(message: impl Into<String>) -> CreatePresignedNotebookUrlError {
+    CreatePresignedNotebookUrlError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }

@@ -460,9 +460,18 @@ pub fn capacity_reservation_wrong_state(status: &str) -> String {
 /// A class of its own rather than the sentence above: what the delete needs is not a
 /// reservation that can be changed but one that has been cancelled, which is the rule
 /// `DeleteCapacityReservation` states — "A reservation must be cancelled before it can be
-/// deleted" — so the refusal states that rule and no other.
-pub fn capacity_reservation_not_cancelled() -> String {
-    "Reservation must be cancelled before it can be deleted".to_string()
+/// deleted".
+///
+/// `status` is the sentence's ONE variable part, read off the reservation the request
+/// addressed: a client reading this refusal decides its next step from the state that
+/// blocked the delete — wait out an allocation or a cancellation still in flight, or cancel
+/// first — so every state a delete can meet reports itself rather than all of them sharing
+/// one stateless sentence.
+pub fn capacity_reservation_not_cancelled(status: &str) -> String {
+    format!(
+        "Reservation state is {status}. Reservation can only be deleted when state is \
+         {CAPACITY_RESERVATION_STATUS_CANCELLED}"
+    )
 }
 
 /// The refusal message for a create that would take the account past
