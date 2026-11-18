@@ -77,8 +77,9 @@ const METHOD_REFUSED: &str = "This distribution is not configured to allow the H
                               method that was used for this request. The distribution \
                               supports only cachable requests.";
 
-/// What a distribution's own address answers a browser request it does not admit, which is
-/// the core's own wording for such a request and not a page CloudFront ever serves.
+/// What a distribution's own address answers a browser request it does not admit, and a
+/// state-changing one from any client stating an origin the distribution does not name: the
+/// core's own wording for such a request, and not a page CloudFront ever serves.
 const CROSS_SITE_REFUSED: &str = "cross-site origin";
 
 /// What a BROWSER states on a request it sends from the page's own origin, and what it
@@ -618,9 +619,11 @@ async fn the_configured_headers_are_written_and_the_removed_ones_are_gone() {
 /// What the address a distribution PUBLISHES does with a request a browser sends from another
 /// site: it serves the ones whose `Origin` the distribution's own configuration NAMES — which
 /// is what makes the policy's CORS verdict observable where a viewer reaches it — and refuses
-/// every other browser request from another site before the edge, which is this emulator
-/// guarding the machine it runs on rather than anything CloudFront does. A client that is no
-/// browser reaches the edge as it always did.
+/// every other browser-classified request from another site before the edge, which is this
+/// emulator guarding the machine it runs on rather than anything CloudFront does. A client that
+/// is no browser reaches the edge as it always did, including one that merely STATES an
+/// `Origin`: that header is a value any client may set and CloudFront refuses no request for
+/// it, so such a read is served and simply carries none of the CORS headers.
 #[tokio::test]
 async fn the_published_address_serves_the_origins_the_distribution_names() {
     let router = emulator();
@@ -631,11 +634,12 @@ async fn the_published_address_serves_the_origins_the_distribution_names() {
     )
     .await;
 
-    // The rows differ along the origin (named, the second named one, not named, none at all)
-    // and along the method, a preflight included.
+    // The rows differ along the origin (named, the second named one, not named, none at all),
+    // along the method (a read, a preflight, a state-changing one) and along whether a BROWSER
+    // classified the request at all.
     let granted_header = format!("access-control-allow-origin: {GRANTED}");
     let second_header = format!("access-control-allow-origin: {SECOND_GRANTED}");
-    let cases: [Dialled<'_>; 7] = [
+    let cases: [Dialled<'_>; 10] = [
         Dialled {
             case: "a cross-site GET from an origin the policy names",
             method: "GET",
@@ -669,6 +673,20 @@ async fn the_published_address_serves_the_origins_the_distribution_names() {
             absent: &["DistributionList", "access-control-allow-origin"],
         },
         Dialled {
+            case: "a GET no browser classified, stating an origin the policy names",
+            method: "GET",
+            headers: &[("origin", GRANTED)],
+            contains: &["HTTP/1.1 200", "DistributionList", &granted_header],
+            absent: &[CROSS_SITE_REFUSED],
+        },
+        Dialled {
+            case: "a GET no browser classified, stating an origin the policy does not name",
+            method: "GET",
+            headers: &[("origin", FOREIGN)],
+            contains: &["HTTP/1.1 200", "DistributionList"],
+            absent: &[CROSS_SITE_REFUSED, "access-control-allow-origin"],
+        },
+        Dialled {
             case: "a cross-site POST from an origin the policy names reaches the edge",
             method: "POST",
             headers: &[("origin", GRANTED), CROSS_SITE],
@@ -680,6 +698,14 @@ async fn the_published_address_serves_the_origins_the_distribution_names() {
                    the address",
             method: "POST",
             headers: &[("origin", FOREIGN), CROSS_SITE],
+            contains: &["HTTP/1.1 403", CROSS_SITE_REFUSED],
+            absent: &[METHOD_REFUSED],
+        },
+        Dialled {
+            case: "a POST no browser classified, stating an origin the policy does not name, \
+                   is still refused by the address",
+            method: "POST",
+            headers: &[("origin", FOREIGN)],
             contains: &["HTTP/1.1 403", CROSS_SITE_REFUSED],
             absent: &[METHOD_REFUSED],
         },

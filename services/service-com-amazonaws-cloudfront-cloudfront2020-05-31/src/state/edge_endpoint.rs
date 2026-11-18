@@ -55,14 +55,21 @@
 //!
 //! These addresses are the emulator's own loopback ports, so a page the developer's browser
 //! visits can send requests to them — and CORS response headers would only hide the answer
-//! from that page, not stop the request arriving. Every request is therefore put through the
-//! core's own browser check ([`refused_before_the_edge`]) before the edge sees it, and a
-//! request a browser sent from another site is refused `403` unless the distribution this
-//! address serves NAMES its origin: the origins the CORS configurations of the response
-//! headers policies its cache behaviours attach carry
-//! ([`EdgeTarget::granted_origins`]), which is a statement made through the CONTROL plane,
-//! where no browser reaches. A distribution that names none admits none, which is the core's
-//! own default.
+//! from that page, not stop the request arriving. Every request a BROWSER CLASSIFIED (one
+//! carrying `Sec-Fetch-Site`, the browser's own unforgeable statement about the site that
+//! caused it) is therefore put through the core's own browser check
+//! ([`refused_before_the_edge`]) before the edge sees it, whatever its method, and one a
+//! browser sent from another site is refused `403` unless the distribution this address serves
+//! NAMES its origin: the origins the CORS configurations of the response headers policies its
+//! cache behaviours attach carry ([`EdgeTarget::granted_origins`]), which is a statement made
+//! through the CONTROL plane, where no browser reaches. A distribution that names none admits
+//! none, which is the core's own default.
+//!
+//! A READ no browser classified is served whatever `Origin` it states, which is the one thing
+//! this address does not ask the check about: the core already serves such a client when it
+//! states no `Origin` either, the header alone is a value any client may state, and CloudFront
+//! refuses no request for it — a response headers policy decides which `Access-Control-*`
+//! headers an answer carries and gates nothing ([`refused_before_the_edge`] states it in full).
 //!
 //! That grant is written to make a response headers policy's headers right, so the fact that
 //! it also decides which pages this port answers is ANNOUNCED where the operator of this
@@ -176,14 +183,15 @@ trait EdgeTarget: Send + Sync + 'static {
     /// rather than per request ([`Self::announce`]).
     fn announced(&self) -> &Mutex<BTreeSet<String>>;
 
-    /// The browser origins this address serves a request addressed to `host` from: the
+    /// The browser origins this address admits a browser-classified request from: the
     /// origins the distribution it resolves to GRANTS in the CORS configuration of the
     /// response headers policies its cache behaviours attach
     /// ([`super::ComAmazonawsCloudfrontCloudfront20200531State::cors_granted_origins`]).
     ///
     /// A distribution that grants none — one with no CORS configuration at all — admits
     /// none, which is the default this address carries otherwise
-    /// ([`refused_before_the_edge`]).
+    /// ([`refused_before_the_edge`]). A read no browser classified is admitted whatever this
+    /// answers, so this is not read for one at all.
     ///
     /// At most [`MAX_CORS_ORIGINS_READ_PER_REQUEST`] of them are read, so what one viewer
     /// request costs here is bounded whatever a configuration holds.
@@ -774,22 +782,35 @@ const OPAQUE_ESCAPES: [&str; 3] = ["%2f", "%5c", "%25"];
 /// domain rather than the loopback address they dialled, so a name this service holds a
 /// routed tenant record for is served there, and every other name is refused as before. The
 /// admitted names are this service's own records — the same names the emulator's front door
-/// already serves a viewer request on host-style — never a name taken from the request, and
-/// the browser check below still decides what a browser may do with any of them.
+/// already serves a viewer request on host-style — never a name taken from the request.
 ///
-/// The browser check runs on EVERY request this address accepts, as it does on a core HTTP
-/// listener, and the only thing that differs is the allowlist it runs against: the ORIGINS
-/// the distribution this address serves NAMES ([`EdgeTarget::granted_origins`]), through the
-/// CORS configuration of the response headers policies its cache behaviours attach. That is a
-/// statement made through the CONTROL plane, which no browser reaches, so it is an
-/// allowlist the operator of this emulator wrote, carried by the core's own
-/// [`RemoteOrigins::Exact`] — read here from this service's own records and never from the
-/// request. Every other browser request from another site is refused before the edge exactly
-/// as the core refuses it, whatever its method: this address is reachable from a page the
+/// The browser check runs on every request a BROWSER CLASSIFIED — one carrying
+/// `Sec-Fetch-Site`, the browser's own unforgeable statement about the site that caused it —
+/// whatever its method, exactly as it does on a core HTTP listener, and the only thing that
+/// differs is the allowlist it runs against: the ORIGINS the distribution this address serves
+/// NAMES ([`EdgeTarget::granted_origins`]), through the CORS configuration of the response
+/// headers policies its cache behaviours attach. That is a statement made through the CONTROL
+/// plane, which no browser reaches, so it is an allowlist the operator of this emulator wrote,
+/// carried by the core's own [`RemoteOrigins::Exact`] — read here from this service's own
+/// records and never from the request. A distribution that names no origin therefore carries
+/// the core's own default, admitting none, and a grant that admits an origin is announced where
+/// the operator sees it ([`EdgeTarget::announce`]). Every browser request from another site is
+/// refused before the edge as the core refuses it: this address is reachable from a page the
 /// developer's browser visits, and CORS response headers would only hide the answer from that
-/// page, not stop the request arriving. A distribution that names no origin therefore carries
-/// the core's own default, admitting none, and a grant that admits an origin is announced
-/// where the operator sees it ([`EdgeTarget::announce`]).
+/// page, not stop the request arriving.
+///
+/// What the check is NOT run on is a READ no browser classified: a request carrying no
+/// `Sec-Fetch-*` at all whose method only reads ([`READ_ONLY_METHODS`]). The core already
+/// serves such a client when it states no `Origin` either — "non-browser clients send neither
+/// header" — and the `Origin` header alone does not make it one: it is a value any client may
+/// state, and a server-side fetch, a proxy, a webview or a test harness states it. CloudFront
+/// refuses no request for that header — a response headers policy's `CorsConfig` selects the
+/// `Access-Control-*` headers an answer carries and gates nothing — so a read that carries
+/// nothing but an `Origin` is served here, and what any page may READ of the answer stays the
+/// browser's own decision, made from the headers that policy wrote
+/// ([`crate::service::edge::response_headers`]). Narrow deliberately: a browser's own
+/// classification still decides every request that carries one, and a method that could CHANGE
+/// what the origin holds is checked whether a browser classified it or not.
 ///
 /// The `allow_remote` the check is given is `true` because this address is a VIEWER data
 /// plane and nothing else: it serves one distribution's objects, never this emulator's
@@ -818,6 +839,13 @@ fn refused_before_the_edge(
     ) {
         return Some(generated(NOT_IMPLEMENTED, NO_WEBSOCKETS));
     }
+    // A request no browser classified, asking only to READ, is served whatever `Origin` it
+    // states: the core's own check is what decides every other one, including every request a
+    // browser classified and every method that could change the origin.
+    let classified_by_a_browser = header("sec-fetch-site").is_some();
+    if !classified_by_a_browser && reads_only(parts.method.as_str()) {
+        return None;
+    }
     let granted = target.granted_origins(Some(host));
     if let BrowserVerdict::Forbid(reason) = ::emulator_server::classify_browser_request(
         header("origin"),
@@ -829,6 +857,22 @@ fn refused_before_the_edge(
         return Some(generated(FORBIDDEN, reason));
     }
     None
+}
+
+/// The viewer methods that only READ what the origin holds — RFC 9110's "safe" methods, of the
+/// ones a cache behaviour's `AllowedMethods` can admit: `GET` and `HEAD`, and the `OPTIONS` a
+/// browser sends a CORS preflight as.
+///
+/// One half of what the browser check above is not run on (the other half being that no browser
+/// classified the request): what one of these can do to the origin is nothing, so the answer is
+/// the only thing at stake, and which page may read that is the browser's own decision from the
+/// response headers. A method that can change the origin is checked whoever sent it.
+const READ_ONLY_METHODS: [&str; 3] = ["GET", "HEAD", "OPTIONS"];
+
+/// Whether a viewer method only reads ([`READ_ONLY_METHODS`]). A method name is case-sensitive
+/// (RFC 9110), so the comparison is.
+fn reads_only(method: &str) -> bool {
+    READ_ONLY_METHODS.contains(&method)
 }
 
 /// Whether a viewer request's `Host` names the interface this address was bound on, by the

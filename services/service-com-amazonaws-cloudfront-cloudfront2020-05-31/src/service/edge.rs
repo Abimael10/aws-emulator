@@ -48,8 +48,10 @@
 //!    goes to the origin and is answered `X-Cache: Miss from cloudfront`;
 //! 8. only then is the ORIGIN the behaviour's `TargetOriginId` names fetched, in process,
 //!    through the emulator this service is running within — over the scheme that origin's
-//!    own `OriginProtocolPolicy` names ([`origin_uri`]) and as the distribution's own origin
-//!    access control says that origin is to be addressed (see below);
+//!    own `OriginProtocolPolicy` names ([`origin_uri`]), for the object the viewer's path
+//!    names or, where that path is the distribution's ROOT, the one its `DefaultRootObject`
+//!    names ([`origin_object_path`]), and as the distribution's own origin access control
+//!    says that origin is to be addressed (see below);
 //! 9. a viewer that asked for part of the object is answered that part of it and no more:
 //!    the edge evaluates the `Range` it sent against the representation it is about to serve,
 //!    whether the cache held it or the origin has just produced it, so a satisfiable window is
@@ -2029,7 +2031,9 @@ fn plan_resolved(
     let uri = origin_uri(
         origin,
         generated_headers::viewer_scheme(req.uri()),
-        &viewer_path,
+        // WHICH object the origin is asked for, which is the viewer's own path everywhere but
+        // at the distribution's root ([`origin_object_path`]).
+        &origin_object_path(resolved.distribution, &viewer_path),
         &origin_query(&keyed, &forwarded, addressed.query),
     );
     // An origin request the edge cannot OPEN at all is reported as an origin CloudFront
@@ -2320,6 +2324,46 @@ fn origin_uri(origin: &Origin, viewer_scheme: &str, viewer_path: &str, query: &s
     }
 }
 
+/// The viewer path WITHIN the distribution that is its ROOT: the one path a default root
+/// object is requested for.
+///
+/// Both spellings of it, because a viewer path reaches this module from two addressings
+/// ([`resolve`]): the root of a host-style request is `/`, and a prefixed path-style request
+/// that names nothing below the distribution carries no viewer path at all.
+const ROOT_VIEWER_PATHS: [&str; 2] = ["/", ""];
+
+/// WHICH object the ORIGIN is asked for: the viewer's own path, except at the ROOT of the
+/// distribution, where it is the object `DefaultRootObject` names.
+///
+/// `DistributionConfig$DefaultRootObject` is "the object that you want CloudFront to request
+/// from your origin … when a viewer requests the root URL for your distribution", and "a
+/// default root object avoids exposing the contents of your distribution": so the root URL is
+/// an origin request for THAT object, and whatever an origin answers a request naming no
+/// object with — a listing of everything it holds, or its own refusal — is never what the
+/// viewer of a distribution that names a root object is served. The substitution is the root's
+/// alone ("CloudFront doesn't return default root objects in subdirectories"), and a
+/// distribution naming none asks the origin for the path the viewer spelled.
+///
+/// Only the ORIGIN request is substituted. The cache key, the cache behaviour the path
+/// selected, the invalidation a batch matches and the event a function is handed are all the
+/// VIEWER's request, which is the request that was made.
+///
+/// A stored value is used as it stands, with a leading separator removed: "do not add a `/`
+/// before the object name", so one carrying it names the same object at the origin's root
+/// rather than an empty first segment.
+fn origin_object_path(distribution: &StoredDistribution, viewer_path: &str) -> String {
+    let root_object = distribution
+        .config
+        .default_root_object
+        .as_deref()
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    if root_object.is_empty() || !ROOT_VIEWER_PATHS.contains(&viewer_path) {
+        return viewer_path.to_string();
+    }
+    format!("/{root_object}")
+}
+
 /// The longest an origin fetch may wait, whatever the configuration asks for:
 /// `OriginReadTimeout`'s own documented maximum ("the minimum timeout is 1 second, the
 /// maximum is 120 seconds"), so one viewer request can never hold a worker longer than
@@ -2503,37 +2547,36 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
             return Fetched::of_cloudfront(generated(BAD_GATEWAY, NO_ORIGIN_DETAIL, cf_id));
         }
     };
-    // The ORIGIN ACCESS CONTROL's own half of the fetch: a request the origin's resource
-    // policy grants this distribution is SIGNED, which is what such an origin serves a
-    // request for at all; one it does not grant travels as it would with no control, so the
-    // origin answers it itself (see [`origin_access`]).
+    // The ORIGIN ACCESS CONTROL's own half of the fetch: the request is made AS the principal
+    // that mechanism names, acting for this distribution, and the ORIGIN decides whether it
+    // serves it — from its own resource policy, for that principal (see [`origin_access`]).
     //
-    // A granted fetch is signed AS CloudFront's own service principal, acting for this
-    // distribution: the credential it is signed with is minted for this one request and
-    // recorded as that call, so a decision the origin's service makes itself about it (the
-    // key policy of a KMS key the object's bytes are encrypted under) is made for that
-    // principal rather than for the account. Both the credential and the record are destroyed
-    // when `_as_the_service_principal` is dropped, which is every path out of this function.
+    // The credential it is signed with is minted for this one request and recorded as that
+    // call, so every decision the origin's service makes itself about it — its own policy, and
+    // the key policy of a KMS key the object's bytes are encrypted under — is made for that
+    // principal rather than for the account, whose own store would serve a private origin in
+    // full. Both the credential and the record are destroyed when `_as_the_service_principal`
+    // is dropped, which is every path out of this function.
     let mut _as_the_service_principal = None;
     if let Some(access) = &fetch.access {
-        if origin_access::grants_origin_request(ctx, access, fetch.read_timeout).await {
-            match origin_access::sign_as_the_service_principal(
-                engine,
-                &mut request,
-                access,
-                ctx,
-                fetch.read_timeout,
-            )
-            .await
-            {
-                Ok(in_flight) => _as_the_service_principal = in_flight,
-                Err(error) => ::tracing::warn!(
-                    uri = %fetch.uri,
-                    %error,
-                    "the origin request could not be signed for this origin access control, \
-                     so it is made as a request carrying no credential"
-                ),
-            }
+        let principal = origin_access::acting_principal(ctx, access, fetch.read_timeout).await;
+        match origin_access::sign_as_the_service_principal(
+            engine,
+            &mut request,
+            access,
+            &principal,
+            ctx,
+            fetch.read_timeout,
+        )
+        .await
+        {
+            Ok(in_flight) => _as_the_service_principal = in_flight,
+            Err(error) => ::tracing::warn!(
+                uri = %fetch.uri,
+                %error,
+                "the origin request could not be signed for this origin access control, \
+                 so it is made as a request carrying no credential"
+            ),
         }
     }
     let (parts, body) = request.into_parts();

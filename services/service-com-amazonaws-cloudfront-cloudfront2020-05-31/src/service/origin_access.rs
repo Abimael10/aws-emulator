@@ -30,46 +30,41 @@
 //!
 //! So one origin fetch under an origin access mechanism is two questions, in this order:
 //!
-//! 1. the DECISION the ORIGIN's own resource policy states about it — may the principal the
-//!    mechanism names ([`SERVICE_PRINCIPAL`] for a control, the identity's own spellings for
-//!    a legacy identity), acting for THIS distribution, perform the action the viewer's
-//!    method names on the object the viewer asked for? The document is read from the origin's
-//!    own service (for an `s3` origin type, through that bucket's `GetBucketPolicy`), so what
-//!    decides a fetch is the document a client's last write left on the bucket: a policy just
-//!    written grants the next fetch and one just cleared stops granting it. The decision
-//!    itself is the tree's ONE evaluation of IAM policy documents
-//!    (`service_common::iam_authorization`), carrying the keys such a grant is scoped by
-//!    ([`ORIGIN_REQUEST_CONDITION_KEYS`]), so a grant written for one distribution authorizes
-//!    that distribution's fetches alone.
-//! 2. the SIGNATURE, which is what the origin serves the request for at all.
+//! 1. WHOSE call it is — the mechanism names the principal: [`SERVICE_PRINCIPAL`] for a
+//!    control, the identity's own spellings for a legacy identity. The fetch is signed with a
+//!    credential minted for that ONE call and RECORDED under it as a call made as that
+//!    principal, acting for this distribution ([`sign_as_the_service_principal`]).
+//! 2. WHETHER the origin serves it, which is the ORIGIN's own decision and nobody else's: the
+//!    service serving the fetch resolves the record from the access key id the request
+//!    presents, and decides the fetch against its OWN resource policy for that principal,
+//!    carrying `aws:SourceArn` and `aws:SourceAccount`. So a policy just written grants the
+//!    next fetch, one just cleared stops granting it, and a fetch nothing granted is refused
+//!    BY THE ORIGIN, in its own vocabulary and with its own status — including the refusal that
+//!    withholds whether an object exists at all, which the origin can only make for the
+//!    principal that asked.
 //!
-//! The signature this emulator applies is made with the credential
-//! `OperationContext::callback` hands every handler — the only identity an in-process request
-//! here can be signed as — and it is applied ONLY to a fetch the origin's own document grants
-//! the CloudFront principal. A fetch that document does NOT grant travels exactly as it would
-//! with no origin access control at all: unsigned, so the origin answers it as it answers any
-//! caller that presents no credential, in its own vocabulary and with its own status, rather
-//! than CloudFront inventing a refusal on the origin's behalf. A document this emulator could
-//! not read decides nothing here, so the control's own instruction stands and the request is
-//! signed; whatever the origin then answers is what the edge serves.
+//! The decision is taken ONCE, where AWS takes it. What this module reads of the origin's own
+//! document ([`acting_principal`]) decides no fetch: it answers WHICH SPELLING of the identity
+//! the document names, which is a question only CloudFront can answer, holding both spellings
+//! AWS publishes for a legacy origin access identity ([`of_origin_access_identity`]) while the
+//! origin holds only the document. A document that names none of them, one this emulator could
+//! not read and a bucket carrying no policy all leave the mechanism's own primary spelling, and
+//! the origin then refuses the fetch as that principal.
 //!
-//! One identity the fetch cannot carry on the credential every in-process call shares it
-//! carries on a credential of its own. A decision the ORIGIN's service makes ITSELF about the
-//! fetch (the KMS key policy of the key an SSE-KMS origin object's bytes are encrypted under
-//! is the one here) has to be made for the CloudFront service principal and this
-//! distribution's ARN, not for the account. So a granted fetch is signed with a credential
-//! minted for that one fetch and RECORDED, under it, as the call it is
-//! ([`sign_as_the_service_principal`]); the serving service reads that record for the access
-//! key id the signature was verified against. The resource-policy half is decided here
-//! ([`admits`]) and is not decided again from the record.
+//! Signing it with the credential every in-process call shares would be the one thing this
+//! must not do: that credential speaks for the ACCOUNT, which a private origin's own store
+//! serves in full, so an origin fetch nothing granted would come back with the object. The
+//! call's own credential is what keeps the fetch attributable, and it is what lets a decision
+//! the ORIGIN's service makes ITSELF about the fetch — the KMS key policy of the key an
+//! SSE-KMS origin object's bytes are encrypted under is the one here — be made for that
+//! principal and this distribution's ARN rather than for the account.
 //!
 //! Two limits worth stating. A viewer's own credential is never relayed to an origin
 //! ([`super::edge`]'s `HEADERS_NEVER_FORWARDED` says why), so under `no-override` a request
-//! whose viewer presented one travels with neither that header nor a signature. And the
-//! resource policy of an origin type other than `s3` is read through that origin's own
-//! service: those origins (a Lambda function URL, a MediaStore container, a MediaPackage
-//! channel) are served by nothing in this emulator, so there is no fetch of them to authorize
-//! — the control's signing instruction is still honoured for them, and the fetch reports the
+//! whose viewer presented one travels with neither that header nor a signature. And an origin
+//! type other than `s3` is served by nothing in this emulator (a Lambda function URL, a
+//! MediaStore container, a MediaPackage channel), so there is no fetch of it to authorize —
+//! the control's signing instruction is still honoured for them, and the fetch reports the
 //! origin it could not reach.
 
 use ::std::time::Duration;
@@ -187,8 +182,6 @@ pub struct OriginAccess {
     /// The signing name of the service the origin belongs to, from the control's own
     /// `OriginAccessControlOriginType` ([`ORIGIN_TYPE_SIGNING_NAMES`]).
     signing_name: &'static str,
-    /// WHICH identity a granted fetch is signed as ([`SignedAs`]).
-    signed_as: SignedAs,
     /// The Region the origin's host addresses ([`region_of_host`]).
     region: String,
     /// The host the origin request is addressed to, which is also where its resource policy
@@ -197,35 +190,17 @@ pub struct OriginAccess {
     /// The ARN of the distribution the request is made on behalf of: the value of
     /// [`SOURCE_ARN_CONDITION_KEY`] a grant may be scoped by.
     source_arn: String,
-    /// The principals the ORIGIN's own resource policy has to grant the fetch to, any one of
-    /// which admits it: the service principal for an origin fronted by an ORIGIN ACCESS
-    /// CONTROL, and the two spellings a bucket policy names a LEGACY ORIGIN ACCESS IDENTITY
-    /// by for an origin fronted by one ([`of_origin_access_identity`]).
+    /// The spellings the principal this fetch is made as is named by, the PRIMARY one first:
+    /// the service principal for an origin fronted by an ORIGIN ACCESS CONTROL, which has one,
+    /// and the two a bucket policy names a LEGACY ORIGIN ACCESS IDENTITY by for an origin
+    /// fronted by one ([`of_origin_access_identity`]). Any one of them names the same identity,
+    /// so the one the origin's own document names is the one the call is made as
+    /// ([`acting_principal`]).
     principals: Vec<String>,
     /// The object an `s3` origin's bucket policy is evaluated over, for an origin whose host
     /// names a bucket; `None` for an origin whose resource policy is not one this emulator
     /// reads.
     s3_object: Option<S3Object>,
-}
-
-/// WHICH identity a granted origin fetch is signed as.
-///
-/// An ORIGIN ACCESS CONTROL names the CloudFront SERVICE PRINCIPAL, and a call made as it is
-/// recorded as that principal's so the serving service decides it for that principal
-/// ([`sign_as_the_service_principal`]). A LEGACY ORIGIN ACCESS IDENTITY names an identity of
-/// CloudFront's own account, for which this emulator mints no credential at all: the grant
-/// the identity holds is decided HERE, from the bucket's own policy ([`admits`]), and the
-/// fetch the policy grants is then signed with the emulator's own credential — so the origin
-/// serves it as it serves the account, which is what makes a private bucket reachable through
-/// the distribution and through nothing else. The consequence is that a decision the ORIGIN's
-/// service would make ITSELF about such a fetch is decided for the account rather than for
-/// the identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SignedAs {
-    /// The CloudFront service principal, acting for this distribution.
-    ServicePrincipal,
-    /// The account, the identity the grant was decided for having no credential of its own.
-    Account,
 }
 
 /// The Amazon S3 object one origin request addresses, as a bucket policy names it.
@@ -299,7 +274,6 @@ fn of_origin_access_control(
         .flatten();
     Some(OriginAccess {
         signing_name,
-        signed_as: SignedAs::ServicePrincipal,
         region: region_of_host(&host, signing_name),
         host,
         source_arn: distribution.arn.clone(),
@@ -346,7 +320,6 @@ fn of_origin_access_identity(
     let s3_object = s3_object(&host, method, object_path)?;
     Some(OriginAccess {
         signing_name: S3_ORIGIN_TYPE,
-        signed_as: SignedAs::Account,
         region: region_of_host(&host, S3_ORIGIN_TYPE),
         host,
         source_arn: distribution.arn.clone(),
@@ -592,57 +565,54 @@ fn dns_host(host: &str) -> Option<String> {
     well_formed.then(|| host.to_string())
 }
 
-/// Whether the ORIGIN's own resource policy leaves this fetch signed: it grants
-/// [`SERVICE_PRINCIPAL`], acting for this distribution, the action on the object — or it is
-/// a document this emulator cannot read, which decides nothing and leaves the control's own
-/// instruction standing.
+/// WHICH spelling of the principal the access mechanism names this fetch is made as: the one
+/// the ORIGIN's own document names, and the mechanism's PRIMARY spelling when the document
+/// names none of them.
 ///
-/// `false` only for a document that WAS read and does not grant the fetch, which includes a
-/// bucket carrying no policy at all: such an origin has granted CloudFront nothing, so the
-/// request travels unsigned and the origin answers it itself.
-pub async fn grants_origin_request(
+/// It decides no fetch — the origin does that, from the record this names the call in
+/// ([`sign_as_the_service_principal`]) — and it answers the one question only CloudFront can:
+/// a legacy origin access identity is named in a bucket policy by either of the two spellings
+/// AWS publishes for it ([`of_origin_access_identity`]), both naming that one identity, so the
+/// call is made as the one the document was written for. An access mechanism with a single
+/// spelling (an origin access control, whose principal is [`SERVICE_PRINCIPAL`]) is made as
+/// that one, and the document is not read at all.
+pub async fn acting_principal(
     ctx: &OperationContext<'_>,
     access: &OriginAccess,
     read_timeout: Duration,
-) -> bool {
+) -> String {
+    let primary = access
+        .principals
+        .first()
+        .cloned()
+        .unwrap_or_else(|| SERVICE_PRINCIPAL.to_string());
     let Some(object) = &access.s3_object else {
-        return true;
+        return primary;
     };
-    match bucket_policy(ctx, access, read_timeout).await {
-        PolicyRead::Document(document) => {
-            let granted = admits(&document, access, object);
-            if !granted {
-                ::tracing::debug!(
-                    origin = %access.host,
-                    action = %object.action,
-                    "the origin's own policy does not grant this distribution the fetch, so \
-                     the origin request is not signed for it"
-                );
-            }
-            granted
-        }
-        PolicyRead::Absent => {
-            ::tracing::debug!(
-                origin = %access.host,
-                "the origin carries no resource policy, so it has granted this distribution \
-                 nothing and the origin request is not signed for it"
-            );
-            false
-        }
-        PolicyRead::Unreadable => true,
+    if access.principals.len() < 2 {
+        return primary;
     }
+    let PolicyRead::Document(document) = bucket_policy(ctx, access, read_timeout).await else {
+        return primary;
+    };
+    access
+        .principals
+        .iter()
+        .find(|principal| admits(&document, access, principal, object))
+        .cloned()
+        .unwrap_or(primary)
 }
 
-/// Whether `document` grants one of `access.principals`, acting for the distribution
-/// `access.source_arn` names, the action `object.action` on `object.resource`.
+/// Whether `document` grants `principal`, acting for the distribution `access.source_arn`
+/// names, the action `object.action` on `object.resource`.
 ///
 /// Neither a service principal nor an origin access identity holds identity-based policies,
 /// so the ORIGIN's document is the only one in force over this fetch and it alone decides it:
 /// in IAM's own order an explicit `Deny` about the fetch refuses it whatever a grant says, and
 /// otherwise the fetch needs an `Allow` about it — a document whose statements are about
 /// something else has granted nothing, which is IAM's implicit deny.
-fn admits(document: &str, access: &OriginAccess, object: &S3Object) -> bool {
-    let principals = access.principals.clone();
+fn admits(document: &str, access: &OriginAccess, principal: &str, object: &S3Object) -> bool {
+    let principals = [principal.to_string()];
     let account = ::service_common::arn::parse(&access.source_arn)
         .map(|arn| arn.account.to_string())
         .unwrap_or_default();
@@ -810,17 +780,17 @@ async fn call(
 /// thing this design must not let happen.
 const IN_FLIGHT_RECORD_SLACK: Duration = Duration::from_secs(60);
 
-/// Sign one origin request AS [`SERVICE_PRINCIPAL`], acting for the distribution `access` was
-/// built for, and record that call for as long as it is in flight.
+/// Sign one origin request AS `principal`, acting for the distribution `access` was built
+/// for, and record that call for as long as it is in flight.
 ///
 /// The CREDENTIAL is what says whose call this is. This mints one in the emulator's own
 /// credential store for this one fetch, signs the fetch with it, and records under its access
 /// key id the principal the call is made as and the resource it is made for
-/// ([`::service_common::service_principal_calls`]). The service SERVING the fetch — the KMS
-/// key policy of the key an origin object's bytes are encrypted under is the decision that
-/// needs this — resolves the record from the access key id the signature was verified
-/// against, and so decides the fetch for the CloudFront service principal and this
-/// distribution's ARN, exactly as the bucket-policy half is decided here ([`admits`]).
+/// ([`::service_common::service_principal_calls`]). The service SERVING the fetch resolves the
+/// record from the access key id the signature was verified against, and so decides the fetch
+/// — its own resource policy, and the KMS key policy of the key an origin object's bytes are
+/// encrypted under — for that principal and this distribution's ARN, which is where AWS takes
+/// that decision.
 ///
 /// The credential and the record live only as long as the call: the returned value deletes
 /// both when it is dropped, which is every path out of the fetch, and the record carries the
@@ -829,26 +799,18 @@ const IN_FLIGHT_RECORD_SLACK: Duration = Duration::from_secs(60);
 /// A fetch that cannot be made AS that principal is not made as the ACCOUNT instead: on an
 /// engine carrying no such directory, or when the directory already holds as many in-flight
 /// calls as it records, the request is left UNSIGNED (`Ok(None)`), so the origin answers it as
-/// it answers a caller presenting no credential — the same travel a fetch the origin's own
-/// document does not grant makes. Signing it with the credential every in-process call
-/// carries would decide the origin's own checks for the ACCOUNT, which a default key policy
-/// permits and AWS would refuse. `Err` carries what went wrong as text, with the request left
-/// unsigned for the caller to report.
+/// it answers a caller presenting no credential. Signing it with the credential every
+/// in-process call carries would decide the origin's own checks for the ACCOUNT, whose own
+/// store serves a private origin in full. `Err` carries what went wrong as text, with the
+/// request left unsigned for the caller to report.
 pub async fn sign_as_the_service_principal<'e, Eng: Send + Sync + 'static>(
     engine: &'e Eng,
     request: &mut ::http::Request<Vec<u8>>,
     access: &OriginAccess,
+    principal: &str,
     ctx: &'e OperationContext<'_>,
     read_timeout: Duration,
 ) -> Result<Option<InFlightOriginRequest<'e, Eng>>, String> {
-    // A fetch for an origin fronted by a LEGACY ORIGIN ACCESS IDENTITY is made as no service
-    // principal: that identity's grant was decided here, from the bucket's own policy, and
-    // the fetch is signed with the emulator's own credential ([`SignedAs`] says why), so
-    // there is no per-call credential to mint and no record to write.
-    if access.signed_as == SignedAs::Account {
-        sign(request, access, ctx).await?;
-        return Ok(None);
-    }
     let Some(directory) = in_flight_calls(engine) else {
         // No directory to record the call in, so there is no way for the origin's service to
         // decide it as the CloudFront principal: the request travels UNSIGNED rather than as
@@ -879,7 +841,7 @@ pub async fn sign_as_the_service_principal<'e, Eng: Send + Sync + 'static>(
             origin = %access.host,
             distribution = %access.source_arn,
             "this distribution's ARN names no account, so this origin request cannot be made \
-             as the CloudFront service principal and is made carrying no credential"
+             as the principal its origin access names and is made carrying no credential"
         );
         let _ = ctx.credential_store().delete(&minted.id);
         return Ok(None);
@@ -887,7 +849,7 @@ pub async fn sign_as_the_service_principal<'e, Eng: Send + Sync + 'static>(
     let recorded = directory.lock().remember(
         minted.id.clone(),
         ::service_common::service_principal_calls::ServicePrincipalCall {
-            principal: SERVICE_PRINCIPAL.to_string(),
+            principal: principal.to_string(),
             source_arn: access.source_arn.clone(),
             source_account,
             expires_at: now + read_timeout + IN_FLIGHT_RECORD_SLACK,
@@ -982,20 +944,22 @@ impl<Eng: Send + Sync + 'static> Drop for InFlightOriginRequest<'_, Eng> {
     }
 }
 
-/// SigV4-sign one origin request in place, for the service and Region the origin addresses.
+/// SigV4-sign the READ of an origin's own resource policy in place, for the service and Region
+/// the origin addresses.
 ///
 /// The identity is the emulator's own credential — the one `OperationContext::callback` hands
-/// every handler — because that is the only identity an in-process request here can be signed
-/// as; [`grants_origin_request`] is what keeps the signature to a fetch the origin's own
-/// document grants the CloudFront principal. The signature itself is the tree's one
-/// in-process signer (`service_common::in_process_sigv4`), so it is the signature the
-/// emulator's own verifier computes over the same request — which is what lets an origin
-/// fetch be served with request authentication on.
+/// every handler — because this is a read THIS service makes of its own accord, to learn which
+/// spelling of the identity the origin's document names ([`acting_principal`]), rather than
+/// the viewer's fetch: that one is signed as the principal the access mechanism names
+/// ([`sign_as_the_service_principal`]). The signature itself is the tree's one in-process
+/// signer (`service_common::in_process_sigv4`), so it is the signature the emulator's own
+/// verifier computes over the same request — which is what lets the read be served with
+/// request authentication on.
 ///
 /// `SigningProtocol` is not read here: `sigv4` and `sigv4a` both say the request is signed,
 /// and the emulator verifies one credential-scope form, so a control naming either is signed
 /// in the form its origin can verify.
-pub async fn sign(
+async fn sign(
     request: &mut ::http::Request<Vec<u8>>,
     access: &OriginAccess,
     ctx: &OperationContext<'_>,
@@ -1020,7 +984,6 @@ mod tests {
     fn access(host: &str, action: &'static str, key: &str) -> OriginAccess {
         OriginAccess {
             signing_name: "s3",
-            signed_as: SignedAs::ServicePrincipal,
             region: region_of_host(host, "s3"),
             host: host.to_string(),
             source_arn: DISTRIBUTION_ARN.to_string(),
@@ -1073,10 +1036,14 @@ mod tests {
         }
     }
 
-    /// The grant is scoped to the distribution it names: the rows differ along the principal
+    /// The grant names the distribution it was written for: the rows differ along the principal
     /// the statement names, the action, the resource pattern and the `aws:SourceArn` clause.
+    ///
+    /// What this decides is WHICH spelling of the identity a document names
+    /// ([`acting_principal`]), never whether the origin serves the fetch — the origin decides
+    /// that from the same document, for the principal the call was made as.
     #[test]
-    fn only_a_grant_to_this_distribution_leaves_the_fetch_signed() {
+    fn only_a_grant_to_this_distribution_admits_the_cloudfront_principal() {
         let host = "private-origin.s3.eu-west-1.amazonaws.com";
         let subject = access(host, "s3:GetObject", "reports/held.csv");
         let another = "arn:aws:cloudfront::000000000000:distribution/E2OTHEREXAMPLE";
@@ -1171,7 +1138,7 @@ mod tests {
                 .s3_object
                 .as_ref()
                 .expect("the subject origin names an object");
-            let granted = admits(&document, &subject, object);
+            let granted = admits(&document, &subject, SERVICE_PRINCIPAL, object);
             assert_eq!(
                 granted, expected,
                 "case {case:?}: expected granted={expected}, got {granted}"
