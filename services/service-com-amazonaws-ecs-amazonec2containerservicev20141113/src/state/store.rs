@@ -3949,6 +3949,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // Nothing is on the network before the networking it runs with is in place.
             connectivity: None,
             connectivity_at: None,
+            // A service's own volume configurations are the SERVICE's
+            // (`CreateService$volumeConfigurations`) rather than a task launch's, so a task
+            // its scheduler placed carries none of its own.
+            volume_configurations: Vec::new(),
             // The networking the placement runs under, which for a service's task is the
             // service's own — the placement the image fetch is decided against.
             awsvpc_configuration: placement

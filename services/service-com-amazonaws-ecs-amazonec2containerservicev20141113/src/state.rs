@@ -148,7 +148,8 @@ use crate::ops::types::{
     ServiceRevision, ServiceRevisionLoadBalancer, ServiceRevisionSummary,
     ServiceRevisionVpcLatticeConfiguration,
     ServiceVolumeConfiguration, Setting, Tag, Task, TaskDefinition,
-    TaskDefinitionPlacementConstraint, TaskEphemeralStorage, TaskOverride, TaskSet,
+    TaskDefinitionPlacementConstraint, TaskEphemeralStorage, TaskManagedEBSVolumeConfiguration,
+    TaskOverride, TaskSet, TaskVolumeConfiguration,
     ThresholdConfiguration, UpdatedExpressGatewayService, VersionInfo, Volume,
     VpcLatticeConfiguration,
     CLUSTER_SETTING_NAME_VALUES,
@@ -194,6 +195,12 @@ pub use task_interfaces::*;
 /// deleted with the task.
 mod awsvpc_interfaces;
 pub use awsvpc_interfaces::*;
+
+/// The managed Amazon EBS volume a launch CONFIGURES AT LAUNCH: what a launch of a revision
+/// declaring one has to carry, and the volume Amazon EC2 holds for the task it is attached
+/// to.
+mod managed_ebs_volumes;
+pub use managed_ebs_volumes::*;
 
 /// Whether a launched task can fetch the images its containers run from where it was
 /// placed — read off the Amazon VPC networking the launch named — and the stop a task that
@@ -4010,10 +4017,21 @@ pub struct TaskRecord {
     /// that instant whether or not anybody called.
     pub protection_expires_at: Option<SystemTime>,
     /// The resources Amazon ECS allocated to this task: the elastic network interface an
-    /// `awsvpc` launch gets ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::mint_task_attachments`]),
+    /// `awsvpc` launch gets ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::mint_task_attachments`])
+    /// and the managed Amazon EBS volume a launch configured at launch
+    /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::mint_managed_ebs_attachments`]),
     /// each in the state the clock has taken it to or the agent last acknowledged through
-    /// `SubmitAttachmentStateChanges`. Empty for a task whose network mode allocates none.
+    /// `SubmitAttachmentStateChanges`. Empty for a task that was allocated none.
     pub attachments: Vec<AttachmentRecord>,
+    /// The volumes THIS launch configured at launch (`RunTask$volumeConfigurations`,
+    /// `StartTask$volumeConfigurations`), and an empty list for a launch that configured
+    /// none.
+    ///
+    /// Kept on the task because the volume is the one THIS task runs with: "one volume
+    /// created for each task" (`TaskManagedEBSVolumeConfiguration`), so it is what the
+    /// provisioning pass creates that volume from ([`settle_managed_ebs_volumes`]), with no
+    /// guard of this store held.
+    pub volume_configurations: Vec<TaskVolumeConfiguration>,
     /// `Task$connectivity`: "The connectivity status of a task", from the model's
     /// `Connectivity` enum (`CONNECTED`, `DISCONNECTED`), and `None` for a task whose
     /// networking is not in place yet ([`Self::report_connected`]).

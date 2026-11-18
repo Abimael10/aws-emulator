@@ -65,6 +65,11 @@ pub fn settle_task_launches<Eng: Send + Sync + 'static>(engine: &Eng) {
     // the task is provisioning, before it pulls an image or starts a container, and the
     // interface is an Amazon VPC resource ([`super::settle_task_interfaces`]).
     super::settle_task_interfaces(engine);
+    // The managed Amazon EBS volume a launch configured at launch is created in the same
+    // step, and for the same reason: Amazon ECS creates and attaches it while the task is
+    // `PROVISIONING`, before anything of the task is started, and the volume is an Amazon
+    // EC2 resource ([`super::settle_managed_ebs_volumes`]).
+    super::settle_managed_ebs_volumes(engine);
     evaluate_launch_role_assumptions(engine);
     evaluate_image_pulls(engine);
 }

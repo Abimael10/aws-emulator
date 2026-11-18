@@ -557,6 +557,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A volume the revision declared `configuredAtLaunch` is configured BY THIS CALL,
+        // matched by name, so the run has to carry that volume's configuration and every
+        // configuration it carries has to name such a volume
+        // ([`crate::state::volume_configuration_violation`]). Checked before any task is
+        // stored, since AWS places nothing when it refuses.
+        if let Some(message) = crate::state::volume_configuration_violation(
+            &definition.volumes,
+            input.volume_configurations.as_deref().unwrap_or_default(),
+        ) {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let requested = usize::try_from(count).unwrap_or(usize::MAX);
         if guard.tasks.len() + requested > crate::state::MAX_TASKS {
@@ -771,11 +787,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let task_arn = crate::state::task_arn(&region, &cluster_name, &task_id);
             // The elastic network interface an `awsvpc` task is allocated, out of the
             // networking this run launches it with.
-            let attachments = guard.mint_task_attachments(
+            let mut attachments = guard.mint_task_attachments(
                 &definition.network_mode,
                 input.network_configuration.as_ref(),
                 now,
             );
+            // And the managed Amazon EBS volume this run configured at launch, created for
+            // THIS task ("one volume created for each task") and attached to it before it is
+            // launched ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::mint_managed_ebs_attachments`]);
+            // the volume itself is created in Amazon EC2 below, with the guard dropped
+            // ([`crate::state::settle_managed_ebs_volumes`]).
+            attachments.extend(guard.mint_managed_ebs_attachments(
+                &definition.volumes,
+                input.volume_configurations.as_deref().unwrap_or_default(),
+                now,
+            ));
             let schedule =
                 crate::state::placement_schedule(awaiting_capacity, &attachments, now);
             let containers = guard.mint_containers(
@@ -865,6 +891,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // place: the interface it was allocated has to be attached first.
                 connectivity: None,
                 connectivity_at: None,
+                // The volumes THIS run configured at launch, which the volume created for
+                // this task is created from
+                // ([`crate::state::settle_managed_ebs_volumes`]).
+                volume_configurations: input.volume_configurations.clone().unwrap_or_default(),
                 // The networking this run launches the task with — the placement the
                 // image fetch is decided against.
                 awsvpc_configuration: input

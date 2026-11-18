@@ -1280,6 +1280,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             attachments: Vec::new(),
             connectivity: None,
             connectivity_at: None,
+            // A daemon task definition declares no volume to configure at launch, and the
+            // daemon scheduler's placement carries no volume configurations.
+            volume_configurations: Vec::new(),
             awsvpc_configuration: None,
             launch_failure: None,
             launch_roles_assumed: false,

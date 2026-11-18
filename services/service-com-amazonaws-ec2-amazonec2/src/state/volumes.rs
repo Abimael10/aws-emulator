@@ -1095,6 +1095,41 @@ impl ComAmazonawsEc2Amazonec2State {
         Some(volume_id)
     }
 
+    /// Record `attachment` on the volume `volume_id`, for a volume a SERVICE of this account
+    /// attached to a resource of its own, and answer whether the volume was there to attach.
+    ///
+    /// The ONE writer of such an attachment: `VolumeAttachment$AssociatedResource` is "the
+    /// ARN of the Amazon Web Services-managed resource to which the volume is attached" and
+    /// `InstanceOwningService` "the service principal of the Amazon Web Services service that
+    /// owns the underlying resource", each "returned only for volumes that are attached to
+    /// Amazon Web Services-managed resources" — so a service that provisions a volume for a
+    /// resource of its own records the attachment here and `DescribeVolumes` reports the
+    /// volume `in-use` with it, exactly as it reports an instance's own attachment
+    /// ([`VolumeRecord::attachments_at`]). `ec2:AttachVolume` keeps its own path: the
+    /// attachment it makes is to an INSTANCE and is one the clock owes `attached`.
+    ///
+    /// The moves the clock already finished for this volume are materialised first, so the
+    /// record holds only what a reader is already being shown and nothing is owed on an
+    /// attachment that is gone — the same order `ec2:AttachVolume` writes in.
+    pub fn attach_volume_to_managed_resource(
+        &mut self,
+        volume_id: &str,
+        attachment: AttachVolumeOutput,
+    ) -> bool {
+        let now = Instant::now();
+        let Some(record) = self.volumes.get_mut(volume_id) else {
+            return false;
+        };
+        record.materialize_due_detachments(now);
+        record.materialize_due_attachments(now);
+        record
+            .view
+            .attachments
+            .get_or_insert_with(Vec::new)
+            .push(attachment);
+        true
+    }
+
     /// Whether the account holds an EBS snapshot under `snapshot_id`.
     ///
     /// The ONE reading of "does this snapshot exist" for a validator that only has to
