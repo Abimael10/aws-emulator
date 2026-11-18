@@ -25,7 +25,7 @@
 //! settings the request states (none, and each at a published bound) and whether the
 //! mapping is enabled.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -684,11 +684,85 @@ pub(crate) async fn send_message(
     if let Some(group) = group {
         request["MessageGroupId"] = json!(group);
     }
-    let (status, sent) = call_sqs(router, "SendMessage", &request).await;
+    dispatch_send(router, case, &request).await;
+}
+
+/// `SendMessage` of `body` to the queue `url` addresses, carrying the `MessageAttributes` map
+/// `attributes` states — the member a suite over what a DELIVERY reports of a message needs,
+/// and the only thing it adds to the send above.
+pub(crate) async fn send_attributed_message(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    body: &str,
+    attributes: &Value,
+) {
+    let request = json!({
+        "QueueUrl": url,
+        "MessageBody": body,
+        "MessageAttributes": attributes,
+    });
+    dispatch_send(router, case, &request).await;
+}
+
+/// Dispatch one `SendMessage` that must be accepted: the one place these suites assert that.
+async fn dispatch_send(router: &MultiServiceRouter, case: &str, request: &Value) {
+    let (status, sent) = call_sqs(router, "SendMessage", request).await;
     assert_eq!(
         status, 200,
         "case {case:?}: expected SendMessage to answer 200, got {status} {sent}"
     );
+}
+
+/// Every record a handler has FORWARDED to the sink queue `url` addresses so far, keyed by the
+/// `body` each record reports — read until `wanted` of them have arrived or `budget` is out.
+///
+/// THE ONE reader of such a sink in these suites: a handler that forwards the record it was
+/// handed is how every suite over an event source makes a delivery observable, so the receive,
+/// its 200 and the parse of each forwarded record live here rather than in a copy per suite.
+/// Nothing is deleted and each receive hides what it hands over for long enough that this
+/// reader is not handed the same record twice while the rest arrive.
+pub(crate) async fn forwarded_records(
+    router: &MultiServiceRouter,
+    url: &str,
+    wanted: usize,
+    budget: Duration,
+) -> BTreeMap<String, Value> {
+    let mut records: BTreeMap<String, Value> = BTreeMap::new();
+    let deadline = Instant::now() + budget;
+    while records.len() < wanted && Instant::now() < deadline {
+        let (status, answered) = call_sqs(
+            router,
+            "ReceiveMessage",
+            &json!({
+                "QueueUrl": url,
+                "MaxNumberOfMessages": 10,
+                "VisibilityTimeout": 300,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "expected ReceiveMessage on the sink queue to answer 200, got {status} {answered}"
+        );
+        for message in answered["Messages"].as_array().cloned().unwrap_or_default() {
+            let text = message["Body"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a forwarded message with no Body: {message}"));
+            let record: Value = serde_json::from_str(text).unwrap_or_else(|error| {
+                panic!("a forwarded record that is not JSON: {text} ({error})")
+            });
+            let body = record["body"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a forwarded record carrying no body: {record}"))
+                .to_string();
+            records.insert(body, record);
+        }
+        if records.len() < wanted {
+            tokio::time::sleep(LOOK_AGAIN).await;
+        }
+    }
+    records
 }
 
 /// Lambda over the SAME engine as Amazon SQS, so a mapping resolves and polls the queue in

@@ -179,6 +179,8 @@ use crate::ops::types::{
 pub mod authorization;
 /// What a message attribute a send supplies has to look like, name and typed value alike.
 mod message_attributes;
+/// When a consumer waiting for this store's next message is told that one is there.
+pub mod message_arrivals;
 /// The bounds a queue policy is held to, and the wording of every refusal a grant or a
 /// revoke answers with.
 mod permissions;
@@ -192,6 +194,7 @@ mod redrive;
 /// Whether a send is a delivery another service is handing the queue as its own service
 /// principal, on behalf of one of its own resources, rather than a client's own request.
 pub mod service_delivery;
+pub use message_arrivals::*;
 pub use message_attributes::*;
 pub use permissions::*;
 pub use queue_depth_metrics::*;
@@ -1162,6 +1165,11 @@ pub struct ComAmazonawsSqsAmazonsqsState {
     /// Read through [`Self::live_data_key`], which answers only a key that may still be
     /// reused; see [`data_keys`] for the window.
     pub data_keys: BTreeMap<(String, String), data_keys::QueueDataKey>,
+    /// What a consumer waiting for this store's next message waits on: every send signals it,
+    /// so an in-process consumer is handed the message as soon as it is enqueued rather than
+    /// on the next tick of a cadence of its own. A wake-up and not state — see
+    /// [`message_arrivals`].
+    pub arrivals: message_arrivals::MessageArrivals,
 }
 
 /// A stored queue: the state the reported `Attributes` map is rebuilt from, plus the

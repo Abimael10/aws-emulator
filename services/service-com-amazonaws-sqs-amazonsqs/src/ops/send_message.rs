@@ -592,6 +592,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One message was added to this queue, of the size Amazon SQS measures a message at:
         // what the `AWS/SQS` sent counters count (`sqs::QueueTraffic`).
         queue.count_sent(size, now);
+        // And a consumer waiting for this store's next message is told there is one, so it is
+        // handed the message as soon as it is enqueued rather than on the next tick of a
+        // cadence of its own ([`sqs::message_arrivals`]).
+        state.note_message_arrival();
 
         Ok(SendMessageOutput {
             md5_of_message_body: Some(md5_of_body),

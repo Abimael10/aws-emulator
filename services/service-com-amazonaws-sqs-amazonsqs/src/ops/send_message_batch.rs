@@ -592,6 +592,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // A consumer waiting for this store's next message is told there is one, once for
+        // the batch: it reads the queue itself, so one wake-up covers every entry this
+        // request enqueued ([`sqs::message_arrivals`]).
+        if !successful.is_empty() {
+            state.note_message_arrival();
+        }
+
         Ok(SendMessageBatchOutput { successful, failed })
     }
 }

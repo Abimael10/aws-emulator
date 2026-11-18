@@ -1,15 +1,16 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lambda__sqs.sqs-esm-message-attributes-keep-type-and-bytes lambda__sqs.function-sdk-send-to-unpermitted-queue-denied-as-function-error lambda__sqs.esm-filter-criteria-non-matching-not-invoked
+Issue-Trace-Ids: lambda__sqs.sqs-esm-message-attributes-keep-type-and-bytes lambda__sqs.function-sdk-send-to-unpermitted-queue-denied-as-function-error
 Issue-Key: lambda__sqs.sqs-esm-message-attributes-keep-type-and-bytes|run#13|AssertionError|assert ma[name].get("stringValue") == want["StringValue"], (
 Issue-Key: lambda__sqs.function-sdk-send-to-unpermitted-queue-denied-as-function-error|run#14|AssertionError|assert err == "Unhandled", f"the unpermitted SendMessage gave FunctionError {err!r}: {out!r}"
-Issue-Key: lambda__sqs.esm-filter-criteria-non-matching-not-invoked|_collect#14|Timeout|resp = sqs.receive_message(
 Issue-Commit: 2b63d043efdd2fa9855b978e8c81153e1c6b6b87
 
 # lambda__sqs: a Number message attribute is not normalized in the delivered ESM record, an unpermitted SendMessage succeeds, and the filter-criteria scenario never settles (3 causes)
 
 > _Note: this issue was identified against the code base at commit `2b63d043efdd2fa9855b978e8c81153e1c6b6b87`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+> _Provenance: this report covers causes 1 and 2, which are fixed. Cause 3 (the filter-criteria check reaching no verdict) is unfixed and is re-filed as `issues/things-that-do-not-work/20261118T000000Z-lambda-sqs-the-filter-criteria-check-reaches-no-verdict.md`, so it is not recorded as working; its `Issue-Key` and trace id moved with it._
 
 ## Operation
 SendMessage
@@ -50,3 +51,36 @@ Cause 3 — expected: a non-matching message never invokes the function while a 
 2. Cause 2: invoke a function whose role has no sqs:SendMessage for the target queue and whose handler sends to it. The invoke returns a messageId with FunctionError unset.
 3. Cause 3: create a mapping with FilterCriteria and send a non-matching message. The check is killed at 60 s with no verdict.
 4. Replay the three check ids in trace_ids.
+
+## Fix record
+
+Causes 1 and 2 are fixed and both replay keys pass. A `Number` message attribute is stored and
+delivered in the plain decimal of the number it names, and each digest covers the set the answer
+it stands in reports (`service-com-amazonaws-sqs-amazonsqs/src/state/message_attributes.rs`,
+pinned by `service-com-amazonaws-lambda-awsgirapiservice/tests/all/sqs_event_source_record_attributes.rs`).
+A call a handler makes with its execution-role session is decided by the policies in force on
+that role at the instant of the call, so an unpermitted `SendMessage` is refused and the raise
+propagates out of the handler as `FunctionError`
+(`service-com-amazonaws-sqs-amazonsqs/src/ops/send_message.rs`).
+
+Cause 3's BEHAVIOUR is correct and is now pinned end to end by
+`service-com-amazonaws-lambda-awsgirapiservice/tests/all/sqs_event_source_filter_criteria.rs`:
+a message at least one `FilterCriteria` pattern matches is handed to the function, one none of
+them matches is not, and either way the message leaves the queue. Measured against the recorded
+check (the emulator instrumented and the check replayed): the whole scenario is served 9 s into
+the check — the non-matching message is deleted without any invocation, the matching one is
+invoked and its record forwarded, and the check takes that record 2 s after it was sent — after
+which the check polls an empty sink queue for the remaining ~50 s of its own collection window
+and is killed by the harness's 60-second budget.
+
+What is still OPEN is therefore not the filter but that budget, and it is re-filed on its own as
+`issues/things-that-do-not-work/20261118T000000Z-lambda-sqs-the-filter-criteria-check-reaches-no-verdict.md`,
+carrying this check's `Issue-Key` and trace id. In short: the check overruns the budget by about
+a second, and the second is the python execution environment, which this emulator builds on a
+function's FIRST invocation (measured: 1.183 s cold, 20 ms warm) while AWS has built it before
+the function reports `Active`. Pre-provisioning that environment — a two-phase warm pool across
+`state/execution/python.rs` and `state/execution/warm_pool.rs` — is a core execution-engine
+change rather than an event-source-mapping one. The alternative, answering a terminal `State`
+from `CreateFunction` and `CreateEventSourceMapping` (each of whose 500 ms transient costs a
+polling client a whole poll round: 2 s and 5 s in this check), would delete states AWS itself
+reports and this crate's suites pin, so it was not taken.

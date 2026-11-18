@@ -319,8 +319,10 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # `time` on top of the workspace features: the data-plane tests wait out the state-settle
 # span and the poller's passes with `tokio::time::sleep`, and `io-util` for the listener the
 # socket tests open on this emulator's own core: its protocol handler reads and writes the
-# connection the core hands it.
-tokio = { workspace = true, features = ["io-util", "time"] }
+# connection the core hands it. `test-util` for the PAUSED clock a unit test over the poll
+# loop's own wait runs on, so the case that lets the loop's interval run out advances virtual
+# time instead of sleeping (`state::sqs_poller`).
+tokio = { workspace = true, features = ["io-util", "test-util", "time"] }
 # The services a mapping's event source and its own metrics live in are mounted beside
 # lambda on ONE engine in the data-plane tests, because a delivery is asserted where a
 # client sees it: on the stream the records were put to, and in the series CloudWatch

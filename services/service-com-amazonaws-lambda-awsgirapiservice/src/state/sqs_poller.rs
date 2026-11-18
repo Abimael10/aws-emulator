@@ -368,10 +368,15 @@ async fn poll_one_mapping<Eng: Send + Sync + 'static>(
     // The store this poller's mapping lives in, held beside the claim so the claim itself can
     // be released through a lock taken here.
     let state = ::engine::ServiceState::clone(&claim.state);
+    // What the queues tell a waiting consumer: the signal every send to this engine's Amazon
+    // SQS store raises ([`sqs::state::message_arrivals`]), resolved once because the handle
+    // does not change. An engine holding no queue store has none, and this poller then keeps
+    // its own cadence alone.
+    let arrivals = sqs::state::message_arrivals(engine);
     loop {
         // Every wake-up waits, which is what hands the runtime back between passes. No lock
         // is held across it.
-        ::tokio::time::sleep(POLL_INTERVAL).await;
+        wait_for_the_next_pass(arrivals.as_ref()).await;
         // Whether this mapping still wants polling, and the claim's release, happen in ONE
         // critical section, which is what makes the hand-over race-free: either this poller
         // keeps the mapping, or the call that re-arms the pollers finds the claim free and
@@ -393,6 +398,51 @@ async fn poll_one_mapping<Eng: Send + Sync + 'static>(
         )
         .await;
     }
+}
+
+/// Wait for the next pass of this mapping's poller: until a message ARRIVES on one of this
+/// engine's queues, and at most [`POLL_INTERVAL`].
+///
+/// "Lambda reads items from the event source and invokes the function", and the read AWS makes
+/// is a LONG POLL — "if a message is available, the call returns sooner than
+/// `WaitTimeSeconds`" (`ReceiveMessageRequest$WaitTimeSeconds`) — so a message a client sends
+/// is handed to the mapping's function as soon as it is on the queue rather than whenever the
+/// consumer next happens to look. This poller's consumer reads the queue through the store
+/// instead of over the wire, so the store TELLS it ([`sqs::state::message_arrivals`]): a send
+/// wakes every poller waiting on that store, and the batch the pass that follows takes is the
+/// one that was just sent. A poller whose own queue got nothing finds nothing and waits again,
+/// and nothing is lost when a send lands mid-pass, because the signal keeps a permit for the
+/// one that waits next.
+///
+/// The interval is the CEILING on the wait and not the cadence of it, because a pass also
+/// does the work the CLOCK owes — a visibility timeout lapsing, a redrive becoming due, a
+/// batching window running out — which no send signals. An engine with no queue store to
+/// signal (nothing to poll either) keeps the interval alone.
+async fn wait_for_the_next_pass(arrivals: Option<&sqs::state::MessageArrivals>) -> NextPass {
+    match arrivals {
+        Some(arrivals) => {
+            // The wait is bounded whether or not anything arrives, so the clock-driven work
+            // of a pass is never held up by a quiet queue.
+            match ::tokio::time::timeout(POLL_INTERVAL, arrivals.notified()).await {
+                Ok(()) => NextPass::Arrival,
+                Err(_) => NextPass::Interval,
+            }
+        }
+        None => {
+            ::tokio::time::sleep(POLL_INTERVAL).await;
+            NextPass::Interval
+        }
+    }
+}
+
+/// What ended a wait for the next pass.
+#[derive(Debug, PartialEq, Eq)]
+enum NextPass {
+    /// A message arrived on one of this engine's queues, so the pass that follows takes it.
+    Arrival,
+    /// Nothing arrived inside [`POLL_INTERVAL`]: the pass that follows is the one the cadence
+    /// owes, which is what does the work the clock owes on a quiet queue.
+    Interval,
 }
 
 /// Take the one poll claim of `engine`'s store, so the passes of its queue mappings are the
@@ -1608,9 +1658,44 @@ mod tests {
     use ::service_com_amazonaws_sqs_amazonsqs::ops::types::shared_types::MessageAttributeValue;
 
     use super::{
-        filter_event, invisible_for_seconds, minute_of, queue_event, queue_record, PolledMessage,
-        RECORD_MD5_OF_MESSAGE_ATTRIBUTES,
+        filter_event, invisible_for_seconds, minute_of, queue_event, queue_record,
+        wait_for_the_next_pass, NextPass, PolledMessage, RECORD_MD5_OF_MESSAGE_ATTRIBUTES,
     };
+
+    /// RULE: the wait between two passes ends the instant a message ARRIVES on one of the
+    /// engine's queues, and otherwise when the loop's own interval is up — so a message a
+    /// client sends is taken by the pass that follows it rather than by whichever pass the
+    /// cadence happens to make next, while the work the clock owes on a quiet queue is still
+    /// done every interval.
+    ///
+    /// The cases differ along what the wait has to go on: an arrival already signalled (the
+    /// send that landed while the previous pass was running), a store with nothing signalled,
+    /// and an engine that holds no queue store to signal at all.
+    ///
+    /// The clock is PAUSED, so the two cases that run the wait out advance virtual time
+    /// instead of sleeping: what each assertion reads is why the wait ended, never how long it
+    /// took.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_arrival_ends_the_wait_before_the_interval_does() {
+        let arrivals: sqs::state::MessageArrivals =
+            ::std::sync::Arc::new(::tokio::sync::Notify::new());
+        arrivals.notify_one();
+        assert_eq!(
+            wait_for_the_next_pass(Some(&arrivals)).await,
+            NextPass::Arrival,
+            "case \"an arrival was signalled\": the wait must end on the arrival"
+        );
+        assert_eq!(
+            wait_for_the_next_pass(Some(&arrivals)).await,
+            NextPass::Interval,
+            "case \"nothing has arrived\": the wait must end on the loop's own interval"
+        );
+        assert_eq!(
+            wait_for_the_next_pass(None).await,
+            NextPass::Interval,
+            "case \"no queue store to signal\": the wait must end on the loop's own interval"
+        );
+    }
 
     /// The queue every envelope row below is built for, and the Region it lives in.
     const QUEUE_ARN: &str = "arn:aws:sqs:us-east-1:000000000000:orders";

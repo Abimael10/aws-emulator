@@ -30,7 +30,7 @@
 //! suite drives the same wire as every other over this surface.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
 use md5::{Digest, Md5};
@@ -39,7 +39,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
     await_mapping_state, call_sqs, create_mapping, create_queue, create_running_function,
-    router_with_queues, LOOK_AGAIN,
+    forwarded_records, router_with_queues,
 };
 
 /// The `State` a mapping reports once it polls its event source
@@ -319,51 +319,6 @@ async fn send_row(router: &MultiServiceRouter, url: &str, row: &Row) -> String {
         .to_string()
 }
 
-/// Every record the handler has forwarded to the sink queue so far, keyed by the `body` it
-/// reports — read until `wanted` of them have arrived or the budget is out.
-async fn forwarded_records(
-    router: &MultiServiceRouter,
-    url: &str,
-    wanted: usize,
-) -> BTreeMap<String, Value> {
-    let mut records: BTreeMap<String, Value> = BTreeMap::new();
-    let deadline = Instant::now() + BUDGET;
-    while records.len() < wanted && Instant::now() < deadline {
-        let (status, answered) = call_sqs(
-            router,
-            "ReceiveMessage",
-            &json!({
-                "QueueUrl": url,
-                "MaxNumberOfMessages": 10,
-                // Long enough that a record counted here is not handed over again while the
-                // rest arrive.
-                "VisibilityTimeout": 300,
-            }),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "expected ReceiveMessage on the sink queue to answer 200, got {status} {answered}"
-        );
-        for message in answered["Messages"].as_array().cloned().unwrap_or_default() {
-            let text = message["Body"]
-                .as_str()
-                .unwrap_or_else(|| panic!("a forwarded message with no Body: {message}"));
-            let record: Value = serde_json::from_str(text)
-                .unwrap_or_else(|error| panic!("a forwarded record that is not JSON: {text} ({error})"));
-            let body = record["body"]
-                .as_str()
-                .unwrap_or_else(|| panic!("a forwarded record carrying no body: {record}"))
-                .to_string();
-            records.insert(body, record);
-        }
-        if records.len() < wanted {
-            tokio::time::sleep(LOOK_AGAIN).await;
-        }
-    }
-    records
-}
-
 /// One `attributes` entry of a record, as text.
 fn attribute(record: &Value, name: &str) -> String {
     record["attributes"][name]
@@ -424,7 +379,7 @@ async fn a_delivered_record_reports_the_message_the_queue_holds() {
         sent_ids.insert(body_of(row), send_row(&router, &source_url, row).await);
     }
 
-    let records = forwarded_records(&router, &sink_url, rows.len()).await;
+    let records = forwarded_records(&router, &sink_url, rows.len(), BUDGET).await;
     assert_eq!(
         records.len(),
         rows.len(),
