@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectVpcPeeringConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RejectVpcPeeringConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: refuses the peering request the store holds for the id the request names,
+//! moving it out of the state it was waiting to be answered in into `rejected`, and answers
+//! `true`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RejectVpcPeeringConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## Which connections it refuses
+//!
+//! "The VPC peering connection must be in the pending-acceptance state" (the contract
+//! reproduced below): a rejection is the ANSWER to a request that is still waiting, so
+//! [`RejectVpcPeeringConnection::handle`] asks the same three questions its counterpart
+//! `AcceptVpcPeeringConnection` asks — whose accepter VPC it is, which Region the call was
+//! made in, and whether the connection is one an answer can still be given for — and differs
+//! only in the answer it records.
+//!
+//! The two states a request passes through while it waits are both refusable,
+//! `initiating-request` included: that is the state the create's own answer reports and the
+//! real service leaves inside that call, so a rejection issued straight after a create is
+//! served. Every other state is one the request has already been answered in or has left —
+//! one that was accepted, one being set up, one that failed, one nobody answered in time, one
+//! already rejected and one on its way out or gone — and for each of those there is no
+//! request left to answer: "To delete an active VPC peering connection, or to delete a VPC
+//! peering connection request that you initiated, use DeleteVpcPeeringConnection".
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +151,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RejectVpcPeeringConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RejectVpcPeeringConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RejectVpcPeeringConnection"))
+        use crate::state;
+
+        // The Region this request was signed for: a rejection answers the request the accepter
+        // VPC's owner was sent, and that VPC is in one Region, so WHERE the call was made is
+        // part of whether it may be served — the same reading `AcceptVpcPeeringConnection`
+        // makes of the other answer to the same request.
+        let region = state::request_region(ctx.parts());
+
+        // A value that is no peering connection id at all names no connection in any account,
+        // so it is refused as malformed BEFORE the store is asked about it and before the
+        // DryRun arm below — the ordering `require_well_formed_id` holds every resource of
+        // this crate to.
+        state::require_well_formed_id(
+            state::VPC_PEERING_CONNECTION_ID_PREFIX,
+            &input.vpc_peering_connection_id,
+            state::INVALID_VPC_PEERING_CONNECTION_ID_MALFORMED,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation" (`DryRun`): the flag asks about
+        // PERMISSION, not about the named connection, so it is answered once the request's own
+        // form has been checked and before anything is resolved — the point the other answer
+        // to the same request answers it at (`AcceptVpcPeeringConnection`) — and every caller
+        // the authorization gate admitted is permitted. Nothing is written on this path.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first: a request that reached `pending-acceptance`, and one whose own
+        // expiry has passed, moved at those instants whether or not anybody called — so
+        // whether this rejection is admissible is asked of the state the request is ACTUALLY
+        // in rather than of the one the last caller left it in.
+        store.materialize_due_transitions();
+
+        // "Use the DescribeVpcPeeringConnections request to view your outstanding VPC peering
+        // connection requests" (`RejectVpcPeeringConnection`): an id this account holds no
+        // connection for names nothing to reject, and is refused with the code every operation
+        // of this crate refuses an unknown peering connection id with.
+        let Some(record) = store
+            .vpc_peering_connections
+            .get(&input.vpc_peering_connection_id)
+        else {
+            return Err(state::invalid_vpc_peering_connection_id_not_found(
+                &input.vpc_peering_connection_id,
+            ));
+        };
+        let accepter = record.view.accepter_vpc_info.clone().unwrap_or_default();
+        let status_code = record
+            .view
+            .status
+            .as_ref()
+            .and_then(|status| status.code.clone())
+            .unwrap_or_default();
+
+        // A rejection is the accepter's answer to the request, so the standing it takes is the
+        // standing an acceptance takes: the accepter's owner is the account the connection
+        // records for that side, and this emulator serves one account, so a request whose
+        // accepter belongs to another is not this caller's to answer.
+        let caller_account_id = ::engine::emulator_account_id();
+        let accepter_owner_id = accepter.owner_id.unwrap_or_default();
+        if accepter_owner_id != caller_account_id {
+            return Err(state::vpc_peering_connection_wrong_account(
+                caller_account_id,
+                &input.vpc_peering_connection_id,
+                &accepter_owner_id,
+            ));
+        }
+        // And a request whose accepter VPC is in another Region is answered in that Region, so
+        // a call made anywhere else is refused and the request is left waiting for the Region
+        // that can answer it.
+        let accepter_region = accepter.region.unwrap_or_default();
+        if accepter_region != region {
+            return Err(state::vpc_peering_connection_wrong_region(
+                &region,
+                &input.vpc_peering_connection_id,
+                &accepter_region,
+            ));
+        }
+        // "The VPC peering connection must be in the pending-acceptance state": what a
+        // rejection answers is a request that is still WAITING — one on its way in included,
+        // the real service leaving that state inside the call that mints it, so a rejection
+        // issued straight after a create is served. Every other state is one the request has
+        // already been answered in or has left, and there is no request left to refuse:
+        // nothing is written, and the refusal names the state the connection IS in, the way
+        // every refusal of this family's lifecycle does.
+        if !state::vpc_peering_connection_awaits_acceptance(Some(status_code.as_str())) {
+            return Err(state::vpc_peering_connection_invalid_state_transition(
+                &input.vpc_peering_connection_id,
+                &status_code,
+            ));
+        }
+
+        // The rejection itself, through the store's ONE writer of one, which settles the state
+        // the connection is reported in from here on.
+        if !store.reject_vpc_peering_connection(&input.vpc_peering_connection_id) {
+            return Err(state::internal_error(
+                "the VPC peering connection checked a moment ago could not be rejected",
+            ));
+        }
+
+        // "Returns true if the request succeeds; otherwise, it returns an error" (`$Return`).
+        Ok(RejectVpcPeeringConnectionOutput {
+            r#return: Some(true),
+        })
     }
 }

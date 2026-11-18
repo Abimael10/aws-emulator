@@ -16,7 +16,9 @@
 //!
 //! What the peering operations share lives here — the id mint, the status words, the
 //! `initiating-request` -> `pending-acceptance` move the clock owes a fresh request, the
-//! expiry of a request nobody answered, the `deleting` -> `deleted` move a deletion is owed
+//! expiry of a request nobody answered, the `rejected` state a refusal records
+//! ([`ComAmazonawsEc2Amazonec2State::reject_vpc_peering_connection`]), the
+//! `deleting` -> `deleted` move a deletion is owed
 //! ([`ComAmazonawsEc2Amazonec2State::delete_vpc_peering_connection`]), the ceilings and the
 //! refusals — so no two of them can report one connection differently.
 
@@ -69,6 +71,11 @@ pub const VPC_PEERING_CONNECTION_STATE_FAILED: &str = "failed";
 /// peering connection request expires after 7 days, after which it cannot be accepted or
 /// rejected" (`CreateVpcPeeringConnection`).
 pub const VPC_PEERING_CONNECTION_STATE_EXPIRED: &str = "expired";
+
+/// A peering request the owner of the accepter VPC refused: the same enum's `rejected`
+/// member — "Rejects a VPC peering connection request" (`RejectVpcPeeringConnection`), the
+/// state [`ComAmazonawsEc2Amazonec2State::reject_vpc_peering_connection`] writes.
+pub const VPC_PEERING_CONNECTION_STATE_REJECTED: &str = "rejected";
 
 /// A connection a delete has been asked for and is still on its way out: the same enum's
 /// `deleting` member, the transient state
@@ -174,6 +181,11 @@ pub const VPC_PEERING_CONNECTION_PROVISIONING_MESSAGE: &str = "Provisioning";
 /// [`VPC_PEERING_CONNECTION_STATE_ACTIVE`].
 pub const VPC_PEERING_CONNECTION_ACTIVE_MESSAGE: &str = "Active";
 
+/// The `VpcPeeringConnectionStateReason$Message` of a request the accepter's owner refused:
+/// the connection carries no traffic and never will, the request having been answered no. It
+/// names no account, as the states a request reaches after it stops waiting do not.
+pub const VPC_PEERING_CONNECTION_REJECTED_MESSAGE: &str = "Inactive";
+
 /// The `VpcPeeringConnectionStateReason$Message` that goes with `code`, or `None` for a
 /// state EC2 reports no message for — "A message that provides more information about the
 /// status, IF APPLICABLE" (`VpcPeeringConnectionStateReason$Message`).
@@ -205,6 +217,9 @@ pub fn vpc_peering_connection_state_message(
         }
         VPC_PEERING_CONNECTION_STATE_FAILED => {
             Some(VPC_PEERING_CONNECTION_FAILED_MESSAGE.to_string())
+        }
+        VPC_PEERING_CONNECTION_STATE_REJECTED => {
+            Some(VPC_PEERING_CONNECTION_REJECTED_MESSAGE.to_string())
         }
         _ => None,
     }
@@ -644,6 +659,55 @@ impl ComAmazonawsEc2Amazonec2State {
         // the describe that follows it cannot answer differently.
         let accepted = record.clone();
         Some(self.vpc_peering_connection_view(&accepted))
+    }
+
+    /// Record the refusal of the peering request `vpc_peering_connection_id` names, and
+    /// answer whether this store held one to refuse.
+    ///
+    /// The ONE writer of a rejection, as [`Self::accept_vpc_peering_connection`] is of an
+    /// acceptance: the request leaves the state it was waiting in for
+    /// [`VPC_PEERING_CONNECTION_STATE_REJECTED`], which is terminal — a refused request is
+    /// answered, so the clock owes it nothing further and it holds its pair no longer
+    /// ([`vpc_peering_connection_holds_its_pair`]), the same two VPCs being free to be peered
+    /// again.
+    ///
+    /// Two facts follow the refusal, both for the same reason a deletion's do
+    /// ([`Self::delete_vpc_peering_connection`]): the connection will never carry traffic, so
+    /// every route whose target is it is `blackhole` — "the `blackhole` state indicates that
+    /// the route's target isn't available" (`Route$State`) — and it expires at no instant,
+    /// "the time that an UNACCEPTED VPC peering connection will expire"
+    /// (`VpcPeeringConnection$ExpirationTime`) being a fact of a request nobody has answered.
+    ///
+    /// Whether the connection is in a state that admits a refusal is the CALLER's question,
+    /// the way it is for an acceptance: it is asked of the request alongside who may answer it
+    /// and where ([`vpc_peering_connection_invalid_state_transition`] is how it refuses one
+    /// that is not).
+    pub fn reject_vpc_peering_connection(&mut self, vpc_peering_connection_id: &str) -> bool {
+        let Some(record) = self
+            .vpc_peering_connections
+            .get_mut(vpc_peering_connection_id)
+        else {
+            return false;
+        };
+        record.view.status = Some(VpcPeeringConnectionStateReason {
+            code: Some(VPC_PEERING_CONNECTION_STATE_REJECTED.to_string()),
+            // Through the ONE mapping from a status to the sentence reported beside it, so a
+            // refused request is worded the same however it is read back. The accepter's
+            // account is passed for the shape of that mapping; this state names none.
+            message: vpc_peering_connection_state_message(
+                VPC_PEERING_CONNECTION_STATE_REJECTED,
+                record
+                    .view
+                    .accepter_vpc_info
+                    .as_ref()
+                    .and_then(|info| info.owner_id.as_deref())
+                    .unwrap_or_default(),
+            ),
+        });
+        record.view.expiration_time = None;
+        record.pending = None;
+        self.blackhole_routes_to_vpc_peering_connection(vpc_peering_connection_id);
+        true
     }
 
     /// Whether the two VPCs `spec` names have overlapping address space, as far as this
