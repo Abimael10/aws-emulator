@@ -19,19 +19,26 @@
 //! The suites are TABLES: each row is one input of the class the rule covers (which
 //! target blocks the policy sets, target values at their modelled bounds, each disaster
 //! recovery approach, no policy at all, a policy ARN that resolves to nothing, a policy
-//! swapped for another one), not one recorded request.
+//! swapped for another one, a policy DELETED while services reference it), not one
+//! recorded request.
 
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_resiliencehubv2_ngrhservicecore::state::{
+    arn_resource_id, POLICY_RESOURCE_TYPE,
+};
 use service_com_amazonaws_resiliencehubv2_ngrhservicecore::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The modelled routes these suites drive.
 const CREATE_POLICY: &str = "/v2/create-policy";
+const GET_POLICY: &str = "/v2/get-policy";
+const DELETE_POLICY: &str = "/v2/delete-policy";
 const CREATE_SERVICE: &str = "/v2/create-service";
 const GET_SERVICE: &str = "/v2/get-service";
 const UPDATE_SERVICE: &str = "/v2/update-service";
+const LIST_SERVICES: &str = "/v2/list-services";
 
 /// The Region these suites sign for.
 const REGION: &str = "us-east-1";
@@ -486,6 +493,219 @@ async fn reattaching_a_policy_rederives_the_values_the_service_reports() {
     .await;
     let updated = service_of(case, status, &answered);
     let expected = derived_from(&second_body, "SecondAttached", SOURCE_SELF);
+    assert_effective(case, &updated, &expected);
+
+    let (status, answered) = get_service(&router, &service_arn).await;
+    let read_back = service_of(case, status, &answered);
+    assert_effective(case, &read_back, &expected);
+}
+
+// ---------------------------------------------------------------------------
+// The same rule, reached by DELETING the policy the values are derived from
+// ---------------------------------------------------------------------------
+
+async fn get_policy(router: &MultiServiceRouter, policy_arn: &str) -> (u16, Value) {
+    call(
+        router,
+        "GET",
+        &format!("{GET_POLICY}?policyArn={policy_arn}"),
+        None,
+    )
+    .await
+}
+
+/// `DeletePolicy` for `policy_arn`, asserting it answered the ARN it removed.
+async fn delete_policy(router: &MultiServiceRouter, case: &str, policy_arn: &str) {
+    let (status, answered) = call(
+        router,
+        "POST",
+        DELETE_POLICY,
+        Some(json!({"policyArn": policy_arn})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: deleting {policy_arn} expected HTTP 200, got {status} {answered:?}"
+    );
+    assert_eq!(
+        answered["policyArn"].as_str(),
+        Some(policy_arn),
+        "case {case:?}: the delete must answer the ARN it removed, got {:?}",
+        answered["policyArn"]
+    );
+}
+
+/// The `serviceArn`s `ListServices` reports for the services whose `policyArn` filter
+/// member equals `policy_arn`, in the order the listing returned them.
+async fn services_filtered_by_policy(
+    router: &MultiServiceRouter,
+    case: &str,
+    policy_arn: &str,
+) -> Vec<String> {
+    let (status, answered) = call(
+        router,
+        "GET",
+        &format!("{LIST_SERVICES}?policyArn={policy_arn}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: listing services for {policy_arn} expected HTTP 200, got {status} \
+         {answered:?}"
+    );
+    let summaries = answered["serviceSummaries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: no serviceSummaries list in {answered:?}"));
+    summaries
+        .iter()
+        .map(|summary| {
+            summary["serviceArn"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no serviceArn in {summary:?}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// Assert `answered` is the not-found refusal a policy reader answers for `policy_arn`.
+fn assert_policy_gone(case: &str, policy_arn: &str, status: u16, answered: &Value) {
+    assert_eq!(
+        status, 404,
+        "case {case:?}: expected HTTP 404 for the deleted {policy_arn}, got {status} \
+         {answered:?}"
+    );
+    let resource_id = arn_resource_id(policy_arn);
+    let expected = format!("{POLICY_RESOURCE_TYPE} not found: {resource_id}");
+    assert_eq!(
+        answered["message"].as_str(),
+        Some(expected.as_str()),
+        "case {case:?}: expected message {expected:?}, got {:?}",
+        answered["message"]
+    );
+}
+
+#[tokio::test]
+async fn deleting_the_referenced_policy_clears_the_values_and_keeps_the_pointer() {
+    // The rule reached from the other side: because a service's `effectivePolicyValues`
+    // are RESOLVED from the policy store on every projection, removing the policy leaves
+    // every service that references it deriving nothing, while the service's own stored
+    // `policyArn` member — the caller's input, not a derived value — survives.
+    //
+    // Rows are the derivation table: the policy deleted differs along which target blocks
+    // it set, so the entries that have to disappear differ with it. Each row attaches the
+    // policy to TWO services, so the delete is asserted over every service that referenced
+    // it, not just one.
+    let router = emulator();
+
+    // A policy no delete touches, with a service of its own: the control that shows a
+    // delete clears the values derived from the DELETED policy and nothing else.
+    let control_case = "a service attached to a policy that is never deleted";
+    let control_body = json!({
+        "name": "SurvivingPolicy",
+        "availabilitySlo": {"target": 92.5},
+        "multiAz": {"rtoInMinutes": 20, "disasterRecoveryApproach": "HOT_STANDBY"},
+    });
+    let control_policy = create_policy(&router, control_case, control_body.clone()).await;
+    let control_expected = derived_from(&control_body, "SurvivingPolicy", SOURCE_SELF);
+    let (status, answered) = create_service(&router, "SvcSurviving", Some(&control_policy)).await;
+    let control_service = service_arn_of(control_case, &service_of(control_case, status, &answered));
+
+    for row in derivation_rows() {
+        let case = row.label;
+        let body = policy_body(&row);
+        let policy_arn = create_policy(&router, case, body.clone()).await;
+        let expected = derived_from(&body, row.name, SOURCE_SELF);
+
+        let mut service_arns = Vec::new();
+        for suffix in ["One", "Two"] {
+            let (status, answered) =
+                create_service(&router, &format!("Svc{}{suffix}", row.name), Some(&policy_arn))
+                    .await;
+            let created = service_of(case, status, &answered);
+            assert_effective(case, &created, &expected);
+            service_arns.push(service_arn_of(case, &created));
+        }
+
+        delete_policy(&router, case, &policy_arn).await;
+
+        // The policy itself is gone, so its own reader refuses the ARN.
+        let (status, answered) = get_policy(&router, &policy_arn).await;
+        assert_policy_gone(case, &policy_arn, status, &answered);
+
+        // Every service that referenced it now derives nothing, and still points at it.
+        for service_arn in &service_arns {
+            let (status, answered) = get_service(&router, service_arn).await;
+            let read_back = service_of(case, status, &answered);
+            assert_effective(case, &read_back, &json!({}));
+            assert_eq!(
+                read_back["policyArn"].as_str(),
+                Some(policy_arn.as_str()),
+                "case {case:?}: expected the policyArn pointer {policy_arn} to survive the \
+                 delete, got {:?}",
+                read_back["policyArn"]
+            );
+        }
+
+        // The surviving pointer is what the modelled `policyArn` filter selects on, so the
+        // listing still reports exactly the services that referenced the deleted policy.
+        let listed = services_filtered_by_policy(&router, case, &policy_arn).await;
+        assert_eq!(
+            listed, service_arns,
+            "case {case:?}: expected the listing filtered by {policy_arn} to report \
+             {service_arns:?}, got {listed:?}"
+        );
+
+        // Nothing else lost its values: the control service still derives its own policy's.
+        let (status, answered) = get_service(&router, &control_service).await;
+        let control_read = service_of(control_case, status, &answered);
+        assert_effective(control_case, &control_read, &control_expected);
+    }
+}
+
+#[tokio::test]
+async fn attaching_a_replacement_for_a_deleted_policy_derives_the_new_values() {
+    // Deleting the policy clears what the service derives WITHOUT breaking the service: a
+    // later `UpdateService` attaching another policy derives that policy's values, so the
+    // delete removed a policy rather than wedging the services that referenced it.
+    let router = emulator();
+    let case = "a service whose deleted policy is replaced by another";
+    let doomed_body = json!({
+        "name": "DoomedPolicy",
+        "multiRegion": {"rtoInMinutes": 180, "rpoInMinutes": 30},
+        "dataRecovery": {"timeBetweenBackupsInMinutes": 15},
+    });
+    let replacement_body = json!({
+        "name": "ReplacementPolicy",
+        "availabilitySlo": {"target": 99.99},
+        "multiAz": {"disasterRecoveryApproach": "PILOT_LIGHT"},
+    });
+    let doomed = create_policy(&router, case, doomed_body.clone()).await;
+    let replacement = create_policy(&router, case, replacement_body.clone()).await;
+
+    let (status, answered) = create_service(&router, "SvcReplaced", Some(&doomed)).await;
+    let created = service_of(case, status, &answered);
+    assert_effective(
+        case,
+        &created,
+        &derived_from(&doomed_body, "DoomedPolicy", SOURCE_SELF),
+    );
+    let service_arn = service_arn_of(case, &created);
+
+    delete_policy(&router, case, &doomed).await;
+    let (status, answered) = get_service(&router, &service_arn).await;
+    let orphaned = service_of(case, status, &answered);
+    assert_effective(case, &orphaned, &json!({}));
+
+    let (status, answered) = call(
+        &router,
+        "POST",
+        UPDATE_SERVICE,
+        Some(json!({"serviceArn": service_arn, "policyArn": replacement})),
+    )
+    .await;
+    let updated = service_of(case, status, &answered);
+    let expected = derived_from(&replacement_body, "ReplacementPolicy", SOURCE_SELF);
     assert_effective(case, &updated, &expected);
 
     let (status, answered) = get_service(&router, &service_arn).await;
