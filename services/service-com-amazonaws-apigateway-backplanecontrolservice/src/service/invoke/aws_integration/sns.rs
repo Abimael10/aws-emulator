@@ -159,6 +159,15 @@ impl TopicCall {
             false => self.topic.clone(),
         }
     }
+
+    /// The INTEGRATION REQUEST this call carries, which is what the stage's execution log
+    /// reports as the integration request after transformations
+    /// ([`super::super::stage_logs`]): the fields it named written out as the
+    /// `application/x-www-form-urlencoded` body this api's requests carry them in, which is
+    /// the form the integration request was rendered as.
+    pub(super) fn sent(&self) -> Vec<u8> {
+        query_form::form_body(&self.parameters)
+    }
 }
 
 /// What Amazon SNS answers a call the integration's role may not make: HTTP 403 with the

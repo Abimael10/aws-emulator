@@ -301,6 +301,12 @@ pub(super) struct ProxyAnswer {
     /// The configuration error the function's own answer was, or `None` where it returned a
     /// proxy response API Gateway could read.
     pub(super) configuration_error: Option<&'static str>,
+    /// What the invocation EXCHANGED with the function, for the stage's own execution log
+    /// ([`super::stage_logs::Exchanged`]): the event it was invoked with, which is this
+    /// integration's own request transformation of the method request, and the answer it
+    /// returned, before API Gateway read a proxy response out of it. `None` where no
+    /// invocation was made at all.
+    pub(super) exchanged: Option<super::stage_logs::Exchanged>,
 }
 
 /// Perform this call through the method's `AWS_PROXY` integration, or `None` when the
@@ -448,6 +454,10 @@ async fn invoked(
             .to_string(),
     })?;
     bounded(payload.len())?;
+    // The event the invocation is made with, kept for the stage's execution log: it is this
+    // integration's own transformation of the method request, and nothing of the answer the
+    // caller is served says what the function was handed.
+    let sent = payload.clone();
     // The X-Ray trace context travels on the `X-Amzn-Trace-Id` header of the invocation,
     // which is where the next hop reads its own trace context off.
     let trace = trace.map(str::to_string);
@@ -537,6 +547,13 @@ async fn invoked(
         return Ok(ProxyAnswer {
             response: bad_gateway(),
             configuration_error: None,
+            exchanged: Some(super::stage_logs::Exchanged {
+                sent,
+                received: answered
+                    .payload()
+                    .map(|payload| payload.as_ref().to_vec())
+                    .unwrap_or_default(),
+            }),
         });
     }
     let returned = answered
@@ -544,10 +561,15 @@ async fn invoked(
         .map(|payload| payload.as_ref().to_vec())
         .unwrap_or_default();
     bounded(returned.len())?;
+    let exchanged = Some(super::stage_logs::Exchanged {
+        sent,
+        received: returned.clone(),
+    });
     match proxy_response(&returned, &call.proxy.binary_media_types) {
         Ok(response) => Ok(ProxyAnswer {
             response,
             configuration_error: None,
+            exchanged,
         }),
         Err(reason) => {
             ::tracing::warn!(
@@ -557,6 +579,7 @@ async fn invoked(
             Ok(ProxyAnswer {
                 response: bad_gateway(),
                 configuration_error: Some(MALFORMED_PROXY_RESPONSE),
+                exchanged,
             })
         }
     }

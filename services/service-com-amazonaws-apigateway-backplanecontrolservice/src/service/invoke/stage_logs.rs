@@ -55,8 +55,14 @@
 //!
 //! `dataTrace` is what puts the request's and the response's own payloads in that trace, which
 //! is the data the setting exists to gate: turned off, the trace carries no line about a
-//! payload at all. Both payload lines are informational, so the data a `dataTrace` adds is
-//! data `INFO` writes.
+//! payload at all. With it on, the trace carries one line per TRANSFORMATION POINT the request
+//! crossed — the method request before the integration's own request transformation, the
+//! integration request as it was sent to the backend after it, the backend's answer as it
+//! arrived before the integration response's mapping, and the method response after that
+//! mapping ([`Exchanged`] carries the two inner ones, which nothing in the answer the caller
+//! holds says). A request that reached no backend at all crosses only the outer two, so those
+//! are the only payload lines it leaves. Every payload line is informational, so the data a
+//! `dataTrace` adds is data `INFO` writes.
 //!
 //! The group is the one API Gateway publishes for a stage's execution log,
 //! `API-Gateway-Execution-Logs_{rest-api-id}/{stage-name}` ([`execution_log_group`]) — a group
@@ -114,6 +120,29 @@ pub(super) struct Recorded {
     /// could not use; `None` for every request whose integration answered usably, was
     /// served from the cache or was never reached.
     pub(super) unperformed: Option<Unperformed>,
+    /// What this request EXCHANGED with the BACKEND of the method's integration, where it
+    /// reached one ([`Exchanged`]); `None` for a request that reached no backend at all — a
+    /// `MOCK` integration, which is answered from the api's own records, a request the
+    /// stage's cache answered without performing the integration, and one no integration
+    /// could be performed for.
+    pub(super) exchanged: Option<Exchanged>,
+}
+
+/// The payloads one request exchanged with the backend of the method's integration, which are
+/// two of the four transformation points a data trace reports ([`trace`]).
+///
+/// Recorded as the serving performs the integration, because neither can be recovered
+/// afterwards: the method response a reader of the response holds is what the integration
+/// response MAPPED, and the integration request is what the integration's own
+/// `requestTemplates` and `passthroughBehavior` made of the method request.
+#[derive(Debug)]
+pub(super) struct Exchanged {
+    /// The integration request AS SENT to the backend — the method request after the
+    /// integration's own request transformation.
+    pub(super) sent: Vec<u8>,
+    /// The backend's own answer AS RECEIVED — before the integration response's mapping of
+    /// it.
+    pub(super) received: Vec<u8>,
 }
 
 /// A configuration error of the method's integration, as the execution log records it.
@@ -148,6 +177,13 @@ impl Recorded {
             reason: reason.to_string(),
             response_type: None,
         });
+    }
+
+    /// Record what this request exchanged with the backend of the method's integration: the
+    /// integration request as it was SENT and the backend's answer as it was RECEIVED
+    /// ([`Exchanged`]).
+    pub(super) fn exchanged_with(&mut self, sent: Vec<u8>, received: Vec<u8>) {
+        self.exchanged = Some(Exchanged { sent, received });
     }
 }
 
@@ -430,6 +466,7 @@ fn planned<Eng: Send + Sync + 'static>(
                         .and_then(|method| method.integration.as_ref())
                         .and_then(|integration| integration.r#type.as_deref()),
                     recorded.unperformed.as_ref(),
+                    recorded.exchanged.as_ref(),
                     level,
                     settings.data_trace_enabled,
                 ),
@@ -510,6 +547,11 @@ fn answered_context(
 /// ([`payload_line`]). Both payload lines are informational, so what a data trace adds is
 /// something a trace written at `INFO` carries.
 ///
+/// `exchanged` is what the request exchanged with the BACKEND of the method's integration
+/// ([`Exchanged`]), which is where the two inner transformation points of the data trace come
+/// from: a request that reached no backend has neither line, because nothing crossed either
+/// point.
+///
 /// `unperformed` is the configuration error of the method's integration, for a request the
 /// stage could not serve through it or whose backend answered something this api could not
 /// use: it is recorded where the integration's own step belongs — after the type that was to
@@ -525,6 +567,7 @@ fn trace(
     resource_path: &str,
     integration_type: Option<&str>,
     unperformed: Option<&Unperformed>,
+    exchanged: Option<&Exchanged>,
     level: Level,
     data_trace: bool,
 ) -> Vec<String> {
@@ -557,6 +600,20 @@ fn trace(
         Level::Info,
         format!("Integration type: {}", integration_type.unwrap_or("none")),
     ));
+    // The integration REQUEST as it was sent to the backend, which only a data trace puts in
+    // the log: a request that reached no backend carries no such line, because nothing
+    // crossed that point.
+    lines.extend(
+        exchanged
+            .and_then(|exchanged| {
+                payload_line(
+                    "Endpoint request body after transformations",
+                    &exchanged.sent,
+                    data_trace,
+                )
+            })
+            .map(|line| (Level::Info, line)),
+    );
     if let Some(unperformed) = unperformed {
         lines.push((
             Level::Error,
@@ -572,7 +629,19 @@ fn trace(
             ));
         }
     }
-    // The RESPONSE's payload, gated by the same data trace as the request's.
+    // The BACKEND's own answer as it arrived, before this api's own responses mapped it, and
+    // then the RESPONSE's payload, both gated by the same data trace as the request's.
+    lines.extend(
+        exchanged
+            .and_then(|exchanged| {
+                payload_line(
+                    "Endpoint response body before transformations",
+                    &exchanged.received,
+                    data_trace,
+                )
+            })
+            .map(|line| (Level::Info, line)),
+    );
     lines.extend(
         payload_line(
             "Method response body after transformations",

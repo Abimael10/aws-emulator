@@ -353,6 +353,17 @@ fn error_body(code: &str, message: &str, resource: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// What performing an `AWS` integration produced: the integration response the call was
+/// answered from, and the payloads it EXCHANGED with that service — the integration request as
+/// it was sent and the service's own answer as it arrived, which the stage's execution log
+/// reports as the two transformation points of the integration itself
+/// ([`super::stage_logs::Exchanged`]).
+#[derive(Debug)]
+pub(super) struct Served {
+    pub(super) answer: IntegrationAnswer,
+    pub(super) exchanged: super::stage_logs::Exchanged,
+}
+
 /// Perform this call through the method's `AWS` integration, or `None` when the
 /// integration is not an AWS service call this module makes — in which case the caller
 /// performs it from the api's own records ([`super::perform_integration`]).
@@ -364,7 +375,7 @@ pub(super) async fn performed(
     region: &str,
     method: &MethodEntry,
     call: &MethodRequest,
-) -> Option<Result<IntegrationAnswer, UnservedIntegration>> {
+) -> Option<Result<Served, UnservedIntegration>> {
     let integration = method.integration.as_ref()?;
     if integration.r#type.as_deref() != Some(AWS_SERVICE_INTEGRATION_TYPE) {
         return None;
@@ -475,6 +486,30 @@ impl ServiceCall {
         }
     }
 
+    /// The INTEGRATION REQUEST this call carries to the service, which is what the stage's
+    /// execution log reports as the integration request after transformations
+    /// ([`super::stage_logs`]): the bytes of the call as this module places it, read from the
+    /// call itself rather than rendered a second time, so what a data trace reports is what
+    /// the service was really sent.
+    ///
+    /// For the two apis whose every input travels in the body — a JSON-RPC document, and the
+    /// query form the fields of a query api's request are written out as — that body IS the
+    /// request. An Amazon S3 OBJECT call carries the method request's own payload where the
+    /// action writes one and nothing otherwise, and a bucket call carries no body at all,
+    /// because those actions address the object in the request line rather than in a body.
+    fn sent(&self, call: &MethodRequest) -> Vec<u8> {
+        match self {
+            Self::Object(object) => match object.action {
+                ObjectAction::Put => call.inputs.payload.clone().unwrap_or_default(),
+                ObjectAction::Get | ObjectAction::Head | ObjectAction::Delete => Vec::new(),
+            },
+            Self::Bucket(_) => Vec::new(),
+            Self::Queue(queue) => queue.sent(),
+            Self::JsonRpc(call) => call.sent().to_vec(),
+            Self::Topic(topic) => topic.sent(),
+        }
+    }
+
     /// The refusal the service answers a call the caller may not make with, in that
     /// service's own error envelope and naming the resource the call addressed.
     ///
@@ -533,7 +568,7 @@ async fn served(
     integration: &GetIntegrationOutput,
     call: &MethodRequest,
     target: &ServiceCall,
-) -> Result<IntegrationAnswer, UnservedIntegration> {
+) -> Result<Served, UnservedIntegration> {
     let answered = match authorization(ctx, integration, target).await {
         Authorization::Unassumable(reason) => return Err(unanswered(&reason)),
         Authorization::Withheld => {
@@ -544,11 +579,17 @@ async fn served(
     // The STATUS the service answered is what `IntegrationResponse$selectionPattern` is
     // matched against, so it travels with the answer; the headers the method response
     // carries are the integration response's own mapping rather than the service's.
-    Ok(IntegrationAnswer {
-        mapping: AnswerMapping::Backend(answered.status),
-        content_type: answered.content_type,
-        payload: Some(answered.body),
-        headers: ::std::collections::BTreeMap::new(),
+    Ok(Served {
+        exchanged: super::stage_logs::Exchanged {
+            sent: target.sent(call),
+            received: answered.body.clone(),
+        },
+        answer: IntegrationAnswer {
+            mapping: AnswerMapping::Backend(answered.status),
+            content_type: answered.content_type,
+            payload: Some(answered.body),
+            headers: ::std::collections::BTreeMap::new(),
+        },
     })
 }
 

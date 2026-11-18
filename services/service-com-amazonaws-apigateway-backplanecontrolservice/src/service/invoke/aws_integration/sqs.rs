@@ -233,6 +233,15 @@ impl QueueCall {
             queue = self.queue
         )
     }
+
+    /// The INTEGRATION REQUEST this call carries, which is what the stage's execution log
+    /// reports as the integration request after transformations
+    /// ([`super::super::stage_logs`]): the fields it named written out as the
+    /// `application/x-www-form-urlencoded` body this api's requests carry them in, which is
+    /// the form the integration request was rendered as.
+    pub(super) fn sent(&self) -> Vec<u8> {
+        query_form::form_body(&self.parameters)
+    }
 }
 
 /// The refusal Amazon SQS answers a call the caller may not make with: HTTP 403 with the

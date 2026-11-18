@@ -251,15 +251,25 @@ pub struct Performed {
     /// The configuration error the backend's answer was, or `None` for an answer API Gateway
     /// could use.
     pub configuration_error: Option<&'static str>,
+    /// What the call EXCHANGED with the integration's backend, for the stage's own execution
+    /// log ([`super::stage_logs::Exchanged`]): the integration request as it was sent and the
+    /// backend's answer as it arrived. `None` for an integration performed from the api's own
+    /// records, which reaches no backend at all.
+    ///
+    /// `pub(super)` rather than `pub` like the two members beside it, because the type is the
+    /// serving path's own: only the data plane's funnel reads it, and a simulated invocation
+    /// reports payload SIZES rather than bytes, having no `dataTrace` setting to gate them.
+    pub(super) exchanged: Option<super::stage_logs::Exchanged>,
 }
 
 impl Performed {
-    /// An answer that is no configuration error, which is what every integration performed
-    /// from the api's own records or by making another service's call produces.
+    /// An answer that is no configuration error and crossed no backend, which is what an
+    /// integration performed from the api's own records produces ([`perform_integration`]).
     fn of(answer: IntegrationAnswer) -> Self {
         Self {
             answer,
             configuration_error: None,
+            exchanged: None,
         }
     }
 }
@@ -290,10 +300,15 @@ pub async fn performed_integration(
             return served.map(|answered| Performed {
                 answer: integration_response::passed_answer(answered.response),
                 configuration_error: answered.configuration_error,
+                exchanged: answered.exchanged,
             });
         }
         if let Some(served) = aws_integration::performed(ctx, region, method, call).await {
-            return served.map(Performed::of);
+            return served.map(|served| Performed {
+                answer: served.answer,
+                configuration_error: None,
+                exchanged: Some(served.exchanged),
+            });
         }
     }
     perform_integration(method, call).map(Performed::of)

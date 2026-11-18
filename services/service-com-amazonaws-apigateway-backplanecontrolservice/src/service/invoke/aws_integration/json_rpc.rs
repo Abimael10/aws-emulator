@@ -167,6 +167,13 @@ impl Call {
             account = ::emulator_server::EMULATOR_ACCOUNT_ID,
         )
     }
+
+    /// The integration request this call CARRIES to the service: the rendered request
+    /// template, which IS the operation's input document on this wire — the bytes the call
+    /// below posts, so the stage's execution log reports what was really sent.
+    pub(super) fn sent(&self) -> &[u8] {
+        &self.body
+    }
 }
 
 /// What `integration`'s `uri` addresses in one of the JSON-RPC apis this module serves:

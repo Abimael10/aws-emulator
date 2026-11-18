@@ -2262,9 +2262,17 @@ async fn serving<Eng: Send + Sync + 'static>(
                 recorded,
             );
         }
+        // The integration request as it was carried to the endpoint, filled by whichever of
+        // the two ways below carried it there.
+        let sent;
         let reached = match passed_on {
             PassedThrough::Unserved(unserved) => return refuse(unserved, recorded),
             PassedThrough::Request(onward) => {
+                // The integration request as it is CARRIED to that endpoint, kept for the
+                // stage's own execution log: a data trace reports the integration request
+                // after this integration's transformation of the method request, and nothing
+                // of the answer the caller is served says what was sent ([`stage_logs`]).
+                sent = onward.body().bytes().unwrap_or_default().to_vec();
                 // The onward request is a request of its own at another endpoint, so it is
                 // answered under its own id, as AWS names each request it processes by one.
                 let onward_id = ::service_common::query_error_envelope::new_request_id();
@@ -2305,6 +2313,8 @@ async fn serving<Eng: Send + Sync + 'static>(
             // one, which is why the proxy's is read with the api's own reserved response
             // header remapped onto it and the standard one's is read whole.
             PassedThrough::Onward(onward) => {
+                // See the arm above: the bytes this integration carried to that endpoint.
+                sent = onward.body().bytes().unwrap_or_default().to_vec();
                 let reached = match endpoint_type {
                     Some(HttpEndpoint::Mapped) => {
                         onward_endpoint::backend_answered(ctx, *onward).await
@@ -2317,6 +2327,10 @@ async fn serving<Eng: Send + Sync + 'static>(
                 }
             }
         };
+        // What this request EXCHANGED with the endpoint it was carried to: the integration
+        // request as it was sent, and the endpoint's own answer as it arrived — before the
+        // integration's responses map it, which is the step below.
+        recorded.exchanged_with(sent, reached.body().bytes().unwrap_or_default().to_vec());
         match endpoint_type {
             // A STANDARD `HTTP` integration: the endpoint answered the integration request,
             // and that answer is the BACKEND's, which the integration's own responses map to
@@ -2367,6 +2381,13 @@ async fn serving<Eng: Send + Sync + 'static>(
             // integration's own responses map it to the method response — here, for this
             // request, exactly as they will for every later request the entry answers.
             Ok(performed) => {
+                // What the call EXCHANGED with the integration's backend, for the stage's own
+                // execution log: a data trace reports the integration request as it was SENT
+                // and the backend's answer as it ARRIVED, and neither can be read off the
+                // response the caller is served ([`stage_logs`]).
+                if let Some(exchanged) = performed.exchanged {
+                    recorded.exchanged = Some(exchanged);
+                }
                 // A backend answer API Gateway could not use is a configuration error of the
                 // integration, recorded for the stage's own execution log: the request IS
                 // answered from that answer, so nothing a reader of the response holds says

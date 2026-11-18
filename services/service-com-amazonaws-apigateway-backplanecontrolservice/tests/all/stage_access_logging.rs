@@ -936,3 +936,176 @@ async fn the_method_settings_in_force_gate_the_execution_log() {
         );
     }
 }
+
+/// The lines a data trace puts in a request's execution log: one per TRANSFORMATION POINT the
+/// request crossed, in the order it crossed them — the method request before the integration's
+/// own request transformation, the integration request as it was sent to the backend after it,
+/// the backend's answer as it arrived before the integration response's mapping, and the method
+/// response after that mapping.
+const PAYLOAD_PREFIXES: [&str; 4] = [
+    "Method request body before transformations: ",
+    "Endpoint request body after transformations: ",
+    "Endpoint response body before transformations: ",
+    "Method response body after transformations: ",
+];
+
+/// Gate every method of `stage` at `level` with `data_trace` beside it.
+async fn gate_execution_logging(
+    router: &MultiServiceRouter,
+    api: &str,
+    stage: &str,
+    level: &str,
+    data_trace: bool,
+) {
+    apigw(
+        router,
+        "UpdateStage methodSettings",
+        "PATCH",
+        &format!("/restapis/{api}/stages/{stage}"),
+        Some(json!({
+            "patchOperations": [
+                { "op": "replace", "path": "/*/*/logging/loglevel", "value": level },
+                {
+                    "op": "replace",
+                    "path": "/*/*/logging/dataTrace",
+                    "value": data_trace.to_string(),
+                },
+            ],
+        })),
+        200,
+    )
+    .await;
+}
+
+/// The records of ONE request in the stage's execution log group.
+async fn trace_of(router: &MultiServiceRouter, group: &str, request_id: &str) -> Vec<String> {
+    let prefix = traced_line(request_id, "");
+    delivered(router, group)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|record| record.starts_with(&prefix))
+        .collect()
+}
+
+/// The text the one record of `trace` opening with `prefix` carries after it.
+fn traced_payload(trace: &[String], case: &str, prefix: &str) -> String {
+    let opening: Vec<&String> = trace
+        .iter()
+        .filter(|record| record.starts_with(prefix))
+        .collect();
+    assert_eq!(
+        opening.len(),
+        1,
+        "case {case:?}: expected exactly one record opening with {prefix:?}, got {trace:?}"
+    );
+    opening
+        .first()
+        .and_then(|record| record.strip_prefix(prefix))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The data trace carries the payloads of EVERY transformation point the request crossed — the
+/// integration's own two included, which are what the request exchanged with the backend — and
+/// with the data trace off the trace carries no payload line at all.
+#[tokio::test]
+async fn a_data_trace_carries_the_payloads_of_every_transformation_point() {
+    let router = emulator();
+    let api = deployed(&router).await;
+    install_account_role(&router).await;
+    let group = format!("API-Gateway-Execution-Logs_{api}/{PROD}");
+
+    // (case, whether the data trace is on, the marker the request carries)
+    for (case, data_trace, marker) in [
+        ("the data trace off", false, "undata"),
+        ("the data trace on", true, "traced"),
+    ] {
+        gate_execution_logging(&router, &api, PROD, "INFO", data_trace).await;
+        let answered = invoke(&router, &api, PROD, "GET", &format!("/echo?id={marker}")).await;
+        assert_eq!(
+            (answered.status, answered.json()),
+            (200, json!({ "seen": marker })),
+            "case {case:?}: expected the stage to serve the proxy integration, got {} with {:?}",
+            answered.status,
+            answered.text()
+        );
+        let request_id = answered
+            .request_id
+            .clone()
+            .unwrap_or_else(|| panic!("case {case:?}: the response named no request id"));
+        let trace = trace_of(&router, &group, &request_id).await;
+
+        for prefix in PAYLOAD_PREFIXES {
+            let prefix = traced_line(&request_id, prefix);
+            let found = trace
+                .iter()
+                .filter(|record| record.starts_with(&prefix))
+                .count();
+            assert_eq!(
+                found,
+                usize::from(data_trace),
+                "case {case:?}: expected the payload line {prefix:?} exactly {} time(s), got \
+                 {trace:?}",
+                usize::from(data_trace)
+            );
+        }
+        if !data_trace {
+            continue;
+        }
+
+        // The integration REQUEST after transformations: for an `AWS_PROXY` integration that is
+        // the event the function was invoked with, which is this integration's own
+        // transformation of the method request.
+        let endpoint_request = traced_payload(
+            &trace,
+            case,
+            &traced_line(&request_id, PAYLOAD_PREFIXES[1]),
+        );
+        let event: Value = serde_json::from_str(&endpoint_request).unwrap_or_else(|error| {
+            panic!(
+                "case {case:?}: expected the proxy event in the endpoint request line, got \
+                 {endpoint_request:?}: {error}"
+            )
+        });
+        assert_eq!(
+            (
+                &event["httpMethod"],
+                &event["resource"],
+                &event["queryStringParameters"]["id"]
+            ),
+            (&json!("GET"), &json!(format!("/{RESOURCE_PATH}")), &json!(marker)),
+            "case {case:?}: expected the event this request was proxied as, got {event}"
+        );
+        // The backend's answer BEFORE transformations: the proxy response envelope the function
+        // returned, which is what API Gateway then read the method response out of.
+        let endpoint_response = traced_payload(
+            &trace,
+            case,
+            &traced_line(&request_id, PAYLOAD_PREFIXES[2]),
+        );
+        let returned: Value = serde_json::from_str(&endpoint_response).unwrap_or_else(|error| {
+            panic!(
+                "case {case:?}: expected the function's own answer in the endpoint response \
+                 line, got {endpoint_response:?}: {error}"
+            )
+        });
+        assert_eq!(
+            (&returned["statusCode"], &returned["body"]),
+            (&json!(200), &json!(answered.text())),
+            "case {case:?}: expected the envelope the function returned, got {returned}"
+        );
+        // And the METHOD response after transformations, which is the body the client was
+        // served.
+        let method_response = traced_payload(
+            &trace,
+            case,
+            &traced_line(&request_id, PAYLOAD_PREFIXES[3]),
+        );
+        assert_eq!(
+            method_response,
+            answered.text(),
+            "case {case:?}: expected the body the client was served, got {method_response:?}"
+        );
+    }
+}
