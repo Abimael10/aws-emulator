@@ -599,10 +599,12 @@ impl ComAmazonawsInvoicingInvoicingState {
     ///
     /// Membership is derived from those configurations and from NOTHING else. The
     /// requester's own account ([`::engine::emulator_account_id`], the identity this
-    /// emulator presents to a caller) is the MANAGEMENT account of this organization, so
-    /// it is a LINKED account only when a stored configuration names it as one — which is
-    /// a different question from whether the requester may READ it:
-    /// [`Self::accounts_the_requester_may_read`] is what an authorization check consults.
+    /// emulator presents to a caller) is the MANAGEMENT account of this organization, and
+    /// a management account is not one of its own organization's LINKED accounts: it is in
+    /// this set only when a stored configuration names it as a linked account, exactly as
+    /// any other account id is. This set is therefore also what an authorization check
+    /// over "linked accounts under the requester management account organization" reads —
+    /// the identity of the requester admits no account into it by itself.
     ///
     /// `BillSourceAccounts` is deliberately NOT a source: the model documents those as
     /// accounts that "can be payer accounts from other organizations that have
@@ -623,28 +625,6 @@ impl ComAmazonawsInvoicingInvoicingState {
                 }
             }
         }
-        accounts
-    }
-
-    /// Every account the REQUESTER may be answered for: the accounts of its organization
-    /// ([`Self::linked_accounts`]) and its own account.
-    ///
-    /// An account a requester holds no access to is what an operation over "linked
-    /// accounts under the requester management account organization"
-    /// (`BatchGetInvoiceProfile`) refuses, and a principal always has access to the
-    /// resources of the account it authenticates as: a requester asking about ITS OWN
-    /// account is asking about its own resources, so that account is readable by it
-    /// whatever this service's state holds beside it — recorded behaviour, which answers a
-    /// request naming only the caller's account with that account's profile. Every OTHER
-    /// account id is readable exactly when a stored configuration places it in the
-    /// organization, and refused when none does.
-    ///
-    /// It is the requester's identity that admits its own account here, so this is the set
-    /// an AUTHORIZATION check reads, while [`Self::linked_accounts`] stays the
-    /// organization's membership — the two differ by exactly that one account.
-    pub fn accounts_the_requester_may_read(&self) -> BTreeSet<String> {
-        let mut accounts = self.linked_accounts();
-        accounts.insert(::engine::emulator_account_id().to_string());
         accounts
     }
 
@@ -2049,7 +2029,7 @@ pub fn resource_tag_list(tags: &BTreeMap<String, String>) -> Vec<ResourceTag> {
 /// to report them from. Each is an optional member, so they are reported ABSENT —
 /// "not on file here" — rather than invented. `AccountId`, the member that says whose
 /// profile this is, is the one this service can answer, and it is answered only for an
-/// account [`ComAmazonawsInvoicingInvoicingState::accounts_the_requester_may_read`] holds.
+/// account [`ComAmazonawsInvoicingInvoicingState::linked_accounts`] holds.
 pub fn invoice_profile(account_id: &str) -> InvoiceProfile {
     InvoiceProfile {
         account_id: Some(account_id.to_string()),
@@ -2143,9 +2123,8 @@ pub fn no_such_resource_unnamed() -> ResourceNotFoundException {
 }
 
 /// The 403 an operation of this service answers when the requester may not read what it
-/// asked about: the account it asked about is neither its own nor a linked account the
-/// requester's organization contains
-/// ([`ComAmazonawsInvoicingInvoicingState::accounts_the_requester_may_read`]), so the
+/// asked about: the account it asked about is not a linked account of the requester's
+/// organization ([`ComAmazonawsInvoicingInvoicingState::linked_accounts`]), so the
 /// requester is not authorized for that account's resources.
 ///
 /// The message is BUILT FROM THE REQUEST, as the recorded refusals of this service state

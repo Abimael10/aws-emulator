@@ -5,18 +5,22 @@
 //! `X-Amz-Target: Invoicing.BatchGetInvoiceProfile` and an awsJson1_0 body, through the
 //! same `MultiServiceRouter` the production router uses).
 //!
-//! The rule under test: a requester may be answered for its own account — it
-//! authenticates as that account, so asking about it is asking about its own resources —
-//! and for every account this service's state names as a LINKED account of its
-//! organization; every other well-formed account id refuses the request WHOLE with the
-//! modelled 403 `AccessDeniedException`, whose message names the requester and the account
-//! it was refused.
+//! The rule under test: the requester may be answered for exactly those accounts this
+//! service's state names as LINKED accounts of its organization, and every other
+//! well-formed account id refuses the request WHOLE with the modelled 403
+//! `AccessDeniedException`, whose message names the requester and the account it was
+//! refused. The requester's own account is no exception — the requester is that
+//! organization's MANAGEMENT account, which is not one of its own organization's linked
+//! accounts — so it is answered when a stored configuration names it as a linked account
+//! and refused when none does, on exactly the terms any other id is.
 //!
-//! The rows span what the rule generalises over: how much state exists around the own
-//! account (none at all, one unit naming others, several units naming others, a unit that
-//! was deleted again), the shape of the batch it is asked about in (alone, repeated,
-//! first, last, among others, at the modelled list maximum) and which other account ids
-//! travel beside it (readable ones and refused ones).
+//! The rows span what the rule generalises over: whether a configuration names the own
+//! account and in which of the ways this service's state can name one (nowhere, as an
+//! invoice unit's `InvoiceReceiver`, as a rule's `LinkedAccounts` entry, in a rule a later
+//! update superseded, only in a unit that was deleted again, only as a
+//! `BillSourceAccounts` entry), the shape of the batch it is asked about in (alone,
+//! repeated, first, last, among others, at the modelled list maximum) and which other
+//! account ids travel beside it.
 
 use std::sync::Arc;
 
@@ -140,13 +144,21 @@ fn reported_accounts(body: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Create one invoice unit naming `receiver` and `linked`, returning its ARN.
+/// Create one invoice unit naming `receiver`, `linked` and `bill_source`, returning its ARN.
 async fn create_unit(
     router: &MultiServiceRouter,
     name: &str,
     receiver: &str,
     linked: &[String],
+    bill_source: &[String],
 ) -> String {
+    let mut rule = serde_json::Map::new();
+    if !linked.is_empty() {
+        rule.insert("LinkedAccounts".to_string(), json!(linked));
+    }
+    if !bill_source.is_empty() {
+        rule.insert("BillSourceAccounts".to_string(), json!(bill_source));
+    }
     let created = ok(
         router,
         "CreateInvoiceUnit",
@@ -154,7 +166,7 @@ async fn create_unit(
             "Name": name,
             "InvoiceReceiver": receiver,
             "TaxInheritanceDisabled": false,
-            "Rule": {"LinkedAccounts": linked},
+            "Rule": Value::Object(rule),
             "ClientToken": format!("own-account-{name}"),
         }),
     )
@@ -166,34 +178,74 @@ async fn create_unit(
         .to_string()
 }
 
-/// How much state exists around the requester's own account when it asks about itself —
-/// the rows of the table below. None of these arrangements names that account, so each one
-/// shows the answer does not come from state naming it.
-#[derive(Debug, Clone, Copy)]
+/// How this service's state names (or does not name) the requester's own account when it
+/// asks about itself — the rows of the tables below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrangement {
     /// A fresh emulator: no invoice unit at all, which is how a client first meets this
     /// operation.
     NothingAtAll,
-    /// One invoice unit, naming other accounts only.
-    OneUnitNamingOthers,
-    /// Several invoice units, naming other accounts only.
-    SeveralUnitsNamingOthers,
-    /// An invoice unit naming other accounts, which was deleted again — so state holds a
-    /// retired unit and nothing live.
+    /// Invoice units naming other accounts only.
+    UnitsNamingOthers,
+    /// An invoice unit naming other accounts, which was deleted again — a delete takes the
+    /// unit's accounts with it, so state holds a retired unit and no live membership.
     OnlyADeletedUnit,
+    /// The own account named only as a `BillSourceAccounts` entry, which the model
+    /// documents as possibly "a payer account from another organization".
+    OwnAsBillSourceOnly,
+    /// The own account as an invoice unit's `InvoiceReceiver` — "the Amazon Web Services
+    /// account ID chosen to be the receiver of an invoice unit".
+    OwnAsInvoiceReceiver,
+    /// The own account as the only entry of a rule's `LinkedAccounts`.
+    OwnAsSoleLinkedAccount,
+    /// The own account as one entry among several of a rule's `LinkedAccounts`.
+    OwnAsOneLinkedAccountOfSeveral,
+    /// The own account in a rule a later `UpdateInvoiceUnit` superseded: it left that
+    /// unit's rule, not the organization, and the configuration naming it is retained.
+    OwnInASupersededRule,
 }
+
+impl Arrangement {
+    /// Whether this arrangement leaves the requester's own account a LINKED account of the
+    /// organization, which is what decides the answer.
+    fn own_account_is_linked(self) -> bool {
+        matches!(
+            self,
+            Arrangement::OwnAsInvoiceReceiver
+                | Arrangement::OwnAsSoleLinkedAccount
+                | Arrangement::OwnAsOneLinkedAccountOfSeveral
+                | Arrangement::OwnInASupersededRule
+        )
+    }
+}
+
+/// Every row of the table, so the arrangement class is stated in one place.
+const ARRANGEMENTS: [Arrangement; 8] = [
+    Arrangement::NothingAtAll,
+    Arrangement::UnitsNamingOthers,
+    Arrangement::OnlyADeletedUnit,
+    Arrangement::OwnAsBillSourceOnly,
+    Arrangement::OwnAsInvoiceReceiver,
+    Arrangement::OwnAsSoleLinkedAccount,
+    Arrangement::OwnAsOneLinkedAccountOfSeveral,
+    Arrangement::OwnInASupersededRule,
+];
 
 /// Apply `arrangement`, returning the OTHER account ids it leaves readable.
 async fn arrange(router: &MultiServiceRouter, arrangement: Arrangement) -> Vec<String> {
+    let own = own_account();
     match arrangement {
         Arrangement::NothingAtAll => Vec::new(),
-        Arrangement::OneUnitNamingOthers => {
-            create_unit(router, "one-unit", &account(1), &[account(2)]).await;
-            vec![account(1), account(2)]
-        }
-        Arrangement::SeveralUnitsNamingOthers => {
-            create_unit(router, "first-unit", &account(1), &[account(2)]).await;
-            create_unit(router, "second-unit", &account(3), &[account(4), account(5)]).await;
+        Arrangement::UnitsNamingOthers => {
+            create_unit(router, "first-unit", &account(1), &[account(2)], &[]).await;
+            create_unit(
+                router,
+                "second-unit",
+                &account(3),
+                &[account(4), account(5)],
+                &[],
+            )
+            .await;
             vec![
                 account(1),
                 account(2),
@@ -203,7 +255,7 @@ async fn arrange(router: &MultiServiceRouter, arrangement: Arrangement) -> Vec<S
             ]
         }
         Arrangement::OnlyADeletedUnit => {
-            let arn = create_unit(router, "retired-unit", &account(1), &[account(2)]).await;
+            let arn = create_unit(router, "retired-unit", &account(1), &[account(2)], &[]).await;
             ok(
                 router,
                 "DeleteInvoiceUnit",
@@ -212,34 +264,149 @@ async fn arrange(router: &MultiServiceRouter, arrangement: Arrangement) -> Vec<S
             .await;
             Vec::new()
         }
+        Arrangement::OwnAsBillSourceOnly => {
+            create_unit(
+                router,
+                "bill-source-unit",
+                &account(1),
+                &[account(2)],
+                std::slice::from_ref(&own),
+            )
+            .await;
+            vec![account(1), account(2)]
+        }
+        Arrangement::OwnAsInvoiceReceiver => {
+            create_unit(router, "own-receiver", &own, &[account(2)], &[]).await;
+            vec![account(2)]
+        }
+        Arrangement::OwnAsSoleLinkedAccount => {
+            create_unit(
+                router,
+                "own-sole-linked",
+                &account(1),
+                std::slice::from_ref(&own),
+                &[],
+            )
+            .await;
+            vec![account(1)]
+        }
+        Arrangement::OwnAsOneLinkedAccountOfSeveral => {
+            create_unit(
+                router,
+                "own-one-of-several",
+                &account(1),
+                &[account(2), own.clone(), account(3)],
+                &[],
+            )
+            .await;
+            vec![account(1), account(2), account(3)]
+        }
+        Arrangement::OwnInASupersededRule => {
+            let arn = create_unit(
+                router,
+                "own-superseded",
+                &account(1),
+                &[account(2), own.clone()],
+                &[],
+            )
+            .await;
+            ok(
+                router,
+                "UpdateInvoiceUnit",
+                &json!({
+                    "InvoiceUnitArn": arn,
+                    "Rule": {"LinkedAccounts": [account(2)]},
+                    "ClientToken": "own-superseded-update",
+                }),
+            )
+            .await;
+            vec![account(1), account(2)]
+        }
     }
 }
 
-/// RULE: the requester's own account resolves to its invoice profile whatever this
-/// service's state holds and whatever shape the batch takes, while an account id the
-/// organization does not contain refuses the whole request with the modelled 403 naming it.
+/// Assert one batch was refused WHOLE with the modelled 403 naming `refused`.
+async fn assert_refused(
+    router: &MultiServiceRouter,
+    label: &str,
+    requested: &[String],
+    refused: &str,
+) {
+    let (status, body) = batch_get(router, requested).await;
+    assert_eq!(
+        status, 403,
+        "case {label}: expected HTTP 403 for {} account ids, got {status} {body}",
+        requested.len()
+    );
+    assert_eq!(
+        error_code(&body),
+        "AccessDeniedException",
+        "case {label}: expected the modelled AccessDeniedException, got {body}"
+    );
+    let expected = not_authorized_message(refused);
+    assert_eq!(
+        error_text(&body),
+        expected,
+        "case {label}: expected the message {expected:?}, got {body}"
+    );
+    assert!(
+        body.get("Profiles").is_none(),
+        "case {label}: a refused batch reports no profiles, got {body}"
+    );
+}
+
+/// Assert one batch was answered with a profile per account asked about, in request order.
+async fn assert_reported(
+    router: &MultiServiceRouter,
+    label: &str,
+    requested: &[String],
+    expected: &[String],
+) {
+    let (status, body) = batch_get(router, requested).await;
+    assert_eq!(
+        status, 200,
+        "case {label}: expected HTTP 200 for {} account ids, got {status} {body}",
+        requested.len()
+    );
+    let actual = reported_accounts(&body);
+    assert_eq!(
+        actual, expected,
+        "case {label}: expected profiles for {expected:?}, got {actual:?}"
+    );
+    // The profile this service holds reports the account it is about and invents nothing
+    // else: every other member of `InvoiceProfile` is written through a plane this service
+    // does not own.
+    let profiles = body
+        .get("Profiles")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {label}: expected a Profiles list in {body}"));
+    for profile in profiles {
+        assert_eq!(
+            profile.as_object().map(|members| members.len()),
+            Some(1),
+            "case {label}: a profile reports the account it is about alone, got {profile}"
+        );
+    }
+}
+
+/// RULE: the requester's own account resolves to its invoice profile exactly when this
+/// service's state names it as a LINKED account of the organization, and is refused with
+/// the modelled 403 — like any other account id outside that membership — when nothing
+/// does, whatever shape the batch takes.
 #[tokio::test]
-async fn the_requesters_own_account_resolves_to_its_profile_whatever_state_holds() {
+async fn the_own_account_answers_on_its_membership_whatever_shape_the_batch_takes() {
     let own = own_account();
 
-    for arrangement in [
-        Arrangement::NothingAtAll,
-        Arrangement::OneUnitNamingOthers,
-        Arrangement::SeveralUnitsNamingOthers,
-        Arrangement::OnlyADeletedUnit,
-    ] {
+    for arrangement in ARRANGEMENTS {
         let router = emulator();
         let readable = arrange(&router, arrangement).await;
+        let own_is_readable = arrangement.own_account_is_linked();
 
-        // The batch shapes the own account can be asked about in, each with the profiles
-        // the answer must carry: one per account asked about, in the order the request
-        // first names it.
+        // The batch shapes the own account can be asked about in, each with the profiles a
+        // readable own account must be answered with: one per account asked about, in the
+        // order the request first names it.
         let mut shapes: Vec<(String, Vec<String>, Vec<String>)> = vec![
-            (
-                "alone".to_string(),
-                vec![own.clone()],
-                vec![own.clone()],
-            ),
+            ("alone".to_string(), vec![own.clone()], vec![own.clone()]),
             (
                 // `AccountIdList` carries no `@uniqueItems`, so a repeat is admitted.
                 "repeated".to_string(),
@@ -270,36 +437,25 @@ async fn the_requesters_own_account_resolves_to_its_profile_whatever_state_holds
 
         for (shape, requested, expected) in shapes {
             let label = format!("{arrangement:?}, {shape}");
-            let (status, body) = batch_get(&router, &requested).await;
-            assert_eq!(
-                status, 200,
-                "case {label}: expected HTTP 200 for {} account ids, got {status} {body}",
-                requested.len()
-            );
-            let actual = reported_accounts(&body);
-            assert_eq!(
-                actual, expected,
-                "case {label}: expected profiles for {expected:?}, got {actual:?}"
-            );
-            // The profile this service holds reports the account it is about and invents
-            // nothing else: every other member of `InvoiceProfile` is written through a
-            // plane this service does not own.
-            let profiles = body
-                .get("Profiles")
-                .and_then(Value::as_array)
-                .unwrap_or_else(|| panic!("case {label}: expected a Profiles list in {body}"));
-            for profile in profiles {
-                assert_eq!(
-                    profile.as_object().map(|members| members.len()),
-                    Some(1),
-                    "case {label}: a profile reports the account it is about alone, got \
-                     {profile}"
-                );
+            if own_is_readable {
+                assert_reported(&router, &label, &requested, &expected).await;
+            } else {
+                // Refused WHOLE on the first id in request order the requester may not
+                // read, which is the own account wherever it sits in these shapes.
+                assert_refused(&router, &label, &requested, &own).await;
             }
         }
 
+        // Every account the arrangement DID place in the organization is readable, whether
+        // or not the own account is: the answer is per account, not per caller.
+        if !readable.is_empty() {
+            let label = format!("{arrangement:?}, the accounts state names");
+            assert_reported(&router, &label, &readable, &readable).await;
+        }
+
         // An id the organization does not contain is refused WHOLE, wherever it sits
-        // beside the own account, and the refusal names the requester and that id.
+        // beside the own account, and the refusal names the requester and the first such
+        // id in request order.
         let outsiders = [account(90), account(91), account(92)];
         for (shape, requested, refused) in [
             (
@@ -310,7 +466,11 @@ async fn the_requesters_own_account_resolves_to_its_profile_whatever_state_holds
             (
                 "an outsider after the own account",
                 vec![own.clone(), outsiders[1].clone()],
-                outsiders[1].clone(),
+                if own_is_readable {
+                    outsiders[1].clone()
+                } else {
+                    own.clone()
+                },
             ),
             (
                 "an outsider before the own account",
@@ -324,40 +484,69 @@ async fn the_requesters_own_account_resolves_to_its_profile_whatever_state_holds
             ),
         ] {
             let label = format!("{arrangement:?}, {shape}");
-            let (status, body) = batch_get(&router, &requested).await;
-            assert_eq!(
-                status, 403,
-                "case {label}: expected HTTP 403, got {status} {body}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "AccessDeniedException",
-                "case {label}: expected the modelled AccessDeniedException, got {body}"
-            );
-            let expected = not_authorized_message(&refused);
-            assert_eq!(
-                error_text(&body),
-                expected,
-                "case {label}: expected the message {expected:?}, got {body}"
-            );
-            assert!(
-                body.get("Profiles").is_none(),
-                "case {label}: a refused batch reports no profiles, got {body}"
-            );
+            assert_refused(&router, &label, &requested, &refused).await;
         }
-
-        // Reading its own profile changes nothing a later caller sees: the same request
-        // answers identically, and the invoice units are what they were.
-        let units = ok(&router, "ListInvoiceUnits", &json!({})).await;
-        let again = batch_get(&router, std::slice::from_ref(&own)).await;
-        assert_eq!(
-            again.0, 200,
-            "case {arrangement:?}, repeated read: expected HTTP 200, got {again:?}"
-        );
-        assert_eq!(
-            units,
-            ok(&router, "ListInvoiceUnits", &json!({})).await,
-            "case {arrangement:?}: reading a profile must leave the invoice units alone"
-        );
     }
+}
+
+/// RULE, the state half: what admits the requester's own account is a stored configuration
+/// naming it as a linked account and nothing else — so a create that names it turns the
+/// very same refused request into an answer, a read (reported or refused) changes nothing a
+/// later caller sees, and the refusal never teaches the service about the account.
+#[tokio::test]
+async fn only_a_stored_configuration_admits_the_own_account() {
+    let router = emulator();
+    let own = own_account();
+
+    // Against a bare organization the own account is refused, and repeating the request
+    // answers identically: a refused read added nothing.
+    let first = batch_get(&router, std::slice::from_ref(&own)).await;
+    let second = batch_get(&router, std::slice::from_ref(&own)).await;
+    assert_eq!(
+        first.0, 403,
+        "case bare organization: expected HTTP 403, got {first:?}"
+    );
+    assert_eq!(
+        first, second,
+        "case repeated refusal: a refused read must not have admitted the account, got \
+         {first:?} then {second:?}"
+    );
+
+    // A create naming it as a linked account is what admits it.
+    create_unit(
+        &router,
+        "admits-own-account",
+        &account(1),
+        std::slice::from_ref(&own),
+        &[],
+    )
+    .await;
+    assert_reported(
+        &router,
+        "after a create names the own account",
+        std::slice::from_ref(&own),
+        std::slice::from_ref(&own),
+    )
+    .await;
+
+    // Reading profiles changes nothing a later caller sees: the invoice units are what
+    // they were, and the same requests answer the same way.
+    let units = ok(&router, "ListInvoiceUnits", &json!({})).await;
+    let reported = batch_get(&router, std::slice::from_ref(&own)).await;
+    let refused = batch_get(&router, &[own.clone(), account(90)]).await;
+    assert_eq!(
+        reported,
+        batch_get(&router, std::slice::from_ref(&own)).await,
+        "case repeated read: the same request must answer identically"
+    );
+    assert_eq!(
+        refused,
+        batch_get(&router, &[own.clone(), account(90)]).await,
+        "case repeated mixed batch: the same request must answer identically"
+    );
+    assert_eq!(
+        units,
+        ok(&router, "ListInvoiceUnits", &json!({})).await,
+        "case state after reads: reading a profile must leave the invoice units alone"
+    );
 }

@@ -12,8 +12,8 @@
 //! organization" (`smithy_query(query="doc", shape="BatchGetInvoiceProfile")`), so the
 //! rule under test is: a profile is reported for an account the requester may be answered
 //! for — one this service's state names as a LINKED account of the requester's
-//! organization, and the requester's OWN account, which it may read because it
-//! authenticates as it — and any other account id refuses the request whole with the
+//! organization, the requester's OWN account included, which is readable on exactly those
+//! terms and no others — and any other account id refuses the request whole with the
 //! modelled 403. The tables below span every way an account enters (and leaves) that
 //! organization in this service's state, the request shapes a batch takes (one account,
 //! several, duplicated, many, reordered) and the read-only contract.
@@ -411,10 +411,10 @@ async fn assert_refused(
     );
 }
 
-/// The requester's own account is readable here whatever the fixture names, and it behaves
-/// like any readable account: the request succeeds whatever shape the batch takes and
-/// wherever in request order the account sits, and an account the organization does not
-/// contain is still what the 403 is reserved for.
+/// The requester's own account, once a rule names it as a linked account, behaves like any
+/// other readable account: the request succeeds whatever shape the batch takes and wherever
+/// in request order the account sits, and an account the organization does not contain is
+/// still what the 403 is reserved for.
 #[tokio::test]
 async fn the_requesters_own_account_is_reported_whatever_the_request_shape() {
     let router = emulator();
@@ -489,13 +489,14 @@ async fn the_requesters_own_account_is_reported_whatever_the_request_shape() {
     .await;
 }
 
-/// The requester's own account is readable whatever this service's state holds beside it:
-/// a principal has access to the resources of the account it authenticates as, so asking
-/// about its own account is asking about its own resources. Every arrangement of state
-/// around it answers the same way, while an account id no configuration names is still
-/// what the modelled 403 is reserved for.
+/// The requester's own account is readable exactly when this service's state names it as a
+/// LINKED account of the organization: the requester is that organization's MANAGEMENT
+/// account, which is not one of its own organization's linked accounts, so its identity as
+/// the caller admits nothing. Every arrangement that names it answers with its profile, the
+/// bare organization that names it nowhere refuses it with the modelled 403, and an account
+/// id no configuration names is refused throughout.
 #[tokio::test]
-async fn the_own_account_is_reported_whatever_state_names() {
+async fn the_own_account_is_reported_exactly_when_state_names_it() {
     let own = management_account().to_string();
     let other = account(21);
 
@@ -510,21 +511,27 @@ async fn the_own_account_is_reported_whatever_state_names() {
         let router = emulator();
         arrange_own_account(&router, how, &own, &other).await;
 
-        let (status, body) = batch_get(&router, std::slice::from_ref(&own)).await;
-        assert_eq!(
-            status, 200,
-            "case {label} ({own}): the requester's own account is readable by it, got \
-             {status} {body}"
-        );
-        assert_eq!(
-            reported_accounts(&body),
-            vec![own.clone()],
-            "case {label} ({own}): expected one profile for that account, got {body}"
-        );
+        if how == OwnAccountInState::NotNamed {
+            // Nothing names it, so it is outside the organization's linked accounts — and
+            // being the account the requester authenticates as admits it no further than
+            // it admits any other id.
+            assert_refused(&router, &label, std::slice::from_ref(&own), &own).await;
+            // The other account of this row is named nowhere either.
+            assert_refused(&router, &label, std::slice::from_ref(&other), &other).await;
+        } else {
+            let (status, body) = batch_get(&router, std::slice::from_ref(&own)).await;
+            assert_eq!(
+                status, 200,
+                "case {label} ({own}): a named linked account is readable, got {status} {body}"
+            );
+            assert_eq!(
+                reported_accounts(&body),
+                vec![own.clone()],
+                "case {label} ({own}): expected one profile for that account, got {body}"
+            );
 
-        // Every one of these configurations but the bare case also names ANOTHER
-        // account, which is a linked account and must be reported as well.
-        if how != OwnAccountInState::NotNamed {
+            // Every one of these configurations also names ANOTHER account, which is a
+            // linked account and must be reported as well.
             let (status, body) = batch_get(&router, std::slice::from_ref(&other)).await;
             assert_eq!(
                 status, 200,
@@ -535,10 +542,6 @@ async fn the_own_account_is_reported_whatever_state_names() {
                 vec![other.clone()],
                 "case {label} ({other}): expected one profile for that account, got {body}"
             );
-        } else {
-            // Nothing names it, so it is outside the organization — and unlike the
-            // requester's own account, nothing else admits it.
-            assert_refused(&router, &label, std::slice::from_ref(&other), &other).await;
         }
 
         // An account no configuration names is outside the organization in every one of
@@ -550,8 +553,8 @@ async fn the_own_account_is_reported_whatever_state_names() {
 /// Every way this service's state can name an account, applied to the requester's OWN
 /// account by [`arrange_own_account`]: its `InvoiceReceiver` and `LinkedAccounts` sources
 /// (`smithy_query(query="shape", shape="InvoiceUnitRule")`), current and superseded, plus
-/// the bare organization that names it nowhere — where it is still readable by the
-/// requester, because that is not what makes the requester's own account readable.
+/// the bare organization that names it nowhere — where it is refused, because nothing but
+/// such a configuration makes an account readable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnAccountInState {
     /// No invoice units at all — the organization as a fresh emulator holds it.
