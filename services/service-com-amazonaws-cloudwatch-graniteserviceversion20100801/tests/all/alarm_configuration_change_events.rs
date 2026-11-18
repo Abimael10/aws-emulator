@@ -25,6 +25,10 @@
 //! configuration an update changed (a threshold, an action list, a rule), and the two shapes of
 //! call that change no configuration.
 //!
+//! A write this service REFUSES is the other negative half, and the one a rule auditing an
+//! account's alarms depends on: it stores no configuration, so it changes none and publishes
+//! none.
+//!
 //! The negative halves are graded WITHOUT waiting out a span: every call of a row is made in
 //! order and the whole SEQUENCE of events delivered is compared against the sequence the rule
 //! owes, so an event a no-op call published would land between two the rule names and fail the
@@ -193,10 +197,23 @@ async fn given_rule_for_alarm(
     alarm_name: &str,
     queue_url: &str,
 ) {
+    given_rule_for_alarms(emulator, case, rule_name, &[alarm_name], queue_url).await;
+}
+
+/// The same, for a rule matching the configuration changes of SEVERAL alarms: one queue holds
+/// everything the account published about any of them, which is how a suite asserts that a call
+/// naming one of them published nothing.
+async fn given_rule_for_alarms(
+    emulator: &Emulator,
+    case: &str,
+    rule_name: &str,
+    alarm_names: &[&str],
+    queue_url: &str,
+) {
     let pattern = json!({
         "source": [SOURCE],
         "detail-type": [DETAIL_TYPE],
-        "detail": {"alarmName": [alarm_name]},
+        "detail": {"alarmName": alarm_names},
     })
     .to_string();
     eventbridge(
@@ -407,16 +424,7 @@ async fn metric_alarm_configuration_writes_publish_what_they_did() {
     expected.push(DELETE);
     until_delivered(&emulator, &queue, expected.len(), &mut held).await;
 
-    let delivered: Vec<String> = held
-        .iter()
-        .map(|event| {
-            event
-                .pointer("/detail/operation")
-                .and_then(Value::as_str)
-                .unwrap_or("<none>")
-                .to_string()
-        })
-        .collect();
+    let delivered = operations_of(&held);
     assert_eq!(
         delivered, expected,
         "case {case:?}: expected the operations {expected:?} in order on the rule's queue, got \
@@ -540,16 +548,7 @@ async fn composite_alarm_configuration_writes_publish_what_they_did() {
     until_delivered(&emulator, &queue, 3, &mut held).await;
 
     let expected = [CREATE, UPDATE, DELETE];
-    let delivered: Vec<String> = held
-        .iter()
-        .map(|event| {
-            event
-                .pointer("/detail/operation")
-                .and_then(Value::as_str)
-                .unwrap_or("<none>")
-                .to_string()
-        })
-        .collect();
+    let delivered = operations_of(&held);
     assert_eq!(
         delivered, expected,
         "case {case:?}: expected the operations {expected:?} in order on the rule's queue, got \
@@ -563,5 +562,388 @@ async fn composite_alarm_configuration_writes_publish_what_they_did() {
             "case {case:?}: expected the composite alarm's rule in the {operation:?} event's \
              configuration, got {event}"
         );
+    }
+}
+
+/// The error class this service refuses a write it would not store with, as the body of the
+/// answer names it: the request-validation class, whose legacy query code travels in the
+/// `x-amzn-query-error` header instead.
+const REFUSAL_CODE: &str = "ValidationException";
+
+/// The `detail.operation` of each delivered event, in the order the queue holds them.
+fn operations_of(held: &[Value]) -> Vec<String> {
+    held.iter()
+        .map(|event| {
+            event
+                .pointer("/detail/operation")
+                .and_then(Value::as_str)
+                .unwrap_or("<none>")
+                .to_string()
+        })
+        .collect()
+}
+
+/// The refusal a composite rule naming alarms the account holds none of answers with, which
+/// names each of them by the ARN that name resolves to.
+fn missing_alarms_refusal(arns: &[String]) -> String {
+    format!(
+        "Could not save the composite alarm as alarms [{}] in the alarm rule do not exist",
+        arns.join(", ")
+    )
+}
+
+/// The refusal a composite alarm whose actions suppressor the account holds none of answers
+/// with.
+fn missing_suppressor_refusal(arn: &str) -> String {
+    format!(
+        "Could not save the composite alarm as the actions suppressor alarm [{arn}] does not \
+         exist"
+    )
+}
+
+/// RULE, over the negative half of the same rule: a write this service REFUSES stores no
+/// configuration, so it publishes no configuration change — the bus carries the changes the
+/// writes that were STORED made and nothing else, which is what makes a rule targeting these
+/// events usable as an audit of what the account's alarms really are.
+///
+/// Graded against a rule that is demonstrably live: the refused writes are made under the very
+/// names the rule matches, and the whole SEQUENCE the queue holds afterwards is compared with
+/// the one the stored writes owe — so an event a refused write leaked would land among them and
+/// fail the comparison, and an absence here cannot be a rule that delivers nothing at all.
+///
+/// The rows differ along what the rule generalises over: WHICH write is refused (a composite
+/// alarm, a metric alarm), WHY it is refused (a rule naming alarms that do not exist, an actions
+/// suppressor that does not exist, a configuration outside a published bound), how many
+/// references the refusal names, and whether the refused write would have created the alarm or
+/// replaced one that already exists.
+#[tokio::test]
+async fn a_refused_alarm_write_publishes_no_configuration_change_event() {
+    let case = "a refused alarm write";
+    let emulator = emulator_with_a_bus();
+    let composite = "refusal-composite";
+    let metric = "refusal-metric";
+    // The live alarm every well-formed rule below reads, under a name the rule does NOT match:
+    // creating it changes a configuration, and the event it publishes belongs to another alarm.
+    let child = "refusal-live-child";
+    let queue = given_target_queue(&emulator, "refusal-q").await;
+    given_rule_for_alarms(
+        &emulator,
+        case,
+        "refusal-rule",
+        &[composite, metric],
+        &queue,
+    )
+    .await;
+    monitoring(&emulator, "PutMetricAlarm", &metric_alarm(child, &json!({}))).await;
+
+    // The ARN form this service resolves an alarm NAME to, read off an alarm it really stored:
+    // the refusals below name missing alarms in that same form.
+    let child_arn = alarm_arn(&emulator, case, "MetricAlarm", child).await;
+    let arn_of = |name: &str| child_arn.replace(child, name);
+
+    // (row, the operation called, the kind of alarm the request names, the request, the refusal
+    // it must answer with — `None` for a row whose message another suite pins)
+    let rows: Vec<(&str, &str, &str, Value, Option<String>)> = vec![
+        (
+            "a composite rule naming one alarm that does not exist",
+            "PutCompositeAlarm",
+            "CompositeAlarm",
+            json!({"AlarmName": composite, "AlarmRule": "ALARM(\"refusal-ghost\")"}),
+            Some(missing_alarms_refusal(&[arn_of("refusal-ghost")])),
+        ),
+        (
+            "a composite rule naming two alarms that do not exist",
+            "PutCompositeAlarm",
+            "CompositeAlarm",
+            json!({
+                "AlarmName": composite,
+                "AlarmRule": "NOT (ALARM(\"refusal-ghost-one\") OR OK(\"refusal-ghost-two\"))",
+            }),
+            Some(missing_alarms_refusal(&[
+                arn_of("refusal-ghost-one"),
+                arn_of("refusal-ghost-two"),
+            ])),
+        ),
+        (
+            "a composite rule naming a missing alarm beside a live one",
+            "PutCompositeAlarm",
+            "CompositeAlarm",
+            json!({
+                "AlarmName": composite,
+                "AlarmRule":
+                    format!("ALARM(\"{child}\") AND ALARM(\"refusal-ghost-beside\")"),
+            }),
+            Some(missing_alarms_refusal(&[arn_of("refusal-ghost-beside")])),
+        ),
+        (
+            "a composite whose actions suppressor does not exist",
+            "PutCompositeAlarm",
+            "CompositeAlarm",
+            json!({
+                "AlarmName": composite,
+                "AlarmRule": format!("ALARM(\"{child}\")"),
+                "ActionsSuppressor": "refusal-ghost-suppressor",
+                "ActionsSuppressorWaitPeriod": 60,
+                "ActionsSuppressorExtensionPeriod": 60,
+            }),
+            Some(missing_suppressor_refusal(&arn_of(
+                "refusal-ghost-suppressor",
+            ))),
+        ),
+        (
+            // A metric alarm refused for a reason of its own kind: the evaluation horizon this
+            // configuration asks for is past the published ceiling for its period.
+            "a metric alarm write past its evaluation horizon",
+            "PutMetricAlarm",
+            "MetricAlarm",
+            metric_alarm(metric, &json!({"Period": 60, "EvaluationPeriods": 1_441})),
+            None,
+        ),
+    ];
+
+    for (row, operation, kind, request, refusal) in &rows {
+        let (status, body) =
+            crate::harness::call_in_region(&emulator.router, REGION, operation, request).await;
+        let code = crate::harness::error_code(&body);
+        assert_eq!(
+            (status, code.as_str()),
+            (400, REFUSAL_CODE),
+            "case {case:?}, row {row:?}: expected HTTP 400 {REFUSAL_CODE}, got {status} with \
+             {body}"
+        );
+        if let Some(refusal) = refusal {
+            let message = crate::harness::error_message(&body);
+            assert_eq!(
+                &message, refusal,
+                "case {case:?}, row {row:?}: expected the refusal {refusal:?}, got {message:?}"
+            );
+        }
+        // A refused write stores nothing, which is WHY it publishes nothing.
+        let name = request["AlarmName"].as_str().unwrap_or_default();
+        let member = if *kind == "CompositeAlarm" {
+            "CompositeAlarms"
+        } else {
+            "MetricAlarms"
+        };
+        let stored = monitoring(
+            &emulator,
+            "DescribeAlarms",
+            &json!({"AlarmNames": [name], "AlarmTypes": [kind]}),
+        )
+        .await;
+        assert_eq!(
+            stored[member],
+            json!([]),
+            "case {case:?}, row {row:?}: a refused write must store nothing, got {stored}"
+        );
+    }
+
+    let mut held: Vec<Value> = Vec::new();
+    collect(&emulator, &queue, &mut held).await;
+    assert!(
+        held.is_empty(),
+        "case {case:?}: expected the refused writes to publish nothing, got {held:?}"
+    );
+
+    // Now the writes that ARE stored, under the same name the refusals named: a create, a
+    // refused update between them, an update and a deletion.
+    let created_rule = format!("ALARM(\"{child}\")");
+    let updated_rule = format!("ALARM(\"{child}\") OR INSUFFICIENT_DATA(\"{child}\")");
+    let composite_write = |rule: &str| {
+        json!({
+            "AlarmName": composite,
+            "AlarmRule": rule,
+            // Written explicitly rather than defaulted, so the configuration the events report
+            // is one a client chose.
+            "ActionsEnabled": false,
+        })
+    };
+    monitoring(&emulator, "PutCompositeAlarm", &composite_write(&created_rule)).await;
+    until_delivered(&emulator, &queue, 1, &mut held).await;
+
+    // A refused UPDATE of the alarm that now exists leaves the stored configuration alone and
+    // publishes nothing either.
+    let (status, body) = crate::harness::call_in_region(
+        &emulator.router,
+        REGION,
+        "PutCompositeAlarm",
+        &json!({"AlarmName": composite, "AlarmRule": "ALARM(\"refusal-ghost-update\")"}),
+    )
+    .await;
+    let code = crate::harness::error_code(&body);
+    assert_eq!(
+        (status, code.as_str()),
+        (400, REFUSAL_CODE),
+        "case {case:?}: expected a refused update to answer HTTP 400 {REFUSAL_CODE}, got \
+         {status} with {body}"
+    );
+    let message = crate::harness::error_message(&body);
+    let refusal = missing_alarms_refusal(&[arn_of("refusal-ghost-update")]);
+    assert_eq!(
+        message, refusal,
+        "case {case:?}: expected the refusal {refusal:?} from a refused update, got {message:?}"
+    );
+    let stored = monitoring(
+        &emulator,
+        "DescribeAlarms",
+        &json!({"AlarmNames": [composite], "AlarmTypes": ["CompositeAlarm"]}),
+    )
+    .await;
+    assert_eq!(
+        stored["CompositeAlarms"][0]["AlarmRule"],
+        json!(created_rule),
+        "case {case:?}: a refused update must leave the stored rule alone, got {stored}"
+    );
+    collect(&emulator, &queue, &mut held).await;
+    assert_eq!(
+        held.len(),
+        1,
+        "case {case:?}: expected the refused update to publish nothing, got {held:?}"
+    );
+
+    monitoring(&emulator, "PutCompositeAlarm", &composite_write(&updated_rule)).await;
+    until_delivered(&emulator, &queue, 2, &mut held).await;
+    let arn = alarm_arn(&emulator, case, "CompositeAlarm", composite).await;
+    monitoring(&emulator, "DeleteAlarms", &json!({"AlarmNames": [composite]})).await;
+    until_delivered(&emulator, &queue, 3, &mut held).await;
+
+    let expected = [CREATE, UPDATE, DELETE];
+    let delivered = operations_of(&held);
+    assert_eq!(
+        delivered, expected,
+        "case {case:?}: expected exactly the operations {expected:?} of the stored writes on \
+         the rule's queue, got {delivered:?} from {held:?}"
+    );
+    for (event, operation) in held.iter().zip(expected) {
+        assert_envelope(case, event, composite, &arn, operation);
+        // The resource the event concerns is the alarm that was written, and only it.
+        assert_eq!(
+            event["resources"],
+            json!([arn]),
+            "case {case:?}: expected the {operation:?} event to name exactly the alarm's ARN in \
+             its resources, got {event}"
+        );
+        // The configuration in force after the write — and, for the deletion, the one it
+        // removed: the rule the alarm applies and whether its actions are enabled.
+        let in_force = if operation == CREATE {
+            &created_rule
+        } else {
+            &updated_rule
+        };
+        let rule = event.pointer("/detail/configuration/alarmRule");
+        assert_eq!(
+            rule,
+            Some(&json!(in_force)),
+            "case {case:?}: expected the {operation:?} event to report the rule {in_force:?}, \
+             got {event}"
+        );
+        let actions_enabled = event.pointer("/detail/configuration/actionsEnabled");
+        assert_eq!(
+            actions_enabled,
+            Some(&json!(false)),
+            "case {case:?}: expected the {operation:?} event to report the configured \
+             actionsEnabled, got {event}"
+        );
+        // A composite alarm evaluates a rule over other alarms and no metric of its own, so
+        // its configuration carries no metric query list.
+        assert_eq!(
+            event.pointer("/detail/configuration/metrics"),
+            None,
+            "case {case:?}: a composite alarm's configuration reports no metrics, got {event}"
+        );
+    }
+    // The configuration an UPDATE replaced is the rule the create stored, and a create and a
+    // deletion replaced none.
+    assert_eq!(
+        held[1].pointer("/detail/previousConfiguration/alarmRule"),
+        Some(&json!(created_rule)),
+        "case {case:?}: expected the update to report the rule it replaced, got {}",
+        held[1]
+    );
+    for (index, operation) in [(0_usize, CREATE), (2, DELETE)] {
+        assert_eq!(
+            held[index].pointer("/detail/previousConfiguration"),
+            None,
+            "case {case:?}: expected the {operation:?} event to report no previous \
+             configuration, got {}",
+            held[index]
+        );
+    }
+}
+
+/// RULE, over a SEQUENCE of writes to one alarm: every write that changes the configuration
+/// publishes its OWN event, reporting the configuration THAT write left — so a client
+/// re-thresholding an alarm sees one event per write, each carrying the threshold just stored
+/// and the one it replaced, rather than one event for the first write and none after it.
+///
+/// The rows are the thresholds written, in order; they differ along the value the write stores,
+/// which is what the rule generalises over.
+#[tokio::test]
+async fn every_threshold_write_publishes_the_threshold_it_stored() {
+    let case = "repeated threshold writes";
+    let emulator = emulator_with_a_bus();
+    let alarm = "threshold-write-probe";
+    let queue = given_target_queue(&emulator, "threshold-write-q").await;
+    given_rule_for_alarm(&emulator, case, "threshold-write-rule", alarm, &queue).await;
+
+    // Consecutive whole numbers, as a client walking an alarm's threshold writes them, beside a
+    // fractional and a large value: the rule is about the value the write stored, not about its
+    // magnitude.
+    let thresholds = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 0.5, 98_765.25];
+
+    let mut held: Vec<Value> = Vec::new();
+    for (index, threshold) in thresholds.iter().enumerate() {
+        monitoring(
+            &emulator,
+            "PutMetricAlarm",
+            &metric_alarm(alarm, &json!({"Threshold": threshold})),
+        )
+        .await;
+        until_delivered(&emulator, &queue, index + 1, &mut held).await;
+        assert_eq!(
+            held.len(),
+            index + 1,
+            "case {case:?}, the write of threshold {threshold}: expected {} event(s) on the \
+             rule's queue, got {held:?}",
+            index + 1
+        );
+        let event = &held[index];
+        let reported = event
+            .pointer("/detail/configuration/threshold")
+            .and_then(Value::as_f64);
+        assert_eq!(
+            reported,
+            Some(*threshold),
+            "case {case:?}, the write of threshold {threshold}: expected that threshold in the \
+             event's configuration, got {reported:?} in {event}"
+        );
+        if index > 0 {
+            let previous = event
+                .pointer("/detail/previousConfiguration/threshold")
+                .and_then(Value::as_f64);
+            let replaced = thresholds[index - 1];
+            assert_eq!(
+                previous,
+                Some(replaced),
+                "case {case:?}, the write of threshold {threshold}: expected the replaced \
+                 threshold {replaced} in the event, got {previous:?} in {event}"
+            );
+        }
+    }
+
+    let arn = alarm_arn(&emulator, case, "MetricAlarm", alarm).await;
+    let delivered = operations_of(&held);
+    let expected: Vec<String> = thresholds
+        .iter()
+        .enumerate()
+        .map(|(index, _)| if index == 0 { CREATE } else { UPDATE }.to_string())
+        .collect();
+    assert_eq!(
+        delivered, expected,
+        "case {case:?}: expected one event per write, the first a create and the rest updates, \
+         got {delivered:?} from {held:?}"
+    );
+    for (event, operation) in held.iter().zip(&expected) {
+        assert_envelope(case, event, alarm, &arn, operation);
     }
 }
