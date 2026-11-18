@@ -315,11 +315,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name must be unique within its context" — a taken name is refused
         // rather than replacing the snapshot stored under it. Copying a snapshot
         // onto its own name lands here too, because the source is itself stored
-        // under that name.
+        // under that name. A COPY names the taken name as the DESTINATION, which
+        // is its own sentence
+        // (`crate::state::COPY_DESTINATION_SNAPSHOT_ALREADY_EXISTS_MESSAGE`).
         if store.snapshots.contains_key(&target_snapshot_name) {
             return Err(CopySnapshotErrorModeled::SnapshotAlreadyExistsFault(
                 SnapshotAlreadyExistsFault {
-                    message: Some(crate::state::SNAPSHOT_ALREADY_EXISTS_MESSAGE.to_string()),
+                    message: Some(
+                        crate::state::COPY_DESTINATION_SNAPSHOT_ALREADY_EXISTS_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

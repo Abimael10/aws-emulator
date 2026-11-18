@@ -72,6 +72,10 @@ redis-protocol = { version = "6.0.0", default-features = false, features = ["std
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The integration tests are ONE cargo target rooted at `tests/all/main.rs`, which
+# declares every suite under `tests/all/` from its file name, so a new suite is a new
+# file and nothing lists it.
+automod = { workspace = true }
 # The encryption suite mounts KMS beside ElastiCache on one engine, because
 # resolving the key a resource names is a call into it.
 service-com-amazonaws-kms-trentservice = { workspace = true }

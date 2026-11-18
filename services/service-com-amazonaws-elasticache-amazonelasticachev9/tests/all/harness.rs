@@ -111,6 +111,28 @@ pub fn assert_own_endpoint(case: &str, what: &str, address: &str, port: Option<&
     );
 }
 
+/// Assert `reply` is the refusal `status` / `code` carrying exactly `message`.
+///
+/// The one copy of the assertion the refusal-wording suites of this crate share: a
+/// refusal's whole observable surface is its status, its `awsQuery` code and its
+/// sentence, so a suite that checks one of the three and not the others passes a
+/// refusal a client cannot act on. `case` names the row.
+pub fn assert_refusal(case: &str, reply: &Reply, status: u16, code: &str, message: &str) {
+    assert_eq!(
+        (reply.status, reply.error_code()),
+        (status, code),
+        "case {case:?}: expected {status} {code}, got {} {}",
+        reply.status,
+        reply.body
+    );
+    assert_eq!(
+        reply.error_message(),
+        message,
+        "case {case:?}: expected message {message:?}, got {:?}",
+        reply.error_message()
+    );
+}
+
 /// One wire answer, reduced to what a client branches on: the status, and every
 /// text node in the XML body keyed by its element path.
 #[derive(Debug)]

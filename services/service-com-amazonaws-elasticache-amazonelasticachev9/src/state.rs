@@ -281,21 +281,34 @@ pub const SNAPSHOT_MAX_RECORDS_MAX: i32 = 50;
 /// See [`SNAPSHOT_MAX_RECORDS_MAX`].
 pub const SNAPSHOT_MAX_RECORDS_DEFAULT: i32 = 50;
 
-/// The largest Memcached cluster, and the only legal Valkey / Redis OSS node
-/// count, as `NumCacheNodes` documents it: "For clusters running Valkey or Redis
-/// OSS, this value must be 1. For clusters running Memcached, this value must be
-/// between 1 and 40."
+/// The Memcached node count `NumCacheNodes` names in its prose ("For clusters
+/// running Valkey or Redis OSS, this value must be 1. For clusters running
+/// Memcached, this value must be between 1 and 40").
+///
+/// An adjustable QUOTA rather than a bound the API validates against: a request
+/// for more nodes than this is accepted and provisioned, so a count is judged
+/// against the floor every engine shares ([`MIN_CACHE_NODES_PER_CLUSTER`]) and
+/// the number of nodes one cluster may hold
+/// ([`MAX_CACHE_NODES_PER_CLUSTER`]) — see [`validate_num_cache_nodes`].
 pub const MEMCACHED_MAX_NODES: i32 = 40;
 
-/// The most nodes this emulator will MATERIALISE for one cluster, whatever a
-/// request asks for: the largest cluster any engine permits
-/// ([`MEMCACHED_MAX_NODES`]).
+/// The most nodes ONE CLUSTER may hold: the per-cluster ceiling this service holds
+/// a cache cluster to, and the only one a request is judged against.
 ///
-/// The handlers refuse a larger `NumCacheNodes` before a record is built (see
-/// [`validate_num_cache_nodes`]); this is the bound at the allocation site
-/// itself, so no path through [`CacheClusterRecord::resize_nodes`] can be made
-/// to allocate node records without end.
-pub const MAX_CACHE_NODES_PER_CLUSTER: i32 = MEMCACHED_MAX_NODES;
+/// It is both what a count past it is refused as — the modelled
+/// `NodeQuotaForClusterExceededFault`, "the request cannot be processed because
+/// it would exceed the allowed number of cache nodes in a single cluster" — and
+/// the bound at the allocation site itself, so no path through
+/// [`CacheClusterRecord::resize_nodes`] can be made to allocate node records
+/// without end.
+///
+/// The figure is this emulator's own: the recorded service accepts a Memcached
+/// cluster larger than the count `NumCacheNodes` names in its prose
+/// ([`MEMCACHED_MAX_NODES`]), so that count is not the ceiling, and the service
+/// publishes no other number for a cluster whose quota was raised. It is set far
+/// enough above the published one that no request a caller would make meets it,
+/// and the store stays bounded.
+pub const MAX_CACHE_NODES_PER_CLUSTER: i32 = 300;
 
 /// The smallest cluster: a cluster always has at least one node, which is also
 /// the floor [`CacheClusterRecord::resize_nodes`] clamps to.
@@ -1261,11 +1274,58 @@ pub const LOOKUP_IDENTIFIER_MAX_LEN: usize = CLUSTER_ID_MAX_LEN;
 /// rather than as a resource that does not exist.
 ///
 /// `prose` is how the service names the member in BOTH sentences ("Replication
-/// Group ID"): ElastiCache states the identifier rule over the resource
-/// identifier the request SPECIFIED — `<prose> specified is not a valid
-/// identifier. …` — rather than over the shape's member name, so one wording
-/// serves every member this rule judges.
+/// Group ID"): for the members this template serves, ElastiCache states the
+/// identifier rule over the resource identifier the request SPECIFIED —
+/// `<prose> specified is not a valid identifier. …`.
+///
+/// It is NOT the only lead-in the service words: the members AWS names by its own
+/// parameter label take [`parameter_identifier_refusal`] instead. Which of the two
+/// a member takes is that member's own and observable apart on the live service,
+/// so one template cannot serve them all.
 pub fn identifier_refusal(prose: &str, value: &str, max_len: usize) -> Option<String> {
+    form_refusal_with_lead_in(
+        &format!("{prose} specified is not a valid identifier."),
+        prose,
+        value,
+        max_len,
+    )
+}
+
+/// Why `value` cannot name a resource of this service, or `None` when it can, for the
+/// members whose FORM refusal names the PARAMETER rather than the resource in prose:
+/// `The parameter <parameter> is not a valid identifier. …`
+///
+/// ElastiCache words this refusal per MEMBER, not per operation: the label it names is
+/// AWS's own for that member (`CacheClusterIdentifier` for a cache cluster's id,
+/// `CacheParameterGroupName` for a parameter group's name), which is not always the wire
+/// member's name, and the members it words the other way round keep
+/// [`identifier_refusal`]. `prose` is how the service names the member in the LENGTH
+/// sentence, which is the same sentence either way.
+pub fn parameter_identifier_refusal(
+    parameter: &str,
+    prose: &str,
+    value: &str,
+    max_len: usize,
+) -> Option<String> {
+    form_refusal_with_lead_in(
+        &format!("The parameter {parameter} is not a valid identifier."),
+        prose,
+        value,
+        max_len,
+    )
+}
+
+/// The refusal behind both identifier templates: the length sentence, which they share,
+/// then `lead_in` followed by the grammar every identifier of this service satisfies.
+///
+/// The grammar sentence is stated once here, so the two lead-ins cannot drift apart about
+/// the rule they state.
+fn form_refusal_with_lead_in(
+    lead_in: &str,
+    prose: &str,
+    value: &str,
+    max_len: usize,
+) -> Option<String> {
     if value.len() > max_len {
         return Some(format!("{prose} cannot be longer than {max_len} characters."));
     }
@@ -1273,9 +1333,8 @@ pub fn identifier_refusal(prose: &str, value: &str, max_len: usize) -> Option<St
         return None;
     }
     Some(format!(
-        "{prose} specified is not a valid identifier. Identifiers must begin with a letter; must \
-         contain only ASCII letters, digits, and hyphens; and must not end with a hyphen or \
-         contain two consecutive hyphens."
+        "{lead_in} Identifiers must begin with a letter; must contain only ASCII letters, \
+         digits, and hyphens; and must not end with a hyphen or contain two consecutive hyphens."
     ))
 }
 
@@ -1329,10 +1388,44 @@ pub const GLOBAL_REPLICATION_GROUP_NOT_FOUND_MESSAGE: &str = "Global Replication
 pub const REPLICATION_GROUP_ALREADY_EXISTS_MESSAGE: &str =
     "Replication group with specified name already exists.";
 
-/// How ElastiCache words a snapshot name that is already taken, whether the
-/// snapshot would be taken from a cluster or copied from another snapshot; see
-/// [`REPLICATION_GROUP_ALREADY_EXISTS_MESSAGE`].
+/// How ElastiCache words a snapshot name that is already taken when the snapshot
+/// is being TAKEN — from a cluster, from a replication group, or as a delete's
+/// final snapshot; see [`REPLICATION_GROUP_ALREADY_EXISTS_MESSAGE`].
+///
+/// A COPY whose destination name is taken is refused with its own sentence,
+/// [`COPY_DESTINATION_SNAPSHOT_ALREADY_EXISTS_MESSAGE`], which names the taken
+/// name as the DESTINATION: the two are observable apart, so one template cannot
+/// serve both.
 pub const SNAPSHOT_ALREADY_EXISTS_MESSAGE: &str = "Snapshot with specified name already exists.";
+
+/// How ElastiCache words a `CopySnapshot` whose `TargetSnapshotName` is already
+/// taken: `A destination snapshot with the specified name already exists` — no
+/// trailing stop, and the name itself is not interpolated.
+pub const COPY_DESTINATION_SNAPSHOT_ALREADY_EXISTS_MESSAGE: &str =
+    "A destination snapshot with the specified name already exists";
+
+/// How ElastiCache refuses a snapshot of a cache whose ENGINE has no snapshots at
+/// all: the fixed sentence `The engine type of this cluster does not support
+/// snapshotting.`
+///
+/// Nothing from the request appears in it — the refusal is about the engine the
+/// cache runs, which `SnapshotFeatureNotSupportedFault` names ("Creating a
+/// snapshot of a cluster that is running Memcached rather than Valkey or Redis
+/// OSS"). One constant for every call that would take such a snapshot, whether it
+/// is asked for directly or as a delete's final snapshot.
+pub const SNAPSHOT_ENGINE_UNSUPPORTED_MESSAGE: &str =
+    "The engine type of this cluster does not support snapshotting.";
+
+/// How ElastiCache refuses taking a snapshot of a cluster that is not
+/// `available`: the fixed sentence `Cluster must be in available state in order
+/// to create a snapshot.`
+///
+/// Wholly fixed text — neither the cluster's id nor the status it carries now
+/// appears in it, because the refusal states the status this class of call
+/// ADMITS. `InvalidCacheClusterStateFault` is "the requested cluster is not in
+/// the available state".
+pub const SNAPSHOT_SOURCE_NOT_AVAILABLE_MESSAGE: &str =
+    "Cluster must be in available state in order to create a snapshot.";
 
 /// How ElastiCache words a service update its published catalogue does not hold:
 /// `ServiceUpdate <name> not found.`
@@ -1423,28 +1516,27 @@ pub fn stored_subnet_group_name(value: &str) -> String {
 ///
 /// The one variable part is the group's stored name
 /// ([`stored_subnet_group_name`]), as in
-/// [`delete_subnet_group_not_found_message`] — the two refusals of one delete
+/// [`subnet_group_does_not_exist_message`] — the two refusals of one delete
 /// name the group the one way.
 pub fn subnet_group_in_use_message(name: &str) -> String {
     format!("Cache subnet group {name} is currently in use.")
 }
 
-/// How ElastiCache words a `CacheSubnetGroupName` that names no cache subnet
-/// group of this account to an operation that would PLACE a resource in it:
-/// `Cache subnet group '<name>' does not exist.`
+/// How `CreateReplicationGroup` words a `CacheSubnetGroupName` that names no
+/// cache subnet group of this account: `Cache subnet group '<name>' does not
+/// exist.`
 ///
 /// The fixed text is `Cache subnet group '` and `' does not exist.`; the one
 /// variable part is the group's stored name ([`stored_subnet_group_name`]),
 /// QUOTED, because a client that named several resources in one call reads the
 /// missing one out of the quotes.
 ///
-/// One helper, so every create that places a resource in a cache subnet group —
-/// a cache cluster, a replication group — words its
-/// `CacheSubnetGroupNotFoundFault` the one way the service does. The operations
-/// that address the GROUP itself word the same fault their own way: the describe
-/// answers `Cache subnet group <name> not found.` and the delete
-/// [`delete_subnet_group_not_found_message`], so the three cannot be served by
-/// one template.
+/// This wording is that ONE create's: the other operations that resolve the same
+/// member word the same fault their own way — the create of a cache cluster and
+/// the two writes that address the group itself answer
+/// [`subnet_group_does_not_exist_message`], and the describe
+/// [`describe_subnet_group_not_found_message`] — so one template cannot serve
+/// them all.
 pub fn placement_subnet_group_not_found_message(name: &str) -> String {
     format!("Cache subnet group '{name}' does not exist.")
 }
@@ -1454,22 +1546,27 @@ pub fn placement_subnet_group_not_found_message(name: &str) -> String {
 ///
 /// The fixed text is `Cache Subnet Group ` and ` does not exist.`; the one
 /// variable part is the group's stored name ([`stored_subnet_group_name`]). One
-/// helper for the two operations that address the group itself by name and change
-/// it (`DeleteCacheSubnetGroup`, `ModifyCacheSubnetGroup`), so they cannot word
-/// one fault two ways; the describe that resolves the same member answers `Cache
-/// subnet group <name> not found.`, which is its own wording.
-pub fn delete_subnet_group_not_found_message(name: &str) -> String {
+/// helper for the three operations that answer this template — the two that
+/// address the group itself by name and change it (`DeleteCacheSubnetGroup`,
+/// `ModifyCacheSubnetGroup`) and the create of a CACHE CLUSTER, for the group it
+/// would be placed in — so they cannot word one fault three ways; the sibling
+/// wordings of the same fault are [`placement_subnet_group_not_found_message`],
+/// which is `CreateReplicationGroup`'s, and
+/// [`describe_subnet_group_not_found_message`], which is the describe's.
+pub fn subnet_group_does_not_exist_message(name: &str) -> String {
     format!("Cache Subnet Group {name} does not exist.")
 }
 
-/// How ElastiCache words a `CacheSubnetGroupName` that names no cache subnet
-/// group of this account to the DESCRIBE of groups: `Cache subnet group <name>
-/// not found.`
+/// How the DESCRIBE of cache subnet groups words a `CacheSubnetGroupName` that
+/// names no cache subnet group of this account: `Cache subnet group <name> not
+/// found.`
 ///
-/// The one variable part is the group's stored name
-/// ([`stored_subnet_group_name`]). The sibling wordings of the same fault are
-/// [`placement_subnet_group_not_found_message`] and
-/// [`delete_subnet_group_not_found_message`].
+/// The fixed text is `Cache subnet group ` and ` not found.`; the one variable
+/// part is the group's stored name ([`stored_subnet_group_name`]), unquoted — a
+/// name is "stored as a lowercase string", and the service reports the identity
+/// it resolved rather than the request's spelling. The sibling wordings of the
+/// same fault are [`placement_subnet_group_not_found_message`] and
+/// [`subnet_group_does_not_exist_message`].
 pub fn describe_subnet_group_not_found_message(name: &str) -> String {
     format!("Cache subnet group {name} not found.")
 }
@@ -1834,16 +1931,15 @@ pub fn unbounded_page_size_with_default(
 /// `engine` lowercased, or the reason it names no cache engine.
 ///
 /// ElastiCache stores the engine name in lowercase, so the comparison and the
-/// stored value are both lowercase.
+/// stored value are both lowercase. The refusal is the service's own sentence for
+/// an `Engine` naming no cache engine — `Invalid Cache engine: <engine>.` — whose
+/// one variable part is the value the request sent, reported as it spelled it.
 pub fn normalize_engine(engine: &str) -> Result<String, String> {
     let lowered = engine.to_ascii_lowercase();
     if ENGINES.contains(&lowered.as_str()) {
         Ok(lowered)
     } else {
-        Err(format!(
-            "Invalid value {engine} for Engine: must be one of {}.",
-            ENGINES.join(" | ")
-        ))
+        Err(format!("Invalid Cache engine: {engine}."))
     }
 }
 
@@ -1883,29 +1979,77 @@ pub fn invalid_engine_name_message(engine: &str) -> String {
     format!("Invalid engine name: {engine}")
 }
 
-/// `Ok(())` when `num` is a node count `engine` permits, else the reason it is
-/// refused.
+/// How ElastiCache refuses a cache node count below the floor every cluster has,
+/// whatever engine it runs: `NumCacheNodes must be greater than or equal to 1.`
 ///
-/// From `NumCacheNodes`: "For clusters running Valkey or Redis OSS, this value
-/// must be 1. For clusters running Memcached, this value must be between 1 and
-/// 40."
-pub fn validate_num_cache_nodes(engine: &str, num: i32) -> Result<(), String> {
-    if engine == "memcached" {
-        if (1..=MEMCACHED_MAX_NODES).contains(&num) {
-            return Ok(());
-        }
-        return Err(format!(
-            "Invalid value {num} for NumCacheNodes: a memcached cluster must have between 1 and \
-             {MEMCACHED_MAX_NODES} cache nodes."
+/// Wholly fixed text — the member and the floor
+/// ([`MIN_CACHE_NODES_PER_CLUSTER`]) are the rule's, and the rejected count is
+/// not echoed. A count past the number of nodes one cluster may hold is the
+/// QUOTA refusal instead (see [`validate_num_cache_nodes`]).
+pub const NUM_CACHE_NODES_FLOOR_MESSAGE: &str =
+    "NumCacheNodes must be greater than or equal to 1.";
+
+/// How ElastiCache refuses a cluster of more nodes than one cluster may hold:
+/// the sentence `NodeQuotaForClusterExceededFault` itself states ("the request
+/// cannot be processed because it would exceed the allowed number of cache nodes
+/// in a single cluster").
+///
+/// Wholly fixed text: the refusal is about the account's quota, so neither the
+/// count asked for nor the cluster appears in it.
+pub const NODE_QUOTA_FOR_CLUSTER_MESSAGE: &str = "The request cannot be processed because it \
+                                                  would exceed the allowed number of cache nodes \
+                                                  in a single cluster.";
+
+/// Why a `NumCacheNodes` cannot be served, and WHICH modelled fault reports it.
+///
+/// A count the member does not admit and a count past a QUOTA are different
+/// classes of refusal on this service, and a client retrying after a quota
+/// increase branches on which it got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeCountRefusal {
+    /// A count no cluster of that engine could carry —
+    /// `InvalidParameterValueException`.
+    InvalidValue(String),
+    /// More nodes than one cluster may hold —
+    /// `NodeQuotaForClusterExceededFault`.
+    ClusterQuota(String),
+}
+
+/// `Ok(())` when `num` is a node count `engine` permits, else the reason it is
+/// refused and the class of refusal it belongs to.
+///
+/// Two rules are the MEMBER's, and both are enforced here: the floor every
+/// engine shares, and the topology `NumCacheNodes` documents for a cache that
+/// speaks RESP ("For clusters running Valkey or Redis OSS, this value must be
+/// 1"). The Memcached figure the same prose names (40, [`MEMCACHED_MAX_NODES`])
+/// is an adjustable quota rather than a bound the API validates against: a
+/// larger Memcached cluster is accepted and provisioned, and only a count past
+/// what one cluster may hold at all ([`MAX_CACHE_NODES_PER_CLUSTER`]) is
+/// refused — as the QUOTA it is, which is the fault the model carries for it.
+pub fn validate_num_cache_nodes(engine: &str, num: i32) -> Result<(), NodeCountRefusal> {
+    // The FLOOR is one rule for every engine — a cluster of no nodes is not a
+    // cluster — so it is stated once, before anything else, and in the service's
+    // own words for it ([`NUM_CACHE_NODES_FLOOR_MESSAGE`]).
+    if num < MIN_CACHE_NODES_PER_CLUSTER {
+        return Err(NodeCountRefusal::InvalidValue(
+            NUM_CACHE_NODES_FLOOR_MESSAGE.to_string(),
         ));
     }
-    if num == REDIS_NUM_CACHE_NODES {
-        return Ok(());
+    if engine != "memcached" {
+        if num == REDIS_NUM_CACHE_NODES {
+            return Ok(());
+        }
+        return Err(NodeCountRefusal::InvalidValue(format!(
+            "Invalid value {num} for NumCacheNodes: a {engine} cluster must have \
+             {REDIS_NUM_CACHE_NODES} cache node."
+        )));
     }
-    Err(format!(
-        "Invalid value {num} for NumCacheNodes: a {engine} cluster must have \
-         {REDIS_NUM_CACHE_NODES} cache node."
-    ))
+    if num > MAX_CACHE_NODES_PER_CLUSTER {
+        return Err(NodeCountRefusal::ClusterQuota(
+            NODE_QUOTA_FOR_CLUSTER_MESSAGE.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// A status change that has just been materialised by a settle: the instant it

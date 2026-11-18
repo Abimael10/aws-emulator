@@ -440,3 +440,116 @@ async fn an_auth_token_rotation_reports_the_grace_window_until_a_set_closes_it()
         );
     }
 }
+
+/// A deferred `NumCacheNodes` is OUTSTANDING until something applies it, and the count the
+/// cluster already has is what cancels it.
+///
+/// `NumCacheNodes`: "If the value for NumCacheNodes is greater than the sum of the number of
+/// current cache nodes and the number of cache nodes pending creation … more nodes are added.
+/// If the value is less than the number of existing cache nodes, nodes are removed. If the
+/// value is equal to the number of current cache nodes, any pending add or remove requests
+/// are canceled." The rows span the direction the pending change goes (adding, removing) and
+/// how far it goes — including past the node count the member's prose names, which is an
+/// adjustable quota and not a bound the API validates against.
+#[tokio::test]
+async fn a_deferred_node_count_pends_until_the_current_count_cancels_it() {
+    // (case, the cluster's own node count, the count a deferred modify asks for, the nodes
+    // it names for removal).
+    let rows: [(&str, &str, &str, &[&str]); 4] = [
+        ("one node added", "1", "2", &[]),
+        ("several nodes added", "2", "5", &[]),
+        ("past the count the prose names", "1", "41", &[]),
+        ("a node removed", "3", "2", &["0003"]),
+    ];
+
+    for (case, held, requested, ids_to_remove) in rows {
+        let emulator = Emulator::new();
+        let id = "pending-nodes";
+        create_settled_cluster(
+            &emulator,
+            case,
+            id,
+            &[
+                ("Engine", "memcached"),
+                ("CacheNodeType", "cache.m7g.large"),
+                ("NumCacheNodes", held),
+            ],
+        )
+        .await;
+
+        let mut pairs = params(&[
+            ("CacheClusterId", id),
+            ("NumCacheNodes", requested),
+            ("ApplyImmediately", "false"),
+        ]);
+        for (index, node) in ids_to_remove.iter().enumerate() {
+            pairs.push((
+                format!("CacheNodeIdsToRemove.CacheNodeId.{}", index + 1),
+                (*node).to_string(),
+            ));
+        }
+        let pended = emulator.call("ModifyCacheCluster", &pairs).await;
+        assert_eq!(
+            pended.status, 200,
+            "case {case:?}: a deferred node change must be accepted, got {} {}",
+            pended.status, pended.body
+        );
+
+        // The change is outstanding: the cluster goes on running the count it has, and the
+        // requested one is reported as pending — on the answer and on a later read alike.
+        let described = describe_cluster(&emulator, id).await;
+        for (source, reply) in [("the answer", &pended), ("a later describe", &described)] {
+            assert_eq!(
+                (
+                    reply.text("CacheCluster/NumCacheNodes"),
+                    reply.text("PendingModifiedValues/NumCacheNodes"),
+                ),
+                (Some(held), Some(requested)),
+                "case {case:?} ({source}): expected the cluster to keep {held} node(s) with \
+                 {requested} pending, got {}",
+                reply.body
+            );
+        }
+
+        // Naming the count the cluster already has cancels what is pending, and leaves the
+        // cluster running exactly what it ran before.
+        let cancelled = emulator
+            .call(
+                "ModifyCacheCluster",
+                &params(&[
+                    ("CacheClusterId", id),
+                    ("NumCacheNodes", held),
+                    ("ApplyImmediately", "false"),
+                ]),
+            )
+            .await;
+        assert_eq!(
+            cancelled.status, 200,
+            "case {case:?}: the cancelling modify must be accepted, got {} {}",
+            cancelled.status, cancelled.body
+        );
+        let after = describe_cluster(&emulator, id).await;
+        for (source, reply) in [("the answer", &cancelled), ("a later describe", &after)] {
+            assert_eq!(
+                reply.text("PendingModifiedValues/NumCacheNodes"),
+                None,
+                "case {case:?} ({source}): expected the pending node change to be cancelled, \
+                 got {}",
+                reply.body
+            );
+            assert!(
+                reply
+                    .all("PendingModifiedValues/CacheNodeIdsToRemove/CacheNodeId")
+                    .is_empty(),
+                "case {case:?} ({source}): expected no node left pending removal, got {}",
+                reply.body
+            );
+            assert_eq!(
+                reply.text("CacheCluster/NumCacheNodes"),
+                Some(held),
+                "case {case:?} ({source}): the cluster must still run {held} node(s), got {}",
+                reply.body
+            );
+        }
+    }
+}

@@ -239,12 +239,23 @@ const FAILOVER_NEEDS_TWO_CLUSTERS: &str =
      group.";
 
 /// The identifier grammar ElastiCache states over the resource identifier a request
-/// specified. `resource` is how the service names that identifier in prose.
+/// specified. `resource` is how the service names that identifier in prose, for the members
+/// it words this way.
 fn identifier_rule(resource: &str) -> String {
     format!(
         "{resource} specified is not a valid identifier. Identifiers must begin with a letter; \
          must contain only ASCII letters, digits, and hyphens; and must not end with a hyphen or \
          contain two consecutive hyphens."
+    )
+}
+
+/// The same grammar for the members ElastiCache names by its own PARAMETER label instead:
+/// the lead-in is per member, not one sentence for the whole service.
+fn parameter_identifier_rule(parameter: &str) -> String {
+    format!(
+        "The parameter {parameter} is not a valid identifier. Identifiers must begin with a \
+         letter; must contain only ASCII letters, digits, and hyphens; and must not end with a \
+         hyphen or contain two consecutive hyphens."
     )
 }
 
@@ -521,17 +532,37 @@ async fn automatic_failover_on_one_cache_cluster_states_the_two_cluster_rule() {
 }
 
 /// One identifier row: the operation, the member the bad value is sent as, the rest of a
-/// request that operation needs, and how the service names that identifier in prose.
+/// request that operation needs, and how the service names that identifier in the refusal —
+/// either in prose (`Prose`) or by the parameter label AWS gives the member (`Parameter`).
 struct IdentifierRow {
     action: &'static str,
     member: &'static str,
     rest: &'static [(&'static str, &'static str)],
-    resource: &'static str,
+    names: IdentifierSubject,
+}
+
+/// Which lead-in the refusal of one member carries; see [`identifier_rule`] and
+/// [`parameter_identifier_rule`].
+enum IdentifierSubject {
+    /// `<resource> specified is not a valid identifier. …`
+    Prose(&'static str),
+    /// `The parameter <label> is not a valid identifier. …`
+    Parameter(&'static str),
+}
+
+impl IdentifierSubject {
+    /// The whole sentence this subject's refusal carries.
+    fn sentence(&self) -> String {
+        match self {
+            Self::Prose(resource) => identifier_rule(resource),
+            Self::Parameter(parameter) => parameter_identifier_rule(parameter),
+        }
+    }
 }
 
 /// The rows span the operations that judge an identifier of this service — a create and a
 /// lookup of each resource whose identifier carries the grammar — so the sentence is pinned
-/// as the one rule the service states rather than as one operation's string.
+/// as the one rule the service states per member rather than as one operation's string.
 const IDENTIFIER_ROWS: &[IdentifierRow] = &[
     IdentifierRow {
         action: "CreateReplicationGroup",
@@ -541,31 +572,31 @@ const IDENTIFIER_ROWS: &[IdentifierRow] = &[
             ("Engine", "redis"),
             ("CacheNodeType", "cache.m7g.large"),
         ],
-        resource: "Replication Group ID",
+        names: IdentifierSubject::Prose("Replication Group ID"),
     },
     IdentifierRow {
         action: "DescribeReplicationGroups",
         member: "ReplicationGroupId",
         rest: &[],
-        resource: "Replication Group ID",
+        names: IdentifierSubject::Prose("Replication Group ID"),
     },
     IdentifierRow {
         action: "CreateCacheCluster",
         member: "CacheClusterId",
         rest: &[("Engine", "memcached"), ("CacheNodeType", "cache.t3.micro")],
-        resource: "Cache Cluster ID",
+        names: IdentifierSubject::Parameter("CacheClusterIdentifier"),
     },
     IdentifierRow {
         action: "DescribeCacheClusters",
         member: "CacheClusterId",
         rest: &[],
-        resource: "Cache Cluster ID",
+        names: IdentifierSubject::Parameter("CacheClusterIdentifier"),
     },
     IdentifierRow {
         action: "DeleteCacheParameterGroup",
         member: "CacheParameterGroupName",
         rest: &[],
-        resource: "Cache Parameter Group Name",
+        names: IdentifierSubject::Parameter("CacheParameterGroupName"),
     },
 ];
 
@@ -584,7 +615,7 @@ async fn a_malformed_identifier_states_the_grammar_over_the_resource_identifier(
     let emulator = Emulator::new();
 
     for row in IDENTIFIER_ROWS {
-        let expected = identifier_rule(row.resource);
+        let expected = row.names.sentence();
         for (shape, value) in MALFORMED_IDENTIFIERS {
             let case = format!("{} with {shape}", row.action);
             let mut pairs = params(&[(row.member, value)]);

@@ -309,10 +309,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cache_cluster_id = input.cache_cluster_id.to_ascii_lowercase();
         // `CacheClusterId` carries no modelled `@pattern`, so the documented
         // name rule is enforced here rather than at the boundary — worded by the
-        // one helper every identifier refusal of this service goes through
-        // (`crate::state::identifier_refusal`), so a create and a lookup state
-        // the same rule and name the resource the same way.
-        if let Some(message) = crate::state::identifier_refusal(
+        // one helper the members ElastiCache names by its own parameter label go
+        // through (`crate::state::parameter_identifier_refusal`, which names this
+        // one `CacheClusterIdentifier`), so a create and a lookup state the same
+        // rule and name the member the same way.
+        if let Some(message) = crate::state::parameter_identifier_refusal(
+            "CacheClusterIdentifier",
             "Cache Cluster ID",
             &cache_cluster_id,
             crate::state::CLUSTER_ID_MAX_LEN,
@@ -358,12 +360,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let num_cache_nodes = input
             .num_cache_nodes
             .unwrap_or(crate::state::DEFAULT_NUM_CACHE_NODES);
-        if let Err(message) = crate::state::validate_num_cache_nodes(&engine, num_cache_nodes) {
-            return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
-                InvalidParameterValueException {
-                    message: Some(message),
-                },
-            )
+        if let Err(refusal) = crate::state::validate_num_cache_nodes(&engine, num_cache_nodes) {
+            return Err(match refusal {
+                crate::state::NodeCountRefusal::InvalidValue(message) => {
+                    CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::NodeCountRefusal::ClusterQuota(message) => {
+                    CreateCacheClusterErrorModeled::NodeQuotaForClusterExceededFault(
+                        NodeQuotaForClusterExceededFault {
+                            message: Some(message),
+                        },
+                    )
+                }
+            }
             .into());
         }
 
@@ -728,9 +741,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             CreateCacheClusterErrorModeled::CacheSubnetGroupNotFoundFault(
                                 CacheSubnetGroupNotFoundFault {
                                     message: Some(
-                                        crate::state::placement_subnet_group_not_found_message(
-                                            &key,
-                                        ),
+                                        crate::state::subnet_group_does_not_exist_message(&key),
                                     ),
                                 },
                             )

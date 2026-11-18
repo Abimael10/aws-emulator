@@ -325,10 +325,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(
                             DeleteReplicationGroupErrorModeled::SnapshotFeatureNotSupportedFault(
                                 SnapshotFeatureNotSupportedFault {
-                                    message: Some(format!(
-                                        "Replication group {key} runs {group_engine}, and \
-                                         snapshots are supported for valkey and redis only."
-                                    )),
+                                    message: Some(
+                                        crate::state::SNAPSHOT_ENGINE_UNSUPPORTED_MESSAGE
+                                            .to_string(),
+                                    ),
                                 },
                             )
                             .into(),

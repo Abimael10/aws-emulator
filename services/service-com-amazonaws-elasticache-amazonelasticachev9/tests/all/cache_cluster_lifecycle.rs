@@ -492,28 +492,41 @@ async fn a_cluster_reaches_available_on_the_clock_and_not_before() {
 async fn the_node_count_a_create_accepts_is_the_one_the_engine_permits() {
     // `NumCacheNodes`: "For clusters running Valkey or Redis OSS, this value
     // must be 1. For clusters running Memcached, this value must be between 1
-    // and 40." Each published bound is a row, and so is one past it.
-    let cases: [(&str, &str, bool); 13] = [
-        ("redis", "1", true),
-        ("redis", "2", false),
-        ("redis", "0", false),
-        ("valkey", "1", true),
-        ("valkey", "3", false),
-        ("memcached", "1", true),
-        ("memcached", "20", true),
-        ("memcached", "40", true),
-        ("memcached", "41", false),
-        ("memcached", "0", false),
+    // and 40." The FLOOR and the RESP-engine topology are bounds the API
+    // validates against; the Memcached figure is an adjustable quota, so a
+    // larger Memcached cluster is served and only a count past what one cluster
+    // may hold (`state::MAX_CACHE_NODES_PER_CLUSTER`) is refused — as the quota
+    // it is. Each row is a count and the code it is refused with, or `None` when
+    // it is accepted.
+    let past_the_quota = (state::MAX_CACHE_NODES_PER_CLUSTER + 1).to_string();
+    let at_the_quota = state::MAX_CACHE_NODES_PER_CLUSTER.to_string();
+    let cases: [(&str, &str, Option<&str>); 15] = [
+        ("redis", "1", None),
+        ("redis", "2", Some("InvalidParameterValue")),
+        ("redis", "0", Some("InvalidParameterValue")),
+        ("valkey", "1", None),
+        ("valkey", "3", Some("InvalidParameterValue")),
+        ("memcached", "1", None),
+        ("memcached", "20", None),
+        ("memcached", "40", None),
+        ("memcached", "41", None),
+        ("memcached", at_the_quota.as_str(), None),
+        (
+            "memcached",
+            past_the_quota.as_str(),
+            Some("NodeQuotaForClusterExceeded"),
+        ),
+        ("memcached", "0", Some("InvalidParameterValue")),
         // `NumCacheNodes` carries no modelled `@range`, so the extremes of the
         // wire type reach the handler and must be refused rather than
         // overflowing any arithmetic on the way.
-        ("memcached", "-2147483648", false),
-        ("memcached", "2147483647", false),
-        ("redis", "-2147483647", false),
+        ("memcached", "-2147483648", Some("InvalidParameterValue")),
+        ("memcached", "2147483647", Some("NodeQuotaForClusterExceeded")),
+        ("redis", "-2147483647", Some("InvalidParameterValue")),
     ];
 
     let emulator = Emulator::new();
-    for (index, (engine, count, accepted)) in cases.iter().enumerate() {
+    for (index, (engine, count, refused_with)) in cases.iter().enumerate() {
         let id = format!("nodes-{index}");
         let reply = create_cluster(
             &emulator,
@@ -521,7 +534,26 @@ async fn the_node_count_a_create_accepts_is_the_one_the_engine_permits() {
             &[("Engine", engine), ("NumCacheNodes", count)],
         )
         .await;
-        if *accepted {
+        if let Some(code) = refused_with {
+            assert_eq!(
+                reply.status, 400,
+                "case {engine}/{count}: must be refused 400, got {} {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                *code,
+                "case {engine}/{count}: expected {code}, got {}",
+                reply.body
+            );
+            // A refused create stores nothing.
+            let described = describe_cluster(&emulator, &id).await;
+            assert_eq!(
+                described.status, 404,
+                "case {engine}/{count}: a refused create must not have stored a cluster, got {}",
+                described.body
+            );
+        } else {
             assert_eq!(
                 reply.status, 200,
                 "case {engine}/{count}: must be accepted, got {} {}",
@@ -532,25 +564,6 @@ async fn the_node_count_a_create_accepts_is_the_one_the_engine_permits() {
                 Some(*count),
                 "case {engine}/{count}: the stored count is what was asked for, got {:?}",
                 reply.text("CacheCluster/NumCacheNodes")
-            );
-        } else {
-            assert_eq!(
-                reply.status, 400,
-                "case {engine}/{count}: must be refused 400, got {} {}",
-                reply.status, reply.body
-            );
-            assert_eq!(
-                reply.error_code(),
-                "InvalidParameterValue",
-                "case {engine}/{count}: expected InvalidParameterValue, got {}",
-                reply.body
-            );
-            // A refused create stores nothing.
-            let described = describe_cluster(&emulator, &id).await;
-            assert_eq!(
-                described.status, 404,
-                "case {engine}/{count}: a refused create must not have stored a cluster, got {}",
-                described.body
             );
         }
     }
@@ -1496,7 +1509,7 @@ async fn modify_refuses_a_member_that_names_no_change_it_can_make() {
                 ("CacheNodeIdsToRemove.CacheNodeId.1", "0001"),
             ],
             400,
-            "InvalidParameterValue",
+            "NodeQuotaForClusterExceeded",
         ),
         (
             "ids to remove without NumCacheNodes",

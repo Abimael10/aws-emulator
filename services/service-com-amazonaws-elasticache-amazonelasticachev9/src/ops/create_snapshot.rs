@@ -334,15 +334,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "creating a snapshot of a cluster that is running Memcached rather
         // than Valkey or Redis OSS" and "creating a snapshot of a Valkey or
         // Redis OSS cluster running on a cache.t1.micro cache node" with. This
-        // operation "is valid for Valkey or Redis OSS only".
-        if cluster.engine == "memcached" {
+        // operation "is valid for Valkey or Redis OSS only". The engine gate
+        // answers the service's own sentence for it
+        // (`crate::state::SNAPSHOT_ENGINE_UNSUPPORTED_MESSAGE`), which carries
+        // neither the cluster's id nor the engine it runs.
+        if !crate::state::engine_speaks_resp(&cluster.engine) {
             return Err(CreateSnapshotErrorModeled::SnapshotFeatureNotSupportedFault(
                 SnapshotFeatureNotSupportedFault {
-                    message: Some(format!(
-                        "Cache cluster {cache_cluster_id} runs {}, and snapshots are supported for \
-                         valkey and redis only.",
-                        cluster.engine
-                    )),
+                    message: Some(
+                        crate::state::SNAPSHOT_ENGINE_UNSUPPORTED_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());
@@ -367,14 +368,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A cluster can only be copied while it is settled: one still
         // `creating`, `modifying`, `deleting` or already `snapshotting` from an
-        // earlier call is refused with the modelled state fault.
+        // earlier call is refused with the modelled state fault, whose sentence
+        // states the status this class of call admits rather than the one the
+        // cluster carries now
+        // (`crate::state::SNAPSHOT_SOURCE_NOT_AVAILABLE_MESSAGE`).
         if cluster.status != crate::state::STATUS_AVAILABLE {
             return Err(CreateSnapshotErrorModeled::InvalidCacheClusterStateFault(
                 InvalidCacheClusterStateFault {
-                    message: Some(format!(
-                        "Cache cluster {cache_cluster_id} is in {} state, not available.",
-                        cluster.status
-                    )),
+                    message: Some(
+                        crate::state::SNAPSHOT_SOURCE_NOT_AVAILABLE_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

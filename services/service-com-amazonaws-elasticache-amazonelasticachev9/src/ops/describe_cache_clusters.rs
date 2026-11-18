@@ -230,7 +230,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The FORM of the identifier first, for the same reason as in
             // `describe_replication_groups`: a value no cluster could ever
             // carry is a bad parameter value rather than a missing cluster.
-            if let Some(message) = crate::state::identifier_refusal(
+            if let Some(message) = crate::state::parameter_identifier_refusal(
+                "CacheClusterIdentifier",
                 "Cache Cluster ID",
                 id,
                 crate::state::LOOKUP_IDENTIFIER_MAX_LEN,

@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
 use crate::cache_cluster_lifecycle::{create_available_cluster, create_cluster, describe_cluster};
-use crate::harness::{params, Emulator, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION};
 
 /// The form pairs of one request row, as a table writes them.
 type FormPairs = &'static [(&'static str, &'static str)];
@@ -758,7 +758,30 @@ async fn the_not_found_and_already_exists_refusals_carry_the_service_templates()
         "the snapshot must be creatable, got {}",
         snapshot.body
     );
-    std::thread::sleep(PAST_TRANSITION);
+    // The rows below name a snapshot and its source cluster, so both have to be settled
+    // first: a snapshot still `creating` would answer the copy's state gate, and a cluster
+    // still `snapshotting` the create's. The transitions are the CLOCK's, so the suite looks
+    // again until each holds rather than waiting a fixed time.
+    poll_until(
+        &emulator,
+        REGION,
+        "the refusal templates",
+        "the snapshot tmpl-snap settling at available",
+        "DescribeSnapshots",
+        &params(&[("SnapshotName", "tmpl-snap")]),
+        |reply| reply.text("Snapshot/SnapshotStatus") == Some("available"),
+    )
+    .await;
+    poll_until(
+        &emulator,
+        REGION,
+        "the refusal templates",
+        "the cluster tmpl-cluster settling at available",
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", "tmpl-cluster")]),
+        |reply| reply.text("CacheCluster/CacheClusterStatus") == Some(state::STATUS_AVAILABLE),
+    )
+    .await;
 
     // The axis: the resource class, the operation that could not resolve (or
     // could not take) its name, and whether the service's template interpolates
@@ -912,13 +935,13 @@ async fn the_not_found_and_already_exists_refusals_carry_the_service_templates()
             state::REPLICATION_GROUP_ALREADY_EXISTS_MESSAGE,
         ),
         (
-            "the duplicate snapshot template",
+            "the copy destination template",
             "CopySnapshot",
             &[
                 ("SourceSnapshotName", "tmpl-snap"),
                 ("TargetSnapshotName", "tmpl-snap"),
             ][..],
-            state::SNAPSHOT_ALREADY_EXISTS_MESSAGE,
+            state::COPY_DESTINATION_SNAPSHOT_ALREADY_EXISTS_MESSAGE,
         ),
     ] {
         let reply = emulator.call(action, &params(pairs)).await;

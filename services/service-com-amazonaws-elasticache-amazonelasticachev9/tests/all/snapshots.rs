@@ -14,6 +14,8 @@
 //! test generalises over (engine, node count, port, retention settings, filter
 //! member, page size, name form), never a single recorded case.
 
+use service_com_amazonaws_elasticache_amazonelasticachev9::state;
+
 use crate::cache_cluster_lifecycle::{
     create_available_cluster, create_cluster, describe_cluster, poll_cluster_status,
 };
@@ -801,9 +803,10 @@ async fn a_snapshot_is_the_cluster_as_it_stood_when_it_was_taken() {
         "case before-change: a snapshotting cluster refuses a second snapshot, got {} {}",
         while_snapshotting.status, while_snapshotting.body
     );
-    assert!(
-        while_snapshotting.error_message().contains("snapshotting"),
-        "case before-change: the refusal must name the status the cluster has, got {:?}",
+    assert_eq!(
+        while_snapshotting.error_message(),
+        state::SNAPSHOT_SOURCE_NOT_AVAILABLE_MESSAGE,
+        "case before-change: the refusal must state the status a snapshot admits, got {:?}",
         while_snapshotting.error_message()
     );
     let settled = poll_cluster_status(&emulator, "before-change", "copied", "available").await;

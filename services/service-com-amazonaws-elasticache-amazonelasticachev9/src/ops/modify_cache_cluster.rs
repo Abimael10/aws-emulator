@@ -618,15 +618,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ends up running, so a request that changes only ONE of the two is
         // checked against the other's stored value — an `Engine` change to
         // valkey or redis on a multi-node Memcached cluster is refused here.
-        if let Err(message) = crate::state::validate_num_cache_nodes(&engine, target_nodes) {
-            return Err(
-                ModifyCacheClusterErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
+        if let Err(refusal) = crate::state::validate_num_cache_nodes(&engine, target_nodes) {
+            return Err(match refusal {
+                crate::state::NodeCountRefusal::InvalidValue(message) => {
+                    ModifyCacheClusterErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::NodeCountRefusal::ClusterQuota(message) => {
+                    ModifyCacheClusterErrorModeled::NodeQuotaForClusterExceededFault(
+                        NodeQuotaForClusterExceededFault {
+                            message: Some(message),
+                        },
+                    )
+                }
+            }
+            .into());
         }
         let target_count = usize::try_from(target_nodes).unwrap_or(0);
         let removing = current_nodes.saturating_sub(target_count);
@@ -859,8 +868,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // reports the requested ones under `PendingModifiedValues`.
             let pending = &mut cluster.pending_modified_values;
             if let Some(target) = input.num_cache_nodes {
-                pending.num_cache_nodes = Some(target);
-                pending.cache_node_ids_to_remove = ids_to_remove;
+                // "If the value is equal to the number of current cache nodes,
+                // any pending add or remove requests are canceled" — naming the
+                // count the cluster already has is the documented way to CANCEL
+                // a pending node change, so such a request clears what is
+                // pending instead of recording a change that would do nothing.
+                if target_count == current_nodes {
+                    pending.num_cache_nodes = None;
+                    pending.cache_node_ids_to_remove.clear();
+                } else {
+                    pending.num_cache_nodes = Some(target);
+                    pending.cache_node_ids_to_remove = ids_to_remove;
+                }
             }
             if let Some(node_type) = input.cache_node_type {
                 pending.cache_node_type = Some(node_type);

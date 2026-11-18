@@ -282,7 +282,19 @@ async fn a_delete_reports_the_cache_as_deleting_and_the_clock_removes_it() {
         "only the cache nothing deleted may be left, got {}",
         listed.body
     );
-    let survivor = describe_cache(&emulator, "survivor-cache").await;
+    // The cache nothing deleted is untouched: it reaches the status its own create owes it
+    // and keeps it. The transition is the CLOCK's, so the suite looks again until it holds
+    // rather than assuming enough time passed while the deletes above ran.
+    let survivor = poll_until(
+        &emulator,
+        REGION,
+        "survivor",
+        "the serverless cache nothing deleted settling at available",
+        "DescribeServerlessCaches",
+        &params(&[("ServerlessCacheName", "survivor-cache")]),
+        |reply| reply.text("Status") == Some(state::SERVERLESS_STATUS_AVAILABLE),
+    )
+    .await;
     assert_eq!(
         survivor.text("Status"),
         Some(state::SERVERLESS_STATUS_AVAILABLE),

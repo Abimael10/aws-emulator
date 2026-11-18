@@ -206,12 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The requested cache subnet group name does not refer to an existing
         // cache subnet group" is the modelled refusal, worded as this operation
-        // words it (`crate::state::delete_subnet_group_not_found_message`).
+        // words it (`crate::state::subnet_group_does_not_exist_message`).
         if !store.cache_subnet_groups.contains_key(&name) {
             return Err(
                 DeleteCacheSubnetGroupErrorModeled::CacheSubnetGroupNotFoundFault(
                     CacheSubnetGroupNotFoundFault {
-                        message: Some(crate::state::delete_subnet_group_not_found_message(&name)),
+                        message: Some(crate::state::subnet_group_does_not_exist_message(&name)),
                     },
                 )
                 .into(),

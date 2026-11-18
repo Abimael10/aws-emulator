@@ -394,8 +394,8 @@ impl CacheClusterRecord {
     /// Zones where the new Memcached cache nodes are created". Otherwise the
     /// added nodes take the cluster's own zone pool.
     ///
-    /// `target` is clamped to a count some engine permits (1 ..=
-    /// [`MEMCACHED_MAX_NODES`]) before anything is allocated. Both callers
+    /// `target` is clamped to a count one cluster may hold (1 ..=
+    /// [`MAX_CACHE_NODES_PER_CLUSTER`]) before anything is allocated. Both callers
     /// already refuse a count outside what their engine permits
     /// ([`validate_num_cache_nodes`]) so the clamp changes no request the service
     /// accepts; it is what keeps ONE request from sizing the allocation this

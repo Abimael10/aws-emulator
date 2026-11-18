@@ -17,15 +17,16 @@
 //!    minted with `ec2:CreateSubnet`, how many are named, the order and position they are
 //!    named in, and whether an absent identifier was never minted or was deleted.
 //!
-//! 2. WORDING — the refusal an operation that would PLACE a resource in a cache subnet
-//!    group answers for a name this account has no group under quotes that name:
-//!    `Cache subnet group '<name>' does not exist.`, naming the name's STORED identity —
-//!    `CacheSubnetGroupName` "is stored as a lowercase string", so the service names a
-//!    group under that one identity whatever case the request spelled. The rows span the
-//!    names a request may send and both operations that take a `CacheSubnetGroupName` to
-//!    place a resource in, with the operations that address the GROUP itself as the
-//!    contrasting rows: each of those words the same fault its own way, so the template
-//!    belongs to the placement.
+//! 2. WORDING — the refusal an operation that resolves a `CacheSubnetGroupName` answers for
+//!    a name this account has no group under is worded PER OPERATION, over the name's
+//!    STORED identity — `CacheSubnetGroupName` "is stored as a lowercase string", so the
+//!    service names the group under that one identity whatever case the request spelled.
+//!    `CreateReplicationGroup` quotes it (`Cache subnet group '<name>' does not exist.`),
+//!    the create of a cache cluster answers the template the group's own writes answer
+//!    (`Cache Subnet Group <name> does not exist.`), and the describe of groups answers
+//!    `Cache subnet group <name> not found.`. The rows span the names a request may send and
+//!    every operation that takes a `CacheSubnetGroupName`, so each wording is pinned where
+//!    it belongs rather than one of them standing for the fault.
 //!
 //! EC2 is mounted beside ElastiCache on ONE engine by [`crate::harness`] and driven through
 //! the AWS SDK over the same in-process callback this service's own resolution reaches it
@@ -50,12 +51,14 @@ const ZONES: [&str; 3] = ["us-east-1a", "us-east-1b", "us-east-1c"];
 const ABSENT_SUBNET: &str = "subnet-00000000deadbeef";
 const SHORT_ABSENT_SUBNET: &str = "subnet-0000beef";
 
-/// One placement row: the operation, the rest of a request it accepts, and the element its
-/// answer reports the group it was placed in under, where the modelled output carries one.
+/// One placement row: the operation, the rest of a request it accepts, the element its
+/// answer reports the group it was placed in under, where the modelled output carries one,
+/// and how THAT operation words a group it cannot resolve.
 type PlacementCase = (
     &'static str,
     &'static [(&'static str, &'static str)],
     Option<&'static str>,
+    fn(&str) -> String,
 );
 
 /// The account's network for one case: the emulator, the default subnets EC2 reports for
@@ -525,6 +528,19 @@ async fn a_serverless_cache_is_placed_only_in_subnets_the_owner_of_subnets_repor
     );
 }
 
+/// How the create of a CACHE CLUSTER words a `CacheSubnetGroupName` it cannot resolve: the
+/// template the two writes that address the group itself answer, over the name's stored
+/// identity.
+fn cluster_placement_wording(requested: &str) -> String {
+    state::subnet_group_does_not_exist_message(&requested.to_ascii_lowercase())
+}
+
+/// How `CreateReplicationGroup` words the same fault: its own quoted template, over the
+/// name's stored identity.
+fn group_placement_wording(requested: &str) -> String {
+    state::placement_subnet_group_not_found_message(&requested.to_ascii_lowercase())
+}
+
 #[tokio::test]
 async fn a_placement_naming_no_cache_subnet_group_quotes_the_name_it_was_given() {
     let net = network().await;
@@ -560,9 +576,10 @@ async fn a_placement_naming_no_cache_subnet_group_quotes_the_name_it_was_given()
         longest.as_str(),
     ];
     // Each operation that PLACES a resource in a cache subnet group, with the rest of a
-    // request it accepts and the element its answer reports the group it was placed in
+    // request it accepts, the element its answer reports the group it was placed in
     // under (`ReplicationGroup` models no member for it, so the group it is placed in is
-    // read back off its member cluster instead).
+    // read back off its member cluster instead) and the wording that operation refuses an
+    // unresolvable group with.
     let placements: [PlacementCase; 2] = [
         (
             "CreateCacheCluster",
@@ -571,6 +588,7 @@ async fn a_placement_naming_no_cache_subnet_group_quotes_the_name_it_was_given()
                 ("CacheNodeType", "cache.t3.micro"),
             ],
             Some("CacheSubnetGroupName"),
+            cluster_placement_wording,
         ),
         (
             "CreateReplicationGroup",
@@ -580,10 +598,11 @@ async fn a_placement_naming_no_cache_subnet_group_quotes_the_name_it_was_given()
                 ("CacheNodeType", "cache.t3.micro"),
             ],
             None,
+            group_placement_wording,
         ),
     ];
 
-    for (action, rest, reports_group_under) in placements {
+    for (action, rest, reports_group_under, wording) in placements {
         for name in missing_names {
             let mut pairs = params(rest);
             pairs.push(("CacheSubnetGroupName".to_string(), name.to_string()));
@@ -601,12 +620,9 @@ async fn a_placement_naming_no_cache_subnet_group_quotes_the_name_it_was_given()
             );
             assert_eq!(
                 refused.error_message(),
-                format!(
-                    "Cache subnet group '{}' does not exist.",
-                    name.to_ascii_lowercase()
-                ),
-                "case {action} / {name:?}: the refusal must quote the name's stored identity, \
-                 got {:?}",
+                wording(name),
+                "case {action} / {name:?}: the refusal must word the group this operation's own \
+                 way, over the name's stored identity, got {:?}",
                 refused.error_message()
             );
         }
@@ -648,8 +664,10 @@ async fn a_placement_naming_no_cache_subnet_group_quotes_the_name_it_was_given()
         member.body
     );
 
-    // The contrast: an operation that addresses the GROUP ITSELF words the same fault its
-    // own way, so the quoted template belongs to the placement rather than to the fault.
+    // The contrast: each other operation that resolves the member words the same fault its
+    // own way, so no one template stands for the fault. The create of a CACHE CLUSTER above
+    // answers what the DELETE answers here; the quoted form is `CreateReplicationGroup`'s
+    // alone, and the describe keeps its own.
     for name in missing_names {
         let described = net
             .emulator

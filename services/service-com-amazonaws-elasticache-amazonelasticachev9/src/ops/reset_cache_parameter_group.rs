@@ -183,11 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // group it could ever hold, so it is reported as the malformed
         // parameter it is rather than as a group that does not exist or as one
         // of the service's own default groups (whose names carry a `.`, which
-        // the grammar does not admit either). Worded by the one helper every
-        // identifier refusal of this service goes through
-        // (`crate::state::identifier_refusal`), the same precedence
+        // the grammar does not admit either). Worded by the one helper the
+        // members ElastiCache names by its own parameter label go through
+        // (`crate::state::parameter_identifier_refusal`), the same precedence
         // `DeleteCacheParameterGroup` applies to this member.
-        if let Some(message) = crate::state::identifier_refusal(
+        if let Some(message) = crate::state::parameter_identifier_refusal(
+            "CacheParameterGroupName",
             "Cache Parameter Group Name",
             &input.cache_parameter_group_name,
             crate::state::PARAMETER_GROUP_NAME_MAX_LEN,
