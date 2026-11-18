@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEventSources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEventSources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEventSources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: enumerates the stored EventSources as summaries, one page at a time,
+//! optionally scoped to the sources of one event bus.
 //!
 //! ## Shape of an operation
 //!
@@ -93,9 +86,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `ListEventSourcesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#ListEventSources")]
+//
+// `InternalException` is widened in with `extra_errors`: this service declares it
+// as a common error for every operation (`AWSEventsV2`'s `errors` list), so it is
+// the modelled answer when the engine cannot hand back this service's store, but
+// the scaffold generated the enum from the OPERATION's own `errors` list only.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#ListEventSources",
+    extra_errors = ["InternalException"]
+)]
 #[derive(Debug)]
 pub enum ListEventSourcesErrorModeled {
+    InternalException(InternalException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -150,18 +152,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEventSources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEventSourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEventSources"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEventSourcesErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        // An EventSource lives in the region of the bus it forwards onto, and a
+        // request names the region it is addressing, so an unscoped enumeration
+        // reports the sources of THAT region only.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        // Reporting only: the sole write is materialising the bus lifecycle
+        // transitions the clock already made due, which is also what retires an
+        // EventSource whose bus has finished disappearing.
+        state.settle_lifecycles(now);
+
+        let resume_after = input.next_token.as_deref().map(decode_next_token);
+        if let Some(None) = resume_after {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "NextToken is not a token this service issued",
+            ));
+        }
+        let resume_after = resume_after.flatten();
+
+        // The page size this request asks for, read the one way every List
+        // operation of this service reads it.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // `EventBusArn` scopes the enumeration to one bus, so that bus has to
+        // resolve: a read resolves the whole ARN, identifier segment included.
+        // The ARN carries its own region and account, which is why a scoped
+        // enumeration takes its region from the bus rather than from the
+        // request.
+        let bus_scope = input.event_bus_arn.as_deref();
+        if let Some(event_bus_arn) = bus_scope {
+            if state.bus(event_bus_arn).is_none() {
+                return Err(ListEventSourcesErrorModeled::ResourceNotFoundException(
+                    state.bus_read_refusal(event_bus_arn),
+                )
+                .into());
+            }
+        }
+
+        // Ordered by name, the key `NamePrefix` filters on, with the ARN
+        // breaking ties so the order is total and a page boundary is stable.
+        let mut page_keys: Vec<PageKey> = state
+            .event_sources
+            .values()
+            .filter(|source| match bus_scope {
+                // Scoped to one bus: the sources forwarding onto that bus.
+                Some(event_bus_arn) => source.event_bus_arn == event_bus_arn,
+                // Unscoped: the sources of the region the request addresses.
+                None => source.region == region,
+            })
+            .filter(|source| {
+                input
+                    .name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| source.name.starts_with(prefix))
+            })
+            .map(|source| PageKey {
+                name: source.name.clone(),
+                arn: source.arn.clone(),
+            })
+            .collect();
+        page_keys.sort();
+
+        let start = match &resume_after {
+            Some(cursor) => page_keys.partition_point(|key| key <= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(page_keys.len());
+        let page = &page_keys[start..end];
+
+        let event_sources: Vec<EventSourceSummary> = page
+            .iter()
+            .filter_map(|key| state.event_source(&key.arn))
+            .map(|source| EventSourceSummary {
+                event_source_arn: Some(source.arn.clone()),
+                name: Some(source.name.clone()),
+                event_bus_arn: Some(source.event_bus_arn.clone()),
+                r#type: Some(source.source_type().to_string()),
+                state: Some(source.state.wire_value().to_string()),
+                // `Revoked` is "present only when true, so a bus owner listing
+                // EventSources sees at a glance which ones they revoked".
+                revoked: source.revoked.then_some(true),
+                creation_time: Some(crate::state::to_date_time(source.creation_time)),
+                last_modified_time: Some(crate::state::to_date_time(source.last_modified_time)),
+                event_source_account_id: Some(source.account_id.clone()),
+            })
+            .collect();
+
+        // A token only when sources remain after this page, so a caller stops
+        // paging exactly when the enumeration is exhausted.
+        let next_token = (end < page_keys.len())
+            .then(|| page.last().map(encode_next_token))
+            .flatten();
+
+        Ok(ListEventSourcesOutput {
+            event_sources: Some(event_sources),
+            next_token,
+        })
+    }
+}
+
+/// The total order `ListEventSources` enumerates in, and exactly what a
+/// `NextToken` carries: the name the list is ordered by, with the ARN breaking
+/// ties.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PageKey {
+    name: String,
+    arn: String,
+}
+
+/// This operation's page cursor as the opaque `NextToken` the next request
+/// replays, rendered by the one page-token codec this service's List operations
+/// share ([`crate::state::encode_page_token`]).
+fn encode_next_token(key: &PageKey) -> String {
+    crate::state::encode_page_token(&[&key.name, &key.arn])
+}
+
+/// Read a cursor back out of a `NextToken`. `None` when the token is not one
+/// this service issued for this enumeration's cursor.
+fn decode_next_token(token: &str) -> Option<PageKey> {
+    let mut fields = crate::state::decode_page_token(token, 2)?.into_iter();
+    Some(PageKey {
+        name: fields.next()?,
+        arn: fields.next()?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_next_token, encode_next_token, PageKey};
+
+    /// A cursor survives the token it is rendered as, and nothing else is read
+    /// as a cursor: the token is this operation's own encoding, so its
+    /// round-trip is pinned here beside it.
+    #[test]
+    fn a_cursor_round_trips_through_its_token() {
+        for (case, key) in [
+            (
+                "plain name",
+                PageKey {
+                    name: "demo-source".to_string(),
+                    arn: "arn:aws:events:us-east-1:000000000000:event-sourcev2/aws.service/demo-source/abc"
+                        .to_string(),
+                },
+            ),
+            (
+                "name with every character class the grammar allows",
+                PageKey {
+                    name: "A.b-c_9".to_string(),
+                    arn: "arn:aws:events:eu-west-3:000000000000:event-sourcev2/aws.partner/A.b-c_9/xyz"
+                        .to_string(),
+                },
+            ),
+        ] {
+            let token = encode_next_token(&key);
+            assert_eq!(
+                decode_next_token(&token).as_ref(),
+                Some(&key),
+                "case {case:?}: the cursor must survive its token {token:?}"
+            );
+        }
+
+        for (case, token) in [
+            ("not hex at all", "not-a-token"),
+            ("odd number of digits", "abc"),
+            ("hex without the separator", "6162"),
+        ] {
+            assert!(
+                decode_next_token(token).is_none(),
+                "case {case:?}: {token:?} is not a token this service issued"
+            );
+        }
     }
 }

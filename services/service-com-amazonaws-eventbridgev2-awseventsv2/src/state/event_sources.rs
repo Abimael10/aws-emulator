@@ -37,6 +37,18 @@ pub const ORIGIN_TYPE_AWS_SERVICE: &str = "aws.service";
 /// See [`ORIGIN_TYPE_AWS_SERVICE`].
 pub const ORIGIN_TYPE_AWS_PARTNER: &str = "aws.partner";
 
+/// The `EventSourceType` of a source whose origin is an AWS service's events.
+///
+/// `EventSourceType` documents "Origin type of an EventSource: an AWS service's
+/// events (AWS_SERVICE_EVENTS) or a partner event source's events
+/// (PARTNER_EVENTS)"; this is an entry of
+/// [`crate::ops::types::EVENT_SOURCE_TYPE_VALUES`].
+pub const EVENT_SOURCE_TYPE_AWS_SERVICE_EVENTS: &str = "AWS_SERVICE_EVENTS";
+
+/// The `EventSourceType` of a source whose origin is a partner event source.
+/// See [`EVENT_SOURCE_TYPE_AWS_SERVICE_EVENTS`].
+pub const EVENT_SOURCE_TYPE_PARTNER_EVENTS: &str = "PARTNER_EVENTS";
+
 /// The most EventSources one emulator process holds.
 ///
 /// This is the EMULATOR's own bound rather than a published AWS quota: without
@@ -101,6 +113,23 @@ impl EventSource {
     /// variant determines.
     pub fn origin_type(&self) -> &'static str {
         origin_type_of(&self.configuration)
+    }
+
+    /// The `EventSourceType` this source reports, which its configuration
+    /// variant determines the same way the ARN type segment does.
+    pub fn source_type(&self) -> &'static str {
+        source_type_of(&self.configuration)
+    }
+}
+
+/// The `EventSourceType` for a configuration: an AWS service's events or a
+/// partner event source's, as that enum's two values name them.
+pub fn source_type_of(configuration: &EventSourceConfiguration) -> &'static str {
+    match configuration {
+        EventSourceConfiguration::AwsServiceEventsConfiguration(_) => {
+            EVENT_SOURCE_TYPE_AWS_SERVICE_EVENTS
+        }
+        EventSourceConfiguration::PartnerEventsConfiguration(_) => EVENT_SOURCE_TYPE_PARTNER_EVENTS,
     }
 }
 
