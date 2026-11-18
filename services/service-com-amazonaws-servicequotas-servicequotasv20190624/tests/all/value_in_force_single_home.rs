@@ -19,10 +19,11 @@
 //! no increase was approved for; a quota no increase can be requested for at all; and
 //! each of them read BOTH at the endpoint the increases were requested at and at one
 //! that was never called — where a per-region quota has no overlay and the AWS default
-//! is still in force.
+//! is still in force. They also span both sides of what a utilization report covers:
+//! the quotas whose usage Service Quotas TRACKS are report records carrying the same
+//! value in force, and a quota whose usage nothing tracks is no record of it.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -30,18 +31,12 @@ use service_com_amazonaws_servicequotas_servicequotasv20190624::service::refusal
 
 // The wire harness this crate already has: `POST /` with `X-Amz-Target:
 // ServiceQuotasV20190624.<Op>` through the `MultiServiceRouter`, over one shared
-// engine, plus its listing walker. Declared `pub(crate)` in `quota_workflow` for
+// engine, plus its listing walker and the waits that read a resource until the clock
+// has carried it where the case needs it. Declared `pub(crate)` in `quota_workflow` for
 // sibling suites to reuse.
-use crate::quota_workflow::{client, emulator, walk_pages, Client};
-
-/// Comfortably past BOTH steps the clock owes a quota increase request
-/// (`crate::state::SUPPORT_CASE_OPEN_DELAY`, then
-/// `crate::state::REQUEST_DECISION_DELAY` once its support case is open).
-const PAST_DECISION: Duration = Duration::from_millis(1_800);
-
-/// Comfortably past `crate::state::REPORT_COMPLETION_DELAY` (500 ms), so a report
-/// started before this wait has completed afterwards.
-const PAST_COMPLETION: Duration = Duration::from_millis(1_200);
+use crate::quota_workflow::{
+    await_report_completion, await_value_in_force, client, emulator, walk_pages, Client,
+};
 
 /// How much an approved increase raises a quota by, so the value in force differs from
 /// the AWS default by a number no catalog row carries by accident.
@@ -120,6 +115,11 @@ async fn every_reader_of_a_quota_reports_the_same_value_in_force() {
 
     let quotas = catalog_quotas(&home).await;
     let mut taken: BTreeSet<(String, String)> = BTreeSet::new();
+    // A utilization report covers the quotas whose usage Service Quotas TRACKS — the
+    // ones publishing a usage metric — so the rows span both: a tracked row is read
+    // through all three readers, an untracked one through the two quota readers, and
+    // the report must not carry it at all.
+    let tracked = |quota: &Value| !quota["UsageMetric"]["MetricNamespace"].is_null();
     let rows = vec![
         Row {
             case: "an account-wide quota raised by an approved increase",
@@ -142,6 +142,26 @@ async fn every_reader_of_a_quota_reports_the_same_value_in_force() {
             increase: true,
         },
         Row {
+            case: "a tracked quota raised by an approved increase",
+            quota: pick(
+                &quotas,
+                &mut taken,
+                "a tracked quota raised by an approved increase",
+                |quota| quota["Adjustable"] == json!(true) && tracked(quota),
+            ),
+            increase: true,
+        },
+        Row {
+            case: "a tracked quota no increase was approved for",
+            quota: pick(
+                &quotas,
+                &mut taken,
+                "a tracked quota no increase was approved for",
+                |quota| quota["Adjustable"] == json!(true) && tracked(quota),
+            ),
+            increase: false,
+        },
+        Row {
             case: "an adjustable quota no increase was approved for",
             quota: pick(
                 &quotas,
@@ -162,9 +182,15 @@ async fn every_reader_of_a_quota_reports_the_same_value_in_force() {
             increase: false,
         },
     ];
+    assert!(
+        rows.iter().any(|row| tracked(&row.quota))
+            && rows.iter().any(|row| !tracked(&row.quota)),
+        "case setup: the rows must span both a tracked and an untracked quota"
+    );
 
-    // Raise the rows that ask to be raised, at the home endpoint only, and let the
-    // clock settle both steps the request owes.
+    // Raise the rows that ask to be raised, at the home endpoint only, and wait — by
+    // READING each quota, never by assuming a duration — until the clock has settled
+    // both steps the request owes and the raised value is in force.
     for row in rows.iter().filter(|row| row.increase) {
         let (service_code, quota_code) = key_of(&row.quota);
         let default_value = row.quota["Value"]
@@ -180,7 +206,19 @@ async fn every_reader_of_a_quota_reports_the_same_value_in_force() {
         )
         .await;
     }
-    tokio::time::sleep(PAST_DECISION).await;
+    for row in rows.iter().filter(|row| row.increase) {
+        let (service_code, quota_code) = key_of(&row.quota);
+        let default_value = row.quota["Value"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {}: a listed quota reports its Value", row.case));
+        await_value_in_force(
+            &home,
+            &json!({"ServiceCode": service_code, "QuotaCode": quota_code}),
+            default_value + RAISE,
+            row.case,
+        )
+        .await;
+    }
 
     // One report per endpoint, started after every increase was decided, so each
     // report's records are the values in force at that endpoint.
@@ -193,7 +231,11 @@ async fn every_reader_of_a_quota_reports_the_same_value_in_force() {
             .to_string();
         reports.push((region, caller, report_id));
     }
-    tokio::time::sleep(PAST_COMPLETION).await;
+    // Each report is read until the clock has completed it, rather than waited on for a
+    // duration.
+    for (_, caller, report_id) in &reports {
+        await_report_completion(caller, report_id).await;
+    }
 
     for (region, caller, report_id) in &reports {
         let records = walk_pages(
@@ -237,11 +279,23 @@ async fn every_reader_of_a_quota_reports_the_same_value_in_force() {
                 "case {case}: expected the value in force {expected}, got {read}"
             );
 
-            let record = by_pair
-                .get(&(service_code.clone(), quota_code.clone()))
-                .unwrap_or_else(|| {
-                    panic!("case {case}: the report must cover {service_code}/{quota_code}")
-                });
+            let record = by_pair.get(&(service_code.clone(), quota_code.clone()));
+            // A utilization report covers exactly the quotas whose usage is tracked, so
+            // an untracked row is read through the two quota readers and is absent from
+            // the report rather than carrying a utilization nothing measured.
+            let Some(record) = record else {
+                assert!(
+                    !tracked(&row.quota),
+                    "case {case}: the report must cover the tracked quota \
+                     {service_code}/{quota_code}"
+                );
+                continue;
+            };
+            assert!(
+                tracked(&row.quota),
+                "case {case}: a quota whose usage nothing tracks must be no record of a \
+                 report, got {record}"
+            );
             assert_eq!(
                 record["AppliedValue"].as_f64(),
                 Some(expected),

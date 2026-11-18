@@ -19,7 +19,7 @@
 //! * an invalid request is refused with the error the model declares for it.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -120,6 +120,57 @@ impl Client {
             .unwrap_or("<no __type>")
             .to_string();
         (status, code)
+    }
+}
+
+/// How often a resource is read again while the clock settles what it owes: well
+/// inside the shortest step the clock owes, so a step is not stepped over.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// A deadline that clears every step the clock owes a quota increase request (its
+/// support case, then its decision) and a utilization report (its processing, then its
+/// completion) many times over, so a wait only ever fails on something genuinely stuck
+/// — never because the host is loaded.
+///
+/// `pub(crate)` beside the harness, so every suite waits for the CONDITION it is after
+/// on one generous deadline instead of each assuming a duration of its own.
+pub(crate) fn settling_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(60)
+}
+
+/// Read `report_id` until the clock has carried the report to `COMPLETED` — by READING
+/// the report, never by assuming a duration — and answer with that completed read.
+pub(crate) async fn await_report_completion(caller: &Client, report_id: &str) -> Value {
+    let deadline = settling_deadline();
+    loop {
+        let read = caller
+            .ok("GetQuotaUtilizationReport", json!({"ReportId": report_id}))
+            .await;
+        if read["Status"] == json!("COMPLETED") {
+            return read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case report {report_id}: expected the clock to complete it, got {read}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Read the quota `pair` (`ServiceCode` + `QuotaCode`) at `caller` until the value in
+/// force is `expected`, which is what settles the increase request the clock owes.
+pub(crate) async fn await_value_in_force(caller: &Client, pair: &Value, expected: f64, case: &str) {
+    let deadline = settling_deadline();
+    loop {
+        let read = caller.ok("GetServiceQuota", pair.clone()).await;
+        if read["Quota"]["Value"].as_f64() == Some(expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: expected the value in force {expected}, got {read}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 

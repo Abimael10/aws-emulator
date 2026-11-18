@@ -8,10 +8,10 @@
 //! limit" (`QuotaUtilizationInfo$Utilization`) — where the usage is counted in the
 //! resources the quota's own CloudWatch usage metric meters, read from the service that
 //! owns them. So the figure moves with what the account holds: it is not a constant, a
-//! quota nothing here meters reads 0 % because the account holds none of what it
-//! permits, a count that was STARTED and could not be finished reports no `Utilization`
-//! rather than an invented one, and the documented "highest utilization first" ordering
-//! really does put the account's hottest quota on the first page.
+//! tracked quota no reader of this emulator meters reads 0 % because the account holds
+//! none of what it permits, a count that was STARTED and could not be finished reports no
+//! `Utilization` rather than an invented one, and the documented "highest utilization
+//! first" ordering really does put the account's hottest quota on the first page.
 //!
 //! That rule spans two services, so both are mounted on ONE engine: Service Quotas is
 //! driven over the wire the way a client drives it, and EC2 — which owns the VPCs and
@@ -36,9 +36,14 @@ use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 /// ServiceQuotasV20190624.<OperationName>`.
 const TARGET_PREFIX: &str = "ServiceQuotasV20190624.";
 
-/// Comfortably past `crate::state::REPORT_COMPLETION_DELAY` (500 ms), so a report
-/// started before this wait has completed afterwards.
-const PAST_COMPLETION: Duration = Duration::from_millis(1_200);
+/// How long a report is given to reach `COMPLETED` — a step the emulator's own clock
+/// owes a fraction of a second after the start, so this is generous headroom for a
+/// loaded host rather than a wait anything depends on.
+const SETTLING_BUDGET: Duration = Duration::from_secs(60);
+
+/// How often a report is read again while that clock settles: well inside the shortest
+/// step it owes, so a step is not stepped over.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// How long a launch is given to reach `running` — the EC2 emulator moves an instance
 /// out of `pending` on its own clock, a fraction of a second after the launch.
@@ -165,7 +170,22 @@ async fn report_records(emulator: &Emulator, region: &str) -> Vec<Value> {
         .as_str()
         .unwrap_or_else(|| panic!("case a start in {region}: expected a ReportId, got {started}"))
         .to_string();
-    tokio::time::sleep(PAST_COMPLETION).await;
+    // Read the report until the clock has completed it, rather than waiting a duration:
+    // a report is COMPLETED when its own clock says so, whatever the host's speed.
+    let deadline = Instant::now() + SETTLING_BUDGET;
+    loop {
+        let read = emulator
+            .quotas(region, "GetQuotaUtilizationReport", json!({"ReportId": report_id}))
+            .await;
+        if read["Status"] == json!("COMPLETED") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case the report in {region}: expected the clock to complete it, got {read}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 
     let mut records = Vec::new();
     let mut token: Option<String> = None;
@@ -538,19 +558,20 @@ async fn a_vcpu_quota_reports_the_vcpus_of_the_accounts_running_instances() {
     );
 }
 
-/// EVERY record of a report carries a `Utilization`, whichever way its usage is metered:
-/// a quota nothing here meters is one the account holds none of what it permits, so it
-/// reads 0 % rather than being published without the figure the report exists to deliver.
+/// EVERY record of a report carries a `Utilization`, whichever way its usage is metered,
+/// and a report is made of the quotas whose usage Service Quotas TRACKS: a quota with no
+/// usage metric has no usage to report a utilization of and is not a record of the report
+/// at all, while one whose metric no reader of this emulator meters is — the account holds
+/// none of what it permits, so it reads 0 % rather than being published without the figure
+/// the report exists to deliver.
 ///
-/// The rows span the three ways a quota's usage is reached: a quota that publishes no
-/// usage metric at all, one whose metric no reader of this emulator meters, and one a
-/// reader does meter and counted.
+/// The rows span the ways a tracked quota's usage is reached: a metric no reader of this
+/// emulator meters, and one a reader does meter and counted.
 #[tokio::test]
 async fn every_record_carries_a_utilization_however_its_usage_is_metered() {
     let emulator = Emulator::new();
     let records = report_records(&emulator, "eu-central-1").await;
 
-    let mut unmetered = 0usize;
     for record in &records {
         let case = format!(
             "{}/{}",
@@ -564,20 +585,17 @@ async fn every_record_carries_a_utilization_however_its_usage_is_metered() {
             reported >= 0.0,
             "case {case}: expected a percentage, got {reported} in {record}"
         );
-        // A quota publishes a usage metric or it does not; without one nothing meters
-        // it, so the account holds none of what it counts.
-        if record["Namespace"].is_null() {
-            unmetered += 1;
-            assert_eq!(
-                reported, 0.0,
-                "case {case}: a quota with no usage metric holds none of what it permits, \
-                 so it reads 0 %, got {record}"
-            );
-        }
+        // Every record is a quota whose usage is tracked, so every record names the
+        // metric that tracks it.
+        assert!(
+            !record["Namespace"].is_null(),
+            "case {case}: a reported quota must publish the usage metric its utilization \
+             is read through, got {record}"
+        );
     }
     assert!(
-        unmetered > 0,
-        "case setup: the catalog must publish quotas with no usage metric, got \
+        !records.is_empty(),
+        "case setup: the catalog must publish quotas whose usage is tracked, got \
          {} records",
         records.len()
     );

@@ -1719,14 +1719,27 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         self.regions.get(region).map_or(0, |state| state.reports.len())
     }
 
-    /// Every quota's utilization, as a report records it.
+    /// The utilization of every quota a report covers, as it records it.
     ///
-    /// One record per quota in the catalog, carrying the AWS default, the value in
-    /// force in `region`, the namespace of the metric Service Quotas tracks that
-    /// quota's usage with, and the utilization that usage reading gives against the
-    /// value in force. Sorted by utilization DESCENDING, the quotas whose utilization is
-    /// unknown last, and then by service and quota code \u2014 a total order, so a page
-    /// boundary in one report always falls in the same place.
+    /// WHICH QUOTAS A REPORT COVERS: the ones whose usage Service Quotas TRACKS — the
+    /// catalog rows that publish a CloudWatch usage metric. A record's figure is
+    /// "(current usage / applied value) × 100" read through the metric the record
+    /// reports as its `Namespace` ("The namespace of the metric used to track quota
+    /// usage", `smithy_query(query="shape", shape="QuotaUtilizationInfo")`), so a quota
+    /// whose usage nothing tracks has no usage to report a utilization of and is not a
+    /// record of the report. That is also what keeps a report a single page: the tracked
+    /// subset of the account's quotas is far inside both the modelled
+    /// `QuotaUtilizationInfoList` bound (len 0..1000) and the largest page the operation
+    /// serves ([`UTILIZATION_REPORT_PAGE_SIZE`]), so a caller that asks for no
+    /// `MaxResults` is answered with the whole report and no `NextToken` — which is what
+    /// the unpaginated read of a completed report is observed to do.
+    ///
+    /// Each record carries the AWS default, the value in force in `region`, the
+    /// namespace of the metric Service Quotas tracks that quota's usage with, and the
+    /// utilization that usage reading gives against the value in force. Sorted by
+    /// utilization DESCENDING, the quotas whose utilization is unknown last, and then by
+    /// service and quota code \u2014 a total order, so a page boundary in one report
+    /// always falls in the same place.
     ///
     /// `usage` is the account's consumption as [`usage::measure`] read it out of the
     /// services that own the resources: the report analyses the account, so a quota's
@@ -1739,6 +1752,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         let mut records: Vec<QuotaUtilizationInfo> = self
             .default_quotas
             .iter()
+            .filter(|default| default.usage_metric.is_some())
             .map(|default| {
                 let service_code = default.service_code.as_str();
                 // The value in force comes from the one helper every quota read uses

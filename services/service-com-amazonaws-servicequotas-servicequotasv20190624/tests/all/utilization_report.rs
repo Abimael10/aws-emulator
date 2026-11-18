@@ -17,12 +17,13 @@
 //!   and the status it carries now — and says so in `Message`, so a caller that
 //!   re-starts converges on one report instead of accumulating them;
 //! * every record in a report agrees, field for field, with what the quota reads
-//!   report for the same `(ServiceCode, QuotaCode)` pair — for EVERY pair in the
-//!   catalog — carries the `Namespace` of the usage metric its usage is counted by
-//!   where it publishes one, and reports a `Utilization` of 0 % for a quota nothing
-//!   here meters, because the account then holds none of what that quota permits (what
-//!   the figure itself is, measured against an account that holds resources, is tabled
-//!   in `quota_utilization_usage`);
+//!   report for the same `(ServiceCode, QuotaCode)` pair, and the report covers
+//!   exactly the quotas whose usage Service Quotas TRACKS — the ones publishing a
+//!   usage metric, whose `Namespace` every record carries (what the figure itself is,
+//!   measured against an account that holds resources, is tabled in
+//!   `quota_utilization_usage`);
+//! * a completed report read with no `MaxResults` is a SINGLE page — the whole report,
+//!   no `NextToken` — and every page reports its own record count as `TotalCount`;
 //! * the report is ordered by utilization descending and is walked to the same
 //!   records whatever page size is used, with page boundaries that do not move;
 //! * a report is a SNAPSHOT: an increase approved after it was started does not change
@@ -31,26 +32,19 @@
 //!   report are each refused with the error the model declares.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 
 // The wire harness this crate already has: `POST /` with `X-Amz-Target:
 // ServiceQuotasV20190624.<Op>` through the `MultiServiceRouter`, over one shared
-// engine, plus its listing walker and token helper. Declared `pub(crate)` in
+// engine, plus its listing walker, its token helper and the waits that read a resource
+// until the clock has carried it where the case needs it. Declared `pub(crate)` in
 // `quota_workflow` for sibling suites to reuse.
 use service_com_amazonaws_servicequotas_servicequotasv20190624::state::UTILIZATION_REPORT_PAGE_SIZE;
 
-use crate::quota_workflow::{base64_of, client, emulator, walk_pages, Client};
-
-/// Comfortably past `crate::state::REPORT_COMPLETION_DELAY` (500 ms), so a report
-/// started before this wait has completed afterwards.
-const PAST_COMPLETION: Duration = Duration::from_millis(1_200);
-
-/// Comfortably past BOTH steps the clock owes a quota increase request
-/// (`crate::state::SUPPORT_CASE_OPEN_DELAY`, then
-/// `crate::state::REQUEST_DECISION_DELAY` once its support case is open).
-const PAST_DECISION: Duration = Duration::from_millis(1_800);
+use crate::quota_workflow::{
+    await_report_completion, await_value_in_force, base64_of, client, emulator, walk_pages, Client,
+};
 
 /// Start a report and return its `ReportId`.
 async fn start_report(client: &Client) -> String {
@@ -64,7 +58,8 @@ async fn start_report(client: &Client) -> String {
 /// Walk a report to its end and return every record it yielded.
 ///
 /// Asserts the page-size contract on the way: no page exceeds `MaxResults`, every page
-/// but the last carries a `NextToken`, and the whole walk reports one `TotalCount`.
+/// but the last carries a `NextToken`, and every page reports its OWN record count as
+/// `TotalCount`.
 async fn walk_report(client: &Client, report_id: &str, page_size: Option<i64>) -> Vec<Value> {
     let case = format!("report {report_id} at page size {page_size:?}");
     let mut records = Vec::new();
@@ -104,15 +99,17 @@ async fn walk_report(client: &Client, report_id: &str, page_size: Option<i64>) -
                 quotas.len()
             );
         }
+        // A page reports the count of the records it carries, short final page included.
+        assert_eq!(
+            total,
+            quotas.len() as i64,
+            "case {case}: page {pages} must report its own record count as TotalCount, \
+             got {total} for {} records",
+            quotas.len()
+        );
         records.extend(quotas);
         token = page["NextToken"].as_str().map(str::to_string);
         if token.is_none() {
-            assert_eq!(
-                records.len() as i64,
-                total,
-                "case {case}: the walk must yield TotalCount records, got {}",
-                records.len()
-            );
             break;
         }
     }
@@ -268,11 +265,10 @@ async fn a_report_is_pending_when_started_and_completes_on_its_own_clock() {
             "case {case}: the read must name the report asked for, got {polled}"
         );
 
-        tokio::time::sleep(PAST_COMPLETION).await;
-
-        let completed = client
-            .ok("GetQuotaUtilizationReport", json!({"ReportId": report_id}))
-            .await;
+        // Read the report until the clock has completed it, rather than waiting a
+        // duration: what is under test is that the report completes ON ITS OWN, with no
+        // further call needed to push it along.
+        let completed = await_report_completion(&client, &report_id).await;
         assert_eq!(
             completed["Status"],
             json!("COMPLETED"),
@@ -321,22 +317,23 @@ async fn a_start_reuses_the_live_report_and_mints_only_where_none_exists() {
     assert_report_message(&minted, false, "the first start");
 
     // Rows: a re-start while the report is still generating and one after the clock
-    // has completed it — the statuses a live report can carry.
-    let rows: Vec<(&str, Option<Duration>, Vec<&str>)> = vec![
+    // has completed it — the statuses a live report can carry. The second row waits for
+    // the report to BE completed (by reading it) rather than for a duration.
+    let rows: Vec<(&str, bool, Vec<&str>)> = vec![
         (
             "a re-start while the report is still generating",
-            None,
+            false,
             vec!["PENDING", "IN_PROGRESS"],
         ),
         (
             "a re-start after the report has completed",
-            Some(PAST_COMPLETION),
+            true,
             vec!["COMPLETED"],
         ),
     ];
-    for (case, wait, expected) in rows {
-        if let Some(wait) = wait {
-            tokio::time::sleep(wait).await;
+    for (case, await_completed, expected) in rows {
+        if await_completed {
+            await_report_completion(&home, &report_id).await;
         }
         let restarted = home.ok("StartQuotaUtilizationReport", json!({})).await;
         assert_eq!(
@@ -405,7 +402,6 @@ async fn a_start_reuses_the_live_report_and_mints_only_where_none_exists() {
     assert_report_message(&other_region, false, "another region's first start");
 
     // Both reports are readable, each at its own endpoint.
-    tokio::time::sleep(PAST_COMPLETION).await;
     for (case, caller, id) in [
         ("the first region's report", &home, report_id.clone()),
         (
@@ -417,9 +413,7 @@ async fn a_start_reuses_the_live_report_and_mints_only_where_none_exists() {
                 .to_string(),
         ),
     ] {
-        let read = caller
-            .ok("GetQuotaUtilizationReport", json!({"ReportId": id}))
-            .await;
+        let read = await_report_completion(caller, &id).await;
         assert_eq!(
             (read["ReportId"].clone(), read["Status"].clone()),
             (json!(id), json!("COMPLETED")),
@@ -435,13 +429,41 @@ async fn every_report_record_agrees_with_the_quota_reads_for_the_same_pair() {
 
     let expected = catalog(&client).await;
     let report_id = start_report(&client).await;
-    tokio::time::sleep(PAST_COMPLETION).await;
+    await_report_completion(&client, &report_id).await;
     let records = walk_report(&client, &report_id, None).await;
 
+    // A report covers the quotas whose usage Service Quotas TRACKS — the ones the
+    // catalog publishes a usage metric for — because a record's Utilization is read
+    // through that metric. The quotas with no usage metric are in the catalog and out
+    // of the report.
+    let tracked: BTreeMap<(String, String), (Value, Value)> = expected
+        .iter()
+        .filter(|(_, (applied, _))| !applied["UsageMetric"]["MetricNamespace"].is_null())
+        .map(|(key, views)| (key.clone(), views.clone()))
+        .collect();
+    assert!(
+        !tracked.is_empty() && tracked.len() < expected.len(),
+        "case setup: the catalog must publish both tracked and untracked quotas, got {} \
+         tracked of {} quotas",
+        tracked.len(),
+        expected.len()
+    );
+    let reported: BTreeMap<(String, String), Value> = records
+        .iter()
+        .map(|record| (key_of(record), record.clone()))
+        .collect();
     assert_eq!(
+        reported.len(),
         records.len(),
-        expected.len(),
-        "case the whole catalog: the report must cover every quota, got {records:?}"
+        "case the whole report: no quota may be reported twice, got {} records for {} \
+         pairs",
+        records.len(),
+        reported.len()
+    );
+    assert_eq!(
+        reported.keys().cloned().collect::<Vec<_>>(),
+        tracked.keys().cloned().collect::<Vec<_>>(),
+        "case the whole report: it must cover exactly the quotas whose usage is tracked"
     );
 
     for record in &records {
@@ -475,22 +497,18 @@ async fn every_report_record_agrees_with_the_quota_reads_for_the_same_pair() {
         );
 
         // Service Quotas tracks usage through the CloudWatch usage metric a quota
-        // publishes, so the record carries the namespace of THAT metric. A quota with no
-        // usage metric is one nothing here meters, and this emulator's state is the whole
-        // account, so the account holds none of what it permits: 0 %.
+        // publishes, so the record carries the namespace of THAT metric — and every
+        // record of a report carries one, because a quota with no usage metric has no
+        // usage to report a utilization of and is not in the report at all.
         let metric_namespace = applied["UsageMetric"]["MetricNamespace"].clone();
         assert_eq!(
             record["Namespace"], metric_namespace,
             "case {case}: Namespace must be the usage metric's namespace, got {record}"
         );
-        if metric_namespace.is_null() {
-            assert_eq!(
-                record["Utilization"].as_f64(),
-                Some(0.0),
-                "case {case}: a quota nothing meters holds none of what it permits, so it \
-                 reads 0 %, got {record}"
-            );
-        }
+        assert!(
+            !record["Namespace"].is_null(),
+            "case {case}: a reported quota must be one whose usage is tracked, got {record}"
+        );
         // The usage itself is counted in the services that OWN the resources a quota is
         // counted in, and this suite mounts Service Quotas alone; the formula over an
         // account whose usage was measured is tabled in `quota_utilization_usage`. What
@@ -511,7 +529,7 @@ async fn a_report_is_ordered_by_utilization_descending_and_pages_consistently() 
     let client = client(&engine, "us-east-1");
 
     let report_id = start_report(&client).await;
-    tokio::time::sleep(PAST_COMPLETION).await;
+    await_report_completion(&client, &report_id).await;
 
     let whole = walk_report(&client, &report_id, None).await;
 
@@ -566,26 +584,30 @@ async fn a_report_is_a_snapshot_of_the_quotas_when_it_was_started() {
     let engine = emulator();
     let home = client(&engine, "us-east-1");
     // A second regional endpoint, because two reports take two regions: a start made
-    // where a live report exists reuses it. An increase approved on a quota AWS counts
-    // ACCOUNT-WIDE is in force at every endpoint, so one increase is visible to both
-    // reports' endpoints and the only difference left between them is WHEN each was
-    // started.
+    // where a live report exists reuses it. The increase is then put in force at BOTH
+    // endpoints before the second report is started, so the only difference left
+    // between the two reports is WHEN each was started.
     let elsewhere = client(&engine, "eu-west-1");
 
-    // The quota comes out of the catalog rather than being named here: every listed
-    // quota reports `GlobalQuota` and `Adjustable`, which is what this row needs.
+    // The quota comes out of the catalog rather than being named here: this row needs an
+    // adjustable quota whose usage Service Quotas tracks, since those are the quotas a
+    // utilization report covers.
     let listed = walk_pages(
         &home,
         "ListServiceQuotas",
-        &json!({"ServiceCode": "iam"}),
+        &json!({"ServiceCode": "vpc"}),
         "Quotas",
         None,
     )
     .await;
     let quota = listed
         .iter()
-        .find(|quota| quota["GlobalQuota"] == json!(true) && quota["Adjustable"] == json!(true))
-        .expect("the seeded catalog holds an adjustable account-wide quota");
+        .find(|quota| {
+            quota["Adjustable"] == json!(true)
+                && !quota["UsageMetric"]["MetricNamespace"].is_null()
+        })
+        .expect("the seeded catalog holds an adjustable quota whose usage is tracked");
+    let account_wide = quota["GlobalQuota"] == json!(true);
     let service_code = quota["ServiceCode"]
         .as_str()
         .expect("a listed quota reports its ServiceCode")
@@ -604,28 +626,28 @@ async fn a_report_is_a_snapshot_of_the_quotas_when_it_was_started() {
     let before = start_report(&elsewhere).await;
 
     let desired = before_value + 15.0;
-    home.ok(
-        "RequestServiceQuotaIncrease",
-        json!({
-            "ServiceCode": service_code,
-            "QuotaCode": quota_code,
-            "DesiredValue": desired,
-        }),
-    )
-    .await;
-    tokio::time::sleep(PAST_DECISION).await;
-    // An account-wide quota's approved value is in force at every endpoint, so both
-    // report endpoints see the increase before the next report is started.
+    let increase = json!({
+        "ServiceCode": service_code,
+        "QuotaCode": quota_code,
+        "DesiredValue": desired,
+    });
+    home.ok("RequestServiceQuotaIncrease", increase.clone()).await;
+    // An account-wide quota's approved value is in force at every endpoint; a REGIONAL
+    // one is raised where it was requested, so it is requested at the other endpoint too
+    // — the increase must be in force at both before the next report is started.
+    if !account_wide {
+        elsewhere
+            .ok("RequestServiceQuotaIncrease", increase.clone())
+            .await;
+    }
+    // Both report endpoints see the increase before the next report is started — waited
+    // for by READING the quota, which is what settles the request the clock owes — so a
+    // report that does not see it is one reporting the snapshot it froze.
     for (case, caller) in [
         ("the requesting region", &home),
         ("another region", &elsewhere),
     ] {
-        assert_eq!(
-            caller.ok("GetServiceQuota", pair.clone()).await["Quota"]["Value"].as_f64(),
-            Some(desired),
-            "case {case}: the approved value of an account-wide quota must be in force \
-             before the next report"
-        );
+        await_value_in_force(caller, &pair, desired, case).await;
     }
 
     let after = start_report(&home).await;
@@ -634,7 +656,8 @@ async fn a_report_is_a_snapshot_of_the_quotas_when_it_was_started() {
         "case two endpoints: each region's first start mints its own report, got \
          {before} twice"
     );
-    tokio::time::sleep(PAST_COMPLETION).await;
+    await_report_completion(&elsewhere, &before).await;
+    await_report_completion(&home, &after).await;
 
     // Rows: the report started before the increase, and the one started after it.
     for (case, caller, report_id, expected) in [
@@ -674,7 +697,8 @@ async fn a_report_this_emulator_did_not_mint_is_refused() {
     // Two DIFFERENT reports take two regional endpoints: a second start at one
     // endpoint reuses that region's live report rather than minting another.
     let other = start_report(&elsewhere).await;
-    tokio::time::sleep(PAST_COMPLETION).await;
+    await_report_completion(&home, &mine).await;
+    await_report_completion(&elsewhere, &other).await;
     let token = elsewhere
         .ok(
             "GetQuotaUtilizationReport",
@@ -788,6 +812,113 @@ async fn starting_reports_in_a_loop_neither_inflates_the_store_nor_is_refused() 
             json!(first),
             "case {region}: the live report must stay readable, got {read}"
         );
+    }
+}
+
+/// A completed report read with NO `MaxResults` is a SINGLE page: it carries the whole
+/// report and no `NextToken`, so a caller that reads the absence of a token as "that was
+/// everything" really has everything. And `TotalCount` is the count of the page in hand
+/// — on the unasked read, on every full page a caller cut with `MaxResults`, and on the
+/// short final page of such a walk.
+#[tokio::test]
+async fn an_unasked_report_read_is_one_page_and_every_page_counts_itself() {
+    let engine = emulator();
+
+    // Rows: two regional endpoints, each with a report of its own.
+    for region in ["us-east-1", "ap-northeast-1"] {
+        let caller = client(&engine, region);
+        let report_id = start_report(&caller).await;
+        let case = format!("the report of {region}");
+
+        // Waited for by READING the report until the clock has completed it.
+        let whole = await_report_completion(&caller, &report_id).await;
+        let records = whole["Quotas"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case}: a completed report reports Quotas: {whole}"))
+            .clone();
+        assert!(
+            whole["NextToken"].is_null(),
+            "case {case}: an unasked read must be the whole report in one page, got a \
+             NextToken after {} records",
+            records.len()
+        );
+        // The report fits one page because it is the TRACKED subset of the account's
+        // quotas, well inside the modelled `QuotaUtilizationInfoList` bound (len 0..1000)
+        // which is also the largest page this operation serves.
+        assert!(
+            !records.is_empty() && records.len() <= UTILIZATION_REPORT_PAGE_SIZE,
+            "case {case}: expected 1..={UTILIZATION_REPORT_PAGE_SIZE} records in one page, \
+             got {}",
+            records.len()
+        );
+        assert_eq!(
+            whole["TotalCount"].as_i64(),
+            Some(records.len() as i64),
+            "case {case}: the unasked read must count the page it answers with, got {whole}"
+        );
+
+        // Rows: page sizes that cut the report into many pages, into a few, into one,
+        // and the modelled maximum of `MaxResultsUtilization` (@range 1..1000).
+        let sizes = [
+            1usize,
+            5,
+            7,
+            records.len(),
+            UTILIZATION_REPORT_PAGE_SIZE,
+        ];
+        for size in sizes {
+            let case = format!("{case} at MaxResults {size}");
+            let mut walked: Vec<Value> = Vec::new();
+            let mut token: Option<String> = None;
+            let mut pages = 0usize;
+            loop {
+                let mut body = json!({"ReportId": report_id, "MaxResults": size});
+                if let Some(next) = &token {
+                    body["NextToken"] = json!(next);
+                }
+                let page = caller.ok("GetQuotaUtilizationReport", body).await;
+                pages += 1;
+                assert!(
+                    pages <= records.len() + 1,
+                    "case {case}: the walk must terminate, got {pages} pages"
+                );
+                let items = page["Quotas"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("case {case}: a page reports Quotas: {page}"))
+                    .clone();
+                assert!(
+                    items.len() <= size,
+                    "case {case}: a page must not exceed MaxResults, got {} records",
+                    items.len()
+                );
+                assert_eq!(
+                    page["TotalCount"].as_i64(),
+                    Some(items.len() as i64),
+                    "case {case}: page {pages} must count the records it carries, got {page}"
+                );
+                walked.extend(items.clone());
+                token = page["NextToken"].as_str().map(str::to_string);
+                match &token {
+                    // A token follows only a page the page size cut short of the report.
+                    Some(_) => assert_eq!(
+                        items.len(),
+                        size,
+                        "case {case}: page {pages} carries a NextToken, so it must be full"
+                    ),
+                    None => break,
+                }
+            }
+            assert_eq!(
+                pages,
+                records.len().div_ceil(size),
+                "case {case}: expected the report cut into {} pages, got {pages}",
+                records.len().div_ceil(size)
+            );
+            assert_eq!(
+                walked, records,
+                "case {case}: a paged walk must yield the unasked read's records, in order"
+            );
+        }
     }
 }
 

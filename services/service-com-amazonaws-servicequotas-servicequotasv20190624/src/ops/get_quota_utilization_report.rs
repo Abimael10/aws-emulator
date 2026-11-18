@@ -189,6 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// a token that names no position in this report's listing is refused, so polling a
     /// report that is still generating never answers a token the completed report would
     /// reject.
+    ///
+    /// `TotalCount` is the count of the page this call answers with, which is what the
+    /// operation is OBSERVED to report — including on the final, short page — rather
+    /// than a figure about pages the caller has not asked for.
     async fn handle(
         &self,
         input: Self::Input,
@@ -220,7 +224,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?
         };
 
-        let total_count = report.quotas.len();
         // The token names a position in THIS report, so one report's token cannot
         // resume another's listing. The cut is taken BEFORE the status is looked at:
         // whether a `NextToken` names a position in this report is a property of the
@@ -260,7 +263,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             report_id: Some(report.id),
             status: Some(report.status),
             generated_at: Some(crate::state::epoch_timestamp(report.completed_at)),
-            total_count: Some(i32::try_from(total_count).unwrap_or(i32::MAX)),
+            // The count of the page being answered. The member's own prose calls it the
+            // total "across all pages", but the OBSERVED answers of this operation count
+            // the page in hand — a full page and the short final one alike — and the
+            // observed contract is the one a client reads: a caller sizing the payload it
+            // just received, or checking it got the page it asked for, is answered about
+            // THIS response rather than about pages it has not fetched.
+            total_count: Some(i32::try_from(page.items.len()).unwrap_or(i32::MAX)),
             quotas: Some(page.items),
             next_token: page.next_token,
             error_code: None,
