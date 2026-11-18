@@ -166,9 +166,9 @@ use super::put_integration::{
 };
 use super::put_method::method_key;
 use crate::state::{
-    patch_bool, patch_enum_string, patch_i32_checked, patch_optional_string,
-    patch_required_string, patch_string_map, patch_string_set, Patch, PatchFailure, PatchOpKind,
-    MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+    patch_bool, patch_content_handling, patch_enum_string, patch_i32_checked,
+    patch_optional_string, patch_required_string, patch_string_map, patch_string_set, Patch,
+    PatchFailure, PatchOpKind, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
 
 // The `path` values `UpdateIntegration` accepts are the ones `apply_patch` below has an
@@ -241,11 +241,10 @@ fn apply_patch(entry: &mut GetIntegrationOutput, patch: &Patch) -> Result<(), Pa
             entry.connection_type = Some(connection);
             Ok(())
         }
-        "contentHandling" => patch_enum_string(
-            &mut entry.content_handling,
-            patch,
-            CONTENT_HANDLING_STRATEGY_VALUES,
-        ),
+        // The same member of the same type the sibling integration-response patch sets, so
+        // a value outside the modelled set earns the one sentence API Gateway words that
+        // condition with ([`crate::state::invalid_content_handling`]).
+        "contentHandling" => patch_content_handling(&mut entry.content_handling, patch),
         "responseTransferMode" => patch_enum_string(
             &mut entry.response_transfer_mode,
             patch,

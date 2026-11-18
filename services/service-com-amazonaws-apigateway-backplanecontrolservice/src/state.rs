@@ -30,7 +30,8 @@ use crate::ops::types::{
     AccessLogSettings, ApiStage, CanarySettings, DocumentationPartLocation, EndpointConfiguration,
     GetGatewayResponseOutput, GetIntegrationOutput, GetMethodResponseOutput, GetSdkTypeOutput,
     MethodSetting, MethodSnapshot, MutualTlsAuthentication, QuotaSettings,
-    SdkConfigurationProperty, ThrottleSettings, SECURITY_POLICY_VALUES,
+    SdkConfigurationProperty, ThrottleSettings, CONTENT_HANDLING_STRATEGY_VALUES,
+    SECURITY_POLICY_VALUES,
 };
 
 /// Per-service state for com-amazonaws-apigateway-backplanecontrolservice. A handler reaches it through [`service_state`].

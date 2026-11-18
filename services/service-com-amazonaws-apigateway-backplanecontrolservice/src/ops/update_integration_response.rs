@@ -114,8 +114,8 @@ use super::put_integration_response::{
 use super::put_method::method_key;
 use super::put_method_response::{invalid_response_parameter, is_method_response_header};
 use crate::state::{
-    patch_enum_string, patch_optional_string, patch_string_map, Patch, PatchFailure, PatchOpKind,
-    MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+    patch_content_handling, patch_optional_string, patch_string_map, Patch, PatchFailure,
+    PatchOpKind, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
 
 // The `path` values `UpdateIntegrationResponse` accepts are the ones `apply_patch` below
@@ -147,12 +147,11 @@ fn apply_patch(
             patch_optional_string(&mut entry.selection_pattern, patch, MAX_STRING_CHARS)
         }
         // A modelled enum, whose value set is checked here because a patch `value` is a
-        // bare string on the wire and so reaches the handler unvalidated.
-        "contentHandling" => patch_enum_string(
-            &mut entry.content_handling,
-            patch,
-            CONTENT_HANDLING_STRATEGY_VALUES,
-        ),
+        // bare string on the wire and so reaches the handler unvalidated. A value outside
+        // that set earns the sentence API Gateway words that condition with, the one the
+        // sibling integration patch answers for the same member
+        // ([`crate::state::invalid_content_handling`]).
+        "contentHandling" => patch_content_handling(&mut entry.content_handling, patch),
         // "The key is a method response header parameter name and the mapped value is an
         // integration response header value, a static value enclosed within a pair of
         // single quotes, or a JSON expression from the integration response body"

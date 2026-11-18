@@ -5,6 +5,13 @@
 //! one `position`/`limit` page at a time, filtered by the `resourceOwner` the request asks
 //! for. Reads only.
 //!
+//! The page member is reported whatever the page holds: an account holding no access
+//! association — one that never created one, one whose last was deleted or rejected, or one
+//! whose `resourceOwner` filter selects none — is answered an EMPTY `items` list, so a
+//! client reads "this private custom domain name has no access association" off a list it
+//! can count rather than off an absent member. That is the one rule every collection of
+//! this service reports its page under ([`crate::state::Page::reported_items`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -170,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             })?;
-        let items = page
+        let items: Vec<_> = page
             .ids
             .iter()
             .filter_map(|id| store.domain_name_access_associations.get(id))
@@ -178,6 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         Ok(Paged::new(
             GetDomainNameAccessAssociationsOutput {
+                // Present whatever the page holds, which is the one rule every collection
+                // of this service reports its page under
+                // ([`crate::state::Page::reported_items`]).
                 items: page.reported_items(items),
                 position: page.next_position.clone(),
             },

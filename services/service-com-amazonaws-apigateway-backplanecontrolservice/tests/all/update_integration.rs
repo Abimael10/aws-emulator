@@ -38,6 +38,7 @@ use crate::method_integration::{
     get_integration, get_method, put_integration, resource_with_a_method,
 };
 use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
+use crate::update_integration_response::INVALID_CONTENT_HANDLING;
 
 /// One `patchOperations` entry, as a client spells it on the wire.
 fn op(kind: &str, path: &str, value: Option<&str>) -> Value {
@@ -652,6 +653,60 @@ async fn a_patch_outside_the_rules_the_integration_publishes_is_refused_and_chan
         // A refused list is applied as one unit: the stored record is the one the seed
         // put, not a half-patched one.
         assert_read_back(&gateway, &api, &resource, "GET", case, &stored).await;
+    }
+}
+
+#[tokio::test]
+async fn an_out_of_set_content_handling_is_refused_with_the_type_sentence_and_changes_nothing() {
+    // `contentHandling` is the member of this record API Gateway has a refusal sentence of
+    // its OWN for: a value outside the set the modelled `ContentHandlingStrategy` declares —
+    // and a patch `value` is a bare string on the wire, so the service is what checks it —
+    // is the modelled `BadRequestException` (400) naming the TYPE and the values it would
+    // have taken, interpolating neither the rejected value nor the patch path. The sentence
+    // is the sibling `update_integration_response` suite's [`INVALID_CONTENT_HANDLING`], the
+    // one both records answer with; the values the set DOES hold are driven by
+    // `every_published_value_of_a_patched_member_is_accepted` above.
+    //
+    // Rows differ along the FORM the out-of-set value takes and the op that carries it, and
+    // each is driven both alone and last after an entry that would have applied.
+    let out_of_set: Vec<(&str, &str, &str)> = vec![
+        ("a neighbouring spelling", "replace", "CONVERT_TO_JSON"),
+        ("a declared value lowercased", "replace", "convert_to_text"),
+        (
+            "a declared value with spaces around it",
+            "add",
+            " CONVERT_TO_TEXT ",
+        ),
+        ("the empty value", "replace", ""),
+        ("a bare word", "add", "TEXT"),
+    ];
+
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "integration-content-handling").await;
+    let (resource, stored) = seed(&gateway, &api, &root, "pets", "GET", seed_request()).await;
+
+    for (form, kind, value) in &out_of_set {
+        for operations in [
+            vec![op(kind, "/contentHandling", Some(value))],
+            vec![
+                replace("/uri", "https://example.com/pets/v3"),
+                op(kind, "/contentHandling", Some(value)),
+            ],
+        ] {
+            let case = format!(
+                "UpdateIntegration({form}: {kind} {value:?}, {} op(s))",
+                operations.len()
+            );
+            let answer = update_integration(&gateway, &api, &resource, "GET", operations).await;
+            assert_failure(&answer, 400, "BadRequestException", &case);
+            assert_eq!(
+                answer.body["message"].as_str(),
+                Some(INVALID_CONTENT_HANDLING),
+                "case {case}: expected the message {INVALID_CONTENT_HANDLING:?}, got {:?}",
+                answer.body["message"]
+            );
+            assert_read_back(&gateway, &api, &resource, "GET", &case, &stored).await;
+        }
     }
 }
 

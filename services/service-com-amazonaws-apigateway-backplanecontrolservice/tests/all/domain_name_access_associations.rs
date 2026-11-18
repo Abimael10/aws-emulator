@@ -29,6 +29,9 @@
 //!   `position` / `limit` page at a time, over page sizes across the documented range
 //!   (default 25, maximum 500), each published bound and one past each, crossed with every
 //!   cursor the sequence holds;
+//! * that listing writes its page member whatever the page holds, so a page holding no
+//!   element is an EMPTY list rather than an absent member, over every way a page comes out
+//!   empty (never created, emptied, narrowed by the filter);
 //! * the `resourceOwner` filter over every value the modelled `ResourceOwner` enum
 //!   declares (`SELF`, `OTHER_ACCOUNTS`) and the request that sets none;
 //! * a read changes nothing a later caller sees.
@@ -48,7 +51,7 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
 
 use crate::domain_name_collection::created_domain;
 use crate::rest_api_lifecycle::{assert_failure, page_items, string_member, Answer, Gateway};
-use crate::tag_reads_by_arn::{apigateway_arn, get_tags};
+use crate::tag_reads_by_arn::{apigateway_arn, encode_label, get_tags};
 
 const BAD_REQUEST: &str = "BadRequestException";
 
@@ -693,5 +696,105 @@ async fn the_resource_owner_filter_selects_by_owner() {
         400,
         "ValidationException",
         "GetDomainNameAccessAssociations(resourceOwner=NOBODY)",
+    );
+}
+
+#[tokio::test]
+async fn the_collection_reports_its_page_member_whatever_the_page_holds() {
+    // The rule: this collection writes its page member — `item` on the wire — WHATEVER the
+    // page holds, so a page holding no element is an EMPTY LIST rather than an absent
+    // member and a client reads "this private custom domain name has no access
+    // association" off a list it can count. It is the one rule every `position`/`limit`
+    // collection of this service reports its page under, which
+    // `crate::collection_page_boundaries` asserts across the listings and
+    // `crate::deployment_collection` for the deployments of an api.
+    //
+    // The rows span every way a page of this collection comes out empty while the listing
+    // still resolves — an account that never created an association, one whose last one was
+    // deleted, and a `resourceOwner` filter selecting none of the ones it does hold — each
+    // crossed with the listing that DOES hold an element, so a handler answering an empty
+    // list unconditionally could not pass either.
+    let gateway = Gateway::new();
+    let domain = private_domain(&gateway, "page-member.example.com").await;
+
+    // Never created: the private custom domain name is there, so what the listing reports
+    // nothing of is the ASSOCIATIONS.
+    for query in ["", "limit=500", "resourceOwner=SELF"] {
+        assert_empty_page(&gateway, query, &format!("never created ({query:?})")).await;
+    }
+
+    let created = create_association(&gateway, association_body(&domain, "vpce-0123456789abcdef0"))
+        .await;
+    assert_eq!(
+        created.status, 201,
+        "case CreateDomainNameAccessAssociation: expected 201, got {} with {:?}",
+        created.status, created.body
+    );
+    let arn = string_member(
+        &created.body,
+        "domainNameAccessAssociationArn",
+        "the created association",
+    );
+
+    // Held: the member carries the one record, so the empty lists are the answer for an
+    // empty PAGE rather than this collection's answer for every page.
+    assert_eq!(
+        listed_arns(&list_associations(&gateway, "").await.body, "one association"),
+        vec![arn.clone()],
+        "case one association: expected the stored record on the page"
+    );
+    // Narrowed to nothing while the collection holds that record.
+    assert_empty_page(
+        &gateway,
+        "resourceOwner=OTHER_ACCOUNTS",
+        "narrowed to other accounts",
+    )
+    .await;
+
+    // Emptied: the last association deleted through its own operation.
+    let deleted = gateway
+        .call(
+            "DELETE",
+            &format!("/domainnameaccessassociations/{}", encode_label(&arn)),
+            None,
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 202,
+        "case DeleteDomainNameAccessAssociation: expected 202, got {} with {:?}",
+        deleted.status, deleted.body
+    );
+    for query in ["", "limit=500", "resourceOwner=SELF"] {
+        assert_empty_page(&gateway, query, &format!("emptied ({query:?})")).await;
+    }
+}
+
+/// Assert a listing reports a page member that is PRESENT, is a list and holds nothing —
+/// and that the page ending the collection hands back no cursor to carry on at.
+async fn assert_empty_page(gateway: &Gateway, query: &str, case: &str) {
+    let answer = list_associations(gateway, query).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let member = answer
+        .body
+        .get("item")
+        .unwrap_or_else(|| panic!("case {case}: expected the page member, got {:?}", answer.body));
+    let items = member.as_array().unwrap_or_else(|| {
+        panic!(
+            "case {case}: expected the page to be a list, got {:?}",
+            answer.body
+        )
+    });
+    assert!(
+        items.is_empty(),
+        "case {case}: expected an empty page, got {items:?}"
+    );
+    assert!(
+        answer.body["position"].is_null(),
+        "case {case}: a page the collection holds nothing after reports no cursor, got {:?}",
+        answer.body["position"]
     );
 }

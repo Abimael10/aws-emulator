@@ -758,6 +758,41 @@ pub fn patch_security_policy(
     })
 }
 
+/// The `BadRequestException` message for a content handling strategy that is not one of
+/// the values the modelled `ContentHandlingStrategy` enum declares
+/// (`smithy_query(query="shape", shape="ContentHandlingStrategy")`, which
+/// [`CONTENT_HANDLING_STRATEGY_VALUES`] lists on the wire).
+///
+/// API Gateway answers this condition with ONE sentence that names the TYPE it rejected
+/// the value for and the values it would have taken, comma-separated with no space: it
+/// names neither the rejected value nor the member or patch path that carried it, as a
+/// recorded refusal of a `/contentHandling` replace shows. The value set is read from the
+/// model rather than written out, so the sentence cannot drift from the set the same patch
+/// is checked against.
+pub fn invalid_content_handling() -> String {
+    format!(
+        "Invalid ContentHandlingType specified. Valid options are {}",
+        CONTENT_HANDLING_STRATEGY_VALUES.join(",")
+    )
+}
+
+/// Apply `patch` to a `contentHandling` member: as [`patch_enum_string`], except that a
+/// value outside the member's declared set is refused with [`invalid_content_handling`],
+/// the service's own sentence for that condition.
+///
+/// One copy for every record whose `contentHandling` a patch can set — an integration and
+/// an integration response carry the same member of the same type — so a client
+/// classifying this refusal against the operation's other bad requests reads the same
+/// sentence whichever record it was made on.
+pub fn patch_content_handling(
+    current: &mut Option<String>,
+    patch: &Patch,
+) -> Result<(), PatchFailure> {
+    patch_enum_string_refused_with(current, patch, CONTENT_HANDLING_STRATEGY_VALUES, |_| {
+        invalid_content_handling()
+    })
+}
+
 /// Apply `patch` to a boolean member. `remove` is refused: a boolean member declared
 /// with a default always has one of its two values.
 pub fn patch_bool(current: &mut bool, patch: &Patch) -> Result<(), PatchFailure> {

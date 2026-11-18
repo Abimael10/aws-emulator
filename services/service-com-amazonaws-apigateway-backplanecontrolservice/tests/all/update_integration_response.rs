@@ -23,6 +23,11 @@
 //! `String`, `ContentHandlingStrategy` and `MapOfStringToString`); `statusCode` is the
 //! record's identity — the URI label addressing it — and is not patchable.
 //!
+//! A `contentHandling` outside the value set its enum declares has a refusal sentence of
+//! its OWN, which the last two tables assert: API Gateway names the TYPE it rejected the
+//! value for and the values it would have taken, and interpolates nothing — see
+//! [`INVALID_CONTENT_HANDLING`].
+//!
 //! The tables span what the rule generalises over: which member the path names, the entry's
 //! kind (single-valued string, enum, map entry), the op (`add`, `replace`, `remove`), how
 //! many ops one request carries, a map key carrying an escaped `/` pointer token, the
@@ -36,6 +41,7 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::ops::put_integrati
     invalid_integration_response_mapping, INTEGRATION_RESPONSE_BODY_PREFIX,
     INTEGRATION_RESPONSE_HEADER_PREFIX,
 };
+use service_com_amazonaws_apigateway_backplanecontrolservice::ops::types::CONTENT_HANDLING_STRATEGY_VALUES;
 use service_com_amazonaws_apigateway_backplanecontrolservice::ops::put_method_response::invalid_response_parameter;
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::invalid_patch_path;
 
@@ -91,6 +97,29 @@ async fn update_integration_response(
         )
         .await
 }
+
+/// The value both content-handling tables start the stored record from — one the declared
+/// set holds, so a refused row has a stored value to still be holding afterwards.
+const SEEDED_CONTENT_HANDLING: &str = "CONVERT_TO_TEXT";
+
+/// The template the content-handling tables seed, so a refusal can be shown to have left
+/// the record's OTHER member alone as well.
+const SEEDED_TEMPLATE: &str = "{\"statusCode\": 200}";
+
+/// What AWS refuses a `contentHandling` value outside the modelled value set with,
+/// verbatim.
+///
+/// Entirely FIXED text: it names the TYPE the value was rejected for and the values it
+/// would have taken, comma-separated with no space after the comma, and carries no slot for
+/// the rejected value, for the member or for the patch path that named it. Source: the
+/// recorded refusal of a `replace /contentHandling` whose value is outside the set
+/// `ContentHandlingStrategy` declares.
+///
+/// `pub(crate)` so the sibling `update_integration` suite, which patches the same member on
+/// the record that OWNS this one, pins the same sentence rather than keeping a second copy
+/// of it.
+pub(crate) const INVALID_CONTENT_HANDLING: &str =
+    "Invalid ContentHandlingType specified. Valid options are CONVERT_TO_BINARY,CONVERT_TO_TEXT";
 
 /// Send `operations`, asserting the modelled 200 (the `http` code of
 /// `smithy_query(query="operation", operation="UpdateIntegrationResponse")`) and returning
@@ -514,8 +543,7 @@ async fn a_patch_this_record_cannot_take_is_refused_and_changes_nothing() {
         (
             "a content handling outside the modelled value set",
             vec![replace("/contentHandling", "CONVERT_TO_XML")],
-            "/contentHandling takes one of CONVERT_TO_BINARY, CONVERT_TO_TEXT, got \"CONVERT_TO_XML\""
-                .to_string(),
+            INVALID_CONTENT_HANDLING.to_string(),
         ),
         (
             "a response parameter key that is not a method response header",
@@ -541,8 +569,7 @@ async fn a_patch_this_record_cannot_take_is_refused_and_changes_nothing() {
                 replace("/responseTemplates/application~1json", "{\"new\": true}"),
                 replace("/contentHandling", "CONVERT_TO_XML"),
             ],
-            "/contentHandling takes one of CONVERT_TO_BINARY, CONVERT_TO_TEXT, got \"CONVERT_TO_XML\""
-                .to_string(),
+            INVALID_CONTENT_HANDLING.to_string(),
         ),
     ];
 
@@ -643,5 +670,125 @@ async fn a_patch_naming_a_record_that_does_not_exist_is_refused_as_not_found() {
         )
         .await;
         assert_failure(&answer, 404, "NotFoundException", case);
+    }
+}
+
+#[tokio::test]
+async fn an_out_of_set_content_handling_is_refused_with_the_type_sentence_and_changes_nothing() {
+    // The rule asserted here is about the MEMBER, not about one rejected value: a
+    // `contentHandling` a patch carries is held to the value set the modelled
+    // `ContentHandlingStrategy` declares — the member is typed by that enum, but a patch
+    // `value` travels as a bare string, so the protocol enforces nothing and the service
+    // checks it — and a value outside that set is the modelled `BadRequestException` (400)
+    // carrying API Gateway's one sentence for that condition, which interpolates nothing.
+    //
+    // Rows differ along the FORM the out-of-set value takes and the OP that carries it: a
+    // neighbouring spelling, a declared value in the wrong letter case, a declared value
+    // with whitespace around it, the empty value, and a bare word — each of them answered
+    // by the same fixed sentence, which is what says the sentence has no slot.
+    let out_of_set: Vec<(&str, &str, &str)> = vec![
+        ("a neighbouring spelling", "replace", "CONVERT_TO_XML"),
+        ("a declared value lowercased", "replace", "convert_to_text"),
+        (
+            "a declared value with spaces around it",
+            "add",
+            " CONVERT_TO_TEXT ",
+        ),
+        ("the empty value", "replace", ""),
+        ("a bare word", "add", "BINARY"),
+    ];
+
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "integration-response-content-handling").await;
+    let resource = resource_with_an_integration(&gateway, &api, &root, "pets", "GET").await;
+    seed(
+        &gateway,
+        &api,
+        &resource,
+        "GET",
+        "200",
+        json!({
+            "contentHandling": SEEDED_CONTENT_HANDLING,
+            "responseTemplates": { "application/json": SEEDED_TEMPLATE },
+        }),
+    )
+    .await;
+    // What every refused row must leave the record holding: the value and the template the
+    // seed stored.
+    let stored = json!({
+        "statusCode": "200",
+        "contentHandling": SEEDED_CONTENT_HANDLING,
+        "responseTemplates": { "application/json": SEEDED_TEMPLATE },
+    });
+
+    for (form, kind, value) in &out_of_set {
+        for operations in [
+            // Alone, and last after an entry that WOULD have applied — which is what shows
+            // the refusal leaves the whole request unapplied rather than just its own op.
+            vec![op(kind, "/contentHandling", Some(value))],
+            vec![
+                replace("/responseTemplates/application~1json", "{\"new\": true}"),
+                op(kind, "/contentHandling", Some(value)),
+            ],
+        ] {
+            let case = format!(
+                "UpdateIntegrationResponse({form}: {kind} {value:?}, {} op(s))",
+                operations.len()
+            );
+            let answer =
+                update_integration_response(&gateway, &api, &resource, "GET", "200", operations)
+                    .await;
+            assert_failure(&answer, 400, "BadRequestException", &case);
+            assert_eq!(
+                answer.body["message"].as_str(),
+                Some(INVALID_CONTENT_HANDLING),
+                "case {case}: expected the message {INVALID_CONTENT_HANDLING:?}, got {:?}",
+                answer.body["message"]
+            );
+            assert_read_back(&gateway, &api, &resource, "GET", "200", &case, &stored).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_declared_content_handling_value_is_accepted_and_persisted() {
+    // The positive control of the rule above, driven over the MODELLED value set —
+    // `smithy_query(query="shape",
+    // shape="com.amazonaws.apigateway#ContentHandlingStrategy")`, which the crate publishes
+    // as `CONTENT_HANDLING_STRATEGY_VALUES` — so a target that refused every value could
+    // not pass, and a value the enum gains is driven here without this suite listing it.
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "integration-response-content-handling-ok").await;
+    let resource = resource_with_an_integration(&gateway, &api, &root, "pets", "GET").await;
+    seed(
+        &gateway,
+        &api,
+        &resource,
+        "GET",
+        "200",
+        json!({ "contentHandling": SEEDED_CONTENT_HANDLING }),
+    )
+    .await;
+
+    for value in CONTENT_HANDLING_STRATEGY_VALUES {
+        for kind in ["add", "replace"] {
+            let case = format!("UpdateIntegrationResponse({kind} {value})");
+            let reported = update_ok(
+                &gateway,
+                &api,
+                &resource,
+                "GET",
+                "200",
+                &case,
+                vec![op(kind, "/contentHandling", Some(value))],
+            )
+            .await;
+            let expected = json!({ "statusCode": "200", "contentHandling": value });
+            assert_eq!(
+                reported, expected,
+                "case {case}: expected the patched record {expected:?}, got {reported:?}"
+            );
+            assert_read_back(&gateway, &api, &resource, "GET", "200", &case, &expected).await;
+        }
     }
 }
