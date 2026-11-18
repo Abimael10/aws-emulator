@@ -27,6 +27,9 @@
 //!   namespace;
 //! * the TOPIC RULE family single-quotes the name: `Topic Rule '<name>' already exists
 //!   for account`;
+//! * the STREAM family states what the REQUEST asked for, as every refusal of one stream
+//!   does: `Requested stream <streamId> stream already exists.`, with the terminating
+//!   period, and DOES report the record that exists;
 //! * the SOFTWARE PACKAGE family reports a duplicate REQUEST rather than an existing
 //!   resource, as a conditional-check failure.
 //!
@@ -244,6 +247,17 @@ fn rule_names() -> Vec<String> {
         "route_to_lambda".to_string(),
         "Rule9".to_string(),
         "u".repeat(128),
+    ]
+}
+
+/// Ids of the form `^[a-zA-Z0-9_-]+$` within 1..128 — the `StreamId` constraint, which
+/// admits neither a dot nor a colon.
+fn stream_ids() -> Vec<String> {
+    vec![
+        "s".to_string(),
+        "firmware-v2_rc".to_string(),
+        "Firmware9".to_string(),
+        "m".repeat(128),
     ]
 }
 
@@ -482,6 +496,36 @@ fn cases() -> Vec<Case> {
             error_type: ALREADY_EXISTS,
             message: format!("RoleAlias cannot be created - name already exists (name={name})"),
             identity: Some((name.clone(), "roleAliasArn")),
+        });
+    }
+
+    for id in stream_ids() {
+        // A stream: this family states what the request asked for, and reports the record
+        // that already holds the id.
+        let role_arn = format!("arn:aws:iam::{ACCOUNT_ID}:role/IoTStreamRole");
+        let file = json!({
+            "fileId": 0,
+            "s3Location": { "bucket": "firmware-images", "key": "firmware.bin" },
+        });
+        rows.push(Case {
+            case: format!("CreateStream on the existing stream {id:?}"),
+            setup: vec![Call::new(
+                "POST",
+                format!("/streams/{id}"),
+                Some(json!({ "files": [file.clone()], "roleArn": role_arn.clone() })),
+            )],
+            retry: Call::new(
+                "POST",
+                format!("/streams/{id}"),
+                Some(json!({
+                    "files": [file],
+                    "roleArn": role_arn,
+                    "description": "a second attempt",
+                })),
+            ),
+            error_type: ALREADY_EXISTS,
+            message: format!("Requested stream {id} stream already exists."),
+            identity: Some((id.clone(), "streamArn")),
         });
     }
 

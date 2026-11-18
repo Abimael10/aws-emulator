@@ -16,6 +16,10 @@
 //!   reference lives on the update's record and not on the stream's;
 //! * an id the account holds no stream under is `ResourceNotFoundException` (404), so
 //!   a second delete of the same stream is refused;
+//! * an id the account ALREADY holds a stream under is
+//!   `ResourceAlreadyExistsException` (409), worded in the stream family's own sentence
+//!   — the same form as the family's miss, with the id the request carried as its only
+//!   variable part — and the stored stream is left exactly as the first create wrote it;
 //! * a file entry naming no S3 object names no file at all, which is
 //!   `InvalidRequestException` (400) with nothing created.
 
@@ -409,6 +413,137 @@ async fn a_file_that_names_no_object_is_refused() {
             emulator.describe_stream("refused").await.status,
             404,
             "case {case}: a refused create must leave no stream behind"
+        );
+    }
+}
+
+/// RULE: a create under an id the account already holds a stream under is refused with
+/// the stream family's own already-exists sentence, whatever the colliding request
+/// carries, and the stored stream stays exactly what the first create wrote.
+#[tokio::test]
+async fn a_taken_stream_id_is_refused_in_the_stream_familys_wording() {
+    // The ids span the modelled `StreamId` (`length 1..128`, `pattern ^[a-zA-Z0-9_-]+$`
+    // — `smithy_query(query="shape",shape="StreamId")`): the shortest, a mixed-case
+    // id with both admitted separators, a digits-and-letters id, and the longest. The
+    // colliding create of the first row repeats the body that took the id — `CreateStream`
+    // carries no idempotency token, so even an identical repeat is a collision — and
+    // every later row's differs from it, in how many files it serves, the object they
+    // name, the role, the description and the tags, because the collision is the ID and
+    // not the body.
+    let rows: Vec<(&str, String, Value, Value)> = vec![
+        (
+            "the shortest id the model admits",
+            "s".to_string(),
+            json!({ "files": [stream_file(0, "firmware.bin")], "roleArn": STREAM_ROLE }),
+            json!({ "files": [stream_file(0, "firmware.bin")], "roleArn": STREAM_ROLE }),
+        ),
+        (
+            "an id carrying both admitted separators",
+            "firmware_v3-RC2".to_string(),
+            json!({
+                "files": [stream_file(0, "boot.bin"), stream_file(1, "kernel.bin")],
+                "roleArn": STREAM_ROLE,
+                "description": "the third firmware release",
+                "tags": [{ "Key": "release", "Value": "rc2" }],
+            }),
+            json!({
+                "files": [stream_file(9, "other.bin")],
+                "roleArn": "arn:aws:iam::000000000000:role/SecondStreamRole",
+            }),
+        ),
+        (
+            "an id of digits and letters",
+            "A0".to_string(),
+            json!({ "files": [stream_file(3, "rootfs.img")], "roleArn": STREAM_ROLE }),
+            json!({
+                "files": [stream_file(3, "rootfs.img"), stream_file(4, "overlay.img")],
+                "roleArn": STREAM_ROLE,
+                "description": "a second attempt",
+            }),
+        ),
+        (
+            "the longest id the model admits",
+            "z".repeat(128),
+            json!({
+                "files": [stream_file(255, "firmware.bin")],
+                "roleArn": STREAM_ROLE,
+                "description": "the longest id",
+            }),
+            json!({ "files": [stream_file(0, "firmware.bin")], "roleArn": STREAM_ROLE }),
+        ),
+    ];
+
+    for (index, (case, stream_id, taken, colliding)) in rows.iter().enumerate() {
+        // A fresh emulator per row: the refusal must depend only on what this row created.
+        let emulator = Emulator::new();
+        let created = emulator.create_stream(stream_id, taken).await;
+        assert_eq!(
+            created.status,
+            200,
+            "case {case}: the create that takes the id must answer 200, got {} body {}",
+            created.status,
+            created.text()
+        );
+
+        let refused = emulator.create_stream(stream_id, colliding).await;
+        assert_eq!(
+            refused.status,
+            409,
+            "case {case}: expected 409, got {} body {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ResourceAlreadyExistsException",
+            "case {case}: got {}",
+            refused.text()
+        );
+        assert_eq!(
+            refused.error_message(),
+            format!("Requested stream {stream_id} stream already exists."),
+            "case {case}: expected the stream family's already-exists sentence, got {}",
+            refused.text()
+        );
+
+        // Nothing of the colliding request is written: the read reports the record the
+        // first create wrote, still at its first version.
+        let read = emulator.describe_stream(stream_id).await;
+        let info = read.json()["streamInfo"].clone();
+        assert_eq!(
+            info["files"], taken["files"],
+            "case {case}: the stored stream must keep the files the first create wrote, \
+             got {info}"
+        );
+        assert_eq!(
+            info["roleArn"], taken["roleArn"],
+            "case {case}: the stored stream must keep the role the first create wrote, \
+             got {info}"
+        );
+        assert_eq!(
+            info["description"],
+            taken.get("description").cloned().unwrap_or(Value::Null),
+            "case {case}: the stored stream must keep its description, got {info}"
+        );
+        assert_eq!(
+            info["streamVersion"],
+            json!(1),
+            "case {case}: a refused create is no write, so the stream stays at version 1, \
+             got {info}"
+        );
+
+        // The collision is the id alone: the SAME body under a free id is served. The
+        // free id is derived from the row's own index, so a failure names which row's
+        // body was refused where nothing held the id.
+        let elsewhere = format!("free-{index}");
+        let accepted = emulator.create_stream(&elsewhere, colliding).await;
+        assert_eq!(
+            accepted.status,
+            200,
+            "case {case}: the same body under the free id {elsewhere:?} must answer 200, \
+             got {} body {}",
+            accepted.status,
+            accepted.text()
         );
     }
 }

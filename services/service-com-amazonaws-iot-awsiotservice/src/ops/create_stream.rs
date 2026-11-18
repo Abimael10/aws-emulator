@@ -220,11 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The id is the stream's identity, so an id already taken is a conflict:
-        // `ResourceAlreadyExistsException` (HTTP 409).
+        // `ResourceAlreadyExistsException` (HTTP 409), worded in the stream family's own
+        // sentence, which lives beside the family's miss
+        // (`crate::state::streams::existing_stream_message`).
         if let Some(existing) = store.streams.get(&input.stream_id) {
             return Err(CreateStreamErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
-                    message: Some(format!("Stream {} already exists", existing.stream_id)),
+                    message: Some(crate::state::streams::existing_stream_message(
+                        &input.stream_id,
+                    )),
                     resource_id: Some(existing.stream_id.clone()),
                     resource_arn: Some(existing.stream_arn.clone()),
                 },

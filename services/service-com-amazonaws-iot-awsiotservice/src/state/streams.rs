@@ -58,12 +58,26 @@ pub fn stream_arn(region: &str, stream_id: &str) -> String {
 ///
 /// The fixed text is the family's — a stream is either one this account holds or no
 /// stream at all — and the variable parts are the id the request named and the
-/// account the request was signed for ([`::engine::emulator_account_id`]).
+/// account the request was signed for ([`::engine::emulator_account_id`]). The same
+/// family's COLLISION is stated in the same form, beside it ([`existing_stream_message`]).
 pub fn missing_stream_message(stream_id: &str) -> String {
     format!(
         "Requested stream {stream_id} does not exist in given account {}",
         ::engine::emulator_account_id()
     )
+}
+
+/// The message a create of a stream under an id the account already holds one under is
+/// refused with: the modelled `ResourceAlreadyExistsException` (HTTP 409).
+///
+/// The stream family words a COLLISION the way it words a MISS
+/// ([`missing_stream_message`]), which is why both of the family's sentences live here
+/// rather than in the handlers: the fixed text states what the REQUEST asked for, and the
+/// only variable part is the id the request carried — never a value read back from the
+/// stored record. (`super::already_exists` holds the sentences of the families that have
+/// no module of their own, as the authorizer family's does.)
+pub fn existing_stream_message(stream_id: &str) -> String {
+    format!("Requested stream {stream_id} stream already exists.")
 }
 
 /// The refusal a create whose file names an object the account's object storage holds
