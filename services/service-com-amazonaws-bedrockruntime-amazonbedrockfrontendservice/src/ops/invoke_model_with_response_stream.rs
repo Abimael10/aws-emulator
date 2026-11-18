@@ -142,11 +142,12 @@ impl<Eng: Send + Sync + 'static> InvokeModelWithResponseStream<Eng> {
 
         let model = {
             let guard = state.lock();
-            match guard.resolve_model_for_inference(&input.model_id) {
+            match guard.resolve_model_for_invocation(&input.model_id) {
                 Ok(entry) => entry.clone(),
-                // An identifier the service cannot interpret is a 400; one
-                // naming a model or resource that is not available here is a
-                // 404 (see `crate::state::resolve_model_for_inference`).
+                // An identifier the service cannot interpret is a 400, as is one
+                // naming a model that is not offered for on-demand invocation;
+                // one naming a model or resource that is not available here is a
+                // 404 (see `crate::state::resolve_model_for_invocation`).
                 Err(crate::state::ModelRejection::Invalid(message)) => {
                     return Err(validation(message))
                 }

@@ -269,7 +269,9 @@ impl ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
     /// that runs none takes the entry the catalogue holds whatever its lifecycle.
     pub fn recognise_model(&self, model_id: &str) -> Result<&ModelEntry, ModelRejection> {
         let (key, named_by_arn) = match interpret_model_id(model_id) {
-            ModelIdentifier::BaseModel { key, named_by_arn } => (key, named_by_arn),
+            ModelIdentifier::BaseModel {
+                key, named_by_arn, ..
+            } => (key, named_by_arn),
             // A well-formed ARN of an account-scoped resource: a custom model, a
             // provisioned throughput, an imported model, a custom-model
             // deployment, a prompt, a prompt router or a SageMaker endpoint.
@@ -319,6 +321,36 @@ impl ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
         let entry = self.recognise_model(model_id)?;
         if entry.lifecycle == ModelLifecycle::EndOfLife {
             return Err(ModelRejection::NotFound(END_OF_LIFE_MESSAGE.to_string()));
+        }
+        Ok(entry)
+    }
+
+    /// Resolve a `modelId` for a call that is about to INVOKE the model it names
+    /// on demand.
+    ///
+    /// Everything [`Self::resolve_model_for_inference`] decides, plus the one rule
+    /// that is about the THROUGHPUT the invocation runs on rather than about the
+    /// model: a model that is not offered for on-demand invocation
+    /// ([`ModelEntry::offers_on_demand`]) serves none, so an identifier that asks
+    /// for on-demand throughput — the bare model id, or a `foundation-model` ARN —
+    /// is refused with [`ModelRejection::Invalid`] (`ValidationException`, 400)
+    /// carrying [`on_demand_throughput_unsupported_message`], while the SAME model
+    /// named through an inference profile that contains it (a cross-region profile
+    /// id, or an `inference-profile` ARN) is served.
+    ///
+    /// Which inference types a model is offered with is published per model, and it
+    /// is a property of the INVOCATION: an operation that only names a model
+    /// without invoking it (`CountTokens`) resolves it with
+    /// [`Self::resolve_model_for_inference`] and is not subject to this rule.
+    pub fn resolve_model_for_invocation(
+        &self,
+        model_id: &str,
+    ) -> Result<&ModelEntry, ModelRejection> {
+        let entry = self.resolve_model_for_inference(model_id)?;
+        if !entry.offers_on_demand && !names_inference_profile(model_id) {
+            return Err(ModelRejection::Invalid(
+                on_demand_throughput_unsupported_message(model_id),
+            ));
         }
         Ok(entry)
     }
@@ -773,6 +805,43 @@ pub struct ModelEntry {
     /// shortened. Zero for a model that takes no text prompt, which measures
     /// nothing.
     pub context_window: u32,
+    /// Whether the model is offered for ON-DEMAND invocation, which is the
+    /// throughput a foundation-model identifier asks for — the bare model id, or a
+    /// `foundation-model` ARN.
+    ///
+    /// A model offered only through an inference profile serves no on-demand
+    /// invocation: it is invoked by naming a profile that CONTAINS it (a
+    /// cross-region profile id, or an `inference-profile` ARN), and a
+    /// foundation-model identifier for it is refused
+    /// ([`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::resolve_model_for_invocation`]).
+    /// Which models are carried that way is [`model_catalog`]'s.
+    pub offers_on_demand: bool,
+}
+
+/// The service's message for an invocation that asks for on-demand throughput on a
+/// model that is not offered with it.
+///
+/// The two sentences are the service's own fixed text; the single variable part is
+/// the `modelId` the request carried, reported as the caller spelled it.
+#[must_use]
+pub fn on_demand_throughput_unsupported_message(model_id: &str) -> String {
+    format!(
+        "Invocation of model ID {model_id} with on-demand throughput isn’t supported. \
+         Retry your request with the ID or ARN of an inference profile that contains this model."
+    )
+}
+
+/// Whether `model_id` names its model through an INFERENCE PROFILE — a
+/// geography-prefixed cross-region profile id, or an `inference-profile` ARN —
+/// rather than as a foundation model, which is what asks for on-demand throughput.
+fn names_inference_profile(model_id: &str) -> bool {
+    matches!(
+        interpret_model_id(model_id),
+        ModelIdentifier::BaseModel {
+            names_inference_profile: true,
+            ..
+        }
+    )
 }
 
 /// The service's fixed message for a `modelId` it cannot interpret as naming a
@@ -827,7 +896,14 @@ enum ModelIdentifier {
     /// the caller named it by ARN (a `foundation-model` or `inference-profile`
     /// ARN), which is a resource reference: when it resolves to nothing, the
     /// resource is absent rather than the identifier unreadable.
-    BaseModel { key: String, named_by_arn: bool },
+    /// `names_inference_profile` records that the identifier names the model
+    /// through an inference profile rather than as a foundation model, which is
+    /// what decides whether the invocation asks for on-demand throughput.
+    BaseModel {
+        key: String,
+        named_by_arn: bool,
+        names_inference_profile: bool,
+    },
     /// An ARN of an account-scoped inference resource.
     AccountResource,
 }
@@ -835,7 +911,7 @@ enum ModelIdentifier {
 /// Interpret a `modelId` as given on the wire, without consulting the
 /// inventory.
 fn interpret_model_id(model_id: &str) -> ModelIdentifier {
-    let (bare, named_by_arn) = if model_id.starts_with("arn:") {
+    let (bare, named_by_arn, arn_names_profile) = if model_id.starts_with("arn:") {
         if ACCOUNT_RESOURCE_SEGMENTS
             .iter()
             .any(|segment| model_id.contains(segment))
@@ -843,26 +919,31 @@ fn interpret_model_id(model_id: &str) -> ModelIdentifier {
             return ModelIdentifier::AccountResource;
         }
         // A foundation-model ARN, or an inference-profile ARN whose resource id
-        // is the (possibly geography-prefixed) model id.
-        match ["foundation-model/", "inference-profile/"]
+        // is the (possibly geography-prefixed) model id. Which of the two it is
+        // decides what throughput the invocation asks for.
+        match [("foundation-model/", false), ("inference-profile/", true)]
             .iter()
-            .find_map(|segment| model_id.split_once(segment))
+            .find_map(|(segment, names_profile)| {
+                model_id
+                    .split_once(segment)
+                    .map(|(_, resource)| (resource, *names_profile))
+            })
         {
-            Some((_, resource)) => (resource, true),
+            Some((resource, names_profile)) => (resource, true, names_profile),
             None => return ModelIdentifier::AccountResource,
         }
     } else {
-        (model_id, false)
+        (model_id, false, false)
     };
     // A cross-region inference profile id is the base model id behind a
-    // geography prefix, and resolves to the same model.
-    let key = INFERENCE_PROFILE_PREFIXES
+    // geography prefix, and resolves to the same model THROUGH that profile.
+    let geography_prefixed = INFERENCE_PROFILE_PREFIXES
         .iter()
-        .find_map(|prefix| bare.strip_prefix(prefix))
-        .unwrap_or(bare);
+        .find_map(|prefix| bare.strip_prefix(prefix));
     ModelIdentifier::BaseModel {
-        key: key.to_string(),
+        key: geography_prefixed.unwrap_or(bare).to_string(),
         named_by_arn,
+        names_inference_profile: arn_names_profile || geography_prefixed.is_some(),
     }
 }
 

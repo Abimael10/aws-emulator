@@ -1424,7 +1424,7 @@ fn identifier_rows() -> Vec<IdentifierRow> {
         // Spellings of a base model the inventory carries, all served.
         IdentifierRow {
             case: "bare base model id",
-            model_id: "amazon.nova-micro-v1:0",
+            model_id: "amazon.nova-lite-v1:0",
             status: 200,
             code: "",
             message: None,
@@ -1693,13 +1693,20 @@ async fn a_model_identifier_is_refused_by_the_class_of_identifier_it_is() {
 #[tokio::test]
 async fn every_active_text_model_in_the_inventory_is_served_in_its_family_envelope() {
     let (engine, router) = emulator_with_engine();
-    let inventory: Vec<(String, Option<state::ModelFamily>, state::ModelModality)> = engine
+    let inventory: Vec<(String, Option<state::ModelFamily>, state::ModelModality, bool)> = engine
         .state::<ServiceState>()
         .lock()
         .models
         .values()
         .filter(|entry| entry.lifecycle == state::ModelLifecycle::Active)
-        .map(|entry| (entry.model_id.clone(), entry.family, entry.modality))
+        .map(|entry| {
+            (
+                entry.model_id.clone(),
+                entry.family,
+                entry.modality,
+                entry.offers_on_demand,
+            )
+        })
         .collect();
     assert!(
         inventory.len() >= FAMILY_ROWS.len(),
@@ -1708,7 +1715,7 @@ async fn every_active_text_model_in_the_inventory_is_served_in_its_family_envelo
     );
 
     let mut served = 0usize;
-    for (model_id, family, modality) in inventory {
+    for (model_id, family, modality, offers_on_demand) in inventory {
         let Some(family) = family else { continue };
         assert_eq!(
             modality,
@@ -1722,10 +1729,18 @@ async fn every_active_text_model_in_the_inventory_is_served_in_its_family_envelo
             .find(|row| row.family == family)
             .map(|row| row.request)
             .unwrap_or_else(|| panic!("case {model_id:?}: no request body for family {family:?}"));
+        // A model that is not offered for on-demand invocation is invoked by
+        // naming an inference profile that contains it — the cross-region profile
+        // id — which is the identifier a client of such a model uses.
+        let invoked_as = if offers_on_demand {
+            model_id.clone()
+        } else {
+            format!("us.{model_id}")
+        };
         let call = send(
             &router,
             "POST",
-            &format!("/model/{}/invoke", encode_path(&model_id)),
+            &format!("/model/{}/invoke", encode_path(&invoked_as)),
             &[("content-type", "application/json")],
             request.as_bytes().to_vec(),
         )
@@ -2029,7 +2044,7 @@ fn body_schema_rows() -> Vec<BodySchemaRow> {
         },
         BodySchemaRow {
             case: "Amazon Nova without messages",
-            model_id: "amazon.nova-micro-v1:0",
+            model_id: "amazon.nova-lite-v1:0",
             accepted: NOVA_BODY,
             rejected: r#"{"inferenceConfig":{"max_new_tokens":16}}"#,
             missing_key: "messages",

@@ -946,8 +946,8 @@ async fn a_nova_response_stream_opens_with_message_start_and_closes_with_message
     // with and without a generation cap, and a non-ascii prompt.
     let rows = vec![
         (
-            "nova micro, bare conversation",
-            "amazon.nova-micro-v1:0",
+            "nova micro, bare conversation, through the inference profile that contains it",
+            "us.amazon.nova-micro-v1:0",
             json!({"messages": [{"role": "user", "content": [{"text": "Reply with one word."}]}]}),
         ),
         (
@@ -1334,6 +1334,243 @@ async fn an_arn_that_resolves_to_nothing_is_not_found_and_anything_else_is_inval
     }
 }
 
+/// One spelling a `modelId` may name ONE base model by, and which throughput it
+/// therefore asks for.
+///
+/// The branches come from the `modelId` member's own `@pattern`
+/// (smithy_query(query="operation",operation="ConverseStream")): the bare base-model
+/// id, a `foundation-model` ARN, an `inference-profile` ARN, and the
+/// geography-prefixed cross-region profile id, whose geographies are the ones
+/// "Supported Regions and models for cross-region inference" publishes.
+struct SpellingRow {
+    case: &'static str,
+    /// The spelling, with `{model}` standing for the base model id it names.
+    template: &'static str,
+    /// Whether the spelling names the model THROUGH an inference profile, which is
+    /// what decides whether the invocation asks for on-demand throughput.
+    through_a_profile: bool,
+}
+
+const SPELLING_ROWS: &[SpellingRow] = &[
+    SpellingRow {
+        case: "the bare base-model id",
+        template: "{model}",
+        through_a_profile: false,
+    },
+    SpellingRow {
+        case: "a foundation-model ARN without an account",
+        template: "arn:aws:bedrock:us-east-1::foundation-model/{model}",
+        through_a_profile: false,
+    },
+    SpellingRow {
+        case: "the us cross-region inference profile id",
+        template: "us.{model}",
+        through_a_profile: true,
+    },
+    SpellingRow {
+        case: "the eu cross-region inference profile id",
+        template: "eu.{model}",
+        through_a_profile: true,
+    },
+    SpellingRow {
+        case: "the apac cross-region inference profile id",
+        template: "apac.{model}",
+        through_a_profile: true,
+    },
+    SpellingRow {
+        case: "the us-gov cross-region inference profile id",
+        template: "us-gov.{model}",
+        through_a_profile: true,
+    },
+    SpellingRow {
+        case: "an inference-profile ARN",
+        template: "arn:aws:bedrock:us-east-1:000000000000:inference-profile/us.{model}",
+        through_a_profile: true,
+    },
+];
+
+/// The refusal an on-demand invocation of a model that is not offered with it
+/// earns, with `{model}` standing for the `modelId` the request carried.
+///
+/// Pinned here as text, so the sentence is asserted and not merely compared with
+/// the implementation's own rendering (which this suite checks against it below).
+const ON_DEMAND_REFUSAL: &str = "Invocation of model ID {model} with on-demand throughput \
+     isn’t supported. Retry your request with the ID or ARN of an inference profile that \
+     contains this model.";
+
+/// Every surface that INVOKES the model a `modelId` names: the operation, the path
+/// under `/model/{modelId}`, and whether a served answer is an event stream.
+const INVOCATION_SURFACES: &[(&str, &str, bool)] = &[
+    ("Converse", "converse", false),
+    ("ConverseStream", "converse-stream", true),
+    ("InvokeModel", "invoke", false),
+    (
+        "InvokeModelWithResponseStream",
+        "invoke-with-response-stream",
+        true,
+    ),
+];
+
+/// RULE: an invocation that asks for ON-DEMAND throughput on a model that is not
+/// offered with it is refused — `400 ValidationException` whose message names the
+/// `modelId` the request carried and the inference profile it has to be invoked
+/// through — while the SAME model named through a profile that contains it (a
+/// cross-region profile id or an `inference-profile` ARN) is served, and a model
+/// that IS offered on demand is served by its bare id. Every surface that invokes a
+/// model follows it, and on a streaming surface the refusal is plain JSON rather
+/// than an event stream.
+///
+/// The rows span what the rule generalises over: the model (one offered only
+/// through a profile, three offered on demand), the identifier spelling
+/// ([`SPELLING_ROWS`]: bare id, foundation-model ARN, each published geography
+/// prefix, inference-profile ARN) and the operation ([`INVOCATION_SURFACES`]).
+#[tokio::test]
+async fn an_invocation_that_asks_for_unoffered_on_demand_throughput_is_refused_on_every_surface() {
+    let router = emulator();
+    // One body both envelopes accept: the Converse API's `messages`, which is also
+    // the Amazon Nova `InvokeModel` request shape, so no row fails on its body
+    // instead of on the identifier under test.
+    let body = json!({ "messages": [{"role": "user", "content": [{"text": "hi"}]}] });
+
+    // (the model id, whether the inventory offers it for on-demand invocation).
+    // The profile-only model is the one this emulator's inventory carries that way;
+    // the on-demand models are three the same family publishes, so the outcome
+    // turns on the model's own offering and not on its family or its envelope.
+    let models: [(&str, bool); 4] = [
+        ("amazon.nova-micro-v1:0", false),
+        ("amazon.nova-lite-v1:0", true),
+        ("amazon.nova-pro-v1:0", true),
+        ("amazon.nova-2-lite-v1:0", true),
+    ];
+
+    for (model, offers_on_demand) in models {
+        for spelling in SPELLING_ROWS {
+            let model_id = spelling.template.replace("{model}", model);
+            let encoded = model_id.replace(':', "%3A").replace('/', "%2F");
+            let served = offers_on_demand || spelling.through_a_profile;
+            for (operation, path, streamed) in INVOCATION_SURFACES {
+                let case = format!("{model} as {} on {operation}", spelling.case);
+                let call = post_json(&router, &format!("/model/{encoded}/{path}"), &body).await;
+                if served {
+                    assert_eq!(
+                        call.status,
+                        200,
+                        "case {case:?}: expected the invocation to be served, got {} / {}",
+                        call.status,
+                        String::from_utf8_lossy(&call.body)
+                    );
+                    let expected_media = if *streamed {
+                        EVENT_STREAM
+                    } else {
+                        "application/json"
+                    };
+                    assert_eq!(
+                        call.media_type(),
+                        expected_media,
+                        "case {case:?}: expected {expected_media}, got {:?}",
+                        call.media_type()
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    call.status,
+                    400,
+                    "case {case:?}: expected the on-demand refusal, got {} / {}",
+                    call.status,
+                    String::from_utf8_lossy(&call.body)
+                );
+                assert!(
+                    call.error_code().starts_with("ValidationException"),
+                    "case {case:?}: expected ValidationException, got {:?}",
+                    call.error_code()
+                );
+                // Never framed as an event stream, on the streaming surfaces as
+                // much as on the others: a client reads this refusal as JSON.
+                assert_eq!(
+                    call.media_type(),
+                    "application/json",
+                    "case {case:?}: expected the refusal as JSON, got {:?} / {}",
+                    call.media_type(),
+                    String::from_utf8_lossy(&call.body)
+                );
+                let expected = ON_DEMAND_REFUSAL.replace("{model}", &model_id);
+                assert_eq!(
+                    call.json()["message"].as_str(),
+                    Some(expected.as_str()),
+                    "case {case:?}: expected {expected:?}, got {}",
+                    call.json()
+                );
+                // The message the service composes is that same sentence, so the
+                // wording lives in one place.
+                assert_eq!(
+                    state::on_demand_throughput_unsupported_message(&model_id),
+                    expected,
+                    "case {case:?}: the service's own rendering must be the pinned sentence, \
+                     got {:?}",
+                    state::on_demand_throughput_unsupported_message(&model_id)
+                );
+            }
+        }
+    }
+}
+
+/// RULE (the other side of the same one): naming a model WITHOUT invoking it is not
+/// an on-demand invocation, so `CountTokens` never answers the on-demand refusal for
+/// a profile-only model — it resolves the identifier and then answers its own rule
+/// about which models it counts for. The rows come from the inventory itself, which
+/// is what records whether a model is offered on demand.
+#[tokio::test]
+async fn naming_a_model_without_invoking_it_is_not_refused_for_on_demand_throughput() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+
+    let state = state::service_state(&*engine).expect("the service state store");
+    let profile_only: Vec<String> = {
+        let guard = state.lock();
+        guard
+            .models
+            .values()
+            .filter(|entry| !entry.offers_on_demand)
+            .map(|entry| entry.model_id.clone())
+            .collect()
+    };
+    assert!(
+        !profile_only.is_empty(),
+        "expected the inventory to carry at least one model offered only through an \
+         inference profile, got none"
+    );
+
+    for model_id in profile_only {
+        let encoded = model_id.replace(':', "%3A");
+        let call = post_json(
+            &router,
+            &format!("/model/{encoded}/count-tokens"),
+            &json!({ "input": { "converse": {
+                "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+            } } }),
+        )
+        .await;
+        let message = call.json()["message"].as_str().unwrap_or_default().to_string();
+        assert_ne!(
+            message,
+            ON_DEMAND_REFUSAL.replace("{model}", &model_id),
+            "case {model_id:?}: counting a prompt is no on-demand invocation, so the \
+             on-demand refusal must not be answered, got {} / {message:?}",
+            call.status
+        );
+        // Whatever this operation answers is its OWN rule's: either the count, or
+        // the refusal it owes for a model whose tokenizer it does not publish.
+        assert!(
+            call.status == 200
+                || message == "The provided model doesn't support counting tokens.",
+            "case {model_id:?}: expected the count or CountTokens' own refusal, got {} / {message:?}",
+            call.status
+        );
+    }
+}
+
 /// RULE: a model version the Bedrock model lifecycle has retired is still a name
 /// the service recognises: every operation that takes a `modelId` answers
 /// `ResourceNotFoundException` (404) saying the version has reached the end of its
@@ -1553,13 +1790,13 @@ async fn a_body_the_model_cannot_read_is_a_malformed_input_request() {
         ),
         (
             "nova: its own envelope",
-            "amazon.nova-micro-v1:0",
+            "amazon.nova-lite-v1:0",
             r#"{"messages":[{"role":"user","content":[{"text":"hi"}]}]}"#,
             None,
         ),
         (
             "nova: another family's prompt member",
-            "amazon.nova-micro-v1:0",
+            "amazon.nova-lite-v1:0",
             r#"{"inputText":"hi"}"#,
             Some(missing_key("messages")),
         ),

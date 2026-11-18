@@ -12,6 +12,11 @@
 //! the two planes carry the same model ids, so a model a client finds in the listing is one
 //! it can invoke.
 //!
+//! What a model is served ON is decided per row too, by whether the row is one of the
+//! [`INFERENCE_PROFILE_ONLY`] ids: those models are not offered for on-demand
+//! invocation, so they are invoked by naming an inference profile that contains them
+//! rather than by a foundation-model identifier.
+//!
 //! What a model is served WITH is decided per row, by how it is [`Served`]:
 //!
 //! * a TEXT model answers in its provider's own `InvokeModel` body envelope
@@ -156,6 +161,20 @@ fn context_window(model_id: &str, family: ModelFamily) -> u32 {
         .find(|(prefix, _)| model_id.starts_with(prefix))
         .map_or_else(|| family_context_window(family), |(_, window)| *window)
 }
+
+/// The catalogued models that are NOT offered for on-demand invocation, so an
+/// invocation has to name an inference profile that contains the model.
+///
+/// Which inference types a model is offered with is published per model ("Amazon
+/// Bedrock base model IDs (on-demand throughput)" lists the ids on-demand
+/// invocation is offered for, and a model outside it is reached through a
+/// cross-region inference profile instead). The published inference types this
+/// service's sibling control plane can report (`InferenceType`: `ON_DEMAND`,
+/// `PROVISIONED`) do not name that case, so which ids this inventory carries that
+/// way is recorded behaviour of this emulator, as [`ModelEntry::supports_count_tokens`]
+/// is: an invocation of one of these by its bare id (or `foundation-model` ARN) is
+/// refused, and the same model named through a profile is served.
+const INFERENCE_PROFILE_ONLY: &[&str] = &["amazon.nova-micro-v1:0"];
 
 /// Every base model id this data plane recognises, with how each one is served.
 ///
@@ -362,6 +381,10 @@ pub(super) fn seed_models() -> Vec<ModelEntry> {
 
 /// One inventory entry, as its catalogue row says the model is served.
 fn entry(model_id: &str, served: Served) -> ModelEntry {
+    // The throughput side of the row: a model this inventory carries as
+    // profile-only is invocable only through an inference profile that contains
+    // it ([`INFERENCE_PROFILE_ONLY`]).
+    let offers_on_demand = !INFERENCE_PROFILE_ONLY.contains(&model_id);
     let model_id = model_id.to_string();
     match served {
         Served::Text {
@@ -384,6 +407,7 @@ fn entry(model_id: &str, served: Served) -> ModelEntry {
             // artifact written to Amazon S3, which is what the video models produce.
             supports_async_invoke: false,
             max_output_tokens,
+            offers_on_demand,
         },
         Served::Unserved(modality) => ModelEntry {
             model_id,
@@ -395,6 +419,7 @@ fn entry(model_id: &str, served: Served) -> ModelEntry {
             supports_async_invoke: false,
             max_output_tokens: 0,
             context_window: 0,
+            offers_on_demand,
         },
         Served::AsyncVideo => ModelEntry {
             model_id,
@@ -406,6 +431,7 @@ fn entry(model_id: &str, served: Served) -> ModelEntry {
             supports_async_invoke: true,
             max_output_tokens: 0,
             context_window: 0,
+            offers_on_demand,
         },
         Served::Retired(modality) => ModelEntry {
             model_id,
@@ -417,6 +443,7 @@ fn entry(model_id: &str, served: Served) -> ModelEntry {
             supports_async_invoke: false,
             max_output_tokens: 0,
             context_window: 0,
+            offers_on_demand,
         },
     }
 }

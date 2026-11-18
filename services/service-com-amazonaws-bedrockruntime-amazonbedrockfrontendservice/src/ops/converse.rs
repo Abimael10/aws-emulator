@@ -300,11 +300,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // API serves: "Supported models and model features" lists base models
         // that only `InvokeModel` serves. An identifier the service cannot
         // interpret is a 400; one naming a model or resource that is not
-        // available here is a 404 (see
-        // `crate::state::resolve_model_for_inference`).
+        // available here is a 404; one naming a model that is not offered for
+        // on-demand invocation is a 400 naming the inference profile it has to
+        // be invoked through (see
+        // `crate::state::resolve_model_for_invocation`).
         let model = {
             let guard = state.lock();
-            match guard.resolve_model_for_inference(&input.model_id) {
+            match guard.resolve_model_for_invocation(&input.model_id) {
                 Ok(entry) => entry.clone(),
                 Err(crate::state::ModelRejection::Invalid(message)) => {
                     return Err(validation(message))
