@@ -156,7 +156,11 @@ async fn rpc_in(
 }
 
 /// One EventBridge operation (`awsJson1_1`, target prefix `AWSEvents`) in `region`.
-async fn events_in(
+///
+/// `pub(crate)` for the sibling suite that reads the ARN EventBridge minted for an installed
+/// rule (`restore_job_event_target_grant.rs`), so a target's grant is written against the
+/// value that service answers with rather than against a second spelling of it.
+pub(crate) async fn events_in(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -180,6 +184,33 @@ pub(crate) async fn sqs_in(
 /// on the queue's resource policy for it, so a queue that has granted it nothing receives
 /// nothing. Answers the queue's url and the ARN a rule names it by.
 async fn given_queue_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    name: &str,
+) -> (String, String) {
+    let (url, arn) = given_unpolicied_queue_in(router, region, case, name).await;
+    let policy = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "Service": "events.amazonaws.com" },
+            "Action": "sqs:SendMessage",
+            "Resource": &arn,
+        }],
+    })
+    .to_string();
+    set_queue_policy_in(router, region, case, &url, &policy).await;
+    (url, arn)
+}
+
+/// The SAME queue, carrying NO resource policy at all: the queue a case states its own
+/// document on afterwards, and the queue that has granted a rule's delivery nothing.
+///
+/// [`given_queue_in`] is this queue plus the unconditioned grant a target needs, so there is
+/// ONE `CreateQueue` + `GetQueueAttributes` plumbing in this test crate rather than one per
+/// document a case wants to put on it.
+async fn given_unpolicied_queue_in(
     router: &MultiServiceRouter,
     region: &str,
     case: &str,
@@ -209,16 +240,30 @@ async fn given_queue_in(
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no QueueArn in {attributes}"))
         .to_string();
-    let policy = json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Principal": { "Service": "events.amazonaws.com" },
-            "Action": "sqs:SendMessage",
-            "Resource": &arn,
-        }],
-    })
-    .to_string();
+    (url, arn)
+}
+
+/// [`given_unpolicied_queue_in`] in [`REGION`].
+///
+/// `pub(crate)` for the sibling suite whose subject is WHICH document admits a rule's
+/// delivery (`restore_job_event_target_grant.rs`), which states each row's own policy.
+pub(crate) async fn given_unpolicied_queue(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> (String, String) {
+    given_unpolicied_queue_in(router, REGION, case, name).await
+}
+
+/// Put `policy` on the queue at `url` in `region`, the way a client states a queue's
+/// resource policy.
+async fn set_queue_policy_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    url: &str,
+    policy: &str,
+) {
     let (status, set) = sqs_in(
         router,
         region,
@@ -230,7 +275,17 @@ async fn given_queue_in(
         status, 200,
         "case {case:?}: SetQueueAttributes answered {status} {set}"
     );
-    (url, arn)
+}
+
+/// [`set_queue_policy_in`] in [`REGION`], `pub(crate)` for the reason given on
+/// [`given_unpolicied_queue`].
+pub(crate) async fn set_queue_policy(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    policy: &str,
+) {
+    set_queue_policy_in(router, REGION, case, url, policy).await;
 }
 
 /// [`given_queue_in`] in [`REGION`].

@@ -121,7 +121,11 @@ async fn given_table(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 /// `PUT /restore-jobs`, as the model binds `StartRestoreJob`; answers the `RestoreJobId`.
-async fn start_restore(
+///
+/// `pub(crate)` for the sibling suite whose subject is WHICH document admits the delivery of
+/// the envelope this start's move owes (`restore_job_event_target_grant.rs`), so a restore is
+/// started one way in this test crate rather than one way per suite.
+pub(crate) async fn start_restore(
     router: &MultiServiceRouter,
     case: &str,
     recovery_point_arn: &str,
@@ -143,7 +147,10 @@ async fn start_restore(
 }
 
 /// `GET /restore-jobs/{RestoreJobId}`, as the model binds `DescribeRestoreJob`.
-async fn describe_restore(router: &MultiServiceRouter, case: &str, job_id: &str) -> Value {
+///
+/// `pub(crate)` for the reason given on [`start_restore`]: the published `detail` is compared
+/// against this read in both suites.
+pub(crate) async fn describe_restore(router: &MultiServiceRouter, case: &str, job_id: &str) -> Value {
     let (status, read) = call(router, "GET", &format!("/restore-jobs/{job_id}"), None).await;
     assert_eq!(
         status, 200,
