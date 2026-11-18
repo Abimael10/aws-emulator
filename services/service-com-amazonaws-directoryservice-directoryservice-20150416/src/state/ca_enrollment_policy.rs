@@ -32,10 +32,15 @@
 //! this service reported `Success` for while nothing could enroll a certificate would be a
 //! success backed by nothing.
 //!
-//! Each refusal's wording follows the class it belongs to: a value the caller must fix is
-//! named in this service's own resolution sentence ([`no_such_pca_connector`]), while a
-//! fact about the directory's own policy, which names no value to fix, is stated as the
-//! model words that error shape.
+//! Each refusal's wording follows WHO decided it. A requirement another AWS service
+//! decides is relayed: the enable reports the connector it could not resolve and carries
+//! that service's own failure — its service name, HTTP status, error code and the request id
+//! of the lookup — inside its message ([`no_such_pca_connector`]), so a caller reads which
+//! service rejected the enrollment and which resource was missing. A fact this service
+//! decides in its OWN store is reported as the lookup that decided it: the directory the
+//! request named and the internal lookup failure that found no enrollment for it
+//! ([`no_ca_enrollment_info`]), rather than the error shape's documentation sentence, which
+//! names neither the directory nor what was looked up.
 
 use super::*;
 
@@ -85,21 +90,61 @@ pub const CA_ENROLLMENT_DISABLE_IN_PROGRESS: &str =
 /// service-wide wording for an entity a create cannot make a second of.
 pub const CA_ENROLLMENT_POLICY_EXISTS: &str = "The specified entity already exists.";
 
+/// The name of the internal lookup failure the enrollment-policy store answers a directory
+/// it holds no enrollment for with, as the relayed inner-exception clause of
+/// [`no_ca_enrollment_info`] names it.
+const NO_ENROLLMENT_LOOKUP_EXCEPTION: &str = "NoResultFoundException";
+
 /// The `EntityDoesNotExistException` diagnostic a disable is refused with when the
-/// directory holds no policy to withdraw — the model's own sentence for that error shape
-/// (`smithy_query(query="shape",shape="EntityDoesNotExistException")`).
-pub const CA_ENROLLMENT_POLICY_ABSENT: &str = "The specified entity could not be found.";
+/// directory holds no CA enrollment to withdraw.
+///
+/// The refusal is decided by the enrollment-policy LOOKUP this service makes for the
+/// directory the request named, and Directory Service reports that lookup rather than the
+/// error shape's documentation sentence: the statement that no enrollment info was found for
+/// that directory, then the inner exception the lookup failed with and its own statement of
+/// the same fact. So the directory id — the one value a caller has to attribute the failure
+/// to in a sweep over many directories — appears in the message, twice, exactly as the
+/// request carried it. [`refusal`] appends the request id, once.
+#[must_use]
+pub fn no_ca_enrollment_info(directory_id: &str) -> String {
+    let looked_up = format!("No CA enrollment info found for directory {directory_id}");
+    format!("{looked_up} with Inner Exception: {NO_ENROLLMENT_LOOKUP_EXCEPTION}: {looked_up}")
+}
+
+/// The service name the Private CA Connector for Active Directory service reports in its
+/// own error envelope, which this service relays unchanged.
+const PCA_CONNECTOR_SERVICE_NAME: &str = "AWSPcaConnectorAd";
+
+/// The HTTP status that service answers a connector it does not hold with: the `httpError`
+/// of the `ResourceNotFoundException` its connector read models
+/// (`smithy_query(query="operation",operation="GetConnector",model_path="services/service-com-amazonaws-pcaconnectorad-pcaconnectorad/smithy-model/com-amazonaws-pcaconnectorad-pcaconnectorad.json")`).
+const PCA_CONNECTOR_NOT_FOUND_STATUS: u16 = 404;
+
+/// The error code of that same modelled failure, as the shape is named on the wire.
+const PCA_CONNECTOR_NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 
 /// The `EntityDoesNotExistException` diagnostic an enable naming a connector the service
 /// that owns connectors does not hold is refused with.
 ///
-/// In this service's own resolution wording — the entity, the quoted value the request
-/// asked for, then "does not exist." ([`no_such_directory`], and the same shape every other
-/// entity this service resolves is refused with) — because the caller fixes the request by
-/// naming a connector that is there. [`refusal`] appends the request id, once.
+/// The requirement is decided THERE, so this service relays that service's failure instead
+/// of wording a not-found of its own: the connector it could not resolve, then the owning
+/// service's own not-found sentence for it ([`pca_connector::not_found_message`]), then the
+/// envelope naming the service that answered, the HTTP status and error code it answered
+/// with, and the request id of THAT lookup (`lookup_request_id`, minted by
+/// [`connector_defect`] where the lookup happens) — which is what tells a caller that the
+/// connector, and not the directory or a permission, is the resource that is missing.
+/// [`refusal`] appends this call's own request id, once.
 #[must_use]
-pub fn no_such_pca_connector(pca_connector_arn: &str) -> String {
-    format!("PCA connector: '{pca_connector_arn}' does not exist.")
+pub fn no_such_pca_connector(pca_connector_arn: &str, lookup_request_id: &str) -> String {
+    format!(
+        "Connector not found for ARN: {pca_connector_arn}. {relayed} (Service: \
+         {PCA_CONNECTOR_SERVICE_NAME}; Status Code: {PCA_CONNECTOR_NOT_FOUND_STATUS}; Error \
+         Code: {PCA_CONNECTOR_NOT_FOUND_CODE}; Request ID: {lookup_request_id}; Proxy: null)",
+        relayed = pca_connector::not_found_message(
+            pca_connector::RESOURCE_TYPE_CONNECTOR,
+            pca_connector_arn,
+        ),
+    )
 }
 
 /// The `InvalidParameterException` diagnostic an enable naming a connector that is not
@@ -145,12 +190,12 @@ pub fn connector_defect<Eng: Send + Sync + 'static>(
     now: SystemTime,
 ) -> Option<ConnectorDefect> {
     let Some(state) = pca_connector::service_state(engine) else {
-        return Some(ConnectorDefect::Absent);
+        return Some(ConnectorDefect::absent());
     };
     let mut store = state.lock();
     store.settle(now);
     let Some(connector) = store.connectors.get(pca_connector_arn) else {
-        return Some(ConnectorDefect::Absent);
+        return Some(ConnectorDefect::absent());
     };
     if connector.directory_id != directory_id {
         return Some(ConnectorDefect::OtherDirectory);
@@ -164,14 +209,31 @@ pub fn connector_defect<Eng: Send + Sync + 'static>(
 /// What [`connector_defect`] found: which refusal the enable answers, and nothing about the
 /// connector's internals — the diagnostic names the value the request carried, so no state
 /// of another service's resource is disclosed beyond the fact that refused the call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectorDefect {
-    /// The service that owns connectors holds none under that ARN.
-    Absent,
+    /// The service that owns connectors holds none under that ARN, so the lookup this
+    /// service made there failed — and the refusal relays that failure, including the
+    /// request id of the lookup that answered it ([`no_such_pca_connector`]).
+    Absent {
+        /// The correlation handle of the connector read this service made: one lookup, one
+        /// id, minted where the lookup failed rather than where the message is built, so
+        /// the id in the relayed envelope is the inner call's and never this call's.
+        lookup_request_id: String,
+    },
     /// It holds one, but not in the active state the enable requires of it.
     NotActive,
     /// It holds one, created for another directory.
     OtherDirectory,
+}
+
+impl ConnectorDefect {
+    /// The defect a connector read that found nothing reports, with the id of that read.
+    #[must_use]
+    fn absent() -> Self {
+        Self::Absent {
+            lookup_request_id: next_request_id(),
+        }
+    }
 }
 
 /// One directory's CA enrollment policy.

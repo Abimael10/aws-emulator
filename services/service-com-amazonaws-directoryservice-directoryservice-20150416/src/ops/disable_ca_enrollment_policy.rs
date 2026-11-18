@@ -202,9 +202,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A deactivation whose transition is still outstanding is the one failure this
         // operation models an in-progress error for.
+        //
+        // The refusal of a directory holding no enrollment reports the lookup that decided
+        // it — naming the directory the request sent — rather than the error shape's
+        // documentation sentence, which names no directory at all.
         let policy_absent = || {
             DisableCAEnrollmentPolicyErrorModeled::EntityDoesNotExistException(
-                crate::state::refusal(crate::state::CA_ENROLLMENT_POLICY_ABSENT),
+                crate::state::refusal(crate::state::no_ca_enrollment_info(&input.directory_id)),
             )
         };
         let policy = directory

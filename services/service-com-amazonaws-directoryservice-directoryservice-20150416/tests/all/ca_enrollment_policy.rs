@@ -39,7 +39,15 @@
 //!   directory is stored under with `DirectoryDoesNotExistException` — over a table of
 //!   well-formed ids differing in digits and form — while an id the MODEL refuses is
 //!   refused before that resolution happens at all, and none of the three ever answers
-//!   the scaffold's `NotImplemented`.
+//!   the scaffold's `NotImplemented`;
+//! * a refusal this service decides in its OWN enrollment-policy store reports the LOOKUP
+//!   that decided it — the directory the request named, and the inner exception the lookup
+//!   failed with — over a table of directories differing in type and in whether a policy was
+//!   ever recorded for them;
+//! * a refusal another AWS service decides RELAYS that service's failure — the connector
+//!   this one could not resolve, that service's own not-found sentence for it, and the
+//!   envelope naming the service, the HTTP status, the error code and the request id of the
+//!   lookup — over the same table of connector forms, on both kinds of directory.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1024,4 +1032,267 @@ async fn every_operation_resolves_the_directory_in_the_store() {
         "case {:?}: the stored directory enrolls and reports back, got {reported:?}",
         "the stored directory"
     );
+}
+
+/// The modelled error class both refusals below answer in: `EntityDoesNotExistException`,
+/// HTTP 400 (`smithy_query(query="operation", operation="DisableCAEnrollmentPolicy")` and
+/// the same for `EnableCAEnrollmentPolicy`).
+const ENTITY_DOES_NOT_EXIST: &str = "EntityDoesNotExistException";
+
+/// The refusal of `operation` for `body`, checked to be the modelled 400 above: the
+/// `Message` and the `RequestId` of the SAME answer, so nothing below is pinned to a value
+/// one run minted.
+async fn refusal_message(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    case: &str,
+) -> (String, String) {
+    let (status, parsed) = call(router, operation, body).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected {operation} to be refused with 400, got {status} with {parsed}"
+    );
+    let wire_type = parsed["__type"].as_str().unwrap_or_default();
+    assert!(
+        wire_type.contains(ENTITY_DOES_NOT_EXIST),
+        "case {case:?}: expected {ENTITY_DOES_NOT_EXIST} from {operation}, got {parsed}"
+    );
+    let message = string(&parsed, "Message", case);
+    let request_id = string(&parsed, "RequestId", case);
+    (message, request_id)
+}
+
+/// Whether `value` is shaped the way a correlation handle of this service is: the `@pattern`
+/// of the modelled `RequestId` member, five hex groups of 8-4-4-4-12
+/// (`smithy_query(query="shape", shape="EntityDoesNotExistException")`).
+fn is_request_id_shaped(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    let lengths: Vec<usize> = groups.iter().map(|group| group.len()).collect();
+    lengths == [8, 4, 4, 4, 12]
+        && groups
+            .iter()
+            .all(|group| group.chars().all(|digit| digit.is_ascii_hexdigit()))
+}
+
+/// The diagnostic the withdrawal of a directory holding no enrollment is refused with: the
+/// lookup that decided it, then the inner exception that lookup failed with restating it.
+fn no_enrollment_found(directory_id: &str) -> String {
+    let looked_up = format!("No CA enrollment info found for directory {directory_id}");
+    format!("{looked_up} with Inner Exception: NoResultFoundException: {looked_up}")
+}
+
+/// RULE: a refusal this service decides in its OWN enrollment-policy store reports the
+/// LOOKUP that decided it — the directory the request named, and the inner exception the
+/// lookup failed with — rather than the error shape's documentation sentence, which names
+/// neither.
+///
+/// Asserted over a table of directories differing in type and in whether a policy was ever
+/// recorded for them at all, because the refusal has two ways in: a directory no enable ever
+/// named, and one whose policy has been withdrawn.
+#[tokio::test]
+async fn a_disable_with_no_enrollment_reports_the_lookup_that_found_none() {
+    let router = emulator();
+
+    // `enrolled` here means the row records a policy and withdraws it BEFORE the refusal is
+    // asked for, so the refusal meets a policy record that has settled out of force rather
+    // than no record at all.
+    let rows = vec![
+        PolicyCase {
+            case: "a Simple AD directory no enable ever named",
+            operation: "CreateDirectory",
+            body: minimal_create("never-enrolled.example.com"),
+            enrolled: false,
+        },
+        PolicyCase {
+            case: "a Managed Microsoft AD directory no enable ever named",
+            operation: "CreateMicrosoftAD",
+            body: minimal_microsoft_ad("never-corp.example.com"),
+            enrolled: false,
+        },
+        PolicyCase {
+            case: "a Managed Microsoft AD directory whose policy was already withdrawn",
+            operation: "CreateMicrosoftAD",
+            body: minimal_microsoft_ad("withdrawn-corp.example.com"),
+            enrolled: true,
+        },
+    ];
+
+    for row in &rows {
+        let id = create(&router, row).await;
+        await_directory_in_service(&router, &id, row.case).await;
+
+        if row.enrolled {
+            let connector = active_connector(&router, &id, row.case).await;
+            ok(
+                &router,
+                "EnableCAEnrollmentPolicy",
+                json!({ "DirectoryId": &id, "PcaConnectorArn": &connector }),
+                row.case,
+            )
+            .await;
+            await_policy_status(&router, &id, SUCCESS, row.case).await;
+            ok(
+                &router,
+                "DisableCAEnrollmentPolicy",
+                json!({ "DirectoryId": &id }),
+                row.case,
+            )
+            .await;
+            await_policy_status(&router, &id, DISABLED, row.case).await;
+        }
+
+        let (message, request_id) = refusal_message(
+            &router,
+            "DisableCAEnrollmentPolicy",
+            json!({ "DirectoryId": &id }),
+            row.case,
+        )
+        .await;
+        let expected = format!(
+            "{} : RequestId: {request_id}",
+            no_enrollment_found(&id)
+        );
+        assert_eq!(
+            message, expected,
+            "case {:?}: expected the lookup failure for {id}, got {message:?}",
+            row.case
+        );
+        assert_eq!(
+            message.matches(&id).count(),
+            2,
+            "case {:?}: expected the directory the request named twice in {message:?}",
+            row.case
+        );
+
+        // The refusal recorded nothing, so the read still reports the inactive status and a
+        // second attempt is refused the same way — with a correlation handle of its own.
+        let status = policy_status(&router, &id, row.case).await;
+        assert_eq!(
+            status, DISABLED,
+            "case {:?}: a refused disable records nothing, got {status:?}",
+            row.case
+        );
+        let (again, retry_request_id) = refusal_message(
+            &router,
+            "DisableCAEnrollmentPolicy",
+            json!({ "DirectoryId": &id }),
+            row.case,
+        )
+        .await;
+        assert_ne!(
+            retry_request_id, request_id,
+            "case {:?}: expected the retry its own request id, got {retry_request_id:?}",
+            row.case
+        );
+        assert_eq!(
+            again,
+            format!(
+                "{} : RequestId: {retry_request_id}",
+                no_enrollment_found(&id)
+            ),
+            "case {:?}: expected the retry the same template, got {again:?}",
+            row.case
+        );
+    }
+}
+
+/// RULE: a refusal another AWS service decides RELAYS that service's failure — the resource
+/// this one could not resolve, that service's own not-found sentence for it, and the
+/// envelope naming the service, the HTTP status, the error code and the request id of the
+/// lookup — rather than being re-worded as a not-found of this service's own.
+///
+/// Asserted over the table of connector ARNs differing along every segment the model leaves
+/// open, on both kinds of directory, because the relayed envelope is about the connector the
+/// request named and not about one form of ARN or one kind of directory.
+#[tokio::test]
+async fn an_enable_naming_an_absent_connector_relays_the_owning_services_refusal() {
+    let router = emulator();
+
+    let directories = vec![
+        PolicyCase {
+            case: "a Simple AD directory",
+            operation: "CreateDirectory",
+            body: minimal_create("relay-simple.example.com"),
+            enrolled: false,
+        },
+        PolicyCase {
+            case: "a Managed Microsoft AD directory",
+            operation: "CreateMicrosoftAD",
+            body: minimal_microsoft_ad("relay-corp.example.com"),
+            enrolled: false,
+        },
+    ];
+
+    for row in &directories {
+        let id = create(&router, row).await;
+        await_directory_in_service(&router, &id, row.case).await;
+
+        for (absent, connector_class) in ABSENT_CONNECTORS {
+            let case = format!("{} enrolling through {connector_class}", row.case);
+            let (message, request_id) = refusal_message(
+                &router,
+                "EnableCAEnrollmentPolicy",
+                json!({ "DirectoryId": &id, "PcaConnectorArn": absent }),
+                &case,
+            )
+            .await;
+
+            // The connector this service could not resolve, the owning service's own
+            // not-found sentence for it, then the envelope naming who answered and with
+            // what — closed by this call's own request-id suffix.
+            let prefix = format!(
+                "Connector not found for ARN: {absent}. Connector was not found: {absent}. \
+                 (Service: AWSPcaConnectorAd; Status Code: 404; Error Code: \
+                 ResourceNotFoundException; Request ID: "
+            );
+            let suffix = format!("; Proxy: null) : RequestId: {request_id}");
+            assert!(
+                message.starts_with(&prefix) && message.ends_with(&suffix),
+                "case {case:?}: expected a relayed connector not-found between {prefix:?} \
+                 and {suffix:?}, got {message:?}"
+            );
+
+            // What the envelope carries between them is the request id of the LOOKUP this
+            // service made in the owning service: a correlation handle of its own, and not
+            // the handle of the call being answered.
+            let lookup_request_id = &message[prefix.len()..message.len() - suffix.len()];
+            assert!(
+                is_request_id_shaped(lookup_request_id),
+                "case {case:?}: expected the relayed lookup's request id, got \
+                 {lookup_request_id:?}"
+            );
+            assert_ne!(
+                lookup_request_id, request_id,
+                "case {case:?}: expected the lookup's own request id rather than this \
+                 call's {request_id:?}"
+            );
+
+            // The refused enable recorded nothing, so the retry of the same bad ARN is
+            // relayed the same way — down to a lookup of its own.
+            let status = policy_status(&router, &id, &case).await;
+            assert_eq!(
+                status, DISABLED,
+                "case {case:?}: a refused enable records nothing, got {status:?}"
+            );
+            let (again, retry_request_id) = refusal_message(
+                &router,
+                "EnableCAEnrollmentPolicy",
+                json!({ "DirectoryId": &id, "PcaConnectorArn": absent }),
+                &case,
+            )
+            .await;
+            let retry_suffix = format!("; Proxy: null) : RequestId: {retry_request_id}");
+            assert!(
+                again.starts_with(&prefix) && again.ends_with(&retry_suffix),
+                "case {case:?}: expected the retry the same relayed template, got {again:?}"
+            );
+            let retry_lookup = &again[prefix.len()..again.len() - retry_suffix.len()];
+            assert_ne!(
+                retry_lookup, lookup_request_id,
+                "case {case:?}: expected the retry's lookup its own request id, got \
+                 {retry_lookup:?}"
+            );
+        }
+    }
 }

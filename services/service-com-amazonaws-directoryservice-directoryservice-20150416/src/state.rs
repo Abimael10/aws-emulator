@@ -111,11 +111,11 @@ pub mod subnet_zones;
 
 pub use account_credentials::{credential_defect, PasswordVerifier};
 pub use ca_enrollment_policy::{
-    connector_defect, no_such_pca_connector, pca_connector_not_active,
+    connector_defect, no_ca_enrollment_info, no_such_pca_connector, pca_connector_not_active,
     pca_connector_of_another_directory, CaEnrollmentPolicyRecord, ConnectorDefect,
     CA_ENROLLMENT_DISABLE_IN_PROGRESS, CA_ENROLLMENT_ENABLE_IN_PROGRESS,
-    CA_ENROLLMENT_POLICY_ABSENT, CA_ENROLLMENT_POLICY_DISABLED, CA_ENROLLMENT_POLICY_DISABLING,
-    CA_ENROLLMENT_POLICY_EXISTS, CA_ENROLLMENT_POLICY_IN_PROGRESS, CA_ENROLLMENT_POLICY_SUCCESS,
+    CA_ENROLLMENT_POLICY_DISABLED, CA_ENROLLMENT_POLICY_DISABLING, CA_ENROLLMENT_POLICY_EXISTS,
+    CA_ENROLLMENT_POLICY_IN_PROGRESS, CA_ENROLLMENT_POLICY_SUCCESS,
 };
 pub use certificate_lookup::CertificateAbsence;
 pub use diagnostics::*;

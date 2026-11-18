@@ -245,10 +245,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::connector_defect(&*self.engine, &input.directory_id, &input.pca_connector_arn, now)
         {
             return Err(match defect {
-                crate::state::ConnectorDefect::Absent => {
+                // The connector is resolved in the service that owns connectors, so the
+                // refusal relays THAT service's failure — which service answered, with
+                // which status, error code and lookup request id — rather than wording a
+                // not-found of this service's own.
+                crate::state::ConnectorDefect::Absent { lookup_request_id } => {
                     EnableCAEnrollmentPolicyErrorModeled::EntityDoesNotExistException(
                         crate::state::refusal(crate::state::no_such_pca_connector(
                             &input.pca_connector_arn,
+                            &lookup_request_id,
                         )),
                     )
                 }
