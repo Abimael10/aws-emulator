@@ -3555,63 +3555,47 @@ pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
     )
 }
 
-/// Whether IAM positively reports that `role_arn` names no role.
+/// The service principal a pipeline's SERVICE ROLE has to trust for CodePipeline to run the
+/// pipeline's actions as it, as a trust document names one (that model's
+/// `awsService.cloudTrailEventSource`, `codepipeline.amazonaws.com`).
+pub const SERVICE_PRINCIPAL: &str = "codepipeline.amazonaws.com";
+
+/// The sentence this service refuses a declaration naming a service role it cannot assume
+/// with: the fixed text AWS words such a refusal in, and the role ARN the declaration named.
 ///
-/// `PipelineDeclaration$roleArn` is the role CodePipeline assumes to run the pipeline's
-/// actions, so a declaration naming a role that does not exist describes a pipeline that
-/// cannot run — which is what `InvalidStructureException` reports. Shared by
-/// `CreatePipeline` and `UpdatePipeline`, so a declaration one of them refuses is not
-/// accepted by the other.
+/// One spelling, read by `CreatePipeline` and `UpdatePipeline` — the two calls that store a
+/// declaration — so neither can word the same refusal differently.
+pub fn role_not_assumable_message(role_arn: &str) -> String {
+    format!("CodePipeline is not authorized to perform AssumeRole on role {role_arn}")
+}
+
+/// Whether IAM ANSWERED that `role_arn` names a role this service cannot assume.
 ///
-/// `true` only for IAM's own `NoSuchEntity`: any other answer (IAM not reachable, a
-/// malformed ARN this emulator cannot resolve to a role name, a transport failure)
-/// leaves the question unanswered, and an unanswered question is not a refusal.
-pub async fn role_is_absent(
+/// `PipelineDeclaration$roleArn` is "the Amazon Resource Name (ARN) for CodePipeline to use
+/// to either perform actions with no actionRoleArn, or to use to assume roles for actions
+/// with an actionRoleArn", so a pipeline declaring a role this service cannot take on
+/// describes a pipeline that cannot run a single action — which is what
+/// `InvalidStructureException` reports. Shared by `CreatePipeline` and `UpdatePipeline`, so a
+/// declaration one of them refuses is not accepted by the other.
+///
+/// The whole question is the tree's ONE reading of it
+/// ([`::service_common::iam_role::role_is_unassumable`]): which role of this account the ARN
+/// names, IAM's own `GetRole`, and whether the trust document that role carries admits
+/// [`SERVICE_PRINCIPAL`]. A role IAM reports absent and a role whose trust policy withholds
+/// the assume are both answers; everything that is not an answer — a value naming no role of
+/// this account, an unreadable answer, an emulator with no IAM mounted — refuses nothing, so
+/// a declaration is never refused on evidence this emulator does not have.
+pub async fn role_is_unassumable(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     role_arn: &str,
 ) -> bool {
-    // An IAM role ARN is `arn:<partition>:iam::<account>:role/<path/><name>`, and
-    // `GetRole` takes the NAME (the last path segment).
-    let Some(role_name) = role_arn
-        .split_once(":role/")
-        .map(|(_, path)| path)
-        .and_then(|path| path.rsplit('/').next())
-        .filter(|name| !name.is_empty())
-    else {
-        return false;
-    };
-    let region = request_region(&ctx.parts().headers);
-    let config = ::aws_sdk_iam::Config::builder()
-        .behavior_version(::aws_sdk_iam::config::BehaviorVersion::latest())
-        .region(::aws_sdk_iam::config::Region::new(region))
-        // The endpoint is a FIXED literal (see [`in_process_endpoint`]): no
-        // request-derived text reaches the host position, so nothing a caller sends can
-        // re-point this call, which carries the emulator's own credentials. The
-        // request's region is only the signing scope, never part of the URL.
-        .endpoint_url(in_process_endpoint("iam"))
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
-        // The transport is in-process: nothing to retry, time out or watch for a
-        // stalled stream, and each would need a sleep implementation this client is
-        // not given.
-        .retry_config(::aws_sdk_iam::config::retry::RetryConfig::disabled())
-        .timeout_config(::aws_sdk_iam::config::timeout::TimeoutConfig::disabled())
-        .identity_cache(::aws_sdk_iam::config::IdentityCache::no_cache())
-        .stalled_stream_protection(
-            ::aws_sdk_iam::config::StalledStreamProtectionConfig::disabled(),
-        )
-        .build();
-    match ::aws_sdk_iam::Client::from_conf(config)
-        .get_role()
-        .role_name(role_name)
-        .send()
-        .await
-    {
-        Ok(_) => false,
-        Err(err) => err
-            .as_service_error()
-            .is_some_and(::aws_sdk_iam::operation::get_role::GetRoleError::is_no_such_entity_exception),
-    }
+    ::service_common::iam_role::role_is_unassumable(
+        ctx,
+        &request_region(&ctx.parts().headers),
+        role_arn,
+        SERVICE_PRINCIPAL,
+    )
+    .await
 }
 
 /// The ARN of the principal this request speaks for — the identity a member naming WHO

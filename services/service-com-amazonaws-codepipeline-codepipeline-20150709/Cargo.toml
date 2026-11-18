@@ -16,8 +16,6 @@ service-common = { path = "../common" }
 # callback into this same emulator (no network client feature: the transport is the
 # emulator's own).
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
-# The IAM client CreatePipeline checks the declaration's roleArn against.
-aws-sdk-iam = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # The CodeCommit client a CodeCommit source action resolves its branch tip and reads the
 # revision's files with, over the same in-process callback.
 aws-sdk-codecommit = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }

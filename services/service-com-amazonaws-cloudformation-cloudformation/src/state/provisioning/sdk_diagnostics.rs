@@ -56,6 +56,19 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // ValidationException; Request ID: …)" (RequestToken: …, HandlerErrorCode:
     // InvalidRequest)`).
     ("braket", "Braket", SdkDiagnostic::Operation),
+    // AWS CodePipeline's SDK names it by that model's own `sdkId` (`CodePipeline`,
+    // `smithy_query(query="service_info")` on that service's model), which is also the
+    // `cloudFormationName` the type names of its resources carry. The shape is the
+    // ATTEMPT-counting one, as the recorded `ResourceStatusReason` of an
+    // `AWS::CodePipeline::Pipeline` whose declared service role that service cannot assume
+    // carries it (in the behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `cloudformation__codepipeline.deploy-codepipeline-pipeline-unassumable-role-rolled-back`,
+    // whose reason reads `Resource handler returned message: "<the service's sentence>
+    // (Service: CodePipeline, Status Code: 400, Request ID: …) (SDK Attempt Count: …)"
+    // (RequestToken: …, HandlerErrorCode: GeneralServiceException)`). Every type this
+    // emulator provisions over this signing name is that service's
+    // (`crate::state::provisioner`'s pipeline, custom-action-type and webhook arms).
+    ("codepipeline", "CodePipeline", SdkDiagnostic::Attempts),
     // Amazon EC2's SDK names it by that model's own `sdkId` (`EC2`,
     // `smithy_query(query="service_info")` on that service's model) written as one word with a
     // capital initial, exactly as Amazon RDS's below is, and words the diagnostic with the
@@ -420,7 +433,11 @@ pub(super) const SERVER_ERROR_STATUS: u16 = 500;
 
 /// The class an answer that named no error at all falls in when its status says the owning
 /// service failed rather than that the request was wrong.
-pub(super) const HANDLER_ERROR_SERVICE_FAILED: &str = "GeneralServiceException";
+///
+/// Read by [`crate::state::provisioner::Provisioner::handler_error_class`] too: it is the
+/// class a provider that maps none of the owning service's own error codes reports a refusal
+/// under, whatever the code itself reads like.
+pub(crate) const HANDLER_ERROR_SERVICE_FAILED: &str = "GeneralServiceException";
 
 /// The `HandlerErrorCode` an owning service's refusal is reported under — see
 /// [`HANDLER_ERROR_CLASSES`].

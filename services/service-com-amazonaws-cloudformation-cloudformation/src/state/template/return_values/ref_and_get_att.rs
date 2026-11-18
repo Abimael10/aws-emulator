@@ -68,6 +68,33 @@ pub(crate) fn return_values(
             );
             (name.to_string(), attributes)
         }
+        // "Ref returns the pipeline name"; Fn::GetAtt: Arn, Version. This is the type
+        // `super::provisioning` creates in CodePipeline itself, which keys a pipeline by
+        // that name — so the ARN computed here is the one that service mints
+        // (`pipeline_arn` in its own state module): the bare pipeline name as the ARN's
+        // resource path, under the one account id this emulator mints. The VERSION is
+        // CodePipeline's to allocate, so what this gives the resource is the version a
+        // created pipeline carries ([`CODEPIPELINE_FIRST_PIPELINE_VERSION`]) and the create
+        // reports the version that service really answered.
+        CODEPIPELINE_PIPELINE => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(CODEPIPELINE_ARN_NAMESPACE, region, name),
+            );
+            attributes.insert(
+                "Version".to_string(),
+                CODEPIPELINE_FIRST_PIPELINE_VERSION.to_string(),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the webhook name"; Fn::GetAtt: Url. The URL is the one CodePipeline
+        // generates for the webhook, carrying a token minted in that service's own store, so
+        // it stands in until `PutWebhook` has reported it and
+        // `super::super::provisioning` re-points it at what that service answered.
+        CODEPIPELINE_WEBHOOK => {
+            attributes.insert("Url".to_string(), service_assigned_document(name, "Url"));
+            (name.to_string(), attributes)
+        }
         // "Ref returns the topic ARN"; Fn::GetAtt: TopicArn, TopicName. This is the type
         // `super::provisioning` creates in Amazon SNS itself, which then answers with the
         // topic's own ARN — the same ARN this computes, since both are built from the one

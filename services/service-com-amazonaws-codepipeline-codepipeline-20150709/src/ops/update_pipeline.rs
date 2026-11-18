@@ -168,10 +168,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same role rule a create is held to: `PipelineDeclaration$roleArn` is the
         // role CodePipeline assumes to run the pipeline's actions, so an update that
-        // names a role IAM positively reports absent would leave a stored pipeline that
-        // cannot run. Only a definitive "no such role" refuses it (see
-        // `state::role_is_absent`).
-        let role_absent = crate::state::role_is_absent(ctx, &input.pipeline.role_arn).await;
+        // names a role this service cannot assume — one IAM reports absent, or one whose
+        // trust policy withholds the assume from this service's own principal — would
+        // leave a stored pipeline that cannot run. Nothing else refuses it (see
+        // `state::role_is_unassumable`).
+        let role_unassumable = crate::state::role_is_unassumable(ctx, &input.pipeline.role_arn).await;
 
         let name = input.pipeline.name.clone();
         let mut state = state.lock();
@@ -193,12 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The same structural rules a create is held to: the declaration the caller
         // sends is the FULL structure of the pipeline, so a structure that cannot
         // describe a pipeline is refused with the error shape modelling that defect.
-        if role_absent {
+        if role_unassumable {
             return Err(UpdatePipelineErrorModeled::InvalidStructureException(
                 InvalidStructureException {
-                    message: Some(format!(
-                        "CodePipeline is not authorized to perform AssumeRole on role {}",
-                        input.pipeline.role_arn
+                    message: Some(crate::state::role_not_assumable_message(
+                        &input.pipeline.role_arn,
                     )),
                 },
             )

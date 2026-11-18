@@ -158,6 +158,10 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         KINESIS_STREAM => &["Arn"],
         ECR_REPOSITORY => &["Arn", "RepositoryUri"],
         ECS_CLUSTER => &["Arn"],
+        // A pipeline publishes the ARN CodePipeline keys it by and the VERSION that service
+        // allocates for it; a webhook the URL that service generates for it.
+        CODEPIPELINE_PIPELINE => &["Arn", "Version"],
+        CODEPIPELINE_WEBHOOK => &["Url"],
         EKS_CLUSTER => &[
             "Arn",
             "CertificateAuthorityData",
@@ -1011,7 +1015,11 @@ pub(super) const COMPOSITE_IDENTITY_SEPARATOR: &str = "|";
 /// `GetTableOptimizer` and `DeleteTableOptimizer` each take to address one optimizer, and the
 /// type declares no name of its own. An `AWS::S3Tables::Namespace` is
 /// `<TableBucketARN>|<Namespace>` for that reason too: `GetNamespace` and `DeleteNamespace`
-/// bind both as the labels of `/namespaces/{tableBucketARN}/{namespace}`.
+/// bind both as the labels of `/namespaces/{tableBucketARN}/{namespace}`. An
+/// `AWS::CodePipeline::CustomActionType` is `<Category>|<Provider>|<Version>`, the triple
+/// `DeleteCustomActionType` addresses a registration by and the one `ListActionTypes` reports
+/// each custom action type under, the type declaring no name of its own
+/// ([`CODEPIPELINE_CUSTOM_ACTION_TYPE`]).
 ///
 /// Because the identity IS the pair, a declaration that re-points either side of it names a
 /// DIFFERENT resource: the deployment replaces the one the stack has
@@ -1034,6 +1042,7 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
         COGNITO_IDENTITY_POOL_PRINCIPAL_TAG => &["IdentityPoolId", "IdentityProviderName"],
         ACMPCA_PERMISSION => &["CertificateAuthorityArn", "Principal"],
         GLUE_TABLE_OPTIMIZER => &["CatalogId", "DatabaseName", "TableName", "Type"],
+        CODEPIPELINE_CUSTOM_ACTION_TYPE => CODEPIPELINE_ACTION_TYPE_IDENTITY,
         S3TABLES_NAMESPACE => S3TABLES_NAMESPACE_IDENTITY,
         AMPLIFYUIBUILDER_COMPONENT | AMPLIFYUIBUILDER_FORM | AMPLIFYUIBUILDER_THEME => {
             AMPLIFYUIBUILDER_ATTRIBUTES

@@ -2932,8 +2932,8 @@ enum Characters {
 /// questions are independent — a type can have published return values this module knows
 /// and no owning service mounted here (`AWS::Transfer::Workflow`), or an owning service that
 /// creates it and no published return value beyond its name
-/// (`AWS::CodePipeline::Pipeline`, whose `Ref` is the pipeline name, which is the default
-/// this module already gives every type).
+/// (`AWS::Glue::Job`, whose `Ref` is the job name, which is the default this module already
+/// gives every type).
 pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     ACMPCA_CERTIFICATE,
     ACMPCA_CERTIFICATE_AUTHORITY,
@@ -2984,6 +2984,10 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     CODEARTIFACT_REPOSITORY,
     CODEBUILD_PROJECT,
     CODEBUILD_REPORT_GROUP,
+    // The CodePipeline pipeline, publishing the ARN that service keys it by and the version
+    // it allocates, and the WEBHOOK, publishing the trigger URL it generates.
+    CODEPIPELINE_PIPELINE,
+    CODEPIPELINE_WEBHOOK,
     COGNITO_USER_POOL,
     // The Amazon Connect Customer Profiles domain, publishing the read-only values that
     // service reports for it.

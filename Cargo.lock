@@ -12148,7 +12148,6 @@ dependencies = [
  "aws-sdk-codecommit",
  "aws-sdk-ecr",
  "aws-sdk-eventbridge",
- "aws-sdk-iam",
  "aws-sdk-kms",
  "aws-sdk-lambda",
  "aws-sdk-s3",

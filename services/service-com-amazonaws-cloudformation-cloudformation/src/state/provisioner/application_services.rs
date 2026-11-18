@@ -517,6 +517,11 @@ pub(super) async fn describe_iam_access_key(
 pub(super) const CODEPIPELINE_SIGNING_NAME: &str = "codepipeline";
 pub(super) const CODEPIPELINE_TARGET_PREFIX: &str = "CodePipeline_20150709";
 
+/// The error code CodePipeline answers for a declaration it will not run a pipeline from —
+/// among them one naming a service role it cannot assume, which is the refusal a stack's own
+/// event reports ([`super::Provisioner::handler_error_class`]).
+pub(super) const CODEPIPELINE_INVALID_STRUCTURE: &str = "InvalidStructureException";
+
 /// The error code CodePipeline answers when a pipeline of that name already exists, which
 /// is the resource this deployment wanted.
 pub(super) const PIPELINE_NAME_IN_USE: &str = "PipelineNameInUseException";
@@ -602,11 +607,43 @@ pub(super) async fn create_pipeline(
     )
     .await
     {
-        Ok(_) => Ok(Created::default()),
-        Err(refusal) if refusal.code == PIPELINE_NAME_IN_USE => Ok(Created::default()),
+        Ok(answer) => Ok(Created::attributes(pipeline_version(&reported_member(
+            &answer, "pipeline",
+        )))),
+        // CodePipeline already holds a pipeline of that name, which is the resource this
+        // deployment wanted: the version it publishes is read back from that service, since
+        // this call got no declaration of its own to read it off.
+        Err(refusal) if refusal.code == PIPELINE_NAME_IN_USE => {
+            let held = describe_pipeline(ctx, region, &resource.physical_resource_id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| Value::Object(Map::new()));
+            Ok(Created::attributes(pipeline_version(&held)))
+        }
         Err(refusal) => Err(refusal),
     }
 }
+
+/// The `Version` attribute a pipeline publishes, read off the declaration CodePipeline
+/// answered with.
+///
+/// "The version number of the pipeline. A new pipeline always has a version number of 1.
+/// This number is incremented when a pipeline is updated" (`PipelineDeclaration$version`),
+/// so the version is that service's to allocate and never a number computed here: this is
+/// what re-points the stand-in the return-value catalogue gave the resource
+/// (`super::super::template::CODEPIPELINE_FIRST_PIPELINE_VERSION`) at the version the
+/// pipeline really carries.
+///
+/// An answer carrying no version leaves the attribute as the catalogue computed it, rather
+/// than publishing an empty value for it ([`reported_attributes`]).
+fn pipeline_version(declaration: &Value) -> BTreeMap<String, String> {
+    reported_attributes(declaration, &[(PIPELINE_VERSION_ATTRIBUTE, "version")])
+}
+
+/// The `Fn::GetAtt` attribute an `AWS::CodePipeline::Pipeline` publishes its version under,
+/// as the type's "Return values" section spells it.
+const PIPELINE_VERSION_ATTRIBUTE: &str = "Version";
 
 /// Every value an action's declaration states for a member CodePipeline models as TEXT, as
 /// that text.
@@ -699,10 +736,6 @@ pub(super) async fn describe_pipeline(
 /// The `ActionOwner` of every action type `CreateCustomActionType` registers ("used for
 /// custom actions only"), which is also the owner a poll for one of their jobs names.
 pub(super) const CODEPIPELINE_OWNER_CUSTOM: &str = "Custom";
-
-/// The three properties that IDENTIFY an `AWS::CodePipeline::CustomActionType`, which are
-/// the three members `DeleteCustomActionType` addresses a registration by.
-pub(super) const CODEPIPELINE_ACTION_TYPE_IDENTITY: &[&str] = &["Category", "Provider", "Version"];
 
 /// Register the custom action type an `AWS::CodePipeline::CustomActionType` declares — so
 /// a job worker that polls for the action type the stack declared is SERVED, and the
@@ -900,6 +933,48 @@ pub(super) fn camel_cased(value: &Value, depth: usize) -> Result<Value, Refusal>
             Ok(Value::Array(converted))
         }
         scalar => Ok(scalar.clone()),
+    }
+}
+
+/// The same document with every object KEY's initial letter UPPER-cased: the INVERSE of
+/// [`camel_cased`], which turns the members an owning service's answer carries back into the
+/// property names the resource type spells them with (`jsonPath` -> `JsonPath`).
+///
+/// Here beside the forward direction so the pair stays in one place: a drift read that
+/// compares a declared composite property against the document that service answered has to
+/// undo exactly what the create's re-casing did. Bounded by [`MAX_PROPERTY_NESTING`] for the
+/// reason the forward walk is — the document is a caller-sized one.
+pub(super) fn upper_initialled(value: &Value, depth: usize) -> Result<Value, Refusal> {
+    if depth >= MAX_PROPERTY_NESTING {
+        return Err(too_deeply_nested());
+    }
+    match value {
+        Value::Object(members) => {
+            let mut converted = Map::new();
+            for (key, member) in members {
+                converted.insert(upper_initial(key), upper_initialled(member, depth + 1)?);
+            }
+            Ok(Value::Object(converted))
+        }
+        Value::Array(items) => {
+            let mut converted = Vec::with_capacity(items.len());
+            for item in items {
+                converted.push(upper_initialled(item, depth + 1)?);
+            }
+            Ok(Value::Array(converted))
+        }
+        scalar => Ok(scalar.clone()),
+    }
+}
+
+/// One name with its FIRST character upper-cased and nothing else touched, the inverse of
+/// [`lower_initial`] — so a member whose name carries an initialism keeps its case
+/// (`allowedIPRange` -> `AllowedIPRange`).
+pub(super) fn upper_initial(name: &str) -> String {
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
     }
 }
 

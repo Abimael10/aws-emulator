@@ -168,22 +168,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `PipelineDeclaration$roleArn` is "the Amazon Resource Name (ARN) for
         // CodePipeline to use to either perform actions with no actionRoleArn, or to use
-        // to assume roles for actions with an actionRoleArn" — a role that cannot be
-        // assumed makes the pipeline unable to run any action, which is what
-        // `InvalidStructureException` reports. The role is looked up in IAM through the
-        // framework's in-process callback; only a definitive "no such role" refuses the
-        // create, so an emulator without IAM mounted still accepts the declaration
-        // rather than refusing on an unanswered question.
+        // to assume roles for actions with an actionRoleArn" — a role this service cannot
+        // ASSUME makes the pipeline unable to run any action, which is what
+        // `InvalidStructureException` reports. The question is put to IAM through the
+        // framework's in-process callback: a role it reports absent and a role whose trust
+        // policy does not let this service's own principal assume it are both answers
+        // (`crate::state::role_is_unassumable`), and nothing else refuses the create, so an
+        // emulator without IAM mounted still accepts the declaration rather than refusing
+        // on an unanswered question.
         //
         // It is resolved BEFORE the declaration is walked: the service settles whether it
         // could run this pipeline's actions at all before it judges what those actions
         // are, so a declaration that is also malformed is refused for the role.
-        if crate::state::role_is_absent(ctx, &input.pipeline.role_arn).await {
+        if crate::state::role_is_unassumable(ctx, &input.pipeline.role_arn).await {
             return Err(CreatePipelineErrorModeled::InvalidStructureException(
                 InvalidStructureException {
-                    message: Some(format!(
-                        "CodePipeline is not authorized to perform AssumeRole on role {}",
-                        input.pipeline.role_arn
+                    message: Some(crate::state::role_not_assumable_message(
+                        &input.pipeline.role_arn,
                     )),
                 },
             )
