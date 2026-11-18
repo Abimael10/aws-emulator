@@ -56,3 +56,12 @@ Cause 1: CreateFramework with a control, PutRule {"source":["aws.backup"],"detai
 Cause 2: CreateBackupVault, PutBackupVaultNotifications for the vault events, PutRule scoped to one detail-type + SQS target, run a job against the vault, ReceiveMessage.
 Cause 3: create a backup plan (via CloudFormation and via CLI), PutRule {"source":["aws.backup"],"detail-type":["Backup Job State Change"]}, target an SNS topic subscribed by a queue (and in the second case the queue directly), StartBackupJob and wait for COMPLETED, ReceiveMessage.
 Cause 4: PutRule with a target whose InputTransformer supplies the vault name to a state machine whose Task is arn:aws:states:::aws-sdk:backup:startBackupJob, PutEvents the matching event, DescribeExecution.
+
+## Resolution
+
+All five recorded checks pass, and each of the four causes is served by the event-publication paths and the Task AWS-SDK dispatch now in the tree. Two things about this report's prose are worth recording, because they are claims the recording does not support:
+
+- Cause 1 names "a framework compliance change" detail-type. The check it cites asserts `detail-type` `Backup Plan State Change` with `detail.state` `MODIFIED`, which is what a plan's own mutation publishes (`services/service-com-amazonaws-backup-cryocontrollerusermanager/src/state/plan_events.rs`). No framework-compliance detail-type is published, and the recording asks for none: a framework's create and update publish nothing at all.
+- Cause 2 names `PutBackupVaultNotifications`. What the check waits for is a detail-type-scoped delivery of the moves AWS Backup publishes for the records in that vault, which arrives without any notification configuration. The three vault-notification operations themselves (`PutBackupVaultNotifications`, `GetBackupVaultNotifications`, `DeleteBackupVaultNotifications`) are STILL unimplemented scaffold stubs answering HTTP 501, tracked by their own report with its own recorded unit: `20261029T175130Z-backup-putbackupvaultnotifications-stub.md` (unit `backup.backup-vault-notifications-lifecycle`). That part of this report is not resolved here.
+
+Pinned by `core/router/tests/all/backup_job_events_are_scoped_by_detail_type.rs` (which detail-type clause admits which kind of record) and `core/router/tests/all/backup_event_rule_target_runs_its_backup_task.rs` (a rule's state-machine target started with the document its input member renders, running the `aws-sdk:backup:startBackupJob` task to a real stored job).
