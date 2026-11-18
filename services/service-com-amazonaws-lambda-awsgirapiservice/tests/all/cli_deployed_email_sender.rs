@@ -24,10 +24,14 @@
 //!
 //! What the sibling suites pin, and this one does not repeat: `handler_email_sdk.rs` drives
 //! the table of BINDING CLASSES a handler's SES v2 calls take (a body-only create, a read by
-//! path label, a list, a read with no input), and `handler_sdk_service_inventory.rs` pins
-//! which services a handler's bundled SDK can build a client for at all. What this suite adds
-//! is the CLI-shaped deploy path around one of those calls: a role IAM holds, a packaged
-//! upload, the wait for `Active`, and an invocation that answers terminally either way.
+//! path label, a list, a read with no input), `handler_sdk_service_inventory.rs` pins which
+//! services a handler's bundled SDK can build a client for at all, and
+//! `cli_deployed_sender_outcome_classes.rs` drives the table of OUTCOME CLASSES one such
+//! invocation settles on. What this suite adds is the CLI-shaped deploy path around one of
+//! those calls: a role IAM holds, a packaged upload, the wait for `Active`, and an invocation
+//! that answers terminally either way. The deploy path's steps are this module's own
+//! ([`given_execution_role`], [`given_active_function`], [`given_verified_identity`],
+//! [`invoke`]), so the sibling suite drives the same steps rather than a second copy of them.
 //!
 //! The suite RUNS handlers, so it takes the target's one invocation stream
 //! ([`crate::invoke_request_id::one_invocation_stream_at_a_time`]): this emulator serves at
@@ -63,7 +67,8 @@ const HANDLER: &str = "index.handler";
 /// The managed runtime the function runs.
 const RUNTIME: &str = "python3.12";
 
-/// The execution role the function runs as, and the name of its one inline policy.
+/// The execution role the function runs as, and the name of the one inline policy every role
+/// this deploy path writes carries its statements in.
 const ROLE_NAME: &str = "cli-deployed-email-sender";
 const INLINE_POLICY: &str = "send-email";
 
@@ -91,7 +96,7 @@ const STRANGER: &str = "nobody@unverified.example.org";
 
 /// The recipient every row addresses: the mailbox of the SES simulator that accepts a message
 /// and reports it delivered.
-const RECIPIENT: &str = "success@simulator.amazonses.com";
+pub(crate) const RECIPIENT: &str = "success@simulator.amazonses.com";
 
 /// The error code SES refuses a send from an identity it has not verified with, and the
 /// status its model binds that error to
@@ -100,7 +105,7 @@ const MESSAGE_REJECTED: &str = "MessageRejected";
 const MESSAGE_REJECTED_STATUS: i64 = 400;
 
 /// The status SES v2's model binds `SendEmail`'s success to.
-const SEND_EMAIL_SUCCESS_STATUS: i64 = 200;
+pub(crate) const SEND_EMAIL_SUCCESS_STATUS: i64 = 200;
 
 /// The message a send from an identity the account has not verified is refused with, as the
 /// email service words it: its fixed text, the Region the check ran in upper-cased, and the
@@ -146,7 +151,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// `core/router/src/lib.rs` mounts them: the handler's SDK call is dispatched back into this
 /// same router as the session of its own execution role, and the identities this suite
 /// verifies are the identities that session's send is checked against.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite signs nothing: the `Authorization` header carries only the credential scope,
@@ -227,7 +232,7 @@ async fn lambda(
 }
 
 /// One SES v2 call made as a CLIENT makes it, which must be served.
-async fn email(
+pub(crate) async fn email(
     router: &MultiServiceRouter,
     what: &str,
     method: &str,
@@ -322,7 +327,7 @@ fn rows() -> Vec<Row> {
 ///
 /// The transition is owed by the CLOCK, so this looks again until the condition holds instead
 /// of sleeping for a fixed span.
-async fn given_verified_identity(router: &MultiServiceRouter, identity: &str) {
+pub(crate) async fn given_verified_identity(router: &MultiServiceRouter, identity: &str) {
     let what = format!("the identity {identity}");
     email(
         router,
@@ -357,10 +362,14 @@ async fn given_verified_identity(router: &MultiServiceRouter, identity: &str) {
     }
 }
 
-/// Create the execution role with IAM's own operations and answer the ARN IAM persisted: a
-/// role Lambda may assume, allowed the send the handler makes and the log writes a function
-/// makes, and nothing else.
-async fn given_execution_role(router: &MultiServiceRouter) -> String {
+/// Create the execution role `role_name` with IAM's own operations, carrying `statements` as
+/// its one inline document, and answer the ARN IAM persisted: a role Lambda may assume, which
+/// may do what those statements allow and nothing else.
+pub(crate) async fn given_execution_role(
+    router: &MultiServiceRouter,
+    role_name: &str,
+    statements: Value,
+) -> String {
     let trust = json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -374,7 +383,7 @@ async fn given_execution_role(router: &MultiServiceRouter) -> String {
         router,
         "CreateRole",
         &[
-            ("RoleName", ROLE_NAME),
+            ("RoleName", role_name),
             ("AssumeRolePolicyDocument", &trust),
         ],
     )
@@ -385,14 +394,14 @@ async fn given_execution_role(router: &MultiServiceRouter) -> String {
     );
     let document = json!({
         "Version": "2012-10-17",
-        "Statement": [logs_only(), allow("ses", &["SendEmail"], "*")],
+        "Statement": statements,
     })
     .to_string();
     let (status, written) = iam(
         router,
         "PutRolePolicy",
         &[
-            ("RoleName", ROLE_NAME),
+            ("RoleName", role_name),
             ("PolicyName", INLINE_POLICY),
             ("PolicyDocument", &document),
         ],
@@ -405,23 +414,29 @@ async fn given_execution_role(router: &MultiServiceRouter) -> String {
     element(&created, "Arn")
 }
 
-/// Create the function from a packaged upload and read its own state back until it reports
-/// `Active`, which is what a command-line client's function-active wait does.
-async fn given_active_function(router: &MultiServiceRouter, role_arn: &str) {
+/// Create the function `function` from a packaged upload of `source` and read its own state
+/// back until it reports `Active`, which is what a command-line client's function-active wait
+/// does.
+pub(crate) async fn given_active_function(
+    router: &MultiServiceRouter,
+    function: &str,
+    source: &str,
+    role_arn: &str,
+) {
     let (status, _headers, created) = lambda(
         router,
         "POST",
         FUNCTIONS_URI,
         &[],
         &serde_json::to_vec(&json!({
-            "FunctionName": FUNCTION,
+            "FunctionName": function,
             "Role": role_arn,
             "Runtime": RUNTIME,
             "Handler": HANDLER,
             "Timeout": FUNCTION_TIMEOUT_SECONDS,
             "Code": {
                 "ZipFile": base64::engine::general_purpose::STANDARD
-                    .encode(package(&[(SOURCE_FILE, HANDLER_SOURCE)])),
+                    .encode(package(&[(SOURCE_FILE, source)])),
             },
         }))
         .expect("the create body serializes"),
@@ -439,7 +454,7 @@ async fn given_active_function(router: &MultiServiceRouter, role_arn: &str) {
         let (status, _headers, configuration) = lambda(
             router,
             "GET",
-            &format!("{FUNCTIONS_URI}/{FUNCTION}/configuration"),
+            &format!("{FUNCTIONS_URI}/{function}/configuration"),
             &[],
             &[],
         )
@@ -469,9 +484,10 @@ async fn given_active_function(router: &MultiServiceRouter, role_arn: &str) {
 /// filed about does with its own invoke-until-answered loop. Every other answer, including a
 /// handler's own unhandled exception and a run that outlived the function's `Timeout`, is
 /// returned to the caller as it came.
-async fn invoke(
+pub(crate) async fn invoke(
     router: &MultiServiceRouter,
     case: &str,
+    function: &str,
     event: &Value,
 ) -> (Option<String>, Value) {
     let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
@@ -479,7 +495,7 @@ async fn invoke(
         let (status, headers, payload) = lambda(
             router,
             "POST",
-            &format!("{FUNCTIONS_URI}/{FUNCTION}/invocations"),
+            &format!("{FUNCTIONS_URI}/{function}/invocations"),
             &[("x-amz-invocation-type", "RequestResponse")],
             event.to_string().as_bytes(),
         )
@@ -513,7 +529,12 @@ async fn a_cli_deployed_function_sends_through_its_own_sdk_and_every_invocation_
     let _stream = one_invocation_stream_at_a_time().await;
     let router = emulator();
 
-    let role_arn = given_execution_role(&router).await;
+    let role_arn = given_execution_role(
+        &router,
+        ROLE_NAME,
+        json!([logs_only(), allow("ses", &["SendEmail"], "*")]),
+    )
+    .await;
     assert_eq!(
         role_arn,
         format!(
@@ -525,7 +546,7 @@ async fn a_cli_deployed_function_sends_through_its_own_sdk_and_every_invocation_
     );
     given_verified_identity(&router, ADDRESS_IDENTITY).await;
     given_verified_identity(&router, SENDING_DOMAIN).await;
-    given_active_function(&router, &role_arn).await;
+    given_active_function(&router, FUNCTION, HANDLER_SOURCE, &role_arn).await;
 
     let mut minted: Vec<String> = Vec::new();
     for row in rows() {
@@ -535,6 +556,7 @@ async fn a_cli_deployed_function_sends_through_its_own_sdk_and_every_invocation_
         let (signal, payload) = invoke(
             &router,
             case,
+            FUNCTION,
             &json!({
                 "from": row.from,
                 "to": RECIPIENT,
