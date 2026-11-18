@@ -25,13 +25,30 @@
 //! exactly the modelled maximum, one byte past it) and the payload's bytes (text and
 //! non-UTF-8).
 //!
+//! What the served `200` CARRIES for a live connection is the second rule here:
+//!
+//! > The report of a connection open on this socket is that connection's OWN record, read
+//! > back and nothing else: `identity.sourceIp` the address its client dialled from,
+//! > `identity.userAgent` the `User-Agent` field its opening handshake named itself with — and
+//! > NO `userAgent` member at all for a handshake that named none — `connectedAt` the instant
+//! > that handshake established it and `lastActiveAt` never before that instant. Activity is
+//! > what moves `lastActiveAt`: a payload delivered over the connection advances it, and
+//! > REPORTING the connection advances nothing, so two reports with no traffic between them
+//! > answer identically.
+//!
+//! Those rows differ along whether the handshake named a user agent at all and along the FORM
+//! of the field it named itself with, and the activity case drives the two directions
+//! separately: reads, then a delivered push.
+//!
 //! The handshake itself, the frames a client exchanges and the `$connect`/`$disconnect`
 //! routes are `websocket_transport_data_plane`'s and `websocket_connect_backend`'s; this
 //! suite drives the socket's OTHER half.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use aws_smithy_types::date_time::Format;
+use aws_smithy_types::DateTime;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -39,6 +56,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::api_lifecycle::{as_str, call};
+use crate::path_label::addressed;
 use crate::websocket_transport_data_plane::{dial_loopback, handshake_at, ClientSocket};
 
 /// How long a case waits for one frame before failing: generous for a loaded test machine —
@@ -648,4 +666,274 @@ async fn another_apis_live_connection_is_gone_on_this_apis_socket() {
             );
         }
     }
+}
+
+/// The `Sec-WebSocket-Key` the handshakes below offer: the 16-byte nonce RFC 6455 §1.3 writes
+/// its own example with. The client library derives nothing from it but the accept value it
+/// checks, so one value serves every case.
+const CLIENT_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+
+/// The status a completed opening handshake is answered with (RFC 6455 §4.1).
+const SWITCHING_PROTOCOLS: u16 = 101;
+
+/// The message the `$default` route answers with the connection's own id, which is how a
+/// client learns the id its `@connections` calls address.
+const WHOAMI: &str = r#"{"action":"whoami"}"#;
+
+/// How long the activity case keeps pushing before it gives up on `lastActiveAt` moving:
+/// generous, because what it waits for is the host clock reading a later instant than the one
+/// already stored, and a loaded machine schedules each push late. The wait is for that
+/// CONDITION — the reported instant having moved — and nothing asserts on elapsed time.
+const ADVANCE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Open a connection on the api's socket whose opening handshake names `user_agent` — or names
+/// none at all — and answer the socket and the `ConnectionId` the handshake minted.
+///
+/// The RFC 6455 §4.1 fields are written field by field rather than left to the client library,
+/// because the field these rows differ along is one that library sends nothing for: a
+/// `User-Agent` is the client's own, and a handshake that names none has to carry none.
+async fn open_connection_naming(
+    case: &str,
+    authority: &str,
+    user_agent: Option<&str>,
+) -> (ClientSocket, String) {
+    let stream = dial_loopback(case, authority)
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: the socket must accept a connection: {error}"));
+    let mut builder = http::Request::builder()
+        .uri(format!("ws://{authority}/{STAGE}"))
+        .header("host", authority)
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", CLIENT_KEY);
+    if let Some(user_agent) = user_agent {
+        builder = builder.header("user-agent", user_agent);
+    }
+    let request = builder
+        .body(())
+        .unwrap_or_else(|error| panic!("case {case:?}: the handshake request must build: {error}"));
+    let (mut socket, response) = tokio_tungstenite::client_async(request, stream)
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: the handshake must complete: {error}"));
+    assert_eq!(
+        response.status().as_u16(),
+        SWITCHING_PROTOCOLS,
+        "case {case:?}: a completed handshake must answer 101"
+    );
+    let connection_id = exchange_text(case, &mut socket, WHOAMI).await;
+    assert!(
+        !connection_id.is_empty(),
+        "case {case:?}: the connection must have an id"
+    );
+    (socket, connection_id)
+}
+
+/// What one `GetConnection` report states about a live connection.
+#[derive(Debug)]
+struct Reported {
+    /// `connectedAt`, as the (seconds, nanoseconds) pair its rendering decodes to, so two
+    /// reports are comparable whatever subsecond digits each carried.
+    connected_at: (i64, u32),
+    /// `lastActiveAt`, read the same way.
+    last_active_at: (i64, u32),
+    /// The `identity` object as it arrived, or `Value::Null` for a report carrying none.
+    identity: Value,
+}
+
+/// Read one connection's report off the api's OWN socket, as a backend's client reads it.
+async fn reported(case: &str, authority: &str, connection_id: &str) -> Reported {
+    let answer = connections_call(case, authority, "GET", &addressed(connection_id), b"").await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: GetConnection must answer 200, got {} {:?}",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    let value: Value = serde_json::from_slice(&answer.body)
+        .unwrap_or_else(|error| panic!("case {case:?}: the report must be JSON: {error}"));
+    Reported {
+        connected_at: instant_of(case, &value, "connectedAt"),
+        last_active_at: instant_of(case, &value, "lastActiveAt"),
+        identity: value.get("identity").cloned().unwrap_or(Value::Null),
+    }
+}
+
+/// The instant `member` states, parsed the way a client's own reader parses a modelled
+/// `date-time`.
+fn instant_of(case: &str, report: &Value, member: &str) -> (i64, u32) {
+    let text = report
+        .get(member)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: the report must state {member}, got {report}"));
+    let parsed = DateTime::from_str(text, Format::DateTime).unwrap_or_else(|error| {
+        panic!("case {case:?}: {member} must be an ISO 8601 date-time, got {text:?}: {error}")
+    });
+    (parsed.secs(), parsed.subsec_nanos())
+}
+
+/// A live connection's report is its OWN handshake's record: the address its client dialled
+/// from, the `User-Agent` that handshake named itself with — and no `userAgent` member at all
+/// when it named none — and an activity instant that is never before the instant the
+/// connection was established.
+#[tokio::test]
+async fn a_live_connections_report_states_its_own_handshakes_identity() {
+    // (case, the `User-Agent` the handshake carries, the `userAgent` the report must state)
+    //
+    // The rows differ along what the rule generalises over: whether the handshake named a user
+    // agent at all, and the FORM of the field it named itself with — a client library's token
+    // and version, a browser-shaped field carrying spaces and parentheses, a command-line
+    // client's, and the EMPTY field, which a client that sent one is reported as having sent
+    // rather than as having sent nothing.
+    let rows: [(&str, Option<&str>, Option<&str>); 5] = [
+        (
+            "a client library naming itself with a version",
+            Some("wscat/5.2.0"),
+            Some("wscat/5.2.0"),
+        ),
+        (
+            "a browser-shaped field with spaces and parentheses",
+            Some("Mozilla/5.0 (compatible; emulator probe)"),
+            Some("Mozilla/5.0 (compatible; emulator probe)"),
+        ),
+        (
+            "a command-line client",
+            Some("curl/8.5.0"),
+            Some("curl/8.5.0"),
+        ),
+        ("an empty field", Some(""), Some("")),
+        ("a handshake naming no user agent at all", None, None),
+    ];
+
+    let emulator = emulator_with_connections();
+    let api = deploy(&emulator, "the identity table", "identity-api").await;
+    // The address every client below dials, which is what a report's `sourceIp` states: read
+    // off the announced socket rather than spelled out here.
+    let (dialled, _port) = api.authority.rsplit_once(':').unwrap_or_else(|| {
+        panic!(
+            "setup: the announced socket must be a host:port, got {:?}",
+            api.authority
+        )
+    });
+
+    for (case, named, expected) in rows {
+        // Held for the whole case: the report is of a connection that is still open.
+        let (_socket, connection_id) = open_connection_naming(case, &api.authority, named).await;
+        let stated = reported(case, &api.authority, &connection_id).await;
+
+        let source_ip = stated.identity.get("sourceIp").and_then(Value::as_str);
+        assert_eq!(
+            source_ip,
+            Some(dialled),
+            "case {case:?}: expected identity.sourceIp {dialled:?}, got {source_ip:?} in {}",
+            stated.identity
+        );
+        let user_agent = stated.identity.get("userAgent").and_then(Value::as_str);
+        assert_eq!(
+            user_agent, expected,
+            "case {case:?}: expected identity.userAgent {expected:?}, got {user_agent:?} in {}",
+            stated.identity
+        );
+        assert_eq!(
+            stated.identity.get("userAgent").is_some(),
+            expected.is_some(),
+            "case {case:?}: expected the userAgent member present={}, got the identity {}",
+            expected.is_some(),
+            stated.identity
+        );
+        assert!(
+            stated.last_active_at >= stated.connected_at,
+            "case {case:?}: lastActiveAt {:?} must not be before connectedAt {:?}",
+            stated.last_active_at,
+            stated.connected_at
+        );
+    }
+}
+
+/// A REPORT leaves the connection exactly as the next caller finds it, and a DELIVERY is what
+/// moves its activity: reading a connection never advances `lastActiveAt`, a payload delivered
+/// over it does, and neither ever moves `connectedAt`.
+#[tokio::test]
+async fn a_report_leaves_last_active_at_where_a_delivery_moves_it() {
+    let case = "the activity a live connection reports";
+    let emulator = emulator_with_connections();
+    let api = deploy(&emulator, case, "activity-api").await;
+    let (mut socket, connection_id) =
+        open_connection_naming(case, &api.authority, Some("activity/1")).await;
+
+    let baseline = reported(case, &api.authority, &connection_id).await;
+    assert!(
+        baseline.last_active_at >= baseline.connected_at,
+        "case {case:?}: lastActiveAt {:?} must not be before connectedAt {:?}",
+        baseline.last_active_at,
+        baseline.connected_at
+    );
+
+    // Reading it again changes nothing a later caller sees.
+    for pass in ["the second read", "the third read"] {
+        let again = reported(case, &api.authority, &connection_id).await;
+        assert_eq!(
+            again.connected_at, baseline.connected_at,
+            "case {case:?}: {pass} must state the same connectedAt, got {:?} after {:?}",
+            again.connected_at, baseline.connected_at
+        );
+        assert_eq!(
+            again.last_active_at, baseline.last_active_at,
+            "case {case:?}: {pass} must leave lastActiveAt where it was, got {:?} after {:?}",
+            again.last_active_at, baseline.last_active_at
+        );
+    }
+
+    // A payload delivered over the connection is what moves it. The push is repeated until the
+    // reported instant HAS moved, because how many pushes that takes is the host clock's
+    // resolution to decide, not the emulator's: the loop waits for the condition and gives up
+    // only at [`ADVANCE_DEADLINE`].
+    let deadline = Instant::now() + ADVANCE_DEADLINE;
+    let mut advanced: Option<(i64, u32)> = None;
+    while advanced.is_none() && Instant::now() < deadline {
+        let answer =
+            connections_call(case, &api.authority, "POST", &addressed(&connection_id), b"tick")
+                .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: PostToConnection must answer 200, got {} {:?}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        match next_frame(case, &mut socket).await {
+            Message::Text(text) => assert_eq!(
+                text.as_str(),
+                "tick",
+                "case {case:?}: expected the delivered payload, got {:?}",
+                text.as_str()
+            ),
+            other => panic!("case {case:?}: expected a text frame, got {other:?}"),
+        }
+        let after = reported(case, &api.authority, &connection_id).await;
+        assert_eq!(
+            after.connected_at, baseline.connected_at,
+            "case {case:?}: a delivery must not move connectedAt, got {:?} after {:?}",
+            after.connected_at, baseline.connected_at
+        );
+        assert!(
+            after.last_active_at >= baseline.last_active_at,
+            "case {case:?}: lastActiveAt must never go backwards, got {:?} after {:?}",
+            after.last_active_at,
+            baseline.last_active_at
+        );
+        if after.last_active_at > baseline.last_active_at {
+            advanced = Some(after.last_active_at);
+        }
+    }
+    let advanced = advanced.unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: a delivered payload must advance lastActiveAt past {:?}",
+            baseline.last_active_at
+        )
+    });
+    assert!(
+        advanced > baseline.connected_at,
+        "case {case:?}: the advanced lastActiveAt {advanced:?} must be after connectedAt {:?}",
+        baseline.connected_at
+    );
 }
