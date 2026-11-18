@@ -10,12 +10,18 @@
 //! behaviour — status, the result document, what the bucket reports afterwards — rather than
 //! any codec's internals.
 //!
-//! The two rules under test, each asserted over a SET of spellings rather than one request:
+//! The three rules under test, each asserted over a SET of spellings rather than one request:
 //!
-//! > A boolean element of a request document is read in the lexical space the schema S3
-//! > publishes for it gives a boolean: `true`, `false`, `1` and `0`, with surrounding
-//! > whitespace allowed — so a document spelling one the NUMERIC way states the same value as
-//! > the word, and text in neither spelling states no boolean at all and is refused.
+//! > A boolean element of a request document that states a VALUE the service keeps is read in
+//! > the lexical space the schema S3 publishes for it gives a boolean: `true`, `false`, `1` and
+//! > `0`, with surrounding whitespace allowed — so a document spelling one the NUMERIC way
+//! > states the same value as the word, and text in neither spelling states no boolean at all
+//! > and is refused.
+//!
+//! > A boolean element whose published rule is that ADDING it with the value `true` turns a MODE
+//! > on states only whether the mode is on: text that states no `true` leaves the mode off — the
+//! > reading the element's own absence has — and never makes the document one that does not
+//! > validate, so the request is carried out and answered whatever that element spells.
 //!
 //! > The text of an element that carries an OBJECT KEY is the key itself, whitespace and all:
 //! > the key a batch delete names is the key it takes away, and the key a tag set states is
@@ -25,20 +31,27 @@
 //! Their sources: a request document is validated against the published schema, where a boolean
 //! element is an `xsd:boolean`, whose lexical space is exactly `{true, false, 1, 0}` (W3C XML
 //! Schema Part 2: Datatypes, §3.2.2.1) — the "0" and "1" being the numeric spellings of the
-//! other two; and `DeleteObjects` names a whitespace key in its own documentation of
+//! other two; `Delete$Quiet` is "element to enable quiet mode for the request. When you add this
+//! element, you must set its value to `true`"
+//! (`smithy_query(query="doc",shape="Delete",member="Quiet")`), switching the two modes
+//! `DeleteObjects` documents ("by default, the operation uses verbose mode in which the response
+//! includes the result of deletion of each key in your request. In quiet mode the response
+//! includes only keys where the delete operation encountered an error"); and `DeleteObjects`
+//! names a whitespace key in its own documentation of
 //! `Delete$Objects` ("an object that's composed entirely of whitespace characters is not
 //! supported by the `DeleteObjects` API operation" for a DIRECTORY bucket, which is the bucket
 //! kind that does not support it). The documents driven here are the two kinds that carry a
-//! boolean — `Delete$Quiet` on `DeleteObjects` ("element to enable quiet mode for the request")
-//! and the four `PublicAccessBlockConfiguration` settings on `PutPublicAccessBlock` — each read
-//! back through the operation that reports it.
+//! boolean — `Delete$Quiet` on `DeleteObjects`, the one element that turns a mode on, and the
+//! four `PublicAccessBlockConfiguration` settings on `PutPublicAccessBlock`, which state values
+//! the bucket keeps — each read back through the operation that reports it.
 
 use std::collections::BTreeSet;
 
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_s3_amazons3::service::wire::{
-    XML_BOOLEAN_DOCUMENT_ELEMENTS, XML_OBJECT_KEY_DOCUMENT_ELEMENTS,
+    XML_BOOLEAN_DOCUMENT_ELEMENTS, XML_MODE_SWITCH_DOCUMENT_ELEMENTS,
+    XML_OBJECT_KEY_DOCUMENT_ELEMENTS,
 };
 
 use super::bucket_lifecycle::{router, send, Answer};
@@ -51,19 +64,38 @@ use super::object_tagging::{get_object_tagging, put_object_tagging};
 /// The XML namespace botocore puts on an S3 request payload.
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
+/// How a case spells the `Quiet` element of its `Delete` document: the element absent, an empty
+/// `<Quiet/>`, or the element carrying exactly this text.
+#[derive(Debug, Clone, Copy)]
+enum Spelled {
+    Absent,
+    SelfClosing,
+    Text(&'static str),
+}
+
+impl Spelled {
+    /// The element as the document carries it.
+    fn element(self) -> String {
+        match self {
+            Self::Absent => String::new(),
+            Self::SelfClosing => "<Quiet/>".to_string(),
+            Self::Text(text) => format!("<Quiet>{text}</Quiet>"),
+        }
+    }
+}
+
 /// `POST /<bucket>?delete` with one identifier and the `Quiet` element spelled exactly as
-/// `quiet` gives it (and no `Quiet` element at all for `None`).
+/// `quiet` gives it.
 async fn delete_objects(
     router: &MultiServiceRouter,
     name: &str,
     key: &str,
-    quiet: Option<&str>,
+    quiet: Spelled,
 ) -> Answer {
-    let mut payload = format!("<Delete xmlns=\"{XMLNS}\"><Object><Key>{key}</Key></Object>");
-    if let Some(quiet) = quiet {
-        payload.push_str(&format!("<Quiet>{quiet}</Quiet>"));
-    }
-    payload.push_str("</Delete>");
+    let payload = format!(
+        "<Delete xmlns=\"{XMLNS}\"><Object><Key>{key}</Key></Object>{}</Delete>",
+        quiet.element()
+    );
     send(router, "POST", &format!("/{name}?delete"), &[], &payload).await
 }
 
@@ -105,10 +137,11 @@ type SpellingRow = (&'static str, &'static str, Option<bool>);
 
 /// Every spelling the published lexical space admits, beside text outside it.
 ///
-/// The rows differ along what the rule generalises over: which of the two words, which of the
-/// two numeric spellings, and the surrounding whitespace the space allows — plus, for the
-/// refusal rows, a word in the wrong case, a number outside the space and text that is no
-/// boolean in any reading.
+/// The rows differ along what the rules generalise over: which of the two words, which of the
+/// two numeric spellings, and the surrounding whitespace the space allows — plus, for the rows
+/// that state no boolean at all, a word in the wrong case, a number outside the space and text
+/// that is no boolean in any reading. A row stating none is refused where the element states a
+/// VALUE the service keeps, and read as the mode's default where it turns a MODE on.
 const SPELLINGS: [SpellingRow; 10] = [
     ("the word true", "true", Some(true)),
     ("the word false", "false", Some(false)),
@@ -331,8 +364,21 @@ async fn a_batch_delete_addresses_the_key_its_document_spells_whitespace_and_all
 }
 
 #[tokio::test]
-async fn a_batch_delete_reads_quiet_in_the_published_boolean_space() {
-    for (case, spelled, states) in SPELLINGS {
+async fn a_batch_delete_is_served_whatever_its_quiet_element_spells() {
+    // The element turns a MODE on, so what its text decides is the mode and never whether the
+    // request validates: every row is served, and the mode is on only where the text states
+    // `true` in the published lexical space. The rows differ along the TEXT (each of the two
+    // words, each of the two numeric spellings, surrounding whitespace, a word in another case,
+    // a number outside the space, a word that is no boolean at all, no text at all) and along
+    // the FORM the element takes (carrying text, self-closing, absent altogether).
+    let rows = SPELLINGS
+        .iter()
+        .map(|(case, spelled, states)| (*case, Spelled::Text(spelled), *states == Some(true)))
+        .chain([
+            ("a self-closing element", Spelled::SelfClosing, false),
+            ("no Quiet element at all", Spelled::Absent, false),
+        ]);
+    for (case, spelled, quiet) in rows {
         // A fresh store per row, so one row's delete cannot decide another's.
         let router = router();
         let name = "batch-delete-quiet";
@@ -347,57 +393,53 @@ async fn a_batch_delete_reads_quiet_in_the_published_boolean_space() {
             text(&written)
         );
 
-        let answer = delete_objects(&router, name, key, Some(spelled)).await;
-        let Some(quiet) = states else {
-            assert_eq!(
-                answer.status,
-                400,
-                "case {case:?}: text in neither spelling states no boolean, so the document is \
-                 refused, got {} with body {:?}",
-                answer.status,
-                text(&answer)
-            );
-            continue;
-        };
+        let answer = delete_objects(&router, name, key, spelled).await;
         assert_eq!(
             answer.status,
             200,
-            "case {case:?}: a boolean the published space admits is served, got {} with body \
-             {:?}",
+            "case {case:?}: the batch names one key, so it is carried out and reported per key, \
+             got {} with body {:?}",
             answer.status,
             text(&answer)
         );
         // "In quiet mode the response includes only keys where the delete operation
-        // encountered an error" (this operation's own documentation), so the value the
-        // element states is what decides whether the deleted key is reported.
+        // encountered an error" (this operation's own documentation), so the mode the element
+        // puts the request in is what decides whether the deleted key is reported.
         let body = String::from_utf8_lossy(&answer.body).into_owned();
         assert_eq!(
-            body.contains("<Deleted>"),
+            body.contains(&format!("<Deleted><Key>{key}</Key></Deleted>")),
             !quiet,
-            "case {case:?}: expected Quiet to state {quiet}, so the result must {} report the \
+            "case {case:?}: expected quiet mode {quiet}, so the result must {} report the \
              deleted key, got {body:?}",
             match quiet {
                 true => "not",
                 false => "",
             }
         );
-    }
 
-    // A payload naming no `Quiet` at all states nothing, which is the verbose default the
-    // member's absence means — so the rows above are about the element's TEXT and not about
-    // its presence.
-    let router = router();
-    let name = "batch-delete-quiet-absent";
-    bucket(&router, name).await;
-    put_object(&router, name, "data/one.csv", b"a,b\n", &[]).await;
-    let answer = delete_objects(&router, name, "data/one.csv", None).await;
-    let body = String::from_utf8_lossy(&answer.body).into_owned();
-    assert!(
-        answer.status == 200 && body.contains("<Deleted>"),
-        "case \"no Quiet element at all\": expected the verbose default, got {} with body \
-         {body:?}",
-        answer.status
-    );
+        // And whichever mode the answer was in, the delete itself happened: the bucket holds
+        // the key no longer.
+        let left = listing_of(&list_objects_v2(&router, name, "").await).keys();
+        assert!(
+            left.is_empty(),
+            "case {case:?}: the delete must take {key:?} away, the bucket still holds {left:?}"
+        );
+    }
+}
+
+#[test]
+fn every_mode_switch_element_is_one_the_model_binds_a_boolean_from() {
+    // The fold is keyed on the element name, so each element it may touch must be one a request
+    // document really binds a BOOLEAN member from — which is the catalog
+    // `the_boolean_element_catalog_matches_the_model` above derives from the model itself.
+    let booleans: BTreeSet<&str> = XML_BOOLEAN_DOCUMENT_ELEMENTS.iter().copied().collect();
+    for element in XML_MODE_SWITCH_DOCUMENT_ELEMENTS {
+        assert!(
+            booleans.contains(element),
+            "case {element:?}: a mode-switch element must be one the model binds a boolean \
+             from, which are {booleans:?}"
+        );
+    }
 }
 
 #[tokio::test]

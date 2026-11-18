@@ -13,9 +13,10 @@
 //! > One `DeleteObjects` performs the delete of each `Object` its `Delete` payload names —
 //! > the version a `VersionId` names, or the simple delete that lays a delete marker on a
 //! > bucket carrying a versioning state — and reports the result of each in the response:
-//! > a key that held nothing is reported deleted too, a `VersionId` the bucket holds no
-//! > version of is that key's own `Errors` entry rather than a failure of the request, and
-//! > `Quiet` leaves the successes out.
+//! > a key that held nothing is reported deleted too, a `VersionId` of the published shape
+//! > the bucket holds no version of is reported deleted as well — nothing was there, which
+//! > the result confirms — a token that is no version id at all is that key's own `Errors`
+//! > entry rather than a failure of the request, and `Quiet` leaves the successes out.
 //!
 //! Its sources (this operation's own documentation): "For each key, Amazon S3 performs a
 //! delete operation and returns the result of that delete, success or failure, in the
@@ -46,6 +47,15 @@ type Identifier<'a> = (&'a str, Option<&'a str>);
 /// The `Delete` payload a `DeleteObjects` request carries, from the identifiers and the
 /// quiet flag a case names.
 fn delete_payload(identifiers: &[Identifier], quiet: bool) -> String {
+    delete_payload_quiet_spelled(identifiers, quiet.then_some("true"))
+}
+
+/// The same payload, with the `Quiet` element carrying exactly the text the case gives — and
+/// no `Quiet` element at all for `None`.
+///
+/// The one builder both forms go through, so a case that spells the element itself and one that
+/// states the flag cannot disagree about the rest of the document.
+fn delete_payload_quiet_spelled(identifiers: &[Identifier], quiet: Option<&str>) -> String {
     let mut payload =
         String::from("<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
     for (key, version_id) in identifiers {
@@ -59,8 +69,10 @@ fn delete_payload(identifiers: &[Identifier], quiet: bool) -> String {
         }
         payload.push_str("</Object>");
     }
-    if quiet {
-        payload.push_str("<Quiet>true</Quiet>");
+    if let Some(quiet) = quiet {
+        payload.push_str("<Quiet>");
+        payload.push_str(quiet);
+        payload.push_str("</Quiet>");
     }
     payload.push_str("</Delete>");
     payload
@@ -351,9 +363,14 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
         );
     }
 
-    // Naming every version AND every marker empties the bucket in one request, and a
-    // `VersionId` the bucket holds no version of is that identifier's own error rather
-    // than a failure of the request.
+    // Naming every version AND every marker empties the bucket in one request. Each
+    // identifier performs exactly what a `DeleteObject` for it would and reports THAT
+    // delete's result: a `VersionId` of the published shape the bucket holds no version of
+    // took nothing away and is confirmed deleted ("if the object specified in the request
+    // isn't found, Amazon S3 confirms the deletion by returning the result as deleted"),
+    // while a token that is no version id at all names no version of any object and is that
+    // identifier's own failure beside the keys that did delete (the single-object path
+    // refuses the ARGUMENT instead, see `version_id_classification`).
     let mut named: Vec<(String, Option<String>)> = Vec::new();
     for key in keys {
         named.push(((*key).to_string(), Some(minted[*key].clone())));
@@ -361,11 +378,8 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
     for (key, marker_id) in &marker_ids {
         named.push((key.clone(), Some(marker_id.clone())));
     }
-    // A token this store never minted, in two shapes: one of the minted shape and one of
-    // no version id's shape at all. The BATCH path reports what it could not do with the
-    // pair rather than classifying the token, so each is that identifier's own
-    // absent-version error (the single-object path is where the argument itself is judged,
-    // see `version_id_classification`).
+    // A token this store never minted, in two shapes: one of the published shape, and one of
+    // no version id's shape at all.
     named.push((
         "one".to_string(),
         Some("a".repeat(VERSION_ID_CHARS)),
@@ -387,18 +401,26 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
     let result = delete_result_of(&drained);
     assert_eq!(
         result.deleted_keys().len(),
-        4,
-        "every version and marker named is reported deleted, got {:?}",
+        5,
+        "every version and marker named, and the one shaped token that named nothing, is \
+         reported deleted, got {:?}",
         result.deleted_keys()
     );
     assert_eq!(
+        result
+            .deleted
+            .iter()
+            .filter_map(|entry| entry.get("VersionId").cloned())
+            .filter(|version_id| *version_id == "a".repeat(VERSION_ID_CHARS))
+            .count(),
+        1,
+        "the confirmed entry echoes the version id the identifier named, got {:?}",
+        result.deleted
+    );
+    assert_eq!(
         result.error_codes(),
-        vec![
-            ("one".to_string(), "NoSuchVersion".to_string()),
-            ("one".to_string(), "NoSuchVersion".to_string())
-        ],
-        "each identifier naming a version the bucket holds none of is that identifier's own \
-         error, got {:?}",
+        vec![("one".to_string(), "NoSuchVersion".to_string())],
+        "only the identifier naming no version id at all is a failure of its own, got {:?}",
         result.error_codes()
     );
     let emptied = version_listing_of(&list_object_versions(&router, name, "").await);
@@ -518,4 +540,104 @@ async fn a_batch_delete_outside_what_it_can_serve_is_refused_not_guessed() {
 /// The identifiers of a payload that names keys and no version ids.
 fn identifiers<'a>(keys: &'a [&'a str]) -> Vec<Identifier<'a>> {
     keys.iter().map(|key| (*key, None)).collect()
+}
+
+#[tokio::test]
+async fn a_versioned_batch_delete_is_served_whatever_its_quiet_element_spells() {
+    // `Delete$Quiet` turns a MODE on — "element to enable quiet mode for the request. When you
+    // add this element, you must set its value to `true`" — so what its text decides is the
+    // response mode and never whether the document validates: a batch naming a version the
+    // bucket holds is carried out and reported per identifier in every row.
+    //
+    // (case, the text the `Quiet` element carries — `None` for no element at all —, whether the
+    // mode is on). The rows differ along the text the element carries: each of the two words,
+    // each of the two numeric spellings the published lexical space admits, surrounding
+    // whitespace, a word in another case, a number outside the space, a word that is no boolean
+    // in any reading, no text at all, and no element at all.
+    let rows: &[(&str, Option<&str>, bool)] = &[
+        ("the word true", Some("true"), true),
+        ("the word false", Some("false"), false),
+        ("the numeric spelling of true", Some("1"), true),
+        ("the numeric spelling of false", Some("0"), false),
+        ("a word with surrounding whitespace", Some(" true "), true),
+        ("a word in another case", Some("True"), false),
+        ("a word in upper case", Some("TRUE"), false),
+        ("a number outside the space", Some("2"), false),
+        ("a word that is no boolean at all", Some("yes"), false),
+        ("no text at all", Some(""), false),
+        ("no Quiet element at all", None, false),
+    ];
+    for (case, spelled, quiet) in rows {
+        // A fresh store per row, so one row's delete cannot decide another's.
+        let router = router();
+        let name = "batch-delete-quiet-versioned";
+        bucket(&router, name).await;
+        set_versioning(&router, name, "Enabled").await;
+        let key = "svc-file1.txt";
+        let minted = write_keys(&router, name, &[key]).await;
+        let version_id = minted[key].clone();
+        assert!(
+            !version_id.is_empty(),
+            "case {case:?}: the setup write must mint a version to name, got {minted:?}"
+        );
+
+        let answer = send(
+            &router,
+            "POST",
+            &format!("/{name}?delete"),
+            &[],
+            &delete_payload_quiet_spelled(&[(key, Some(&version_id))], *spelled),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: the batch names one resolvable version, so it is carried out and \
+             reported per identifier, got {} with body {:?}",
+            answer.status,
+            text(&answer)
+        );
+        let result = delete_result_of(&answer);
+        assert!(
+            result.errors.is_empty(),
+            "case {case:?}: a resolvable version is no per-identifier failure, got {:?}",
+            result.error_codes()
+        );
+        // "In quiet mode the response includes only keys where the delete operation
+        // encountered an error"; verbose mode reports the identifier the request named, which
+        // for a version-scoped delete is the key and that version id.
+        match quiet {
+            true => assert!(
+                result.deleted.is_empty(),
+                "case {case:?}: quiet mode reports no success, got {:?}",
+                result.deleted_keys()
+            ),
+            false => {
+                let entry = result.deleted_entry(key).unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: the key must be reported deleted, got {:?}",
+                        result.deleted_keys()
+                    )
+                });
+                assert_eq!(
+                    (
+                        entry.get("VersionId").cloned().unwrap_or_default(),
+                        entry.get("DeleteMarker").cloned()
+                    ),
+                    (version_id.clone(), None),
+                    "case {case:?}: the entry must echo the version the identifier named and \
+                     report no marker, got {entry:?}"
+                );
+            }
+        }
+
+        // And whichever mode the answer was in, the version is gone.
+        let listing = version_listing_of(&list_object_versions(&router, name, "").await);
+        assert!(
+            listing.entries().is_empty(),
+            "case {case:?}: the version {version_id:?} must be gone, the listing still reports \
+             {:?}",
+            listing.entries()
+        );
+    }
 }

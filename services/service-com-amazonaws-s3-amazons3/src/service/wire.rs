@@ -107,6 +107,12 @@
 //! [`xsd_boolean_spellings_folded`] re-spells those two values onto the words; text in neither
 //! spelling is left exactly as it arrived, for the codec to refuse.
 //!
+//! One kind of boolean element is not refused for such text, because it states no value the
+//! service keeps: one whose published rule is that ADDING it with the value `true` turns a MODE
+//! on ([`XML_MODE_SWITCH_DOCUMENT_ELEMENTS`]). The only thing it can state is whether the mode
+//! is on, so text stating no `true` leaves it off — the reading the element's own absence has —
+//! and [`mode_switch_booleans_folded`] re-spells it onto the word that says so.
+//!
 //! And the codec reads every element's text TRIMMED, which is right for a value whose own
 //! lexical space ignores surrounding whitespace and wrong for one the caller CHOSE: an object
 //! key may be composed of whitespace (`DeleteObjects` names such a key in its own
@@ -1395,6 +1401,122 @@ fn xsd_boolean_spellings_folded(document: &[u8]) -> Option<Vec<u8>> {
             .find(|(numeric, _)| *numeric == spelled.trim())
             .map(|(_, word)| (*word).to_string())
     })
+}
+
+/// Every ELEMENT a request document of this service turns a MODE ON with, under the name
+/// restXml writes it with.
+///
+/// Such an element states no value the service keeps: its published rule is that ADDING it with
+/// the value `true` turns the mode on, so the only thing it can state is whether the mode is on.
+/// `Delete$Quiet` is the one this service publishes — "Element to enable quiet mode for the
+/// request. When you add this element, you must set its value to `true`"
+/// (`smithy_query(query="doc",shape="Delete",member="Quiet")`), the mode being the one
+/// `DeleteObjects` documents as "the operation supports two modes for the response: verbose and
+/// quiet. By default, the operation uses verbose mode". Text that states no `true` therefore
+/// leaves the mode OFF — the reading the member's own absence has — rather than making the
+/// document one that does not validate, which is why such an element is folded onto a word the
+/// codec reads instead of being left for it to refuse.
+///
+/// Every entry is also one of [`XML_BOOLEAN_DOCUMENT_ELEMENTS`], the model-derived catalog of
+/// the elements a request document binds a boolean from; `tests/all/zzz_batch_probe.rs`
+/// re-checks that, so an element named here cannot drift away from the member it belongs to.
+pub const XML_MODE_SWITCH_DOCUMENT_ELEMENTS: &[&str] = &["Quiet"];
+
+/// The two words a mode-switch element is folded onto: the mode on, and the mode off.
+///
+/// The words rather than the numeric spellings, because the codec reads those two alone
+/// ([`XSD_BOOLEAN_SPELLINGS`]).
+const MODE_ON: &str = "true";
+/// The mode off — see [`MODE_ON`].
+const MODE_OFF: &str = "false";
+
+/// `document` with the text of every mode-switch element
+/// ([`XML_MODE_SWITCH_DOCUMENT_ELEMENTS`]) re-spelled as the state it puts the mode in —
+/// [`MODE_ON`] where its text states true in the published lexical space, [`MODE_OFF`] for text
+/// that states no true at all, an element carrying no text included — or `None` when it carries
+/// no such element whose text is not already that word (in which case nothing is rewritten and
+/// the original bytes are used).
+///
+/// Only the TEXT of an element the catalog names changes: every other element, every attribute
+/// and every other value is written back exactly as it arrived, and a document in which such an
+/// element carries anything but text is left for the framework's own parser to refuse.
+///
+/// A walk of its own rather than one of [`fold_element_text`]'s: that walk hands an element's
+/// text to its fold as the BYTES it arrived as and writes what comes back where that text was,
+/// which is what keeps an object key's escaping untouched and what a fold re-spelling a VALUE
+/// needs. This one answers a different question — which state the element puts the mode in —
+/// so it reads the text DECODED, and it must be able to write a word into an element that
+/// carried no text at all (`<Quiet></Quiet>`, `<Quiet/>`), where there is no text event to fold.
+fn mode_switch_booleans_folded(document: &[u8]) -> Option<Vec<u8>> {
+    let names = |name: &[u8]| {
+        XML_MODE_SWITCH_DOCUMENT_ELEMENTS
+            .iter()
+            .any(|element| element.as_bytes() == name)
+    };
+    let mut reader = Reader::from_reader(document);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut changed = false;
+    // The start tag of the mode-switch element being read and the text it has carried so far.
+    // Written at its END tag rather than as each event arrives, because an element carrying no
+    // text at all still states which state the mode is in.
+    let mut reading: Option<(BytesStart<'static>, String)> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(start)) if reading.is_none() && names(start.name().as_ref()) => {
+                reading = Some((start.into_owned(), String::new()));
+            }
+            Ok(Event::Empty(empty)) if reading.is_none() && names(empty.name().as_ref()) => {
+                changed = true;
+                let start = empty.into_owned();
+                let end =
+                    BytesEnd::new(::std::str::from_utf8(start.name().as_ref()).ok()?.to_owned());
+                writer.write_event(Event::Start(start)).ok()?;
+                writer
+                    .write_event(Event::Text(BytesText::from_escaped(MODE_OFF)))
+                    .ok()?;
+                writer.write_event(Event::End(end)).ok()?;
+            }
+            Ok(Event::Text(text)) if reading.is_some() => {
+                if let Some((_, carried)) = reading.as_mut() {
+                    carried.push_str(&text.xml10_content().unwrap_or_default());
+                }
+            }
+            Ok(Event::End(end)) if reading.is_some() => {
+                let (start, carried) = reading.take()?;
+                let stated = match XSD_BOOLEAN_SPELLINGS
+                    .iter()
+                    .find(|(numeric, _)| *numeric == carried.trim())
+                    .map(|(_, word)| *word)
+                    .unwrap_or(carried.trim())
+                {
+                    MODE_ON => MODE_ON,
+                    _ => MODE_OFF,
+                };
+                changed |= carried != stated;
+                writer.write_event(Event::Start(start)).ok()?;
+                writer
+                    .write_event(Event::Text(BytesText::from_escaped(stated)))
+                    .ok()?;
+                writer.write_event(Event::End(end)).ok()?;
+            }
+            // Anything else inside such an element is no text a boolean can be read from, so
+            // the document is left exactly as it arrived.
+            Ok(_) if reading.is_some() => return None,
+            Ok(other) => {
+                writer.write_event(other).ok()?;
+            }
+            // A document the XML reader cannot walk is left for the framework's own parser to
+            // refuse, so the refusal a client sees is the framework's.
+            Err(_) => return None,
+        }
+    }
+    // A start tag the document never closed is not one this walk can have written back whole.
+    if reading.is_some() {
+        return None;
+    }
+    changed.then(|| writer.into_inner())
 }
 
 /// `document` with every `@xmlAttribute` member moved out of its own element and onto its
@@ -3353,9 +3475,8 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                 .body()
                 .bytes()
                 .ok_or_else(|| ProtocolError::BodyRead("body is not available as bytes".into()))?;
-            // Four normalizations, each applied only to a document that calls for it, and
-            // each over the result of the one before it so a document needing several is
-            // served.
+            // Each normalization is applied only to a document that calls for it, and each
+            // over the result of the one before it so a document needing several is served.
             let mut normalized: Option<Vec<u8>> = None;
             if XML_ATTRIBUTE_MEMBERS
                 .iter()
@@ -3386,7 +3507,22 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                     normalized = Some(document);
                 }
             }
-            // And a FOURTH, for the whitespace an OBJECT KEY's element begins or ends with:
+            // And a FOURTH, for a boolean element that states no VALUE but turns a MODE on: its
+            // published rule is that adding it with the value `true` turns the mode on, so text
+            // stating no true leaves the mode off — the reading the element's own absence has —
+            // rather than making the document one that does not validate
+            // ([`mode_switch_booleans_folded`]). The byte scan comes first, so only a document
+            // that carries such an element at all is walked.
+            let current: &[u8] = normalized.as_deref().unwrap_or(body);
+            if XML_MODE_SWITCH_DOCUMENT_ELEMENTS
+                .iter()
+                .any(|element| holds(current, format!("<{element}").as_bytes()))
+            {
+                if let Some(document) = mode_switch_booleans_folded(current) {
+                    normalized = Some(document);
+                }
+            }
+            // And a FIFTH, for the whitespace an OBJECT KEY's element begins or ends with:
             // the codec reads an element's text trimmed, and a key's whitespace is part of the
             // key, so it is re-spelled as the character references that state it
             // ([`verbatim_text_folded`]). The byte scan comes first, so only a document that
@@ -3400,7 +3536,7 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                     normalized = Some(document);
                 }
             }
-            // And a FIFTH, for the one document whose refusals `PutBucketWebsite` is the
+            // And a SIXTH, for the one document whose refusals `PutBucketWebsite` is the
             // one place that can state them: a website document that operation refuses on
             // the DOCUMENT — because the published schema rejects it, or because a member
             // carries a value only the document still holds — is withheld from the codec in
@@ -3415,7 +3551,7 @@ impl ServerProtocol for UnwrappedXmlRestXml {
             {
                 normalized = Some(EMPTY_WEBSITE_CONFIGURATION.to_vec());
             }
-            // And a SIXTH, for the one VALUE a create's configuration carries that the
+            // And a SEVENTH, for the one VALUE a create's configuration carries that the
             // operation rather than the boundary refuses: a location constraint naming no
             // Region the model publishes is withheld from the codec — the whole container is
             // replaced by [`EMPTY_CREATE_BUCKET_CONFIGURATION`] — so `CreateBucket` answers
@@ -3425,7 +3561,7 @@ impl ServerProtocol for UnwrappedXmlRestXml {
             if rejected_location_constraint(input_schema).is_some() {
                 normalized = Some(EMPTY_CREATE_BUCKET_CONFIGURATION.to_vec());
             }
-            // And a SEVENTH, for the two values of a NOTIFICATION document that Amazon S3
+            // And an EIGHTH, for the two values of a NOTIFICATION document that Amazon S3
             // judges itself. A document naming an event or a filter rule name the published
             // vocabulary does not carry is withheld from the codec whole — replaced by
             // [`EMPTY_NOTIFICATION_CONFIGURATION`] — so
@@ -3445,7 +3581,7 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                     normalized = Some(document);
                 }
             }
-            // And an EIGHTH, for the one configuration document whose own refusals
+            // And a NINTH, for the one configuration document whose own refusals
             // `PutBucketAnalyticsConfiguration` is the one place that states them: a document
             // the published schema rejects, or one naming no storage class analysis, is
             // withheld from the codec in full — replaced by

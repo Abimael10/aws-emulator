@@ -20,11 +20,14 @@
 //! failure for it and the absent-version row is its modelled success (HTTP 204, empty body),
 //! while a token that is not shaped like a version id is still the refused argument — the
 //! classification that separates "fix the request" from "that version is gone" survives in
-//! the one operation whose absent case is a no-op. The `DeleteObjects` batch is held to the
-//! other half of the rule: "DeleteObjects itself has no modeled top-level errors; each result
-//! entry carries Key, VersionId, Code, Message", and what an entry reports is what the batch
-//! could not do with that pair — a version id it cannot resolve names no version of the key,
-//! so the entry is the absent-version failure whatever the token's shape.
+//! the one operation whose absent case is a no-op. The `DeleteObjects` batch reports, per
+//! identifier, the result the `DeleteObject` for that identifier has — "DeleteObjects itself
+//! has no modeled top-level errors; each result entry carries Key, VersionId, Code, Message" —
+//! so a shaped token naming no version is that entry's confirmed delete ("if the object
+//! specified in the request isn't found, Amazon S3 confirms the deletion by returning the
+//! result as deleted"), and a token that is no version id at all, which names no version of
+//! any object and so has nothing to confirm, is that entry's own absent-version failure
+//! instead of the argument refusal only an operation taking one `versionId` argument can make.
 
 use service_com_amazonaws_s3_amazons3::state::{MAX_VERSION_ID_CHARS, VERSION_ID_CHARS};
 use smithy_server_runtime::MultiServiceRouter;
@@ -98,6 +101,21 @@ fn entry_error(answer: &Answer) -> Option<(String, String)> {
         .and_then(|(_, rest)| rest.split_once("</Message>"))
         .map(|(message, _)| message.to_string())?;
     Some((code, message))
+}
+
+/// The `<Key>` and `<VersionId>` of the one `<Deleted>` entry a `DeleteObjects` answer
+/// carries, or `None` when it confirms no delete at all.
+fn entry_deleted(answer: &Answer) -> Option<(String, String)> {
+    let body = String::from_utf8_lossy(&answer.body).to_string();
+    let (_, rest) = body.split_once("<Deleted>")?;
+    let (entry, _) = rest.split_once("</Deleted>")?;
+    let element = |name: &str| {
+        entry
+            .split_once(&format!("<{name}>"))
+            .and_then(|(_, rest)| rest.split_once(&format!("</{name}>")))
+            .map(|(text, _)| text.to_string())
+    };
+    Some((element("Key")?, element("VersionId")?))
 }
 
 /// The ids every row of the table is built from, paired with how each must be classified.
@@ -290,7 +308,11 @@ async fn a_version_id_is_classified_the_same_way_wherever_it_arrives() {
         }
 
         // The batch path: the same id, as one entry of a `DeleteObjects` request. The
-        // request itself succeeds — the classification is that ENTRY's own error.
+        // request itself succeeds — what the entry reports is that identifier's own result,
+        // which is the result a `DeleteObject` for the same pair has: the shaped token naming
+        // nothing is confirmed deleted, and the token that is no version id at all is the
+        // entry's own failure, under the absent-version code rather than under the argument
+        // refusal only an operation taking one `versionId` argument can make.
         let batch = delete_objects(&router, name, &[(KEY, &version_id)]).await;
         assert_eq!(
             batch.status, 200,
@@ -299,13 +321,28 @@ async fn a_version_id_is_classified_the_same_way_wherever_it_arrives() {
             text(&batch)
         );
         let reported = entry_error(&batch);
-        assert_eq!(
-            reported,
-            Some((ABSENT.code.to_string(), ABSENT.message.to_string())),
-            "case {case:?}/DeleteObjects: the entry must report the version as absent, \
-             whatever the token's shape, got {reported:?} in body {:?}",
-            text(&batch)
-        );
+        let confirmed = entry_deleted(&batch);
+        match expected == ABSENT {
+            true => assert_eq!(
+                (reported.clone(), confirmed.clone()),
+                (None, Some((KEY.to_string(), version_id.clone()))),
+                "case {case:?}/DeleteObjects: a shaped token naming no version took nothing \
+                 away, so the entry confirms the delete and echoes the identifier, got \
+                 {reported:?}/{confirmed:?} in body {:?}",
+                text(&batch)
+            ),
+            false => assert_eq!(
+                (reported.clone(), confirmed.clone()),
+                (
+                    Some((ABSENT.code.to_string(), ABSENT.message.to_string())),
+                    None
+                ),
+                "case {case:?}/DeleteObjects: a token that is no version id names nothing to \
+                 confirm, so the entry is its own failure, got {reported:?}/{confirmed:?} in \
+                 body {:?}",
+                text(&batch)
+            ),
+        }
     }
 
     // The id the store DID mint is served throughout, so every row above failed on what it
