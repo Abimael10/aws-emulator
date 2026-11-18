@@ -284,6 +284,11 @@ const TEMPLATE_WAIT_CEILING: ::std::time::Duration = ::std::time::Duration::from
 /// guide).
 const LOCAL_DATA_SOURCE: &str = "NONE";
 
+/// The `DataSourceType` of a data source whose resource is an EVENT BUS: a step resolving
+/// against one publishes the events its request half returned onto that bus
+/// ([`super::event_bridge`]).
+const EVENT_BRIDGE_DATA_SOURCE: &str = "AMAZON_EVENTBRIDGE";
+
 /// The `DataSourceType` of a data source that IS a function of AWS Lambda: "the data source
 /// is an Lambda function" (`DataSource$type`), which a resolver bound to it resolves against
 /// by INVOKING ([`super::lambda`]).
@@ -1001,13 +1006,13 @@ impl Execution<'_> {
         // function is handed.
         let mut previous = match (&plan.code, &plan.templates) {
             (Some(code), _) => {
-                let context = step_context(&base, &stash, &Json::Null, None);
+                let context = step_context(&base, &stash, &Json::Null, None, &Json::Null);
                 self.evaluated(code, REQUEST_FUNCTION, &context, &mut stash)
                     .await?
             }
             (None, Some(templates)) => match &templates.request {
                 Some(template) => {
-                    let context = step_context(&base, &stash, &Json::Null, None);
+                    let context = step_context(&base, &stash, &Json::Null, None, &Json::Null);
                     let rendered = self.rendered(template, &context, &mut stash).await?;
                     read_rendered(&rendered, REQUEST_TEMPLATE)?
                 }
@@ -1027,13 +1032,14 @@ impl Execution<'_> {
         // And its AFTER step, over what the last function produced.
         match (&plan.code, &plan.templates) {
             (Some(code), _) => {
-                let context = step_context(&base, &stash, &previous, Some(&previous));
+                let context = step_context(&base, &stash, &previous, Some(&previous), &Json::Null);
                 self.evaluated(code, RESPONSE_FUNCTION, &context, &mut stash)
                     .await
             }
             (None, Some(templates)) => match &templates.response {
                 Some(template) => {
-                    let context = step_context(&base, &stash, &previous, Some(&previous));
+                    let context =
+                        step_context(&base, &stash, &previous, Some(&previous), &Json::Null);
                     let rendered = self.rendered(template, &context, &mut stash).await?;
                     read_rendered(&rendered, RESPONSE_TEMPLATE)
                 }
@@ -1073,13 +1079,20 @@ impl Execution<'_> {
             };
         };
         let recorded = self.recorded_step(&step.name);
-        let context = step_context(base, stash, &Json::Null, previous);
+        let context = step_context(base, stash, &Json::Null, previous, &Json::Null);
         let requested = self
             .evaluated(code, REQUEST_FUNCTION, &context, stash)
             .await?;
         self.record_request(recorded, &requested);
-        let result = self.data_source_result(step, &requested).await?;
-        let context = step_context(base, stash, &result, previous);
+        // A data source that was CALLED and did not answer is handed to the step's own
+        // `ctx.error`, over which the response half still runs; a step no data source was
+        // called for is reported to the caller ([`Self::run_templates`] states the rule).
+        let (result, error) = match self.data_source_outcome(step, &requested).await {
+            DataSourceOutcome::Result(result) => (result, Json::Null),
+            DataSourceOutcome::Answered(failure) => (Json::Null, failure.reported()),
+            DataSourceOutcome::NotCalled(failure) => return Err(failure),
+        };
+        let context = step_context(base, stash, &result, previous, &error);
         let answered = self
             .evaluated(code, RESPONSE_FUNCTION, &context, stash)
             .await?;
@@ -1153,7 +1166,7 @@ impl Execution<'_> {
             .into());
         }
         self.engine_runs = self.engine_runs.saturating_add(1);
-        Ok(returned(code, function, context, stash).await?)
+        returned(code, function, context, stash).await
     }
 
     /// Run ONE step that is defined by MAPPING TEMPLATES: evaluate the request template to
@@ -1169,6 +1182,13 @@ impl Execution<'_> {
     /// contributes nothing of its own: "VTL request mapping templates are optional when
     /// using an Lambda data source", and a missing response template leaves the data
     /// source's own result as the field's value.
+    ///
+    /// A data source that was CALLED and did not answer is not the end of the step: AppSync
+    /// hands what went wrong to the step's own `$ctx.error` and evaluates the RESPONSE half
+    /// over it, so a definition that states what to do about a failure decides the field —
+    /// which is what `$util.error($ctx.error.message, $ctx.error.type)` is written for. A step
+    /// with no response half to run reports the failure itself, and so does one whose data
+    /// source was never called at all ([`DataSourceOutcome`]).
     async fn run_templates(
         &mut self,
         step: &PipelineStep,
@@ -1180,17 +1200,25 @@ impl Execution<'_> {
         let recorded = self.recorded_step(&step.name);
         let requested = match &templates.request {
             Some(template) => {
-                let context = step_context(base, stash, &Json::Null, previous);
+                let context = step_context(base, stash, &Json::Null, previous, &Json::Null);
                 let rendered = self.rendered(template, &context, stash).await?;
                 read_rendered(&rendered, REQUEST_TEMPLATE)?
             }
             None => Json::Null,
         };
         self.record_request(recorded, &requested);
-        let result = self.data_source_result(step, &requested).await?;
+        let (result, error) = match self.data_source_outcome(step, &requested).await {
+            DataSourceOutcome::Result(result) => (result, Json::Null),
+            DataSourceOutcome::Answered(failure) if templates.response.is_some() => {
+                (Json::Null, failure.reported())
+            }
+            DataSourceOutcome::Answered(failure) | DataSourceOutcome::NotCalled(failure) => {
+                return Err(failure)
+            }
+        };
         let answered = match &templates.response {
             Some(template) => {
-                let context = step_context(base, stash, &result, previous);
+                let context = step_context(base, stash, &result, previous, &error);
                 let rendered = self.rendered(template, &context, stash).await?;
                 read_rendered(&rendered, RESPONSE_TEMPLATE)?
             }
@@ -1330,40 +1358,79 @@ impl Execution<'_> {
     /// the local resolver AppSync documents. `AWS_LAMBDA` is a FUNCTION, so the request's
     /// `payload` is the event that function is INVOKED with and what it returned is the
     /// result; the request's `operation` says whether that event travels on its own
-    /// (`Invoke`) or as the one-element list a batched invocation carries (`BatchInvoke`).
-    /// Every other type names a resource of another service, which this endpoint does not
-    /// call, so the field is reported as one that did not resolve rather than answered with a
-    /// value nothing produced.
-    async fn data_source_result(
+    /// (`Invoke`) or as the one-element list a batched invocation carries (`BatchInvoke`). An
+    /// `AMAZON_EVENTBRIDGE` data source is CALLED too: the events the request carries are
+    /// published onto the bus it was configured with, and the result is what EventBridge
+    /// answered ([`super::event_bridge`]). Every other type names a resource of another
+    /// service, which this endpoint does not call, so the step is one no data source was
+    /// called for rather than one answered with a value nothing produced — the distinction
+    /// [`DataSourceOutcome`] draws, and what keeps such a refusal reaching the CALLER instead
+    /// of being offered to a definition as a failure it may handle.
+    async fn data_source_outcome(
         &mut self,
         step: &PipelineStep,
         requested: &Json,
-    ) -> Result<Json, Failure> {
+    ) -> DataSourceOutcome {
         let Some(data_source) = step.data_source.clone() else {
-            return Err(crate::state::DATA_SOURCE_NAME_MISSING_MESSAGE
-                .to_string()
-                .into());
+            return DataSourceOutcome::NotCalled(
+                crate::state::DATA_SOURCE_NAME_MISSING_MESSAGE
+                    .to_string()
+                    .into(),
+            );
         };
         let payload = || requested.get(PAYLOAD_MEMBER).cloned().unwrap_or(Json::Null);
         match data_source.kind.as_str() {
-            LOCAL_DATA_SOURCE => Ok(payload()),
+            LOCAL_DATA_SOURCE => DataSourceOutcome::Result(payload()),
             LAMBDA_DATA_SOURCE => {
                 let batched = requested
                     .get(OPERATION_MEMBER)
                     .and_then(Json::as_str)
                     .is_some_and(|operation| operation == BATCH_INVOKE_OPERATION)
                     || batches(step.max_batch_size);
-                self.lambda_results(&data_source, vec![payload()], batched)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| Err(NOT_ONE_RESULT.to_string().into()))
+                let invoked = match self
+                    .lambda_results(&data_source, vec![payload()], batched)
+                    .await
+                {
+                    Ok(results) => results
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| Err(NOT_ONE_RESULT.to_string().into())),
+                    Err(failure) => Err(failure),
+                };
+                // The function WAS the call, so what it came to — the value it returned, or
+                // the error it raised — is the data source's own answer.
+                match invoked {
+                    Ok(result) => DataSourceOutcome::Result(result),
+                    Err(failure) => DataSourceOutcome::Answered(failure),
+                }
             }
-            other => Err(format!(
-                "{DATA_SOURCE_NOT_CALLED} {other} data source {}.",
-                data_source.name
+            EVENT_BRIDGE_DATA_SOURCE => match super::event_bridge::published(
+                self.context,
+                &super::event_bridge::Configured {
+                    name: &data_source.name,
+                    event_bus_arn: data_source.event_bus_arn.as_deref(),
+                    service_role_arn: data_source.service_role_arn.as_deref(),
+                },
+                requested,
             )
-            .into()),
+            .await
+            {
+                Ok(result) => DataSourceOutcome::Result(result),
+                // Carried as a RAISED failure, so the step's own `ctx.error` states the type
+                // the refusal is of and an error of the field reports it as its `errorType`.
+                Err(refused) => DataSourceOutcome::Answered(Failure::Raised(Box::new(Raised {
+                    message: refused.message,
+                    error_type: Some(refused.error_type),
+                    ..Raised::default()
+                }))),
+            },
+            other => DataSourceOutcome::NotCalled(
+                format!(
+                    "{DATA_SOURCE_NOT_CALLED} {other} data source {}.",
+                    data_source.name
+                )
+                .into(),
+            ),
         }
     }
 
@@ -1688,13 +1755,13 @@ impl Execution<'_> {
         let previous = in_pipeline.then_some(&Json::Null);
         match (&step.code, &step.templates) {
             (Some(code), _) => {
-                let context = step_context(base, stash, &Json::Null, previous);
+                let context = step_context(base, stash, &Json::Null, previous, &Json::Null);
                 self.evaluated(code, REQUEST_FUNCTION, &context, stash)
                     .await
             }
             (None, Some(templates)) => match &templates.request {
                 Some(template) => {
-                    let context = step_context(base, stash, &Json::Null, previous);
+                    let context = step_context(base, stash, &Json::Null, previous, &Json::Null);
                     let rendered = self.rendered(template, &context, stash).await?;
                     read_rendered(&rendered, REQUEST_TEMPLATE)
                 }
@@ -1715,7 +1782,16 @@ impl Execution<'_> {
         result: &Json,
         in_pipeline: bool,
     ) -> Result<Json, Failure> {
-        let context = step_context(base, stash, result, in_pipeline.then_some(&Json::Null));
+        // The element this sibling is handed IS the data source's answer for it: a sibling
+        // whose own element reported an error is reported before its response half would run
+        // ([`batched_item`]), so nothing of a failure reaches this `ctx`.
+        let context = step_context(
+            base,
+            stash,
+            result,
+            in_pipeline.then_some(&Json::Null),
+            &Json::Null,
+        );
         match (&step.code, &step.templates) {
             (Some(code), _) => {
                 self.evaluated(code, RESPONSE_FUNCTION, &context, stash)
@@ -1752,6 +1828,25 @@ impl Execution<'_> {
             }),
         }
     }
+}
+
+/// What resolving one step's DATA SOURCE came to.
+///
+/// The three cases are not one: a data source that was CALLED and did not answer is a failure
+/// AppSync hands to the step's own `ctx.error`, over which the response half still runs, so a
+/// definition that states what to do about it decides the field. A step whose data source was
+/// never called — the API holds none under the name the step names, or its type names a
+/// resource of a service this endpoint does not call — produced no such answer: there is
+/// nothing for a definition to handle, and reporting it as one would answer a client who asked
+/// for work this endpoint did not do with whatever value a response half happened to render.
+/// Such a step is reported to the CALLER as a field that did not resolve.
+enum DataSourceOutcome {
+    /// The data source produced this result.
+    Result(Json),
+    /// The data source was called and answered with this failure.
+    Answered(Failure),
+    /// No data source was called at all.
+    NotCalled(Failure),
 }
 
 /// What resolves one field: the code, the data source and the pipeline the stored resolver
@@ -1963,6 +2058,18 @@ impl Failure {
             Self::Raised(raised) => raised.message.clone(),
         }
     }
+
+    /// This failure as the step's own `ctx.error`: the `message` of what went wrong and the
+    /// `type` it is of, which is what a definition reads to decide the field itself.
+    fn reported(&self) -> Json {
+        match self {
+            Self::Message(message) => json!({"message": message, "type": Json::Null}),
+            Self::Raised(raised) => json!({
+                "message": raised.message,
+                "type": raised.error_type.clone(),
+            }),
+        }
+    }
 }
 
 impl From<String> for Failure {
@@ -2022,9 +2129,10 @@ fn batched_item(element: Json) -> Result<Json, Failure> {
     }
 }
 
-/// The data source one step resolves against: its type, the name it is held under, and — for
-/// a data source that IS a function — what addresses that function and whose role it is
-/// invoked under.
+/// The data source one step resolves against: its type, the name it is held under, and what a
+/// step that CALLS it needs of its configuration — for a data source that IS a function, what
+/// addresses that function; for one that is an event BUS, the bus its events go to; and, for
+/// either, whose role the call is made under.
 #[derive(Debug, Clone)]
 struct StepDataSource {
     kind: String,
@@ -2032,14 +2140,20 @@ struct StepDataSource {
     /// "The Amazon Resource Name (ARN) for the Lambda function"
     /// (`LambdaDataSourceConfig$lambdaFunctionArn`), for a data source configured with one.
     function_arn: Option<String>,
+    /// `eventBridgeConfig.eventBusArn` of an `AMAZON_EVENTBRIDGE` data source, and `None` for
+    /// every other type — which configures no bus.
+    event_bus_arn: Option<String>,
     /// "The Identity and Access Management (IAM) service role Amazon Resource Name (ARN) for
     /// the data source. The system assumes this role when accessing the data source"
     /// (`DataSource$serviceRoleArn`) — so it is the principal whose permissions admit the
-    /// invocation.
+    /// call a step makes.
     service_role_arn: Option<String>,
 }
 
 /// The data source `name` of `api`, or `None` when the API holds none under that name.
+///
+/// Copied out of the record as it stands NOW, so a data source an update REPOINTED is called
+/// with the configuration it carries at the moment the step runs.
 fn step_data_source(api: &GraphqlApiRecord, name: Option<&str>) -> Option<StepDataSource> {
     let name = name?;
     api.data_sources
@@ -2047,6 +2161,10 @@ fn step_data_source(api: &GraphqlApiRecord, name: Option<&str>) -> Option<StepDa
         .map(|record: &DataSourceRecord| StepDataSource {
             kind: record.r#type.clone(),
             name: record.name.clone(),
+            event_bus_arn: record
+                .event_bridge_config
+                .as_ref()
+                .map(|config| config.event_bus_arn.clone()),
             function_arn: record
                 .lambda_config
                 .as_ref()
@@ -2240,16 +2358,19 @@ fn loggable_event(event: &Json) -> Json {
 const REQUEST_MEMBER: &str = "request";
 
 /// The `ctx` one step is run with: what the field carries, the stash as the steps before it
-/// left it, the result the data source produced and the previous step's result.
+/// left it, the result the data source produced, the previous step's result and what went
+/// wrong with the data source.
 ///
 /// The member names are the ones APPSYNC_JS code reads them under: `arguments` (with `args`
-/// as its documented alias), `source`, `identity`, `request`, `info`, `stash`, `result` and
-/// `prev`.
+/// as its documented alias), `source`, `identity`, `request`, `info`, `stash`, `result`,
+/// `prev` and `error` — the last of which carries the `message` and the `type` of a data
+/// source that did not answer, and is `null` for a step whose data source did.
 fn step_context(
     base: &FieldContext,
     stash: &Json,
     result: &Json,
     previous: Option<&Json>,
+    error: &Json,
 ) -> Json {
     json!({
         "arguments": base.arguments,
@@ -2264,7 +2385,7 @@ fn step_context(
         "stash": stash,
         "result": result,
         "prev": json!({"result": previous.cloned().unwrap_or(Json::Null)}),
-        "error": Json::Null,
+        "error": error,
     })
 }
 
@@ -2273,13 +2394,14 @@ fn step_context(
 ///
 /// `Err` is a step that did not return: the code raised (`util.error` is how a resolver
 /// refuses), it defines no such function, or one of the engine's bounds stopped it. The text
-/// is the engine's own.
+/// is the engine's own, and a raise that NAMED an `errorType` carries it — `util.error`'s
+/// second argument is "a custom error type" the error of the field reports as its own.
 async fn returned(
     code: &str,
     function: &str,
     context: &Json,
     stash: &mut Json,
-) -> Result<Json, String> {
+) -> Result<Json, Failure> {
     let evaluation =
         appsync_js::evaluate(code.to_string(), function.to_string(), context.clone()).await;
     if let Some(left) = evaluation
@@ -2291,11 +2413,23 @@ async fn returned(
     }
     match evaluation.outcome {
         Outcome::Returned(text) => Ok(::serde_json::from_str(&text).unwrap_or(Json::Null)),
-        Outcome::Raised(message) | Outcome::Stopped(message) => Err(message),
-        Outcome::Faults(faults) => Err(faults
-            .first()
-            .map(|fault| fault.value.clone())
-            .unwrap_or_else(|| NO_DEFINITION.to_string())),
+        Outcome::Raised {
+            message,
+            error_type: Some(error_type),
+        } => Err(Failure::Raised(Box::new(Raised {
+            message,
+            error_type: Some(error_type),
+            ..Raised::default()
+        }))),
+        Outcome::Raised { message, .. } | Outcome::Stopped(message) => {
+            Err(Failure::Message(message))
+        }
+        Outcome::Faults(faults) => Err(Failure::Message(
+            faults
+                .first()
+                .map(|fault| fault.value.clone())
+                .unwrap_or_else(|| NO_DEFINITION.to_string()),
+        )),
     }
 }
 

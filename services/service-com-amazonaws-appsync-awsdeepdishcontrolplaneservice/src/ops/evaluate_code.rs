@@ -265,7 +265,7 @@ fn answer(evaluation: Evaluation) -> Result<EvaluateCodeOutput, EvaluateCodeErro
     };
     match outcome {
         Outcome::Returned(result) => output.evaluation_result = Some(result),
-        Outcome::Raised(message) | Outcome::Stopped(message) => {
+        Outcome::Raised { message, .. } | Outcome::Stopped(message) => {
             output.error = Some(EvaluateCodeErrorDetail {
                 message: Some(message),
                 code_errors: None,

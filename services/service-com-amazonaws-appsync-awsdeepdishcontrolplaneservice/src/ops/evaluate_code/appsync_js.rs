@@ -180,9 +180,14 @@ pub enum Outcome {
     /// The evaluated function returned: the JSON text of the value it returned, as the
     /// engine rendered it (`null` for a function that returned nothing).
     Returned(String),
-    /// The evaluated code did not return: it raised, or its module body did. The text is
-    /// the error's own message.
-    Raised(String),
+    /// The evaluated code did not return: it raised, or its module body did. The message is
+    /// the error's own, and `error_type` the `errorType` the raise named — `util.error`'s
+    /// second argument, which an error of a resolved field reports as its own `errorType` —
+    /// or `None` for a raise that named none.
+    Raised {
+        message: String,
+        error_type: Option<String>,
+    },
     /// A bound of this module stopped the run. The text says which.
     Stopped(String),
     /// The code defines nothing this call could run: it does not compile, or it does not
@@ -509,7 +514,13 @@ fn evaluate_in(
     // had loaded.
     if let Err(caught) = settled.finish::<()>().catch(ctx) {
         if !pending(&caught) {
-            return (Outcome::Raised(raised_message(&caught)), None);
+            return (
+                Outcome::Raised {
+                    message: raised_message(&caught),
+                    error_type: None,
+                },
+                None,
+            );
         }
     }
     let Ok(handler) = evaluated.get::<_, Function<'_>>(function) else {
@@ -540,7 +551,15 @@ fn evaluate_in(
         Ok(answered) => answered,
         // The invoker reports the code's own raise itself, so reaching here means the run
         // was interrupted out of it — which the latch has already recorded.
-        Err(caught) => return (Outcome::Raised(raised_message(&caught)), None),
+        Err(caught) => {
+            return (
+                Outcome::Raised {
+                    message: raised_message(&caught),
+                    error_type: None,
+                },
+                None,
+            )
+        }
     };
     read_answer(&answered)
 }
@@ -576,7 +595,16 @@ fn read_answer(answered: &str) -> (Outcome, Option<String>) {
                 Outcome::Returned(result)
             }
         }
-        Some("raised" | "unreadable") => Outcome::Raised(member("message")),
+        Some("raised" | "unreadable") => Outcome::Raised {
+            message: member("message"),
+            // The `errorType` the raise named, which the invoker reports as the error's own
+            // name; a raise that named none carries no type.
+            error_type: document
+                .get("errorType")
+                .and_then(Json::as_str)
+                .filter(|named| !named.is_empty())
+                .map(str::to_string),
+        },
         _ => Outcome::Stopped("the sandbox answered with no outcome".to_string()),
     };
     (outcome, stash)
@@ -809,6 +837,22 @@ const INVOKER_SOURCE: &str = r#"
             return "the code raised a value that cannot be read";
         }
     };
+    // The `errorType` a raise named, which `util.error` writes onto the error's own name;
+    // the engine's own name for a plain error names no type, so it reports none.
+    const typed = function (error) {
+        try {
+            if (error === null || typeof error !== "object") {
+                return null;
+            }
+            const name = error.name;
+            if (name === undefined || name === null || toText(name) === "Error") {
+                return null;
+            }
+            return toText(name);
+        } catch (ignored) {
+            return null;
+        }
+    };
     const stashed = function (context) {
         try {
             if (context === null || typeof context !== "object") {
@@ -836,6 +880,7 @@ const INVOKER_SOURCE: &str = r#"
             return stringify({
                 outcome: "raised",
                 message: described(error),
+                errorType: typed(error),
                 stash: stashed(context),
             });
         }
@@ -849,6 +894,7 @@ const INVOKER_SOURCE: &str = r#"
             return stringify({
                 outcome: "unreadable",
                 message: described(error),
+                errorType: typed(error),
                 stash: stashed(context),
             });
         }

@@ -46,6 +46,7 @@ use crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState as Serv
 
 pub mod authorizer;
 pub mod caller;
+pub mod event_bridge;
 pub mod execution;
 pub mod field_logs;
 pub mod introspection;
