@@ -248,6 +248,29 @@ pub fn gateway_not_attached_to_vpc<E>(vpc_id: &str) -> Scaffolded<E> {
 /// no association for (EC2 API "Error codes": `InvalidAssociationID.NotFound`).
 pub const INVALID_ASSOCIATION_ID_NOT_FOUND: &str = "InvalidAssociationID.NotFound";
 
+/// EC2's error code for a value the service cannot READ as a route table association id — one
+/// no issue of that kind could have produced
+/// ([`ComAmazonawsEc2Amazonec2State::id_was_issued`]): the `.Malformed` half of the pair whose
+/// not-found half is [`INVALID_ASSOCIATION_ID_NOT_FOUND`], spelled for the association's own
+/// id kind (`RouteTableAssociationId`) rather than for the route table it is an association of.
+pub const INVALID_ROUTE_TABLE_ASSOCIATION_ID_MALFORMED: &str =
+    "InvalidRouteTableAssociationId.Malformed";
+
+/// Refuse a value this service could not have issued as a route table association id: HTTP
+/// 400 [`INVALID_ROUTE_TABLE_ASSOCIATION_ID_MALFORMED`], BEFORE any association is looked up,
+/// so a value the service cannot read is never reported as "no such association".
+///
+/// The message is the resource-agnostic [`super::invalid_id_message`] template — `Invalid id:
+/// "<value>"` — the wording this crate carries for every id kind with no sentence of its own,
+/// with the value from the REQUEST bounded by that template's own echo ceiling.
+pub fn invalid_route_table_association_id_malformed<E>(association_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ROUTE_TABLE_ASSOCIATION_ID_MALFORMED,
+        400,
+        super::invalid_id_message(association_id),
+    )
+}
+
 /// Refuse a request that named an association id no association of a stored route table
 /// carries: HTTP 400 [`INVALID_ASSOCIATION_ID_NOT_FOUND`], worded the way every other
 /// not-found id of this crate is ([`super::id_not_found`]).
@@ -628,27 +651,11 @@ impl ComAmazonawsEc2Amazonec2State {
             return None;
         }
         let route_table_id = self.next_id(ROUTE_TABLE_ID_PREFIX);
-        // "Indicates whether this is the main route table"
-        // (`RouteTableAssociation$Main`): the main table is reported with one association
-        // that names no subnet — the implicit association every subnet without one of its
-        // own uses ("a subnet ID is not returned for an implicit association" —
-        // `RouteTableAssociation$SubnetId`).
-        let associations = if spec.main {
-            let association_id = self.next_id(ROUTE_TABLE_ASSOCIATION_ID_PREFIX);
-            vec![RouteTableAssociation {
-                main: Some(true),
-                route_table_association_id: Some(association_id),
-                route_table_id: Some(route_table_id.clone()),
-                subnet_id: None,
-                gateway_id: None,
-                public_ipv4_pool: None,
-                association_state: Some(associated_state()),
-            }]
-        } else {
-            Vec::new()
-        };
         let route_table = RouteTable {
-            associations: Some(associations),
+            // The implicit association a MAIN table is reported with is written below,
+            // through the one writer of such a record, so a table that is main from birth
+            // and one made main later cannot be reported differently.
+            associations: Some(Vec::new()),
             // "Any virtual private gateway (VGW) propagating routes"
             // (`RouteTable$PropagatingVgws`): none until `EnableVgwRoutePropagation` says
             // so.
@@ -664,6 +671,9 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(charged_bytes);
         self.route_tables
             .insert(route_table_id.clone(), route_table);
+        if spec.main {
+            self.record_main_route_table_association(&route_table_id);
+        }
         for cidr_block in spec.local_cidr_blocks {
             self.insert_route(&route_table_id, RouteSpec::local(&cidr_block));
         }
@@ -810,6 +820,44 @@ impl ComAmazonawsEc2Amazonec2State {
         let held = routes.len();
         routes.retain(|route| !route_matches_destination(route, destination));
         held != routes.len()
+    }
+
+    /// Record that the route table `route_table_id` is the MAIN table of its VPC, and answer
+    /// the `RouteTableAssociationId` that implicit association was given.
+    ///
+    /// "Indicates whether this is the main route table" (`RouteTableAssociation$Main`): the
+    /// main table is reported with one association that names no subnet — the implicit
+    /// association every subnet without one of its own uses ("a subnet ID is not returned for
+    /// an implicit association" — `RouteTableAssociation$SubnetId`). The ONE writer of such a
+    /// record, so the table a VPC comes with and a table made main later
+    /// ([`Self::replace_route_table_association`]) are reported identically, and
+    /// [`Self::main_route_table_of_vpc`] reads one member either way. The id is minted out of
+    /// the store's own counter and the record holds no caller-chosen bytes, so there is
+    /// nothing to charge against the byte budget.
+    ///
+    /// A VPC has exactly one main table, so a caller that moves the main association takes
+    /// the old record away before this writes the new one.
+    ///
+    /// `None`, with nothing written, for a table the store does not hold.
+    pub fn record_main_route_table_association(&mut self, route_table_id: &str) -> Option<String> {
+        if !self.route_tables.contains_key(route_table_id) {
+            return None;
+        }
+        let association_id = self.next_id(ROUTE_TABLE_ASSOCIATION_ID_PREFIX);
+        let route_table = self.route_tables.get_mut(route_table_id)?;
+        route_table
+            .associations
+            .get_or_insert_with(Vec::new)
+            .push(RouteTableAssociation {
+                main: Some(true),
+                route_table_association_id: Some(association_id.clone()),
+                route_table_id: Some(route_table_id.to_string()),
+                subnet_id: None,
+                gateway_id: None,
+                public_ipv4_pool: None,
+                association_state: Some(associated_state()),
+            });
+        Some(association_id)
     }
 
     /// Point the route the route table `route_table_id` holds for `spec`'s destination at
@@ -1087,6 +1135,72 @@ impl ComAmazonawsEc2Amazonec2State {
             }
         }
         dropped.then(disassociating_route_table_association_state)
+    }
+
+    /// The association `association_id` names, whichever stored table holds it — the implicit
+    /// association of a MAIN table as well as an explicit one a caller made.
+    ///
+    /// A READ, and the resolver for an operation that may name either: "you can also use this
+    /// operation to change which table is the main route table in the VPC. Specify the main
+    /// route table's association ID and the route table ID of the new main route table"
+    /// (`ReplaceRouteTableAssociation`). [`Self::explicit_route_table_association`] is the
+    /// narrower read, for the operations whose id must name an association a caller made.
+    pub fn route_table_association(&self, association_id: &str) -> Option<RouteTableAssociation> {
+        self.route_tables
+            .values()
+            .flat_map(|route_table| route_table.associations.iter().flatten())
+            .find(|association| {
+                association.route_table_association_id.as_deref() == Some(association_id)
+            })
+            .cloned()
+    }
+
+    /// Put the route table `route_table_id` in the place of the one the association
+    /// `association_id` names, and answer the `RouteTableAssociationId` of the association
+    /// that replaces it.
+    ///
+    /// "After the operation completes, the subnet or gateway uses the routes in the new route
+    /// table" (`ReplaceRouteTableAssociation`): what the displaced association bound stays
+    /// bound, to the named table instead — so the old record goes and a new one takes its
+    /// place, with an id of its own, through the one writer of the kind of association it is
+    /// ([`Self::associate_subnet_with_route_table`] for a subnet's explicit association,
+    /// [`Self::record_main_route_table_association`] for the VPC's implicit one). A subnet is
+    /// therefore left associated with exactly one table and a VPC with exactly one main
+    /// table, which is what every reader of those records depends on.
+    ///
+    /// `None`, with NOTHING written, when no stored table holds that association, the store
+    /// holds no table with that id, or the association binds an endpoint this store keeps no
+    /// record of.
+    pub fn replace_route_table_association(
+        &mut self,
+        association_id: &str,
+        route_table_id: &str,
+    ) -> Option<String> {
+        let association = self.route_table_association(association_id)?;
+        if !self.route_tables.contains_key(route_table_id) {
+            return None;
+        }
+        // What the displaced association binds — the VPC's implicit endpoint, or the one
+        // subnet it names — read BEFORE anything is written, so an association with an
+        // endpoint this store cannot rebind leaves the store exactly as it was.
+        let main = association.main == Some(true);
+        let subnet_id = association.subnet_id.clone();
+        if !main && subnet_id.is_none() {
+            return None;
+        }
+        for route_table in self.route_tables.values_mut() {
+            if let Some(associations) = route_table.associations.as_mut() {
+                associations.retain(|held| {
+                    held.route_table_association_id.as_deref() != Some(association_id)
+                });
+            }
+        }
+        match subnet_id {
+            Some(subnet_id) if !main => {
+                self.associate_subnet_with_route_table(route_table_id, &subnet_id)
+            }
+            _ => self.record_main_route_table_association(route_table_id),
+        }
     }
 
     /// Drop the routes of ONE table whose GATEWAY target is `gateway_id`, and answer how many

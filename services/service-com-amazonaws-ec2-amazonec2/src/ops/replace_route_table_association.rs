@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReplaceRouteTableAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReplaceRouteTableAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: moves what a stored route table association binds — one subnet, or the
+//! VPC's implicit main endpoint — onto another route table of the SAME VPC, and answers the
+//! id and state of the association that replaced it (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::replace_route_table_association`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReplaceRouteTableAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +138,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReplaceRouteTableAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReplaceRouteTableAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReplaceRouteTableAssociation"))
+        // `ctx` carries request metadata only; this operation reads none of it — both the
+        // association and the table that takes over are named by id. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A move the clock already owed is applied before the store is read, so the
+        // association this replaces is resolved as it stands now.
+        store.materialize_due_transitions();
+
+        // "The association ID" (`$AssociationId`): a value this service could not have ISSUED
+        // as one is refused before anything is looked up — an EC2 id reaches the service
+        // encoded rather than as the identifier it stands for, so a value no issue of this
+        // kind could have produced is one the service cannot read rather than a resource that
+        // is not there ([`state::ComAmazonawsEc2Amazonec2State::id_was_issued`], the reading
+        // every id kind of this crate that answers `Invalid<Kind>.Malformed` for a merely
+        // well-printed value takes).
+        if !store.id_was_issued(state::ROUTE_TABLE_ASSOCIATION_ID_PREFIX, &input.association_id) {
+            return Err(state::invalid_route_table_association_id_malformed(
+                &input.association_id,
+            ));
+        }
+
+        // The association is what this operation replaces, so an id the service COULD have
+        // issued that no stored table holds an association for is the not-found half of that
+        // pair rather than an association made out of nothing. The implicit association of a
+        // main table IS one a caller may name here — "you can also use this operation to
+        // change which table is the main route table in the VPC. Specify the main route
+        // table's association ID" — which is why this resolves every association rather than
+        // only the explicit ones a `DisassociateRouteTable` may take away.
+        let Some(association) = store.route_table_association(&input.association_id) else {
+            return Err(state::invalid_association_id_not_found(&input.association_id));
+        };
+
+        // "The ID of the new route table to associate with the subnet" (`$RouteTableId`): the
+        // table that takes over, which the account has to hold.
+        let Some(route_table) = store.route_tables.get(&input.route_table_id) else {
+            return Err(state::invalid_route_table_id_not_found(&input.route_table_id));
+        };
+        let route_table_vpc_id = route_table.vpc_id.clone();
+
+        // "Changes the route table associated with a given subnet, internet gateway, or
+        // virtual private gateway IN A VPC": a route table routes for one VPC
+        // (`RouteTable$VpcId`), so what the association binds can only move onto a table of
+        // that same VPC — the routes would otherwise be in a network the subnet, or the VPC
+        // itself, is not part of. `AssociateRouteTable` refuses the same cross-VPC pairing,
+        // in the same words.
+        let association_route_table_id = association.route_table_id.clone().unwrap_or_default();
+        let association_vpc_id = store
+            .route_tables
+            .get(&association_route_table_id)
+            .and_then(|route_table| route_table.vpc_id.clone());
+        if association_vpc_id != route_table_vpc_id {
+            // The pair the request collided on, named out of the STORE: the subnet the
+            // association binds, or the network itself for the implicit association every
+            // subnet without one of its own uses.
+            let other = match association.subnet_id.as_deref() {
+                Some(subnet_id) => format!("subnet {subnet_id}"),
+                None => format!("network {}", association_vpc_id.unwrap_or_default()),
+            };
+            return Err(state::invalid_parameter_value(format!(
+                "route table {route_table_id} and {other} \
+                 belong to different networks",
+                route_table_id = input.route_table_id,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // What the association bound moves onto the named table: the old record goes and a
+        // new one takes its place — written by the store's own writers of a table's
+        // `Associations`, so `DescribeRouteTables` reads the move off the same records, and a
+        // subnet is left using exactly one table and a VPC having exactly one main table.
+        let Some(new_association_id) =
+            store.replace_route_table_association(&input.association_id, &input.route_table_id)
+        else {
+            // Both sides were resolved under this same lock, so this cannot happen — and if
+            // it ever did, the request must not answer 200 with nothing moved.
+            return Err(state::internal_error(
+                "the route table association checked a moment ago could not be replaced",
+            ));
+        };
+
+        // The answer is the association as it was stored: the id the store minted for the
+        // record it just wrote, and the state read back OFF that record, so this call and
+        // `DescribeRouteTables` cannot drift apart.
+        let association_state = store
+            .route_table_association(&new_association_id)
+            .and_then(|association| association.association_state);
+        Ok(ReplaceRouteTableAssociationOutput {
+            new_association_id: Some(new_association_id),
+            association_state,
+        })
     }
 }
