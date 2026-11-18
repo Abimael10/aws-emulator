@@ -55,10 +55,14 @@ const JOB_IN_PROGRESS: &str = "IN_PROGRESS";
 const JOB_CANCELED: &str = "CANCELED";
 const JOB_COMPLETED: &str = "COMPLETED";
 
-/// The `DeploymentStatus` a deployment that has just been created carries, and the one
-/// a cancelled deployment reports.
-const DEPLOYMENT_ACTIVE: &str = "ACTIVE";
-const DEPLOYMENT_CANCELED: &str = "CANCELED";
+/// The `DeploymentStatus` values these rows name, from the modelled enum
+/// (`smithy_query(query="shape",shape="DeploymentStatus")`: `ACTIVE`, `COMPLETED`,
+/// `CANCELED`, `FAILED`, `INACTIVE`) — the one a deployment that has just been created
+/// carries, the one a cancelled deployment reports, and the one a superseded revision
+/// settles in.
+pub(crate) const DEPLOYMENT_ACTIVE: &str = "ACTIVE";
+pub(crate) const DEPLOYMENT_CANCELED: &str = "CANCELED";
+pub(crate) const DEPLOYMENT_INACTIVE: &str = "INACTIVE";
 
 type GreengrassV2 =
     service_com_amazonaws_greengrassv2_greengrassv2::EmulatedService<engine::InMemoryEngine>;
@@ -69,16 +73,21 @@ type IotJobsData =
     >;
 
 /// One answer, reduced to what the rows assert on.
+///
+/// This suite OWNS the Greengrass V2 + IoT harness (the router, the deployment calls and
+/// the answer readers); the sibling suite
+/// `all/greengrass_deployment_supersede_status.rs` drives the same front door through it,
+/// so a deployment request is built and read exactly one way across these rows.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    error_code: String,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error_code: String,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// A string member, addressed by JSON pointer so a nested member is one call.
-    fn text(&self, pointer: &str) -> String {
+    pub(crate) fn text(&self, pointer: &str) -> String {
         self.body
             .pointer(pointer)
             .and_then(Value::as_str)
@@ -103,16 +112,22 @@ impl Answer {
     fn number(&self, pointer: &str) -> Option<i64> {
         self.body.pointer(pointer).and_then(Value::as_i64)
     }
+
+    /// A boolean member, `None` when the answer carries none — so a member that is
+    /// missing is never read as `false`.
+    pub(crate) fn flag(&self, pointer: &str) -> Option<bool> {
+        self.body.pointer(pointer).and_then(Value::as_bool)
+    }
 }
 
 /// The three services, over ONE shared engine exactly as `router/src/lib.rs` mounts
 /// them.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests exercise handler behaviour, not request signing.
@@ -167,12 +182,12 @@ impl Emulator {
         }
     }
 
-    async fn create_deployment(&self, request: Value) -> Answer {
+    pub(crate) async fn create_deployment(&self, request: Value) -> Answer {
         self.call(GREENGRASS, "POST", "/greengrass/v2/deployments", Some(request))
             .await
     }
 
-    async fn get_deployment(&self, deployment_id: &str) -> Answer {
+    pub(crate) async fn get_deployment(&self, deployment_id: &str) -> Answer {
         self.call(
             GREENGRASS,
             "GET",
@@ -182,7 +197,19 @@ impl Emulator {
         .await
     }
 
-    async fn cancel_deployment(&self, deployment_id: &str) -> Answer {
+    /// `ListDeployments` with `query` as its query string — how a client reads the
+    /// deployment history of a target rather than one deployment.
+    pub(crate) async fn list_deployments(&self, query: &str) -> Answer {
+        self.call(
+            GREENGRASS,
+            "GET",
+            &format!("/greengrass/v2/deployments?{query}"),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn cancel_deployment(&self, deployment_id: &str) -> Answer {
         self.call(
             GREENGRASS,
             "POST",
@@ -221,7 +248,7 @@ impl Emulator {
     /// a target that plane holds nothing under is refused. A target an earlier row
     /// already created answers `ResourceAlreadyExistsException`, which is the same
     /// prerequisite met.
-    async fn ensure_target(&self, target_arn: &str) {
+    pub(crate) async fn ensure_target(&self, target_arn: &str) {
         let resource = target_arn
             .rsplit_once(':')
             .map(|(_, resource)| resource)
@@ -245,12 +272,12 @@ impl Emulator {
 }
 
 /// The ARN of a thing group, as a deployment names one.
-fn thing_group_arn(name: &str) -> String {
+pub(crate) fn thing_group_arn(name: &str) -> String {
     format!("arn:aws:iot:{REGION}:{ACCOUNT}:thinggroup/{name}")
 }
 
 /// The ARN of a thing, the other target form a deployment may name.
-fn thing_arn(name: &str) -> String {
+pub(crate) fn thing_arn(name: &str) -> String {
     format!("arn:aws:iot:{REGION}:{ACCOUNT}:thing/{name}")
 }
 
