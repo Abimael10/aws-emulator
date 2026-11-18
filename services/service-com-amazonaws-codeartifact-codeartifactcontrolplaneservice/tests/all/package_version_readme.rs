@@ -72,12 +72,24 @@ fn publish_document(package: &str, version: &str, readme: Option<&str>, tarball:
     .expect("serialize the publish document")
 }
 
-/// `GetPackageVersionReadme` over the control plane.
+/// The `namespace` query component a coordinate carries, empty for a package whose format
+/// has no namespace component or that was published without one. Percent-encoded with the
+/// suite-wide helper, so a namespace carrying reserved characters (a Maven groupId, a scope
+/// written with a separator) survives the server's decode.
+fn namespace_component(namespace: Option<&str>) -> String {
+    namespace.map_or_else(String::new, |namespace| {
+        format!("&namespace={}", crate::resource_tags::encode_query(namespace))
+    })
+}
+
+/// `GetPackageVersionReadme` over the control plane, for a coordinate with or without a
+/// namespace.
 async fn get_readme(
     router: &MultiServiceRouter,
     domain: &str,
     repository: &str,
     format: &str,
+    namespace: Option<&str>,
     package: &str,
     version: &str,
 ) -> Answer {
@@ -86,7 +98,8 @@ async fn get_readme(
         "GET",
         &format!(
             "/v1/package/version/readme?domain={domain}&repository={repository}&format={format}\
-             &package={package}&version={version}"
+             &package={package}&version={version}{}",
+            namespace_component(namespace)
         ),
         None,
     )
@@ -100,6 +113,7 @@ async fn describe_version(
     domain: &str,
     repository: &str,
     format: &str,
+    namespace: Option<&str>,
     package: &str,
     version: &str,
 ) -> Answer {
@@ -108,7 +122,8 @@ async fn describe_version(
         "GET",
         &format!(
             "/v1/package/version?domain={domain}&repository={repository}&format={format}\
-             &package={package}&version={version}"
+             &package={package}&version={version}{}",
+            namespace_component(namespace)
         ),
         None,
     )
@@ -225,7 +240,8 @@ async fn the_readme_an_npm_publish_carried_is_reported_unchanged() {
             "case {case:?}: the npm publish must succeed, got {published:?}"
         );
 
-        let answer = get_readme(&router, domain, repository, "npm", package, version).await;
+        let answer =
+            get_readme(&router, domain, repository, "npm", None, package, version).await;
         assert_eq!(
             answer.status, 200,
             "case {case:?}: expected HTTP 200, got {answer:?}"
@@ -249,7 +265,7 @@ async fn the_readme_an_npm_publish_carried_is_reported_unchanged() {
             );
         }
         let described =
-            describe_version(&router, domain, repository, "npm", package, version).await;
+            describe_version(&router, domain, repository, "npm", None, package, version).await;
         assert_eq!(
             answer.body.get("versionRevision").and_then(Value::as_str),
             described
@@ -258,6 +274,119 @@ async fn the_readme_an_npm_publish_carried_is_reported_unchanged() {
                 .and_then(Value::as_str),
             "case {case:?}: expected the revision DescribePackageVersion reports, got \
              {answer:?}"
+        );
+    }
+}
+
+/// One row of the namespaced table: the case, the scope the publish wrote (`None` for an
+/// unscoped publish of the same name), and the readme that publish declared inline.
+type ScopedRow = (&'static str, Option<&'static str>, &'static str);
+
+/// RULES 1 and 2 where the version sits under a NAMESPACE, which for npm is its scope: a
+/// package is its whole `(format, namespace, name)` coordinate, so one name published under
+/// several scopes keeps each publish's own readme, reported beside the namespace it was
+/// stored under. Reading it again answers the same thing, because reporting a readme moves
+/// nothing.
+#[tokio::test]
+async fn a_namespaced_version_reports_its_own_readme_and_namespace() {
+    let router = emulator();
+    let domain = "ca-readme-scoped";
+    let repository = "documented";
+    let token = given_repository(&router, domain, repository).await;
+    let host = endpoint_host(domain);
+    // ONE name, published under scopes and bare: each row's readme must come back only for
+    // the coordinate that carried it.
+    let package = "widget";
+    let version = "2.1.0";
+    let rows: [ScopedRow; 3] = [
+        ("under one scope", Some("acme"), "# acme widget\n説明 ☕"),
+        ("under another scope", Some("globex"), "# globex widget\nОбзор"),
+        ("with no scope at all", None, "# bare widget\nplain"),
+    ];
+
+    for (case, namespace, readme) in rows {
+        let display_name = match namespace {
+            Some(scope) => format!("@{scope}/{package}"),
+            None => package.to_string(),
+        };
+        // npm addresses a scoped package in ONE path segment, its separator encoded.
+        let path = match namespace {
+            Some(scope) => format!("/npm/{repository}/@{scope}%2f{package}"),
+            None => format!("/npm/{repository}/{package}"),
+        };
+        let archive = tarball("package/index.js", b"module.exports = 1;");
+        let published = registry(
+            &router,
+            "PUT",
+            &host,
+            &path,
+            Some(&token),
+            Some(publish_document(
+                &display_name,
+                version,
+                Some(readme),
+                &archive,
+            )),
+        )
+        .await;
+        assert_eq!(
+            published.status, 200,
+            "case {case:?}: the npm publish of {display_name:?} must succeed, got {published:?}"
+        );
+    }
+
+    for (case, namespace, readme) in rows {
+        let answer =
+            get_readme(&router, domain, repository, "npm", namespace, package, version).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected HTTP 200, got {answer:?}"
+        );
+        assert_eq!(
+            readme_of(&answer).as_deref(),
+            Some(readme),
+            "case {case:?}: expected the readme {readme:?}, got {:?}",
+            readme_of(&answer)
+        );
+        // RULE 2: the namespace the version is stored under, reported for a scoped version
+        // and absent for one published without a scope.
+        assert_eq!(
+            answer.body.get("namespace").and_then(Value::as_str),
+            namespace,
+            "case {case:?}: expected the namespace {namespace:?}, got {answer:?}"
+        );
+        assert_eq!(
+            answer.body.get("package").and_then(Value::as_str),
+            Some(package),
+            "case {case:?}: expected the package {package:?}, got {answer:?}"
+        );
+
+        // RULE 2, for a namespaced coordinate too: the version it read, at the revision
+        // `DescribePackageVersion` reports for the same coordinate.
+        assert_eq!(
+            answer.body.get("version").and_then(Value::as_str),
+            Some(version),
+            "case {case:?}: expected the version {version:?}, got {answer:?}"
+        );
+        let described =
+            describe_version(&router, domain, repository, "npm", namespace, package, version)
+                .await;
+        assert_eq!(
+            answer.body.get("versionRevision").and_then(Value::as_str),
+            described
+                .body
+                .pointer("/packageVersion/revision")
+                .and_then(Value::as_str),
+            "case {case:?}: expected the revision DescribePackageVersion reports, got {answer:?}"
+        );
+
+        // Reporting only: a second read answers exactly what the first one did.
+        let again =
+            get_readme(&router, domain, repository, "npm", namespace, package, version).await;
+        assert_eq!(
+            again.body, answer.body,
+            "case {case:?}: expected a second read to answer {:?}, got {:?}",
+            answer.body, again.body
         );
     }
 }
@@ -313,7 +442,8 @@ async fn the_long_description_a_pypi_upload_sent_is_its_readme() {
             uploaded.status, 201,
             "case {case:?}: the upload must succeed, got {uploaded:?}"
         );
-        let answer = get_readme(&router, domain, repository, "pypi", normalized, "1.0.0").await;
+        let answer =
+            get_readme(&router, domain, repository, "pypi", None, normalized, "1.0.0").await;
         assert_eq!(
             answer.status, 200,
             "case {case:?}: expected HTTP 200, got {answer:?}"
@@ -394,6 +524,7 @@ async fn a_coordinate_the_repository_does_not_hold_is_refused() {
             in_domain,
             in_repository,
             "npm",
+            None,
             for_package,
             for_version,
         )
