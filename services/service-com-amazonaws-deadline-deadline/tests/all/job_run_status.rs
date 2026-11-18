@@ -532,14 +532,28 @@ async fn deleting_a_fleet_a_queue_is_associated_with_is_refused() {
         "ConflictException",
         "DeleteFleet on an associated fleet: expected a ConflictException, got {body}"
     );
-    let expected = format!(
-        "The fleet {fleet_id} can't be deleted because it is associated with the queue \
-         {queue_id}."
-    );
+    // The fixed sentence this service's resource-in-use conflict carries, with the blocked
+    // resource named in prose and no id interpolated.
+    let expected = "Request could not be completed: Fleet is associated with one or more \
+                    Queues.";
     assert_eq!(
         string_at(&body, "message"),
         expected,
         "DeleteFleet on an associated fleet: expected the message {expected:?}, got {body}"
+    );
+    assert_eq!(
+        (
+            string_at(&body, "reason"),
+            string_at(&body, "resourceType"),
+            string_at(&body, "resourceId"),
+        ),
+        (
+            "RESOURCE_IN_USE".to_string(),
+            "fleet".to_string(),
+            fleet_id.clone(),
+        ),
+        "DeleteFleet on an associated fleet: expected the conflict to name the fleet in \
+         use, got {body}"
     );
 
     // The refusal removed nothing.

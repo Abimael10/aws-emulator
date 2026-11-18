@@ -10,9 +10,9 @@
 //!   delete — and a delete naming a limit or a farm this emulator does not hold — is the
 //!   same empty success rather than a refusal;
 //! * a queue-limit association is a live reference to the limit, so while one holds it the
-//!   delete is refused with the only client-input error the operation models (HTTP 400
-//!   `ValidationException`) and the limit stays readable; once nothing is associated with
-//!   it the same delete succeeds.
+//!   delete is refused as a conflict over a resource in use (HTTP 409 `ConflictException`,
+//!   `reason` `RESOURCE_IN_USE`, naming the blocked limit) and the limit stays readable;
+//!   once nothing is associated with it the same delete succeeds.
 //!
 //! The harness (`Emulator`) and the limit helper are the ones the other suites drive the
 //! service with, so these tests go through routing, deserialization, constraint
@@ -273,84 +273,90 @@ async fn a_limit_a_queue_is_still_associated_with_is_not_deleted() {
     associate(&emulator, &farm_id, &second_of_two, &limits[1]).await;
     associate(&emulator, &other_farm_id, &other_farm_queue, &elsewhere).await;
 
-    // `expected_queue` is the queue the refusal must name: the lowest id of the queues
-    // holding an association, so the answer does not depend on map order. `None` means the
-    // delete is expected to succeed.
-    let cases: Vec<(&str, &str, &str, Option<String>)> = vec![
+    // `blocked` says whether the delete is expected to be refused; the refusal names no
+    // queue, so a row does not have to predict WHICH holder the store finds first.
+    let cases: Vec<(&str, &str, &str, bool)> = vec![
         (
             "one queue is associated with this limit",
             &farm_id,
             &limits[0],
-            Some(sole),
+            true,
         ),
         (
             "two queues are associated with this limit",
             &farm_id,
             &limits[1],
-            Some(first_of_two.min(second_of_two)),
+            true,
         ),
         (
             "no queue of this farm is associated with this limit",
             &farm_id,
             &limits[2],
-            None,
+            false,
         ),
         (
             "a queue of this farm exists but is associated with nothing",
             &farm_id,
             &limits[3],
-            None,
+            false,
         ),
         (
             "only a queue of ANOTHER farm is associated with a limit of that farm",
             &other_farm_id,
             &elsewhere,
-            Some(other_farm_queue),
+            true,
         ),
     ];
 
-    for (case, farm, limit_id, expected_queue) in &cases {
+    for (case, farm, limit_id, blocked) in &cases {
         let (status, body) = delete_limit(&emulator, farm, limit_id).await;
-        match expected_queue {
-            Some(queue_id) => {
-                assert_eq!(
-                    status, 400,
-                    "case {case:?}: expected DeleteLimit to answer 400, got {status} with {body}"
-                );
-                assert_eq!(
-                    error_code(&body),
-                    "ValidationException",
-                    "case {case:?}: expected a ValidationException, got {body}"
-                );
-                assert_eq!(
-                    string_at(&body, "message"),
-                    format!(
-                        "The limit {limit_id} can't be deleted because it is associated with \
-                         the queue {queue_id}."
-                    ),
-                    "case {case:?}: expected the refusal to name the limit and the queue \
-                     associated with it, got {body}"
-                );
-                // The refused delete removed nothing.
-                let (status, read) = emulator.get(&limit_path(farm, limit_id)).await;
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: expected the refused limit to stay readable, got {status} \
-                     with {read}"
-                );
-            }
-            None => {
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: expected DeleteLimit to answer 200, got {status} with {body}"
-                );
-                let (status, read) = emulator.get(&limit_path(farm, limit_id)).await;
-                assert_eq!(
-                    status, 404,
-                    "case {case:?}: expected the deleted limit to be gone, got {status} with \
-                     {read}"
-                );
-            }
+        if *blocked {
+            assert_eq!(
+                status, 409,
+                "case {case:?}: expected DeleteLimit to answer 409, got {status} with {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ConflictException",
+                "case {case:?}: expected a ConflictException, got {body}"
+            );
+            assert_eq!(
+                string_at(&body, "message"),
+                "Request could not be completed: Limit is associated with one or more \
+                 Queues.",
+                "case {case:?}: expected this error class's fixed sentence, got {body}"
+            );
+            assert_eq!(
+                (
+                    string_at(&body, "reason"),
+                    string_at(&body, "resourceType"),
+                    string_at(&body, "resourceId"),
+                ),
+                (
+                    "RESOURCE_IN_USE".to_string(),
+                    "limit".to_string(),
+                    (*limit_id).to_string(),
+                ),
+                "case {case:?}: expected the conflict to name the limit in use, got {body}"
+            );
+            // The refused delete removed nothing.
+            let (status, read) = emulator.get(&limit_path(farm, limit_id)).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the refused limit to stay readable, got {status} \
+                 with {read}"
+            );
+        } else {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected DeleteLimit to answer 200, got {status} with {body}"
+            );
+            let (status, read) = emulator.get(&limit_path(farm, limit_id)).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected the deleted limit to be gone, got {status} with \
+                 {read}"
+            );
         }
     }
 }
@@ -372,8 +378,8 @@ async fn a_limit_is_deletable_once_nothing_is_associated_with_it() {
     // refused while a queue was associated with the limit succeeds once that queue is gone.
     let (status, body) = delete_limit(&emulator, &farm_id, &limit_id).await;
     assert_eq!(
-        status, 400,
-        "while the queue holds the association: expected 400, got {status} with {body}"
+        status, 409,
+        "while the queue holds the association: expected 409, got {status} with {body}"
     );
 
     let (status, body) = emulator

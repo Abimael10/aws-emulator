@@ -5,11 +5,13 @@
 //!
 //! A queue's `allowedStorageProfileIds` points at the profiles that queue may use, so a
 //! profile one of its farm's queues still lists is NOT deleted out from under it: the
-//! delete is refused and the profile stays readable. `DeleteStorageProfile` models neither
-//! `ConflictException` nor `ResourceNotFoundException` — `ValidationException` is its only
-//! client-input error — so that refusal is a 400, and a delete naming a farm or a profile
-//! this store no longer holds is the empty success an `@idempotent` delete answers with
-//! when there is nothing left to remove.
+//! delete is refused and the profile stays readable. That refusal is a conflict over a
+//! resource still IN USE, not a complaint about the request, so it goes out as this
+//! SERVICE's `ConflictException` (HTTP 409) — widened onto this operation's error enum
+//! through `extra_errors` below, because the operation's own `errors` list omits the
+//! shape. `DeleteStorageProfile` models no `ResourceNotFoundException`, so a delete naming
+//! a farm or a profile this store no longer holds is the empty success an `@idempotent`
+//! delete answers with when there is nothing left to remove.
 //!
 //! ## Shape of an operation
 //!
@@ -61,6 +63,10 @@
 //! ## Errors
 //!
 //! * `AccessDeniedException` (HTTP 403) — You don't have permission to perform the action.
+//! * `ConflictException` (HTTP 409) — widened in through `extra_errors` (see below): your
+//!   request has conflicting operations, which includes a resource another one still has in
+//!   use. The model's `errors` list for this operation omits the shape, which this SERVICE
+//!   models.
 //! * `InternalServerErrorException` (HTTP 500) — Deadline Cloud can't process your request
 //!   right now. Try again later.
 //! * `ThrottlingException` (HTTP 429) — Your request exceeded a request rate quota.
@@ -81,10 +87,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-deadline-deadline.json"
 // here — hence the `DeleteStorageProfileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.deadline#DeleteStorageProfile")]
+//
+// `ConflictException` is widened in through `extra_errors`: the refusal of a delete that a
+// queue's reference blocks is a conflict over a resource in use (409), which this SERVICE
+// models — and other operations of it declare — while this operation's own `errors` list
+// omits it. Answering it as the operation's `ValidationException` instead would tell the
+// caller its request was malformed.
+#[smithy_macros::operation_error(
+    "com.amazonaws.deadline#DeleteStorageProfile",
+    extra_errors = ["ConflictException"]
+)]
 #[derive(Debug)]
 pub enum DeleteStorageProfileErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    ConflictException(ConflictException),
     InternalServerErrorException(InternalServerErrorException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
@@ -152,17 +168,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A queue's `allowedStorageProfileIds` is a live reference to the profile — it is
         // what `GetStorageProfileForQueue` and `ListStorageProfilesForQueue` resolve — so
-        // the profile is not deleted out from under the queue that points at it. The
-        // refusal goes out as this operation's only modeled client-input error.
-        if let Some(queue_id) = store
+        // the profile is not deleted out from under the queue that points at it. What the
+        // caller has to change is the reference, not the request, so the refusal is the
+        // resource-in-use conflict (409) and carries the blocked profile as the resource in
+        // use; which queues hold it is not part of the answer.
+        if store
             .queue_allowing_storage_profile(&input.farm_id, &input.storage_profile_id)
-            .map(str::to_string)
+            .is_some()
         {
-            return Err(DeleteStorageProfileErrorModeled::ValidationException(
-                crate::state::storage_profile_allowed_by_queue(
-                    &input.storage_profile_id,
-                    &queue_id,
-                ),
+            return Err(DeleteStorageProfileErrorModeled::ConflictException(
+                crate::state::storage_profile_in_use_by_queues(&input.storage_profile_id),
             )
             .into());
         }

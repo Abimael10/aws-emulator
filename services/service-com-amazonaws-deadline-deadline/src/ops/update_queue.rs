@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Patches a queue of this service's store in place.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Only `farmId` and `queueId` are required, so every other member the request carries is
+//! applied and every one it leaves out keeps the value the queue holds. The two list
+//! members are patched rather than replaced: the model gives each of them an `…ToAdd` and
+//! an `…ToRemove` list, so the stored list is the one it already held with the removals
+//! taken out and the additions it does not already carry appended (the lists are
+//! `@uniqueItems`, so an entry is stored once). A list the patch empties stays a list: a
+//! patch changes what a member holds, not whether the queue has it. The list a patch would
+//! leave the queue with has to fit the maximum the model gives the stored shape (both are
+//! `len 0..20`), so a patch that would pass it is refused with the queue untouched. `schedulingConfiguration` is documented as replaced whole, which is what a
+//! patched member does here.
+//!
+//! A queue is reached only through its own farm, so each missing level of the path is the
+//! modelled 404 naming that level and nothing is written; `clientToken` is
+//! `@idempotencyToken`, so a retry of an update already applied answers as that update did
+//! and writes nothing again.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +181,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateQueue"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateQueueErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // `clientToken` is `@idempotencyToken` — the token the server recognizes retries of
+        // the same request by. An update is addressed at ONE queue, so the token is scoped
+        // to the queue rather than to its farm: the same token spent on two queues of one
+        // farm is two updates, and a later retry of either is still recognized as the retry
+        // it is.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, &input.queue_id, token));
+        let remembered = token
+            .as_deref()
+            .and_then(|key| store.remembered_resource(key).map(str::to_string));
+
+        // A queue is reached only through its own farm, so each missing level of the path
+        // is a 404 naming that level and nothing is written.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(UpdateQueueErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        let updated_by = crate::state::caller_principal(&*self.engine, ctx);
+        let Some(queue) = store.queue_mut(&input.farm_id, &input.queue_id) else {
+            return Err(UpdateQueueErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+            )
+            .into());
+        };
+
+        // A retry of an update already applied to this very queue answers as that update
+        // did and writes nothing again, so the queue keeps the `updatedAt` of the call the
+        // caller actually made.
+        if remembered.as_deref() == Some(input.queue_id.as_str()) {
+            return Ok(UpdateQueueOutput {});
+        }
+
+        // A patch changes what the queue's list members HOLD, so the list each one would be
+        // left with is built — and checked against the model's own maximum for the stored
+        // shape — before any member is applied: a patch that would leave the queue holding
+        // more than the shape allows is refused with the queue untouched, naming the member
+        // whose additions do not fit.
+        let required_file_system_location_names = patched_list(
+            queue.required_file_system_location_names.as_deref(),
+            input.required_file_system_location_names_to_add.as_deref(),
+            input.required_file_system_location_names_to_remove.as_deref(),
+        );
+        let allowed_storage_profile_ids = patched_list(
+            queue.allowed_storage_profile_ids.as_deref(),
+            input.allowed_storage_profile_ids_to_add.as_deref(),
+            input.allowed_storage_profile_ids_to_remove.as_deref(),
+        );
+        for (member, patched, maximum) in [
+            (
+                "requiredFileSystemLocationNamesToAdd",
+                required_file_system_location_names.as_deref(),
+                crate::state::MAX_QUEUE_REQUIRED_FILE_SYSTEM_LOCATION_NAMES,
+            ),
+            (
+                "allowedStorageProfileIdsToAdd",
+                allowed_storage_profile_ids.as_deref(),
+                crate::state::MAX_QUEUE_ALLOWED_STORAGE_PROFILE_IDS,
+            ),
+        ] {
+            let held = patched.map_or(0, <[String]>::len);
+            if held > maximum {
+                return Err(UpdateQueueErrorModeled::ValidationException(
+                    crate::state::field_validation_failed(
+                        member,
+                        &format!(
+                            "A queue holds at most {maximum} of them, and this update would \
+                             leave it with {held}."
+                        ),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        if let Some(display_name) = input.display_name {
+            queue.display_name = display_name;
+        }
+        if let Some(description) = input.description {
+            queue.description = description;
+        }
+        if let Some(default_budget_action) = input.default_budget_action {
+            queue.default_budget_action = default_budget_action;
+        }
+        if let Some(role_arn) = input.role_arn {
+            queue.role_arn = Some(role_arn);
+        }
+        if let Some(job_attachment_settings) = input.job_attachment_settings {
+            queue.job_attachment_settings = Some(job_attachment_settings);
+        }
+        if let Some(job_run_as_user) = input.job_run_as_user {
+            queue.job_run_as_user = Some(job_run_as_user);
+        }
+        if let Some(scheduling_configuration) = input.scheduling_configuration {
+            // "When updating the scheduling configuration, the entire configuration is
+            // replaced" (`smithy_query(query="doc", shape="UpdateQueueRequest",
+            // member="schedulingConfiguration")`), which is what this member does.
+            queue.scheduling_configuration = Some(scheduling_configuration);
+        }
+        queue.required_file_system_location_names = required_file_system_location_names;
+        queue.allowed_storage_profile_ids = allowed_storage_profile_ids;
+        queue.updated_at = Some(::std::time::SystemTime::now());
+        queue.updated_by = Some(updated_by);
+
+        if let Some(key) = token {
+            store.remember_resource(key, &input.queue_id);
+        }
+
+        Ok(UpdateQueueOutput {})
     }
+}
+
+/// `stored` with `to_remove` taken out and the entries of `to_add` it does not already
+/// carry appended.
+///
+/// Both of this operation's list members are patched this way: each is modelled as a pair
+/// of `…ToAdd`/`…ToRemove` lists over a `@uniqueItems` list, so the order the queue already
+/// held is kept, an entry is stored once however often it is added, and an entry named in
+/// both lists of one request ends up carried — the request asked for it. A patch changes
+/// what the list HOLDS, not whether the queue has one: a member the create set stays set
+/// (as the empty list, once the patch takes its last entry out) and one no create set is
+/// reported only once something is added to it. The caller checks the result against the
+/// maximum the model gives the stored shape.
+fn patched_list(
+    stored: Option<&[String]>,
+    to_add: Option<&[String]>,
+    to_remove: Option<&[String]>,
+) -> Option<Vec<String>> {
+    let was_set = stored.is_some();
+    let mut entries = stored.unwrap_or_default().to_vec();
+    if let Some(to_remove) = to_remove {
+        entries.retain(|entry| !to_remove.contains(entry));
+    }
+    for entry in to_add.unwrap_or_default() {
+        if !entries.contains(entry) {
+            entries.push(entry.clone());
+        }
+    }
+    (was_set || !entries.is_empty()).then_some(entries)
 }

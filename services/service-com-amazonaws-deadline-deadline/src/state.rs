@@ -205,7 +205,8 @@ pub const BUDGET_STATUS_INACTIVE: &str = "INACTIVE";
 pub const RESOURCE_TYPE_FARM: &str = "farm";
 /// `resourceType` this service reports for a queue in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_QUEUE: &str = "queue";
-/// `resourceType` this service reports for a fleet in `ResourceNotFoundException`.
+/// `resourceType` this service reports for a fleet in `ResourceNotFoundException` and
+/// `ConflictException`.
 pub const RESOURCE_TYPE_FLEET: &str = "fleet";
 /// `resourceType` this service reports for a worker in `ResourceNotFoundException` and
 /// `ConflictException`.
@@ -225,16 +226,17 @@ pub const RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION: &str = "queue-fleet-association
 pub const RESOURCE_TYPE_QUEUE_LIMIT_ASSOCIATION: &str = "queue-limit-association";
 /// `resourceType` this service reports for a budget in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_BUDGET: &str = "budget";
-/// `resourceType` this service reports for a limit in `ResourceNotFoundException`. The
-/// model documents the member only as "the type of the resource that couldn't be found"
-/// and enumerates no values, so a resource type is spelled the way the API path spells
-/// that resource — the segment `/limits/` names it `limit`.
+/// `resourceType` this service reports for a limit in `ResourceNotFoundException` and
+/// `ConflictException`. The model documents the member only as "the type of the resource
+/// that couldn't be found" and enumerates no values, so a resource type is spelled the way
+/// the API path spells that resource — the segment `/limits/` names it `limit`.
 pub const RESOURCE_TYPE_LIMIT: &str = "limit";
 /// `resourceType` this service reports for a storage profile in
-/// `ResourceNotFoundException`. The model documents the member only as "the type of the
-/// resource that couldn't be found" and enumerates no values, so a resource type is
-/// spelled the way the API path spells that resource — the segment `/storage-profiles/`
-/// names it `storage-profile`, kebab-case and singular like every other type above.
+/// `ResourceNotFoundException` and `ConflictException`. The model documents the member
+/// only as "the type of the resource that couldn't be found" and enumerates no values, so
+/// a resource type is spelled the way the API path spells that resource — the segment
+/// `/storage-profiles/` names it `storage-profile`, kebab-case and singular like every
+/// other type above.
 pub const RESOURCE_TYPE_STORAGE_PROFILE: &str = "storage-profile";
 
 /// How many client tokens the store remembers at once.
@@ -280,6 +282,22 @@ pub const MAX_STORAGE_PROFILES_PER_FARM: usize = 500;
 
 /// How many limits one farm holds at once. See [`MAX_FARMS`].
 pub const MAX_LIMITS_PER_FARM: usize = 500;
+
+/// How many storage profile ids one queue allows at once.
+///
+/// The model's own maximum for the stored shape: `AllowedStorageProfileIds` is
+/// `len 0..20` (`smithy_query(query="shape", shape="AllowedStorageProfileIds")`), which is
+/// what `CreateQueue` stores and what `GetQueue` reports, so a queue cannot hold more than
+/// this however the list was built. `UpdateQueue` patches the list rather than replacing
+/// it, so the result of a patch is checked against this maximum as well.
+pub const MAX_QUEUE_ALLOWED_STORAGE_PROFILE_IDS: usize = 20;
+
+/// How many file system location names one queue requires at once.
+///
+/// The model's own maximum for the stored shape: `RequiredFileSystemLocationNames` is
+/// `len 0..20` (`smithy_query(query="shape", shape="RequiredFileSystemLocationNames")`).
+/// Same rule as [`MAX_QUEUE_ALLOWED_STORAGE_PROFILE_IDS`].
+pub const MAX_QUEUE_REQUIRED_FILE_SYSTEM_LOCATION_NAMES: usize = 20;
 
 /// The `maxCount` a limit may not carry.
 ///
@@ -1563,89 +1581,81 @@ pub fn fleet_at_worker_capacity(
     }
 }
 
-/// The 409 this service answers when a fleet a queue is still associated with is deleted.
+/// The 409 this service answers when a resource one or more of its farm's queues still
+/// names is deleted.
 ///
-/// The association is what the deletion would leave pointing at a fleet that no longer
-/// exists, so the fleet is the resource in conflict and the message names the queue that
-/// holds it; `queue_id` is read from the store, never from the request.
-pub fn fleet_associated_with_queue(
-    fleet_id: &str,
-    queue_id: &str,
+/// A queue that names the resource — in its own configuration, or through an association
+/// reached from it — depends on it, so the resource is not deleted out from under that
+/// queue: the delete is refused as a conflict over the resource that is IN USE, never as a
+/// malformed request, because every member of the request satisfies its own constraints.
+/// `resource_id`/`resource_type` are the model's "the resource in use" pair
+/// (`smithy_query(query="shape", shape="ConflictException")`), so they name the resource
+/// whose delete was refused, read from the request and this crate's own type spelling.
+///
+/// The sentence states only what the caller has to change — the reference — and names
+/// neither the blocked resource nor the queues holding it, so `display_noun` (how this
+/// service spells that resource in prose, sentence case) is the only part that varies
+/// between resources. One place to change: the fixed text is the wording of this error
+/// class, not of one operation.
+fn in_use_by_queues(
+    resource_type: &str,
+    resource_id: &str,
+    display_noun: &str,
 ) -> crate::ops::types::ConflictException {
     crate::ops::types::ConflictException {
         message: format!(
-            "The fleet {fleet_id} can't be deleted because it is associated with the \
-             queue {queue_id}."
+            "Request could not be completed: {display_noun} is associated with one or more \
+             Queues."
         ),
         // From `smithy_query(query="shape", shape="ConflictExceptionReason")`:
         // CONFLICT_EXCEPTION, CONCURRENT_MODIFICATION, RESOURCE_ALREADY_EXISTS,
-        // RESOURCE_IN_USE, STATUS_CONFLICT. The queue's association is a use of the fleet.
+        // RESOURCE_IN_USE, STATUS_CONFLICT. A queue's reference is a USE of the resource —
+        // nothing about the resource's own status conflicts.
         reason: "RESOURCE_IN_USE".to_string(),
-        resource_id: fleet_id.to_string(),
-        resource_type: RESOURCE_TYPE_FLEET.to_string(),
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
         context: None,
     }
 }
 
-/// The 400 this service answers when a storage profile a queue still allows is deleted.
+/// The 409 this service answers when a fleet a queue is still associated with is deleted.
 ///
-/// Same rule as [`fleet_associated_with_queue`] — a resource a queue's configuration still
-/// points at is not deleted out from under it — answered through the only client-input
-/// error `DeleteStorageProfile` models: it declares neither `ConflictException` nor
-/// `ResourceNotFoundException`, so its refusals go out as `ValidationException`
-/// (`smithy_query(query="operation", operation="DeleteStorageProfile")`). The message names
-/// the queue that holds the reference; `queue_id` is read from the store, never from the
-/// request.
-pub fn storage_profile_allowed_by_queue(
-    storage_profile_id: &str,
-    queue_id: &str,
-) -> crate::ops::types::ValidationException {
-    crate::ops::types::ValidationException {
-        message: format!(
-            "The storage profile {storage_profile_id} can't be deleted because it is \
-             associated with the queue {queue_id}."
-        ),
-        // From `smithy_query(query="shape", shape="ValidationExceptionReason")`:
-        // UNKNOWN_OPERATION, CANNOT_PARSE, FIELD_VALIDATION_FAILED, OTHER. Every member of
-        // the request satisfies its own constraints — what is refused is the state the
-        // deletion would leave behind — so no one field is at fault and the refusal
-        // carries no field list.
-        reason: "OTHER".to_string(),
-        field_list: None,
-        context: None,
-    }
+/// The association is what the deletion would leave pointing at a fleet that no longer
+/// exists, so the fleet is the resource in use. See [`in_use_by_queues`] for the class.
+pub fn fleet_in_use_by_queues(fleet_id: &str) -> crate::ops::types::ConflictException {
+    in_use_by_queues(RESOURCE_TYPE_FLEET, fleet_id, "Fleet")
 }
 
-/// The 400 this service answers when a limit a queue is still associated with is deleted.
+/// The 409 this service answers when a storage profile a queue still allows is deleted.
+///
+/// A queue's `allowedStorageProfileIds` is a live reference to the profile — it is what
+/// `GetStorageProfileForQueue` and `ListStorageProfilesForQueue` resolve — so the same
+/// class answers it as for a fleet a queue is associated with: see [`in_use_by_queues`].
+/// `DeleteStorageProfile`'s own `errors` list omits `ConflictException`
+/// (`smithy_query(query="operation", operation="DeleteStorageProfile")`), so that handler
+/// widens the shape this SERVICE models onto its error enum through `extra_errors` rather
+/// than re-classing the refusal as a client-input error.
+pub fn storage_profile_in_use_by_queues(
+    storage_profile_id: &str,
+) -> crate::ops::types::ConflictException {
+    in_use_by_queues(
+        RESOURCE_TYPE_STORAGE_PROFILE,
+        storage_profile_id,
+        "Storage profile",
+    )
+}
+
+/// The 409 this service answers when a limit a queue is still associated with is deleted.
 ///
 /// `smithy_query(query="doc", shape="DeleteLimit")` states the precondition: "Before you
 /// delete a limit you must use the DeleteQueueLimitAssociation operation to remove the
 /// association with any queues." The association is a live reference to the limit — it is
-/// what `GetQueueLimitAssociation` resolves — so the limit is not deleted out from under
-/// the queue that holds it. Same rule as [`storage_profile_allowed_by_queue`], and
-/// answered through the only client-input error `DeleteLimit` models: it declares neither
-/// `ConflictException` nor `ResourceNotFoundException`, so its refusals go out as
-/// `ValidationException` (`smithy_query(query="operation", operation="DeleteLimit")`). The
-/// message names the queue that holds the association; `queue_id` is read from the store,
-/// never from the request.
-pub fn limit_associated_with_queue(
-    limit_id: &str,
-    queue_id: &str,
-) -> crate::ops::types::ValidationException {
-    crate::ops::types::ValidationException {
-        message: format!(
-            "The limit {limit_id} can't be deleted because it is associated with the \
-             queue {queue_id}."
-        ),
-        // From `smithy_query(query="shape", shape="ValidationExceptionReason")`:
-        // UNKNOWN_OPERATION, CANNOT_PARSE, FIELD_VALIDATION_FAILED, OTHER. Every member of
-        // the request satisfies its own constraints — what is refused is the state the
-        // deletion would leave behind — so no one field is at fault and the refusal
-        // carries no field list.
-        reason: "OTHER".to_string(),
-        field_list: None,
-        context: None,
-    }
+/// what `GetQueueLimitAssociation` resolves — so the refusal is the same class as for
+/// every other resource a queue still holds: see [`in_use_by_queues`]. `DeleteLimit`'s own
+/// `errors` list omits `ConflictException`, so that handler widens it in the same way
+/// [`storage_profile_in_use_by_queues`] describes.
+pub fn limit_in_use_by_queues(limit_id: &str) -> crate::ops::types::ConflictException {
+    in_use_by_queues(RESOURCE_TYPE_LIMIT, limit_id, "Limit")
 }
 
 /// The 409 this service answers when a queue-fleet association is deleted before it has

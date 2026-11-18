@@ -172,14 +172,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A queue that still has this fleet associated with it depends on the fleet: the
         // association is reached through the queue, so removing the fleet would leave it
-        // naming one the store no longer holds. The queue in conflict is read from the
-        // store, and deleting the association releases the fleet.
-        let associated_queue = store
+        // naming one the store no longer holds. What the caller has to change is the
+        // association, so the refusal carries the blocked fleet as the resource in use;
+        // deleting the association releases the fleet.
+        if store
             .queue_associated_with_fleet(&input.farm_id, &input.fleet_id)
-            .map(str::to_string);
-        if let Some(queue_id) = associated_queue {
+            .is_some()
+        {
             return Err(DeleteFleetErrorModeled::ConflictException(
-                crate::state::fleet_associated_with_queue(&input.fleet_id, &queue_id),
+                crate::state::fleet_in_use_by_queues(&input.fleet_id),
             )
             .into());
         }

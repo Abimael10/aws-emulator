@@ -9,9 +9,10 @@
 //!   `@idempotent` and models no not-found error, so a profile this emulator no longer
 //!   holds (and a farm it never held) is nothing left to remove rather than a refusal;
 //! * a queue's `allowedStorageProfileIds` is a live reference to a profile of the same
-//!   farm, so while one holds it the delete is refused with the only client-input error
-//!   the operation models (HTTP 400 `ValidationException`) and the profile stays readable;
-//!   once nothing references it the same delete succeeds.
+//!   farm, so while one holds it the delete is refused as a conflict over a resource in
+//!   use (HTTP 409 `ConflictException`, `reason` `RESOURCE_IN_USE`, naming the blocked
+//!   profile) and the profile stays readable; once nothing references it the same delete
+//!   succeeds.
 //!
 //! The harness (`Emulator`) is the one every other suite in this target drives the service
 //! with, so these tests go through routing, deserialization, constraint validation, the
@@ -214,8 +215,8 @@ async fn a_storage_profile_a_queue_still_allows_is_not_deleted() {
     // along how the reference is held — alone, among several ids, by two queues at once —
     // and along the ways a reference does NOT reach the profile: a queue that allows other
     // ids, a queue with no list at all, and a queue of another farm that allows this id.
-    let sole = create_queue(&emulator, &farm_id, "Sole reference", Some(&[&profiles[0]])).await;
-    let among = create_queue(
+    create_queue(&emulator, &farm_id, "Sole reference", Some(&[&profiles[0]])).await;
+    create_queue(
         &emulator,
         &farm_id,
         "One of several",
@@ -226,9 +227,8 @@ async fn a_storage_profile_a_queue_still_allows_is_not_deleted() {
         ]),
     )
     .await;
-    let first_of_two = create_queue(&emulator, &farm_id, "First holder", Some(&[&profiles[2]])).await;
-    let second_of_two =
-        create_queue(&emulator, &farm_id, "Second holder", Some(&[&profiles[2]])).await;
+    create_queue(&emulator, &farm_id, "First holder", Some(&[&profiles[2]])).await;
+    create_queue(&emulator, &farm_id, "Second holder", Some(&[&profiles[2]])).await;
     create_queue(&emulator, &farm_id, "Other ids only", Some(&[&unrelated])).await;
     create_queue(&emulator, &farm_id, "No list at all", None).await;
     create_queue(
@@ -239,85 +239,83 @@ async fn a_storage_profile_a_queue_still_allows_is_not_deleted() {
     )
     .await;
 
-    // `expected_queue` is the queue the refusal must name: the lowest id of the queues
-    // holding the reference, so the answer does not depend on map order. `None` means the
-    // delete is expected to succeed.
-    let cases: Vec<(&str, &str, Option<String>)> = vec![
-        (
-            "one queue allows exactly this profile",
-            &profiles[0],
-            Some(sole),
-        ),
+    // `blocked` says whether the delete is expected to be refused; the refusal names no
+    // queue, so a row does not have to predict WHICH holder the store finds first.
+    let cases: Vec<(&str, &str, bool)> = vec![
+        ("one queue allows exactly this profile", &profiles[0], true),
         (
             "a queue allows this profile among several ids",
             &profiles[1],
-            Some(among),
+            true,
         ),
-        (
-            "two queues allow this profile",
-            &profiles[2],
-            Some(first_of_two.min(second_of_two)),
-        ),
+        ("two queues allow this profile", &profiles[2], true),
         (
             "no queue of this farm allows this profile",
             &profiles[3],
-            None,
+            false,
         ),
         (
             "only a queue of ANOTHER farm allows this profile",
             &profiles[4],
-            None,
+            false,
         ),
     ];
 
-    for (case, storage_profile_id, expected_queue) in &cases {
+    for (case, storage_profile_id, blocked) in &cases {
         let (status, body) = delete_profile(&emulator, &farm_id, storage_profile_id).await;
-        match expected_queue {
-            Some(queue_id) => {
-                assert_eq!(
-                    status, 400,
-                    "case {case:?}: expected DeleteStorageProfile to answer 400, got {status} \
-                     with {body}"
-                );
-                assert_eq!(
-                    error_code(&body),
-                    "ValidationException",
-                    "case {case:?}: expected a ValidationException, got {body}"
-                );
-                assert_eq!(
-                    string_at(&body, "message"),
-                    format!(
-                        "The storage profile {storage_profile_id} can't be deleted because it \
-                         is associated with the queue {queue_id}."
-                    ),
-                    "case {case:?}: expected the refusal to name the profile and the queue \
-                     holding it, got {body}"
-                );
-                // The refused delete removed nothing.
-                let (status, read) = emulator
-                    .get(&profile_path(&farm_id, storage_profile_id))
-                    .await;
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: expected the refused profile to stay readable, got \
-                     {status} with {read}"
-                );
-            }
-            None => {
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: expected DeleteStorageProfile to answer 200, got {status} \
-                     with {body}"
-                );
-                let (status, read) = emulator
-                    .get(&profile_path(&farm_id, storage_profile_id))
-                    .await;
-                assert_eq!(
-                    status, 404,
-                    "case {case:?}: expected the deleted profile to be gone, got {status} \
-                     with {read}"
-                );
-            }
+        if *blocked {
+            assert_eq!(
+                status, 409,
+                "case {case:?}: expected DeleteStorageProfile to answer 409, got {status} \
+                 with {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ConflictException",
+                "case {case:?}: expected a ConflictException, got {body}"
+            );
+            assert_eq!(
+                string_at(&body, "message"),
+                "Request could not be completed: Storage profile is associated with one or \
+                 more Queues.",
+                "case {case:?}: expected this error class's fixed sentence, got {body}"
+            );
+            assert_eq!(
+                (
+                    string_at(&body, "reason"),
+                    string_at(&body, "resourceType"),
+                    string_at(&body, "resourceId"),
+                ),
+                (
+                    "RESOURCE_IN_USE".to_string(),
+                    "storage-profile".to_string(),
+                    (*storage_profile_id).to_string(),
+                ),
+                "case {case:?}: expected the conflict to name the profile in use, got {body}"
+            );
+            // The refused delete removed nothing.
+            let (status, read) = emulator
+                .get(&profile_path(&farm_id, storage_profile_id))
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the refused profile to stay readable, got \
+                 {status} with {read}"
+            );
+        } else {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected DeleteStorageProfile to answer 200, got {status} \
+                 with {body}"
+            );
+            let (status, read) = emulator
+                .get(&profile_path(&farm_id, storage_profile_id))
+                .await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected the deleted profile to be gone, got {status} \
+                 with {read}"
+            );
         }
     }
 }
@@ -344,8 +342,8 @@ async fn a_storage_profile_is_deletable_once_nothing_references_it() {
     // refused while a queue held the reference succeeds once that queue is gone.
     let (status, body) = delete_profile(&emulator, &farm_id, &storage_profile_id).await;
     assert_eq!(
-        status, 400,
-        "while the queue holds the reference: expected 400, got {status} with {body}"
+        status, 409,
+        "while the queue holds the reference: expected 409, got {status} with {body}"
     );
 
     let (status, body) = emulator

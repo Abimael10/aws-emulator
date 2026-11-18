@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLimit
+//! Deletes a limit from its farm in this service's store.
+//!
+//! A queue-limit association is a live reference to the limit, and the operation documents
+//! the precondition: the association must be removed first. A limit a queue is still
+//! associated with is therefore NOT deleted out from under it — the delete is refused as a
+//! conflict over a resource still IN USE (HTTP 409 `ConflictException`, widened onto this
+//! operation's error enum through `extra_errors` below because its own `errors` list omits
+//! the shape) and the limit stays readable. `DeleteLimit` models no
+//! `ResourceNotFoundException`, so a delete naming a farm or a limit this store no longer
+//! holds is the empty success an `@idempotent` delete answers with.
 //!
 //! ## Shape of an operation
 //!
@@ -58,6 +68,10 @@
 //! * `ThrottlingException` (HTTP 429) — Your request exceeded a request rate quota.
 //! * `ValidationException` (HTTP 400) — The request isn't valid. This can occur if your
 //!   request contains malformed JSON or unsupported characters.
+//! * `ConflictException` (HTTP 409) — widened in through `extra_errors` (see below): your
+//!   request has conflicting operations, which includes a resource another one still has in
+//!   use. The model's `errors` list for this operation omits the shape, which this SERVICE
+//!   models.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -73,10 +87,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-deadline-deadline.json"
 // here — hence the `DeleteLimitError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.deadline#DeleteLimit")]
+//
+// `ConflictException` is widened in through `extra_errors`, exactly as
+// `DeleteStorageProfile` widens it: the refusal of a delete a queue's reference blocks is a
+// conflict over a resource in use (409), which this SERVICE models while this operation's
+// own `errors` list omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.deadline#DeleteLimit",
+    extra_errors = ["ConflictException"]
+)]
 #[derive(Debug)]
 pub enum DeleteLimitErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    ConflictException(ConflictException),
     InternalServerErrorException(InternalServerErrorException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
@@ -143,14 +166,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A queue-limit association is a live reference to the limit, and the operation
-        // documents the precondition: the association must be removed first. The refusal
-        // goes out as this operation's only modeled client-input error.
-        if let Some(queue_id) = store
+        // documents the precondition: the association must be removed first. What the
+        // caller has to change is the association, not the request, so the refusal is the
+        // resource-in-use conflict (409) and carries the blocked limit as the resource in
+        // use; which queues hold it is not part of the answer.
+        if store
             .queue_associated_with_limit(&input.farm_id, &input.limit_id)
-            .map(str::to_string)
+            .is_some()
         {
-            return Err(DeleteLimitErrorModeled::ValidationException(
-                crate::state::limit_associated_with_queue(&input.limit_id, &queue_id),
+            return Err(DeleteLimitErrorModeled::ConflictException(
+                crate::state::limit_in_use_by_queues(&input.limit_id),
             )
             .into());
         }
