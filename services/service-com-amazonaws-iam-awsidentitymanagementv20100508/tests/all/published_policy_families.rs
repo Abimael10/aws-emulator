@@ -33,8 +33,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 
-use crate::role_lifecycle::optional;
-use crate::user_lifecycle::{call, element, elements, router};
+use crate::user_lifecycle::{await_completed_report, call, element, elements, router};
 
 /// A trust policy every role here needs to exist at all. It is a resource-based policy, so
 /// it puts no service in the role's reach.
@@ -310,77 +309,39 @@ async fn each_published_policy_carries_its_own_publication_data() {
     }
 }
 
-/// How long to wait for the generation the clock owes a report to become due.
-fn generation_span() -> ::std::time::Duration {
-    ::std::time::Duration::from_secs(state::ACCESS_REPORT_GENERATION_SECONDS as u64 + 1)
-}
-
 /// The services a report covers, ascending by namespace — the enumeration order a report is
 /// sorted in.
 ///
-/// SOURCE: `state::REPORTED_SERVICES`, the catalog of published service prefixes the service
-/// itself reports from, so the expectation spans every entry rather than the handful a
-/// fixture could write out.
+/// SOURCE: `state::last_accessed_services`, the subset of the published prefix catalog that
+/// service-last-accessed data reports an entry for — the enumeration the service itself
+/// reports from — so the expectation spans every entry rather than the handful a fixture
+/// could write out.
 fn every_namespace() -> Vec<String> {
-    state::REPORTED_SERVICES
-        .iter()
+    state::last_accessed_services()
         .map(|service| service.service_namespace.to_string())
         .collect()
 }
 
-/// One page of a report: the namespaces it carried, whether it was truncated, and the marker
-/// it handed out.
-struct Page {
-    namespaces: Vec<String>,
-    names: Vec<String>,
-    counts: Vec<String>,
-    is_truncated: bool,
-    marker: Option<String>,
-}
-
-/// Read one page of the report `job_id` names, at `max_items` when the row names one.
+/// Read one page of the report `job_id` names, at `max_items` when the row names one —
+/// the harness's one reader of that page
+/// ([`crate::user_lifecycle::read_report_page`]), so this suite and every other read the
+/// same members the same way.
 async fn report_page(
     router: &MultiServiceRouter,
     case: &str,
     job_id: &str,
     max_items: Option<usize>,
     marker: Option<&str>,
-) -> Page {
-    let rendered = max_items.map(|size| size.to_string());
-    let mut params: Vec<(&str, &str)> = vec![("JobId", job_id)];
-    if let Some(size) = rendered.as_deref() {
-        params.push(("MaxItems", size));
-    }
-    if let Some(token) = marker {
-        params.push(("Marker", token));
-    }
-    let (status, body) = call(router, "GetServiceLastAccessedDetails", &params).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: GetServiceLastAccessedDetails must succeed, got {status}: {body}"
-    );
-    assert_eq!(
-        element(&body, "JobStatus"),
-        state::JOB_STATUS_COMPLETED,
-        "case {case:?}: expected the generation the clock owed to be done, got {body}"
-    );
-    let is_truncated = element(&body, "IsTruncated") == "true";
-    let marker = optional(&body, "Marker");
-    Page {
-        namespaces: elements(&body, "ServiceNamespace"),
-        names: elements(&body, "ServiceName"),
-        counts: elements(&body, "TotalAuthenticatedEntities"),
-        is_truncated,
-        marker,
-    }
+) -> crate::user_lifecycle::LastAccessedPage {
+    crate::user_lifecycle::read_report_page(router, case, job_id, max_items, marker).await
 }
 
 /// RULE: a completed report enumerates, out of the published catalog of service namespaces,
 /// every service the resource's permissions policies allow an action of — ascending by
 /// namespace, each entry carrying the service's published name and the number of principals
-/// recorded as having attempted to reach it — served WHOLE to a read that asks for no page
-/// size, and paged over that one enumeration when `MaxItems` names one, reporting
-/// `IsTruncated` with a resumable `Marker` exactly when more remain.
+/// recorded as having attempted to reach it — served ONE page at a time, bounded by
+/// `MaxItems` when the read names one and by the report's own page size when it names none,
+/// reporting `IsTruncated` with a resumable `Marker` exactly when more remain.
 #[tokio::test]
 async fn a_report_enumerates_the_published_service_catalog_and_pages_over_it() {
     let router = router();
@@ -474,22 +435,24 @@ async fn a_report_enumerates_the_published_service_catalog_and_pages_over_it() {
         jobs.push((case, element(&body, "JobId"), expected));
     }
 
-    tokio::time::sleep(generation_span()).await;
+    for (case, job_id, _) in &jobs {
+        await_completed_report(&router, case, job_id).await;
+    }
 
-    // The published catalog is wide enough that a report of it runs well past any page size
-    // a caller is likely to ask for, which is what makes the paging observable.
+    // The report's enumeration is wide enough that it runs well past any page size a caller
+    // is likely to ask for, which is what makes the paging observable.
     assert!(
-        state::REPORTED_SERVICES.len() > state::DEFAULT_MAX_ITEMS as usize,
-        "the services a report covers must be the published catalog, not a shortlist, got {}",
-        state::REPORTED_SERVICES.len()
+        every_namespace().len() > state::DEFAULT_MAX_ITEMS as usize,
+        "the services a report covers must be the published breadth, not a shortlist, got {}",
+        every_namespace().len()
     );
 
     for (case, job_id, expected) in &jobs {
         // Page sizes below, around and above the length of the enumeration, plus the read
-        // that asks for no size at all — which is served the report whole.
+        // that asks for no size at all — which is bounded by the report's own page size.
         for max_items in [Some(3_usize), Some(128), Some(1_000), None] {
             let case = format!("{case} at {max_items:?} per page");
-            let size = max_items.unwrap_or(usize::MAX);
+            let size = max_items.unwrap_or(state::SERVICE_LAST_ACCESSED_PAGE_SIZE as usize);
             let mut walked: Vec<String> = Vec::new();
             let mut marker: Option<String> = None;
             for page in 0..1_000 {
@@ -506,7 +469,7 @@ async fn a_report_enumerates_the_published_service_catalog_and_pages_over_it() {
                     read.names,
                     read.namespaces
                         .iter()
-                        .map(|namespace| state::reported_service(namespace)
+                        .map(|namespace| state::published_service(namespace)
                             .unwrap_or_else(|| panic!(
                                 "case {case:?}: {namespace} is a service a report covers"
                             ))

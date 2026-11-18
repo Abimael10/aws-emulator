@@ -600,7 +600,7 @@ async fn the_namespaces_are_reported_over_resumable_pages() {
         // The first `count` service prefixes AWS publishes, which is what a request may
         // ask about: a namespace has to name a service, so the request is built from the
         // catalog this service reads them against rather than from invented words.
-        let owned: Vec<String> = state::REPORTED_SERVICES
+        let owned: Vec<String> = state::PUBLISHED_SERVICES
             .iter()
             .take(count)
             .map(|service| service.service_namespace.to_string())

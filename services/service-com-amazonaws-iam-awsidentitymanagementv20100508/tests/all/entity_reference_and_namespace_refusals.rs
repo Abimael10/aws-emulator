@@ -810,11 +810,11 @@ async fn a_service_namespace_no_service_is_published_under_is_refused() {
     put_user_policy(&router, "NamespaceReader").await;
 
     // SOURCE for every published prefix below: this crate's catalog of the services a
-    // policy can name an action of (`state::REPORTED_SERVICES`), which is the Service
+    // policy can name an action of (`state::PUBLISHED_SERVICES`), which is the Service
     // Authorization Reference's own list of prefixes. The rows take entries the issue's
     // recording did not cite — the catalog's first and last entry and two from its middle
     // — so the rule is not pinned to one namespace.
-    let published: Vec<&str> = state::REPORTED_SERVICES
+    let published: Vec<&str> = state::PUBLISHED_SERVICES
         .iter()
         .map(|service| service.service_namespace)
         .collect();

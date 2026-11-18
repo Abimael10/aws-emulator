@@ -24,7 +24,8 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::user_lifecycle::{
-    account_id, call, element, elements, error_code, router, router_with_engine,
+    account_id, await_completed_report, call, element, elements, error_code, read_report_page,
+    router, router_with_engine,
 };
 
 /// A trust policy every role this suite creates needs. It is a RESOURCE-based policy — it
@@ -35,11 +36,6 @@ const TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Al
 /// The namespace [`TRUST_POLICY`] would be reported under if it were ever read as a
 /// permissions policy.
 const TRUST_POLICY_NAMESPACE: &str = "sts";
-
-/// How long a test waits for the generation the clock owes to become due.
-fn generation_span() -> ::std::time::Duration {
-    ::std::time::Duration::from_secs(state::ACCESS_REPORT_GENERATION_SECONDS as u64 + 1)
-}
 
 /// Create a user, answering the ARN the account holds it under.
 async fn create_user(router: &MultiServiceRouter, user_name: &str, path: &str) -> String {
@@ -209,8 +205,8 @@ fn service_names(namespaces: &[String]) -> Vec<String> {
     namespaces
         .iter()
         .map(|namespace| {
-            state::reported_service(namespace)
-                .unwrap_or_else(|| panic!("{namespace} is a service a report covers"))
+            state::published_service(namespace)
+                .unwrap_or_else(|| panic!("{namespace} is a published service"))
                 .service_name
                 .to_string()
         })
@@ -231,8 +227,7 @@ impl Expected {
     /// The namespaces the row expects, ascending — the order the report is sorted in.
     fn namespaces(&self) -> Vec<String> {
         let every = || {
-            state::REPORTED_SERVICES
-                .iter()
+            state::last_accessed_services()
                 .map(|service| service.service_namespace.to_string())
         };
         match self {
@@ -369,7 +364,9 @@ async fn a_report_is_recorded_per_resource_and_served_once_the_clock_completes_i
         jobs.push((what.to_owned(), job_id, expected.clone()));
     }
 
-    tokio::time::sleep(generation_span()).await;
+    for (what, job_id, _) in &jobs {
+        await_completed_report(&router, what, job_id).await;
+    }
 
     for (what, job_id, expected) in &jobs {
         let body = details(&router, what, job_id, &[]).await;
@@ -542,7 +539,9 @@ async fn the_report_lists_every_service_the_resources_policies_allow_an_action_o
         ));
     }
 
-    tokio::time::sleep(generation_span()).await;
+    for (what, job_id, _) in &jobs {
+        await_completed_report(&router, what, job_id).await;
+    }
 
     for (what, job_id, expected) in &jobs {
         // Every service the row's grant reaches has to fit one page, so the whole report
@@ -563,12 +562,13 @@ async fn the_report_lists_every_service_the_resources_policies_allow_an_action_o
     }
 }
 
-/// RULE: the services a report covers are a catalog keyed by service namespace, so no
-/// namespace is reported twice and the catalog's order IS the namespace order the report is
-/// sorted in.
+/// RULE: the published service prefixes are a catalog keyed by service namespace, so no
+/// namespace is carried twice and the catalog's order IS the namespace order a report is
+/// sorted in; the services a report enumerates are the subset of it last-accessed data
+/// reports an entry for, in that same order.
 #[test]
 fn the_services_a_report_covers_are_a_sorted_catalog_of_distinct_namespaces() {
-    let namespaces: Vec<&str> = state::REPORTED_SERVICES
+    let namespaces: Vec<&str> = state::PUBLISHED_SERVICES
         .iter()
         .map(|service| service.service_namespace)
         .collect();
@@ -580,15 +580,37 @@ fn the_services_a_report_covers_are_a_sorted_catalog_of_distinct_namespaces() {
         "the catalog must be ascending by namespace and hold each namespace once, got \
          {namespaces:?}"
     );
-    for service in state::REPORTED_SERVICES {
+    // The report's enumeration is a SUBSET of it, in the same order: every service it
+    // enumerates is a published prefix, and the prefixes it does not are published all the
+    // same.
+    let enumerated: Vec<&str> = state::last_accessed_services()
+        .map(|service| service.service_namespace)
+        .collect();
+    assert!(
+        enumerated.iter().all(|namespace| namespaces.contains(namespace)),
+        "every service a report enumerates must be a published prefix, got {enumerated:?}"
+    );
+    assert!(
+        enumerated.len() < namespaces.len(),
+        "the catalog must publish prefixes a report enumerates no entry for, got {} of {}",
+        enumerated.len(),
+        namespaces.len()
+    );
+    let mut ascending = enumerated.clone();
+    ascending.sort_unstable();
+    assert_eq!(
+        enumerated, ascending,
+        "the enumeration must keep the catalog's ascending order, got {enumerated:?}"
+    );
+    for service in state::PUBLISHED_SERVICES {
         assert!(
             !service.service_name.is_empty(),
-            "case {:?}: every service a report covers carries its published name",
+            "case {:?}: every published service carries its published name",
             service.service_namespace
         );
         // The lookup folds case, because an action element may spell a prefix in any.
         assert_eq!(
-            state::reported_service(&service.service_namespace.to_ascii_uppercase())
+            state::published_service(&service.service_namespace.to_ascii_uppercase())
                 .map(|found| found.service_namespace),
             Some(service.service_namespace),
             "case {:?}: the lookup must not be case-sensitive",
@@ -604,24 +626,24 @@ fn the_services_a_report_covers_are_a_sorted_catalog_of_distinct_namespaces() {
         ("iam", "AWS Identity and Access Management"),
     ] {
         assert_eq!(
-            state::reported_service(namespace).map(|found| found.service_name),
+            state::published_service(namespace).map(|found| found.service_name),
             Some(service_name),
             "case {namespace:?}: expected the published name of that service"
         );
     }
-    // And a prefix the catalog does not carry names no service a report covers.
+    // And a prefix the catalog does not carry names no service at all.
     assert!(
-        state::reported_service("nosuchservicehere").is_none(),
-        "a namespace outside the catalog names no service a report covers"
+        state::published_service("nosuchservicehere").is_none(),
+        "a namespace outside the catalog names no published service"
     );
     // The catalog is the published breadth of AWS service prefixes rather than a
     // shortlist: a report of it covers hundreds of services, which is what a
     // least-privilege review of a wide grant reads.
     assert!(
-        state::REPORTED_SERVICES.len() > 100,
-        "the services a report covers must be the published catalog, not a shortlist, got \
+        enumerated.len() > 100,
+        "the services a report covers must be the published breadth, not a shortlist, got \
          {}",
-        state::REPORTED_SERVICES.len()
+        enumerated.len()
     );
 }
 
@@ -671,7 +693,9 @@ async fn the_job_type_is_the_level_of_detail_the_generate_asked_for() {
         ));
     }
 
-    tokio::time::sleep(generation_span()).await;
+    for (what, job_id, _) in &jobs {
+        await_completed_report(&router, what, job_id).await;
+    }
 
     for (what, job_id, expected) in &jobs {
         let body = details(&router, what, job_id, &[]).await;
@@ -791,7 +815,14 @@ async fn the_entities_reported_are_the_ones_the_reports_resource_reaches() {
     let user_job = generate(&router, "a user's report", &alice_arn, None).await;
     let role_job = generate(&router, "a role's report", &role_arn, None).await;
 
-    tokio::time::sleep(generation_span()).await;
+    for (what, job_id) in [
+        ("a group's report", &group_job),
+        ("the policy's report", &policy_job),
+        ("a user's report", &user_job),
+        ("a role's report", &role_job),
+    ] {
+        await_completed_report(&router, what, job_id).await;
+    }
 
     // The rows: which resource the report is about, which service is asked about, and the
     // entities that service is in reach of through that resource.
@@ -935,18 +966,18 @@ async fn a_service_namespace_covering_no_service_is_refused_as_an_invalid_input(
     )
     .await;
     let job_id = generate(&router, case, &arn, None).await;
-    tokio::time::sleep(generation_span()).await;
+    await_completed_report(&router, case, &job_id).await;
 
-    // SOURCE of which namespaces name a service at all: `state::REPORTED_SERVICES`, the
-    // services a report covers — so the rows that must be SERVED are taken from it, the
-    // first and the last entry included, rather than written out here.
-    let first = state::REPORTED_SERVICES
+    // SOURCE of which namespaces name a service at all: `state::PUBLISHED_SERVICES`, every
+    // prefix a policy can name an action of — so the rows that must be SERVED are taken
+    // from it, the first and the last entry included, rather than written out here.
+    let first = state::PUBLISHED_SERVICES
         .first()
-        .expect("a report covers at least one service")
+        .expect("the catalog publishes at least one service")
         .service_namespace;
-    let last = state::REPORTED_SERVICES
+    let last = state::PUBLISHED_SERVICES
         .last()
-        .expect("a report covers at least one service")
+        .expect("the catalog publishes at least one service")
         .service_namespace;
 
     // Rows spanning the ways a namespace names a service the report covers: the one the
@@ -1051,7 +1082,7 @@ async fn a_report_pages_through_its_services_and_entities_exactly_once() {
     every_user.sort();
 
     let job_id = generate(&router, case, &policy_arn, None).await;
-    tokio::time::sleep(generation_span()).await;
+    await_completed_report(&router, case, &job_id).await;
 
     // The rows: page sizes below, at and above the length of each list.
     for page_size in [1_usize, 2, 4, 5, 1000] {
@@ -1345,4 +1376,292 @@ async fn an_arn_or_job_id_naming_nothing_is_refused() {
         vec![organizations_job],
         "the report of the other kind must be left as it was"
     );
+}
+
+/// One row of the paging table: how wide a grant the report's resource holds, the services
+/// that grant reaches, and the page sizes the report is read at.
+struct PagingRow {
+    what: &'static str,
+    document: &'static str,
+    expected: Vec<String>,
+    sizes: Vec<Option<usize>>,
+}
+
+/// Walk every page of the report `job_id` names at the page size `max_items`, asserting on
+/// each page the bound, what it reports about the services still to come and the names it
+/// carries, and that the pages together are `expected` once.
+async fn walk_report_pages(
+    router: &MultiServiceRouter,
+    case: &str,
+    job_id: &str,
+    max_items: Option<usize>,
+    expected: &[String],
+) {
+    let bound = max_items.unwrap_or(state::SERVICE_LAST_ACCESSED_PAGE_SIZE as usize);
+    let mut collected: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut marker: Option<String> = None;
+    // The report is finite, so the walk ends; the cap only keeps a `Marker` that never runs
+    // out from looping forever.
+    for page in 0..expected.len() + 2 {
+        let read = read_report_page(router, case, job_id, max_items, marker.as_deref()).await;
+        let remaining = expected.len() - collected.len();
+        assert_eq!(
+            read.namespaces.len(),
+            remaining.min(bound),
+            "case {case:?} page {page}: a page carries at most {bound} of the {remaining} \
+             services still to report, got {:?}",
+            read.namespaces
+        );
+        assert_eq!(
+            read.is_truncated,
+            remaining > bound,
+            "case {case:?} page {page}: expected IsTruncated {} with {remaining} services \
+             still to report at {bound} per page, got {}",
+            remaining > bound,
+            read.is_truncated
+        );
+        assert_eq!(
+            read.marker.is_some(),
+            read.is_truncated,
+            "case {case:?} page {page}: a Marker is reported exactly when services remain, \
+             got truncated={} marker={:?}",
+            read.is_truncated,
+            read.marker
+        );
+        collected.extend(read.namespaces.clone());
+        names.extend(read.names.clone());
+        if !read.is_truncated {
+            marker = None;
+            break;
+        }
+        marker = read.marker.clone();
+    }
+    assert!(
+        marker.is_none(),
+        "case {case:?}: the walk must end, got a Marker that never ran out"
+    );
+    assert_eq!(
+        collected, expected,
+        "case {case:?}: the pages together must be the report once, in its namespace order, \
+         got {collected:?}"
+    );
+    assert_eq!(
+        names,
+        service_names(&collected),
+        "case {case:?}: each entry must name its own service, got {names:?}"
+    );
+}
+
+/// Every namespace a report enumerates, in the order it reports them.
+fn every_reported_namespace() -> Vec<String> {
+    state::last_accessed_services()
+        .map(|service| service.service_namespace.to_string())
+        .collect()
+}
+
+/// RULE: a read of a completed report is answered with ONE page of it — at most the
+/// `MaxItems` the caller names, and at most the report's own page size when the caller names
+/// none — reporting `IsTruncated` and a `Marker` exactly when services remain, so the pages
+/// of a walk are the whole report once, in its one namespace order.
+#[tokio::test]
+async fn a_report_is_served_one_page_at_a_time_bounded_by_the_size_asked_for() {
+    let router = router();
+    let default_page = state::SERVICE_LAST_ACCESSED_PAGE_SIZE as usize;
+    // The widest row has to run PAST that page for the row that names no size to page at
+    // all, which the breadth of the report's enumeration is what provides.
+    assert!(
+        every_reported_namespace().len() > default_page,
+        "the report's enumeration must be wider than one page for this suite to page, got {}",
+        every_reported_namespace().len()
+    );
+
+    // The rows: how many services the report covers — one, a run of them, and every service
+    // it enumerates — each read at page sizes spanning none at all, one, a few, exactly as
+    // many as remain, and more than the whole report.
+    let namespace_run: Vec<String> = state::last_accessed_services()
+        .filter(|service| service.service_namespace.starts_with("ssm-"))
+        .map(|service| service.service_namespace.to_string())
+        .collect();
+    assert!(
+        namespace_run.len() > 2,
+        "the catalog must publish a run of `ssm-` services for the middle row, got \
+         {namespace_run:?}"
+    );
+    let rows: Vec<PagingRow> = vec![
+        PagingRow {
+            what: "a report of one service",
+            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#,
+            expected: vec!["s3".to_string()],
+            sizes: vec![None, Some(1), Some(2), Some(1_000)],
+        },
+        PagingRow {
+            what: "a report of a run of namespaces",
+            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ssm-*:Get*","Resource":"*"}]}"#,
+            expected: namespace_run.clone(),
+            sizes: vec![
+                None,
+                Some(1),
+                Some(2),
+                Some(namespace_run.len()),
+                Some(1_000),
+            ],
+        },
+        PagingRow {
+            what: "a report of every service the catalog covers",
+            document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#,
+            expected: every_reported_namespace(),
+            sizes: vec![None, Some(7), Some(default_page), Some(1_000)],
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let user_name = format!("paged-report-user-{index}");
+        let arn = create_user(&router, &user_name, "/").await;
+        put_policy(
+            &router,
+            "PutUserPolicy",
+            "UserName",
+            &user_name,
+            "granted",
+            row.document,
+        )
+        .await;
+        let job_id = generate(&router, row.what, &arn, None).await;
+        await_completed_report(&router, row.what, &job_id).await;
+        for size in &row.sizes {
+            let what = match size {
+                Some(size) => format!("{} read {size} at a time", row.what),
+                None => format!("{} read with no page size", row.what),
+            };
+            walk_report_pages(&router, &what, &job_id, *size, &row.expected).await;
+        }
+    }
+}
+
+/// RULE: each entry of a report is one service of the published catalog — the namespace it
+/// is published with, and the name service-last-accessed data reports that namespace under —
+/// while a published prefix that data reports no entry for is enumerated by no report and
+/// still accepted by every read that NAMES a namespace.
+#[tokio::test]
+async fn every_entry_of_a_report_names_a_published_service_under_its_published_name() {
+    let router = router();
+    let case = "the catalog report";
+    let arn = create_user(&router, "catalog-report-user", "/").await;
+    put_policy(
+        &router,
+        "PutUserPolicy",
+        "UserName",
+        "catalog-report-user",
+        "granted",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#,
+    )
+    .await;
+    let job_id = generate(&router, case, &arn, None).await;
+    await_completed_report(&router, case, &job_id).await;
+
+    // `maxItemsType` admits a thousand, which the report's enumeration fits inside, so the
+    // whole report is read in one page here.
+    assert!(
+        every_reported_namespace().len() < 1_000,
+        "the report must fit one maximal page for this read, got {}",
+        every_reported_namespace().len()
+    );
+    let read = read_report_page(&router, case, &job_id, Some(1_000), None).await;
+    assert!(
+        !read.is_truncated && read.marker.is_none(),
+        "a page as wide as the catalog leaves nothing remaining, got truncated={} \
+         marker={:?}",
+        read.is_truncated,
+        read.marker
+    );
+    assert_eq!(
+        read.namespaces,
+        every_reported_namespace(),
+        "expected one entry per service the report enumerates, in its namespace order"
+    );
+    // The namespaces ascend strictly, which is the order the list is sorted by and what
+    // lets a client read it positionally.
+    for pair in read.namespaces.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "the report must ascend by namespace, got {:?} before {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+
+    // Pairs written out rather than echoed, so the names the report carries are asserted.
+    // SOURCE: the name service-last-accessed data publishes per namespace, which is not
+    // always one per service — API Gateway is reported once for managing it (`apigateway`)
+    // and once for calling a deployed API (`execute-api`), each under its own name.
+    for (namespace, service_name) in [
+        ("apigateway", "Manage - Amazon API Gateway"),
+        ("execute-api", "Amazon API Gateway"),
+        ("application-autoscaling", "AWS Application Auto Scaling"),
+        ("s3", "Amazon Simple Storage Service"),
+    ] {
+        let position = read
+            .namespaces
+            .iter()
+            .position(|reported| reported == namespace)
+            .unwrap_or_else(|| panic!("case {namespace:?}: the report must cover this service"));
+        assert_eq!(
+            read.names[position], service_name,
+            "case {namespace:?}: expected the name the report publishes for it, got {:?}",
+            read.names[position]
+        );
+    }
+
+    // And a prefix a policy can name an action of, but service-last-accessed data reports
+    // no entry for: the report enumerates nothing for it, while the reads that NAME a
+    // namespace still accept it, because the published prefixes and the services a report
+    // enumerates are not the same set.
+    for namespace in ["amplifybackend", "amplifyuibuilder", "appintegrations"] {
+        assert!(
+            state::published_service(namespace).is_some(),
+            "case {namespace:?}: the catalog must publish this prefix"
+        );
+        assert!(
+            !read.namespaces.iter().any(|reported| reported == namespace),
+            "case {namespace:?}: a prefix the report enumerates no entry for is reported \
+             nowhere in it"
+        );
+        // The read that asks which policies grant access to it answers about it rather than
+        // refusing the namespace as invalid.
+        let (status, body) = call(
+            &router,
+            "ListPoliciesGrantingServiceAccess",
+            &[
+                ("Arn", arn.as_str()),
+                ("ServiceNamespaces.member.1", namespace),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {namespace:?}: ListPoliciesGrantingServiceAccess must accept a published \
+             prefix, got {status}: {body}"
+        );
+        assert_eq!(
+            elements(&body, "ServiceNamespace"),
+            vec![namespace.to_string()],
+            "case {namespace:?}: expected the namespace asked about, got {body}"
+        );
+        // So does the read that reports the entities one service is in reach of.
+        let (status, body) = call(
+            &router,
+            "GetServiceLastAccessedDetailsWithEntities",
+            &[
+                ("JobId", job_id.as_str()),
+                ("ServiceNamespace", namespace),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {namespace:?}: GetServiceLastAccessedDetailsWithEntities must accept a \
+             published prefix, got {status}: {body}"
+        );
+    }
 }

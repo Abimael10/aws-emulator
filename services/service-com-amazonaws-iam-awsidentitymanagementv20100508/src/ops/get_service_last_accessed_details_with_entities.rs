@@ -222,12 +222,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Provide the service namespace to learn when the IAM entity last attempted to
-        // access the specified service": the request names ONE service, so a namespace no
-        // service this report family reports on is published under
-        // (`crate::state::reported_service`) names nothing to report and is refused as an
+        // access the specified service": the request names ONE service, so a namespace IAM
+        // publishes no service prefix for (`crate::state::published_service`, every prefix
+        // a policy can name an action of) names nothing to report and is refused as an
         // "invalid … value … supplied for an input parameter" rather than answered with an
         // empty list, which would say the service is in nobody's reach.
-        if crate::state::reported_service(&input.service_namespace).is_none() {
+        if crate::state::published_service(&input.service_namespace).is_none() {
             return Err(
                 GetServiceLastAccessedDetailsWithEntitiesErrorModeled::InvalidInputException(
                     InvalidInputException {

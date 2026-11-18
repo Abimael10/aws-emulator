@@ -16,8 +16,8 @@
 //! data of the entry being reported — a managed policy's own id, default version,
 //! publication and revision instants and published attachability; a report's own one entry
 //! per service namespace the catalog covers, in the catalog's order — and the catalog is
-//! served whole: every family it publishes is selectable by its path, and a report asked for
-//! no page size carries every service it covers. Nothing a reader reports is a value stamped
+//! served whole: every family it publishes is selectable by its path, and a report's pages
+//! together carry every service it covers. Nothing a reader reports is a value stamped
 //! on the catalog as a whole, and nothing is left out of an enumeration of it.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: the policy
@@ -29,8 +29,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 
-use crate::role_lifecycle::{borrowed, optional, param};
-use crate::user_lifecycle::{call, element, elements, error_code, router};
+use crate::user_lifecycle::{await_completed_report, call, element, elements, error_code, router};
 
 /// A trust policy every role here needs to exist at all. It is a resource-based policy, so
 /// it puts no service in the role's reach.
@@ -624,11 +623,6 @@ async fn the_root_task_family_is_published_as_aws_publishes_it() {
     }
 }
 
-/// How long to wait for the generation the clock owes a report to become due.
-fn generation_span() -> ::std::time::Duration {
-    ::std::time::Duration::from_secs(state::ACCESS_REPORT_GENERATION_SECONDS as u64 + 1)
-}
-
 /// Create a role carrying `document` as an inline permissions policy, answering its ARN.
 async fn role_granting(router: &MultiServiceRouter, role_name: &str, document: &str) -> String {
     let (status, body) = call(
@@ -677,71 +671,65 @@ async fn generate_report(router: &MultiServiceRouter, arn: &str) -> String {
     element(&body, "JobId")
 }
 
-/// One page of a completed report: the namespaces and names it carried, and the marker it
-/// handed out.
-struct ReportPage {
-    namespaces: Vec<String>,
-    names: Vec<String>,
-    is_truncated: bool,
-    marker: Option<String>,
-}
-
-/// Read one page of the report `job_id` names, at `max_items` when the row names one.
+/// Read one page of the report `job_id` names, at `max_items` when the row names one —
+/// the harness's one reader of that page
+/// ([`crate::user_lifecycle::read_report_page`]), so this suite and every other read the
+/// same members the same way.
 async fn report_page(
     router: &MultiServiceRouter,
     case: &str,
     job_id: &str,
     max_items: Option<usize>,
     marker: Option<&str>,
-) -> ReportPage {
-    let mut params: Vec<(String, String)> = vec![param("JobId", job_id)];
-    if let Some(size) = max_items {
-        params.push(param("MaxItems", &size.to_string()));
-    }
-    if let Some(token) = marker {
-        params.push(param("Marker", token));
-    }
-    let (status, body) = call(
-        router,
-        "GetServiceLastAccessedDetails",
-        &borrowed(&params),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: GetServiceLastAccessedDetails must succeed, got {status}: {body}"
-    );
-    assert_eq!(
-        element(&body, "JobStatus"),
-        state::JOB_STATUS_COMPLETED,
-        "case {case:?}: expected the generation the clock owed to be done, got {body}"
-    );
-    ReportPage {
-        namespaces: elements(&body, "ServiceNamespace"),
-        names: elements(&body, "ServiceName"),
-        is_truncated: element(&body, "IsTruncated") == "true",
-        marker: optional(&body, "Marker"),
-    }
+) -> crate::user_lifecycle::LastAccessedPage {
+    crate::user_lifecycle::read_report_page(router, case, job_id, max_items, marker).await
 }
 
 /// RULE: a completed report carries one entry per service namespace the published catalog
 /// covers and the resource's policies reach, in the catalog's own namespace order with no
 /// namespace left out — so a client reading the list positionally attributes each entry to
-/// the service it belongs to — and a read that asks for no page size is served the report
-/// whole.
+/// the service it belongs to — and every read of it is served ONE page, bounded by the size
+/// the caller asks for or by the report's own page size when it asks for none.
 #[tokio::test]
 async fn a_report_covers_the_published_namespace_catalog_without_gaps() {
     let router = router();
     let role_arn = role_granting(&router, "catalog-report-role", EVERY_ACTION).await;
     let job_id = generate_report(&router, &role_arn).await;
-    tokio::time::sleep(generation_span()).await;
+    await_completed_report(&router, "the catalog report", &job_id).await;
 
-    // A read that asks for no page size is served every service the report covers.
-    let whole = report_page(&router, "the whole report", &job_id, None, None).await;
+    // A read that asks for no page size is served the report's own page out of a catalog
+    // wider than it, and told that the rest remain.
+    let default_page = report_page(&router, "no page size asked for", &job_id, None, None).await;
+    assert_eq!(
+        default_page.namespaces.len(),
+        state::SERVICE_LAST_ACCESSED_PAGE_SIZE as usize,
+        "a read that names no page size is served one page out of the {} services the \
+         report enumerates, got {}",
+        state::last_accessed_services().count(),
+        default_page.namespaces.len()
+    );
+    assert!(
+        default_page.is_truncated && default_page.marker.is_some(),
+        "the services past that page remain, so the read reports them as remaining: got \
+         truncated={} marker={:?}",
+        default_page.is_truncated,
+        default_page.marker
+    );
+
+    // `maxItemsType` admits a thousand, which the report's enumeration has to fit inside
+    // for the reads below to ask for it as a page size.
+    let enumerated = state::last_accessed_services().count();
+    assert!(
+        enumerated < 1_000,
+        "the report must fit one maximal page for these reads, got {enumerated}"
+    );
+    // Asked for a page wide enough for the whole enumeration, the same read is served every
+    // service the report covers and nothing remains.
+    let whole = report_page(&router, "the whole report", &job_id, Some(enumerated), None).await;
     assert!(
         !whole.is_truncated,
-        "a report asked for with no MaxItems is served whole, so nothing remains: got \
-         IsTruncated true after {} services",
+        "a page as wide as the catalog leaves nothing remaining: got IsTruncated true after \
+         {} services",
         whole.namespaces.len()
     );
     assert_eq!(
@@ -750,12 +738,10 @@ async fn a_report_covers_the_published_namespace_catalog_without_gaps() {
         whole.marker
     );
 
-    let expected_namespaces: Vec<String> = state::REPORTED_SERVICES
-        .iter()
+    let expected_namespaces: Vec<String> = state::last_accessed_services()
         .map(|service| service.service_namespace.to_string())
         .collect();
-    let expected_names: Vec<String> = state::REPORTED_SERVICES
-        .iter()
+    let expected_names: Vec<String> = state::last_accessed_services()
         .map(|service| service.service_name.to_string())
         .collect();
     assert_eq!(
@@ -878,18 +864,26 @@ async fn a_narrower_grant_reports_fewer_services_from_the_same_catalog() {
         let role_arn = role_granting(&router, &role_name, document).await;
         let expected: Vec<String> = match expected {
             Some(namespaces) => namespaces.iter().map(|name| (*name).to_string()).collect(),
-            None => state::REPORTED_SERVICES
-                .iter()
+            None => state::last_accessed_services()
                 .map(|service| service.service_namespace.to_string())
                 .collect(),
         };
         jobs.push((case, generate_report(&router, &role_arn).await, expected));
     }
 
-    tokio::time::sleep(generation_span()).await;
+    for (case, job_id, _) in &jobs {
+        await_completed_report(&router, case, job_id).await;
+    }
 
     for (case, job_id, expected) in &jobs {
-        let read = report_page(&router, case, job_id, None, None).await;
+        let read = report_page(
+            &router,
+            case,
+            job_id,
+            Some(state::last_accessed_services().count()),
+            None,
+        )
+        .await;
         assert_eq!(
             read.namespaces, *expected,
             "case {case:?}: expected the services the grant reaches, out of the published \
@@ -897,7 +891,7 @@ async fn a_narrower_grant_reports_fewer_services_from_the_same_catalog() {
         );
         assert!(
             !read.is_truncated,
-            "case {case:?}: a report asked for with no MaxItems is served whole"
+            "case {case:?}: a page as wide as the catalog leaves nothing remaining"
         );
     }
 }

@@ -3,8 +3,8 @@
 //! @op GetServiceLastAccessedDetails
 //! Serves the service-last-accessed report the request's `JobId` names: the status of its
 //! generation, and — once that generation is due — one entry per service the report's
-//! resource can reach through its permissions policies, sorted by service namespace,
-//! whole unless the caller asks for a page size.
+//! resource can reach through its permissions policies, sorted by service namespace, one
+//! page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -252,14 +252,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
         // "Use this only when paginating results to indicate the maximum number of items
-        // you want in the response": the cap is one the CALLER asks for. A read that asks
-        // for no size is served the report WHOLE — recorded AWS answers it with every
-        // service the report covers in one response, which is what a least-privilege pass
-        // reads the report for — so the enumeration below is capped only when `MaxItems`
-        // names a size. `maxItemsType` is range 1..1000 and the boundary validator has
-        // already refused anything outside it, so a named size is in range; `.max(1)` is
-        // what makes the cast lossless.
-        let page_size = input.max_items.map(|size| size.max(1) as usize);
+        // you want in the response. If additional items exist beyond the maximum you
+        // specify, the IsTruncated response element is true. If you do not include this
+        // parameter, the number of items defaults to 100": the page is BOUNDED whether or
+        // not the caller names a size. The size a read that names none is served is the
+        // one THIS report serves (`crate::state::SERVICE_LAST_ACCESSED_PAGE_SIZE`, whose
+        // doc records why it is not the hundred that sentence states for the entity
+        // listings), and the rest are reported as remaining through `IsTruncated` and a
+        // `Marker`. `maxItemsType` is range 1..1000 and the boundary validator has already
+        // refused anything outside it, so a named size is in range; `.max(1)` is what
+        // makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::SERVICE_LAST_ACCESSED_PAGE_SIZE)
+            .max(1) as usize;
 
         // The status follows the CLOCK the generate set running, read through the one
         // definition of that rule (`crate::state::report_job_status`).
@@ -300,12 +306,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // namespace one of those documents ALLOWS an action of, decided by the one reading
         // of a policy document this crate holds
         // (`crate::state::grants_service_access`), over the services a report covers
-        // (`crate::state::REPORTED_SERVICES`, already ascending by namespace, which is the
-        // order "the list is sorted by").
+        // (`crate::state::last_accessed_services`, the subset of the published catalog
+        // last-accessed data reports an entry for, already ascending by namespace, which
+        // is the order "the list is sorted by").
         let mut is_truncated = false;
         let mut page: Vec<ServiceLastAccessed> = Vec::new();
         if completed {
-            for service in crate::state::REPORTED_SERVICES.iter().filter(|service| {
+            for service in crate::state::last_accessed_services().filter(|service| {
                 resume_after
                     .as_deref()
                     .is_none_or(|after| service.service_namespace > after)
@@ -315,7 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         })
                     })
             }) {
-                if page_size.is_some_and(|size| page.len() == size) {
+                if page.len() == page_size {
                     is_truncated = true;
                     break;
                 }
@@ -366,7 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// covers, including the ones no principal has reached, where the count is zero. So what is
 /// reported is the number of attempts this account's records hold for the service
 /// (`crate::state::RECORDED_SERVICE_ACCESS_ATTEMPTS`).
-fn reported_entry(service: &crate::state::ReportedService) -> ServiceLastAccessed {
+fn reported_entry(service: &crate::state::PublishedService) -> ServiceLastAccessed {
     ServiceLastAccessed {
         service_name: service.service_name.to_string(),
         service_namespace: service.service_namespace.to_string(),

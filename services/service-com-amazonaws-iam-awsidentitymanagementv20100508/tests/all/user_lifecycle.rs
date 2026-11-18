@@ -269,6 +269,103 @@ pub(crate) fn document_elements(body: &str, tag: &str) -> Vec<String> {
         .collect()
 }
 
+/// How long a suite waits for the generation the clock owes an access report to become due
+/// before giving up. Generous on purpose: [`await_completed_report`] ends on the CONDITION —
+/// the job reporting itself completed — so this only bounds a wait that is never expected to
+/// run out.
+const REPORT_GENERATION_DEADLINE: ::std::time::Duration = ::std::time::Duration::from_secs(120);
+
+/// How long that wait pauses between two reads of the same job.
+const REPORT_GENERATION_POLL_PAUSE: ::std::time::Duration =
+    ::std::time::Duration::from_millis(25);
+
+/// Look at the service-last-accessed report `job_id` names until it reports itself
+/// completed, which is what tells a caller the report is ready — never a fixed span of
+/// waiting.
+///
+/// The ONE definition of that wait, shared by every suite in this crate that reads a report
+/// the clock owes a generation for, so no suite has to decide how long to wait. The page is
+/// read at one service, because only `JobStatus` is being looked at.
+pub(crate) async fn await_completed_report(
+    router: &MultiServiceRouter,
+    case: &str,
+    job_id: &str,
+) {
+    let deadline = ::std::time::Instant::now() + REPORT_GENERATION_DEADLINE;
+    loop {
+        let (status, body) = call(
+            router,
+            "GetServiceLastAccessedDetails",
+            &[("JobId", job_id), ("MaxItems", "1")],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetServiceLastAccessedDetails must succeed, got {status}: {body}"
+        );
+        if element(&body, "JobStatus")
+            == service_com_amazonaws_iam_awsidentitymanagementv20100508::state::JOB_STATUS_COMPLETED
+        {
+            return;
+        }
+        assert!(
+            ::std::time::Instant::now() < deadline,
+            "case {case:?}: the generation the clock owes must become due, got {body}"
+        );
+        ::tokio::time::sleep(REPORT_GENERATION_POLL_PAUSE).await;
+    }
+}
+
+/// One page of a service-last-accessed report as a client on the socket reads it: the
+/// services it carried, the name and the attempt count beside each, and whether it reported
+/// more remaining.
+pub(crate) struct LastAccessedPage {
+    pub(crate) namespaces: Vec<String>,
+    pub(crate) names: Vec<String>,
+    pub(crate) counts: Vec<String>,
+    pub(crate) is_truncated: bool,
+    pub(crate) marker: Option<String>,
+}
+
+/// Read ONE page of the completed report `job_id` names, at the page size `max_items` names
+/// and from the position `marker` names.
+///
+/// The one reader of that page in this crate's tests, so every suite about the report — its
+/// contents, its paging, the catalog it projects — sees the same members read the same way.
+pub(crate) async fn read_report_page(
+    router: &MultiServiceRouter,
+    case: &str,
+    job_id: &str,
+    max_items: Option<usize>,
+    marker: Option<&str>,
+) -> LastAccessedPage {
+    let size = max_items.map(|size| size.to_string());
+    let mut params: Vec<(&str, &str)> = vec![("JobId", job_id)];
+    if let Some(size) = size.as_deref() {
+        params.push(("MaxItems", size));
+    }
+    if let Some(marker) = marker {
+        params.push(("Marker", marker));
+    }
+    let (status, body) = call(router, "GetServiceLastAccessedDetails", &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: GetServiceLastAccessedDetails must succeed, got {status}: {body}"
+    );
+    assert_eq!(
+        element(&body, "JobStatus"),
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::state::JOB_STATUS_COMPLETED,
+        "case {case:?}: expected the generation the clock owed to be done, got {body}"
+    );
+    LastAccessedPage {
+        namespaces: elements(&body, "ServiceNamespace"),
+        names: elements(&body, "ServiceName"),
+        counts: elements(&body, "TotalAuthenticatedEntities"),
+        is_truncated: element(&body, "IsTruncated") == "true",
+        marker: elements(&body, "Marker").into_iter().next(),
+    }
+}
+
 /// The Region every request this harness sends addresses unless a suite names another
 /// ([`call_signed_in_region`]).
 ///

@@ -62,7 +62,7 @@ pub fn takes_a_named_resource(action: &str) -> bool {
 ///
 /// SOURCE: the Service Authorization Reference ("Actions, resources, and condition keys for
 /// Amazon Web Services services"), the same publication this crate reads a service's
-/// namespace out of ([`super::REPORTED_SERVICES`]) and names each IAM action from
+/// namespace out of ([`super::PUBLISHED_SERVICES`]) and names each IAM action from
 /// ([`super::authorization::actions`]): an action whose row lists no resource type is one
 /// "that does not support resource-level permissions", which a statement must therefore
 /// permit on `*`.
@@ -82,7 +82,7 @@ pub fn takes_a_named_resource(action: &str) -> bool {
 /// action against a named resource says what the documents decide and nothing about the
 /// action's own publication; a resourceless action is filed here, at its place, as the
 /// behaviour that needs it arrives, the way a service is filed into
-/// [`super::REPORTED_SERVICES`]. The permissive resolution is deliberate: denying on a gap
+/// [`super::PUBLISHED_SERVICES`]. The permissive resolution is deliberate: denying on a gap
 /// in this list would withhold a grant the documents DO carry, which is the answer a
 /// least-privilege review would then have to work around.
 pub const ACTIONS_WITHOUT_RESOURCE_TYPES: &[&str] = &[

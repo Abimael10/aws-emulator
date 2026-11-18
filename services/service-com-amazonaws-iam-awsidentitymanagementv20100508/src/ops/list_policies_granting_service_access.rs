@@ -218,11 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The service namespace for the Amazon Web Services services whose policies you
         // want to list": a namespace has to NAME a service — `serviceNamespaceType`'s
         // pattern admits any word, so the value is read against AWS's own published
-        // prefixes (`crate::state::REPORTED_SERVICES`). A namespace no service is
-        // published under is a value this operation cannot answer about, and answering it
-        // with an empty list would tell a caller that mistyped one that the identity has
-        // no policy granting it. Every rejected namespace is named, so the whole request
-        // is refused and nothing is reported.
+        // prefixes (`crate::state::PUBLISHED_SERVICES`, every prefix a policy can name an
+        // action of rather than the subset a last-accessed report enumerates). A namespace
+        // no service is published under is a value this operation cannot answer about, and
+        // answering it with an empty list would tell a caller that mistyped one that the
+        // identity has no policy granting it. Every rejected namespace is named, so the
+        // whole request is refused and nothing is reported.
         let unknown = crate::state::unknown_service_namespaces(
             input.service_namespaces.iter().map(String::as_str),
         );
