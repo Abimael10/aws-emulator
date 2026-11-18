@@ -135,3 +135,29 @@ Cause 4:
 5. acm.request_certificate(DomainName='*.<some-zone>', ValidationMethod='DNS') and read DomainValidationOptions[0].ValidationDomain from acm.describe_certificate. Observed: the leading '*.' label is stripped. Expected (AWS): the requested name is echoed verbatim, wildcard label included (DomainNameString's pattern admits '^(\*\.)?').
 
 6. Re-replay ALL FIVE fixture#step keys (the representative acm-certificate-dns-lifecycle#task#7 plus the four in trace_ids) and confirm every one passes before closing; closing any subset leaves the others live.
+
+## Resolution
+
+All nine fixtures of this issue replay clean (65/65 steps, both Issue-Keys report `fixed`): a requested
+public certificate whose names no evidence from the account could cover settles into terminal Status
+'FAILED' with FailureReason 'ADDITIONAL_VERIFICATION_REQUIRED', the per-domain ValidationStatus of the
+name the service stopped at is 'FAILED', each entry echoes the requested name verbatim (wildcard label
+included) and no synthesized address list is served, because such a request is never mailed. The rules
+are pinned end to end, on the wall clock, by
+`core/router/tests/all/acm_unvalidatable_certificate_settles_terminally.rs`, beside the owning crate's
+own `tests/all/unvalidatable_name_certificate_failure.rs` and
+`tests/all/delegated_zone_certificate_validation.rs`.
+
+RESIDUAL DIFFERENCE, cause 3: for a name whose ValidationMethod is EMAIL the DomainValidation entry
+still carries `ValidationEmails` as the EMPTY LIST rather than omitting the member — "a list of email
+addresses that ACM used to send domain validation emails" with none used — where the recorded response
+carries no member at all. The replay accepts it on all three steps of that cluster
+(acm-certificate-email-with-inline-tags#task#2, acm-update-certificate-options-validation-method#task#2
+and #task#4), and the member-absence rule is stated in this report as a hypothesis the model does not
+make, so the empty-list form was left as the member's own documentation and this crate's suites
+(tests/all/validation_mail_dispatch_span.rs, tests/all/email_validation_dispatch.rs,
+tests/all/certificate_detail_projection.rs and others) have it. A recorded response of an
+email-validated certificate that IS awaiting its challenge would decide it: if ACM carries the member
+only while the challenge is live, the projection in
+`services/service-com-amazonaws-acm-certificatemanager/src/state.rs` (`domain_validation`) should report
+it only when it names an address, and those suites' expectations move with it.
