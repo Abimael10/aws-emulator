@@ -227,15 +227,17 @@ async fn published_units(router: &MultiServiceRouter, case: &str, table: &str, a
         .sum()
 }
 
-/// Every `WriteCapacityUnits` figure a response carries, summed: with `ReturnConsumedCapacity`
-/// of `TOTAL` each entry carries one figure for the table it is about, and these rows address
-/// one table per request, so this is what the request reported spending in write capacity.
+/// Every `CapacityUnits` figure a response carries, summed: with `ReturnConsumedCapacity`
+/// of `TOTAL` the answer is the table it is about and the aggregate it spent — "only the
+/// aggregate ConsumedCapacity for the operation" (the `ReturnConsumedCapacity` doc), with no
+/// per-table or per-index line to count twice — and these rows are writes addressing one
+/// table per request, so this is what the request reported spending in write capacity.
 fn reported_units(answered: &Value) -> f64 {
     match answered {
         Value::Object(members) => members
             .iter()
             .map(|(name, value)| {
-                if name == "WriteCapacityUnits" {
+                if name == "CapacityUnits" {
                     value.as_f64().unwrap_or_default()
                 } else {
                     reported_units(value)

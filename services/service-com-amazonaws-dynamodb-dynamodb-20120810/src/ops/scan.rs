@@ -290,13 +290,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The most data one page of a `Scan` response carries, which is the store's own page
-/// budget: "If the total size of scanned items exceeds the maximum dataset size limit
-/// of 1 MB, the scan completes and results are returned to the user" (the `Scan`
-/// doc). A page that stops there reports a `LastEvaluatedKey`, so the caller pages on,
-/// and one request cannot amplify into a response the size of a table.
-use crate::state::MAX_PAGE_BYTES;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -637,6 +630,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // item carries ([`crate::state::read_capacity_units`]), summed over the items this
         // scan examined, exactly as a batched read of the same items is charged.
         let mut page_units: f64 = 0.0;
+        // What this scan spends on the TABLE rather than on the index it read: the
+        // base-table fetches it made, charged per item.
+        let mut fetched_units: f64 = 0.0;
         let mut truncated = false;
         for (_, item) in evaluated {
             let read = crate::state::Read::new(
@@ -647,28 +643,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             let size = crate::state::item_size(read.seen());
             // The first row always fits, the way DynamoDB always returns at least
-            // one item it read; after that the page stops BEFORE the row that would
-            // carry it past the budget, so the response is bounded BY the budget
-            // rather than by the budget plus one item.
+            // one item it read; after that the page stops once the rows it already
+            // holds have CROSSED the budget, so the item that carried it past the
+            // limit is in the page and a truncated page is one the limit was
+            // exceeded by ([`crate::state::page_budget_spent`]).
             if page.len() >= limit
-                || (!page.is_empty() && page_size.saturating_add(size) > MAX_PAGE_BYTES)
+                || (!page.is_empty() && crate::state::page_budget_spent(page_size))
             {
                 truncated = true;
                 break;
             }
             page_size = page_size.saturating_add(size);
-            page_units += crate::state::read_capacity_units(size, consistent_read);
+            page_units += crate::state::read_capacity_units(
+                crate::state::item_size(read.projected()),
+                consistent_read,
+            );
+            // What the scan spends ON THE TABLE: an index read that had to fetch the
+            // attributes its index does not project read the table's own copy of this
+            // item, which is charged per item
+            // ([`crate::state::fetch_capacity_units`]); what it spends on the INDEX is
+            // what the index holds for the item, which is what `page_units` above sums.
+            if fetches_from_table {
+                fetched_units += crate::state::fetch_capacity_units(size);
+            }
             page.push(read);
         }
 
         // "The primary key of the item where the operation stopped" — reported when
-        // the walk stopped with items left to evaluate, and when it stopped because it
-        // reached the `Limit` the request asked for, whether or not a row remains
-        // ([`crate::state::reports_stop_key`]). A page that ran out of rows with no
-        // limit reached reports none, which is what tells the client the scan is done.
-        // An index scan reports the index's key beside the table's, because that pair is
-        // what addresses one entry of an index.
-        let last_evaluated_key = crate::state::reports_stop_key(input.limit, page.len(), truncated)
+        // the walk stopped with items left to evaluate, when it stopped because it
+        // reached the `Limit` the request asked for, and when it stopped because the
+        // page spent its 1 MB budget, whether or not a row remains
+        // ([`crate::state::reports_stop_key`], [`crate::state::page_budget_spent`]):
+        // "if LastEvaluatedKey is not empty, it does not necessarily mean that there is
+        // more data in the result set" (`Scan$LastEvaluatedKey`), so a page the budget
+        // stopped carries a key and the client learns the scan is done from the page it
+        // asks for next. A page that ran out of rows inside both bounds reports none,
+        // which is what tells the client the scan is done. An index scan reports the
+        // index's key beside the table's, because that pair is what addresses one entry
+        // of an index.
+        let stopped = truncated || crate::state::page_budget_spent(page_size);
+        let last_evaluated_key = crate::state::reports_stop_key(input.limit, page.len(), stopped)
             .then(|| page.last())
             .flatten()
             .map(|read| crate::state::evaluated_key(table, index.as_ref(), read.item()));
@@ -705,6 +719,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &name,
             index.as_ref(),
             units,
+            fetched_units,
         );
         // WHICH throughput series these units are counted into is the line of
         // `ConsumedCapacity` this response bills them to
@@ -724,7 +739,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(throttle) = store
             .active_table_mut(&region, &name, now)
             .map_err(lift)?
-            .admit_read_from(billed_index.as_deref(), units, now)
+            .admit_read_from(billed_index.as_deref(), units + fetched_units, now)
         {
             return Err(ScanErrorModeled::ProvisionedThroughputExceededException(
                 crate::state::read_throughput_exceeded(

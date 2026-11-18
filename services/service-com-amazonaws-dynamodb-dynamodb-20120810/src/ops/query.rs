@@ -289,13 +289,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The most data one page of a `Query` response carries, which is the store's own
-/// page budget: "A single Query operation can retrieve a maximum of 1 MB of data"
-/// (`Query$Limit` and "Paginating table query results"). A page that stops there
-/// reports a `LastEvaluatedKey`, so the caller pages on, and one request cannot
-/// amplify into a response the size of a partition.
-use crate::state::MAX_PAGE_BYTES;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -707,10 +700,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_or(available, |limit| usize::try_from(limit).unwrap_or(0));
         let mut page: Vec<crate::state::Read<'_>> = Vec::new();
         let mut page_size: i64 = 0;
+        // What the SOURCE this query read holds for the rows the page took: the items
+        // themselves on a base-table read, and the entries the index holds for them on an
+        // index read — which is what reading that index costs, whatever the read went on
+        // to fetch from the table.
+        let mut index_bytes: i64 = 0;
+        // What this read spends on the TABLE rather than on the index it read: the
+        // base-table fetches it made, charged per item.
+        let mut fetched_units: f64 = 0.0;
         for (_, item) in rows.iter().take(limit) {
             // The first item always fits, the way DynamoDB always returns at least
-            // one item it found.
-            if !page.is_empty() && page_size >= MAX_PAGE_BYTES {
+            // one item it found; after that the page stops once what it holds has
+            // CROSSED the budget ([`crate::state::page_budget_spent`]).
+            if !page.is_empty() && crate::state::page_budget_spent(page_size) {
                 break;
             }
             let read = crate::state::Read::new(
@@ -719,7 +721,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &table.key_schema,
                 fetches_from_table,
             );
-            page_size = page_size.saturating_add(crate::state::item_size(read.seen()));
+            let size = crate::state::item_size(read.seen());
+            page_size = page_size.saturating_add(size);
+            // What the read spends ON THE TABLE: an index read that had to fetch the
+            // attributes its index does not project read the table's own copy of this
+            // item, which is charged per item
+            // ([`crate::state::fetch_capacity_units`]); what it spends on the INDEX is
+            // what the index holds for the item, which is all the index itself was read
+            // for.
+            if fetches_from_table {
+                fetched_units += crate::state::fetch_capacity_units(size);
+            }
+            index_bytes = index_bytes.saturating_add(crate::state::item_size(read.projected()));
             page.push(read);
         }
         let truncated = available > page.len();
@@ -727,9 +740,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An index read reports the index's key beside the table's, because that pair
         // is what addresses one entry of an index
         // ([`crate::state::evaluated_key`]), and it reports one whenever the page
-        // stopped short of the end of what it walked — rows left to evaluate, or the
-        // caller's `Limit` reached ([`crate::state::reports_stop_key`]).
-        let last_evaluated_key = crate::state::reports_stop_key(input.limit, page.len(), truncated)
+        // stopped short of the end of what it walked — rows left to evaluate, the
+        // caller's `Limit` reached ([`crate::state::reports_stop_key`]), or the page's
+        // own 1 MB budget spent ([`crate::state::page_budget_spent`]), whether or not a
+        // row remains: "if LastEvaluatedKey is not empty, it does not necessarily mean
+        // that there is more data in the result set" (`Query$LastEvaluatedKey`).
+        let stopped = truncated || crate::state::page_budget_spent(page_size);
+        let last_evaluated_key = crate::state::reports_stop_key(input.limit, page.len(), stopped)
             .then(|| page.last())
             .flatten()
             .map(|read| crate::state::evaluated_key(table, index.as_ref(), read.item()));
@@ -750,14 +767,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not carry still narrows the read.
         let items = crate::state::reported_items(&selection, &matched);
 
-        let units = crate::state::read_capacity_units(page_size, consistent_read);
+        let units = crate::state::read_capacity_units(index_bytes, consistent_read);
         // Billed to the index this query read when it named one, which is where the
-        // units were spent.
+        // units were spent, with the base-table fetches it made on the table's own arm.
         let consumed_capacity = crate::state::consumed_read_capacity(
             input.return_consumed_capacity.as_deref(),
             &name,
             index.as_ref(),
             units,
+            fetched_units,
         );
         // WHICH throughput series these units are counted into is the line of
         // `ConsumedCapacity` this response bills them to
@@ -777,7 +795,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(throttle) = store
             .active_table_mut(&region, &name, now)
             .map_err(lift)?
-            .admit_read_from(billed_index.as_deref(), units, now)
+            .admit_read_from(billed_index.as_deref(), units + fetched_units, now)
         {
             // The key activity of a read refused for exceeding the table's throughput: the
             // partition the condition pinned was THROTTLED.
@@ -814,7 +832,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.index_name.as_deref(),
             &[(
                 vec![condition.partition.key_text()],
-                crate::state::contributor_insights::Access::Consumed(units),
+                crate::state::contributor_insights::Access::Consumed(units + fetched_units),
             )],
             now,
         );

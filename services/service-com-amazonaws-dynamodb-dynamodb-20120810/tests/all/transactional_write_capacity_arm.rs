@@ -253,7 +253,19 @@ async fn a_transaction_reports_twice_the_single_item_write_in_the_same_member() 
             }),
         )
         .await;
-        let single_units = write_arm(&case, &single["ConsumedCapacity"]);
+        // The item API's own answer at `TOTAL` is the aggregate alone: the per-kind figure
+        // itemises it, and `TOTAL` asks for "only the aggregate ConsumedCapacity for the
+        // operation" (the `ReturnConsumedCapacity` doc).
+        let single_units = single["ConsumedCapacity"]["CapacityUnits"]
+            .as_f64()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected a CapacityUnits aggregate, got {single}")
+            });
+        assert_eq!(
+            single["ConsumedCapacity"].get("WriteCapacityUnits"),
+            None,
+            "case {case:?}: the item API's TOTAL answer is the aggregate alone, got {single}"
+        );
 
         let transactional = ok(
             &router,

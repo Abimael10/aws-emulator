@@ -161,7 +161,7 @@ use super::types::*;
 /// it found; the results past the budget are left out, so a page that stops there is a
 /// SHORTER `SearchResults` list — this operation carries no continuation token to resume
 /// from.
-use crate::state::MAX_PAGE_BYTES;
+use crate::state::page_budget_spent;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -436,7 +436,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut search_results: Vec<SearchResultItem> = Vec::new();
         let mut reported_bytes: i64 = 0;
         for (score, item) in ranked.into_iter().take(top_k) {
-            if !search_results.is_empty() && reported_bytes >= MAX_PAGE_BYTES {
+            if !search_results.is_empty() && page_budget_spent(reported_bytes) {
                 break;
             }
             let entry = index.reported_entry(item, &table.key_schema);

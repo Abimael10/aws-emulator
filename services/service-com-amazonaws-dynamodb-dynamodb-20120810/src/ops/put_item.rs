@@ -614,6 +614,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &name,
                 &capacity,
                 crate::state::CapacityKind::Write,
+                crate::state::KindReport::Itemised,
             ),
             item_collection_metrics: item_collection_metrics.flatten(),
         })

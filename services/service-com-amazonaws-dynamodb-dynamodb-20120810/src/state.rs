@@ -88,6 +88,24 @@ pub const MAX_ITEM_SIZE_BYTES: i64 = 400 * 1024;
 /// readers cannot drift apart.
 pub const MAX_PAGE_BYTES: i64 = 1024 * 1024;
 
+/// Whether a page that has already taken `page_bytes` of items has spent its budget, so
+/// the walk stops and reports where it stopped.
+///
+/// A page is the SHORTEST run of items whose sizes CROSS [`MAX_PAGE_BYTES`]: "If the total
+/// size of scanned items exceeds the maximum dataset size limit of 1 MB, the scan
+/// completes and results are returned to the user" (the `Scan` doc) — the scan completes
+/// once the total it has already read exceeds the limit, so the item that carries the page
+/// past the limit is part of that page and the page that stops is one the limit was
+/// exceeded by. Each item is measured as the store holds it, attribute names included
+/// ([`item_size`]).
+///
+/// One rule for every reader that pages ([`MAX_PAGE_BYTES`] is the store's, not either
+/// operation's), so a `Query`, a `Scan` and a PartiQL `SELECT` over the same items stop at
+/// the same item.
+pub fn page_budget_spent(page_bytes: i64) -> bool {
+    page_bytes > MAX_PAGE_BYTES
+}
+
 /// How a write of an item past [`MAX_ITEM_SIZE_BYTES`] is refused: AWS's FIXED
 /// sentence for that quota ("Item size has exceeded the maximum allowed size" —
 /// the Developer Guide's "Error handling" entry for `ValidationException`), with
@@ -4542,11 +4560,12 @@ fn byte_len(len: usize) -> i64 {
     i64::try_from(len).unwrap_or(i64::MAX)
 }
 
-/// A number's stored size: 1 byte per two significant digits, plus 1 byte. An
-/// unparseable value is sized by its text, which is all there is to store.
+/// A number's stored size: 1 byte per two significant digits (rounded up), plus 1 byte,
+/// plus one byte for a negative number ([`NumberKey::stored_bytes`]). An unparseable
+/// value is sized by its text, which is all there is to store.
 fn number_size(text: &str) -> i64 {
     match NumberKey::parse(text) {
-        Some(number) => number.significant_digits() / 2 + 1,
+        Some(number) => number.stored_bytes(),
         None => byte_len(text.len()),
     }
 }

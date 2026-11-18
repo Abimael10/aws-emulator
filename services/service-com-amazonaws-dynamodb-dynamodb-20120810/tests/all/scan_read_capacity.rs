@@ -169,10 +169,13 @@ async fn a_scan_is_charged_a_read_unit_for_every_item_it_examined() {
         assert_eq!(
             (
                 scanned["ConsumedCapacity"]["CapacityUnits"].clone(),
-                scanned["ConsumedCapacity"]["ReadCapacityUnits"].clone(),
+                // `TOTAL` asks for "only the aggregate ConsumedCapacity for the
+                // operation" (the `ReturnConsumedCapacity` doc), so the per-kind figure
+                // that itemises it is not part of this answer.
+                scanned["ConsumedCapacity"].get("ReadCapacityUnits").cloned(),
                 scanned["ScannedCount"].clone(),
             ),
-            (json!(row.units), json!(row.units), json!(row.items)),
+            (json!(row.units), None, json!(row.items)),
             "case {:?}: expected {} read unit(s) over {} item(s), got {scanned}",
             row.case,
             row.units,

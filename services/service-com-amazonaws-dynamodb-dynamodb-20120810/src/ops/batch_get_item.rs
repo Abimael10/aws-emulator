@@ -567,7 +567,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // client's retry loop terminate, and carrying the keys a table had no
             // capacity left for — or the response no room left for — when it did not.
             unprocessed_keys: Some(unprocessed),
-            consumed_capacity: ledger.consumed_capacity(input.return_consumed_capacity.as_deref()),
+            consumed_capacity: ledger.consumed_capacity(
+                input.return_consumed_capacity.as_deref(),
+                crate::state::KindReport::Itemised,
+            ),
         })
     }
 }

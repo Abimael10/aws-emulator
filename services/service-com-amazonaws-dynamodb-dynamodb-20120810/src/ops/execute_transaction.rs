@@ -367,9 +367,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // The repeat re-applies nothing, so no statement of it produced an
                     // item to report ([`reported_responses`]).
                     responses: reported_responses(parsed.iter().map(|_| None)),
-                    consumed_capacity: completed
-                        .ledger
-                        .consumed_capacity(requested_capacity, crate::state::CapacityKind::Read),
+                    consumed_capacity: completed.ledger.consumed_capacity(
+                        requested_capacity,
+                        crate::state::CapacityKind::Read,
+                        crate::state::KindReport::Named,
+                    ),
                 });
             }
         }
@@ -588,6 +590,7 @@ fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             requested_capacity,
             &name,
             units,
+            crate::state::KindReport::Named,
         ));
         *per_table.entry(name.clone()).or_default() += units;
         responses.push(ItemResponse {
@@ -983,6 +986,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                         .consumed_capacity(
                             requested_capacity,
                             crate::state::CapacityKind::Write,
+                            crate::state::KindReport::Named,
                         )
                         .unwrap_or_default(),
                 );

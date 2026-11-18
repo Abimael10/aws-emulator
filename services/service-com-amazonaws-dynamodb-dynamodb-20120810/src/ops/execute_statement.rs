@@ -188,14 +188,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-// The store's own page budget, which is what a `SELECT` pages at as well as `Query`
-// and `Scan`: "if the total number of processed items exceeds the maximum dataset size
-// limit of 1 MB, the read stops and results are returned to the user as a
-// LastEvaluatedKey value to continue the read in a subsequent operation" (the
-// `ExecuteStatement` doc). A statement that names no `Limit` therefore cannot pull a
-// whole table into one response.
-use crate::state::MAX_PAGE_BYTES;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -548,15 +540,22 @@ fn select_items(
     // 4 KB of EACH row, half a unit where the read is eventually consistent — the charge a
     // `Scan` of the same rows carries ([`crate::ops::scan`]).
     let mut page_units: f64 = 0.0;
+    // An index reports the attributes it PROJECTS — "only the attributes that are
+    // projected into the index are reported" — so an index is also what the statement
+    // READ: the bytes a row costs are the bytes its source holds for that row, which for
+    // a statement whose source is a secondary index are the attributes that index
+    // projects and not the whole stored item.
+    let projected = crate::state::projected_attributes(table, select.index.as_deref());
     let mut evaluated = 0usize;
     let mut rows: Vec<(&crate::state::ItemKey, &crate::state::Item)> = Vec::new();
     for (key, item) in &candidates {
         // The first row always fits, the way DynamoDB always returns at least one
-        // item it found.
-        if evaluated >= limit || (evaluated > 0 && page_size >= MAX_PAGE_BYTES) {
+        // item it found; after that the page stops once the rows it holds have CROSSED
+        // the budget ([`crate::state::page_budget_spent`]).
+        if evaluated >= limit || (evaluated > 0 && crate::state::page_budget_spent(page_size)) {
             break;
         }
-        let size = crate::state::item_size(item);
+        let size = held_size(item, projected.as_ref());
         page_size = page_size.saturating_add(size);
         page_units +=
             crate::state::read_capacity_units(size, input.consistent_read.unwrap_or(false));
@@ -568,7 +567,9 @@ fn select_items(
         }
         rows.push((*key, *item));
     }
-    let truncated = candidates.len() > evaluated;
+    // A page that spent its 1 MB budget stopped there, whether or not a row remains, by
+    // the rule every reader that pages follows ([`crate::state::page_budget_spent`]).
+    let truncated = candidates.len() > evaluated || crate::state::page_budget_spent(page_size);
 
     // "The primary key of the item where the operation stopped": the last row the page
     // EVALUATED, which is where a resumed page carries on from whether or not the
@@ -577,21 +578,11 @@ fn select_items(
         .checked_sub(1)
         .and_then(|last| candidates.get(last))
         .map(|(key, item)| ((*key).clone(), table.key_attributes(item)));
-    // An index reports the attributes it PROJECTS — "only the attributes that are
-    // projected into the index are reported" — and the statement's own projection
-    // narrows those further.
-    let projected = crate::state::projected_attributes(table, select.index.as_deref());
+    // The statement's own projection narrows what the source holds for a row further.
     let items: Vec<crate::state::Item> = rows
         .iter()
         .map(|(_, item)| {
-            let held: crate::state::Item = match projected.as_ref() {
-                Some(allowed) => item
-                    .iter()
-                    .filter(|(name, _)| allowed.contains(name.as_str()))
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect(),
-                None => (*item).clone(),
-            };
+            let held = held_item(item, projected.as_ref());
             crate::state::project_item(&held, select.projection.as_ref())
         })
         .collect();
@@ -618,6 +609,24 @@ fn select_items(
     } else {
         page_units
     };
+    // WHERE those units were spent: a statement whose source is a secondary index read
+    // that INDEX, so they are billed to it exactly as the `Query` or `Scan` of the same
+    // index bills them ([`crate::state::consumed_read_capacity`]) — and the table's own
+    // arm carries only what the read spent on the table, which for this plan is nothing:
+    // it reads what the index holds for each row and never goes on to the table for more.
+    // Projected while the index is still borrowed from the table, before the admission
+    // below reaches for the table again.
+    let consumed_capacity = crate::state::consumed_read_capacity(
+        input.return_consumed_capacity.as_deref(),
+        name,
+        select
+            .index
+            .as_deref()
+            .and_then(|index| table.secondary_index(index))
+            .as_ref(),
+        units,
+        0.0,
+    );
     // The read is ADMITTED against the read capacity the table is provisioned for, the
     // same as the item API's reads: a statement past that capacity is refused rather
     // than served.
@@ -647,12 +656,37 @@ fn select_items(
         items: Some(items),
         next_token,
         last_evaluated_key,
-        consumed_capacity: crate::state::consumed_capacity(
-            input.return_consumed_capacity.as_deref(),
-            name,
-            units,
-        ),
+        consumed_capacity,
     })
+}
+
+/// What the SOURCE a statement read holds for one row: the stored item, narrowed to the
+/// attributes a secondary index projects when the statement's source is one
+/// ([`crate::state::projected_attributes`] answers `None` for the table itself, which
+/// holds every attribute).
+fn held_item(
+    item: &crate::state::Item,
+    projected: Option<&::std::collections::BTreeSet<String>>,
+) -> crate::state::Item {
+    match projected {
+        Some(allowed) => item
+            .iter()
+            .filter(|(name, _)| allowed.contains(name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        None => item.clone(),
+    }
+}
+
+/// The bytes that source holds for one row, which is what reading the row costs.
+fn held_size(
+    item: &crate::state::Item,
+    projected: Option<&::std::collections::BTreeSet<String>>,
+) -> i64 {
+    match projected {
+        Some(_) => crate::state::item_size(&held_item(item, projected)),
+        None => crate::state::item_size(item),
+    }
 }
 
 /// `INSERT`: the item the statement carries, which must not already be stored —
@@ -726,6 +760,7 @@ fn insert_item(
             name,
             &capacity,
             crate::state::CapacityKind::Write,
+            crate::state::KindReport::Itemised,
         ),
     })
 }
@@ -858,6 +893,7 @@ fn update_item(
             name,
             &capacity,
             crate::state::CapacityKind::Write,
+            crate::state::KindReport::Itemised,
         ),
     })
 }
@@ -940,6 +976,7 @@ fn delete_item(
             name,
             &capacity,
             crate::state::CapacityKind::Write,
+            crate::state::KindReport::Itemised,
         ),
     })
 }

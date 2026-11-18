@@ -399,6 +399,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     consumed_capacity: completed.ledger.consumed_capacity(
                         input.return_consumed_capacity.as_deref(),
                         crate::state::CapacityKind::Read,
+                        crate::state::KindReport::Named,
                     ),
                     item_collection_metrics: report_item_collection
                         .then(|| completed.ledger.item_collection_metrics())
@@ -799,6 +800,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             consumed_capacity: ledger.consumed_capacity(
                 input.return_consumed_capacity.as_deref(),
                 crate::state::CapacityKind::Write,
+                crate::state::KindReport::Named,
             ),
             item_collection_metrics: report_item_collection
                 .then(|| ledger.item_collection_metrics())

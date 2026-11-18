@@ -583,6 +583,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             consumed_capacity: ledger.consumed_capacity(
                 input.return_consumed_capacity.as_deref(),
                 crate::state::CapacityKind::Write,
+                crate::state::KindReport::Itemised,
             ),
         })
     }

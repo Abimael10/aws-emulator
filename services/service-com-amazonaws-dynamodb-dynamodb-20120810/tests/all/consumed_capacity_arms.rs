@@ -7,14 +7,20 @@
 //! `ReadCapacityUnits` is "the total number of read capacity units consumed by the
 //! operation" and `WriteCapacityUnits` the write equivalent — and so does every `Capacity`
 //! line of the per-table and per-index breakdown. A data-plane operation spends capacity of
-//! ONE kind, so the figure of that kind equals the aggregate and the other kind's is absent:
-//! a read reports the read arm, a write reports the write arm.
+//! ONE kind, so the figure of that kind equals the aggregate and the other kind's is never
+//! there: a read reports the read arm, a write reports the write arm.
 //!
-//! The one place the kind is not the operation's own direction is a `TransactWriteItems`
-//! replay under a `ClientRequestToken`: "the initial TransactWriteItems call returns the
-//! amount of write capacity units consumed in making the changes. Subsequent
-//! TransactWriteItems calls with the same client token return the number of READ capacity
-//! units consumed in reading the item"
+//! WHICH of those members an answer carries follows what the request asked for: `TOTAL`
+//! asks for "only the aggregate ConsumedCapacity for the operation" (the
+//! `ReturnConsumedCapacity` doc), so that answer is the table and the aggregate alone,
+//! while `INDEXES` asks for the itemisation — the `Table` and per-index lines, and the
+//! per-kind figure that itemises the aggregate the same way.
+//!
+//! A TRANSACTIONAL call names its kind at either level, because which kind it billed IS
+//! part of its answer: "the initial TransactWriteItems call returns the amount of write
+//! capacity units consumed in making the changes. Subsequent TransactWriteItems calls with
+//! the same client token return the number of READ capacity units consumed in reading the
+//! item"
 //! (`smithy_query(query="doc",shape="TransactWriteItemsInput",member="ClientRequestToken")`)
 //! — the replay applies nothing, so it is billed as the read it was, which is how a caller
 //! tells which of several identical idempotent calls committed.
@@ -45,10 +51,20 @@ impl Kind {
     }
 }
 
+/// Whether this operation's `ConsumedCapacity` NAMES the kind it billed beside the
+/// aggregate: the level that asks for the itemisation does, and so does a transactional
+/// call, whose answer IS which kind it billed.
+fn names_kind(operation: &str, body: &Value) -> bool {
+    body["ReturnConsumedCapacity"] == json!("INDEXES")
+        || operation.starts_with("Transact")
+        || operation == "ExecuteTransaction"
+}
+
 /// Assert the rule over ONE `ConsumedCapacity` object: the aggregate is positive, the
-/// kind's arm equals it, the other kind's arm is absent, and every `Capacity` line of the
-/// breakdown reports its own figure in the same arm.
-fn assert_arms(case: &str, kind: Kind, consumed: &Value) {
+/// kind's arm equals it where the answer names the kind and is absent where it does not,
+/// the other kind's arm is always absent, and every `Capacity` line of the breakdown
+/// reports its own figure in the same arm.
+fn assert_arms(case: &str, kind: Kind, consumed: &Value, named: bool) {
     let (reported, absent) = kind.arms();
     let aggregate = consumed["CapacityUnits"].as_f64().unwrap_or_else(|| {
         panic!("case {case:?}: expected a CapacityUnits aggregate, got {consumed}")
@@ -59,8 +75,9 @@ fn assert_arms(case: &str, kind: Kind, consumed: &Value) {
     );
     assert_eq!(
         consumed[reported].as_f64(),
-        Some(aggregate),
-        "case {case:?}: expected {reported} to equal CapacityUnits ({aggregate}), got {consumed}"
+        named.then_some(aggregate),
+        "case {case:?}: expected {reported} to equal CapacityUnits ({aggregate}) only where \
+         the answer names the kind ({named}), got {consumed}"
     );
     assert_eq!(
         consumed.get(absent),
@@ -255,13 +272,14 @@ async fn every_data_plane_operation_reports_its_capacity_in_its_own_arm() {
     ];
 
     for (case, operation, body, kind) in rows {
+        let named = names_kind(operation, &body);
         let answered = ok(&router, operation, body).await;
         let consumed = &answered["ConsumedCapacity"];
         assert!(
             consumed.is_object(),
             "case {case:?}: a request that asked for capacity gets one object, got {answered}"
         );
-        assert_arms(case, kind, consumed);
+        assert_arms(case, kind, consumed, named);
     }
 
     // The surfaces that report a LIST of per-table entries follow the same rule, entry by
@@ -326,6 +344,7 @@ async fn every_data_plane_operation_reports_its_capacity_in_its_own_arm() {
     ];
 
     for (case, operation, body, kind) in batched {
+        let named = names_kind(operation, &body);
         let answered = ok(&router, operation, body).await;
         let entries = answered["ConsumedCapacity"]
             .as_array()
@@ -339,7 +358,7 @@ async fn every_data_plane_operation_reports_its_capacity_in_its_own_arm() {
              {answered}"
         );
         for entry in &entries {
-            assert_arms(case, kind, entry);
+            assert_arms(case, kind, entry, named);
         }
     }
 
@@ -388,7 +407,7 @@ async fn a_token_replay_of_a_transaction_is_billed_as_the_read_it_was() {
         .unwrap_or_else(|| panic!("case first use: expected a ConsumedCapacity list, got {first}"))
         .clone();
     for entry in &first_entries {
-        assert_arms("first use of the token", Kind::Write, entry);
+        assert_arms("first use of the token", Kind::Write, entry, true);
     }
 
     // Every REPLAY applies nothing and is billed as a read of the same items — the arm is
@@ -406,7 +425,7 @@ async fn a_token_replay_of_a_transaction_is_billed_as_the_read_it_was() {
             "case {case:?}: the replay reports what the first call recorded, got {replayed}"
         );
         for (entry, first_entry) in entries.iter().zip(&first_entries) {
-            assert_arms(&case, Kind::Read, entry);
+            assert_arms(&case, Kind::Read, entry, true);
             assert_eq!(
                 entry["CapacityUnits"].as_f64(),
                 first_entry["CapacityUnits"].as_f64(),
@@ -449,7 +468,7 @@ async fn a_token_replay_of_a_transaction_is_billed_as_the_read_it_was() {
         .as_array()
         .unwrap_or_else(|| panic!("case a second token: expected a list, got {other}"))
     {
-        assert_arms("a second token's first use", Kind::Write, entry);
+        assert_arms("a second token's first use", Kind::Write, entry, true);
     }
 
     // A conditional transaction that is REFUSED reports no capacity at all, so nothing

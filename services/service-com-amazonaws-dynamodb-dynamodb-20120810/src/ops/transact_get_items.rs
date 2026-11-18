@@ -369,7 +369,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record_key_activity(&*self.engine, &store, &region, &key_activity, false, now);
 
         Ok(TransactGetItemsOutput {
-            consumed_capacity: ledger.consumed_capacity(input.return_consumed_capacity.as_deref()),
+            consumed_capacity: ledger.consumed_capacity(
+                input.return_consumed_capacity.as_deref(),
+                crate::state::KindReport::Named,
+            ),
             responses: Some(responses),
         })
     }

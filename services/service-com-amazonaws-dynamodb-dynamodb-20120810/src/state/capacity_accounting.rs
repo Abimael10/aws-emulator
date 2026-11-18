@@ -24,6 +24,21 @@ pub fn read_capacity_units(size: i64, consistent_read: bool) -> f64 {
     }
 }
 
+/// The capacity units a base-table FETCH of ONE item costs: that item's own size rounded up
+/// to the read unit, at the strongly consistent rate.
+///
+/// "If any of the requested attributes are not projected into the local secondary index,
+/// DynamoDB fetches each of these attributes from the parent table" (`Query$Select`), and
+/// each of those fetches is a read of THAT item in its own right — so the rounding is per
+/// item rather than over the page, and it is the whole unit however the request asked to
+/// read the INDEX: the recorded answer for an eventually consistent index query bills the
+/// parent-table fetches of items of 1,024 / 5,120 and 9,216 bytes as 1 + 2 + 3 units, which
+/// is the unhalved per-item rounding. The index read beside it keeps the consistency the
+/// request asked for, which is what [`read_capacity_units`] applies.
+pub fn fetch_capacity_units(size: i64) -> f64 {
+    read_capacity_units(size, true)
+}
+
 /// How many whole units of `unit_bytes` cover `size` bytes, never fewer than one.
 fn units_of(size: i64, unit_bytes: i64) -> f64 {
     let size = size.max(0);
@@ -85,6 +100,25 @@ pub enum CapacityKind {
     Write,
 }
 
+/// Whether an operation's `ConsumedCapacity` NAMES the kind of capacity it billed
+/// (`ConsumedCapacity$ReadCapacityUnits` / `$WriteCapacityUnits`) beside the aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindReport {
+    /// Only as part of the itemisation `INDEXES` asks for. `TOTAL` asks for "only the
+    /// aggregate ConsumedCapacity for the operation" (the `ReturnConsumedCapacity` doc),
+    /// so that answer is the table the operation ran against and that aggregate: the
+    /// per-direction figures itemise the aggregate, like the `Table` and per-index lines
+    /// beside them.
+    Itemised,
+    /// Beside the aggregate whatever the level, because WHICH kind it billed is part of a
+    /// transactional call's answer: "the initial TransactWriteItems call returns the amount
+    /// of write capacity units consumed in making the changes. Subsequent TransactWriteItems
+    /// calls with the same client token return the number of read capacity units consumed in
+    /// reading the item" (`TransactWriteItems$ClientRequestToken`) — the kind is how a caller
+    /// tells a replay from the call that committed.
+    Named,
+}
+
 impl CapacityKind {
     /// One `Capacity` line — a table's or an index's — of `units` of this kind: the
     /// aggregate and this kind's own figure, which are the same number.
@@ -96,16 +130,27 @@ impl CapacityKind {
         }
     }
 
-    /// A `ConsumedCapacity` reporting `units` of this kind for `table_name`, with no
-    /// per-table or per-index breakdown yet: the operation's aggregate and this kind's
-    /// own figure, filled from [`Self::line`] so one rule decides every arm.
-    fn consumed(self, table_name: &str, units: f64) -> ConsumedCapacity {
+    /// WHICH members it carries follows the level the request asked for and whether the
+    /// operation names the kind it billed ([`KindReport`]): the aggregate and the table are
+    /// always there, and the per-direction figures itemise the aggregate.
+    fn consumed(
+        self,
+        table_name: &str,
+        units: f64,
+        detail: bool,
+        report: KindReport,
+    ) -> ConsumedCapacity {
         let aggregate = self.line(units);
+        let names_kind = detail || report == KindReport::Named;
         ConsumedCapacity {
             table_name: Some(table_name.to_string()),
             capacity_units: aggregate.capacity_units,
-            read_capacity_units: aggregate.read_capacity_units,
-            write_capacity_units: aggregate.write_capacity_units,
+            read_capacity_units: names_kind
+                .then_some(aggregate.read_capacity_units)
+                .flatten(),
+            write_capacity_units: names_kind
+                .then_some(aggregate.write_capacity_units)
+                .flatten(),
             ..ConsumedCapacity::default()
         }
     }
@@ -132,6 +177,7 @@ pub fn consumed_write_capacity(
     table_name: &str,
     capacity: &WriteCapacity,
     kind: CapacityKind,
+    report: KindReport,
 ) -> Option<ConsumedCapacity> {
     let detail = match requested {
         Some("TOTAL") => false,
@@ -150,7 +196,7 @@ pub fn consumed_write_capacity(
         // for — it is a different meter, in bytes — so it is reported whenever the
         // request asked for its consumption at all, for each index the write reached.
         vector_indexes: vector_breakdown(&capacity.vector_indexes),
-        ..kind.consumed(table_name, capacity.total())
+        ..kind.consumed(table_name, capacity.total(), detail, report)
     })
 }
 
@@ -241,14 +287,17 @@ pub fn size_estimate_range_gb(bytes: i64) -> Vec<f64> {
 /// `INDEXES` asks for "the aggregate ConsumedCapacity for the operation, together with
 /// ConsumedCapacity for each table and secondary index that was accessed" (the
 /// `ReturnConsumedCapacity` doc): a read of an index spends its units ON THAT INDEX, so
-/// the index carries the aggregate and the table's own line is zero — the read did not go
-/// to the table (`Scan$Select`: a read served from the index "reads only the index and not
-/// the table"). Which of the two per-index maps the index appears under is its kind.
+/// the index carries them, and what the TABLE's arm carries is what the read spent on the
+/// table — nothing for a read the index answered on its own ("reads only the index and not
+/// the table" — `Scan$Select`), and `fetched` where the read had to go on to the table for
+/// attributes the index does not project. Which of the two per-index maps the index appears
+/// under is its kind.
 pub fn consumed_index_capacity(
     requested: Option<&str>,
     table_name: &str,
     index: &SecondaryIndex<'_>,
     units: f64,
+    fetched: f64,
 ) -> Option<ConsumedCapacity> {
     let detail = match requested {
         Some("TOTAL") => false,
@@ -260,13 +309,13 @@ pub fn consumed_index_capacity(
     per_index.insert(index.name.to_string(), units);
     let breakdown = detail.then(|| capacity_breakdown(kind, &per_index)).flatten();
     Some(ConsumedCapacity {
-        // The read did not go to the table, so its own line is zero rather than absent:
-        // `INDEXES` asks for "each table and secondary index that was accessed", and the
-        // table that holds the index is named by every line of the breakdown.
-        table: detail.then(|| kind.line(0.0)),
+        // The table's own line is reported for an index read either way — `INDEXES` asks
+        // for "each table and secondary index that was accessed" — and carries the units
+        // the base-table fetches cost, which is zero for a read that made none.
+        table: detail.then(|| kind.line(fetched)),
         local_secondary_indexes: (!index.global).then(|| breakdown.clone()).flatten(),
         global_secondary_indexes: index.global.then_some(breakdown).flatten(),
-        ..kind.consumed(table_name, units)
+        ..kind.consumed(table_name, units + fetched, detail, KindReport::Itemised)
     })
 }
 
@@ -278,12 +327,12 @@ pub fn consumed_index_capacity(
 /// it (the `ReturnConsumedCapacity` doc: "specifying INDEXES will only return
 /// ConsumedCapacity information for table(s)").
 ///
-/// Every figure is reported in the read arm as well as the aggregate
-/// ([`CapacityKind`]).
+/// Which members carry the figures follows the level and `report` ([`KindReport`]).
 pub fn consumed_capacity(
     requested: Option<&str>,
     table_name: &str,
     units: f64,
+    report: KindReport,
 ) -> Option<ConsumedCapacity> {
     let detail = match requested {
         Some("TOTAL") => false,
@@ -293,6 +342,6 @@ pub fn consumed_capacity(
     let kind = CapacityKind::Read;
     Some(ConsumedCapacity {
         table: detail.then(|| kind.line(units)),
-        ..kind.consumed(table_name, units)
+        ..kind.consumed(table_name, units, detail, report)
     })
 }

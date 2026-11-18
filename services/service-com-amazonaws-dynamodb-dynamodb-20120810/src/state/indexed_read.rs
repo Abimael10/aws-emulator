@@ -21,7 +21,7 @@ use crate::ops::types::{ConsumedCapacity, KeySchemaElement};
 use crate::state::{
     consumed_capacity, consumed_index_capacity, enum_value_requirement, expression_conflict,
     invalid_member, unknown_index_named, AttributeValueKey, DocumentPath, IndexItemKey, Item,
-    ItemKey, RequestError, SecondaryIndex, Substitutions, Table,
+    ItemKey, KindReport, RequestError, SecondaryIndex, Substitutions, Table,
 };
 
 /// How a strongly consistent read of a GLOBAL secondary index is refused: "The
@@ -554,15 +554,23 @@ pub fn reports_stop_key(limit: Option<i32>, evaluated: usize, more: bool) -> boo
 /// The `ConsumedCapacity` a read reports, billed to the index it was served from when it
 /// named one ([`consumed_index_capacity`]) and to the table otherwise
 /// ([`consumed_capacity`]).
+///
+/// `units` is what reading the SOURCE cost, rounded the way the reader charges its own
+/// rows — a `Scan` is charged "a read unit for every item it examined" and a `Query` once
+/// over the page it read — and `fetched` is what the read spent going on to the parent
+/// table for attributes the index it read does not project, which is the table's own arm
+/// of an index read ([`fetch_capacity_units`]); a base-table read spends everything on the
+/// table and so has none.
 pub fn consumed_read_capacity(
     requested: Option<&str>,
     table_name: &str,
     index: Option<&SecondaryIndex<'_>>,
     units: f64,
+    fetched: f64,
 ) -> Option<ConsumedCapacity> {
     match index {
-        Some(index) => consumed_index_capacity(requested, table_name, index, units),
-        None => consumed_capacity(requested, table_name, units),
+        Some(index) => consumed_index_capacity(requested, table_name, index, units, fetched),
+        None => consumed_capacity(requested, table_name, units, KindReport::Itemised),
     }
 }
 

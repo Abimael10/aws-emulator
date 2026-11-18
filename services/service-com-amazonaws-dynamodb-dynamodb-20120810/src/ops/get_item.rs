@@ -363,6 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.return_consumed_capacity.as_deref(),
                 &name,
                 units,
+                crate::state::KindReport::Itemised,
             ),
         })
     }

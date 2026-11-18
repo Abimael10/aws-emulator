@@ -1102,12 +1102,13 @@ impl WriteLedger {
         &self,
         requested: Option<&str>,
         kind: CapacityKind,
+        report: KindReport,
     ) -> Option<Vec<ConsumedCapacity>> {
         let reported: Vec<ConsumedCapacity> = self
             .capacity
             .iter()
             .filter_map(|(table, capacity)| {
-                consumed_write_capacity(requested, table, capacity, kind)
+                consumed_write_capacity(requested, table, capacity, kind, report)
             })
             .collect();
         (!reported.is_empty()).then_some(reported)
@@ -1140,11 +1141,15 @@ impl ReadLedger {
     }
 
     /// The `ConsumedCapacity` list the operation reports, one entry per table it read.
-    pub fn consumed_capacity(&self, requested: Option<&str>) -> Option<Vec<ConsumedCapacity>> {
+    pub fn consumed_capacity(
+        &self,
+        requested: Option<&str>,
+        report: KindReport,
+    ) -> Option<Vec<ConsumedCapacity>> {
         let reported: Vec<ConsumedCapacity> = self
             .units
             .iter()
-            .filter_map(|(table, units)| consumed_capacity(requested, table, *units))
+            .filter_map(|(table, units)| consumed_capacity(requested, table, *units, report))
             .collect();
         (!reported.is_empty()).then_some(reported)
     }

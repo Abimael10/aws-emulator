@@ -614,7 +614,12 @@ fn read_item(
             item: found.map(|item| crate::state::project_item(&item, select.projection.as_ref())),
             ..BatchStatementResponse::default()
         },
-        crate::state::consumed_capacity(requested_capacity, name, units),
+        crate::state::consumed_capacity(
+            requested_capacity,
+            name,
+            units,
+            crate::state::KindReport::Itemised,
+        ),
     ))
 }
 
@@ -682,6 +687,7 @@ fn insert_item(
             name,
             &capacity,
             crate::state::CapacityKind::Write,
+            crate::state::KindReport::Itemised,
         ),
     ))
 }
@@ -793,6 +799,7 @@ fn update_item(
             name,
             &capacity,
             crate::state::CapacityKind::Write,
+            crate::state::KindReport::Itemised,
         ),
     ))
 }
@@ -863,6 +870,7 @@ fn delete_item(
             name,
             &capacity,
             crate::state::CapacityKind::Write,
+            crate::state::KindReport::Itemised,
         ),
     ))
 }

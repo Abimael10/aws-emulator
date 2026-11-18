@@ -1809,8 +1809,8 @@ async fn the_largest_accepted_operand_moves_with_the_clauses_stated_beside_it() 
 
     // One row per clause KIND. `below` is the frame that clause carries plus the bytes it
     // leaves in the item: a one-character attribute name (1 byte) and its value — a
-    // one-character string (1 byte) or a one-digit number (1 byte, "1 byte per two
-    // significant digits plus 1 byte" with the digits rounding down).
+    // one-character string (1 byte) or a one-digit number (2 bytes, "1 byte per two
+    // significant digits" rounded up "plus 1 byte").
     let rows = [
         Frame {
             case: "a second assignment",
@@ -1824,21 +1824,21 @@ async fn the_largest_accepted_operand_moves_with_the_clauses_stated_beside_it() 
             expression: "SET v = :v ADD b :one",
             values: || json!({":one": {"N": "1"}}),
             seed: None,
-            below: 19 + 2,
+            below: 19 + 3,
         },
         Frame {
             case: "an assignment whose operand is arithmetic",
             expression: "SET v = :v, b = :one + :zero",
             values: || json!({":one": {"N": "1"}, ":zero": {"N": "0"}}),
             seed: None,
-            below: 69 + 2,
+            below: 69 + 3,
         },
         Frame {
             case: "an assignment whose operand is a function call",
             expression: "SET v = :v, b = if_not_exists(b, :one)",
             values: || json!({":one": {"N": "1"}}),
             seed: None,
-            below: 74 + 2,
+            below: 74 + 3,
         },
         Frame {
             case: "a REMOVE of a one-character path",

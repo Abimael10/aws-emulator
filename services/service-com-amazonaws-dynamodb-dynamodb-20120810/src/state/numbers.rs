@@ -146,8 +146,45 @@ impl NumberKey {
 
     /// The number of significant digits, which is what an `N` value's stored size is
     /// computed from.
+    ///
+    /// The digits are the ones the number is SPELLED with, leading zeros left out:
+    /// "Leading and trailing zeroes are trimmed" (the `AttributeValue$N` numeric domain),
+    /// and a decimal point is where a trailing zero can be trimmed at all — so the zeros a
+    /// whole number carries BEFORE the point are digits of it (`100` spells three), while
+    /// the zeros a fraction ends with are not (`1.100` spells two), and a zero between two
+    /// significant digits is always one of them (`1.0001` spells five).
+    ///
+    /// A value whose decimal point sits just past the digits it holds is spelled with the
+    /// zeros that point asks for, and counts them. A magnitude past the documented
+    /// precision ceiling is not: a number that would need more digits than a stored number
+    /// can hold is spelled with an EXPONENT instead of with that run of zeros, so what it
+    /// is spelled with is its mantissa — which is also what keeps every `N` value inside
+    /// the documented maximum width of one.
     pub(super) fn significant_digits(&self) -> i64 {
-        i64::try_from(self.digits.len()).unwrap_or(i64::MAX)
+        let held = i64::try_from(self.digits.len()).unwrap_or(i64::MAX);
+        let ceiling = i64::try_from(MAX_SIGNIFICANT_DIGITS).unwrap_or(i64::MAX);
+        let spelled = i64::from(self.point).max(0);
+        if spelled > ceiling {
+            return held;
+        }
+        held.max(spelled)
+    }
+
+    /// The bytes storing this number is accounted for: "1 byte per two significant
+    /// digits" — so an odd digit count fills the second half of a byte and pays for it —
+    /// "+ 1 byte" (the Developer Guide's "Item sizes and formats"), and one more byte for
+    /// a negative number, which is what makes an `N` value at the documented precision
+    /// ceiling the documented 21 bytes wide at most.
+    ///
+    /// Zero holds no significant digits, so it is the base byte alone.
+    pub(super) fn stored_bytes(&self) -> i64 {
+        let digits = self.significant_digits();
+        let sign = i64::from(self.negative);
+        digits
+            .saturating_add(1)
+            .saturating_div(2)
+            .saturating_add(1)
+            .saturating_add(sign)
     }
 
     /// This number's CANONICAL text — the one form every read of it reports.
