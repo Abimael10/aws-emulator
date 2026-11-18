@@ -30,6 +30,12 @@ use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 #[path = "account_level_reads_publish_service_data/auto_scaling_instances.rs"]
 mod auto_scaling_instances;
 
+// `DescribeAutoScalingGroups`: the LIST members a reported group carries — one list per
+// collection of the shape, empty when the group holds nothing in it rather than left out of
+// the answer. Its own file under this suite's directory, declared here for the same reason.
+#[path = "account_level_reads_publish_service_data/auto_scaling_group_list_members.rs"]
+mod auto_scaling_group_list_members;
+
 /// The launch source every group in this suite is created from: a launch TEMPLATE,
 /// because no account can create a launch configuration
 /// (`CreateLaunchConfiguration` is refused with `UnsupportedOperation`).
