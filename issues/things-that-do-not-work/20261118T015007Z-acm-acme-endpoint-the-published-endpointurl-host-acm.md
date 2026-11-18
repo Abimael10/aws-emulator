@@ -1,0 +1,71 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: acm.acme-account-describe-list acm.acme-account-double-revoke-is-idempotent acm.acme-account-identity-is-the-account-key-not-the-binding acm.acme-account-revoke-lifecycle acm.acme-account-revoke-terminal-transition acm.acme-account-revoke-transitions-state acm.acme-contact-required-endpoint-refuses-a-registration-without-contact acm.acme-directory-serves-the-rfc8555-resource-map-and-single-use-nonces acm.acme-new-account-with-a-forged-eab-mac-rejected acm.acme-replayed-nonce-rejected-and-the-error-carries-a-usable-nonce acm.concurrent-revoke-acme-account-idempotent-terminal acm.concurrent-revoke-acme-account-single-winner acm.create-domain-validation-on-revoked-account-blocked acm.describe-acme-account-revoked-status-not-notfound acm.e2e-acme-endpoint-binding-revoke-flow acm.list-acme-accounts-pagination-server-enforced acm.revoke-acme-account-reaches-terminal-state acm.revoke-acme-account-sets-terminal-state acm.revoke-already-revoked-acme-account-is-idempotent acm.update-acme-endpoint-on-revoked-account-succeeds
+Issue-Shape-Id: com.amazonaws.acm#CertificateManager
+Issue-Key: acm.acme-account-describe-list|_routed_request#6|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.acme-account-double-revoke-is-idempotent|_routed_request#6|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.acme-account-identity-is-the-account-key-not-the-binding|_routed_request#9|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.acme-account-revoke-lifecycle|_routed_request#13|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.acme-account-revoke-terminal-transition|_routed_request#7|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.acme-account-revoke-transitions-state|_routed_request#6|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.acme-contact-required-endpoint-refuses-a-registration-without-contact|_routed_request#9|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.acme-directory-serves-the-rfc8555-resource-map-and-single-use-nonces|_routed_request#3|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.acme-new-account-with-a-forged-eab-mac-rejected|_routed_request#9|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.acme-replayed-nonce-rejected-and-the-error-carries-a-usable-nonce|_routed_request#9|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.concurrent-revoke-acme-account-idempotent-terminal|_routed_request#12|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.concurrent-revoke-acme-account-single-winner|_routed_request#9|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.create-domain-validation-on-revoked-account-blocked|_routed_request#8|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.describe-acme-account-revoked-status-not-notfound|_routed_request#10|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.e2e-acme-endpoint-binding-revoke-flow|_routed_request#22|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.list-acme-accounts-pagination-server-enforced|_routed_request#7|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.revoke-acme-account-reaches-terminal-state|_register_acme_account#12|EgressRefused|directory = acme_messages.Directory.from_json(net.get(directory_url).json())
+Issue-Key: acm.revoke-acme-account-sets-terminal-state|_routed_request#10|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Key: acm.revoke-already-revoked-acme-account-is-idempotent|run#11|AssertionError|raise AssertionError(f"ACME protocol account registration did not complete: {exc!r}")
+Issue-Key: acm.update-acme-endpoint-on-revoked-account-succeeds|_routed_request#12|PublishedUrlRejected|target, route = ctx.endpoint_route(url)
+Issue-Commit: a086688dd5af7e9f4a8f58691fb77bab7bb9ceb6
+
+# ACM ACME endpoint: the published EndpointUrl host acm-acme-enroll.<region>.<domain> is not served by the emulator, so the entire native RFC8555 ACME data plane is unreachable (1 cause)
+
+> _Note: this issue was identified against the code base at commit `a086688dd5af7e9f4a8f58691fb77bab7bb9ceb6`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeAcmeEndpoint
+
+## Description
+REOPENS 20261106T080855Z-acm-acme-endpoint-endpointurl-is-published-as-a.md: its fix left the call refused.
+
+Cause 1 of 1: the ACME directory URL the service publishes (AcmeEndpoint.EndpointUrl, minted by CreateAcmeEndpoint and echoed by DescribeAcmeEndpoint) now has the correct AWS *shape* but names a host the emulator does not answer on, so every subsequent native-ACME request against that URL is refused before it reaches the emulator. Failing checks: acm.acme-account-describe-list, acm.acme-account-double-revoke-is-idempotent, acm.acme-account-identity-is-the-account-key-not-the-binding, acm.acme-account-revoke-lifecycle, acm.acme-account-revoke-terminal-transition, acm.acme-account-revoke-transitions-state, acm.acme-contact-required-endpoint-refuses-a-registration-without-contact, acm.acme-directory-serves-the-rfc8555-resource-map-and-single-use-nonces, acm.acme-new-account-with-a-forged-eab-mac-rejected, acm.acme-replayed-nonce-rejected-and-the-error-carries-a-usable-nonce, acm.concurrent-revoke-acme-account-idempotent-terminal, acm.concurrent-revoke-acme-account-single-winner, acm.create-domain-validation-on-revoked-account-blocked, acm.describe-acme-account-revoked-status-not-notfound, acm.e2e-acme-endpoint-binding-revoke-flow, acm.list-acme-accounts-pagination-server-enforced, acm.revoke-acme-account-reaches-terminal-state, acm.revoke-acme-account-sets-terminal-state, acm.revoke-already-revoked-acme-account-is-idempotent, acm.update-acme-endpoint-on-revoked-account-succeeds.
+
+AWS: recorded behavior only. The Smithy model (com.amazonaws.acm#AcmeEndpoint) documents EndpointUrl as only "<p>The URL of the ACME endpoint.</p>" (target String, no pattern), and neither CreateAcmeEndpointRequest nor UpdateAcmeEndpointRequest exposes an EndpointUrl input member, so the value is entirely service-assigned. What the recordings show is that the assigned value is an ACME directory URL that is actually SERVED: an RFC8555 client GETs it and receives the resource map (newNonce/newAccount/newOrder/...), POSTs a JWS to newAccount, and registers an account — the whole data plane the ACME checks drive runs over that one published URL. The URL's shape (https, leading DNS label acm-acme-enroll, second label the region, further domain labels, path exactly /<endpoint-id>/directory) is the template; the region, remaining domain labels and <endpoint-id> are the variable parts. Reachability of the published URL is a property of the recording, not of one host value: whatever authority the service announces, the service answers on it.
+
+Emulator: EndpointUrl is published as https://acm-acme-enroll.<region>.localhost:<port>/<endpoint-id>/directory — the right template, but on a hostname the emulator stands up no listener for and announces no address for. Every request to it is refused at the network layer, never reaching the emulator: the harness reports either 'simparity.published.PublishedUrlRejected: endpoint_url was given https://acm-acme-enroll.us-west-2.localhost:<port>/<endpoint-id>/directory (published by the emulator or built by the check): its host is not one of the emulator's own hosts; a customer of the emulator needs http(s)://127.0.0.1:<port>/<resource path>, or http(s)://<own host>:<port>/<path> on a per-resource listener' (18 of the 20 checks, one of them wrapped as 'AssertionError: ACME protocol account registration did not complete: PublishedUrlRejected(...)'), or 'CapabilityNotOffered: the target serves no address for acm-acme-enroll.us-west-2.localhost / simparity.egress.EgressRefused: egress refused: ... the emulator announces an address other than the endpoint it is reached on' (acm.revoke-acme-account-reaches-terminal-state). The specific port and endpoint uuid differ per run and are not the finding; the invariant is that the announced authority is not one the emulator serves. The control-plane calls themselves succeed (CreateAcmeEndpoint/DescribeAcmeEndpoint return 200 and the endpoint reaches ACTIVE) — only the advertised data plane is dead, which is why the four representation-only checks fixed by 20261106T080855Z pass while all 20 protocol-driving checks fail.
+
+Why: a client is handed EndpointUrl and treats it as the live ACME directory — it derives the enrollment host from the authority, GETs the directory, fetches a nonce from newNonce and POSTs its EAB-bound JWS to newAccount. Here the first connection to that host fails to resolve/connect, so nothing downstream of it can run: no account registration, hence no DescribeAcmeAccount/ListAcmeAccounts/RevokeAcmeAccount against a real account, no nonce single-use enforcement, no forged-EAB-MAC rejection, no contact-required refusal, no revoked-account write guard, and no ListAcmeAccounts pagination. The emulator looks healthy on the control plane and is unusable for ACME enrollment, and a caller cannot work around it because the host is the service's own published value.
+
+Fix: the ACME endpoint URL publication and its listener binding in the acm crate — whatever mints EndpointUrl when CreateAcmeEndpoint creates the endpoint (and serves it from endpoint state via DescribeAcmeEndpoint) must announce an authority the emulator actually accepts connections on, and the ACME data-plane routes (/<endpoint-id>/directory, newNonce, newAccount, newOrder and the account resources) must be bound on that same authority. Either stand up the per-resource listener for the acm-acme-enroll.<region>.<domain> host the URL names, or publish the emulator's own reachable host while keeping the /<endpoint-id>/directory path layout. Publishing the AWS-shaped hostname without serving it satisfies the URL-shape checks and breaks every protocol check.
+
+Traces: the 20 checks listed above; 18 fail on PublishedUrlRejected for the published endpoint_url, one on EgressRefused/CapabilityNotOffered for the same host, and acm.revoke-already-revoked-acme-account-is-idempotent surfaces the same PublishedUrlRejected wrapped in its registration assertion.
+
+## Evidence
+Expected (AWS, from the recordings): DescribeAcmeEndpoint returns AcmeEndpoint.EndpointUrl = https://acm-acme-enroll.<region>.<domain>/<endpoint-id>/directory, and a GET of that exact URL returns 200 with the RFC8555 directory resource map; a POST of an EAB-bound JWS to the newAccount URL it lists returns 201 with a Location account URL. The URL the service publishes is one the service answers on.
+
+Actual (emulator): EndpointUrl = https://acm-acme-enroll.us-west-2.localhost:<port>/<endpoint-id>/directory (e.g. .../c12ce110-30f8-45aa-ab69-81550a794a6b/directory on one run, .../94150628-9fec-4805-90f5-5dc801c94caf/directory on another — the port and uuid are per-run and are not the requirement). No request to it ever reaches the emulator:
+
+  simparity.published.PublishedUrlRejected: endpoint_url was given https://acm-acme-enroll.us-west-2.localhost:35757/<endpoint-id>/directory (published by the emulator or built by the check): its host is not one of the emulator's own hosts; a customer of the emulator needs http(s)://127.0.0.1:43955/<resource path>, or http(s)://<own host>:<port>/<path> on a per-resource listener
+
+  CapabilityNotOffered: the target serves no address for acm-acme-enroll.us-west-2.localhost
+  simparity.egress.EgressRefused: egress refused: 'acm-acme-enroll.us-west-2.localhost' is not the endpoint under test (127.0.0.1); an emulator run may reach only the emulator. If the host came from a URL the emulator returned, the emulator announces an address other than the endpoint it is reached on
+
+  AssertionError: ACME protocol account registration did not complete: PublishedUrlRejected("endpoint_url was given https://acm-acme-enroll.us-west-2.localhost:45805/<endpoint-id>/directory ...")
+
+In the fixed text above, the fixed parts are the refusal class (the host is not one the emulator serves / announces); the host, port and endpoint id are values taken from the emulator's own published EndpointUrl.
+
+CreateAcmeEndpoint, DescribeAcmeEndpoint, CreateAcmeExternalAccountBinding and GetAcmeExternalAccountBindingCredentials all return 200 in these runs; the failure is always the first hop onto the published URL. Smithy: com.amazonaws.acm#AcmeEndpoint$EndpointUrl -> String, no pattern, no input member on CreateAcmeEndpoint/UpdateAcmeEndpoint, so the value is wholly service-assigned.
+
+## Steps to Reproduce
+1. acm.create_acme_endpoint(AuthorizationBehavior="PRE_APPROVED", Contact="NOT_REQUIRED", CertificateAuthority={"PublicCertificateAuthority": {"AllowedKeyAlgorithms": ["RSA_2048"]}}, Tags=[{"Key":"Name","Value":"<unique>"}]) -> AcmeEndpointArn.
+2. Poll acm.describe_acme_endpoint(AcmeEndpointArn=arn)["AcmeEndpoint"] until Status == ACTIVE and read EndpointUrl: https://acm-acme-enroll.<region>.localhost:<port>/<endpoint-id>/directory.
+3. Create an IAM role for ACME, acm.create_acme_external_account_binding(...), then acm.get_acme_external_account_binding_credentials(...) -> KeyId/MacKey. All of these succeed (200).
+4. HTTP GET the EndpointUrl from step 2 (what any RFC8555 client does first): the host acm-acme-enroll.<region>.localhost resolves/connects to nothing the emulator serves — the request is refused before the emulator sees it (PublishedUrlRejected / EgressRefused 'the target serves no address for acm-acme-enroll.<region>.localhost'). No directory resource map is returned, so newNonce/newAccount cannot be reached and no ACME account can be registered.
+5. Re-run the 20 behavioral checks listed in trace_ids; each fails at that first hop onto the published EndpointUrl.
