@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTrainingSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTrainingSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTrainingSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the training session `crate::state` holds under the requested
+//! `TrainingSessionName`, materialising the `Created` -> `Running` transition the clock
+//! already owed, and refuses a name this account holds no session under. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +135,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTrainingSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTrainingSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTrainingSession"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        // The only write this reporting call makes is the transition the clock already
+        // owed: it was due at the stored instant whether or not anybody described the
+        // session, so a waiter terminates and no caller's read changes the outcome.
+        let Some((session, settled)) = store.advance_training_session(
+            &input.training_session_name,
+            ::std::time::SystemTime::now(),
+        ) else {
+            return Err(DescribeTrainingSessionErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::training_session_not_found(
+                        &input.training_session_name,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let output = DescribeTrainingSessionOutput {
+            training_session_detail: TrainingSessionDetail {
+                training_session_arn: session.arn.clone(),
+                training_session_name: session.name.clone(),
+                training_session_status: session.status.clone(),
+                model_package_group_arn: session.model_package_group_arn.clone(),
+                creation_time: crate::state::timestamp(session.creation_time),
+                last_modified_time: Some(crate::state::timestamp(session.last_modified_time)),
+                // A session that is still being provisioned or running has not ended, and
+                // nothing has failed or blocked it, so neither member reports a value: the
+                // stop and the expiry that end a session are their own operations.
+                end_time: None,
+                error_details: None,
+                // The sequence numbers and the token counts are accrued by the training
+                // and sampling operations a caller submits through the SageMaker Training
+                // Session Runtime data plane, which keeps those records in its own store;
+                // this control plane observes none of them, so it reports no count rather
+                // than one it did not measure.
+                last_received_sequence_number: None,
+                billable_token_usage: None,
+                vpc_config: session.vpc_config.clone(),
+                role_arn: Some(session.role_arn.clone()),
+                lora_config: Some(session.lora_config.clone()),
+                model_config: Some(session.model_config.clone()),
+                output_config: Some(session.output_config.clone()),
+                // The session's own tag collection, EMPTY for one created with no tags:
+                // the member is how a session reports what it holds, not what the create
+                // request mentioned.
+                tags: Some(session.tags.clone()),
+            },
+        };
+        let arn = session.arn.clone();
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create does
+            // rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        Ok(output)
     }
 }

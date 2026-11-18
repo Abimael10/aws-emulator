@@ -1126,6 +1126,12 @@ pub use training_run::*;
 pub mod training_artifact;
 pub use training_artifact::*;
 
+/// The TRAINING SESSION slice — the session `CreateTrainingSession` writes and
+/// `DescribeTrainingSession` replays, with its ARN kind, statuses, store bound, clock span
+/// and not-found sentence: see `state/training_session.rs`.
+pub mod training_session;
+pub use training_session::*;
+
 /// The server-side RUN of an accepted Inference Recommender job — the endpoint it
 /// benchmarks, the traffic it sends and what it measured: see `state/recommendation_run.rs`.
 pub mod recommendation_run;
@@ -1350,6 +1356,7 @@ tag_accessors!(
     pipelines,
     processing_jobs,
     training_jobs,
+    training_sessions,
     transform_jobs,
     trial_components,
     trials,
@@ -2561,6 +2568,10 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub models: BTreeMap<String, Model>,
     /// Keyed by `TrainingJobName`.
     pub training_jobs: BTreeMap<String, TrainingJob>,
+    /// Keyed by `TrainingSessionName`, which every operation of the training-session
+    /// family addresses a session by. See [`TrainingSession`], whose slice lives in
+    /// [`training_session`].
+    pub training_sessions: BTreeMap<String, TrainingSession>,
     /// Keyed by `InferenceComponentName`.
     pub inference_components: BTreeMap<String, InferenceComponent>,
     /// Keyed by `EndpointConfigName`.

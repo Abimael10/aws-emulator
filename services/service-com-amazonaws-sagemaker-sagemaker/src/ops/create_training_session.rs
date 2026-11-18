@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrainingSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrainingSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrainingSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a training session in `crate::state` under its
+//! `TrainingSessionName`, minting the `TrainingSessionArn` from the region the request
+//! signed for, refusing a name already in use, a store at its bound and a model package
+//! group this account does not hold, and storing the instant the clock owes the session's
+//! `Created` -> `Running` transition. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +162,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrainingSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrainingSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrainingSession"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // No role admission is asked here, unlike the job and hosting creates: which
+        // reading of a caller-supplied execution role an operation takes is decided by
+        // what that operation is RECORDED doing (see `crate::state::admission`), and this
+        // one is recorded SERVING a create whose `RoleArn` names a role whose stored trust
+        // document does not admit the SageMaker service principal. Registering the session
+        // is therefore not what settles the role; the work the session goes on to do is.
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::TRAINING_SESSION_ARN_KIND,
+            &input.training_session_name,
+        );
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The session PUBLISHES its checkpoints and fine-tuned artifacts into the model
+        // package group the request names (`ModelPackageGroupArn`'s doc), so a group this
+        // account does not hold backs no session: `ResourceNotFound` is the modelled
+        // failure for a reference that resolves to nothing, worded the way every other
+        // reader of that resource words it. The member is optional, so a request naming no
+        // group references none.
+        if let Some(group_arn) = input.model_package_group_arn.as_deref() {
+            if store.model_package_group_arn_is_unresolvable(&region, group_arn) {
+                return Err(CreateTrainingSessionErrorModeled::ResourceNotFound(
+                    ResourceNotFound {
+                        message: Some(crate::state::entity_does_not_exist(
+                            crate::state::MODEL_PACKAGE_GROUP_ENTITY,
+                            group_arn,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        // A name already in use is refused with the modelled `ResourceInUse`, never
+        // overwritten: otherwise the caller reads a 200 for a session it did not create
+        // and loses the one it did, and the runtime operations already submitted against
+        // that name would belong to a session with another configuration. Checked before
+        // the store's bound, so the per-name rule answers the same whatever the store
+        // holds.
+        if store
+            .training_sessions
+            .contains_key(&input.training_session_name)
+        {
+            return Err(CreateTrainingSessionErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!(
+                    "Training session names must be unique within an Amazon Web Services \
+                     account and Region, and \"{}\" already exists.",
+                    input.training_session_name
+                )),
+            })
+            .into());
+        }
+        // The store is bounded, so a caller varying `TrainingSessionName` cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.training_sessions_below_quota() {
+            return Err(CreateTrainingSessionErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for training sessions is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::TRAINING_SESSION_QUOTA,
+                        store.training_sessions.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.training_sessions.insert(
+            input.training_session_name.clone(),
+            crate::state::TrainingSession {
+                name: input.training_session_name,
+                arn: arn.clone(),
+                // The compute the session runs on is still being provisioned: the clock
+                // owes `Running` at `running_due_at`.
+                status: crate::state::TRAINING_SESSION_CREATED.to_string(),
+                model_package_group_arn: input.model_package_group_arn,
+                role_arn: input.role_arn,
+                lora_config: input.lora_config,
+                model_config: input.model_config,
+                output_config: input.output_config,
+                vpc_config: input.vpc_config,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                last_modified_time: now,
+                running_due_at: now + crate::state::TRAINING_SESSION_RUNNING_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateTrainingSessionOutput {
+            training_session_arn: arn,
+        })
     }
 }
