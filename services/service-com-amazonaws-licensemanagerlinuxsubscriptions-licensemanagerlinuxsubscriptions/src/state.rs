@@ -1179,8 +1179,10 @@ pub fn source_filter_signature(sources: &[String]) -> String {
 /// cursors that name an element of the list THAT selection produced.
 ///
 /// Each filter is rendered as the selection it MEANS rather than as the request spelled
-/// it, the way [`filter_selects`] applies it: an absent `Operator` renders as the equality
-/// it stands for ([`OPERATOR_EQUAL`]), and the `Values` render as the set they are
+/// it, the way [`filter_selects`] applies it: the comparison is read through the one
+/// accessor both paths read it through ([`filter_operator`]), so an absent `Operator`
+/// renders as the equality it stands for ([`OPERATOR_EQUAL`]), and the `Values` render as
+/// the set they are
 /// compared as (`Values` is `uniqueItems` in the model, and every operator compares the
 /// values held against the values named without regard to their order). The filters
 /// themselves are a set too, because [`filters_select`] selects what satisfies every one
@@ -1194,16 +1196,13 @@ pub fn filter_signature(filters: &[Filter]) -> String {
 }
 
 /// One filter rendered as the selection it means: the member its `Name` addresses, the
-/// comparison it asks for (the default one when it names none) and the set of values it
-/// compares against.
+/// comparison it asks for ([`filter_operator`], the same accessor that applies it) and the
+/// set of values it compares against.
 fn canonical_filter(filter: &Filter) -> String {
     length_prefixed(
         [
             filter.name.clone().unwrap_or_default(),
-            filter
-                .operator
-                .clone()
-                .unwrap_or_else(|| OPERATOR_EQUAL.to_string()),
+            filter_operator(filter).to_string(),
         ]
         .into_iter()
         .chain(canonical_set(filter.values.clone().unwrap_or_default())),
@@ -1239,6 +1238,18 @@ pub const OPERATOR_NOT_EQUAL: &str = "NotEqual";
 
 /// `Operator` for a filter that selects on a substring of the member's value.
 pub const OPERATOR_CONTAINS: &str = "Contains";
+
+/// The comparison one `Filter` asks for: the `Operator` it names, or — when it names
+/// none — the comparison an absent one stands for ([`OPERATOR_EQUAL`]).
+///
+/// The one place this crate reads a filter's comparison, so the default is stated once.
+/// [`filter_selects`] APPLIES the comparison this answers, and [`canonical_filter`] RENDERS
+/// it into the identity of the list a pagination cursor is minted against; that rendering
+/// is a correct name for the list only because it names the very comparison the selection
+/// applies, so neither path may default on its own.
+pub fn filter_operator(filter: &Filter) -> &str {
+    filter.operator.as_deref().unwrap_or(OPERATOR_EQUAL)
+}
 
 /// Refuse a filter the list it was given to cannot apply.
 ///
@@ -1291,7 +1302,7 @@ pub fn filter_selects(filter: &Filter, member_values: &[String]) -> bool {
     }
     let values = filter.values.as_deref().unwrap_or_default();
     let equals = member_values.iter().any(|held| values.contains(held));
-    match filter.operator.as_deref().unwrap_or(OPERATOR_EQUAL) {
+    match filter_operator(filter) {
         OPERATOR_CONTAINS => member_values
             .iter()
             .any(|held| values.iter().any(|value| held.contains(value.as_str()))),
