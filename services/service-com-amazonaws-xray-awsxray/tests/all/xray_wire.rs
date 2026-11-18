@@ -284,10 +284,7 @@ impl Xray {
         filter: Option<&str>,
         token: Option<&str>,
     ) -> Answer {
-        let mut body = json!({ "StartTime": start, "EndTime": end });
-        if let Some(filter) = filter {
-            body["FilterExpression"] = json!(filter);
-        }
+        let mut body = summaries_body(start, end, filter);
         if let Some(token) = token {
             body["NextToken"] = json!(token);
         }
@@ -300,33 +297,58 @@ impl Xray {
     /// until the service stops issuing one. `filter` is the optional filter
     /// expression every page is queried with.
     pub async fn paged_summaries(&self, start: f64, end: f64, filter: Option<&str>) -> Vec<Value> {
+        let body = summaries_body(start, end, filter);
+        let mut summaries: Vec<Value> = Vec::new();
+        for page in self.trace_summary_pages(&body).await {
+            summaries.extend(array(&page.body, "TraceSummaries").iter().cloned());
+        }
+        summaries
+    }
+
+    /// Every page of the `GetTraceSummaries` query `query`, in the order the
+    /// service serves them.
+    ///
+    /// The pages of one query are SLICES of its own window walked from the end
+    /// of the window backwards, and which slice a trace falls in follows from
+    /// the hour grid rather than from the window's own bounds — so a reader
+    /// asking what a WINDOW holds follows `NextToken` until the service stops
+    /// issuing one, whatever the window's position on that grid. `query` is the
+    /// request body every page is asked with, carrying whatever else the query
+    /// states (a `TimeRangeType`, a `SamplingStrategy`, a filter expression);
+    /// the token is the only member this walk sets.
+    pub async fn trace_summary_pages(&self, query: &Value) -> Vec<Answer> {
         /// More pages than any window this harness asks about is cut into, so a
         /// walk that does not terminate fails the case instead of hanging.
         const MAX_PAGES: usize = 200;
 
-        let mut summaries: Vec<Value> = Vec::new();
+        let mut pages: Vec<Answer> = Vec::new();
         let mut token: Option<String> = None;
-        let mut pages = 0;
         loop {
-            let page = self
-                .query_summaries(start, end, filter, token.as_deref())
-                .await;
+            let mut body = query.clone();
+            let object = body
+                .as_object_mut()
+                .expect("a GetTraceSummaries query is a JSON object");
+            match token.as_deref() {
+                Some(token) => object.insert("NextToken".to_string(), json!(token)),
+                None => object.remove("NextToken"),
+            };
+            let page = self.call("/TraceSummaries", &body).await;
             assert_eq!(
                 page.status, 200,
-                "walking the pages of [{start}, {end}) must succeed, got {page:?}"
+                "walking the pages of {query} must succeed, got {page:?}"
             );
-            summaries.extend(array(&page.body, "TraceSummaries").iter().cloned());
             token = page.get("NextToken").as_str().map(str::to_string);
-            pages += 1;
+            pages.push(page);
             assert!(
-                pages <= MAX_PAGES,
-                "walking the pages of [{start}, {end}) must terminate, stopped after {pages} pages"
+                pages.len() <= MAX_PAGES,
+                "walking the pages of {query} must terminate, stopped after {} pages",
+                pages.len()
             );
             if token.is_none() {
                 break;
             }
         }
-        summaries
+        pages
     }
 
     pub async fn batch_get(&self, ids: &[String], token: Option<&str>) -> Answer {
@@ -387,6 +409,34 @@ pub fn array<'a>(value: &'a Value, member: &str) -> &'a [Value] {
         .get(member)
         .and_then(Value::as_array)
         .map_or(&[], Vec::as_slice)
+}
+
+/// The request body of a `GetTraceSummaries` query over `[start, end)` with an
+/// optional filter expression: the one shape every caller of that read builds,
+/// stated once so a walk of its pages and a single call cannot disagree.
+pub fn summaries_body(start: f64, end: f64, filter: Option<&str>) -> Value {
+    let mut body = json!({ "StartTime": start, "EndTime": end });
+    if let Some(filter) = filter {
+        body["FilterExpression"] = json!(filter);
+    }
+    body
+}
+
+/// The trace ids one `GetTraceSummaries` answer reports, in the order it
+/// reports them.
+pub fn reported(answer: &Answer) -> Vec<String> {
+    array(&answer.body, "TraceSummaries")
+        .iter()
+        .filter_map(|summary| summary.get("Id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The trace ids the pages of one `GetTraceSummaries` query report, in the order
+/// the pages report them — what a reader of the WHOLE window sees, as opposed to
+/// what one page of it carries.
+pub fn reported_trace_ids(pages: &[Answer]) -> Vec<String> {
+    pages.iter().flat_map(reported).collect()
 }
 
 /// A root segment document with the given times, in progress when `end` is

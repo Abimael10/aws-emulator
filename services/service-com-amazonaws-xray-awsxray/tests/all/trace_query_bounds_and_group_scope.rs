@@ -35,7 +35,9 @@
 
 use serde_json::{json, Value};
 
-use super::xray_wire::{array, close, root_document, trace_id, Answer, Xray};
+use super::xray_wire::{
+    array, close, reported, reported_trace_ids, root_document, trace_id, Answer, Xray,
+};
 
 /// An instant well in the past, so no window a case asks about reaches ahead of
 /// the clock-skew allowance the window check applies.
@@ -441,6 +443,11 @@ async fn the_sample_is_a_stable_subset_of_what_the_query_selected() {
     // be told from all of them and from none without a second page entering it.
     let base = BASE + 1_000.0;
     const STORED: u32 = 5;
+    // The instant each segment is ACCEPTED is the clock's, so the window the
+    // sample is drawn over is bracketed around the seeding rather than guessed
+    // from a span: every trace's update time lies between these two readings
+    // however long the ingestion takes.
+    let accepted_from = now();
     for n in 0..STORED {
         let document = root_document(
             &format!("c0000000000000{n:02x}"),
@@ -456,62 +463,64 @@ async fn the_sample_is_a_stable_subset_of_what_the_query_selected() {
             "the traces the sample is drawn from must be stored, got {put:?}"
         );
     }
+    let window = (accepted_from - 1.0, now() + 1.0);
 
-    let whole = sampled_ids(&xray, 1.0).await;
+    let whole = sampled_ids(&xray, window, 1.0).await;
     assert_eq!(
         whole.len(),
         STORED as usize,
         "a rate of one selects every trace the window holds, got {whole:?}"
     );
-    let none = sampled_ids(&xray, 0.0).await;
+    let none = sampled_ids(&xray, window, 0.0).await;
     assert!(
         none.is_empty(),
         "a rate of none selects no trace, got {none:?}"
     );
-    let half = sampled_ids(&xray, 0.5).await;
+    let half = sampled_ids(&xray, window, 0.5).await;
     assert!(
         half.len() <= whole.len() && half.iter().all(|id| whole.contains(id)),
         "a rate inside the interval selects a SUBSET of what the window holds, got {half:?}"
     );
     // The subset is a function of the traces and the rate, so asking twice
     // answers the same traces: no clock and no random source enters it.
-    let again = sampled_ids(&xray, 0.5).await;
+    let again = sampled_ids(&xray, window, 0.5).await;
     assert_eq!(
         half, again,
         "the same query at the same rate must answer the same subset, got {half:?} then {again:?}"
     );
 }
 
-/// The trace ids a query sampled at `rate` reports, over the window holding
+/// The trace ids a query sampled at `rate` reports, over the `window` holding
 /// every trace this suite's sampling case stored.
-async fn sampled_ids(xray: &Xray, rate: f64) -> Vec<String> {
-    let answered = xray
-        .call(
-            "/TraceSummaries",
-            &json!({
-                // The window the sample is drawn over, applied to each trace's
-                // UPDATE time — the range type a strategy is admitted under —
-                // which for a just-ingested trace is when this service accepted
-                // it.
-                "StartTime": now() - 300.0,
-                "EndTime": now() + 60.0,
-                "TimeRangeType": "Event",
-                "SamplingStrategy": {"Name": "FixedRate", "Value": rate},
-            }),
-        )
+async fn sampled_ids(xray: &Xray, window: (f64, f64), rate: f64) -> Vec<String> {
+    let (start, end) = window;
+    let pages = xray
+        .trace_summary_pages(&json!({
+            // The window the sample is drawn over, applied to each trace's
+            // UPDATE time — the range type a strategy is admitted under —
+            // which for a just-ingested trace is when this service accepted
+            // it.
+            "StartTime": start,
+            "EndTime": end,
+            "TimeRangeType": "Event",
+            "SamplingStrategy": {"Name": "FixedRate", "Value": rate},
+        }))
         .await;
-    assert_eq!(
-        answered.status, 200,
-        "a sampled query at {rate} must be answered, got {answered:?}"
-    );
     // The count is of the traces the WINDOW holds, which sampling does not
-    // narrow: the sample is of what is reported, not of what was processed.
-    assert_eq!(
-        answered.get("TracesProcessedCount").as_i64(),
-        Some(5),
-        "a sampled query still processed every trace in the window, got {answered:?}"
-    );
-    reported(&answered)
+    // narrow: the sample is of what is reported, not of what was processed. It
+    // is the same on every page of the one query, because the window is.
+    for (page, answered) in pages.iter().enumerate() {
+        assert_eq!(
+            answered.get("TracesProcessedCount").as_i64(),
+            Some(5),
+            "page {page} at rate {rate}: a sampled query still processed every trace in the \
+             window, got {answered:?}"
+        );
+    }
+    // What the WINDOW reports, walked across every page the query serves it in:
+    // the pages are hour-grid slices of the window, so a window positioned by
+    // the clock can straddle a boundary and report its traces on a later page.
+    reported_trace_ids(&pages)
 }
 
 #[tokio::test]
@@ -646,16 +655,6 @@ async fn seed(xray: &Xray) -> String {
         "both traces must be stored whole, got {put:?}"
     );
     arn
-}
-
-/// The trace ids a `GetTraceSummaries` answer reports, in the order it reports
-/// them.
-fn reported(answer: &Answer) -> Vec<String> {
-    array(&answer.body, "TraceSummaries")
-        .iter()
-        .filter_map(|summary| summary.get("Id").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect()
 }
 
 #[tokio::test]

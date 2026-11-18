@@ -42,7 +42,7 @@ use service_com_amazonaws_xray_awsxray::state::{
     ComAmazonawsXrayAwsxrayState, RESPONSE_TIME_ROOT_CAUSE_MIN_COVERAGE,
 };
 
-use crate::xray_wire::{array, close, root_document, trace_id, Answer, Xray};
+use crate::xray_wire::{array, close, reported_trace_ids, root_document, trace_id, Answer, Xray};
 
 /// A 60-second-aligned epoch instant, so a case's periods are easy to read:
 /// `1_699_999_980 == 60 * 28_333_333`.
@@ -517,13 +517,19 @@ async fn the_time_range_type_chooses_the_instant_the_window_is_applied_to() {
     let trace = trace_id(710);
     let started = ALIGNED - 600.0;
     let ended = ALIGNED - 60.0;
+    // The instant the segment is ACCEPTED is the clock's, so it is bracketed
+    // rather than guessed: the trace's update time lies between these two
+    // readings however long the call takes, which is what the `Event` rows below
+    // window on. The window those rows ask over reaches a second past the later
+    // reading, because `[StartTime, EndTime)` excludes its end.
+    let accepted_from = service_com_amazonaws_xray_awsxray::state::now_epoch_seconds();
     let put = xray
         .put_segments(&[
             root_document("7100000000000001", &trace, "svc", started, Some(ended)).to_string(),
         ])
         .await;
     assert_eq!(put.status, 200, "seeding must succeed, got {put:?}");
-    let ingested = service_com_amazonaws_xray_awsxray::state::now_epoch_seconds();
+    let accepted_to = service_com_amazonaws_xray_awsxray::state::now_epoch_seconds();
 
     // Rows: each `TimeRangeType` member against a window around each of the
     // three instants, and the default (no member at all), which is the trace's
@@ -566,7 +572,7 @@ async fn the_time_range_type_chooses_the_instant_the_window_is_applied_to() {
         (
             "Event over the instant the trace was last updated",
             Some("Event"),
-            (ingested - 60.0, ingested + 60.0),
+            (accepted_from, accepted_to + 1.0),
             true,
         ),
         (
@@ -588,17 +594,14 @@ async fn the_time_range_type_chooses_the_instant_the_window_is_applied_to() {
         if let Some(range) = range {
             body["TimeRangeType"] = json!(range);
         }
-        let answered = xray.call("/TraceSummaries", &body).await;
+        // What the WINDOW selects, which is what a `TimeRangeType` decides —
+        // walked across every page the query serves it in, because the pages of
+        // one query are hour-grid slices of its own window and which slice an
+        // instant falls in is not what this rule is about.
+        let pages = xray.trace_summary_pages(&body).await;
+        let ids = reported_trace_ids(&pages);
         assert_eq!(
-            answered.status, 200,
-            "case {case:?}: every modelled TimeRangeType is served, got {answered:?}"
-        );
-        let ids: Vec<&str> = array(&answered.body, "TraceSummaries")
-            .iter()
-            .filter_map(|summary| summary.get("Id").and_then(Value::as_str))
-            .collect();
-        assert_eq!(
-            ids == vec![trace.as_str()],
+            ids == vec![trace.clone()],
             selected,
             "case {case:?}: expected the trace to be selected: {selected}, got {ids:?}"
         );

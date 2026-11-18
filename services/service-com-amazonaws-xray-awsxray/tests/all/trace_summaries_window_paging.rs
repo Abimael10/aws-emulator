@@ -17,7 +17,11 @@
 //!   this one while the window reaches into it — whether or not the slice just
 //!   served held anything;
 //! * resuming from that token serves the next slice, so following the tokens
-//!   walks the whole window exactly once, newest slice first;
+//!   walks the whole window exactly once, newest slice first — which is how a
+//!   reader learns what a WINDOW holds, because the slices are cut on the hour
+//!   grid rather than on the window's own bounds, so a window of a few minutes
+//!   that straddles a boundary answers an empty first page and reports its
+//!   traces on the next one;
 //! * a token naming a slice the requested window is not paged by, or no slice at
 //!   all, is refused with the service's one wording for an uninterpretable
 //!   pagination token.
@@ -33,7 +37,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_xray_awsxray::ops::get_trace_summaries::TRACE_SUMMARIES_PAGE_SIZE;
 use service_com_amazonaws_xray_awsxray::state::TRACE_PAGE_SECONDS;
 
-use super::xray_wire::{array, root_document, trace_id, Answer, Xray};
+use super::xray_wire::{reported, reported_trace_ids, root_document, trace_id, Answer, Xray};
 
 /// One hour in the epoch seconds every instant on this wire travels as — the
 /// length of one page of a query's window, read from the service's own statement
@@ -60,15 +64,6 @@ fn approximate_time(answer: &Answer) -> Option<f64> {
 /// The `NextToken` of an answer.
 fn next_token(answer: &Answer) -> Option<String> {
     answer.get("NextToken").as_str().map(str::to_string)
-}
-
-/// The trace ids a page reports, in the order it reports them.
-fn reported(answer: &Answer) -> Vec<String> {
-    array(&answer.body, "TraceSummaries")
-        .iter()
-        .filter_map(|summary| summary.get("Id").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect()
 }
 
 /// Store `count` traces, the `index`th of them starting `offsets[index]` seconds
@@ -480,7 +475,187 @@ async fn a_window_at_the_edge_of_the_timestamp_range_is_answered() {
 
 
 // =============================================================================
-// 6. The window the slices are cut from is the one the request asks about,
+// 6. A window reports every trace it holds, wherever its bounds fall on the
+//    grid — which is what following the tokens is for
+// =============================================================================
+
+/// One window over the store [`grid_cases`] seeds, and what the rule says a
+/// reader of it sees: the trace ids the WHOLE query reports (newest slice
+/// first), and the ids its FIRST page carries — which differ exactly when the
+/// window straddles a boundary and holds something before it.
+struct GridCase {
+    label: &'static str,
+    start: f64,
+    end: f64,
+    whole: Vec<String>,
+    first_page: Vec<String>,
+}
+
+/// The windows the rule is asserted over, against a store holding one trace in
+/// each of three adjacent slices: `stored` is the ids of the traces seeded at
+/// [`GRID_OFFSETS`], in that order.
+fn grid_cases(stored: &[String]) -> Vec<GridCase> {
+    let (before, inside, later) = (stored[0].clone(), stored[1].clone(), stored[2].clone());
+    vec![
+        GridCase {
+            label: "a window wholly inside one slice",
+            start: ALIGNED,
+            end: ALIGNED + 60.0,
+            whole: vec![inside.clone()],
+            first_page: vec![inside.clone()],
+        },
+        GridCase {
+            label: "a window straddling a boundary, its trace before it",
+            start: ALIGNED - 60.0,
+            end: ALIGNED + 1.0,
+            whole: vec![before.clone()],
+            first_page: Vec::new(),
+        },
+        GridCase {
+            label: "a window straddling a boundary, with a trace each side",
+            start: ALIGNED - 60.0,
+            end: ALIGNED + 60.0,
+            whole: vec![inside.clone(), before.clone()],
+            first_page: vec![inside.clone()],
+        },
+        GridCase {
+            label: "a window ending exactly on a boundary",
+            start: ALIGNED - 60.0,
+            end: ALIGNED,
+            whole: vec![before.clone()],
+            first_page: vec![before.clone()],
+        },
+        GridCase {
+            label: "a window spanning three slices",
+            start: ALIGNED - HOUR,
+            end: ALIGNED + 2.0 * HOUR,
+            whole: vec![later.clone(), inside, before],
+            first_page: vec![later],
+        },
+        GridCase {
+            label: "a window holding nothing",
+            start: ALIGNED + 2.0 * HOUR,
+            end: ALIGNED + 2.0 * HOUR + 60.0,
+            whole: Vec::new(),
+            first_page: Vec::new(),
+        },
+    ]
+}
+
+/// Where the three traces the grid cases are read over start, relative to
+/// [`ALIGNED`]: one in the slice before that boundary, one just after it, and
+/// one a slice later.
+const GRID_OFFSETS: [f64; 3] = [-30.0, 30.0, HOUR + 30.0];
+
+#[tokio::test]
+async fn a_window_reports_every_trace_it_holds_wherever_its_bounds_fall_on_the_grid() {
+    let xray = Xray::new();
+    let stored = seed(&xray, &GRID_OFFSETS).await;
+
+    for case in grid_cases(&stored) {
+        let label = case.label;
+        let body = json!({"StartTime": case.start, "EndTime": case.end});
+
+        // Following the tokens reports every trace the window holds, exactly
+        // once, newest slice first — whatever the window's position on the hour
+        // grid.
+        let pages = xray.trace_summary_pages(&body).await;
+        assert_eq!(
+            reported_trace_ids(&pages),
+            case.whole,
+            "case {label:?}: the window [{}, {}) holds {:?}, got {:?}",
+            case.start,
+            case.end,
+            case.whole,
+            reported_trace_ids(&pages)
+        );
+
+        // And what the FIRST page of that same walk carries is the slice the
+        // window ends in — so a window that straddles a boundary and holds its
+        // traces before it answers an empty first page, with a token for the
+        // slice that holds them.
+        let first = pages
+            .first()
+            .expect("every window is answered by at least one page");
+        assert_eq!(
+            reported(first),
+            case.first_page,
+            "case {label:?}: the first page carries the slice the window ends in, got {first:?}"
+        );
+
+        // The count is of the WINDOW, so every page of the one query reports
+        // the same one however the window is sliced.
+        let held = i64::try_from(case.whole.len()).expect("the case is small");
+        for (page, answered) in pages.iter().enumerate() {
+            assert_eq!(
+                answered.get("TracesProcessedCount").as_i64(),
+                Some(held),
+                "case {label:?}: page {page} must report the {held} trace(s) the window holds, \
+                 got {answered:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_window_positioned_by_the_clock_reports_its_trace_across_its_pages() {
+    let xray = Xray::new();
+    // The one range type whose instant is the clock's: `Event` windows on when
+    // this service last accepted a segment for the trace, so a window drawn
+    // around NOW is the shape a dashboard asks for — and where that window sits
+    // on the hour grid is not the client's to choose. This one is built to
+    // straddle the boundary the current hour began on, so the walk is the only
+    // way to read the whole of it.
+    let id = trace_id(31);
+    // The instant the segment is ACCEPTED is the clock's, so it is bracketed
+    // around the call: the trace's update time lies between these two readings
+    // however long the ingestion takes.
+    let accepted_from = service_com_amazonaws_xray_awsxray::state::now_epoch_seconds();
+    let put = xray
+        .put_segments(&[root_document("00000000000003a1", &id, "svc", ALIGNED, Some(ALIGNED + 0.5))
+            .to_string()])
+        .await;
+    assert_eq!(put.status, 200, "seeding the trace must succeed, got {put:?}");
+    let accepted_to = service_com_amazonaws_xray_awsxray::state::now_epoch_seconds();
+
+    // The window reaches back over the boundary the hour the trace was accepted
+    // in began on, so it always straddles one — and it holds every instant the
+    // trace could have been accepted at, so what it selects is not the clock's
+    // to decide.
+    #[allow(clippy::cast_precision_loss)]
+    let boundary =
+        service_com_amazonaws_xray_awsxray::state::hour_boundary_at_or_before(accepted_to) as f64;
+    let body = json!({
+        "StartTime": boundary.min(accepted_from) - 60.0,
+        "EndTime": accepted_to + 1.0,
+        "TimeRangeType": "Event",
+    });
+
+    let pages = xray.trace_summary_pages(&body).await;
+    assert!(
+        pages.len() >= 2,
+        "a window reaching back over the hour boundary is cut into at least two slices, got {} \
+         page(s) for {body}",
+        pages.len()
+    );
+    assert_eq!(
+        reported_trace_ids(&pages),
+        vec![id.clone()],
+        "the window around the instant the trace was accepted must report it exactly once, got \
+         {:?}",
+        reported_trace_ids(&pages)
+    );
+    for (page, answered) in pages.iter().enumerate() {
+        assert_eq!(
+            answered.get("TracesProcessedCount").as_i64(),
+            Some(1),
+            "page {page}: the window holds the one accepted trace, got {answered:?}"
+        );
+    }
+}
+
+// =============================================================================
+// 7. The window the slices are cut from is the one the request asks about,
 //    whichever instant of a trace the window is applied to
 // =============================================================================
 
