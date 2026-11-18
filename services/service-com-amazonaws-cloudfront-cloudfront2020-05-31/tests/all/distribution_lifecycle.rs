@@ -61,7 +61,14 @@ pub(crate) const ACCOUNT_ID: &str = "000000000000";
 /// This service's API version, which every route and `Location` is under.
 pub(crate) const API_VERSION: &str = "2020-05-31";
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// One emulator: a router carrying this service, over one shared engine.
+///
+/// The account's own Service Quotas is mounted on the SAME engine, because what this service
+/// is entitled to allocate for some resources is a quota of the ACCOUNT rather than a number
+/// this service decides: `CreateAnycastIpList` reads its entitlement out of that store, and a
+/// suite raises it through Service Quotas' own `RequestServiceQuotaIncrease`
+/// ([`crate::anycast_ip_list_lifecycle::ensure_anycast_entitlement`]) rather than by
+/// hand-writing an applied value.
 ///
 /// `pub(crate)` so the sibling suites in `tests/all/` stand one up the same way rather
 /// than each writing its own harness.
@@ -69,7 +76,10 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        service_com_amazonaws_servicequotas_servicequotasv20190624::EmulatedService::new(engine),
+    );
     router
 }
 

@@ -3420,6 +3420,19 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 quota("Web distributions per account", 200.0).global(),
                 quota("Alternate domain names (CNAMEs) per distribution", 100.0).global(),
                 quota("Cache behaviors per distribution", 25.0).global(),
+                // The ONE CloudFront quota whose code this catalog can cite: CloudFront's
+                // own refusal of a `CreateAnycastIpList` names the quota's Service Quotas
+                // page, so the code in that page's path is AWS's code for this quota. Its
+                // default is ZERO — the feature is one an account asks AWS to entitle it
+                // for, which is what that refusal tells the caller to do — and it is
+                // adjustable, so an approved increase is what puts a non-zero value in
+                // force.
+                quota("Anycast static IP lists", 0.0)
+                    .code("L-6A19EDFD")
+                    .global()
+                    .describe(
+                        "The maximum number of Anycast static IP lists in this account.",
+                    ),
             ],
         ),
         service("cloudhsm", "AWS CloudHSM", cloudhsm_quotas()),

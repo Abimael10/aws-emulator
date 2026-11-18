@@ -38,6 +38,12 @@ tracing = { workspace = true }
 # negotiated in band and of the `host:port` a published endpoint carries, which a
 # distribution's edge listener is announced and served through.
 service-common = { path = "../common" }
+# The account's own Service Quotas: how many Anycast static IP lists this account is entitled
+# to hold is an ADJUSTABLE quota whose AWS default is zero, so `CreateAnycastIpList` reads the
+# value in force out of the store `GetServiceQuota` answers from and
+# `RequestServiceQuotaIncrease` writes an approved increase into
+# (`state::anycast_entitlement`).
+service-com-amazonaws-servicequotas-servicequotasv20190624 = { workspace = true }
 # WHO a request speaks for and WHAT that principal may do: the authorization step in front
 # of this service's operations (`service::authorization`) resolves the caller through STS's
 # own `resolve_caller` — the same place `sts:GetCallerIdentity` answers from — and reads the

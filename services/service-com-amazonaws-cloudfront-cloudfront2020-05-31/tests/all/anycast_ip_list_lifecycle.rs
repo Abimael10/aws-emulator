@@ -47,7 +47,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::connection_groups::{create_connection_group, get_connection_group};
 use crate::distribution_lifecycle::{
-    call, emulator, is_version_token, Answer, Node, ACCOUNT_ID, API_VERSION,
+    call, emulator, is_version_token, Answer, Node, ACCOUNT_ID, API_VERSION, POLL_INTERVAL,
+    READY_DEADLINE,
 };
 use crate::key_value_store_lifecycle::member;
 use crate::response_headers_policy_lifecycle::assert_absent;
@@ -58,9 +59,26 @@ use crate::response_headers_policy_lifecycle::assert_absent;
 
 /// `POST /2020-05-31/anycast-ip-list` with the request document `body`.
 ///
+/// The account's ENTITLEMENT for Anycast static IP lists is raised first
+/// ([`ensure_anycast_entitlement`]): how many lists an account may hold is its own Service
+/// Quotas quota for them, and that quota's AWS default is zero, so an account that has not had
+/// it raised is entitled to allocate none at all. Every suite that needs a list to exist
+/// therefore stands that entitlement up the way an account does, and the cases ABOUT the
+/// entitlement itself ([`crate::anycast_ip_list_entitlement`]) drive the route directly.
+///
 /// `pub(crate)` so the sibling listing suite drives the same create path rather than
 /// growing its own copy of it.
 pub(crate) async fn create_anycast_ip_list(router: &MultiServiceRouter, body: &str) -> Answer {
+    ensure_anycast_entitlement(router).await;
+    post_anycast_ip_list(router, body).await
+}
+
+/// `POST /2020-05-31/anycast-ip-list` with the request document `body` and NOTHING staged
+/// first — the create exactly as a client makes it.
+///
+/// `pub(crate)` so the suite about the account's entitlement can submit a create under the
+/// entitlement the account actually holds.
+pub(crate) async fn post_anycast_ip_list(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -69,6 +87,124 @@ pub(crate) async fn create_anycast_ip_list(router: &MultiServiceRouter, body: &s
         None,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// The account's entitlement for Anycast static IP lists
+// ---------------------------------------------------------------------------
+
+/// The Service Quotas `ServiceCode` the account's CloudFront quotas are published under.
+pub(crate) const ANYCAST_QUOTA_SERVICE_CODE: &str = "cloudfront";
+
+/// The `QuotaCode` of the quota that bounds how many Anycast static IP lists the account may
+/// hold — the quota CloudFront's own refusal of a create directs the caller to.
+pub(crate) const ANYCAST_QUOTA_CODE: &str = "L-6A19EDFD";
+
+/// How many Anycast static IP lists the account is entitled to hold once a suite has raised
+/// the quota: comfortably more than any case below creates, and far under the number of
+/// addresses the pool a list is allocated out of holds.
+pub(crate) const SUITE_ENTITLEMENT: u32 = 64;
+
+/// Raise the account's Anycast static IP list quota to [`SUITE_ENTITLEMENT`], unless the value
+/// in force already covers it.
+pub(crate) async fn ensure_anycast_entitlement(router: &MultiServiceRouter) {
+    raise_anycast_entitlement(router, SUITE_ENTITLEMENT).await;
+}
+
+/// Raise the account's Anycast static IP list quota to `wanted` and wait for the raised value
+/// to be IN FORCE, or return at once when it already is.
+///
+/// Raised through Service Quotas' OWN `RequestServiceQuotaIncrease` — the operation an account
+/// raises a quota with — and read back through `GetServiceQuota`, so the entitlement this
+/// service allocates against is one a client really put in force rather than a value written
+/// into a store by hand. The decision the clock owes that request is waited for by LOOKING
+/// AGAIN until the value is in force.
+///
+/// `pub(crate)` so the suite about the entitlement itself raises it to the value its own row
+/// names.
+pub(crate) async fn raise_anycast_entitlement(router: &MultiServiceRouter, wanted: u32) {
+    let wanted_value = f64::from(wanted);
+    if quota_in_force(router).await >= wanted_value {
+        return;
+    }
+    let (status, raw) = quotas_call(
+        router,
+        "RequestServiceQuotaIncrease",
+        &format!(
+            "{{\"ServiceCode\":\"{ANYCAST_QUOTA_SERVICE_CODE}\",\
+              \"QuotaCode\":\"{ANYCAST_QUOTA_CODE}\",\"DesiredValue\":{wanted}}}"
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case raising the Anycast static IP list quota to {wanted}: expected HTTP 200, got \
+         {status} with {raw}"
+    );
+    let deadline = ::std::time::Instant::now() + READY_DEADLINE;
+    loop {
+        if quota_in_force(router).await >= wanted_value {
+            return;
+        }
+        assert!(
+            ::std::time::Instant::now() < deadline,
+            "case raising the Anycast static IP list quota: the increase to {wanted} never came \
+             into force"
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The value the account's Anycast static IP list quota is in force at, as `GetServiceQuota`
+/// reports it.
+///
+/// `pub(crate)` so the suite about the entitlement reads the value in force through the
+/// operation that publishes it.
+pub(crate) async fn quota_in_force(router: &MultiServiceRouter) -> f64 {
+    let (status, raw) = quotas_call(
+        router,
+        "GetServiceQuota",
+        &format!(
+            "{{\"ServiceCode\":\"{ANYCAST_QUOTA_SERVICE_CODE}\",\
+              \"QuotaCode\":\"{ANYCAST_QUOTA_CODE}\"}}"
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case reading the Anycast static IP list quota: expected HTTP 200, got {status} with \
+         {raw}"
+    );
+    let parsed: ::serde_json::Value = ::serde_json::from_str(&raw).unwrap_or_default();
+    parsed["Quota"]["Value"].as_f64().unwrap_or_default()
+}
+
+/// One awsJson1_1 call to the Service Quotas service mounted on the same router
+/// ([`emulator`]), the way an SDK drives it: `POST /` under `X-Amz-Target`, signed for that
+/// service's own signing name so the router can name it.
+async fn quotas_call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &str,
+) -> (u16, String) {
+    let request = ::http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", "servicequotas.us-east-1.amazonaws.com")
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("ServiceQuotasV20190624.{operation}"))
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIDEXAMPLE/20260101/us-east-1/servicequotas/aws4_request, \
+             SignedHeaders=host, Signature=abc",
+        )
+        .body(::bytes::Bytes::from(body.to_string()))
+        .expect("the test request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let raw = String::from_utf8_lossy(&response.into_body()).to_string();
+    (status, raw)
 }
 
 /// `GET /2020-05-31/anycast-ip-list/{Id}`.

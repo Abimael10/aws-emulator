@@ -4024,3 +4024,10 @@ pub use resource_policies::*;
 /// name reachable as `crate::state::<name>`.
 mod path_identifiers;
 pub use path_identifiers::*;
+
+/// The account's ENTITLEMENT for Anycast static IP lists: the value its adjustable Service
+/// Quotas quota for them is in force at, which is what bounds how many lists
+/// `CreateAnycastIpList` may allocate. A SUBMODULE for the same reason [`functions`] is one;
+/// `pub use` keeps every name reachable as `crate::state::<name>`.
+mod anycast_entitlement;
+pub use anycast_entitlement::*;

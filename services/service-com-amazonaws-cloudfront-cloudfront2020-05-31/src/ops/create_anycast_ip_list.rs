@@ -12,6 +12,11 @@
 //! `IpCount` outside the value set the member documents is refused with `InvalidArgument`
 //! before anything is allocated.
 //!
+//! How many lists the ACCOUNT may hold is its own Service Quotas entitlement for them
+//! ([`crate::state::anycast_ip_list_entitlement`]), whose AWS default is zero: a create that
+//! would take the account past the value in force is refused with `EntityLimitExceeded`,
+//! under the sentence that tells the caller to have the quota raised.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -199,10 +204,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A name identifies ONE Anycast static IP list for its whole life, so a name the
-        // store already holds cannot name a second one. Checked BEFORE anything is minted.
+        // store already holds cannot name a second one. Checked BEFORE anything is minted,
+        // and before the account's entitlement: a create repeating a stored list's name asks
+        // for no new allocation at all.
         if store.anycast_ip_list_named(&input.name).is_some() {
             return Err(CreateAnycastIpListErrorModeled::EntityAlreadyExists(
                 crate::state::anycast_ip_list_already_exists(&input.name),
+            )
+            .into());
+        }
+
+        // An Anycast static IP list is a resource the ACCOUNT is entitled to a number of, and
+        // that number is its Service Quotas quota for them — whose AWS default is zero, so an
+        // account that has not had the quota raised holds no entitlement to allocate a list
+        // against at all ([`crate::state::anycast_ip_list_entitlement`]). A create that would
+        // take the account past the value in force is refused with the modelled
+        // `EntityLimitExceeded`, whose sentence is the instruction to have the quota raised,
+        // and nothing is allocated for it.
+        let entitlement = crate::state::anycast_ip_list_entitlement(&*self.engine, now);
+        if store.anycast_ip_lists.len() >= entitlement {
+            return Err(CreateAnycastIpListErrorModeled::EntityLimitExceeded(
+                crate::state::anycast_ip_list_entitlement_exceeded(),
             )
             .into());
         }

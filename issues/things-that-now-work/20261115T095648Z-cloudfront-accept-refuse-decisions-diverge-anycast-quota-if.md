@@ -59,3 +59,32 @@ Cause 3 — cloudfront-icc-distribution-identifier-mistakes#task#2, CreateInvali
 4. Cause 2: replay cloudfront-fle-config-not-found-and-invalid-ifmatch-errors, step teardown#8 — create a public key, read the ETag from the create/get response header, then DELETE /2020-05-31/public-key/{Id} with exactly that ETag as If-Match. Expect 204; the emulator answers 412.
 5. Cause 3: replay cloudfront-icc-distribution-identifier-mistakes, steps task#2 and task#3 — POST /2020-05-31/distribution/{DistributionId}/invalidation with a DistributionId that is not a well-formed distribution id. Expect 404 with Error.Message 'DistributionId format is invalid'; the emulator answers 404 with 'The specified distribution does not exist.'
 6. All three causes must close before submitting: the quota refusal, the accepted current-ETag delete, and the id-format message.
+
+## Resolution
+
+Cause 1 FIXED, cause 3 already correct in the current code base and now pinned by a suite,
+cause 2 DECLINED as a per-run value.
+
+- Cause 1 FIXED: how many Anycast static IP lists an account may hold is the value its
+  adjustable Service Quotas quota for them is in force at, and that quota's AWS default is
+  zero — which is why the service's own refusal of the create tells the caller to have it
+  raised. The CloudFront create now reads the value in force out of the store Service Quotas
+  serves `GetServiceQuota` from and records an approved `RequestServiceQuotaIncrease` into
+  (`state::anycast_entitlement`), and refuses a create that would take the account past it
+  with the modelled `EntityLimitExceeded` before anything is allocated. The Service Quotas
+  catalog publishes that quota (`cloudfront` / `L-6A19EDFD`, default 0, adjustable,
+  account-wide), so an account that asks for an increase may allocate up to the raised value.
+  The three anycast fixtures replay end to end.
+- Cause 3 FIXED (already implemented): an operation addressed by a resource identifier in its
+  path reads that identifier's FORM before resolving it against the store and words the
+  refusal with the model's name for the member it arrived in, keeping the absent-resource
+  sentence for a value that could address one. `CreateInvalidation` answers a malformed
+  `DistributionId` with 404 `NoSuchDistribution` / "DistributionId format is invalid", covered
+  end to end by `tests/all/unreadable_path_identifiers.rs`.
+- Cause 2 DECLINED: an `ETag` is a per-run, server-generated value. The emulator already
+  compares an `If-Match` against the addressed entity's own current token; at the cited
+  teardown the replay carries the token this emulator minted for the field-level encryption
+  CONFIGURATION created earlier in the same fixture, not the profile's or the public key's, so
+  answering 204 would mean accepting a version token issued to another resource — the very
+  condition the issue states must be 412. The rule is pinned instead by
+  `tests/all/if_match_is_the_entitys_own_version.rs`.

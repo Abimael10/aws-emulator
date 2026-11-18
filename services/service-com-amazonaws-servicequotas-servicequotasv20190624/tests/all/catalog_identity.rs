@@ -260,6 +260,7 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("cloud9", "L-8ECD6BDB"),
     ("cloud9", "L-A29EDECE"),
     ("cloud9", "L-C1302C17"),
+    ("cloudfront", "L-6A19EDFD"),
     ("cloudhsm", "L-0B35A0E6"),
     ("cloudhsm", "L-0D8B0541"),
     ("cloudhsm", "L-194EB2B8"),
