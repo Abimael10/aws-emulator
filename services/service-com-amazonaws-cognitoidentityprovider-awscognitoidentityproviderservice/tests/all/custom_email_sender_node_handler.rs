@@ -36,7 +36,13 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice as cognito_idp;
 
 /// The Region every request below is signed for.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` here and below: the harness this suite builds for the custom email sender
+/// trigger — a key, a queue, a `nodejs22.x` function that opens the code it is handed, and
+/// the reads of what that function reported — is the one every suite of this crate that
+/// needs a REAL delivered code drives the trigger through, so there is one spelling of it
+/// (`crate::custom_email_sender_live_code`).
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The local name of Cognito's Smithy shape, which is the `X-Amz-Target` prefix.
 const COGNITO_TARGET_PREFIX: &str = "AWSCognitoIdentityProviderService";
@@ -54,10 +60,10 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 
 /// A password satisfying a default pool's password policy.
-const GOOD_PASSWORD: &str = "Passw0rd!2024";
+pub(crate) const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
 /// The password the reset row sets.
-const NEW_PASSWORD: &str = "Passw0rd!2025";
+pub(crate) const NEW_PASSWORD: &str = "Passw0rd!2025";
 
 /// How long this suite waits for a message the trigger function forwarded. Generous: the
 /// wait is for the message, and a loaded host takes far longer than an idle one.
@@ -75,7 +81,7 @@ const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// Cognito, the key service, Lambda and Amazon SQS over ONE shared engine, as
 /// `core/router/src/lib.rs` mounts them.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -131,7 +137,11 @@ async fn json_call(
 }
 
 /// One Cognito call, as its status and parsed body.
-async fn cognito(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn cognito(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     json_call(
         router,
         "cognito-idp",
@@ -143,7 +153,7 @@ async fn cognito(router: &MultiServiceRouter, operation: &str, body: &Value) -> 
 }
 
 /// A Cognito call that must answer 200, with its response body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, payload) = cognito(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -153,7 +163,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value
 }
 
 /// One key-service call that must answer 200.
-async fn kms(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn kms(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, payload) = json_call(
         router,
         "kms",
@@ -170,7 +180,7 @@ async fn kms(router: &MultiServiceRouter, operation: &str, body: &Value) -> Valu
 }
 
 /// One Amazon SQS call that must answer 200.
-async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, payload) = json_call(
         router,
         "sqs",
@@ -210,7 +220,11 @@ fn package(source: &str) -> Vec<u8> {
 /// The function is created and then waited FOR: an invocation only reaches a function Lambda
 /// reports as `Active`, and that transition is the clock's, so the wait is for that condition
 /// with a generous deadline.
-async fn create_function(router: &MultiServiceRouter, name: &str, source: &str) -> String {
+pub(crate) async fn create_function(
+    router: &MultiServiceRouter,
+    name: &str,
+    source: &str,
+) -> String {
     let request = http::Request::builder()
         .method("POST")
         .uri(FUNCTIONS_URI)
@@ -282,7 +296,7 @@ async fn lambda_get(router: &MultiServiceRouter, uri: &str) -> Value {
 /// body — asks the key service to unwrap that data key, derives the content key the suite
 /// states, checks the header's own tag and opens the frame. Every name it imports comes from
 /// the runtime: the key service's client package and `node:crypto`.
-fn handler_source(queue_url: &str) -> String {
+pub(crate) fn handler_source(queue_url: &str) -> String {
     format!(
         r#"
 import {{ KMSClient, DecryptCommand }} from "@aws-sdk/client-kms";
@@ -407,7 +421,11 @@ export const handler = async (event) => {{
 }
 
 /// One message the trigger function forwarded, waited for until [`DELIVERY_WAIT`] is spent.
-async fn next_report(router: &MultiServiceRouter, case: &str, queue_url: &str) -> Value {
+pub(crate) async fn next_report(
+    router: &MultiServiceRouter,
+    case: &str,
+    queue_url: &str,
+) -> Value {
     let deadline = Instant::now() + DELIVERY_WAIT;
     while Instant::now() < deadline {
         let received = sqs(
@@ -438,7 +456,7 @@ async fn next_report(router: &MultiServiceRouter, case: &str, queue_url: &str) -
 ///
 /// `digits` is how many decimal digits the issuing stage's code carries: a verification code
 /// and an email one-time password are each a fixed-length decimal code, of their own length.
-fn reported_code(case: &str, report: &Value, source: &str, digits: usize) -> String {
+pub(crate) fn reported_code(case: &str, report: &Value, source: &str, digits: usize) -> String {
     assert_eq!(
         report["ok"], json!(true),
         "case {case:?}: expected the function to open the code it was handed, got {report}"
@@ -478,7 +496,7 @@ fn jwt_claims(token: &str) -> Value {
 }
 
 /// The error code of an error body (`__type`), without its namespace, and its message.
-fn refusal(body: &Value) -> (String, String) {
+pub(crate) fn refusal(body: &Value) -> (String, String) {
     (
         body.get("__type")
             .and_then(Value::as_str)
