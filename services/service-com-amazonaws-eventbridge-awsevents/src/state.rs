@@ -931,6 +931,13 @@ pub const INVALID_PARAMETER: &str = "INVALID_PARAMETER";
 /// was made with it.
 pub const INVALID_JSON: &str = "INVALID_JSON";
 
+/// The condition EventBridge reports for a delivery to a target that is an HTTP
+/// ENDPOINT — an API Gateway REST API stage — which the request did not get a
+/// successful answer from: the endpoint answered a status outside the 2xx range, or
+/// nothing answered it at all. What there is to go on is that answer, which the
+/// dead letter's `ERROR_MESSAGE` carries beside this condition.
+pub const CONNECTION_FAILURE: &str = "CONNECTION_FAILURE";
+
 /// What that delivery reports beside the condition: AWS's own sentence for an
 /// input a target may not be handed, which carries nothing of the request —
 /// "Invalid input for target."

@@ -31,7 +31,9 @@
 //! `sns:Publish` for a topic, `states:StartExecution` for a state machine,
 //! `kinesis:PutRecord` for a data stream, `firehose:PutRecord` for a delivery
 //! stream, `logs:PutLogEvents` for a CloudWatch
-//! Logs log group),
+//! Logs log group, `execute-api:Invoke` for one method of a deployed API Gateway
+//! REST API stage, which is the signed HTTP request that stage serves
+//! ([`rest_api_stage`])),
 //! carrying the whole event envelope. A target that NAMES a `RoleArn` is reached
 //! by ACTING AS that role, so a role EventBridge cannot assume for the invoking
 //! rule fails the delivery whatever the target's kind is (the recorded behaviour
@@ -189,6 +191,17 @@ mod ecs_task;
 // The items it holds are this module's own, for the reason the api-destination
 // glob above gives.
 use ecs_task::*;
+
+/// The API Gateway half of the delivery pass: the signed HTTP request made at the
+/// deployed REST API stage an `execute-api` target names, and the retries its
+/// target's `RetryPolicy` bounds.
+///
+/// The `#[path]` is what points the child at `ops/put_events/`, for the reason
+/// the api-destination module above gives. Its items are reached through the
+/// module name rather than through a glob: every one of them is about this one
+/// target kind, so naming it says which kind a line is deciding.
+#[path = "put_events/rest_api_stage.rs"]
+mod rest_api_stage;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -580,12 +593,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cloudwatch = crate::state::cloudwatch_state(&*self.engine);
         let glue = crate::state::glue_state(&*self.engine);
         let kms = crate::state::target_encryption::kms_state(&*self.engine);
+        // The base URL this emulator is reached at, which is where a delivery to
+        // an HTTP endpoint of it is addressed.
+        let endpoint = ctx.endpoint();
         let stores = Stores {
             iam: iam.as_ref(),
             cloudwatch: cloudwatch.as_ref(),
             glue: glue.as_ref(),
             kms: kms.as_ref(),
             events: Some(&state),
+            endpoint: endpoint.as_str(),
         };
 
         // Every pattern match is counted on the matched rule's own
@@ -2327,6 +2344,13 @@ pub(crate) struct Stores<'a> {
     /// which is invoked without pacing rather than withheld.
     pub(crate) events:
         Option<&'a ::engine::ServiceState<crate::state::ComAmazonawsEventbridgeAwseventsState>>,
+    /// The base URL this emulator is reached at
+    /// ([`smithy_server_runtime::OperationContext::endpoint`]), which is what a
+    /// delivery to a target that is an HTTP ENDPOINT addresses: the invoke URL of
+    /// an API Gateway REST API stage is announced under this base
+    /// ([`rest_api_stage`]), because the host AWS publishes for one resolves
+    /// nowhere on the machine this emulator runs on.
+    pub(crate) endpoint: &'a str,
 }
 
 /// Hand ONE routed event to the Glue workflow `arn` names, and answer what came
@@ -2911,6 +2935,11 @@ enum TargetKind {
     /// `EcsParameters` describe in that cluster, with what the target receives as
     /// the run's `overrides` (see [`ecs_task::run`]).
     EcsTask,
+    /// One method of a deployed API Gateway REST API stage: the `execute-api:Invoke`
+    /// the target's ARN names, made as the signed HTTP request that stage serves,
+    /// carrying what the target receives as the body (see
+    /// [`rest_api_stage::invoke_rest_api_stage`]).
+    RestApiStage,
 }
 
 /// The ARN namespace of Amazon SQS, whose queues a rule delivers to.
@@ -3038,6 +3067,14 @@ impl TargetKind {
             // resource addressing something WITHIN a cluster (one of its tasks,
             // one of its services) is not a cluster, so no task is run for it.
             ECS_ARN_NAMESPACE if ecs_task::cluster_in_arn(arn).is_some() => Some(Self::EcsTask),
+            // An invoke ARN names the api, the stage, the verb and the resource
+            // path ONE request is made to: an ARN stating fewer of those names no
+            // request at all ([`rest_api_stage::addressed_stage`]).
+            rest_api_stage::EXECUTE_API_ARN_NAMESPACE
+                if rest_api_stage::addressed_stage(arn).is_some() =>
+            {
+                Some(Self::RestApiStage)
+            }
             _ => None,
         }
     }
@@ -3060,6 +3097,7 @@ impl TargetKind {
             Self::LogGroup => crate::state::log_group_target::PUT_LOG_EVENTS_ACTION,
             Self::DeliveryStream => "firehose:PutRecord",
             Self::EcsTask => crate::state::ecs_target::RUN_TASK_ACTION,
+            Self::RestApiStage => rest_api_stage::INVOKE_ACTION,
         }
     }
 
@@ -3333,6 +3371,22 @@ impl TargetKind {
                 ::tokio::task::yield_now().await;
                 ecs_task::run(callback, clients, stores, region, handover, body).await
             }
+            Self::RestApiStage => {
+                // The stage is reached over the IN-PROCESS emulator transport, the
+                // way an api destination's endpoint is: the invoke url names the
+                // api this emulator holds rather than a name anything resolves, so
+                // no socket is opened and nothing outside this process is reached.
+                rest_api_stage::invoke_rest_api_stage(
+                    callback,
+                    stores.endpoint,
+                    region,
+                    handover,
+                    body,
+                    retries,
+                    budget,
+                )
+                .await
+            }
         })
     }
 
@@ -3350,6 +3404,7 @@ impl TargetKind {
             Self::LogGroup => crate::state::log_group_target::LOGS_ARN_NAMESPACE,
             Self::DeliveryStream => FIREHOSE_ARN_NAMESPACE,
             Self::EcsTask => ECS_ARN_NAMESPACE,
+            Self::RestApiStage => rest_api_stage::EXECUTE_API_ARN_NAMESPACE,
         }
     }
 }

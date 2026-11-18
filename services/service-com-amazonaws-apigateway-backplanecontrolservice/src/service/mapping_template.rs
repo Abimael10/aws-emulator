@@ -896,9 +896,34 @@ impl Render<'_> {
                 }
                 // `$input.params(x)` — "returns the method request parameter value from the
                 // path, query string, or header (in that order) given a parameter name".
-                [Step::Call(method, arguments)] if method == "params" => {
+                [Step::Call(method, arguments)] if method == "params" && !arguments.is_empty() => {
                     let name = self.one_argument(arguments)?.ok_or_else(unresolved)?;
                     Ok(text(parameter(self.inputs, &name).unwrap_or_default()))
+                }
+                // `$input.params()` — "returns a map of all request parameters": the
+                // parameters of THIS call keyed by where each came from, which is the value
+                // every documented use of this form reads through — a source and a name
+                // (`$input.params().path.get('id')`), or the whole map bound by a `#set` and
+                // read the same way. So the steps after it are the keys of that map, read
+                // the way a reference reads the keys of every other map of the call.
+                [Step::Call(method, arguments), read @ ..]
+                    if method == "params" && arguments.is_empty() =>
+                {
+                    // The keys are read first: an argument of a `get` is itself resolved
+                    // against this call, which the lookup below holds no borrow for.
+                    let mut keys = Vec::with_capacity(read.len());
+                    for step in read {
+                        match step {
+                            Step::Member(name) => keys.push(name.clone()),
+                            Step::Call(method, arguments) if method == "get" => {
+                                keys.push(self.one_argument(arguments)?.ok_or_else(unresolved)?);
+                            }
+                            Step::Call(_, _) => return Err(unresolved()),
+                        }
+                    }
+                    let value = parameters_at(self.inputs, &keys).ok_or_else(unresolved)?;
+                    self.spend(weight(&value))?;
+                    Ok(value)
                 }
                 _ => Err(unresolved()),
             },
@@ -1183,6 +1208,76 @@ fn parameter(inputs: &TemplateInputs, name: &str) -> Option<String> {
         .iter()
         .find(|(sent, _)| sent.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.clone())
+}
+
+/// The key the map `$input.params()` names carries the request's HEADERS under: the one
+/// source whose names are matched case-insensitively, because a header name is.
+const HEADER_SOURCE: &str = "header";
+
+/// The three sources a method request parameter comes from, each under the key the map
+/// `$input.params()` names carries it under — the same three [`parameter`] reads, in the
+/// order it reads them.
+fn parameter_sources(inputs: &TemplateInputs) -> [(&'static str, &BTreeMap<String, String>); 3] {
+    [
+        ("path", &inputs.path),
+        ("querystring", &inputs.querystring),
+        (HEADER_SOURCE, &inputs.header),
+    ]
+}
+
+/// The value the map `$input.params()` names carries at `keys`, or `None` for a reference
+/// that reads PAST the shape of that map.
+///
+/// With no key it is the whole map: one entry per source, each the parameters that source
+/// carries by name. With a source it is that source's own map, and with a source and a name
+/// it is the value that source carries under that name. A source or a name the map does not
+/// carry is an ABSENT value rather than a reference naming something outside the language,
+/// the way a key no other map of the call carries is ([`Render::evaluated`]): it renders as
+/// nothing, exactly as `$input.params` of a parameter the request did not send does. A key
+/// BEYOND a name is neither: a parameter's value is text, which carries no key at all, so
+/// such a reference names nothing this call has a value for and leaves the template
+/// unrendered rather than rendering the empty string for it.
+fn parameters_at(inputs: &TemplateInputs, keys: &[String]) -> Option<::serde_json::Value> {
+    use ::serde_json::Value;
+
+    let sources = parameter_sources(inputs);
+    let Some((source, rest)) = keys.split_first() else {
+        return Some(Value::Object(
+            sources
+                .iter()
+                .map(|(key, entries)| ((*key).to_string(), named_parameters(entries)))
+                .collect(),
+        ));
+    };
+    let Some((key, entries)) = sources.iter().find(|(key, _)| key == source) else {
+        return Some(Value::Null);
+    };
+    let Some((name, rest)) = rest.split_first() else {
+        return Some(named_parameters(entries));
+    };
+    // A value of the map is a parameter's own text, which carries no further key.
+    if !rest.is_empty() {
+        return None;
+    }
+    let sent = if *key == HEADER_SOURCE {
+        entries
+            .iter()
+            .find(|(sent, _)| sent.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    } else {
+        entries.get(name).cloned()
+    };
+    Some(sent.map_or(Value::Null, Value::String))
+}
+
+/// One source's parameters as the map a reference reads the names of.
+fn named_parameters(entries: &BTreeMap<String, String>) -> ::serde_json::Value {
+    ::serde_json::Value::Object(
+        entries
+            .iter()
+            .map(|(name, value)| (name.clone(), ::serde_json::Value::String(value.clone())))
+            .collect(),
+    )
 }
 
 /// `text` with the characters a JavaScript string literal cannot carry as they stand
@@ -1638,6 +1733,91 @@ mod tests {
         }
     }
 
+    /// RULE: `$input.params()` names the map of this call's method request parameters keyed
+    /// by the source each came from, and a reference reading into it — a source and then a
+    /// name, by either spelling of a map's key — resolves to that parameter's value.
+    #[test]
+    fn the_parameter_map_names_each_parameter_by_the_source_it_came_from() {
+        /// (case, the template, what it renders to)
+        type Row<'a> = (&'a str, &'a str, &'a str);
+        // The rows differ along the SOURCE the parameter came from, the SPELLING of each
+        // step (a member, `get(…)`, the braced reference), the CASE a header name is written
+        // in, whether the map is read directly or bound by a `#set` first, and whether the
+        // name is one this call carries at all.
+        let rows: &[Row<'_>] = &[
+            (
+                "the path parameter, by get",
+                "$input.params().path.get('pet')",
+                "fido",
+            ),
+            (
+                "the path parameter, by the bare member",
+                "$input.params().path.pet",
+                "fido",
+            ),
+            (
+                "the query-string parameter",
+                "$input.params().querystring.get('tenant')",
+                "acme",
+            ),
+            (
+                "the header, by the name as sent",
+                "$input.params().header.get('X-Trace')",
+                "t-1",
+            ),
+            (
+                "the header, by another case of the same name",
+                "$input.params().header.get('x-trace')",
+                "t-1",
+            ),
+            (
+                "the source named by get as well",
+                "$input.params().get('path').get('pet')",
+                "fido",
+            ),
+            (
+                "the braced spelling of the whole reference",
+                "${input.params().path.get('pet')}",
+                "fido",
+            ),
+            (
+                "the map bound by a #set and read through the binding",
+                "#set($all = $input.params())$all.path.pet",
+                "fido",
+            ),
+            (
+                "the value carried into a conversion",
+                "$util.urlEncode($input.params().path.get('pet'))",
+                "fido",
+            ),
+            (
+                "a name the source does not carry, which is an absent value",
+                "$input.params().path.get('absent')",
+                "",
+            ),
+            (
+                "a key the map does not carry at all",
+                "$input.params().elsewhere.get('pet')",
+                "",
+            ),
+            (
+                "the same parameter named with no source at all, which is the one-argument \
+                 form",
+                "$input.params('pet')",
+                "fido",
+            ),
+        ];
+        let inputs = inputs();
+        for (case, template, expected) in rows {
+            let rendered = rendered(template, &inputs);
+            assert_eq!(
+                rendered.as_deref().ok(),
+                Some(*expected),
+                "case {case:?}: expected {expected:?}, got {rendered:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_reference_nothing_resolves_leaves_the_template_unrendered() {
         let cases: &[&str] = &[
@@ -1650,8 +1830,14 @@ mod tests {
             "$stageVariables.undefined",
             // A method the variable does not document, and one called wrongly.
             "$input.query('$.id')",
+            "$input.params('a', 'b')",
+            // A reference whose value is a MAP or a structure rather than one value: the
+            // whole parameter map, one source of it, and a path selecting a structure or
+            // several nodes.
             "$input.params()",
-            // A path selecting a structure, and one selecting several nodes.
+            "$input.params().path",
+            // A key BEYOND a parameter's own name, which is text and carries none.
+            "$input.params().path.pet.deeper",
             "$input.path('$.nested')",
             "$input.json('$.*')",
             // A path carrying a construct whose work is per node rather than per document

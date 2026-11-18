@@ -96,6 +96,17 @@ pub(super) async fn invoke_api_destination(
         .duration_since(handover.published)
         .unwrap_or_default();
     let transport = callback.http_connector();
+    // The target's own parameters, with every value that names a place in the
+    // EVENT resolved against it ([`crate::state::invocation::resolved_http_parameters`]):
+    // what a parameter contributes is a value of the event, not of the input this
+    // delivery reshaped, and it is resolved ONCE for every attempt this delivery
+    // makes.
+    let event = ::serde_json::from_str::<::serde_json::Value>(handover.rendered)
+        .unwrap_or(::serde_json::Value::Null);
+    let parameters = target
+        .http_parameters
+        .as_ref()
+        .map(|parameters| crate::state::invocation::resolved_http_parameters(parameters, &event));
     // What the LAST attempt came to, which is what the dead letter reports.
     let mut last: Option<Attempt> = None;
     // How many attempts were made; one more than the retries, which is what the
@@ -121,7 +132,8 @@ pub(super) async fn invoke_api_destination(
         }
         attempted += 1;
         let started = ::std::time::Instant::now();
-        let attempt = attempt_api_destination(&transport, destination, target, body).await;
+        let attempt =
+            attempt_api_destination(&transport, destination, parameters.as_ref(), body).await;
         budget.charge_endpoint_wait(started.elapsed());
         // The endpoint ANSWERED and refused: "a 4xx response is not retried", so
         // the delivery fails on this attempt, under the condition the target's
@@ -259,6 +271,11 @@ pub(super) fn reported_payload(payload: &[u8]) -> String {
 /// query-string, path and body parameters merged with the connection's value
 /// winning ([`crate::state::invocation::api_destination_invocation`]).
 ///
+/// `parameters` are the TARGET's own `HttpParameters` with every value that names
+/// a place in the event already resolved against it, which the caller does once
+/// for every attempt it makes
+/// ([`crate::state::invocation::resolved_http_parameters`]).
+///
 /// `transport` is the in-process emulator connector and the ONLY thing this
 /// request is handed to: the endpoint text decides which emulated service
 /// receives it, and a URL naming anything this emulator does not serve is
@@ -266,7 +283,7 @@ pub(super) fn reported_payload(payload: &[u8]) -> String {
 pub(super) async fn attempt_api_destination(
     transport: &::aws_smithy_runtime_api::client::http::SharedHttpConnector,
     destination: &ApiDestination,
-    target: &CompiledTarget,
+    parameters: Option<&HttpParameters>,
     body: &str,
 ) -> Attempt {
     use ::aws_smithy_runtime_api::client::http::HttpConnector;
@@ -283,7 +300,7 @@ pub(super) async fn attempt_api_destination(
     let invocation = crate::state::invocation::api_destination_invocation(
         &destination.endpoint,
         &destination.secret,
-        target.http_parameters.as_ref(),
+        parameters,
         body,
         API_DESTINATION_CONTENT_TYPE,
         API_DESTINATION_USER_AGENT,

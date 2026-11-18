@@ -265,6 +265,68 @@ fn header_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+/// `parameters` with every value that NAMES A PLACE IN THE EVENT replaced by
+/// what the event carries there.
+///
+/// `HttpParameters` are "the parameters needed for you to contribute to the HTTP
+/// request" of the two target kinds that are HTTP endpoints — an API Gateway REST
+/// API and one of this service's own API destinations — and a value of one may be
+/// written as a JSON path into the event rather than as a constant, which is what
+/// lets one rule address a different path, header or query value per event. So a
+/// value rooted at the event ([`names_a_place`]) stands for what the event carries
+/// at that place, read by this service's ONE path reader
+/// ([`super::input_transform::selection`]), and every other value is contributed
+/// exactly as the target stored it.
+///
+/// A path that selects no place of this event contributes the EMPTY STRING, which
+/// is what a placeholder of an `InputTransformer` whose path selects nothing
+/// renders as ([`super::input_transform::render`]), and a path that reader does
+/// not evaluate is left as written rather than guessed at.
+pub fn resolved_http_parameters(
+    parameters: &HttpParameters,
+    event: &::serde_json::Value,
+) -> HttpParameters {
+    let resolve = |value: &String| match names_a_place(value) {
+        false => value.clone(),
+        true => match super::input_transform::selection(value, event) {
+            Ok(super::input_transform::Selection::Value(
+                ::serde_json::Value::String(text),
+            )) => text,
+            Ok(super::input_transform::Selection::Value(selected)) => selected.to_string(),
+            Ok(super::input_transform::Selection::Nothing) => String::new(),
+            Err(_) => value.clone(),
+        },
+    };
+    HttpParameters {
+        path_parameter_values: parameters
+            .path_parameter_values
+            .as_ref()
+            .map(|values| values.iter().map(resolve).collect()),
+        header_parameters: parameters.header_parameters.as_ref().map(|entries| {
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), resolve(value)))
+                .collect()
+        }),
+        query_string_parameters: parameters
+            .query_string_parameters
+            .as_ref()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(key, value)| (key.clone(), resolve(value)))
+                    .collect()
+            }),
+    }
+}
+
+/// Whether `value` names a place in the event rather than standing for itself:
+/// the JSON-path form this service reads a target's paths in, "rooted at the
+/// event" and written in dot notation (`$.detail.id`).
+fn names_a_place(value: &str) -> bool {
+    value.starts_with("$.")
+}
+
 /// `endpoint` with each `*` of its PATH replaced, in order, by the next of
 /// `values`.
 ///
@@ -273,7 +335,12 @@ fn header_name(name: &str) -> String {
 /// (`HttpParameters$PathParameterValues`): a wildcard with no value left for it
 /// is left as it stands, because nothing says what it stands for, and a value
 /// with no wildcard left to fill is not appended to the path.
-fn filled_path(endpoint: &str, values: &[String]) -> String {
+///
+/// Both target kinds the member serves fill their wildcards here — a
+/// destination's stored `InvocationEndpoint` and the resource path of a REST
+/// API stage target's ARN — so one value fills one wildcard the same way
+/// whichever of them is being invoked.
+pub fn filled_path(endpoint: &str, values: &[String]) -> String {
     // The query and fragment are not the path: a `*` in either is not a path
     // wildcard.
     let (path, rest) = match endpoint.find(['?', '#']) {

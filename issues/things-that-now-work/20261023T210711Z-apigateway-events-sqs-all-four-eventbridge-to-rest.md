@@ -1,11 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: apigateway__events__sqs.xsvc-apigateway-1-near-miss-detail-type-is-not-delivered-to-rest-stage apigateway__events__sqs.xsvc-apigateway-1-rule-delivers-transformed-detail-with-path-and-header-to-rest-stage apigateway__events__sqs.xsvc-apigateway-1-stage-500-is-retried-then-dead-lettered-with-error-code apigateway__events__sqs.xsvc-apigateway-1-target-role-without-execute-api-invoke-is-denied
+Issue-Trace-Ids: apigateway__events__sqs.xsvc-apigateway-1-near-miss-detail-type-is-not-delivered-to-rest-stage apigateway__events__sqs.xsvc-apigateway-1-rule-delivers-transformed-detail-with-path-and-header-to-rest-stage apigateway__events__sqs.xsvc-apigateway-1-stage-500-is-retried-then-dead-lettered-with-error-code
 Issue-Key: apigateway__events__sqs.xsvc-apigateway-1-near-miss-detail-type-is-not-delivered-to-rest-stage|_poll_signed_post#7|Timeout|time.sleep(5)
 Issue-Key: apigateway__events__sqs.xsvc-apigateway-1-rule-delivers-transformed-detail-with-path-and-header-to-rest-stage|_poll_signed_post#7|Timeout|time.sleep(5)
 Issue-Key: apigateway__events__sqs.xsvc-apigateway-1-stage-500-is-retried-then-dead-lettered-with-error-code|_poll_signed_post#8|Timeout|time.sleep(5)
-Issue-Key: apigateway__events__sqs.xsvc-apigateway-1-target-role-without-execute-api-invoke-is-denied|_poll_signed_post#8|Timeout|time.sleep(5)
 Issue-Commit: 8bb3e31d2bc3a99611966740f58be573e66087fa
 
 # apigateway__events__sqs: all four EventBridge-to-REST-stage checks hang to the 60 s cap
@@ -30,3 +29,21 @@ Detail for all four checks is exactly "Error: Check timed out after 60.0s".
 1. Deploy a REST API stage, create an EventBridge rule targeting it with an input transformer and a DLQ, and put a matching event.
 2. Observe that the stage never produces a response and the check exhausts its 60 s budget.
 3. Or replay the check ids in trace_ids.
+
+## Resolution
+Cause 1 of 1 is fixed, and the three checks whose keys this report now carries pass.
+
+* The stage answers: a mapping template's `$input.params()` called with no argument names the
+  map of the method request's parameters keyed by the source each came from, so an `AWS`-type
+  integration whose request template reads it is performed instead of leaving the template
+  unrendered and the request answered through `API_CONFIGURATION_ERROR` (the apigateway
+  crate's `src/service/mapping_template.rs`).
+* The delivery happens: a target whose ARN is of the `execute-api` service is invoked by
+  making that ARN's own request at the stage's invoke URL, with the target's `HttpParameters`
+  contributed to it, retried within the target's `RetryPolicy` and dead-lettered with the
+  status the stage answered (the eventbridge crate's `src/ops/put_events/rest_api_stage.rs`).
+
+The fourth check of the group, `…target-role-without-execute-api-invoke-is-denied`, is NOT
+resolved. It is tracked on its own, with what was established about it, in
+`issues/things-that-do-not-work/20261118T120000Z-apigateway-events-sqs-a-denied-execute-api-target-dead.md`;
+its key and trace id moved there with it, so nothing about it is claimed here.

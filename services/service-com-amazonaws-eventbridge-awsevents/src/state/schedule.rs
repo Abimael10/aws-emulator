@@ -410,10 +410,13 @@ fn schedulable_rule(key: &BusKey, rule: &RuleRecord) -> Option<Schedulable> {
 ///
 /// `callback` is the in-process emulator every delivery is made through, cloned from the
 /// request that started the clock: the firings this clock performs reach the same handlers a
-/// published event's deliveries reach.
+/// published event's deliveries reach. `endpoint` is the base URL that emulator is reached
+/// at, which is where a firing delivered to an HTTP endpoint of it is addressed
+/// ([`crate::ops::put_events::Stores`]).
 pub fn drive_schedule_clock<Eng: Send + Sync + 'static>(
     engine: &::std::sync::Arc<Eng>,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
+    endpoint: &str,
 ) {
     let Some(state) = service_state(&**engine) else {
         return;
@@ -426,6 +429,7 @@ pub fn drive_schedule_clock<Eng: Send + Sync + 'static>(
         return;
     };
     let callback = callback.clone();
+    let endpoint = endpoint.to_string();
     let claimed = ::engine::ServiceState::clone(&state);
     let engine = ::std::sync::Arc::clone(engine);
     let running = runtime.spawn(async move {
@@ -444,7 +448,7 @@ pub fn drive_schedule_clock<Eng: Send + Sync + 'static>(
                 store.schedules.take_due(&schedulable, now)
             };
             for rule in firing {
-                fire(&*engine, &state, &callback, &rule, now).await;
+                fire(&*engine, &state, &callback, &endpoint, &rule, now).await;
             }
         }
         state.lock().schedules.release(generation);
@@ -463,6 +467,7 @@ async fn fire<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &::engine::ServiceState<super::ComAmazonawsEventbridgeAwseventsState>,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
+    endpoint: &str,
     rule: &Schedulable,
     now: SystemTime,
 ) {
@@ -504,6 +509,7 @@ async fn fire<Eng: Send + Sync + 'static>(
         glue: glue.as_ref(),
         kms: kms.as_ref(),
         events: Some(state),
+        endpoint,
     };
     let mut clients = crate::ops::put_events::Clients::default();
     let mut budget = crate::ops::put_events::DeliveryBudget::new();
