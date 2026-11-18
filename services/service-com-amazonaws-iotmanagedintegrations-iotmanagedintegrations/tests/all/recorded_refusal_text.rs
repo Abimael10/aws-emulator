@@ -5,7 +5,7 @@
 //!
 //! RULE: a refusal's `Message` is the sentence the service itself words for that refusal
 //! class, and nothing of the request is interpolated into it unless the sentence's own
-//! grammar has a slot for it. Two halves of that rule are asserted here, each over a table
+//! grammar has a slot for it. Three parts of that rule are asserted here, each over a table
 //! that spans the class rather than one recorded request:
 //!
 //! 1. a `@pattern` clause quotes the expression the service PUBLISHES for the member's
@@ -17,6 +17,9 @@
 //! 2. a refusal whose sentence is FIXED states that sentence verbatim and quotes no
 //!    identifier, member name, enum value or ARN from the request — including the
 //!    operation-specific ones, which differ between two operations bound to the same URI.
+//! 3. a create refused because the resource it would mint is already there states its OWN
+//!    resource's fixed sentence and interpolates nothing — neither the target or level the
+//!    request named nor the identifier or name of the record already stored.
 //!
 //! Each row names the modelled shape its expression or its sentence belongs to, and the
 //! rows differ along what the rule generalises over: the operation, the member and its
@@ -29,7 +32,9 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::state::HUB_NETWORK_MODE_VALUES;
+use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::state::{
+    HUB_NETWORK_MODE_VALUES, LOG_LEVEL_VALUES,
+};
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -39,6 +44,7 @@ const REGION: &str = "us-east-1";
 /// The wire error codes the model's `@httpError` shapes are rendered under.
 const VALIDATION: &str = "ValidationException";
 const NOT_FOUND: &str = "ResourceNotFoundException";
+const CONFLICT: &str = "ConflictException";
 
 /// The account id every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`), which
 /// the ARNs the rows below carry are built for.
@@ -64,6 +70,16 @@ const GET_CONFIGURATION_ABSENT: &str =
 /// The sentence a put against a managed thing that runs no managed-integrations runtime is
 /// refused with: the device classes runtime logging is supported for, and no request value.
 const RUNTIME_LOGGING_UNSUPPORTED: &str = "Only 1P device or hub is supported for Runtime logging";
+
+/// The sentence a `CreateEventLogConfiguration` is refused with when the account already
+/// holds an event log configuration for the log target the request names, as the log backend
+/// words it: the whole string is fixed text.
+const LOG_CONFIGURATION_EXISTS: &str = "Log configuration already exists.";
+
+/// The sentence a `CreateDestination` is refused with when the region already holds a
+/// destination under the name the request names — the sibling refusal of the same class,
+/// worded by its own backend, which is why neither sentence is derived from the other.
+const DESTINATION_EXISTS: &str = "Destination already exists";
 
 /// One HTTP answer, reduced to what the assertions read.
 struct Reply {
@@ -631,4 +647,210 @@ async fn each_runtime_log_operation_states_its_own_absence_sentence() {
          got {:?}",
         unsupported.message()
     );
+}
+
+/// The body of a `CreateEventLogConfiguration` for one log target at one level, carrying
+/// `ResourceId` only when the target names a resource.
+fn event_log_request(resource_type: &str, resource_id: Option<&str>, level: &str) -> Value {
+    let mut body = json!({"ResourceType": resource_type, "EventLogLevel": level});
+    if let Some(resource_id) = resource_id {
+        body["ResourceId"] = json!(resource_id);
+    }
+    body
+}
+
+/// One row of the duplicate-create table: the log target a create names, and the level the
+/// first of those creates stored against it.
+struct DuplicateTarget {
+    label: &'static str,
+    /// The region the pair of creates is signed for: the record and the conflict are both
+    /// regional, and the sentence is the same in every one of them.
+    region: &'static str,
+    resource_type: &'static str,
+    resource_id: Option<String>,
+    first_level: &'static str,
+}
+
+/// The `@length` maximum of `SmartHomeResourceId`, in characters
+/// (`smithy_query(query="shape",shape="SmartHomeResourceId")` -> length 1..200).
+const RESOURCE_ID_MAX_LENGTH: usize = 200;
+
+/// RULE: a create refused because the resource it would mint is already there answers the
+/// modelled `ConflictException` (HTTP 409) carrying the FIXED sentence its own resource's
+/// backend words, interpolating nothing — not the target or level the request named, and not
+/// the identifier or name of the record already stored.
+#[tokio::test]
+async fn a_duplicate_create_states_its_resources_fixed_sentence() {
+    // The rows differ along what the rule generalises over: the resource type the target
+    // names (the account wildcard, and types the `SmartHomeResourceType` `@pattern` admits),
+    // whether the target names a resource inside that type, the form and length of the
+    // `ResourceId` inside its `@pattern` (`^[a-zA-Z0-9+*]*$`) and `@length` (1..200), the
+    // level stored first, and the region the calls are signed for.
+    let rows: [DuplicateTarget; 6] = [
+        DuplicateTarget {
+            label: "the account wildcard",
+            region: REGION,
+            resource_type: "*",
+            resource_id: None,
+            first_level: "INFO",
+        },
+        DuplicateTarget {
+            label: "a whole resource type",
+            region: REGION,
+            resource_type: "ota-task",
+            resource_id: None,
+            first_level: "ERROR",
+        },
+        DuplicateTarget {
+            label: "a resource inside a type",
+            region: REGION,
+            resource_type: "managed-thing",
+            resource_id: Some("sim2realthingone".to_string()),
+            first_level: "DEBUG",
+        },
+        DuplicateTarget {
+            label: "a mixed-case resource id with the punctuation the pattern admits",
+            region: "eu-central-1",
+            resource_type: "account-association",
+            resource_id: Some("Assoc9+Wildcard*".to_string()),
+            first_level: "WARN",
+        },
+        DuplicateTarget {
+            label: "another region, another type",
+            region: "ap-southeast-2",
+            resource_type: "credential-locker",
+            resource_id: Some("lockerninetynine".to_string()),
+            first_level: "INFO",
+        },
+        DuplicateTarget {
+            label: "a resource id at the modelled length maximum",
+            region: "eu-west-1",
+            resource_type: "provisioning-profile",
+            resource_id: Some("a".repeat(RESOURCE_ID_MAX_LENGTH)),
+            first_level: "DEBUG",
+        },
+    ];
+
+    for row in &rows {
+        // A fresh store per row, so the only configuration it holds is the row's own.
+        let router = emulator();
+        let created = call_in(
+            &router,
+            row.region,
+            "POST",
+            "/event-log-configurations",
+            Some(event_log_request(
+                row.resource_type,
+                row.resource_id.as_deref(),
+                row.first_level,
+            )),
+        )
+        .await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: expected HTTP 201 from the first create, got {} with body {:?}",
+            row.label, created.status, created.body
+        );
+        let id = created
+            .string("Id")
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: expected an Id, got body {:?}",
+                    row.label, created.body
+                )
+            })
+            .to_string();
+
+        // The duplicate is refused whatever level it asks for — the whole `LogLevel` value
+        // set — and the sentence it carries never changes.
+        for level in LOG_LEVEL_VALUES {
+            let case = format!("{}/again at {level}", row.label);
+            let refused = call_in(
+                &router,
+                row.region,
+                "POST",
+                "/event-log-configurations",
+                Some(event_log_request(
+                    row.resource_type,
+                    row.resource_id.as_deref(),
+                    level,
+                )),
+            )
+            .await;
+            assert_eq!(
+                refused.status, 409,
+                "case {case:?}: expected HTTP 409, got {} with body {:?}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error_type.as_deref(),
+                Some(CONFLICT),
+                "case {case:?}: expected the modelled {CONFLICT} code, got {:?}",
+                refused.error_type
+            );
+            assert_eq!(
+                refused.message(),
+                LOG_CONFIGURATION_EXISTS,
+                "case {case:?}: expected the log backend's fixed sentence, got {:?}",
+                refused.message()
+            );
+
+            // Nothing of the request, and nothing of the record already stored, appears in
+            // it. A value of one or two characters is left out of this check: such a value
+            // is a letter of the sentence itself and says nothing about interpolation.
+            let mut quoted: Vec<&str> = vec![id.as_str(), row.resource_type, level, row.first_level];
+            quoted.extend(row.resource_id.as_deref());
+            for value in quoted.into_iter().filter(|value| value.len() > 2) {
+                assert!(
+                    !refused.message().contains(value),
+                    "case {case:?}: the sentence interpolates nothing, yet it carries \
+                     {value:?}: {:?}",
+                    refused.message()
+                );
+            }
+        }
+    }
+
+    // The same rule in another resource of this service, whose backend words the refusal its
+    // own way: the two sentences are each their resource's, so neither is derived from the
+    // other. The rows differ along the form of the name repeated.
+    for name in ["events.stream-1", "Prod Stream", "destination_99"] {
+        let body = json!({
+            "Name": name,
+            "DeliveryDestinationArn": delivery_destination_arn(),
+            "DeliveryDestinationType": "KINESIS",
+            "RoleArn": delivery_role_arn(),
+        });
+        let router = emulator();
+        let created = call(&router, "POST", "/destinations", Some(body.clone())).await;
+        assert_eq!(
+            created.status, 201,
+            "case {name:?}: expected HTTP 201 from the first create, got {} with body {:?}",
+            created.status, created.body
+        );
+
+        let refused = call(&router, "POST", "/destinations", Some(body)).await;
+        assert_eq!(
+            refused.status, 409,
+            "case {name:?}: expected HTTP 409, got {} with body {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_type.as_deref(),
+            Some(CONFLICT),
+            "case {name:?}: expected the modelled {CONFLICT} code, got {:?}",
+            refused.error_type
+        );
+        assert_eq!(
+            refused.message(),
+            DESTINATION_EXISTS,
+            "case {name:?}: expected the destination backend's own sentence, got {:?}",
+            refused.message()
+        );
+        assert!(
+            !refused.message().contains(name),
+            "case {name:?}: the sentence quotes no name, got {:?}",
+            refused.message()
+        );
+    }
 }

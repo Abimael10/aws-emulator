@@ -472,6 +472,18 @@ pub const EVENT_LOG_CONFIGURATION_RESOURCE_TYPE: &str = "EventLogConfiguration";
 /// same way, the way the recorded 404 of a get after a delete words it.
 pub const EVENT_LOG_CONFIGURATION_ABSENT_REASON: &str = "Event log configuration doesn't exist";
 
+/// The one sentence this service states when a create names a log target the account already
+/// holds an event log configuration for.
+///
+/// It is FIXED text, the way the recorded duplicate is refused: it names neither the target
+/// the request asked for, nor the level it asked for, nor the identifier of the configuration
+/// already stored — so every duplicate, of the account wildcard, of a whole resource type, or
+/// of a resource inside one, is refused the same way. This backend calls the resource a log
+/// configuration and ends the sentence with a full stop, where a destination's own duplicate
+/// is recorded without one ([`already_exists_message`]): the sentence belongs to the resource
+/// that answered rather than to a template over all of them.
+pub const EVENT_LOG_CONFIGURATION_EXISTS_REASON: &str = "Log configuration already exists.";
+
 /// What `ResourceId` reports for a configuration whose target names no resource of its
 /// [`EventLogConfiguration::resource_type`] — the account wildcard, or a resource type as a
 /// whole.

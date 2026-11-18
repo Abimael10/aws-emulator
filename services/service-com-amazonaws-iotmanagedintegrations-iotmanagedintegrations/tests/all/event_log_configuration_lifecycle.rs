@@ -80,6 +80,11 @@ const UNSCOPED_RESOURCE_ID: &str = "unknown";
 /// here for the same reason. It quotes nothing from the request.
 const ABSENT_REASON: &str = "Event log configuration doesn't exist";
 
+/// The one sentence a create refused as a duplicate of an already configured target carries,
+/// written out here for the same reason. It quotes nothing from the request and nothing of
+/// the configuration already stored, its identifier included.
+const EXISTS_REASON: &str = "Log configuration already exists.";
+
 /// The `@length` bounds of `LogConfigurationId`, in characters
 /// (`smithy_query(query="shape",shape="LogConfigurationId")` -> length 1..200, pattern
 /// `^[A-Za-z0-9]+$`).
@@ -390,10 +395,15 @@ async fn a_second_create_for_the_same_target_conflicts() {
             let case = format!("{case}/again at {level}");
             let again = create(&router, request(resource_type, resource_id, level)).await;
             assert_refused(&case, &again, 409, CONFLICT);
+            assert_eq!(
+                again.message(),
+                EXISTS_REASON,
+                "case {case:?}: expected the fixed duplicate sentence {EXISTS_REASON:?}, got {:?}",
+                again.message()
+            );
             assert!(
-                again.message().contains(&id),
-                "case {case:?}: expected the reason to name the existing configuration {id:?}, \
-                 got {:?}",
+                !again.message().contains(&id),
+                "case {case:?}: the sentence quotes no identifier, yet it names {id:?}: {:?}",
                 again.message()
             );
             assert!(

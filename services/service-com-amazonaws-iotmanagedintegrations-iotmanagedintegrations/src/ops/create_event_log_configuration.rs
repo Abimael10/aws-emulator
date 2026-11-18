@@ -217,22 +217,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A log target carries ONE logging level, so a target that already has a
         // configuration is a conflict rather than a second record: the caller updates or
-        // deletes the existing one. The reason names that configuration's identifier, so
-        // the caller can act on it, and nothing the request sent.
-        if let Some(existing) = store.event_log_configuration_for_target(
-            &region,
-            &input.resource_type,
-            input.resource_id.as_deref(),
-        ) {
-            let existing_id = existing.id.clone();
+        // deletes the existing one. The reason is this resource's own fixed sentence
+        // (`crate::state::EVENT_LOG_CONFIGURATION_EXISTS_REASON`) — it quotes nothing the
+        // request sent and nothing of the stored record, not even its identifier.
+        if store
+            .event_log_configuration_for_target(
+                &region,
+                &input.resource_type,
+                input.resource_id.as_deref(),
+            )
+            .is_some()
+        {
             drop(store);
             audit(&akid, &region, &input.resource_type, "conflict");
             return Err(CreateEventLogConfigurationErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "an event log configuration already exists for this resource type and \
-                         resource, with identifier '{existing_id}'"
-                    )),
+                    message: Some(
+                        crate::state::EVENT_LOG_CONFIGURATION_EXISTS_REASON.to_string(),
+                    ),
                 },
             )
             .into());
