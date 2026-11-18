@@ -354,7 +354,15 @@ pub(super) async fn removal(
 ///
 /// The properties its read reports are the ones this type declares under a name
 /// `DescribeStateMachine` answers for AND that the declaration states as they are stored: the
-/// role, the name and the type. A property the read does not report is not evidence of
+/// role, the name, the type and each CONFIGURATION structure that read answers with
+/// ([`CONFIGURATION_PROPERTIES`]). A configuration is reported with its member names back in
+/// the spelling the type declares them under ([`upper_camel_members`], the inverse of the walk
+/// the create sends them through), so the two sides of the comparison are the same document
+/// where nothing changed and differ at the leaf that did — which is what makes a logging,
+/// tracing or encryption setting changed outside the stack a reported difference rather than
+/// a configuration nothing compared.
+///
+/// A property the read does not report is not evidence of
 /// anything ([`super::super::drift`]), which is why the DEFINITION is not among them — the
 /// document that service holds is the one the declaration's `DefinitionSubstitutions` filled
 /// in, so comparing it against the declared `${Key}` text would report every templated
@@ -375,6 +383,14 @@ pub(super) async fn actual_configuration(
     ] {
         if let Some(value) = machine.get(member).filter(|value| !value.is_null()) {
             reported.insert(property.to_string(), value.clone());
+        }
+    }
+    for property in CONFIGURATION_PROPERTIES {
+        if let Some(configuration) = machine
+            .get(lower_camel(property))
+            .filter(|value| !value.is_null())
+        {
+            reported.insert(property.to_string(), upper_camel_members(configuration, 0));
         }
     }
     Ok(Some(Value::Object(reported)))
@@ -591,7 +607,10 @@ fn lower_camel(name: &str) -> String {
 ///
 /// Applied only to [`CONFIGURATION_PROPERTIES`], every name inside which is modelled: a
 /// property carrying a map of caller data would have its keys re-cased too, and none of the
-/// three carries one. The walk is bounded because the document is the caller's.
+/// three carries one. The walk is bounded because the document is the caller's, and a
+/// declaration past the bound is REFUSED rather than sent — where its inverse
+/// ([`upper_camel_members`]) reports what the owning service answered as it stands, that
+/// document being this emulator's own rather than a caller's.
 fn lower_camel_members(value: &Value, depth: usize) -> Result<Value, Refusal> {
     if depth >= MAX_CONFIGURATION_NESTING {
         return Err(Refusal {
@@ -618,6 +637,46 @@ fn lower_camel_members(value: &Value, depth: usize) -> Result<Value, Refusal> {
             Ok(Value::Array(converted))
         }
         other => Ok(other.clone()),
+    }
+}
+
+/// `name` with its initial letter upper-cased, which is how this type's properties spell the
+/// member Step Functions answers for in lower camel case — the inverse of [`lower_camel`].
+fn upper_camel(name: &str) -> String {
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
+/// One configuration this service REPORTED with every member name in upper camel case, which
+/// is how the type declares the very same members — the inverse of [`lower_camel_members`],
+/// over the same [`CONFIGURATION_PROPERTIES`], every name inside which is modelled rather
+/// than a caller's own data.
+///
+/// The walk is bounded exactly as the sending one is; past [`MAX_CONFIGURATION_NESTING`] the
+/// value is reported as it stands, which no answer of the three configurations reaches.
+fn upper_camel_members(value: &Value, depth: usize) -> Value {
+    if depth >= MAX_CONFIGURATION_NESTING {
+        return value.clone();
+    }
+    match value {
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .map(|(name, member)| {
+                    (upper_camel(name), upper_camel_members(member, depth + 1))
+                })
+                .collect(),
+        ),
+        Value::Array(elements) => Value::Array(
+            elements
+                .iter()
+                .map(|element| upper_camel_members(element, depth + 1))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -814,6 +873,37 @@ mod tests {
                 "destinations": [{ "cloudWatchLogsLogGroup": { "logGroupArn": "arn:aws:logs:::g" } }],
             }),
             "expected every member in this service's own spelling, got {converted}"
+        );
+    }
+
+    /// ...and the configuration this service REPORTS is read back under the names the type
+    /// declares those very members under, so a declaration and the answer for an untouched
+    /// machine are the same document.
+    #[test]
+    fn a_reported_configuration_is_read_in_the_declared_spelling() {
+        let reported = serde_json::json!({
+            "level": "ALL",
+            "includeExecutionData": true,
+            "destinations": [{ "cloudWatchLogsLogGroup": { "logGroupArn": "arn:aws:logs:::g" } }],
+        });
+        let declared = serde_json::json!({
+            "Level": "ALL",
+            "IncludeExecutionData": true,
+            "Destinations": [{ "CloudWatchLogsLogGroup": { "LogGroupArn": "arn:aws:logs:::g" } }],
+        });
+        let read_back = upper_camel_members(&reported, 0);
+        assert_eq!(
+            read_back, declared,
+            "expected the reported configuration in the declared spelling, got {read_back}"
+        );
+        // The two walks are inverses over a configuration of this type, so what the create
+        // sends and what the read reports agree member for member.
+        let sent = lower_camel_members(&declared, 0).expect("the walk converts it");
+        assert_eq!(
+            upper_camel_members(&sent, 0),
+            declared,
+            "expected the sending and reading walks to be inverses, got {}",
+            upper_camel_members(&sent, 0)
         );
     }
 
