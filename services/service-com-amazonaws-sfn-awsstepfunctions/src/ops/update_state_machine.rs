@@ -453,6 +453,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         let revision_id = store.fresh_revision_id();
+        // "You can publish up to 1000 versions for each state machine. You must manually
+        // delete unused versions using the DeleteStateMachineVersion API action" — the cap
+        // is on what the state machine HOLDS, and a publish that would exceed it is the
+        // modelled `ServiceQuotaExceededException`, the same refusal
+        // `PublishStateMachineVersion` answers with for the same reason. It is weighed
+        // BEFORE the update is applied, so a refused publish leaves the state machine, its
+        // revision and its version list exactly as they were.
+        if input.publish
+            && store.version_count(&input.state_machine_arn)
+                >= crate::state::MAX_VERSIONS_PER_STATE_MACHINE
+        {
+            return Err(
+                UpdateStateMachineErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::version_limit_message(&parsed.name)),
+                    },
+                )
+                .into(),
+            );
+        }
         let update = crate::state::StateMachineUpdate {
             definition: input.definition,
             role_arn: input.role_arn,

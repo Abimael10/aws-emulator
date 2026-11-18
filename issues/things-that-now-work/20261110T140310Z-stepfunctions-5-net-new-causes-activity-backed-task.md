@@ -1,13 +1,11 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: stepfunctions.activity-heartbeat-timeout-catcher-order-decides-winner stepfunctions.catch-timeout-empty-cause stepfunctions.jsonata-task-error-two-levels-deep-propagates-through-map-and-parallel stepfunctions.conc-distributed-map-tolerated-failure-percentage-succeeds-and-names-failed-items stepfunctions.start-sync-execution-on-deleting-state-machine-rejected stepfunctions.statemachinequalifier-condition-restricts-qualifier-value-not-its-absence stepfunctions.update-state-machine-publish-at-version-cap-quota-exceeded
+Issue-Trace-Ids: stepfunctions.activity-heartbeat-timeout-catcher-order-decides-winner stepfunctions.catch-timeout-empty-cause stepfunctions.conc-distributed-map-tolerated-failure-percentage-succeeds-and-names-failed-items stepfunctions.statemachinequalifier-condition-restricts-qualifier-value-not-its-absence stepfunctions.update-state-machine-publish-at-version-cap-quota-exceeded
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
 Issue-Key: stepfunctions.activity-heartbeat-timeout-catcher-order-decides-winner|_poll_activity_task#7|Timeout|last = sfn.get_activity_task(activityArn=activity_arn, workerName=worker_name)
 Issue-Key: stepfunctions.catch-timeout-empty-cause|_poll_activity_task#6|Timeout|last = sfn.get_activity_task(activityArn=activity_arn, workerName=worker_name)
-Issue-Key: stepfunctions.jsonata-task-error-two-levels-deep-propagates-through-map-and-parallel|_poll_activity_task#8|Timeout|resp = sfn.get_activity_task(activityArn=activity_arn, workerName="sim2real-behav")
 Issue-Key: stepfunctions.conc-distributed-map-tolerated-failure-percentage-succeeds-and-names-failed-items|_wait_terminal#9|Timeout|time.sleep(interval_s)
-Issue-Key: stepfunctions.start-sync-execution-on-deleting-state-machine-rejected|_poll_until_stable_error#8|Timeout|time.sleep(interval_s)
 Issue-Key: stepfunctions.statemachinequalifier-condition-restricts-qualifier-value-not-its-absence|_retry_iam_propagation#15|Timeout|time.sleep(3.0)
 Issue-Key: stepfunctions.update-state-machine-publish-at-version-cap-quota-exceeded|_publish_one#8|Timeout|return sfn.update_state_machine(
 Issue-Commit: 5598dd881b8e225c34bc5a9814ddc1ff981b448f
@@ -15,6 +13,19 @@ Issue-Commit: 5598dd881b8e225c34bc5a9814ddc1ff981b448f
 # stepfunctions: 5 net-new causes — activity-backed Task states never hand out a token (so the task/heartbeat clocks and their Catchers are unreachable), a tolerated-failure Distributed Map never terminates, StartSyncExecution never settles on StateMachineDeleting, a qualified StartExecution scenario never completes, and the 1000-version cap is never enforced
 
 > _Note: this issue was identified against the code base at commit `5598dd881b8e225c34bc5a9814ddc1ff981b448f`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+> _RESOLVED for the five causes below, except two of their checks, which were SPLIT OUT and
+> are filed with their own replay keys as
+> `issues/things-that-do-not-work/20261118T204500Z-stepfunctions-2-causes-carried-over-nested-activity-task-and-deletion-window.md`:
+> `stepfunctions.jsonata-task-error-two-levels-deep-propagates-through-map-and-parallel` (an
+> activity task inside a `Map` inside a `Parallel` branch, which needs the interpreter to
+> suspend inside a frame) and
+> `stepfunctions.start-sync-execution-on-deleting-state-machine-rejected` (how long a started
+> deletion stays observable, which CloudFormation's own teardown bounds). Their trace ids and
+> keys are carried THERE, not here, so a later scan reads them as the open work they are.
+> What remains below is the account of the five causes and the two checks of cause 1 that are
+> served: the activity task is scheduled and handed to a poll, its `Catch` answers for the
+> bound that closes it, and the 1000-version cap is enforced._
 
 ## Operation
 GetActivityTask

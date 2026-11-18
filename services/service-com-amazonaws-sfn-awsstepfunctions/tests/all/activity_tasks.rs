@@ -26,7 +26,13 @@
 //!    `States.Timeout`;
 //! 5. a `Task` state that names any other integration schedules nothing: it is the
 //!    call to another service this emulator does not make, so the execution ends
-//!    `FAILED` with `States.Runtime` and no worker is handed anything.
+//!    `FAILED` with `States.Runtime` and no worker is handed anything;
+//! 6. the scheduling state's own `Catch` answers for the task either way it can fail —
+//!    a bound of its own closing it, and a failure a worker reported — so the FIRST
+//!    catcher whose `ErrorEquals` names the error takes the execution on at its `Next`
+//!    with the `{Error, Cause}` error output placed through that catcher's `ResultPath`,
+//!    and a closure of the HEARTBEAT window answers to both names the language states
+//!    for it.
 //!
 //! The harness (`Emulator`, `string`, `create_machine`, `start_execution`,
 //! `describe_execution`) is the one `state_machine_lifecycle` builds; `tests/all.rs`
@@ -38,7 +44,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
-    asl::{DATA_LIMIT_ERROR, MAX_PAYLOAD_BYTES, RUNTIME_ERROR, TIMEOUT_ERROR},
+    asl::{DATA_LIMIT_ERROR, HEARTBEAT_TIMEOUT_ERROR, MAX_PAYLOAD_BYTES, RUNTIME_ERROR, TIMEOUT_ERROR},
     ACTIVITY_POLL_HOLD,
 };
 
@@ -831,6 +837,295 @@ async fn a_poll_that_answered_gives_its_place_back() {
             scheduled,
             json!({ "n": index }),
             "case {index}: expected the task that run scheduled, got {scheduled}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What the scheduling state's own `Catch` does with the task
+// ---------------------------------------------------------------------------
+
+/// Where the catchers below place the error output, and where the state after them
+/// reads it from: a `ResultPath` into the state's own input.
+const ERROR_INFO_PATH: &str = "$.error-info";
+
+/// A definition whose `Task` state polls `activity_arn` under `bounds` with `catch` as
+/// its `Catch`, followed by the `Pass` states those catchers name.
+///
+/// Each reporting state puts out what the catcher placed at [`ERROR_INFO_PATH`], so the
+/// execution's own output IS the error output the catcher wrote — the one way to read
+/// that document back through this API.
+fn caught_definition(activity_arn: &str, bounds: &Value, catch: Value, reports: &[&str]) -> String {
+    let mut task = json!({
+        "Type": "Task",
+        "Resource": activity_arn,
+        "Catch": catch,
+        "End": true,
+    });
+    let members = task.as_object_mut().expect("the state is an object");
+    for (member, value) in bounds.as_object().expect("the bounds are an object") {
+        members.insert(member.clone(), value.clone());
+    }
+    let mut states = json!({ "HandOff": task });
+    let declared = states.as_object_mut().expect("the states are an object");
+    for report in reports {
+        declared.insert(
+            (*report).to_string(),
+            json!({ "Type": "Pass", "OutputPath": ERROR_INFO_PATH, "End": true }),
+        );
+    }
+    json!({ "StartAt": "HandOff", "States": states }).to_string()
+}
+
+/// The document an execution that ended `SUCCEEDED` put out.
+fn output_of(described: &Value, case: &str) -> Value {
+    let output = described
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: expected an output in {described:?}"));
+    serde_json::from_str(output)
+        .unwrap_or_else(|error| panic!("case {case:?}: expected JSON output, got {error} for {output}"))
+}
+
+/// A bound the scheduling state declared closing the task is the `Task` state's own
+/// failure, so its `Catch` answers for it: the FIRST catcher that names the error takes
+/// the execution on at its `Next` with the error output, and with none the failure is
+/// the execution's.
+///
+/// The rows differ along which bound closes the task and along the name the catcher
+/// takes it over by. The names are the Amazon States Language's own predefined error
+/// names (its "Error names" documentation): `States.Timeout` — "a Task state either ran
+/// longer than the TimeoutSeconds value, or failed to send a heartbeat for a period
+/// longer than the HeartbeatSeconds value" — `States.HeartbeatTimeout`, the `States.ALL`
+/// wildcard, and one name the closure is NOT ("States.TaskFailed [...] matches any known
+/// error name except States.Timeout").
+#[tokio::test]
+async fn a_catcher_takes_over_the_bound_that_closed_the_task() {
+    let emulator = Emulator::new();
+
+    // Each row: the bounds the `Task` state declares, the errors its one catcher names,
+    // and the output the execution ends with — `None` where no catcher takes the closure
+    // over, which leaves it the execution's own failure.
+    let cases: Vec<(&str, Value, Value, Option<Value>)> = vec![
+        (
+            "TimeoutSeconds, caught by the error's own name",
+            json!({ "TimeoutSeconds": 1 }),
+            json!([TIMEOUT_ERROR]),
+            Some(json!({ "Error": TIMEOUT_ERROR, "Cause": "" })),
+        ),
+        (
+            "TimeoutSeconds, caught by the wildcard",
+            json!({ "TimeoutSeconds": 1 }),
+            json!(["States.ALL"]),
+            Some(json!({ "Error": TIMEOUT_ERROR, "Cause": "" })),
+        ),
+        (
+            "HeartbeatSeconds, caught by the heartbeat's own name",
+            json!({ "HeartbeatSeconds": 1, "TimeoutSeconds": 120 }),
+            json!([HEARTBEAT_TIMEOUT_ERROR]),
+            Some(json!({ "Error": TIMEOUT_ERROR, "Cause": "" })),
+        ),
+        (
+            "HeartbeatSeconds, caught by the timeout name the language states for it too",
+            json!({ "HeartbeatSeconds": 1, "TimeoutSeconds": 120 }),
+            json!([TIMEOUT_ERROR]),
+            Some(json!({ "Error": TIMEOUT_ERROR, "Cause": "" })),
+        ),
+        (
+            "a catcher of another error entirely, which takes nothing over",
+            json!({ "TimeoutSeconds": 1 }),
+            json!(["States.TaskFailed"]),
+            None,
+        ),
+    ];
+
+    for (index, (case, bounds, errors, expected)) in cases.into_iter().enumerate() {
+        let activity = create_activity(&emulator, &format!("caught-{index}")).await;
+        let definition = caught_definition(
+            &activity,
+            &bounds,
+            json!([{ "ErrorEquals": errors, "ResultPath": ERROR_INFO_PATH, "Next": "Report" }]),
+            &["Report"],
+        );
+        let machine = create_machine(&emulator, &format!("caught-machine-{index}"), &definition).await;
+        let execution = start_execution(&emulator, &machine, "only", "{}").await;
+
+        // A state that declares a `Catch` still SCHEDULES its activity's task: the poll
+        // is handed it, and the worker then answers nothing at all, so the bound runs
+        // out with the task out with that worker.
+        let (token, _) = claimed(&emulator, case, &activity, Some("w-1")).await;
+        assert!(!token.is_empty(), "case {case:?}: expected a token, got {token:?}");
+
+        match expected {
+            Some(error_output) => {
+                let described = reported_as(&emulator, case, &execution, "SUCCEEDED").await;
+                assert_eq!(
+                    output_of(&described, case),
+                    error_output,
+                    "case {case:?}: expected the catcher's error output {error_output}, got \
+                     {described:?}"
+                );
+            }
+            None => {
+                let described = reported_as(&emulator, case, &execution, "FAILED").await;
+                assert_eq!(
+                    described.get("error").and_then(Value::as_str),
+                    Some(TIMEOUT_ERROR),
+                    "case {case:?}: expected the error {TIMEOUT_ERROR}, got {described:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A closure both catchers name is taken over by the one the `Catch` array lists FIRST,
+/// whichever of the two names the error is reported by: the catchers are matched in the
+/// order the definition declares them, not by how specifically they name the error.
+#[tokio::test]
+async fn the_first_catcher_that_names_the_closure_takes_it_over() {
+    let emulator = Emulator::new();
+
+    // Both orders of the same two catchers, over a task whose HEARTBEAT window is the
+    // bound that closes it — the closure both names answer to.
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "the heartbeat's own name first",
+            json!([HEARTBEAT_TIMEOUT_ERROR, TIMEOUT_ERROR]),
+            "HeartbeatCaught",
+        ),
+        (
+            "the timeout name first",
+            json!([TIMEOUT_ERROR, HEARTBEAT_TIMEOUT_ERROR]),
+            "TimeoutCaught",
+        ),
+    ];
+
+    for (index, (case, order, winner)) in cases.into_iter().enumerate() {
+        let activity = create_activity(&emulator, &format!("ordered-{index}")).await;
+        let catch: Vec<Value> = order
+            .as_array()
+            .expect("the order is an array")
+            .iter()
+            .map(|error| {
+                json!({
+                    "ErrorEquals": [error],
+                    "ResultPath": ERROR_INFO_PATH,
+                    "Next": match error.as_str() {
+                        Some(HEARTBEAT_TIMEOUT_ERROR) => "HeartbeatCaught",
+                        _ => "TimeoutCaught",
+                    },
+                })
+            })
+            .collect();
+        let definition = caught_definition(
+            &activity,
+            &json!({ "HeartbeatSeconds": 1, "TimeoutSeconds": 120 }),
+            Value::Array(catch),
+            &["HeartbeatCaught", "TimeoutCaught"],
+        );
+        let machine =
+            create_machine(&emulator, &format!("ordered-machine-{index}"), &definition).await;
+        let execution = start_execution(&emulator, &machine, "only", "{}").await;
+        claimed(&emulator, case, &activity, Some("w-1")).await;
+
+        let described = reported_as(&emulator, case, &execution, "SUCCEEDED").await;
+        let history = emulator
+            .ok("GetExecutionHistory", &json!({ "executionArn": execution }))
+            .await;
+        let entered: Vec<String> = history
+            .get("events")
+            .and_then(Value::as_array)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|event| {
+                        event.get("type").and_then(Value::as_str) == Some("PassStateEntered")
+                    })
+                    .filter_map(|event| {
+                        event
+                            .get("stateEnteredEventDetails")
+                            .and_then(|details| details.get("name"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            entered,
+            vec![winner.to_string()],
+            "case {case:?}: expected only {winner} to have run, got {entered:?} with \
+             {described:?}"
+        );
+    }
+}
+
+/// A failure a WORKER reported is the `Task` state's own in exactly the same way, so the
+/// same `Catch` answers for it — carrying the `error` and the `cause` that worker
+/// reported into the error output.
+#[tokio::test]
+async fn a_catcher_takes_over_a_failure_the_worker_reported() {
+    let emulator = Emulator::new();
+
+    // Each row: the errors the catcher names, and what the worker reports. The names are
+    // the language's own ("States.TaskFailed [...] acts as a wildcard that matches any
+    // known error name except States.Timeout").
+    let cases: Vec<(&str, Value, Option<&str>, Option<&str>)> = vec![
+        (
+            "the error the worker named",
+            json!(["OutOfCapacity"]),
+            Some("OutOfCapacity"),
+            Some("the pool is empty"),
+        ),
+        (
+            "the task-failed wildcard",
+            json!(["States.TaskFailed"]),
+            Some("SomethingElse"),
+            None,
+        ),
+        (
+            "a worker that named no error at all, under the wildcard",
+            json!(["States.ALL"]),
+            None,
+            None,
+        ),
+    ];
+
+    for (index, (case, errors, error, cause)) in cases.into_iter().enumerate() {
+        let activity = create_activity(&emulator, &format!("reported-{index}")).await;
+        let definition = caught_definition(
+            &activity,
+            &json!({}),
+            json!([{ "ErrorEquals": errors, "ResultPath": ERROR_INFO_PATH, "Next": "Report" }]),
+            &["Report"],
+        );
+        let machine =
+            create_machine(&emulator, &format!("reported-machine-{index}"), &definition).await;
+        let execution = start_execution(&emulator, &machine, "only", "{}").await;
+        let (token, _) = claimed(&emulator, case, &activity, Some("w-1")).await;
+
+        let mut reply = json!({ "taskToken": token });
+        let members = reply.as_object_mut().expect("the reply is an object");
+        if let Some(error) = error {
+            members.insert("error".to_string(), json!(error));
+        }
+        if let Some(cause) = cause {
+            members.insert("cause".to_string(), json!(cause));
+        }
+        emulator.ok("SendTaskFailure", &reply).await;
+
+        let described = reported_as(&emulator, case, &execution, "SUCCEEDED").await;
+        let mut expected = json!({ "Cause": cause.unwrap_or_default() });
+        if let Some(error) = error {
+            expected
+                .as_object_mut()
+                .expect("the document is an object")
+                .insert("Error".to_string(), json!(error));
+        }
+        assert_eq!(
+            output_of(&described, case),
+            expected,
+            "case {case:?}: expected the catcher's error output {expected}, got {described:?}"
         );
     }
 }

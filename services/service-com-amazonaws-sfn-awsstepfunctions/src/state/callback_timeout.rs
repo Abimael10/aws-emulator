@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The CONTINUATION of an execution whose callback (`.waitForTaskToken`) task ran out
-//! of the time its state allowed it.
+//! The CONTINUATION of an execution whose task ran out of the time its state allowed it
+//! — the task of an ACTIVITY a worker claimed, or a callback (`.waitForTaskToken`) task.
 //!
 //! "If the task runs longer than the specified seconds, this state fails with a
 //! States.Timeout error name" — and that failure is the `Task` state's own, so the state
 //! answers for it exactly as it answers for a failure a `SendTaskFailure` reported: a
-//! `Retry` whose retrier names the error makes the state's integration call again, a
-//! `Catch` whose catcher names it carries the execution on at that catcher's `Next`, and
-//! with neither the failure is the execution's.
+//! `Retry` whose retrier names the error makes the state's work's next attempt (which for
+//! an ACTIVITY is a task the store queues itself, so it never reaches here), a `Catch`
+//! whose catcher names it carries the execution on at that catcher's `Next`, and with
+//! neither the failure is the execution's.
 //!
 //! ## Why it is not the settle that applies it
 //!
@@ -46,8 +47,8 @@ use smithy_server_runtime::EmbeddedEmulator;
 use super::asl;
 use super::integration;
 
-/// How long a callback task whose bound has run out waits to be CONTINUED before the
-/// store fails its execution with the timeout instead.
+/// How long a task whose bound has run out waits to be CONTINUED before the store fails
+/// its execution with the timeout instead.
 ///
 /// Emulator bound, NOT an AWS limit: on the service the state's error handling is
 /// applied at the instant the bound is reached. Here a continuation is a walk, which
@@ -58,12 +59,12 @@ use super::integration;
 /// reaches the terminal status its timed-out task owes it.
 pub const MAX_CONTINUATION_DELAY: Duration = Duration::from_secs(30);
 
-/// How many timed-out callback tasks ONE pass continues, so a driver cannot be held
+/// How many timed-out tasks ONE pass continues, so a driver cannot be held
 /// walking a store full of them: what is left over is claimed by the next pass, which
 /// the clock makes on its own.
 const MAX_CONTINUATIONS_PER_PASS: usize = 8;
 
-/// Hand the continuation of every timed-out callback task this store owes one for to a
+/// Hand the continuation of every timed-out task this store owes one for to a
 /// task of its own, and return at once.
 ///
 /// For a driver that must ANSWER: the walk a continuation runs makes the state's own
@@ -87,7 +88,7 @@ pub fn drive<Eng: Send + Sync + 'static>(engine: &Arc<Eng>, callback: &EmbeddedE
     });
 }
 
-/// Continue every timed-out callback task this store owes a continuation for, here, and
+/// Continue every timed-out task this store owes a continuation for, here, and
 /// answer how many were continued.
 ///
 /// For a driver that is already background work — this service's own clock — and the one
@@ -103,17 +104,17 @@ pub async fn continue_due<Eng: Send + Sync + 'static>(
     let mut continued = 0;
     while continued < MAX_CONTINUATIONS_PER_PASS {
         let now = super::now();
-        // Phase 1, under the lock: CLAIM one timed-out callback task and read everything
+        // Phase 1, under the lock: CLAIM one timed-out task and read everything
         // its continuation needs. The claim and the reading are one critical section, so
         // two drivers cannot continue one task twice — and nothing ELSE of the store is
         // touched here: the bound a claim is made on is the task's own, which
-        // [`ComAmazonawsSfnAwsstepfunctionsState::claim_timed_out_callback`] reads
+        // [`ComAmazonawsSfnAwsstepfunctionsState::claim_timed_out_task`] reads
         // without settling, so this pass does not materialise — nor queue the
         // publications of — transitions the caller that drove it settles and publishes
         // itself.
         let claimed = {
             let mut store = state.lock();
-            let Some((task, due)) = store.claim_timed_out_callback(now) else {
+            let Some((task, due)) = store.claim_timed_out_task(now) else {
                 break;
             };
             let facts = Facts::read(&store, &task);
@@ -234,6 +235,11 @@ async fn continue_one<Eng: Send + Sync + 'static>(
         // The bound that ran out IS the task's outcome, under the name the language
         // gives it and with nothing beside it ([`asl::timed_out`]).
         outcome: Err(asl::timed_out()),
+        // The CLOCK closed it, which is what the event this closure records reports.
+        by_the_clock: true,
+        // A HEARTBEAT window that lapsed answers to the second name the language states
+        // for that closure as well, so a catcher naming either takes it over.
+        also_answers: asl::task_closure_errors(task.closed_by_heartbeat()),
         // What this state's retriers have already spent, so the continuation takes that
         // budget up rather than restarting it.
         retries_taken: task.retries_taken.clone(),

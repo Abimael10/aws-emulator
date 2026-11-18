@@ -33,7 +33,11 @@
 //! here is the rule it shares with every other state — a `Resource` this emulator
 //! makes no call for is reported rather than faked.
 
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
+
+use service_com_amazonaws_sfn_awsstepfunctions::state::DELETE_SETTLE_DELAY;
 
 use crate::state_machine_lifecycle::{
     string, Emulator, ACCOUNT, HELLO_DEFINITION, REGION, ROLE_ARN,
@@ -514,6 +518,102 @@ async fn a_sync_start_on_a_deleting_state_machine_is_refused() {
         (400, "StateMachineDeleting"),
         "a started deletion refuses a synchronous start, got {status} {code}"
     );
+}
+
+/// How long a call below waits for the started deletion to go THROUGH before giving up —
+/// generous next to the span the emulator removes the record over, because what the loop
+/// waits for is the ANSWER CHANGING and never a span.
+const DELETION_DEADLINE: Duration = DELETE_SETTLE_DELAY
+    .saturating_mul(4)
+    .saturating_add(Duration::from_secs(60));
+
+/// How long one call pauses before looking again.
+const DELETION_POLL_PAUSE: Duration = Duration::from_millis(50);
+
+/// How many consecutive calls answering the same way a client needs to call an answer
+/// stable.
+const CONSECUTIVE_CALLS: usize = 3;
+
+/// The answer a call that would START WORK on a deleted state machine SETTLES on is one
+/// classifiable refusal: while the deletion is in progress it is `StateMachineDeleting`,
+/// and from the moment the deletion is through every such call answers
+/// `StateMachineDoesNotExist` — so a client tearing a deployment down reaches a stable
+/// answer instead of being handed one and then another for ever.
+///
+/// Both rows are that class of call — the synchronous start and the asynchronous one — so
+/// the rule is pinned on the operations that start work rather than on one of them. Every
+/// wait here is for the ANSWER to change: "this is an asynchronous operation", so how long
+/// the deletion takes is the emulator's own ([`DELETE_SETTLE_DELAY`]) and nothing below is
+/// asserted against the clock. How MANY consecutive calls read the in-progress refusal is
+/// what the carried-over issue on the deletion window owns.
+#[tokio::test]
+async fn the_refusal_a_started_deletion_answers_settles() {
+    let emulator = Emulator::new();
+    let express = create_express(&emulator, "deleting-stably", HELLO_DEFINITION).await;
+    let created = emulator
+        .ok(
+            "CreateStateMachine",
+            &json!({
+                "name": "deleting-stably-standard",
+                "definition": HELLO_DEFINITION,
+                "roleArn": ROLE_ARN,
+            }),
+        )
+        .await;
+    let standard = string(&created, "stateMachineArn");
+
+    // (case, the operation that starts work, the ARN it is addressed to)
+    for (case, operation, machine) in [
+        (
+            "the synchronous start of an Express workflow",
+            "StartSyncExecution",
+            &express,
+        ),
+        (
+            "the asynchronous start of a Standard workflow",
+            "StartExecution",
+            &standard,
+        ),
+    ] {
+        emulator
+            .ok("DeleteStateMachine", &json!({ "stateMachineArn": machine }))
+            .await;
+        let start = json!({ "stateMachineArn": machine, "input": "{}" });
+
+        // Read until the ANSWER changes, never for a span: every answer before it is the
+        // deletion in progress, and the change is to the one refusal for an ARN that names
+        // nothing.
+        let deadline = Instant::now() + DELETION_DEADLINE;
+        let once_gone = loop {
+            let (status, code) = emulator.err(operation, &start).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: every call on a deleted state machine must be refused, got \
+                 {status} {code}"
+            );
+            if code != "StateMachineDeleting" {
+                break code;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected the deletion to go through, still answering {code}"
+            );
+            ::tokio::time::sleep(DELETION_POLL_PAUSE).await;
+        };
+        assert_eq!(
+            once_gone, "StateMachineDoesNotExist",
+            "case {case:?}: once the deletion is through the refusal must say so, got {once_gone}"
+        );
+        for call in 0..CONSECUTIVE_CALLS {
+            let (status, code) = emulator.err(operation, &start).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "StateMachineDoesNotExist"),
+                "case {case:?}: call {call} after the deletion must answer the same refusal, got \
+                 {status} {code}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

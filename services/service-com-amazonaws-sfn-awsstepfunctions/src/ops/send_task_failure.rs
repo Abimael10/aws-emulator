@@ -352,43 +352,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Ok(SendTaskFailureOutput {});
                 }
 
-                // Nothing is interpreted: no retrier of the scheduling state answers
-                // for the error, and the state declares no `Catch` this emulator
-                // interprets, so the failure the worker reported is the execution's —
-                // what is recorded is the two events that failure writes and the
-                // outcome the clock then owes.
-                let planned = crate::state::plan_task_failure(
-                    &state_name,
-                    now,
-                    input.error,
-                    input.cause,
-                    last_event_id,
-                );
-                return match store.fail_activity_task(
-                    &input.task_token,
-                    planned.opening,
-                    planned.pending,
-                ) {
-                    Ok(()) => Ok(SendTaskFailureOutput {}),
-                    Err(crate::state::TaskReplyRejection::Gone) => {
-                        Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {
-                            message: Some(crate::state::task_timed_out_message(&input.task_token)),
-                        })
-                        .into())
-                    }
-                    // The failure's own events and outcome are what the execution
-                    // would grow by, so a reply the store has no room for is refused
-                    // rather than retained past its ceiling. This operation models no
-                    // limit error, so the refusal is the standard 400 validation
-                    // envelope.
-                    Err(crate::state::TaskReplyRejection::NoRoom) => {
-                        Err(crate::scaffolded::Scaffolded::validation(format!(
-                            "failing execution {execution_arn} would take the store past the {} \
-                             bytes this emulator retains",
-                            crate::state::MAX_STORE_BYTES
-                        )))
-                    }
-                };
+                // A `Catch` whose catcher names the error carries the execution on at
+                // that catcher's `Next`, which is a WALK of the definition: such a reply
+                // is CONTINUED below, exactly as a callback task's is. With no retrier and
+                // no catcher for it, nothing is interpreted — the failure the worker
+                // reported is the execution's, and what is recorded is the two events that
+                // failure writes and the outcome the clock then owes.
+                if !store.task_state_catches(&input.task_token, &reported) {
+                    let planned = crate::state::plan_task_failure(
+                        &state_name,
+                        now,
+                        input.error,
+                        input.cause,
+                        last_event_id,
+                    );
+                    return match store.fail_activity_task(
+                        &input.task_token,
+                        planned.opening,
+                        planned.pending,
+                    ) {
+                        Ok(()) => Ok(SendTaskFailureOutput {}),
+                        Err(crate::state::TaskReplyRejection::Gone) => {
+                            Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {
+                                message: Some(crate::state::task_timed_out_message(
+                                    &input.task_token,
+                                )),
+                            })
+                            .into())
+                        }
+                        // The failure's own events and outcome are what the execution
+                        // would grow by, so a reply the store has no room for is refused
+                        // rather than retained past its ceiling. This operation models no
+                        // limit error, so the refusal is the standard 400 validation
+                        // envelope.
+                        Err(crate::state::TaskReplyRejection::NoRoom) => {
+                            Err(crate::scaffolded::Scaffolded::validation(format!(
+                                "failing execution {execution_arn} would take the store past \
+                                 the {} bytes this emulator retains",
+                                crate::state::MAX_STORE_BYTES
+                            )))
+                        }
+                    };
+                }
             }
 
             let Some(machine) = store.state_machines.get(&state_machine_arn) else {
@@ -443,6 +448,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         error: input.error.clone(),
                         cause: input.cause.clone(),
                     }),
+                    // A failure a caller NAMED: the task was answered rather than closed
+                    // by its own clock, and it answers to that one name — the second name
+                    // the language states for a closure belongs to the clock's own
+                    // ([`crate::state::callback_timeout`]).
+                    by_the_clock: false,
+                    also_answers: &[],
                     retries_taken,
                 },
             )

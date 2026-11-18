@@ -446,9 +446,9 @@ pub async fn publish<Eng: Send + Sync + 'static>(
     let Some(state) = super::service_state(&**engine) else {
         return;
     };
-    // A callback task whose bound the clock has made due owes its state's own error
-    // handling, which is a WALK and so cannot be run inside a settle: it is handed to a
-    // task of its own here, because this call has a caller to answer
+    // A task whose bound the clock has made due owes its state's own error handling,
+    // which is a WALK and so cannot be run inside a settle: it is handed to a task of its
+    // own here, because this call has a caller to answer
     // ([`super::callback_timeout`]).
     super::callback_timeout::drive(engine, callback);
     hand_over(engine, &state, callback).await;

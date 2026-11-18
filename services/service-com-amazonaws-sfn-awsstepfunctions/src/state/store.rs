@@ -623,16 +623,27 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         // "If the task runs longer than the specified seconds, this state fails with a
         // States.Timeout error name": the state's own `Retry` answers for that error
         // before the execution does, and the attempt it schedules is a task a worker
-        // polls for exactly as this one was.
-        if self.retry_activity_task(token, TASK_TIMEOUT_ERROR, EVENT_ACTIVITY_TIMED_OUT, due) {
+        // polls for exactly as this one was. A HEARTBEAT window that lapsed answers to
+        // the second name the language states for it as well
+        // ([`asl::task_closure_errors`]).
+        let heartbeat = self
+            .activity_tasks
+            .get(token)
+            .is_some_and(ActivityTask::closed_by_heartbeat);
+        if self.retry_activity_task(
+            token,
+            asl::task_closure_errors(heartbeat),
+            EVENT_ACTIVITY_TIMED_OUT,
+            due,
+        ) {
             return;
         }
-        // A CALLBACK task's next attempt — and the `Catch` that carries its execution
-        // past the failure — are a WALK of the definition, which no settle can run: the
-        // task is left for [`super::callback_timeout`] to claim and continue, which is
-        // where the state's own error handling is applied. Past the span that
-        // continuation is allowed, nothing continued it, and the bound the clock reached
-        // is the execution's failure after all.
+        // The `Catch` that carries an execution past the closure is a WALK of the
+        // definition, which no settle can run: the task is left for
+        // [`super::callback_timeout`] to claim and continue, which is where the state's
+        // own error handling is applied. Past the span that continuation is allowed,
+        // nothing continued it, and the bound the clock reached is the execution's failure
+        // after all.
         if self.awaits_timeout_continuation(token, due, now) {
             return;
         }
@@ -642,10 +653,22 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         self.fail_timed_out_task(&task, due);
     }
 
-    /// Whether the task `token` names is a CALLBACK task whose own state answers
-    /// [`TASK_TIMEOUT_ERROR`], and whose continuation is still owed at `now` — the span
-    /// a timed-out callback task waits to be continued in, measured from the instant
-    /// `due` its bound ran out.
+    /// Whether the task `token` names has a state that ANSWERS the closure of its own
+    /// bound with a WALK, and whose continuation is still owed at `now` — the span a
+    /// timed-out task waits to be continued in, measured from the instant `due` its bound
+    /// ran out.
+    ///
+    /// What needs a walk differs by kind of task, and the answer is the same whoever asks
+    /// — the settle, or the clock that claims one of these ([`Self::claim_timed_out_task`])
+    /// — so neither can skip what the other would have applied:
+    ///
+    /// * an ACTIVITY's next attempt is a task THIS STORE queues
+    ///   ([`Self::retry_activity_task`]), so a closure a retrier of its state answers for
+    ///   is not the continuation's at all; only a `Catch` carrying the execution on at a
+    ///   catcher's `Next` is;
+    /// * a CALLBACK task's next attempt has to MAKE the state's integration call again,
+    ///   which only a walk can do, so both halves of the state's answer are the
+    ///   continuation's.
     fn awaits_timeout_continuation(
         &self,
         token: &str,
@@ -655,28 +678,26 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         let Some(task) = self.activity_tasks.get(token) else {
             return false;
         };
-        // An ACTIVITY's task needs no walk: what its state does with the timeout is the
-        // `Retry` this store schedules itself, and its failure is the execution's.
-        if task.activity_arn.is_some() {
-            return false;
-        }
         if after(due, callback_timeout::MAX_CONTINUATION_DELAY) <= now {
             return false;
         }
         let Some(definition) = self.definition_of_execution(&task.execution_arn) else {
             return false;
         };
-        asl::state_answers_error(
-            &definition,
-            &task.state_name,
-            TASK_TIMEOUT_ERROR,
-            &task.retries_taken,
-        )
+        let errors = asl::task_closure_errors(task.closed_by_heartbeat());
+        let retried =
+            asl::activity_retry_any(&definition, &task.state_name, errors, &task.retries_taken)
+                .is_some();
+        let caught = asl::state_catches_error(&definition, &task.state_name, errors);
+        match task.activity_arn.is_some() {
+            true => !retried && caught,
+            false => retried || caught,
+        }
     }
 
-    /// CLAIM the callback task whose bound the clock has made due and whose state
-    /// answers that timeout itself, for the continuation that applies the state's own
-    /// error handling: the task as it stood, and the instant its bound ran out.
+    /// CLAIM the task whose bound the clock has made due and whose state answers that
+    /// closure itself, for the continuation that applies the state's own error handling:
+    /// the task as it stood, and the instant its bound ran out.
     ///
     /// The record is DISCARDED in the same critical section it is read in, so exactly
     /// one caller continues one timed-out task however many look at once — and the token
@@ -685,7 +706,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     ///
     /// `None` when this store holds no such task, which is every store where nothing is
     /// owed.
-    pub fn claim_timed_out_callback(
+    pub fn claim_timed_out_task(
         &mut self,
         now: SystemTime,
     ) -> Option<(ActivityTask, SystemTime)> {
@@ -815,7 +836,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     fn retry_activity_task(
         &mut self,
         token: &str,
-        error: &str,
+        errors: &[&str],
         failure_event: &str,
         at: SystemTime,
     ) -> bool {
@@ -835,7 +856,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             return false;
         };
         let Some((retrier, delay)) =
-            asl::activity_retry(&definition, &task.state_name, error, &task.retries_taken)
+            asl::activity_retry_any(&definition, &task.state_name, errors, &task.retries_taken)
         else {
             return false;
         };
@@ -873,7 +894,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             failure_event,
             &task.state_name,
             at,
-            EventDetails::of_failure(Some(error.to_string()), None),
+            // The attempt is recorded as having failed under the name the failure is
+            // REPORTED by, which is the first of the names it answers to.
+            EventDetails::of_failure(errors.first().map(|error| (*error).to_string()), None),
         );
         candidate.push_state_event(
             EVENT_ACTIVITY_SCHEDULED,
@@ -910,14 +933,33 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// The error a worker reports is what the scheduling state's `Retry` is matched
     /// against, exactly as the `States.Timeout` the clock reports is: a task the state
     /// retries is queued for its next attempt and the execution stays `RUNNING`, and
-    /// one it does not leaves the reply to fail the execution.
+    /// one it does not leaves the reply to the state's `Catch`, or to failing the
+    /// execution.
     pub fn retry_failed_activity_task(
         &mut self,
         token: &str,
         error: &str,
         at: SystemTime,
     ) -> bool {
-        self.retry_activity_task(token, error, EVENT_ACTIVITY_FAILED, at)
+        self.retry_activity_task(token, &[error], EVENT_ACTIVITY_FAILED, at)
+    }
+
+    /// Whether the state the task `token` names belongs to CATCHES the failure `error` —
+    /// a `Catch` whose catcher names it, the `Retry` above having been offered it first —
+    /// so the reply CONTINUES the execution at that catcher instead of failing it
+    /// ([`asl::state_catches_error`]).
+    ///
+    /// `false` for a token this store holds no task under, and for one whose execution
+    /// runs a definition this store can no longer read.
+    #[must_use]
+    pub fn task_state_catches(&self, token: &str, error: &str) -> bool {
+        let Some(task) = self.activity_tasks.get(token) else {
+            return false;
+        };
+        let Some(definition) = self.definition_of_execution(&task.execution_arn) else {
+            return false;
+        };
+        asl::state_catches_error(&definition, &task.state_name, &[error])
     }
 
     // -----------------------------------------------------------------------

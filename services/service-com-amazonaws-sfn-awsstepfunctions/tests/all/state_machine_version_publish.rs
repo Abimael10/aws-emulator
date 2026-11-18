@@ -22,7 +22,11 @@
 //!    request pinned and then the one the state machine holds;
 //! 4. the ARN is judged before the lookup, and a state machine that is absent or
 //!    being deleted is the operation's own modelled refusal — never a published
-//!    version.
+//!    version;
+//! 5. one state machine may hold at most the documented 1000 versions: at that count
+//!    every operation that would mint another is refused
+//!    `ServiceQuotaExceededException` and mints nothing, and a deletion makes room for
+//!    exactly one more.
 //!
 //! The harness (`Emulator`, `create_machine`, `string`, `error_code`) is the one
 //! `state_machine_lifecycle` builds; `tests/all.rs` is this binary's crate root, so
@@ -30,7 +34,10 @@
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_sfn_awsstepfunctions::state::INITIAL_REVISION_ID;
+use service_com_amazonaws_sfn_awsstepfunctions::service::wire::CLIENT_ERROR_STATUS;
+use service_com_amazonaws_sfn_awsstepfunctions::state::{
+    version_limit_message, INITIAL_REVISION_ID, MAX_VERSIONS_PER_STATE_MACHINE,
+};
 
 use crate::state_machine_lifecycle::{
     create_machine, error_code, string, Emulator, ACCOUNT, HELLO_DEFINITION,
@@ -814,4 +821,131 @@ async fn a_malformed_or_qualified_arn_is_refused_before_the_lookup() {
         vec![format!("{arn}:1")],
         "the existing versions must be unchanged, got {listed:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// How many versions one state machine may hold
+// ---------------------------------------------------------------------------
+
+/// "You can publish up to 1000 versions for each state machine. You must manually
+/// delete unused versions using the DeleteStateMachineVersion API action": the cap is on
+/// what ONE state machine HOLDS, so once it holds that many, every operation that
+/// publishes a version is refused with the modelled `ServiceQuotaExceededException` and
+/// mints nothing, another state machine still takes its own, and deleting one version
+/// makes room for exactly one more.
+///
+/// The STATUS is this service's one client-refusal status, which `client_refusal_status`
+/// is the rule for: `awsJson1_0` names which refusal it was in the body's `__type`.
+#[tokio::test]
+async fn the_version_quota_counts_the_versions_a_state_machine_holds() {
+    let emulator = Emulator::new();
+    let arn = create_machine(&emulator, "quota-versions", HELLO_DEFINITION).await;
+    let other = create_machine(&emulator, "quota-elsewhere", HELLO_DEFINITION).await;
+
+    // Every update mints a fresh revision, so every publish of one takes the next
+    // number: this is a client driving the cap the way a deploy that publishes per
+    // update does.
+    for number in 1..=MAX_VERSIONS_PER_STATE_MACHINE {
+        let published = update_and_publish(&emulator, &arn, HELLO_DEFINITION).await;
+        assert_eq!(
+            string(&published, "stateMachineVersionArn"),
+            format!("{arn}:{number}"),
+            "publish {number} must take that number, got {published:?}"
+        );
+    }
+
+    // Both operations that mint a version are refused for the same reason. The second
+    // needs a revision that has no version yet, because a publish of one that has is the
+    // documented idempotent answer rather than a new version — so the update between them
+    // publishes nothing, which the cap does not count.
+    let (status, body) = emulator
+        .call(
+            "UpdateStateMachine",
+            &json!({ "stateMachineArn": arn, "definition": HELLO_DEFINITION, "publish": true }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (CLIENT_ERROR_STATUS, "ServiceQuotaExceededException"),
+        "an update that would publish past the cap must be refused, got {status} with body \
+         {body:?}"
+    );
+    // The refusal states the LIMIT and the state machine that reached it, by the name the
+    // request's own ARN carried.
+    assert_eq!(
+        body.get("message").and_then(Value::as_str),
+        Some(version_limit_message("quota-versions").as_str()),
+        "the refusal must state the limit it is about, got {body:?}"
+    );
+    update_definition(&emulator, &arn, GOODBYE_DEFINITION).await;
+    let (status, body) = publish_call(&emulator, &arn, json!({})).await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (CLIENT_ERROR_STATUS, "ServiceQuotaExceededException"),
+        "a publish past the cap must be refused, got {status} with body {body:?}"
+    );
+    assert_eq!(
+        body.get("message").and_then(Value::as_str),
+        Some(version_limit_message("quota-versions").as_str()),
+        "both operations must state the same limit, got {body:?}"
+    );
+
+    // Neither refusal minted anything, and neither counted against another state
+    // machine: the quota is per state machine.
+    let listed = listed_versions(&emulator, &arn).await;
+    assert_eq!(
+        listed.len(),
+        MAX_VERSIONS_PER_STATE_MACHINE,
+        "the refusals must leave the {MAX_VERSIONS_PER_STATE_MACHINE} versions the state \
+         machine held, got {} of them",
+        listed.len()
+    );
+    let elsewhere = update_and_publish(&emulator, &other, HELLO_DEFINITION).await;
+    assert_eq!(
+        string(&elsewhere, "stateMachineVersionArn"),
+        format!("{other}:1"),
+        "another state machine's first version must still publish, got {elsewhere:?}"
+    );
+
+    // "You must manually delete unused versions": the cap counts what is HELD, so one
+    // deletion makes room for exactly one more publish — which takes the NEXT number
+    // rather than the deleted one.
+    emulator
+        .ok(
+            "DeleteStateMachineVersion",
+            &json!({ "stateMachineVersionArn": format!("{arn}:1") }),
+        )
+        .await;
+    let published = update_and_publish(&emulator, &arn, HELLO_DEFINITION).await;
+    assert_eq!(
+        string(&published, "stateMachineVersionArn"),
+        format!("{arn}:{}", MAX_VERSIONS_PER_STATE_MACHINE + 1),
+        "the publish a deletion made room for must take the next number, got {published:?}"
+    );
+    let (status, body) = emulator
+        .call(
+            "UpdateStateMachine",
+            &json!({ "stateMachineArn": arn, "definition": HELLO_DEFINITION, "publish": true }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (CLIENT_ERROR_STATUS, "ServiceQuotaExceededException"),
+        "the state machine must be back at the cap, got {status} with body {body:?}"
+    );
+}
+
+/// `UpdateStateMachine` with `publish` set, which must succeed, and the body it
+/// answered: the ONE call a client that publishes per deploy makes.
+async fn update_and_publish(emulator: &Emulator, arn: &str, definition: &str) -> Value {
+    emulator
+        .ok(
+            "UpdateStateMachine",
+            &json!({
+                "stateMachineArn": arn,
+                "definition": definition,
+                "publish": true,
+            }),
+        )
+        .await
 }

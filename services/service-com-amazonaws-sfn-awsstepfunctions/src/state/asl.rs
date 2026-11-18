@@ -182,9 +182,14 @@ mod intrinsics;
 mod jsonpath;
 mod map_items;
 mod member_order;
+// Which members each state type may carry, in each query language: one concern in a file
+// of its own, whose names stay reachable unqualified from here and from the walk. They
+// are this module's own, so the import is not a re-export.
+mod members;
 mod walk;
 mod work_events;
 mod work_meter;
+use members::*;
 pub use diagnose::*;
 // The ceiling on the PRODUCT the ceilings below bound factor by factor, and the
 // primitives that spend it: one concern in a file of its own, whose names stay
@@ -260,6 +265,31 @@ pub const TOLERATED_FAILURE_ERROR: &str = "States.ExceedToleratedFailureThreshol
 /// The ASL predefined error name for an execution that ran longer than the
 /// `TimeoutSeconds` its definition declares ("States.Timeout").
 pub const TIMEOUT_ERROR: &str = "States.Timeout";
+
+/// The OTHER ASL predefined error name a lapsed HEARTBEAT window answers to
+/// ("States.HeartbeatTimeout — a Task state failed to send a heartbeat for a period
+/// longer than the HeartbeatSeconds value").
+///
+/// The language states BOTH names for that one closure: "States.Timeout — a Task state
+/// either ran longer than the TimeoutSeconds value, or failed to send a heartbeat for a
+/// period longer than the HeartbeatSeconds value". So a task its heartbeat window closed
+/// is taken over by a retrier or a catcher naming either name, and the FIRST entry of the
+/// array that names one of them decides — which is what [`task_closure_errors`] hands the
+/// matching ([`errors_match`]).
+pub const HEARTBEAT_TIMEOUT_ERROR: &str = "States.HeartbeatTimeout";
+
+/// The error names the closure of a task's own clock answers to, for a closure the
+/// HEARTBEAT window made due (`heartbeat`) and for one a `TimeoutSeconds` did.
+///
+/// The name such a closure is REPORTED under is [`TIMEOUT_ERROR`] either way — "this
+/// state fails with a States.Timeout error name" — and a heartbeat window's lapse answers
+/// to [`HEARTBEAT_TIMEOUT_ERROR`] as well.
+pub fn task_closure_errors(heartbeat: bool) -> &'static [&'static str] {
+    match heartbeat {
+        true => &[TIMEOUT_ERROR, HEARTBEAT_TIMEOUT_ERROR],
+        false => &[TIMEOUT_ERROR],
+    }
+}
 
 /// The ASL predefined error name for an expression that could not be evaluated
 /// ("States.QueryEvaluationError — the JSONata expression evaluation failed").
@@ -911,353 +941,6 @@ const DEFAULT_RETRY_BACKOFF_RATE: f64 = 2.0;
 /// computed time itself.
 const JITTER_STRATEGY_FULL: &str = "FULL";
 
-/// The members each executed state type may carry. A state that carries any other
-/// member is not executed: the member changes what the state does, and running the
-/// state while ignoring it would report an outcome the definition does not describe.
-///
-/// A `Task`'s members depend on WHICH work its `Resource` names, so the type alone
-/// does not decide them: this answers the ACTIVITY task's set, and
-/// [`INTEGRATION_TASK_MEMBERS`] the service-integration call's.
-/// [`unexecutable_member`] is what picks between the two.
-fn executable_members(state_type: &str) -> &'static [&'static str] {
-    match state_type {
-        "Pass" => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "InputPath",
-            "Parameters",
-            "Result",
-            "ResultPath",
-            "OutputPath",
-            "Next",
-            "End",
-        ],
-        "Wait" => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "InputPath",
-            "OutputPath",
-            "Seconds",
-            "SecondsPath",
-            "Timestamp",
-            "TimestampPath",
-            "Next",
-            "End",
-        ],
-        "Choice" => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "InputPath",
-            "OutputPath",
-            "Choices",
-            "Default",
-        ],
-        "Succeed" => &["Type", "Comment", "QueryLanguage", "InputPath", "OutputPath"],
-        "Fail" => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "Error",
-            "ErrorPath",
-            "Cause",
-            "CausePath",
-        ],
-        // An ACTIVITY task's own work is done by a worker, so the members below are
-        // the ones that decide what is scheduled for it, what the state does with the
-        // reply, and what happens when the task fails or runs out of time: a `Retry`
-        // re-schedules the task for its next attempt, which is a task a worker polls
-        // for exactly as the attempt before it was. `Catch` is deliberately absent:
-        // handing the failure to a catcher continues the walk from the catcher's
-        // `Next`, and a state after it may be a service integration whose call is made
-        // from the REQUEST the walk runs inside — a task the clock closes has no
-        // request around it, so a state that declares one is not run rather than run as
-        // though it declared none. `Credentials` is absent for the same reason it is on
-        // every other type: it changes who the invocation is made as.
-        "Task" => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "Resource",
-            "InputPath",
-            "Parameters",
-            "TimeoutSeconds",
-            "TimeoutSecondsPath",
-            "HeartbeatSeconds",
-            "HeartbeatSecondsPath",
-            "ResultSelector",
-            "ResultPath",
-            "OutputPath",
-            "Retry",
-            "Next",
-            "End",
-        ],
-        // `ResultWriter` is interpreted too: it WRITES an S3 dataset, and the manifest
-        // of result files it writes is written there for real
-        // ([`super::result_writer`]), as `ItemReader` and `ItemBatcher` are — the
-        // dataset is read from S3 ([`super::item_reader`]) and its items are grouped as
-        // declared ([`super::item_batcher`]).
-        "Map" => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "InputPath",
-            "Parameters",
-            "ItemReader",
-            "ItemBatcher",
-            "ItemSelector",
-            "ItemsPath",
-            "Items",
-            "ItemProcessor",
-            "Iterator",
-            "MaxConcurrency",
-            "MaxConcurrencyPath",
-            "ResultSelector",
-            "ResultWriter",
-            "ResultPath",
-            "OutputPath",
-            "Retry",
-            "Catch",
-            "ToleratedFailureCount",
-            "ToleratedFailureCountPath",
-            "ToleratedFailurePercentage",
-            "ToleratedFailurePercentagePath",
-            "Label",
-            "Next",
-            "End",
-        ],
-        "Parallel" => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "InputPath",
-            "Parameters",
-            "Branches",
-            "ResultSelector",
-            "ResultPath",
-            "OutputPath",
-            "Retry",
-            "Catch",
-            "Next",
-            "End",
-        ],
-        _ => &[],
-    }
-}
-
-/// The members a `Task` state whose `Resource` names a SERVICE INTEGRATION may
-/// carry: the ones that decide the request the call carries, what becomes of its
-/// answer, and how a failed call is handled.
-///
-/// `HeartbeatSeconds`/`HeartbeatSecondsPath` and `Credentials` are deliberately
-/// absent: a heartbeat is owed by an activity or a callback task, whose outcome
-/// arrives after the call this emulator makes ([`CALLBACK_TASK_MEMBERS`] is that
-/// task's own set), and `Credentials` asks for the call to be made under another
-/// role, which this emulator does not assume.
-const INTEGRATION_TASK_MEMBERS: &[&str] = &[
-    "Type",
-    "Comment",
-    "QueryLanguage",
-    "Resource",
-    "InputPath",
-    "Parameters",
-    "ResultSelector",
-    "ResultPath",
-    "OutputPath",
-    "Retry",
-    "Catch",
-    "TimeoutSeconds",
-    "TimeoutSecondsPath",
-    "Next",
-    "End",
-];
-
-/// The members a `Task` state asking for the callback (`.waitForTaskToken`) pattern
-/// may carry: an integration task's, plus the heartbeat this one CAN owe.
-///
-/// "If more time than the specified seconds elapses between heartbeats from the task,
-/// this state fails with a States.Timeout error name": the answer to a callback task
-/// comes from outside the execution, so the span between the `SendTaskHeartbeat`
-/// calls that report it still running is a span this pattern has — which the
-/// request-response form, finished by its own call, does not.
-const CALLBACK_TASK_MEMBERS: &[&str] = &[
-    "Type",
-    "Comment",
-    "QueryLanguage",
-    "Resource",
-    "InputPath",
-    "Parameters",
-    "ResultSelector",
-    "ResultPath",
-    "OutputPath",
-    "Retry",
-    "Catch",
-    "TimeoutSeconds",
-    "TimeoutSecondsPath",
-    "HeartbeatSeconds",
-    "HeartbeatSecondsPath",
-    "Next",
-    "End",
-];
-
-/// The members a `Task` state written in JSONata that asks for the callback pattern
-/// may carry: the JSONata integration task's, plus the same heartbeat bound.
-const JSONATA_CALLBACK_TASK_MEMBERS: &[&str] = &[
-    "Type",
-    "Comment",
-    "QueryLanguage",
-    "Assign",
-    "Output",
-    "Resource",
-    "Arguments",
-    "TimeoutSeconds",
-    "HeartbeatSeconds",
-    "Retry",
-    "Catch",
-    "Next",
-    "End",
-];
-
-/// The first member of `state` this emulator does not execute, if any.
-///
-/// `language` is the query language the state is written in, which decides WHICH set
-/// of data-flow members it may carry: a JSONata state reads and writes its data
-/// through the members of that language ([`jsonata_members`]) and a JSONPath one
-/// through the `*Path` family and the payload templates.
-fn unexecutable_member(
-    state_type: &str,
-    state: &Map<String, Value>,
-    language: &str,
-) -> Option<String> {
-    let resource = task_resource(state);
-    let activity = super::names_an_activity(resource);
-    // A callback task's work is answered from OUTSIDE the execution, so it carries
-    // the heartbeat bound neither of the other two kinds of integration task does.
-    let callback = state_type == "Task"
-        && !activity
-        && super::integration::asks_for_callback(resource);
-    let allowed = match (language, state_type) {
-        (JSONATA, "Task") if callback => JSONATA_CALLBACK_TASK_MEMBERS,
-        (JSONATA, _) => jsonata_members(state_type, activity),
-        (_, "Task") if callback => CALLBACK_TASK_MEMBERS,
-        // The two kinds of `Task` work carry different members, and the `Resource`
-        // is what says which kind this state is.
-        (_, "Task") if !activity => INTEGRATION_TASK_MEMBERS,
-        _ => executable_members(state_type),
-    };
-    state
-        .keys()
-        .find(|member| !allowed.contains(&member.as_str()))
-        .cloned()
-}
-
-/// The members a state written in JSONata may carry.
-///
-/// The language's own data-flow members replace JSONPath's: `Arguments` is the request
-/// a `Task` builds (`Parameters`), `Items` the array a `Map` iterates (`ItemsPath`),
-/// a `Choice` rule's `Condition` its test (`Variable` and the comparators) and
-/// `Output` what a state puts out (`ResultSelector`, `ResultPath`, `OutputPath`) —
-/// beside `Assign`, which every type may carry and which only this language has. The
-/// `*Path` family and the payload templates belong to the other language
-/// ([`JSONPATH_ONLY_MEMBERS`]), which is what a definition carrying one is refused
-/// for at create time.
-fn jsonata_members(state_type: &str, activity: bool) -> &'static [&'static str] {
-    match state_type {
-        "Pass" => &["Type", "Comment", "QueryLanguage", "Assign", "Output", "Next", "End"],
-        "Wait" => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "Assign",
-            "Output",
-            "Seconds",
-            "Timestamp",
-            "Next",
-            "End",
-        ],
-        "Choice" => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "Assign",
-            "Output",
-            "Choices",
-            "Default",
-        ],
-        "Succeed" => &["Type", "Comment", "QueryLanguage", "Assign", "Output"],
-        "Fail" => &["Type", "Comment", "QueryLanguage", "Error", "Cause"],
-        // An ACTIVITY task's work is a worker's, so it carries the heartbeat an
-        // integration call cannot owe and no `Catch` — the same split
-        // [`executable_members`] makes for the other language, for the same reasons.
-        "Task" if activity => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "Assign",
-            "Output",
-            "Resource",
-            "Arguments",
-            "TimeoutSeconds",
-            "HeartbeatSeconds",
-            "Retry",
-            "Next",
-            "End",
-        ],
-        "Task" => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "Assign",
-            "Output",
-            "Resource",
-            "Arguments",
-            "TimeoutSeconds",
-            "Retry",
-            "Catch",
-            "Next",
-            "End",
-        ],
-        "Map" => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "Assign",
-            "Output",
-            "Items",
-            "ItemReader",
-            "ItemBatcher",
-            "ItemSelector",
-            "ItemProcessor",
-            "Iterator",
-            "MaxConcurrency",
-            "ResultWriter",
-            "Retry",
-            "Catch",
-            "ToleratedFailureCount",
-            "ToleratedFailurePercentage",
-            "Label",
-            "Next",
-            "End",
-        ],
-        "Parallel" => &[
-            "Type",
-            "Comment",
-            "QueryLanguage",
-            "Assign",
-            "Output",
-            "Arguments",
-            "Branches",
-            "Retry",
-            "Catch",
-            "Next",
-            "End",
-        ],
-        _ => &[],
-    }
-}
-
 /// The `Resource` a `Task` state names, as the text the language writes it as — the
 /// empty string for a state that carries none, which names no work either way.
 fn task_resource(state: &Map<String, Value>) -> &str {
@@ -1627,14 +1310,15 @@ pub struct ActivityReply {
     pub entered_event_id: Option<i64>,
 }
 
-/// What a `SendTaskSuccess` or `SendTaskFailure` reported for the callback
-/// (`.waitForTaskToken`) task an execution is SUSPENDED at.
+/// What a `SendTaskSuccess`, a `SendTaskFailure` or the task's own CLOCK reported for
+/// the task an execution is SUSPENDED at — a callback (`.waitForTaskToken`) task, or the
+/// task of an ACTIVITY a worker claimed.
 ///
-/// The answer is the outcome of the state whose integration call carried the token,
-/// so the walk continues from that state with it: `Ok` is the `output` a success
-/// reported, which the state's own result-side data flow places, and `Err` the
-/// `error` and `cause` a failure reported, which the state's `Retry` and `Catch`
-/// answer for exactly as they answer for a call that failed.
+/// The answer is the outcome of the state the task belongs to, so the walk continues
+/// from that state with it: `Ok` is the `output` a success reported, which the state's
+/// own result-side data flow places, and `Err` the `error` and `cause` a failure
+/// reported — or the closure of the state's own bound — which the state's `Retry` and
+/// `Catch` answer for exactly as they answer for a call that failed.
 #[derive(Debug, Clone)]
 pub struct CallbackReply {
     /// The state whose call carried the token, which the stored task names.
@@ -1644,6 +1328,17 @@ pub struct CallbackReply {
     pub state_input: String,
     /// What the answer reported.
     pub outcome: Result<Value, Failure>,
+    /// Whether the task was closed by its own CLOCK rather than answered by a caller,
+    /// which is what the event the task's closure records reports
+    /// ([`Interpreter::activity_task_state`] writes the activity's timeout event for one
+    /// and its failure event for the other): the kind of closure is known where the reply
+    /// is built, so no reader infers it from the error name a caller could have chosen.
+    pub by_the_clock: bool,
+    /// The error names this outcome answers to BESIDE the one it carries, which a
+    /// retrier or a catcher is matched against too: empty for everything a caller
+    /// reported, and the second name the language states for a task whose HEARTBEAT
+    /// window lapsed ([`task_closure_errors`]).
+    pub also_answers: &'static [&'static str],
     /// How many attempts each retrier of that state had already spent on the task,
     /// as the stored task carries it ([`ScheduledActivity::retries_taken`]).
     ///
@@ -1750,14 +1445,23 @@ impl Failure {
     }
 
     /// The `{Error, Cause}` document a `Catch` hands to the state it transitions to.
+    ///
+    /// "When a state reports an error and it matches a catcher, the state's output is the
+    /// error output": that output is a JSON object with the fields `Error` and `Cause`, so
+    /// the `Cause` key is PRESENT whatever the failure reports in it — a bound that simply
+    /// ran out leaves nothing to report there ([`timed_out`]), which is the empty string
+    /// and not an absent key. The `cause` MEMBER of everything that projects a failure
+    /// (`DescribeExecution`'s output, a `TaskTimedOut`/`ActivityTimedOut` event's details)
+    /// is optional and stays absent for it: this is the document, not those members.
     fn payload(&self) -> Value {
         let mut object = Map::new();
         if let Some(error) = &self.error {
             object.insert("Error".to_string(), Value::String(error.clone()));
         }
-        if let Some(cause) = &self.cause {
-            object.insert("Cause".to_string(), Value::String(cause.clone()));
-        }
+        object.insert(
+            "Cause".to_string(),
+            Value::String(self.cause.clone().unwrap_or_default()),
+        );
         Value::Object(object)
     }
 }
@@ -3650,6 +3354,7 @@ impl Interpreter<'_> {
                 &raw,
                 &effective,
                 failure,
+                walk::NO_OTHER_ERRORS,
                 context,
                 end,
             ),
@@ -3985,21 +3690,24 @@ fn jitter_draw() -> u64 {
 }
 
 /// Which retrier of the `Task` state `state_name` of `definition` retries an activity
-/// task that failed with `error`, and how long after that failure its next attempt is
-/// due.
+/// task that failed, and how long after that failure its next attempt is due.
+///
+/// `errors` is every error name that failure answers to — one name for what a worker
+/// reported, and both names the language states for a closure of the task's clock
+/// ([`task_closure_errors`]).
 ///
 /// `taken` is how many attempts each retrier of that state has already spent on the
 /// task, in the order the state declares them. The answer is the FIRST retrier whose
-/// `ErrorEquals` names the error, exactly as a retried walk's is, so one rule decides
-/// every retry this service makes.
+/// `ErrorEquals` names one of those errors, exactly as a retried walk's is, so one rule
+/// decides every retry this service makes.
 ///
 /// `None` when the definition declares no such state, when the state declares no
 /// `Retry`, when no retrier names the error, or when the one that does has spent its
 /// `MaxAttempts`: the failure is then the state's own.
-pub fn activity_retry(
+pub fn activity_retry_any(
     definition: &str,
     state_name: &str,
-    error: &str,
+    errors: &[&str],
     taken: &[u64],
 ) -> Option<(usize, Duration)> {
     let document = serde_json::from_str::<Value>(definition).ok()?;
@@ -4013,7 +3721,7 @@ pub fn activity_retry(
         let Some(retrier) = retrier.as_object() else {
             continue;
         };
-        if !errors_match(retrier, error) {
+        if !errors_match_any(retrier, errors) {
             continue;
         }
         let max_attempts = retrier
@@ -4032,7 +3740,20 @@ pub fn activity_retry(
     None
 }
 
-/// Whether the state `state_name` of `definition` ANSWERS `error` ITSELF: a `Retry`
+/// Which retrier retries a task that failed with ONE error name: the whole of what a
+/// worker reports, and the one name every failure inside a walk carries
+/// ([`activity_retry_any`] is the same rule over the several names one closure of a
+/// task's clock answers to).
+pub fn activity_retry(
+    definition: &str,
+    state_name: &str,
+    error: &str,
+    taken: &[u64],
+) -> Option<(usize, Duration)> {
+    activity_retry_any(definition, state_name, &[error], taken)
+}
+
+/// Whether the state `state_name` of `definition` ANSWERS a failure ITSELF: a `Retry`
 /// whose retrier names it with an attempt left, or a `Catch` whose catcher names it.
 ///
 /// "Task states […] can have a field named Catch. […] When a state reports an error and
@@ -4041,19 +3762,29 @@ pub fn activity_retry(
 /// carries on at the catcher's `Next`. A state that answers neither way fails the
 /// execution with the error.
 ///
-/// `taken` is how many attempts each retrier of that state has already spent, read
-/// exactly as [`activity_retry`] reads it, and the matching is the one rule every
-/// retrier and catcher of this service is decided by ([`errors_match`]) — so this
-/// answers the same question the walk itself would, without walking.
+/// `errors` is every error name the failure answers to and `taken` how many attempts each
+/// retrier of that state has already spent, both read exactly as [`activity_retry`] reads
+/// them, and the matching is the one rule every retrier and catcher of this service is
+/// decided by ([`errors_match`]) — so this answers the same question the walk itself
+/// would, without walking.
 pub fn state_answers_error(
     definition: &str,
     state_name: &str,
-    error: &str,
+    errors: &[&str],
     taken: &[u64],
 ) -> bool {
-    if activity_retry(definition, state_name, error, taken).is_some() {
-        return true;
-    }
+    activity_retry_any(definition, state_name, errors, taken).is_some()
+        || state_catches_error(definition, state_name, errors)
+}
+
+/// Whether the state `state_name` of `definition` CATCHES a failure: a `Catch` whose
+/// catcher names any of `errors`.
+///
+/// The `Catch` half of [`state_answers_error`] on its own, for the caller that has
+/// already answered the `Retry` half itself: an activity task's next attempt is a task
+/// the store queues ([`super::ComAmazonawsSfnAwsstepfunctionsState::retry_failed_activity_task`]),
+/// so only a catcher's branch is left needing a walk.
+pub fn state_catches_error(definition: &str, state_name: &str, errors: &[&str]) -> bool {
     let Ok(document) = serde_json::from_str::<Value>(definition) else {
         return false;
     };
@@ -4068,7 +3799,14 @@ pub fn state_answers_error(
     retry_entries(state, "Catch")
         .iter()
         .filter_map(Value::as_object)
-        .any(|catcher| errors_match(catcher, error))
+        .any(|catcher| errors_match_any(catcher, errors))
+}
+
+/// Whether a retrier's or catcher's `ErrorEquals` names ANY of `errors`: the names one
+/// failure answers to, which is more than one where the language states more than one for
+/// it ([`task_closure_errors`]).
+pub(super) fn errors_match_any(entry: &Map<String, Value>, errors: &[&str]) -> bool {
+    errors.iter().any(|error| errors_match(entry, error))
 }
 
 /// Whether a retrier's or catcher's `ErrorEquals` names `error`.

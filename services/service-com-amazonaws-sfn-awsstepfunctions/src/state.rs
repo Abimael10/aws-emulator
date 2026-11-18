@@ -419,9 +419,16 @@ pub const EXECUTION_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
 /// How long after `DeleteStateMachine` the state machine is removed.
 ///
-/// EMULATOR-CHOSEN, for the same reason: `DeleteStateMachine` documents only that
-/// it "sets the state machine's status to DELETING and begins the deletion
-/// process", with no published duration.
+/// EMULATOR-CHOSEN: `DeleteStateMachine` documents only that it "sets the state machine's
+/// status to DELETING and begins the deletion process", with no published duration. It is
+/// deliberately non-zero, so a caller that reads the state machine straight after asking
+/// for its deletion still observes the DELETING status the operation documents.
+///
+/// It is also what everything WAITING for the deletion waits out, because every waiter
+/// waits for the RECORD to go: a caller polling `DescribeStateMachine`, and another
+/// service's provisioner polling that same read for a resource it deleted. A longer span
+/// is therefore not this service's decision alone — see the issue this fix carried the
+/// deletion window over to.
 pub const DELETE_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
@@ -1278,6 +1285,18 @@ impl ActivityTask {
         match (self.timeout_due_at(), self.heartbeat_due_at()) {
             (Some(timeout), Some(heartbeat)) => Some(timeout.min(heartbeat)),
             (timeout, heartbeat) => timeout.or(heartbeat),
+        }
+    }
+
+    /// Whether the bound that closes this task is its HEARTBEAT window rather than its
+    /// `TimeoutSeconds`, which decides the error names that closure answers to
+    /// ([`asl::task_closure_errors`]).
+    ///
+    /// `false` for a task no bound closes at all, which is closed by neither.
+    pub fn closed_by_heartbeat(&self) -> bool {
+        match (self.timeout_due_at(), self.heartbeat_due_at()) {
+            (Some(timeout), Some(heartbeat)) => heartbeat <= timeout,
+            (_, heartbeat) => heartbeat.is_some(),
         }
     }
 
@@ -2926,6 +2945,19 @@ pub fn activity_worker_limit_message(activity_arn: &str) -> String {
 // ---------------------------------------------------------------------------
 // Error messages
 // ---------------------------------------------------------------------------
+
+/// The message the version quota's refusal carries: the LIMIT it is about and the state
+/// machine that reached it, named as the request named it.
+///
+/// Worded here rather than through [`resource_error_message`] for the reason every other
+/// limit is: the subject is a quota rather than a value of the request. The state machine
+/// is named by its NAME — the field of the ARN the request carried — because that is what
+/// identifies it to the caller that drove the limit.
+pub fn version_limit_message(state_machine_name: &str) -> String {
+    format!(
+        "Limit on maximum number of versions for state machine {state_machine_name} reached"
+    )
+}
 
 /// The message a Step Functions client error carries: the CONDITION the error
 /// names, in spaced Title Case, then `: ` and the value of the request that

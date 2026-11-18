@@ -402,6 +402,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         state_name,
                         state_input,
                         outcome: Ok(result),
+                        // A caller answered it, and a success answers to no error name at
+                        // all.
+                        by_the_clock: false,
+                        also_answers: &[],
                         retries_taken,
                     }),
                 },

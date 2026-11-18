@@ -320,11 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PublishStateMachineVersionErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "'{}' already holds the {} versions a state machine may publish",
-                            input.state_machine_arn,
-                            crate::state::MAX_VERSIONS_PER_STATE_MACHINE
-                        )),
+                        message: Some(crate::state::version_limit_message(&parsed.name)),
                     },
                 )
                 .into(),

@@ -23,10 +23,13 @@
 //!    spent its `MaxAttempts`, the execution fails with that error and the cause the
 //!    failure carried, and a state whose retriers name another error is not retried at
 //!    all;
-//! 4. `Catch` on a state whose `Resource` is an activity is NOT interpreted: handing a
-//!    failure to a catcher continues the walk past the state, which a task the clock
-//!    closes has no request to make the states after it from, so such a state is not
-//!    run rather than run as though it declared no catcher.
+//! 4. a closure the scheduling state answers in BOTH ways is the retrier's first: the
+//!    attempt it queues is a task a worker claims exactly as the one before it was, and
+//!    the `Catch` takes the execution on only once that retrier has spent its
+//!    `MaxAttempts`;
+//! 5. `Credentials` on a state whose `Resource` is an activity is NOT interpreted: it
+//!    changes who the work is done as, so such a state is not run rather than run as
+//!    though it declared none.
 //!
 //! The harness (`Emulator`, `create_machine`, `start_execution`, `describe_execution`)
 //! is the one `state_machine_lifecycle` builds and the activity helpers are
@@ -565,16 +568,10 @@ async fn an_activity_state_carrying_a_member_this_emulator_does_not_interpret_is
     let emulator = Emulator::new();
 
     // (case, the member the state declares)
-    let cases: Vec<(&str, Value)> = vec![
-        (
-            "Catch, which continues the walk past the state",
-            json!({ "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "Recover" }] }),
-        ),
-        (
-            "Credentials, which changes who the work is done as",
-            json!({ "Credentials": { "RoleArn": "arn:aws:iam::000000000000:role/Other" } }),
-        ),
-    ];
+    let cases: Vec<(&str, Value)> = vec![(
+        "Credentials, which changes who the work is done as",
+        json!({ "Credentials": { "RoleArn": "arn:aws:iam::000000000000:role/Other" } }),
+    )];
 
     for (index, (case, member)) in cases.into_iter().enumerate() {
         let activity = create_activity(&emulator, &format!("declined-{index}")).await;
@@ -605,4 +602,68 @@ async fn an_activity_state_carrying_a_member_this_emulator_does_not_interpret_is
              task(s)"
         );
     }
+}
+
+/// A closure BOTH a retrier and a catcher of the scheduling state name is answered by the
+/// RETRIER first: the next attempt is a task a worker claims exactly as the one before it
+/// was, and only once that retrier has spent its `MaxAttempts` does the catcher take the
+/// execution on at its `Next` with the error output.
+///
+/// Every wait here is a poll waiting for the CONDITION: the second claim is the long poll
+/// itself, held open until the attempt the retrier queued is there to hand out.
+#[tokio::test]
+async fn a_retrier_answers_a_closure_before_a_catcher_does() {
+    let emulator = Emulator::new();
+    let activity = create_activity(&emulator, "retried-then-caught").await;
+    let definition = definition_with_a_recovery_state(
+        &activity,
+        json!({
+            "TimeoutSeconds": 1,
+            "Retry": [{ "ErrorEquals": [TIMEOUT_ERROR], "IntervalSeconds": 1, "MaxAttempts": 1 }],
+            "Catch": [{
+                "ErrorEquals": [TIMEOUT_ERROR],
+                "ResultPath": "$.caught",
+                "Next": "Recover",
+            }],
+        }),
+    );
+    let machine = create_machine(&emulator, "retried-then-caught-machine", &definition).await;
+    let execution = start_execution(&emulator, &machine, "only", "{}").await;
+
+    // The first attempt is claimed and then abandoned, so its bound lapses. The retrier
+    // answers that closure, so the execution is still running and the next attempt is
+    // queued for a worker — which is what this second poll is handed.
+    claimed(&emulator, "the first attempt", &activity, Some("w-1")).await;
+    claimed(
+        &emulator,
+        "the attempt the retrier queued",
+        &activity,
+        Some("w-2"),
+    )
+    .await;
+
+    // That attempt is abandoned too, and the retrier has no attempt left: the catcher
+    // takes over, so the execution ENDS at the catcher's branch rather than failing.
+    let described = describe_execution(&emulator, &execution).await;
+    let (status, error, cause) =
+        outcome_once(&emulator, "the caught closure", &execution, "SUCCEEDED").await;
+    assert_eq!(
+        (error.as_str(), cause.as_str()),
+        ("", ""),
+        "expected a caught closure to leave no error on the execution, got {status:?} {error:?} \
+         {cause:?} (before: {described:?})"
+    );
+    let settled = describe_execution(&emulator, &execution).await;
+    let output: Value = serde_json::from_str(
+        settled
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("expected an output in {settled:?}")),
+    )
+    .unwrap_or_else(|why| panic!("the output is JSON: {why}"));
+    assert_eq!(
+        output,
+        json!({ "caught": { "Error": TIMEOUT_ERROR, "Cause": "" } }),
+        "expected the error output at the catcher's ResultPath, got {output}"
+    );
 }

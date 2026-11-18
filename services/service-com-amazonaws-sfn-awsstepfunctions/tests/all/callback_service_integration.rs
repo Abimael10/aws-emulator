@@ -547,7 +547,9 @@ async fn an_answer_re_enters_the_states_own_data_flow() {
                 }],
             }),
             Some("WorkerSaidNo"),
-            json!({ "from": "the start", "why": { "Error": "WorkerSaidNo" } }),
+            // The error output is the `{Error, Cause}` document: a worker that reported
+            // no cause leaves the second key empty rather than absent.
+            json!({ "from": "the start", "why": { "Error": "WorkerSaidNo", "Cause": "" } }),
         ),
     ];
 

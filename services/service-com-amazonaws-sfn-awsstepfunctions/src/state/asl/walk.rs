@@ -955,32 +955,63 @@ impl Interpreter<'_> {
             .map_err(|failure| failure.at(at))?;
         self.push_entered("TaskStateEntered", name, at, raw);
         self.push("ActivityScheduled", name, at);
-        // A worker has already answered THIS state's task: the reply is that task's
-        // result — "the JSON output of the task" — so the state's own result-side data
-        // flow (`ResultSelector`, `ResultPath`, `OutputPath`) is applied to it and the
-        // walk carries on to the state's `Next`, instead of suspending again. The
-        // steps up to here are what the call that suspended the walk already recorded,
-        // which is what [`Resumed::index`] marks.
-        let replied = match &self.reply {
+        // Something has already CLOSED this state's task, so the walk applies that
+        // outcome here instead of suspending again: a worker's `SendTaskSuccess` is the
+        // task's result — "the JSON output of the task" — and a `SendTaskFailure`, or the
+        // closure of a bound the state declared, is the task's failure. The steps up to
+        // here are what the call that suspended the walk already recorded, which is what
+        // [`Resumed::index`] marks.
+        let succeeded = match &self.reply {
             Some(reply) if reply.state_name == name => self.reply.take(),
             _ => None,
         };
-        if let Some(reply) = replied {
+        let closed = match &self.callback_reply {
+            Some(reply) if reply.state_name == name => self.callback_reply.take(),
+            _ => None,
+        };
+        let answered = succeeded
+            .map(|reply| (Ok(reply.result), NO_OTHER_ERRORS, false))
+            .or_else(|| {
+                closed.map(|reply| (reply.outcome, reply.also_answers, reply.by_the_clock))
+            });
+        if let Some((outcome, also_answers, by_the_clock)) = answered {
             self.resumed = Some(Resumed {
                 index: self.steps.len(),
                 at,
             });
+            let result = match outcome {
+                Ok(result) => result,
+                // The failure is the `Task` state's own, so the state answers for it
+                // exactly as it answers for a failed integration call: the FIRST catcher
+                // of its `Catch` that names the error takes the execution on at its
+                // `Next` with the error output, and with none the failure is the
+                // execution's ([`Interpreter::catch_or_fail`]).
+                Err(failure) => {
+                    self.push_detailed(
+                        activity_closure(by_the_clock),
+                        name,
+                        at,
+                        super::super::EventDetails::of_failure(
+                            failure.error.clone(),
+                            failure.cause.clone(),
+                        ),
+                    );
+                    return self.catch_or_fail(
+                        (name, "TaskStateExited"),
+                        state,
+                        language,
+                        raw,
+                        &effective,
+                        failure,
+                        also_answers,
+                        context,
+                        at,
+                    );
+                }
+            };
             self.push("ActivitySucceeded", name, at);
             let value = self
-                .produced(
-                    state,
-                    language,
-                    raw,
-                    &effective,
-                    Some(reply.result),
-                    context,
-                    true,
-                )
+                .produced(state, language, raw, &effective, Some(result), context, true)
                 .map_err(|failure| failure.at(at))?;
             self.push_exited("TaskStateExited", name, at, &value);
             let next = self.next_of(state).map_err(|failure| failure.at(at))?;
@@ -1393,6 +1424,7 @@ impl Interpreter<'_> {
                     raw,
                     effective,
                     failure,
+                    NO_OTHER_ERRORS,
                     context,
                     at,
                 )
@@ -2371,6 +2403,7 @@ impl Interpreter<'_> {
                 &raw,
                 &effective,
                 failure,
+                NO_OTHER_ERRORS,
                 context,
                 end,
             ),
@@ -2524,6 +2557,7 @@ impl Interpreter<'_> {
                     &raw,
                     &effective,
                     failure,
+                    NO_OTHER_ERRORS,
                     context,
                     at,
                 );
@@ -2700,6 +2734,7 @@ impl Interpreter<'_> {
                 &raw,
                 &effective,
                 failure,
+                NO_OTHER_ERRORS,
                 context,
                 end,
             ),
@@ -3324,6 +3359,12 @@ impl Interpreter<'_> {
     ///
     /// `left` is the event the state records when a catcher takes over, so a caught
     /// state's history pairs the event it was entered with.
+    ///
+    /// `also_answers` is the error names this failure answers to beside the one it
+    /// carries ([`super::task_closure_errors`]), so a closure the language gives two
+    /// names is taken over by a catcher naming either — and, because the catchers are
+    /// scanned in the order the array declares them, by the FIRST catcher that names one
+    /// of them.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn catch_or_fail(
         &mut self,
@@ -3333,6 +3374,7 @@ impl Interpreter<'_> {
         raw: &Value,
         effective: &Value,
         failure: Failure,
+        also_answers: &[&str],
         context: &Value,
         at: Duration,
     ) -> Result<StateStep, Fault> {
@@ -3351,7 +3393,9 @@ impl Interpreter<'_> {
             let Some(catcher) = catcher.as_object() else {
                 continue;
             };
-            if !errors_match(catcher, failure.name()) {
+            if !errors_match(catcher, failure.name())
+                && !errors_match_any(catcher, also_answers)
+            {
                 continue;
             }
             let Some(next) = catcher.get("Next").and_then(Value::as_str) else {
@@ -3454,6 +3498,24 @@ fn member_path_value(
     expression(path, input, context).map_err(|failure| {
         member_path_diagnosis(member, path, failure.cause.unwrap_or_default())
     })
+}
+
+/// The error names a reply reports BESIDE the one its failure carries, for an outcome
+/// that answers to that one name alone: everything a caller reported.
+pub(super) const NO_OTHER_ERRORS: &[&str] = &[];
+
+/// The event an activity's task records for having been CLOSED without a result: the
+/// language's own timeout event where a bound the state declared ran out, and the
+/// activity's failure event for a failure a worker reported.
+///
+/// It is decided by WHICH of the two closed the task
+/// ([`super::CallbackReply::by_the_clock`]) and never by the error name, which a worker
+/// reporting a failure chooses.
+fn activity_closure(by_the_clock: bool) -> &'static str {
+    match by_the_clock {
+        true => super::super::EVENT_ACTIVITY_TIMED_OUT,
+        false => super::super::EVENT_ACTIVITY_FAILED,
+    }
 }
 
 /// Whether `event_type` is the event a STATE records for having failed.

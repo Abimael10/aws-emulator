@@ -419,12 +419,14 @@ async fn a_callback_bound_is_answered_by_the_states_own_error_handling() {
                 "case {case:?}: expected the error output to name {TIMEOUT_ERROR}, got {output:?}"
             );
             // The error output is the `{Error, Cause}` document of the failure the bound
-            // raised, and that failure carries no cause: the `Cause` member is absent
-            // from the document the catcher passes on, exactly as it is absent from the
-            // execution's own report.
-            assert!(
-                output.get("Cause").is_none(),
-                "case {case:?}: expected the error output to carry no Cause, got {output:?}"
+            // raised: both keys are there, and the bound that simply ran out leaves
+            // nothing to report in the second one — which is the empty string, not an
+            // absent key. The optional `cause` MEMBER of the execution's own report stays
+            // absent for it, because that is a member and this is the document.
+            assert_eq!(
+                output.get("Cause").and_then(Value::as_str),
+                Some(""),
+                "case {case:?}: expected the error output to carry an empty Cause, got {output:?}"
             );
         } else {
             assert_eq!(
