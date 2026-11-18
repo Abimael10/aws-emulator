@@ -4,7 +4,7 @@
 //! `<ErrorResponse>` carrying a `<RequestId>`, and a rejected `NextToken` is named in
 //! the `InvalidNextToken` message.
 //!
-//! Two rules are under test, neither of them per operation:
+//! Three rules are under test, none of them per operation:
 //!
 //! 1. an awsQuery error response is
 //!    `<ErrorResponse><Error><Type/><Code/><Message/></Error><RequestId/></ErrorResponse>`,
@@ -14,9 +14,16 @@
 //!    server-side records. The table below is therefore keyed on the CLASS of failure,
 //!    not on the operation, and each row names the status and wire code it expects as
 //!    well, so a row cannot pass by failing for a different reason.
-//! 2. a paginated read handed a cursor it never issued answers `InvalidNextToken` with a
+//! 2. EVERY problem with a request's ARGUMENTS is answered with HTTP 400, `<Type>Sender`
+//!    and the one error code this service names for that class, `ValidationError` — the
+//!    awsQuery common client error, because no operation of this service models an
+//!    input-validation fault. Whether the front door could READ the offending value or
+//!    not parts no answer: it is one bad-argument refusal to a client, which branches on
+//!    that one code. The table for it spans the operations, the member types and the
+//!    texts that reach the unreadable half of the class.
+//! 3. a paginated read handed a cursor it never issued answers `InvalidNextToken` with a
 //!    message BUILT FROM THE REQUEST: it quotes the rejected token back, because that is
-//!    the only thing that says which of a caller's cursors went stale. The second table
+//!    the only thing that says which of a caller's cursors went stale. The last table
 //!    spans the token forms a client can submit — every one `DescribeAutoScalingGroups`
 //!    does not issue. (`DescribeLaunchConfigurations` is not in that table: its token is
 //!    a start-after key, so no value is invalid and it answers a page instead of
@@ -47,9 +54,12 @@ struct ErrorCase {
 /// `awsQueryError` code (`InvalidNextToken`, `smithy_query(query="operation",
 /// operation="DescribeAutoScalingGroups")`), a handler refusal the `ValidationError`
 /// this service answers an unsatisfiable request with, the launch-configuration surface
-/// its `UnsupportedOperation`, a body the codec could not read `MalformedInput`, a value
-/// outside a declared set `ValidationError`, a scaffolded operation `NotImplemented`,
-/// and an `Action` naming no modelled operation `InvalidAction`.
+/// its `UnsupportedOperation`, a scaffolded operation `NotImplemented`, and an `Action`
+/// naming no modelled operation `InvalidAction`. EVERY problem with a request's
+/// arguments — a value outside a declared set, an absent required member and a value the
+/// codec could not read at all — answers the one `ValidationError`, which is this
+/// service's whole client-error vocabulary for that class (the second table below spans
+/// it).
 const ERROR_CASES: &[ErrorCase] = &[
     ErrorCase {
         case: "a modelled error: a NextToken the service never issued",
@@ -156,7 +166,7 @@ const ERROR_CASES: &[ErrorCase] = &[
             ("DesiredCapacity", "not-an-integer"),
         ],
         status: 400,
-        code: "MalformedInput",
+        code: "ValidationError",
     },
     ErrorCase {
         case: "a scaffolded operation, which answers the 501 channel",
@@ -281,6 +291,308 @@ async fn each_error_response_carries_its_own_request_id() {
         );
         seen.push(request_id);
     }
+}
+
+/// The one error code this service names for a problem with a request's arguments.
+///
+/// No operation of this service models an input-validation fault
+/// (`smithy_query(query="operation",operation="EnterStandby")` and
+/// `…="TerminateInstanceInAutoScalingGroup"` declare only the contention and
+/// activity-in-progress faults), so an argument problem is reported through the awsQuery
+/// common client error, and this is it.
+const ARGUMENT_REFUSAL_CODE: &str = "ValidationError";
+
+/// A text that is no value of the wire type the member it is sent for carries, so the
+/// front door cannot READ it at all.
+///
+/// One row per member TYPE a request of this service carries a scalar of — boolean,
+/// integer, double and timestamp — each at an operation that carries one, so the rule is
+/// exercised where each type is read rather than at one operation.
+struct UnreadableCase {
+    /// What class of value this row sends.
+    case: &'static str,
+    action: &'static str,
+    params: &'static [(&'static str, &'static str)],
+}
+
+/// The texts a BOOLEAN member cannot be read from, one per spelling a client gets wrong:
+/// a word of assent, the word in another case, and a word of neither value.
+///
+/// The two NUMERIC spellings of a boolean (`1`, `0`) are deliberately absent: they are
+/// values of the wire type (`service_common::query_boolean_values`), so a request
+/// spelling a boolean that way is not of this class at all.
+const UNREADABLE_BOOLEANS: &[(&str, &str)] = &[
+    ("a word of assent", "yes"),
+    ("the word in upper case", "TRUE"),
+    ("the word in title case", "False"),
+    ("a word of neither value", "notabool"),
+];
+
+/// One row of the boolean table: the operation, the boolean member an unreadable text is
+/// sent for, and whatever else the request needs beside it.
+type BooleanMember<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+/// Every operation of this service whose input carries a BOOLEAN member, with the member
+/// that boolean is sent as and whatever else the request needs beside it.
+///
+/// The members are the model's own
+/// (`smithy_query(query="operation",operation="<the operation>")`): one per operation, so
+/// one unreadable text is tried against each boolean the API reads.
+const BOOLEAN_MEMBERS: &[BooleanMember<'static>] = &[
+    (
+        "EnterStandby",
+        "ShouldDecrementDesiredCapacity",
+        &[
+            ("AutoScalingGroupName", "asg-arguments"),
+            ("InstanceIds.member.1", "i-0123456789abcdef0"),
+        ],
+    ),
+    (
+        "DetachInstances",
+        "ShouldDecrementDesiredCapacity",
+        &[
+            ("AutoScalingGroupName", "asg-arguments"),
+            ("InstanceIds.member.1", "i-0123456789abcdef0"),
+        ],
+    ),
+    (
+        "TerminateInstanceInAutoScalingGroup",
+        "ShouldDecrementDesiredCapacity",
+        &[("InstanceId", "i-0123456789abcdef0")],
+    ),
+    (
+        "SetInstanceHealth",
+        "ShouldRespectGracePeriod",
+        &[
+            ("InstanceId", "i-0123456789abcdef0"),
+            ("HealthStatus", "Unhealthy"),
+        ],
+    ),
+    (
+        "SetInstanceProtection",
+        "ProtectedFromScaleIn",
+        &[
+            ("AutoScalingGroupName", "asg-arguments"),
+            ("InstanceIds.member.1", "i-0123456789abcdef0"),
+        ],
+    ),
+    (
+        "DeleteAutoScalingGroup",
+        "ForceDelete",
+        &[("AutoScalingGroupName", "asg-arguments")],
+    ),
+    (
+        "CreateAutoScalingGroup",
+        "NewInstancesProtectedFromScaleIn",
+        &[
+            ("AutoScalingGroupName", "asg-new"),
+            LAUNCH_SOURCE,
+            ("MinSize", "0"),
+            ("MaxSize", "1"),
+            ("AvailabilityZones.member.1", "us-west-2a"),
+        ],
+    ),
+    (
+        "UpdateAutoScalingGroup",
+        "CapacityRebalance",
+        &[("AutoScalingGroupName", "asg-arguments")],
+    ),
+];
+
+/// The rows for every OTHER scalar type a request of this service carries.
+const UNREADABLE_SCALARS: &[UnreadableCase] = &[
+    UnreadableCase {
+        case: "an integer member whose text is no integer",
+        action: "SetDesiredCapacity",
+        params: &[
+            ("AutoScalingGroupName", "asg-arguments"),
+            ("DesiredCapacity", "not-an-integer"),
+        ],
+    },
+    UnreadableCase {
+        case: "an integer member whose text is a decimal",
+        action: "SetDesiredCapacity",
+        params: &[
+            ("AutoScalingGroupName", "asg-arguments"),
+            ("DesiredCapacity", "1.5"),
+        ],
+    },
+    UnreadableCase {
+        case: "a page size whose text is no integer",
+        action: "DescribeAutoScalingGroups",
+        params: &[("MaxRecords", "all-of-them")],
+    },
+    UnreadableCase {
+        case: "a double member whose text is no number",
+        action: "PutScalingPolicy",
+        params: &[
+            ("AutoScalingGroupName", "asg-arguments"),
+            ("PolicyName", "track"),
+            ("PolicyType", "TargetTrackingScaling"),
+            (
+                "TargetTrackingConfiguration.PredefinedMetricSpecification.\
+                 PredefinedMetricType",
+                "ASGAverageCPUUtilization",
+            ),
+            ("TargetTrackingConfiguration.TargetValue", "as-high-as-it-goes"),
+        ],
+    },
+    UnreadableCase {
+        case: "a timestamp member whose text is no instant",
+        action: "PutScheduledUpdateGroupAction",
+        params: &[
+            ("AutoScalingGroupName", "asg-arguments"),
+            ("ScheduledActionName", "scale-up"),
+            ("StartTime", "tomorrow"),
+            ("DesiredCapacity", "1"),
+        ],
+    },
+];
+
+/// The answer to an argument this service could not read: HTTP 400, `<Type>Sender`, the
+/// one argument-refusal code — never the framework's own code for a body it could not
+/// read — and a request id, with no reader's diagnostic in the envelope.
+fn assert_argument_refusal(case: &str, status: u16, body: &str) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with {body:?}"
+    );
+    assert_eq!(
+        (
+            tag_value(body, "Type").as_str(),
+            tag_value(body, "Code").as_str()
+        ),
+        ("Sender", ARGUMENT_REFUSAL_CODE),
+        "case {case:?}: expected a Sender {ARGUMENT_REFUSAL_CODE}, got {body:?}"
+    );
+    assert!(
+        !body.contains("MalformedInput"),
+        "case {case:?}: the answer must name no code outside this service's vocabulary, got \
+         {body:?}"
+    );
+    assert_eq!(
+        tag_value(body, "Message"),
+        "",
+        "case {case:?}: an unreadable value is stated with no message, got {body:?}"
+    );
+    let request_id = error_envelope_request_id(case, body);
+    assert_request_id_shape(case, &request_id);
+}
+
+/// Every BOOLEAN member the API reads, sent a text no boolean spells, answers the one
+/// argument-refusal code.
+#[tokio::test]
+async fn an_unreadable_boolean_answers_the_argument_refusal_code() {
+    let router = router_with(new_engine());
+
+    for (action, member, extra) in BOOLEAN_MEMBERS {
+        for (spelling, text) in UNREADABLE_BOOLEANS {
+            let case = format!("{action}.{member} carrying {spelling}");
+            let mut params: Vec<(&str, &str)> = vec![(member, text)];
+            params.extend_from_slice(extra);
+            let (status, body) = query(&router, action, &params).await;
+            assert_argument_refusal(&case, status, &body);
+        }
+    }
+}
+
+/// The same for every other scalar type a request carries, and for a request carrying
+/// SEVERAL unreadable values at once.
+#[tokio::test]
+async fn an_unreadable_value_of_any_type_answers_the_argument_refusal_code() {
+    let router = router_with(new_engine());
+
+    for case in UNREADABLE_SCALARS {
+        let (status, body) = query(&router, case.action, case.params).await;
+        assert_argument_refusal(case.case, status, &body);
+    }
+
+    let (status, body) = query(
+        &router,
+        "CreateAutoScalingGroup",
+        &[
+            ("AutoScalingGroupName", "asg-several"),
+            LAUNCH_SOURCE,
+            ("MinSize", "none"),
+            ("MaxSize", "1"),
+            ("NewInstancesProtectedFromScaleIn", "yes"),
+            ("AvailabilityZones.member.1", "us-west-2a"),
+        ],
+    )
+    .await;
+    assert_argument_refusal("a create carrying two unreadable values", status, &body);
+}
+
+/// The other half of the class is unmoved: a value the front door DID read and then
+/// refused keeps its own sentence under the same code, so the code says "your arguments
+/// are wrong" and the message still says what was wrong wherever there is one to state.
+#[tokio::test]
+async fn a_readable_argument_is_still_refused_with_its_own_sentence() {
+    let router = router_with(new_engine());
+
+    // (case, action, params) — an absent required member, a value outside a declared
+    // bound, a value outside an enum's set, and a refusal a handler raises.
+    let cases: [ActionCase<'_>; 4] = [
+        ("an absent required member", "SetDesiredCapacity", vec![]),
+        (
+            "a value outside a declared bound",
+            "DescribeAutoScalingGroups",
+            vec![("MaxRecords", "101")],
+        ),
+        (
+            "a value outside an enum's declared set",
+            "CreateAutoScalingGroup",
+            vec![
+                ("AutoScalingGroupName", "asg-bad-protection"),
+                LAUNCH_SOURCE,
+                ("MinSize", "0"),
+                ("MaxSize", "1"),
+                ("AvailabilityZones.member.1", "us-west-2a"),
+                ("DeletionProtection", "not-a-level"),
+            ],
+        ),
+        (
+            "a refusal a handler raises",
+            "DeleteAutoScalingGroup",
+            vec![("AutoScalingGroupName", "no-such-group")],
+        ),
+    ];
+
+    for (case, action, params) in cases {
+        let (status, body) = query(&router, action, &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body:?}"
+        );
+        assert_eq!(
+            tag_value(&body, "Code"),
+            ARGUMENT_REFUSAL_CODE,
+            "case {case:?}: expected <Code>{ARGUMENT_REFUSAL_CODE}</Code>, got {body:?}"
+        );
+        assert!(
+            !xml_unescape(&tag_value(&body, "Message")).is_empty(),
+            "case {case:?}: a value the service read is stated with a message, got {body:?}"
+        );
+    }
+
+    // And a request whose arguments are all readable and acceptable still succeeds.
+    let (status, body) = query(
+        &router,
+        "CreateAutoScalingGroup",
+        &[
+            ("AutoScalingGroupName", "asg-readable"),
+            LAUNCH_SOURCE,
+            ("MinSize", "0"),
+            ("MaxSize", "1"),
+            ("NewInstancesProtectedFromScaleIn", "true"),
+            ("AvailabilityZones.member.1", "us-west-2a"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a readable create must succeed, got {status} with {body:?}"
+    );
 }
 
 /// A refusal that depends on STORED state answers the same envelope: a duplicate create

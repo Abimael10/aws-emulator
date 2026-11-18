@@ -1196,3 +1196,135 @@ async fn a_page_size_outside_the_range_reports_the_bound_it_missed() {
         }
     }
 }
+
+/// The member path a target-tracking policy's predefined metric type is carried at, as a
+/// client spells it in the request.
+const PREDEFINED_METRIC_TYPE_PARAMETER: &str =
+    "TargetTrackingConfiguration.PredefinedMetricSpecification.PredefinedMetricType";
+
+/// The same member as a refusal names it: the path the validating walk reports, in the
+/// lowerCamel spelling every constraint clause of this protocol uses.
+const PREDEFINED_METRIC_TYPE_PATH: &str =
+    "targetTrackingConfiguration.predefinedMetricSpecification.predefinedMetricType";
+
+/// The predefined metric types the SERVICE publishes for that member, in the order it
+/// lists them.
+///
+/// SOURCE: the service's own refusal of a value outside the set. The model this emulator
+/// ships declares four of them (`smithy_query(query="shape",shape="MetricType")`); the
+/// service publishes five — the high-resolution CPU metric as well — and lists them in
+/// this order, which is neither the model's declaration order nor a sort of it.
+const PUBLISHED_METRIC_TYPES: &str = "ASGAverageCPUUtilization, ASGAverageNetworkOut, \
+                                      ASGAverageNetworkIn, \
+                                      ASGAverageCPUUtilizationHighResolution, \
+                                      ALBRequestCountPerTarget";
+
+/// The parameters of a target-tracking put whose predefined metric type is `metric_type`.
+fn target_tracking_put<'p>(
+    group: &'p str,
+    policy: &'p str,
+    metric_type: &'p str,
+) -> Vec<(&'p str, &'p str)> {
+    vec![
+        ("AutoScalingGroupName", group),
+        ("PolicyName", policy),
+        ("PolicyType", "TargetTrackingScaling"),
+        (PREDEFINED_METRIC_TYPE_PARAMETER, metric_type),
+        ("TargetTrackingConfiguration.TargetValue", "50"),
+    ]
+}
+
+/// A predefined metric type outside the set states the set the SERVICE publishes — the
+/// whole sentence, with the rejected value echoed from the request — and stores no policy.
+#[tokio::test]
+async fn a_predefined_metric_type_outside_the_set_states_the_published_set() {
+    let router = router_with(new_engine());
+    create_group(&router, "asg-metric-type").await;
+
+    // Values outside the set, differing in how they miss it: a name no metric type
+    // spells, a legal value in the wrong case, two legal values run together, and a
+    // metric type of another service's own enumeration.
+    for (case, rejected) in [
+        ("a value no metric type spells", "ASGBogusMetric"),
+        ("a legal value in the wrong case", "asgaveragecpuutilization"),
+        ("two legal values run together", "ASGAverageNetworkInOut"),
+        (
+            "a metric type of another service",
+            "ECSServiceAverageCPUUtilization",
+        ),
+    ] {
+        let params = target_tracking_put("asg-metric-type", "track", rejected);
+        let (status, body) = query(&router, "PutScalingPolicy", &params).await;
+        let (error_type, code, message) = refusal(&body);
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body:?}"
+        );
+        assert_eq!(
+            (error_type.as_str(), code.as_str()),
+            ("Sender", "ValidationError"),
+            "case {case:?}: expected a Sender ValidationError, got {body:?}"
+        );
+        let expected = format!(
+            "1 validation error detected: Value '{rejected}' at \
+             '{PREDEFINED_METRIC_TYPE_PATH}' failed to satisfy constraint: Member must \
+             satisfy enum value set: [{PUBLISHED_METRIC_TYPES}]"
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
+        );
+    }
+
+    // Nothing was stored by any of them.
+    let (status, body) = query(
+        &router,
+        "DescribePolicies",
+        &[("AutoScalingGroupName", "asg-metric-type")],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the read of the group's policies must succeed, got {status} with {body:?}"
+    );
+    assert_eq!(
+        tag_values(&body, "PolicyName"),
+        Vec::<String>::new(),
+        "a refused put must store no policy, got {body:?}"
+    );
+
+    // The controls: the metric types the model declares are accepted and read back, so
+    // the refusals above cannot pass by refusing every value.
+    for (case, accepted) in [
+        ("the CPU metric", "ASGAverageCPUUtilization"),
+        ("the inbound network metric", "ASGAverageNetworkIn"),
+        ("the outbound network metric", "ASGAverageNetworkOut"),
+    ] {
+        let policy = format!("track-{accepted}");
+        let params = target_tracking_put("asg-metric-type", &policy, accepted);
+        let (status, body) = query(&router, "PutScalingPolicy", &params).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body:?}"
+        );
+        let (status, body) = query(
+            &router,
+            "DescribePolicies",
+            &[
+                ("AutoScalingGroupName", "asg-metric-type"),
+                ("PolicyNames.member.1", policy.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reading the policy back expected HTTP 200, got {status} with \
+             {body:?}"
+        );
+        assert_eq!(
+            tag_values(&body, "PredefinedMetricType"),
+            vec![accepted.to_string()],
+            "case {case:?}: expected the stored policy to track {accepted:?}, got {body:?}"
+        );
+    }
+}

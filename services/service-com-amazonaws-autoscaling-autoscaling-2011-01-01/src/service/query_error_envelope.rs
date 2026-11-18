@@ -115,9 +115,10 @@ fn add_request_id(body: &str, request_id: &str) -> Option<String> {
 /// request id) is returned untouched, so the success path cannot be affected.
 pub fn with_request_id(resp: RtResponse) -> RtResponse {
     // The answer this service gives a request the framework could not READ is completed
-    // first: it carries no message, which is that module's business, not this one's
+    // first: it is restated under this service's one client-error code and carries no
+    // message, which is that module's business, not this one's
     // ([`crate::service::malformed_input`]).
-    let mut resp = crate::service::malformed_input::without_message(resp);
+    let mut resp = crate::service::malformed_input::restated(resp);
     let request_id = new_request_id();
     let rewritten = {
         // An error envelope is built in memory by its renderer, so the bytes are readable

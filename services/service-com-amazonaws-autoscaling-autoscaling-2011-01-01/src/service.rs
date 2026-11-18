@@ -60,9 +60,14 @@
 //! and the IAM policies in force on the principal it speaks for, not of the input any one
 //! operation reads, so it is decided once for every request this service serves rather
 //! than per handler.
+//!
+//! `override_refusal` is taken for one reason beyond the error code: the value set a
+//! refusal of an enumerated member STATES, and the order it lists it in, are the service's
+//! own rather than the model's ([`enum_value_sets`]).
 
 pub mod authorization;
 pub mod decimal_floats;
+pub mod enum_value_sets;
 pub mod malformed_input;
 pub mod query_error_envelope;
 
@@ -72,13 +77,19 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// The error code Amazon EC2 Auto Scaling answers every refusal of a value it READ with.
+/// The error code Amazon EC2 Auto Scaling answers every refusal of a request's ARGUMENTS
+/// with.
 ///
 /// One code for the whole class: a request whose values do not satisfy the rules the model
-/// declares, whichever rule and whichever member. The handlers in `src/ops/` answer it
-/// through `crate::scaffolded::Scaffolded::validation_error`, and the framework's own
-/// constraint walk answers it through [`EmulatedService::override_refusal`] below.
-const VALIDATION_ERROR_CODE: &str = "ValidationError";
+/// declares, whichever rule and whichever member — and a request whose values the front
+/// door could not read at all, which is the same bad-argument refusal to a caller. None of
+/// this service's operations models an input-validation fault, so this is the awsQuery
+/// common client error every one of them reports an argument problem through. The handlers
+/// in `src/ops/` answer it through `crate::scaffolded::Scaffolded::validation_error`, the
+/// framework's own constraint walk answers it through
+/// [`EmulatedService::override_refusal`] below, and a body the codec could not read answers
+/// it through [`malformed_input`].
+pub(crate) const VALIDATION_ERROR_CODE: &str = "ValidationError";
 
 /// The `com-amazonaws-autoscaling-autoscaling-2011-01-01` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -137,22 +148,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // Amazon EC2 Auto Scaling answers EVERY refusal of values it read with one error
-        // code: `ValidationError`. An absent required member is one of them — the recorded
-        // refusal of a request omitting `ShouldDecrementDesiredCapacity` carries that code
-        // — so the layer the framework distinguishes (a body it could not read at all
-        // against one it read and then refused) decides nothing about the code HERE: a
-        // client of this service branches on `ValidationError` for both.
+        // Amazon EC2 Auto Scaling answers EVERY problem with a request's arguments under
+        // one error code: `ValidationError`. An absent required member is one of them — the
+        // recorded refusal of a request omitting `ShouldDecrementDesiredCapacity` carries
+        // that code — so the layer the framework distinguishes (a body it could not read at
+        // all against one it read and then refused) decides nothing about the code: a
+        // client of this service branches on `ValidationError` for both, which is why the
+        // answer for the other layer is completed in [`malformed_input`] under this same
+        // code. This hook is called for the layer that WAS read.
         //
         // The message stays the framework's own: its constraint envelope
         // (`N validation error(s) detected: <clause>`) is the wording this service states
-        // such a refusal in, so it is rendered from the violations rather than reworded.
-        // The answer for a body that could not be read at all is completed in
-        // [`malformed_input`], which this hook is never called for.
+        // such a refusal in, so it is rendered from the violations rather than reworded —
+        // with one exception, which is a fact of the SERVICE rather than of the model: the
+        // value set a refusal of an enumerated member states, and the order it lists it in
+        // ([`enum_value_sets`]). That set is restated on the VIOLATION, so the clause, the
+        // member path and the echoed value stay with the framework.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_ERROR_CODE.to_string(),
-                message: aws_smithy_schema_server::envelope(violations)?,
+                message: aws_smithy_schema_server::envelope(&enum_value_sets::in_published_order(
+                    violations,
+                ))?,
             }),
             // An authentication refusal is not about the input at all, and the framework's
             // own code and wording for it are what AWS answers.
