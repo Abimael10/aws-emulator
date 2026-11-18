@@ -34,6 +34,9 @@ tracing = { workspace = true }
 # Name-based (v5) identifiers, for the opaque `categoryId` the catalog issues per taxonomy
 # category: the same identifier on every boot, derived from no display text.
 uuid = { version = "1", features = ["v5"] }
+# HTML escaping, for the stored catalog values written into the buyer-facing pages this
+# service serves at the addresses a SaaS fulfillment option publishes.
+html-escape = "0.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

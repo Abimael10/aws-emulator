@@ -63,10 +63,18 @@
 //!   request's own lists, and [`validation`] turns them into the sentence. `override_refusal`
 //!   states a refusal that reaches the centralized walk anyway through the SAME module, so
 //!   the wording lives in ONE place — it just has only the violations to state from.
+//! * [`saas_fulfillment_page`] — the one address this service serves that no modelled
+//!   operation describes: a buyer-facing page a SaaS fulfillment option publishes in
+//!   `fulfillmentUrl` / `launchUrl`, claimed in `can_handle` and answered from
+//!   `override_routing_error`, because such an address is opened by a browser rather than
+//!   called by an SDK.
 
 /// The per-request IAM decision every operation of this service takes before it reads any
 /// catalog record: `AccessDeniedException` is a service-common error of this model.
 pub mod authorization;
+/// The route that answers at the buyer-facing addresses a SaaS fulfillment option
+/// publishes, which no modelled operation describes.
+pub mod saas_fulfillment_page;
 /// How a request the framework's walk refused is WORDED.
 pub(crate) mod validation;
 
@@ -86,6 +94,10 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The shared engine, for the one address this service serves that no modelled
+    /// operation describes ([`saas_fulfillment_page`]): that answer is taken outside the
+    /// operation walk, so it reaches the store itself.
+    engine: Arc<Eng>,
     /// The same modelled operations the generated table holds, each wrapped in
     /// [`StatedPerOperation`] so a refused request is worded the way this service words it.
     /// Keyed by the routing key the protocol resolves — the key the generated table uses —
@@ -135,7 +147,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             search_listings::SearchListings,
         );
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
             stated,
         }
     }
@@ -246,12 +259,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // operations bind — every operation here is `POST /2026-02-05/<operation>`
         // (`OPERATIONS.md`) — which is what `claims_request` matches against the
         // generated `ROUTE_PATH_SEGMENTS` when a service declares no RPC protocol.
-        service_common::claims_request(
+        if service_common::claims_request(
             parts,
             self.entry.identity().signing_name(),
             crate::ROUTE_PATH_SEGMENTS,
             None,
-        )
+        ) {
+            return true;
+        }
+        // And a fetch of a buyer-facing page a SaaS fulfillment option publishes: the
+        // registration and launch addresses this service hands back in `fulfillmentUrl` and
+        // `launchUrl` are opened by whatever browser, probe or test holds them —
+        // anonymously, with no credential scope naming this service, only the path this
+        // service itself minted under the plane segment that is this service's alone. See
+        // [`saas_fulfillment_page`]: without this the router answers `404 UnknownService`
+        // for an address this service published.
+        saas_fulfillment_page::claimed(parts)
     }
 
     fn override_operation(
@@ -298,8 +321,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        //
+        // The ONE address this service serves that no modelled operation describes: a
+        // buyer-facing page of a stored SaaS fulfillment option, which `fulfillmentUrl` and
+        // `launchUrl` publish for a buyer to follow. It is answered here because the router
+        // consults this seam before it authenticates anything, which is how AWS serves the
+        // seller's own host — unauthenticated, and as a web page rather than a modelled API
+        // call.
+        saas_fulfillment_page::answer(&*self.engine, req)
     }
 
     fn override_framework_error(

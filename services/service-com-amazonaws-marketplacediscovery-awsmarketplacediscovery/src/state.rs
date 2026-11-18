@@ -29,6 +29,15 @@ use std::collections::BTreeMap;
 /// catalog and a facet-refined one alike continuable.
 mod taxonomy_rows;
 
+/// Where this emulator serves the buyer-facing pages a SaaS fulfillment option's record
+/// names, and the addresses it announces them at.
+mod saas_fulfillment;
+
+pub use saas_fulfillment::{
+    announced_page_base, saas_page_not_found_page, saas_page_path, saas_page_route, saas_page_url,
+    SaasPage, SaasServedPages, SAAS_FULFILLMENT_PLANE_SEGMENT, SAAS_PAGE_MEDIA_TYPE,
+};
+
 use crate::ops::types::{
     AmazonMachineImageEbsVolume, AmazonMachineImageFulfillmentOption,
     AmazonMachineImageOperatingSystem, AmazonMachineImageRecommendation,
@@ -280,6 +289,10 @@ fn set_usage_instructions(option: &mut FulfillmentOption, instructions: String) 
 pub struct FulfillmentOptionRecord {
     default: FulfillmentOption,
     translations: BTreeMap<String, FulfillmentOption>,
+    /// The buyer-facing pages this record names, which this emulator serves itself and
+    /// announces at its own endpoint ([`Self::announced`]). A record names none unless it
+    /// says so, so no address is published for an option the catalog holds no page for.
+    served_pages: SaasServedPages,
 }
 
 impl FulfillmentOptionRecord {
@@ -288,7 +301,16 @@ impl FulfillmentOptionRecord {
         Self {
             default: option,
             translations: BTreeMap::new(),
+            served_pages: SaasServedPages::default(),
         }
+    }
+
+    /// Record that this option's record names `pages`, the buyer-facing pages of it this
+    /// emulator serves.
+    #[must_use]
+    fn serving(mut self, pages: SaasServedPages) -> Self {
+        self.served_pages = pages;
+        self
     }
 
     /// Record `locale`'s translation of this option's usage instructions.
@@ -316,6 +338,30 @@ impl FulfillmentOptionRecord {
             .get(locale)
             .unwrap_or(&self.default)
             .clone()
+    }
+
+    /// This option in `locale` as it is ANNOUNCED to a caller that reached this emulator at
+    /// `endpoint_base`: the stored option with each buyer-facing page the record names
+    /// carried as the address this emulator serves that page at
+    /// ([`saas_page_url`]), and no such member at all for a record that names none.
+    ///
+    /// `fulfillmentUrl` and `launchUrl` are the two addresses a BUYER follows rather than
+    /// calls, so they have to lead back to this emulator; every other member is the stored
+    /// record's, unchanged.
+    pub fn announced(&self, locale: &str, endpoint_base: &str) -> FulfillmentOption {
+        let mut option = self.option(locale);
+        if let FulfillmentOption::saasFulfillmentOption(saas) = &mut option {
+            let id = saas.fulfillment_option_id.clone();
+            saas.fulfillment_url = self
+                .served_pages
+                .names(SaasPage::Registration)
+                .then(|| saas_page_url(endpoint_base, &id, SaasPage::Registration));
+            saas.launch_url = self
+                .served_pages
+                .names(SaasPage::Launch)
+                .then(|| saas_page_url(endpoint_base, &id, SaasPage::Launch));
+        }
+        option
     }
 
     /// The option's `fulfillmentOptionId`, which no translation changes.
@@ -480,13 +526,15 @@ impl Product {
     }
 
     /// This product's fulfillment options in `locale`, ordered by `fulfillmentOptionId`
-    /// so every page of `ListFulfillmentOptions` is cut from one stable total order.
-    pub fn fulfillment_options(&self, locale: &str) -> Vec<FulfillmentOption> {
+    /// so every page of `ListFulfillmentOptions` is cut from one stable total order, each
+    /// announced to a caller that reached this emulator at `endpoint_base`
+    /// ([`FulfillmentOptionRecord::announced`]).
+    pub fn fulfillment_options(&self, locale: &str, endpoint_base: &str) -> Vec<FulfillmentOption> {
         let mut records: Vec<&FulfillmentOptionRecord> = self.fulfillment_options.iter().collect();
         records.sort_by(|a, b| a.id().cmp(b.id()));
         records
             .into_iter()
-            .map(|record| record.option(locale))
+            .map(|record| record.announced(locale, endpoint_base))
             .collect()
     }
 
@@ -1945,16 +1993,20 @@ fn aws_service(service_type: &str, display_name: &str, description: &str) -> Aws
 }
 
 /// A SaaS fulfillment option: the seller hosts the software and the buyer reaches it over
-/// the web, so the option carries a registration URL rather than a version.
+/// the web, so the option carries buyer-facing pages rather than a version.
 ///
-/// `launchUrl` ("The URL that a buyer uses to launch the seller's SaaS product") is
-/// optional, so it is carried only for a record that has one.
+/// `pages` says WHICH of them this record names — `fulfillmentUrl` ("The URL of the
+/// seller's software registration landing page") and `launchUrl` ("The URL that a buyer uses
+/// to launch the seller's SaaS product") are both optional, and each is announced, at the
+/// address this emulator serves that page at, only for a record that names it
+/// ([`FulfillmentOptionRecord::announced`]). `usage_instructions` ("Instructions on how to
+/// access and use this SaaS product") is the seller's own text and likewise optional, so a
+/// record that states none carries none.
 fn saas_option(
     id: &str,
-    fulfillment_url: &str,
-    launch_url: Option<&str>,
+    pages: SaasServedPages,
     quick_launch: &str,
-    usage_instructions: &str,
+    usage_instructions: Option<&str>,
     available_from: i64,
 ) -> FulfillmentOptionRecord {
     FulfillmentOptionRecord::new(FulfillmentOption::saasFulfillmentOption(
@@ -1962,13 +2014,17 @@ fn saas_option(
             fulfillment_option_id: id.to_string(),
             fulfillment_option_type: "SAAS".to_string(),
             fulfillment_option_display_name: fulfillment_option_display_name("SAAS"),
-            fulfillment_url: Some(fulfillment_url.to_string()),
-            usage_instructions: Some(usage_instructions.to_string()),
+            // Both addresses are filled in where the option is announced, from the endpoint
+            // the request that reads it reached this emulator at: a page is served HERE, and
+            // the address it is served at is not known at seeding time.
+            fulfillment_url: None,
+            usage_instructions: usage_instructions.map(ToString::to_string),
             available_from_time: Some(datetime(available_from)),
-            launch_url: launch_url.map(ToString::to_string),
+            launch_url: None,
             quick_launch: quick_launch.to_string(),
         },
     ))
+    .serving(pages)
 }
 
 /// An API fulfillment option: the buyer calls the seller's API, so the option names the
@@ -2624,11 +2680,15 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             fulfillment_options: vec![
                 saas_option(
                     "fo-0001-analytics-saas",
-                    "https://example.com/acme/register",
-                    Some("https://example.com/acme/launch"),
+                    SaasServedPages {
+                        registration: true,
+                        launch: true,
+                    },
                     "ENABLED",
-                    "Register with your AWS account, then invite your analysts from the Acme \
-                     console.",
+                    Some(
+                        "Register with your AWS account, then invite your analysts from the \
+                         Acme console.",
+                    ),
                     year_ago,
                 )
                 .translate(
@@ -3317,11 +3377,15 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             fulfillment_options: vec![
                 saas_option(
                     "fo-0013-backup-saas",
-                    "https://example.com/vertex/register",
-                    Some("https://example.com/vertex/launch"),
+                    SaasServedPages {
+                        registration: true,
+                        launch: true,
+                    },
                     "DISABLED",
-                    "Grant the collector read-only access to your backup inventories, then \
-                     open the Vertex console.",
+                    Some(
+                        "Grant the collector read-only access to your backup inventories, \
+                         then open the Vertex console.",
+                    ),
                     month_ago,
                 ),
                 professional_services_option("fo-0014-backup-onboarding"),
@@ -3655,17 +3719,21 @@ fn fulfillment_option_for_type(
     available_from: i64,
 ) -> FulfillmentOptionRecord {
     match option_type {
-        // A derived row's record carries a registration URL and no launch URL, so it claims
-        // no quick-launch deployment: `quickLaunch` ("Specifies whether the SaaS product
-        // supports quick-launch deployment") is an attribute of the product, claimed only
-        // where the record states it, and `launchUrl` is the URL such a launch sends the
-        // buyer to.
+        // A derived row's record names the seller's registration landing page and no launch
+        // page, so it claims no quick-launch deployment: `quickLaunch` ("Specifies whether
+        // the SaaS product supports quick-launch deployment") is an attribute of the
+        // product, claimed only where the record states it, and `launchUrl` is the page such
+        // a launch sends the buyer to. The row seeds no seller-authored usage text either,
+        // so the option carries no `usageInstructions`: an optional member is emitted only
+        // where the record holds a value for it.
         "SAAS" => saas_option(
             id,
-            &format!("https://example.com/{slug}/register"),
-            None,
+            SaasServedPages {
+                registration: true,
+                launch: false,
+            },
             "DISABLED",
-            &format!("Subscribe, then open the {name} console."),
+            None,
             available_from,
         ),
         "API" => api_option(

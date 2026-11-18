@@ -16832,6 +16832,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "hex",
+ "html-escape",
  "http",
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",

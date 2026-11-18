@@ -19,6 +19,15 @@
 //!   ("The URL that a buyer uses to launch the seller's SaaS product") such a launch sends
 //!   the buyer to, and a listing's `QUICK_LAUNCH` badge appears exactly where one of its
 //!   products has such an option.
+//! * An address a fulfillment option PUBLISHES for a buyer to follow (a SaaS option's
+//!   `fulfillmentUrl` registration landing page and the `launchUrl` a launch uses) is served
+//!   by THIS emulator, on the endpoint the request that read it reached it at, and answers
+//!   there with the stored option — and an address of that shape naming a page no record
+//!   names is served as no page at all.
+//! * An optional member of an option is restated off the record: a SaaS option's
+//!   `usageInstructions` ("Instructions on how to access and use this SaaS product") is the
+//!   seller's own text, so a record that states none carries none rather than a sentence
+//!   composed from the product's name.
 //! * `Category$categoryId` is "The machine-readable identifier of the category" and
 //!   `displayName` "The human-readable name of the category", so the identifier is the
 //!   catalog's own opaque handle rather than a form of the name it renders: a client can
@@ -442,6 +451,445 @@ async fn a_category_is_named_by_an_opaque_identifier_that_round_trips_as_a_filte
         assert!(
             reported.contains(&id),
             "case {key}: the CATEGORY facet must report {id}, got {reported:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The addresses a SaaS fulfillment option publishes for a buyer to FOLLOW.
+// ---------------------------------------------------------------------------
+
+/// The endpoint bases this emulator can report as its own: the forms a data port is
+/// published at, plus the base of an emulator served on no port at all (embedded in another
+/// process, or a test). One row each, because an address an option publishes has to follow
+/// whichever one the request that read it reached this emulator at.
+const ENDPOINT_BASES: [&str; 4] = [
+    "https://127.0.0.1:9297",
+    "https://localhost:39355",
+    "https://[::1]:8443",
+    smithy_server_runtime::UNSERVED_URL_BASE,
+];
+
+/// Hosts this emulator does not answer on: the zones AWS publishes its own endpoints in, and
+/// the domain reserved for documentation examples. A published address may name none of them,
+/// because nothing serves a fetch of one.
+const UNSERVED_HOSTS: [&str; 4] = ["example.com", ".amazonaws.com", ".api.aws", ".on.aws"];
+
+/// The optional URL members of a SaaS option, with the last path segment of the address each
+/// one publishes.
+///
+/// Source: `smithy_query(query="shape",shape="SaasFulfillmentOption")` — `fulfillmentUrl`
+/// ("The URL of the seller's software registration landing page") and `launchUrl` ("The URL
+/// that a buyer uses to launch the seller's SaaS product"), both optional.
+const PUBLISHED_PAGES: [(&str, &str); 2] = [
+    ("fulfillmentUrl", "register"),
+    ("launchUrl", "launch"),
+];
+
+/// The path prefix every address this service publishes for a fulfillment option carries:
+/// the reserved namespace segment of a plane served at the emulator's own front door,
+/// followed by the segment naming this service's SaaS fulfillment plane.
+const PLANE_PREFIX: &str = "/_aws/marketplace-discovery-saas-fulfillment";
+
+/// A router whose `OperationContext::endpoint` is `base`, which is the address the pages a
+/// SaaS option publishes have to be announced on.
+fn router_served_at(base: &str) -> MultiServiceRouter {
+    let mut router = router();
+    router.set_url_base(
+        smithy_server_runtime::EndpointUrl::parse(base).expect("a base URL the router accepts"),
+    );
+    router
+}
+
+/// One page a client FETCHES: the status, the content type and the document.
+struct Page {
+    status: u16,
+    content_type: String,
+    body: String,
+}
+
+/// Fetch `url` the way a browser holding a published address does: no credential and no
+/// target header, just the address the option announced.
+async fn fetch(router: &MultiServiceRouter, method: &str, url: &str) -> Page {
+    let (host, path) = split_url(url);
+    let request = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", host)
+        .body(bytes::Bytes::new())
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    Page {
+        status: response.status().as_u16(),
+        content_type: response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+        body: String::from_utf8_lossy(response.body()).into_owned(),
+    }
+}
+
+/// The authority and the path of an absolute URL, which is how a client addresses it.
+fn split_url(url: &str) -> (String, String) {
+    let without_scheme = url.split_once("://").map_or(url, |(_scheme, rest)| rest);
+    match without_scheme.find('/') {
+        Some(at) => (
+            without_scheme[..at].to_string(),
+            without_scheme[at..].to_string(),
+        ),
+        None => (without_scheme.to_string(), "/".to_string()),
+    }
+}
+
+/// Every fulfillment option in the catalog, as `(productId, productName, option body)` with
+/// the union member it was served as.
+async fn catalog_options(router: &MultiServiceRouter) -> Vec<(String, String, String, Value)> {
+    let mut options = Vec::new();
+    for summary in whole_catalog(router).await {
+        for entity in array(&summary, "associatedEntities") {
+            let Some(product) = entity.get("product") else {
+                continue;
+            };
+            let product_id = text(product, "productId");
+            let product_name = text(product, "productName");
+            for option in options_of(router, &product_id).await {
+                let (member, body) = union_member(&product_id, &option);
+                options.push((product_id.clone(), product_name.clone(), member, body));
+            }
+        }
+    }
+    assert!(
+        !options.is_empty(),
+        "case setup: the seeded catalog must hold fulfillment options"
+    );
+    options
+}
+
+/// Every SaaS fulfillment option in the catalog, as `(productId, productName, option body)`.
+async fn saas_options(router: &MultiServiceRouter) -> Vec<(String, String, Value)> {
+    catalog_options(router)
+        .await
+        .into_iter()
+        .filter(|(_, _, member, _)| member == "saasFulfillmentOption")
+        .map(|(product_id, product_name, _, body)| (product_id, product_name, body))
+        .collect()
+}
+
+/// RULE: each buyer-facing page a SaaS option's record names is announced at the endpoint
+/// THIS emulator is served at, with the option's own id in the path, and a fetch of that
+/// address is answered here from the stored option; the address of a page the record does not
+/// name is announced by no member and is served as no page.
+#[tokio::test]
+async fn a_saas_option_publishes_each_page_its_record_names_on_this_emulators_endpoint() {
+    for base in ENDPOINT_BASES {
+        let router = router_served_at(base);
+        let options = saas_options(&router).await;
+        assert!(
+            !options.is_empty(),
+            "case {base:?}: the catalog must hold SaaS fulfillment options"
+        );
+
+        let mut announced = 0_usize;
+        let mut withheld = 0_usize;
+        for (product_id, _, option) in &options {
+            let option_id = text(option, "fulfillmentOptionId");
+            let quick_launch = text(option, "quickLaunch");
+            for (member, segment) in PUBLISHED_PAGES {
+                let address = format!("{base}{PLANE_PREFIX}/{option_id}/{segment}");
+                let Some(published) = option.get(member).and_then(Value::as_str) else {
+                    // The record names no such page, so no member announces one — and the
+                    // address it would have is served as nothing.
+                    let page = fetch(&router, "GET", &address).await;
+                    assert_eq!(
+                        page.status, 404,
+                        "case {base:?} {option_id} {member}: an address no record names must \
+                         be served as no page, got {} ({:?})",
+                        page.status, page.body
+                    );
+                    assert!(
+                        !page.body.contains(&option_id),
+                        "case {base:?} {option_id} {member}: a page nothing stands behind must \
+                         restate no record, got {:?}",
+                        page.body
+                    );
+                    withheld += 1;
+                    continue;
+                };
+                assert_eq!(
+                    published, address,
+                    "case {base:?} {option_id} {member}: expected the page published on this \
+                     emulator's own endpoint, got {published:?}"
+                );
+                for host in UNSERVED_HOSTS {
+                    assert!(
+                        !published.contains(host),
+                        "case {base:?} {option_id} {member}: a published address must name no \
+                         host this emulator does not serve, got {published:?}"
+                    );
+                }
+
+                let page = fetch(&router, "GET", published).await;
+                assert_eq!(
+                    page.status, 200,
+                    "case {base:?} {option_id} {member}: expected {published:?} to be served \
+                     here, got {} ({:?})",
+                    page.status, page.body
+                );
+                assert!(
+                    page.content_type.starts_with("text/html"),
+                    "case {base:?} {option_id} {member}: expected a buyer-facing page, got \
+                     content type {:?}",
+                    page.content_type
+                );
+                for stated in [option_id.as_str(), product_id.as_str(), quick_launch.as_str()] {
+                    assert!(
+                        page.body.contains(stated),
+                        "case {base:?} {option_id} {member}: expected the page to restate \
+                         {stated:?} off the record, got {:?}",
+                        page.body
+                    );
+                }
+
+                // What a client asks when it only wants to know the page is there.
+                let head = fetch(&router, "HEAD", published).await;
+                assert_eq!(
+                    (head.status, head.body.is_empty()),
+                    (200, true),
+                    "case {base:?} {option_id} {member}: expected a HEAD of {published:?} to \
+                     answer 200 with no body, got {} ({:?})",
+                    head.status,
+                    head.body
+                );
+                announced += 1;
+            }
+        }
+
+        assert!(
+            announced > 0 && withheld > 0,
+            "case {base:?}: the catalog must hold records that name a page and records that do \
+             not, so the presence of each member carries information, got {announced} announced \
+             and {withheld} withheld"
+        );
+    }
+}
+
+/// RULE: an optional text member of a fulfillment option is restated off the stored record,
+/// so it is emitted only where the record holds a value for it and is never composed at
+/// projection time from the product's own name.
+///
+/// Checked over every SaaS option in the catalog, which is where the catalog holds records
+/// both with and without the member: `usageInstructions` ("Instructions on how to access and
+/// use this SaaS product") is the seller's own text, so a record that states none carries
+/// none and a client branching on the member sees that.
+#[tokio::test]
+async fn a_fulfillment_option_carries_optional_text_only_where_its_record_states_it() {
+    let router = router();
+
+    let mut stated = 0_usize;
+    let mut absent = 0_usize;
+    for (product_id, product_name, option) in saas_options(&router).await {
+        let option_id = text(&option, "fulfillmentOptionId");
+        match option.get("usageInstructions") {
+            Some(value) => {
+                let instructions = value.as_str().unwrap_or_default();
+                assert!(
+                    !instructions.trim().is_empty(),
+                    "case {product_id} {option_id}: a member the record states must carry its \
+                     value, got {value}"
+                );
+                assert!(
+                    !instructions.contains(&product_name),
+                    "case {product_id} {option_id}: usageInstructions is the seller's own text, \
+                     not a sentence composed from the product name {product_name:?}, got \
+                     {instructions:?}"
+                );
+                stated += 1;
+            }
+            None => absent += 1,
+        }
+    }
+
+    assert!(
+        stated > 0 && absent > 0,
+        "case the whole catalog: both a record that states usage instructions and one that \
+         states none must stay reachable, so the presence of the member carries information, \
+         got {stated} stating and {absent} not"
+    );
+}
+
+/// RULE: only an address this service PUBLISHED is served as a buyer-facing page: an address
+/// of the same shape naming an option the catalog does not hold, an option of another
+/// fulfillment type, or no page at all is served as no page.
+#[tokio::test]
+async fn only_a_published_address_is_served_as_a_buyer_facing_page() {
+    let router = router();
+    let base = smithy_server_runtime::UNSERVED_URL_BASE;
+
+    let options = catalog_options(&router).await;
+    let saas_id = options
+        .iter()
+        .find(|(_, _, member, _)| member == "saasFulfillmentOption")
+        .map(|(_, _, _, option)| text(option, "fulfillmentOptionId"))
+        .expect("the catalog holds a SaaS fulfillment option");
+    let other_id = options
+        .iter()
+        .find(|(_, _, member, _)| member != "saasFulfillmentOption")
+        .map(|(_, _, _, option)| text(option, "fulfillmentOptionId"))
+        .expect("the catalog holds an option of another fulfillment type");
+
+    // One row per way an address can fail to name a page this service published.
+    let cases: Vec<(String, String)> = vec![
+        (
+            "an option this catalog does not hold".to_string(),
+            format!("{base}{PLANE_PREFIX}/fo-0000-no-such-option-saas/register"),
+        ),
+        (
+            "an option of another fulfillment type".to_string(),
+            format!("{base}{PLANE_PREFIX}/{other_id}/register"),
+        ),
+        (
+            "a page this service publishes for no option".to_string(),
+            format!("{base}{PLANE_PREFIX}/{saas_id}/manage"),
+        ),
+        (
+            "a path below a page, which is one document rather than a path space".to_string(),
+            format!("{base}{PLANE_PREFIX}/{saas_id}/register/terms"),
+        ),
+        (
+            "no option named at all".to_string(),
+            format!("{base}{PLANE_PREFIX}/register"),
+        ),
+    ];
+
+    for (case, address) in cases {
+        let page = fetch(&router, "GET", &address).await;
+        assert_ne!(
+            page.status, 200,
+            "case {case}: {address:?} names no page this service published, got {} ({:?})",
+            page.status, page.body
+        );
+        assert!(
+            !page.body.contains(&saas_id) && !page.body.contains(&other_id),
+            "case {case}: an answer for {address:?} must restate no record, got {:?}",
+            page.body
+        );
+    }
+
+    // And the address this service DID publish is still served, so the refusals above are
+    // the shape of the address rather than the route being unreachable.
+    let option = options
+        .iter()
+        .find(|(_, _, _, option)| text(option, "fulfillmentOptionId") == saas_id)
+        .map(|(_, _, _, option)| option.clone())
+        .expect("the SaaS option just read");
+    let published = option
+        .get("fulfillmentUrl")
+        .and_then(Value::as_str)
+        .expect("a SaaS record naming a registration page publishes it")
+        .to_string();
+    let page = fetch(&router, "GET", &published).await;
+    assert_eq!(
+        page.status, 200,
+        "case the published address {published:?}: expected it to be served here, got {} ({:?})",
+        page.status, page.body
+    );
+}
+
+/// The addresses a client can have DIALLED to reach this emulator, with whether that address
+/// is the emulator's own endpoint or a host AWS publishes its service endpoints at (which a
+/// client resolving AWS's own names reaches this emulator through).
+///
+/// One row each, because the page address a response publishes is the address the request
+/// that read it arrived on, so a client that dialled the emulator directly must be handed a
+/// URL it can dial again.
+const DIALLED_HOSTS: [(&str, bool); 4] = [
+    ("127.0.0.1:9297", true),
+    ("localhost:39355", true),
+    ("[::1]:8443", true),
+    ("discovery-marketplace.us-east-1.amazonaws.com", false),
+];
+
+/// Call `listFulfillmentOptions` as a client that dialled `host`: the address it resolved and
+/// reached this emulator at, carried both in the `Host` header and in the request URI.
+async fn options_dialled_at(
+    router: &MultiServiceRouter,
+    host: &str,
+    product_id: &str,
+) -> Vec<Value> {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{host}/2026-02-05/listFulfillmentOptions"))
+        .header("host", host)
+        .header("authorization", crate::catalog_drilldown::AUTHORIZATION)
+        .header("content-type", "application/json")
+        .body(bytes::Bytes::from(
+            json!({ "productId": product_id, "maxResults": 50 }).to_string(),
+        ))
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "case dialled {host}: expected HTTP 200, got {} ({:?})",
+        response.status().as_u16(),
+        String::from_utf8_lossy(response.body())
+    );
+    let body: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    array(&body, "fulfillmentOptions")
+}
+
+/// RULE: the address a published page is announced on is the one the request that read it
+/// reached this emulator at — the endpoint a client dialled directly, and otherwise the port
+/// this process is served on — so a client holding the URL can dial it again.
+#[tokio::test]
+async fn a_published_address_names_the_endpoint_the_request_reached_this_emulator_at() {
+    // The emulator is served on a port of its own, which is the address every other caller
+    // reaches it at.
+    let served = "https://127.0.0.1:9297";
+    let router = router_served_at(served);
+    let product_id = saas_options(&router)
+        .await
+        .first()
+        .map(|(product_id, _, _)| product_id.clone())
+        .expect("the catalog holds a product fulfilled as SaaS");
+
+    for (host, dialled_the_emulator) in DIALLED_HOSTS {
+        let expected_base = if dialled_the_emulator {
+            format!("https://{host}")
+        } else {
+            served.to_string()
+        };
+        let options = options_dialled_at(&router, host, &product_id).await;
+        let mut seen = 0_usize;
+        for option in options {
+            let (member, body) = union_member(&product_id, &option);
+            if member != "saasFulfillmentOption" {
+                continue;
+            }
+            let option_id = text(&body, "fulfillmentOptionId");
+            let published = body
+                .get("fulfillmentUrl")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                published,
+                format!("{expected_base}{PLANE_PREFIX}/{option_id}/register"),
+                "case dialled {host}: expected the page announced on the address the request \
+                 reached this emulator at, got {published:?}"
+            );
+            let page = fetch(&router, "GET", published).await;
+            assert_eq!(
+                page.status, 200,
+                "case dialled {host}: expected {published:?} to be served here, got {} ({:?})",
+                page.status, page.body
+            );
+            seen += 1;
+        }
+        assert!(
+            seen > 0,
+            "case dialled {host}: the product read must report its SaaS option"
         );
     }
 }
