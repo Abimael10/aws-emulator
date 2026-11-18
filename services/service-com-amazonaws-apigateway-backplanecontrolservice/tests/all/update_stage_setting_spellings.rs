@@ -165,8 +165,8 @@ async fn either_spelling_of_a_setting_writes_the_same_method_setting() {
         // One method path per spelling, so each row proves which setting the spelling
         // wrote rather than merely that something changed. The key is the method the
         // pointer addressed.
-        let published_key = format!("{member}-published/GET");
-        let member_key = format!("{member}-member/GET");
+        let published_key = format!("~1{member}-published/GET");
+        let member_key = format!("~1{member}-member/GET");
         for (spelling, path, key) in [
             (
                 published,
@@ -209,17 +209,21 @@ async fn a_setting_addressed_by_its_member_name_is_keyed_by_the_method_it_names(
     // the two-token spelling, so it is keyed the same way), and the `*/*` wildcard
     // `Stage$methodSettings` documents for every method of the stage.
     let cases: Vec<(&str, &str, &str)> = vec![
-        ("a child resource", "/~1pets/GET/metricsEnabled", "pets/GET"),
-        ("the root resource", "/~1/GET/metricsEnabled", "/GET"),
+        (
+            "a child resource",
+            "/~1pets/GET/metricsEnabled",
+            "~1pets/GET",
+        ),
+        ("the root resource", "/~1/GET/metricsEnabled", "~1/GET"),
         (
             "a nested resource path",
             "/~1pets~1{petId}/GET/metricsEnabled",
-            "pets/{petId}/GET",
+            "~1pets~1{petId}/GET",
         ),
         (
             "the whole method path in one token",
             "/~1pets~1POST/metricsEnabled",
-            "pets/POST",
+            "~1pets/POST",
         ),
         ("every method", "/*/*/metricsEnabled", "*/*"),
     ];

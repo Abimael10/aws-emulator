@@ -168,19 +168,24 @@ async fn a_table_created_without_an_index_reports_none() {
     );
 }
 
-/// The rows an index-lifecycle entry naming no index of the table is asserted over: how
-/// the name misses the names the table does carry.
+/// The rows an index-lifecycle entry naming no GLOBAL secondary index of the table is
+/// asserted over: how the name misses the names the table does carry.
 ///
 /// They differ along what the rule generalises over — a name nothing carries, the name of
 /// an index of ANOTHER kind on this very table (a local secondary index is not one
 /// `GlobalSecondaryIndexUpdates` names), the stored name in another case, and the stored
-/// name with one character added.
+/// name with one character added. The local secondary index is the one row that IS on the
+/// table, so a `Delete` of it breaks another rule than the lookup — see
+/// [`NOT_A_GLOBAL_SECONDARY_INDEX`].
 const ABSENT_INDEX_NAMES: &[(&str, &str)] = &[
     ("a name no index of the table carries", "by-nothing"),
     ("the name of a local secondary index", "by-rank"),
     ("the stored name in another case", "BY-OWNER"),
     ("the stored name with a trailing character", "by-ownerr"),
 ];
+
+/// The name of the row above that is an index of the table but not a global secondary one.
+const NOT_A_GLOBAL_SECONDARY_INDEX: &str = "by-rank";
 
 #[tokio::test]
 async fn an_index_lifecycle_entry_naming_no_index_of_the_table_is_refused_by_its_action() {
@@ -226,13 +231,13 @@ async fn an_index_lifecycle_entry_naming_no_index_of_the_table_is_refused_by_its
     );
     describe_when_active(&router, "create", table).await;
 
-    // The two actions that NAME an index, each refused in its own verb.
-    type Action = (&'static str, &'static str, fn(&str) -> Value);
+    // The two actions that NAME an index, each refused for the index it could not find.
+    type Action = (&'static str, fn(&str) -> Value);
     let actions: [Action; 2] = [
-        ("Delete", "delete", |index| {
+        ("Delete", |index| {
             json!({"Delete": {"IndexName": index}})
         }),
-        ("Update", "update", |index| {
+        ("Update", |index| {
             json!({"Update": {
                 "IndexName": index,
                 "ProvisionedThroughput": {"ReadCapacityUnits": 9, "WriteCapacityUnits": 9},
@@ -240,7 +245,7 @@ async fn an_index_lifecycle_entry_naming_no_index_of_the_table_is_refused_by_its
         }),
     ];
 
-    for (action, verb, build) in actions {
+    for (action, build) in actions {
         for (row, absent) in ABSENT_INDEX_NAMES {
             let case = format!("a {action} of {absent:?} ({row})");
             let (status, answered) = call(
@@ -252,16 +257,24 @@ async fn an_index_lifecycle_entry_naming_no_index_of_the_table_is_refused_by_its
                 }),
             )
             .await;
+            // A `Delete` of an index that IS on the table but is a LOCAL secondary one
+            // breaks the rule that this member acts on global secondary indexes only; every
+            // other row names no index of the table at all, which is the lookup miss.
+            let expected = if action == "Delete" && *absent == NOT_A_GLOBAL_SECONDARY_INDEX {
+                (
+                    "ValidationException".to_string(),
+                    format!("Cannot delete an index that is not a GlobalSecondaryIndex: {absent}"),
+                )
+            } else {
+                (
+                    "ResourceNotFoundException".to_string(),
+                    format!("Requested resource not found: Index {absent} for table {table}"),
+                )
+            };
             assert_eq!(
-                (status, error_code(&answered)),
-                (400, "ValidationException".to_string()),
-                "case {case:?}: expected the request defect, got {status} with {answered}"
-            );
-            assert_eq!(
-                message(&answered),
-                format!("Attempting to {verb} an index which does not exist: {absent}"),
-                "case {case:?}: got {}",
-                message(&answered)
+                (status, error_code(&answered), message(&answered)),
+                (400, expected.0.clone(), expected.1.clone()),
+                "case {case:?}: expected {expected:?}, got {status} with {answered}"
             );
         }
     }

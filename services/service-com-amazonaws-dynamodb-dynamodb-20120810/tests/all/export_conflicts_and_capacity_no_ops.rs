@@ -627,15 +627,15 @@ async fn provisioned_table(router: &MultiServiceRouter, name: &str) {
 }
 
 #[tokio::test]
-async fn an_index_lifecycle_action_naming_no_index_of_the_table_is_a_request_defect() {
+async fn an_index_lifecycle_action_naming_no_index_of_the_table_is_a_lookup_miss() {
     let router = emulator();
     provisioned_table(&router, "Lifecycle").await;
 
     // Rows differ in HOW the name misses: a name of its own, one differing only in case,
     // one with a trailing character, and the two actions that name an index — a
-    // `Delete` and an `Update`, each refused in its own verb.
+    // `Delete` and an `Update`, each answered for the index it could not find.
     let names = ["by-nothing", "byowner", "ByOwnerr", "ByOwner.2"];
-    // Which action names the index; the refusal states that action's verb.
+    // Which action names the index; the refusal names the index and the table either way.
     type Action = (&'static str, fn(&str) -> Value);
     let actions: [Action; 2] = [
         ("Delete", |index| json!({"Delete": {"IndexName": index}})),
@@ -664,15 +664,12 @@ async fn an_index_lifecycle_action_naming_no_index_of_the_table_is_a_request_def
             .await;
             assert_eq!(
                 (status, error_code(&answered).as_str()),
-                (400, "ValidationException"),
-                "case {case:?}: expected the request defect, got {status} with {answered}"
+                (400, "ResourceNotFoundException"),
+                "case {case:?}: expected the lookup miss, got {status} with {answered}"
             );
             assert_eq!(
                 message(&answered),
-                format!(
-                    "Attempting to {} an index which does not exist: {absent}",
-                    action.to_lowercase()
-                ),
+                format!("Requested resource not found: Index {absent} for table Lifecycle"),
                 "case {case:?}: got {}",
                 message(&answered)
             );

@@ -1660,17 +1660,28 @@ fn resolve_indexes(
             });
         }
         if let Some(delete) = &update.delete {
+            // A LOCAL secondary index is on the table but is not a global one, so this
+            // member cannot delete it: the index exists and the work does not
+            // ([`crate::state::cannot_delete_non_global_secondary_index`]), which is a
+            // different refusal from one that names nothing on the table at all.
+            if table
+                .local_secondary_indexes
+                .iter()
+                .any(|index| index.name == delete.index_name)
+            {
+                return Err(crate::state::cannot_delete_non_global_secondary_index(
+                    &delete.index_name,
+                ));
+            }
             let before = indexes.len();
             indexes.retain(|index| index.name != delete.index_name);
             if indexes.len() == before {
-                // The resource this call addresses is the TABLE, which was found: an
-                // entry naming an index the table does not carry asks for work on
-                // something that is not there, which is a defect of the REQUEST rather
-                // than a lookup miss ([`crate::state::lifecycle_index_not_found`]). The
-                // stored indexes are left exactly as they were, because `handle` writes
-                // nothing until this whole list resolves.
+                // An entry naming an index the table does not carry is a lookup miss on
+                // that index ([`crate::state::lifecycle_index_not_found`]). The stored
+                // indexes are left exactly as they were, because `handle` writes nothing
+                // until this whole list resolves.
                 return Err(crate::state::lifecycle_index_not_found(
-                    crate::state::IndexLifecycle::Delete,
+                    &table.name,
                     &delete.index_name,
                 ));
             }
@@ -1680,11 +1691,11 @@ fn resolve_indexes(
                 .iter_mut()
                 .find(|index| index.name == change.index_name)
             else {
-                // An `Update` names the index the same way a `Delete` does, so the defect
-                // is reported with the same sentence, in that entry's own verb: one
+                // An `Update` names the index the same way a `Delete` does, so an index
+                // the table does not carry is reported with the same sentence: one
                 // index-lifecycle surface, one wording.
                 return Err(crate::state::lifecycle_index_not_found(
-                    crate::state::IndexLifecycle::Update,
+                    &table.name,
                     &change.index_name,
                 ));
             };
@@ -1766,10 +1777,8 @@ fn resolve_indexes(
 /// The table's vector indexes after the update: every one a `Delete` names is gone, and
 /// every one a `Create` names is added, `CREATING` until the clock settles it `ACTIVE`.
 ///
-/// A `Delete` naming a vector index the table does not carry asks for work on something
-/// that is not there, which is a defect of the REQUEST rather than a lookup miss — the
-/// resource the call addresses is the table itself — so it is refused with the
-/// index-lifecycle surface's own sentence
+/// A `Delete` naming a vector index the table does not carry names a resource that is not
+/// there, so it is refused with the index-lifecycle surface's own sentence
 /// ([`crate::state::lifecycle_index_not_found`]), and because this resolves the whole list
 /// before `handle` writes anything, the stored indexes are left exactly as they were.
 ///
@@ -1810,7 +1819,7 @@ fn resolve_vector_indexes(
         indexes.retain(|index| index.name != delete.index_name);
         if indexes.len() == before {
             return Err(crate::state::lifecycle_index_not_found(
-                crate::state::IndexLifecycle::Delete,
+                &table.name,
                 &delete.index_name,
             ));
         }

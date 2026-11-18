@@ -29,10 +29,10 @@
 //!
 //! * the per-method settings. A method-setting path is the TWO reference tokens naming
 //!   the method followed by the setting it writes (`/~1pets/GET/metrics/enabled`), the
-//!   key being `{resource-path}/{HTTP-METHOD}` or `*/*` as `Stage$methodSettings`
-//!   documents — so a `/` inside the resource path is escaped `~1` in the PATH while the
-//!   separator before the HTTP method is a real one, the path's own LEADING separator is
-//!   either escaped too or left to the pointer's (`/pets/GET/…`, the spelling
+//!   key being `{escaped-resource-path}/{HTTP-METHOD}` or `*/*` as `Stage$methodSettings`
+//!   documents — so a `/` inside the resource path is escaped `~1` in the PATH and in the
+//!   KEY while the separator before the HTTP method is a real one, the path's own LEADING
+//!   separator is either escaped too or left to the pointer's (`/pets/GET/…`, the spelling
 //!   `MethodSetting$ResourcePath` states a path in), and a pointer that escapes the
 //!   separator before the method too names the method in ONE token instead. Every one of
 //!   those spellings addresses the one method, so every one is keyed under the one

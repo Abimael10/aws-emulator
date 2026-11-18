@@ -155,9 +155,10 @@ fn invalidation_refusal(req: &RtRequest, call: &resource_policy::Call<'_>) -> Ga
 /// every method of the stage, else none at all.
 ///
 /// A `methodSettings` key is the method path `Stage$methodSettings` documents —
-/// `{resource_path}/{http_method}` with the resource path's leading separator dropped — or
-/// [`EVERY_METHOD_SETTINGS_KEY`]. It is derived HERE from the deployed resource path and the
-/// verb through the one place that derives it ([`crate::state::method_settings_key`]), which
+/// `{resource_path}/{http_method}` with the resource path carried as one reference token, its
+/// separators escaped — or [`EVERY_METHOD_SETTINGS_KEY`]. It is derived HERE from the deployed
+/// resource path and the verb through the one place that derives it
+/// ([`crate::state::method_settings_key`]), which
 /// is also what `UpdateStage` stores by, so whichever spelling a patch addressed the method
 /// in, the setting it wrote is the setting resolved here. The whole-stage key is the
 /// fallback, which is what makes a `/*/*/caching/enabled` patch cache every method.

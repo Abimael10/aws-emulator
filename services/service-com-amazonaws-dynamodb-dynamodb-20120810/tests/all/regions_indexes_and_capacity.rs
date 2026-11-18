@@ -797,10 +797,9 @@ async fn update_table_moves_the_capacity_it_is_given() {
                     },
                 }],
             }),
-            // The resource the call addresses is the TABLE, which is there: an entry
-            // naming an index the table does not carry asks for work on something that is
-            // not there, which is a defect of the request.
-            "ValidationException",
+            // The entry names the index as a resource of the table, and the table carries
+            // no index by that name: a lookup miss on the index.
+            "ResourceNotFoundException",
         ),
         (
             "a capacity below the floor of 1",

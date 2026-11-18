@@ -3098,45 +3098,40 @@ pub fn index_not_found(table: &str, index: &str) -> RequestError {
     ))
 }
 
-/// Which lifecycle action an `UpdateTable` entry asked for on an index the table does
-/// not carry — the verb its refusal names ([`lifecycle_index_not_found`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexLifecycle {
-    /// A `Delete` entry: the index is to be removed.
-    Delete,
-    /// An `Update` entry: the index's own settings are to be moved.
-    Update,
-}
-
-impl IndexLifecycle {
-    /// The verb the refusal states this action with.
-    fn verb(self) -> &'static str {
-        match self {
-            Self::Delete => "delete",
-            Self::Update => "update",
-        }
-    }
-}
-
 /// How the INDEX-LIFECYCLE surface refuses an action naming an index the addressed table
 /// does not carry.
 ///
-/// `UpdateTable` does not ADDRESS an index as the resource it reads — the resource it
-/// addresses is the TABLE, which was found — so an entry naming an index the table does
-/// not carry describes work the request cannot ask for rather than a resource that is
-/// missing: it is a request defect, answered as a `ValidationException`, and the sentence
-/// names the ACTION that was attempted and the index it named, and nothing of the table
-/// (the caller addressed the table itself, so the refusal does not report it back).
-/// `UpdateTable`'s secondary-index and vector-index entries share it, for either action:
-/// one index-lifecycle surface, one sentence, with the verb read off the entry.
+/// An `UpdateTable` entry that updates or deletes an index names a resource of the table:
+/// "the operation tried to access a nonexistent table or index" (the
+/// `ResourceNotFoundException` doc), and `UpdateTable` models that error, so an entry naming
+/// an index that is not on the table is a lookup MISS rather than a request defect — the
+/// caller's not-found branch is what answers a typo'd or already-deleted index. The sentence
+/// names both halves of the selector, the index and the table the request carried.
 ///
-/// The surfaces that ADDRESS an index as their resource — a read served through one, a
-/// describe of one — keep the control plane's lookup miss ([`index_not_found`]), because
-/// there the index IS the resource the request could not find.
-pub fn lifecycle_index_not_found(action: IndexLifecycle, index: &str) -> RequestError {
+/// `UpdateTable`'s secondary-index and vector-index entries share it, for either action: one
+/// index-lifecycle surface, one sentence, because one index that is not there is one missing
+/// resource whichever member named it. Recorded behaviour for the wording: the fixed text
+/// around the two names the request carried.
+pub fn lifecycle_index_not_found(table: &str, index: &str) -> RequestError {
+    RequestError::NotFound(format!(
+        "Requested resource not found: Index {index} for table {table}"
+    ))
+}
+
+/// How a `GlobalSecondaryIndexUpdates` `Delete` naming an index that IS on the table but is
+/// a LOCAL secondary index is refused.
+///
+/// A local secondary index "is created at the same time that you create a table" and cannot
+/// be added or removed afterwards, so the member that deletes GLOBAL secondary indexes
+/// cannot act on it: the index exists, the work asked for does not, which is a defect of the
+/// request (`ValidationException`) rather than a missing resource, and the sentence states
+/// which rule the named index broke. Recorded behaviour for the wording: fixed text with the
+/// index name the request carried, and it is what tells this refusal apart from the
+/// lookup miss above, which the same member answers for a name the table has no index of at
+/// all ([`lifecycle_index_not_found`]).
+pub fn cannot_delete_non_global_secondary_index(index: &str) -> RequestError {
     RequestError::Validation(format!(
-        "Attempting to {} an index which does not exist: {index}",
-        action.verb()
+        "Cannot delete an index that is not a GlobalSecondaryIndex: {index}"
     ))
 }
 

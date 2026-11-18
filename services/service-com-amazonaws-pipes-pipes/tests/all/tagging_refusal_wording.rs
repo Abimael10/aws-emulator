@@ -10,20 +10,22 @@
 //! * a value outside a bound the MODEL publishes (`TagKey`'s `@length(min: 1, max: 128)`,
 //!   `TagValue`'s `@length(min: 0, max: 256)`) is refused with the request-validation
 //!   sentence — the member the value arrived on, that member's value echoed, and both
-//!   published bounds — and that sentence is the WHOLE message a client reads: nothing is
-//!   wrapped around it, so it does not parse as a JSON document, and nothing of it is
+//!   published bounds — and that sentence arrives as the JSON document this error class
+//!   carries, the sentence under a `message` member, so a client that parses the message
+//!   gets a document and reads the sentence out of it; nothing of the sentence is
 //!   re-escaped, so the apostrophes it quotes a value and a member name with arrive as
 //!   apostrophes;
 //! * a rule the model expresses NOWHERE (the prefix AWS reserves for its own tags, the
 //!   documented tag character set) has no validation sentence: the message is the fixed
-//!   documented sentence itself, which interpolates nothing from the request;
+//!   documented sentence itself, stated bare — no document around it — and it interpolates
+//!   nothing from the request;
 //! * the two bounds of one `@length` can be owned by different layers, and then they
 //!   answer different codes: a key named for removal that is past `TagKey`'s MAXIMUM is the
-//!   tagging layer's `BadRequestException` carrying that sentence, while one that breaks
+//!   tagging layer's `BadRequestException` carrying that document, while one that breaks
 //!   its MINIMUM is the `ValidationException` the operation models, naming the member alone
 //!   — because a `@httpQuery` value that arrived empty never became a parameter at all.
 //!
-//! The one message of this service that IS a JSON document is the `ValidationException` it
+//! The other message of this service that is a JSON document is the `ValidationException` it
 //! models for its own refusals (a `ValidationErrorFields` array), which
 //! [`the_modelled_validation_exception_keeps_its_document`] holds in place.
 //!
@@ -41,7 +43,8 @@ use crate::pipe_tagging::{
     assert_tags_agree, create_body, pipe_arn, tag, tag_map, untag, TAG_MUTATION_STATUS,
 };
 use crate::tag_key_rules::{
-    elided, one_tag, shown, tags_of, CHARACTER_SET_SENTENCE, RESERVED_PREFIX_SENTENCE,
+    elided, one_tag, shown, tags_of, validation_document, CHARACTER_SET_SENTENCE,
+    RESERVED_PREFIX_SENTENCE,
 };
 
 /// `TagKey`'s published bounds and `TagValue`'s. Source: the `TagKey` and `TagValue`
@@ -80,11 +83,28 @@ fn stored() -> Value {
 }
 
 /// Whether `message` is a JSON document rather than the prose sentence a refusal states.
-/// A tag-rule refusal's message is the sentence, so a document is the defect this suite
-/// pins against; the modelled `ValidationException`'s message IS one, which is what
-/// [`the_modelled_validation_exception_keeps_its_document`] asserts with the same reading.
+/// A constraint-validation refusal's message IS one, carrying the sentence under its
+/// `message` member ([`document`]) with the apostrophes it quotes with escaped, so a client
+/// unescapes those before parsing it; an unmodelled rule's message is the bare sentence,
+/// which is what [`an_unmodelled_tag_rule_is_refused_with_its_fixed_sentence`] pins.
 fn is_a_json_document(message: &str) -> bool {
-    serde_json::from_str::<Value>(message).is_ok_and(|parsed| parsed.is_object())
+    serde_json::from_str::<Value>(&message.replace("\\'", "'"))
+        .is_ok_and(|parsed| parsed.is_object())
+}
+
+/// The message a constraint-validation refusal carries for `sentence`: the document this
+/// error class words such a refusal as, with the sentence under its `message` member.
+fn document(sentence: &str) -> String {
+    validation_document(sentence)
+}
+
+/// The sentence a refusal's message document carries, or the message itself when it is no
+/// document — what a client that unescapes the document's quotes and parses it reads.
+fn carried_sentence(message: &str) -> String {
+    serde_json::from_str::<Value>(&message.replace("\\'", "'"))
+        .ok()
+        .and_then(|parsed| parsed["message"].as_str().map(str::to_string))
+        .unwrap_or_else(|| message.to_string())
 }
 
 /// Which published `@length` a row breaks, and the constraint class request validation
@@ -173,9 +193,10 @@ async fn assert_nothing_changed(
 }
 
 /// RULE: a tag value outside a bound the model publishes is refused with 400
-/// `BadRequestException` whose message is the request-validation sentence ITSELF — the
-/// member the value arrived on, that member's value, and both published bounds, with
-/// nothing wrapped around it and nothing of it re-escaped — and nothing is stored.
+/// `BadRequestException` whose message is the JSON document this error class carries — the
+/// request-validation sentence (the member the value arrived on, that member's value, and
+/// both published bounds) under the document's `message` member, with nothing of the
+/// sentence re-escaped — and nothing is stored.
 ///
 /// The rows span what the rule generalises over: which bound was broken (`TagKey`'s
 /// maximum and its minimum, `TagValue`'s maximum), by how much (one character past, far
@@ -321,22 +342,30 @@ async fn a_bound_outside_the_model_is_refused_with_the_validation_sentence() {
         );
 
         let sentence = bound.sentence(member, &echoed);
-        // The sentence is the message, byte for byte...
+        // The document is the message, byte for byte...
         assert_eq!(
             reply.message(),
-            sentence,
-            "case {case:?}: expected the validation sentence {sentence:?}, got {reply:?}"
+            document(&sentence),
+            "case {case:?}: expected the validation sentence {sentence:?} inside the \
+             message document, got {reply:?}"
         );
-        // ...so a client reads prose rather than a document it has to unwrap, and the
-        // apostrophes the sentence quotes with are not escaped again.
+        // ...so a client that parses the message gets a document and reads the sentence out
+        // of it, and the apostrophes the sentence quotes with are not escaped again.
         assert!(
-            !is_a_json_document(&reply.message()),
-            "case {case:?}: the message must be the sentence, not a JSON document, got {:?}",
+            is_a_json_document(&reply.message()),
+            "case {case:?}: the message must be the document that carries the sentence, got {:?}",
+            reply.message()
+        );
+        assert_eq!(
+            carried_sentence(&reply.message()),
+            sentence,
+            "case {case:?}: expected the document to carry {sentence:?}, got {:?}",
             reply.message()
         );
         assert!(
-            !reply.message().contains("\\'"),
-            "case {case:?}: the sentence's apostrophes must arrive unescaped, got {:?}",
+            !carried_sentence(&reply.message()).contains("\\'"),
+            "case {case:?}: the sentence the document carries must quote with plain \
+             apostrophes, got {:?}",
             reply.message()
         );
 
@@ -345,10 +374,10 @@ async fn a_bound_outside_the_model_is_refused_with_the_validation_sentence() {
 }
 
 /// RULE, pinned ONCE with nothing shared with the code that builds it: the whole message a
-/// refused tag carries, spelled out literally — the count, the echoed map, the member and
-/// both bounds, and not one character more — so an error in the wording cannot be mirrored
-/// in the expectation that checks it. The key's length is this one row's example; the table
-/// above is what spans the class.
+/// refused tag carries, spelled out literally — the document, the count, the echoed map, the
+/// member and both bounds, and not one character more — so an error in the wording cannot be
+/// mirrored in the expectation that checks it. The key's length is this one row's example;
+/// the table above is what spans the class.
 #[tokio::test]
 async fn the_bytes_of_one_refusal_are_spelled_out_whole() {
     let router = router();
@@ -369,15 +398,103 @@ async fn the_bytes_of_one_refusal_are_spelled_out_whole() {
     assert_eq!(
         reply.message(),
         format!(
-            "1 validation error detected: Value '{{{key}=irrelevant}}' at 'addedTags' \
-             failed to satisfy constraint: Map keys must satisfy constraint: [Member must \
-             have length less than or equal to 128, Member must have length greater than \
-             or equal to 1]"
+            "{{\"message\": \"1 validation error detected: Value \\'{{{key}=irrelevant}}\\' \
+             at \\'addedTags\\' failed to satisfy constraint: Map keys must satisfy \
+             constraint: [Member must have length less than or equal to 128, Member must \
+             have length greater than or equal to 1]\"}}"
         ),
-        "the refusal's bytes must be the validation sentence itself, got {reply:?}"
+        "the refusal's bytes must be the document carrying the validation sentence, got {reply:?}"
     );
 
     assert_tags_agree(&router, "nothing-stored", name, &tag_map(&stored())).await;
+}
+
+/// RULE: the message of EVERY constraint-validation refusal of the tagging surface parses as
+/// the document this error class carries, and the sentence a client reads is the one under
+/// its `message` member — whichever member the value arrived on and whichever collection's
+/// bound it broke.
+///
+/// The rows span each validated tag member of the surface: the map a `TagResource` merges
+/// (its keys), the map a `CreatePipe` carries (its values), and the key list an
+/// `UntagResource` names (its members). What they add to the table above is that the message
+/// is READ as a document — parsed, with the sentence taken out of it — rather than compared
+/// to one built the same way the service builds it.
+#[tokio::test]
+async fn every_constraint_validated_tag_member_carries_the_sentence_in_a_document() {
+    let router = router();
+
+    let past_key = "k".repeat(MAX_TAG_KEY_LEN + 1);
+    let past_value = "v".repeat(MAX_TAG_VALUE_LEN + 1);
+    let key_bounds = format!(
+        "[Member must have length less than or equal to {MAX_TAG_KEY_LEN}, \
+         Member must have length greater than or equal to {MIN_TAG_KEY_LEN}]"
+    );
+
+    // (the case, the write, the member the carried sentence must name, the constraint class
+    // it must state, the bracketed bounds it must list).
+    let rows: Vec<(&str, Write, &str, &str, String)> = vec![
+        (
+            "merge-a-key-past-its-bound",
+            Write::Merge(one_tag(&past_key, "irrelevant")),
+            ADDED_TAGS,
+            "Map keys must satisfy constraint:",
+            key_bounds.clone(),
+        ),
+        (
+            "create-with-a-value-past-its-bound",
+            Write::Create(one_tag("env", &past_value)),
+            MODEL_TAGS,
+            "Map value must satisfy constraint:",
+            format!(
+                "[Member must have length less than or equal to {MAX_TAG_VALUE_LEN}, \
+                 Member must have length greater than or equal to {MIN_TAG_VALUE_LEN}]"
+            ),
+        ),
+        (
+            "remove-a-key-past-its-bound",
+            Write::Remove(vec![past_key.clone()]),
+            REMOVED_TAG_KEYS,
+            "Member must satisfy constraint:",
+            key_bounds.clone(),
+        ),
+    ];
+
+    for (index, (case, write, member, class, bounds)) in rows.into_iter().enumerate() {
+        let name = format!("tagenvelope{index}");
+        fixture(&router, &name, case, &write).await;
+
+        let reply = issue(&router, &name, &write).await;
+        assert_eq!(
+            (reply.status, reply.error_code.as_str()),
+            (400, TAG_RULE_CODE),
+            "case {case:?}: expected 400 {TAG_RULE_CODE}, got {reply:?}"
+        );
+        let parsed: Value =
+            serde_json::from_str(&reply.message().replace("\\'", "'")).unwrap_or(Value::Null);
+        let carried = parsed["message"].as_str().unwrap_or_default().to_string();
+        assert!(
+            parsed.is_object() && !carried.is_empty(),
+            "case {case:?}: the message must parse as the document that carries the \
+             sentence, got {:?}",
+            reply.message()
+        );
+        assert!(
+            carried.starts_with("1 validation error detected: Value '"),
+            "case {case:?}: expected the validation sentence, got {carried:?}"
+        );
+        assert!(
+            carried.contains(&format!("' at '{member}' failed to satisfy constraint: {class} ")),
+            "case {case:?}: expected the sentence to name {member:?} and state {class:?}, \
+             got {carried:?}"
+        );
+        assert!(
+            carried.ends_with(&bounds),
+            "case {case:?}: expected the sentence to end in the bounds {bounds:?}, got \
+             {carried:?}"
+        );
+
+        assert_nothing_changed(&router, &name, case, &write).await;
+    }
 }
 
 /// RULE: a tag rule the model expresses nowhere — the reserved key prefix, the documented
@@ -522,7 +639,10 @@ async fn the_two_tag_key_bounds_are_answered_by_different_codes_on_removal() {
             vec![past_maximum.clone()],
             Some((
                 TAG_RULE_CODE,
-                Bound::ListMember.sentence(REMOVED_TAG_KEYS, &format!("[{past_maximum}]")),
+                document(&Bound::ListMember.sentence(
+                    REMOVED_TAG_KEYS,
+                    &format!("[{past_maximum}]"),
+                )),
             )),
         ),
         (
@@ -571,9 +691,9 @@ const SOURCE: &str = "arn:aws:sqs:us-west-2:000000000000:orders";
 const TARGET: &str = "arn:aws:lambda:us-west-2:000000000000:function:handler";
 
 /// RULE, the other side of the one above: the `ValidationException` this service MODELS for
-/// its own refusals does word its message as this service's `ValidationErrorFields`
-/// document, so a client that parses that document keeps getting one — only the tagging
-/// layer's `BadRequestException` states a bare sentence.
+/// its own refusals words its message as this service's `ValidationErrorFields`
+/// document, which is a document of its own rather than the tagging layer's `message`
+/// envelope, so a client that parses that document keeps getting one.
 ///
 /// The rows differ along what the refusal is about (a filter pattern the service cannot
 /// read, in two forms, and a pipe name outside its modelled pattern) and therefore along

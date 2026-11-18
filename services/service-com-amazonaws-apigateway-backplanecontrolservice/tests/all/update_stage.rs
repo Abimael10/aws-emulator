@@ -239,13 +239,24 @@ async fn a_patch_sets_the_member_its_path_names_and_the_stage_reads_back() {
                 { "op": "replace", "path": "/~1pets/GET/caching/dataEncrypted", "value": "true" }
             ]),
             vec![
+                // The `methodSettings` key is `~1pets/GET`, whose own separator and escape
+                // are spelled `~1` and `~0` inside one reference token of these pointers.
                 (
-                    "methodSettings/pets~1GET/throttlingRateLimit",
+                    "methodSettings/~01pets~1GET/throttlingRateLimit",
                     json!(25.5),
                 ),
-                ("methodSettings/pets~1GET/throttlingBurstLimit", json!(7)),
-                ("methodSettings/pets~1GET/dataTraceEnabled", json!(true)),
-                ("methodSettings/pets~1GET/cacheDataEncrypted", json!(true)),
+                (
+                    "methodSettings/~01pets~1GET/throttlingBurstLimit",
+                    json!(7),
+                ),
+                (
+                    "methodSettings/~01pets~1GET/dataTraceEnabled",
+                    json!(true),
+                ),
+                (
+                    "methodSettings/~01pets~1GET/cacheDataEncrypted",
+                    json!(true),
+                ),
             ],
         ),
         (
@@ -350,14 +361,14 @@ async fn a_method_path_with_no_settings_yet_takes_the_documented_defaults() {
     // produces: the stage-wide wildcard, one method of one resource and one of a nested
     // resource spelled in two reference tokens, and the whole method path spelled in ONE
     // token — every one of them keyed by the method path `Stage$methodSettings` documents,
-    // with the resource path's separators real and its leading one dropped.
+    // with the resource path carried as one reference token, its separators escaped `~1`.
     let cases: Vec<(&str, &str, &str)> = vec![
         ("every method of the stage", "/*/*", "*/*"),
-        ("one method of one resource", "/~1pets/GET", "pets/GET"),
+        ("one method of one resource", "/~1pets/GET", "~1pets/GET"),
         (
             "one method of a nested resource",
             "/~1pets~1{petId}/DELETE",
-            "pets/{petId}/DELETE",
+            "~1pets~1{petId}/DELETE",
         ),
     ];
 

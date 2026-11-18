@@ -63,7 +63,12 @@ pub fn json_pointer(dotted: &str) -> String {
 /// One pointer segment with the two characters a JSON pointer gives a meaning of its own
 /// escaped: `~` as `~0` and `/` as `~1` (RFC 6901), so a caller-chosen key holding either
 /// still names one member instead of splitting into two.
-fn escaped_segment(segment: &str) -> String {
+///
+/// `pub` because a few services SPELL a value the way a pointer segment is spelled — a map
+/// key a service documents as a reference token of a method path, for one — and the escape
+/// is the same rule there: one spelling of it, called rather than inlined again.
+#[must_use]
+pub fn escaped_segment(segment: &str) -> String {
     segment.replace('~', "~0").replace('/', "~1")
 }
 

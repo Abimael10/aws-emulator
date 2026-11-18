@@ -315,12 +315,23 @@ fn length_requirements(bound: &std::ops::RangeInclusive<usize>) -> String {
 /// One refused request as request validation states it: how many clauses, then the
 /// clause. The writes below refuse one tag at a time, so one clause is stated.
 ///
-/// This sentence IS the whole message such a refusal carries. The protocol's error
-/// envelope already holds a refusal's message under its own member, so the sentence is
-/// what a client reads there — a document of its own around it would make the client's
-/// message that document instead of the sentence.
+/// The sentence travels as the JSON DOCUMENT this service's tagging layer words a
+/// constraint-validation refusal as — the sentence under a `message` member — which is what
+/// a client unescapes and parses out of the error's own message member. Recorded behaviour
+/// for this error class.
 fn one_validation_error(clause: String) -> String {
-    format!("1 validation error detected: {clause}")
+    validation_document(&format!("1 validation error detected: {clause}"))
+}
+
+/// `sentence` as the refusal DOCUMENT carries it: inside `{"message": "…"}`, rendered as a
+/// JSON string so every character a JSON string escapes — the backslash, the quote and the
+/// control characters a tag key may carry — is escaped rather than reaching the document raw,
+/// and then with the apostrophes the sentence quotes a value and a member name with escaped
+/// too. That last escape is recorded behaviour of this error class rather than JSON's own, so
+/// a client unescapes it before parsing the document.
+fn validation_document(sentence: &str) -> String {
+    let quoted = ::serde_json::Value::String(sentence.to_string()).to_string();
+    format!("{{\"message\": {}}}", quoted.replace('\'', "\\'"))
 }
 
 /// The tags a request carried, as a validation message echoes the member's value: every

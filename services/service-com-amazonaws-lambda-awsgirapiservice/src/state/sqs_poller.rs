@@ -18,10 +18,11 @@
 //!   The hold covers the whole span this poller holds the batch — the window it gathers it
 //!   over plus the attempt it hands it to, which is the queue's own `VisibilityTimeout` or
 //!   the function's `Timeout`, whichever is longer, since one attempt cannot outlast the
-//!   function's — and it is RENEWED when the attempt BEGINS and while it is still running
-//!   ([`renew_hold`]), because the hold the delivery took has already paid for the gathering
-//!   window by then, and because what an attempt costs this emulator is not bounded by those
-//!   spans alone: an invocation also waits for its share of the run capacity. So no message is
+//!   function's — and it is RENEWED while the mapping is still GATHERING the batch, when the
+//!   attempt BEGINS and while that attempt is still running ([`renew_hold`]), because the
+//!   mapping is the consumer holding those records for every one of those spans and what each
+//!   of them costs this emulator is not bounded by the configured spans alone: an invocation
+//!   also waits for its share of the run capacity. So no message is
 //!   handed to a second consumer while the first attempt at it may still be running (see
 //!   [`invisible_for_seconds`]). A mapping carrying a
 //!   `MaximumBatchingWindowInSeconds` — "the maximum amount of time, in seconds, that Lambda
@@ -602,8 +603,13 @@ async fn poll_mapping_due<Eng: Send + Sync + 'static>(
         let batches = match due_batches(&queues, session, &target, now, hold_seconds) {
             Due::Batches(batches) => batches,
             // Still gathering: the messages are held, so nothing is invoked, deleted or
-            // metered for them yet. The pass that hands them over reports all of it.
-            Due::Gathering => continue,
+            // metered for them yet. The pass that hands them over reports all of it. The
+            // mapping IS still holding them, though, so their reservation is renewed on this
+            // pass ([`renew_gathering_hold`]) rather than left to run out under the window.
+            Due::Gathering => {
+                renew_gathering_hold(&queues, session, &target, hold_seconds, now);
+                continue;
+            }
             Due::Nothing => {
                 // Nothing was waiting, so no processing attempt was made and there is no
                 // result of one to report. The poll itself is still a measurement: a mapping
@@ -1257,6 +1263,43 @@ fn renew_hold(target: &PollTarget, held: &HeldBatch<'_>, now: SystemTime) {
     for message in held.messages {
         let _ = queue.change_visibility(&message.receipt_handle, held.hold_seconds, now);
     }
+}
+
+/// Renew the hold on the messages `target` is still GATHERING into a batch, for one hold span
+/// counted from `now`.
+///
+/// A mapping that has taken records and not handed them over yet is a consumer still holding
+/// them: it holds them for the whole of "the maximum amount of time, in seconds, that Lambda
+/// spends gathering records before invoking the function"
+/// (`MaximumBatchingWindowInSeconds`), and a record that came back part way through that
+/// window would be handed to a second consumer while this mapping still had it — a delivery
+/// nothing asked for. So the reservation is renewed on every pass that finds the mapping still
+/// gathering, exactly as it is renewed while an attempt runs ([`renew_hold`]), rather than
+/// resting on the one span the delivery that took them hid them for.
+///
+/// Nothing to renew for a mapping that is gathering no messages.
+fn renew_gathering_hold(
+    queues: &::engine::ServiceState<sqs::state::ComAmazonawsSqsAmazonsqsState>,
+    session: &PollSession,
+    target: &PollTarget,
+    hold_seconds: i64,
+    now: SystemTime,
+) {
+    let Some(gathering) = session.gathering.get(&target.uuid) else {
+        return;
+    };
+    if gathering.messages.is_empty() {
+        return;
+    }
+    renew_hold(
+        target,
+        &HeldBatch {
+            queues,
+            messages: &gathering.messages,
+            hold_seconds,
+        },
+        now,
+    );
 }
 
 /// Split `polled` into the messages `target`'s filter criteria admit and the ones they

@@ -6,16 +6,17 @@
 //! The RULE under test, one level above any one call:
 //!
 //! > `Stage$methodSettings` is "a map that defines the method settings for a Stage resource.
-//! > Keys … are method paths defined as {resource_path}/{http_method} for an individual
-//! > method override, or /\*/\* for overriding all methods in the stage". A key therefore
-//! > names a METHOD, in the method path's own spelling: the resource path with its separators
-//! > REAL and its leading one dropped — as the documented whole-stage path `/*/*` is keyed
-//! > `*/*` — a separator, then the HTTP method. The JSON Pointer escape `~1` belongs to the
-//! > patch PATH alone, which may spell that method several ways (the resource path's leading
-//! > separator escaped or left to the pointer's own, the separator before the HTTP method
-//! > escaped too so the whole method path rides in one reference token), and every one of them
-//! > addresses the one method, so a stage holds exactly ONE entry per method however many
-//! > spellings wrote it and no key carries an escape.
+//! > Keys (designated as /{method_setting_key) are method paths defined as
+//! > {resource_path}/{http_method} for an individual method override, or /\*/\* for
+//! > overriding all methods in the stage". A key therefore names a METHOD, in the method
+//! > path's own spelling: the resource path as ONE reference token — every separator in it,
+//! > the leading one included, escaped `~1` as `PatchOperation$path` spells a separator
+//! > inside a path name — then a real separator, then the HTTP method; and `*/*` for the
+//! > whole-stage path `/*/*`, which names no resource path. A patch may spell that method
+//! > several ways (the resource path's leading separator escaped or left to the pointer's
+//! > own, the separator before the HTTP method escaped too so the whole method path rides in
+//! > one reference token), and every one of them addresses the one method, so a stage holds
+//! > exactly ONE entry per method however many spellings wrote it.
 //!
 //! The rows span what the rule generalises over: the DEPTH of the resource path (the root, a
 //! child, a nested one), the wildcard that stands for every method, and each spelling of the
@@ -50,7 +51,7 @@ struct Row {
 const ROWS: &[Row] = &[
     Row {
         case: "a child resource",
-        key: "pets/GET",
+        key: "~1pets/GET",
         spellings: &[
             // The resource path's leading separator escaped into the first token.
             ("/~1pets/GET/metrics/enabled", "metricsEnabled"),
@@ -63,7 +64,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "a nested resource path",
-        key: "pets/{petId}/DELETE",
+        key: "~1pets~1{petId}/DELETE",
         spellings: &[
             (
                 "/~1pets~1{petId}/DELETE/metrics/enabled",
@@ -78,7 +79,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "the root resource",
-        key: "/GET",
+        key: "~1/GET",
         spellings: &[
             ("/~1/GET/metrics/enabled", "metricsEnabled"),
             ("//GET/caching/enabled", "cachingEnabled"),
@@ -137,12 +138,13 @@ async fn every_spelling_of_one_method_writes_the_one_documented_key() {
                 keys, expected_keys,
                 "case {case}: expected the keys {expected_keys:?}, got {keys:?}"
             );
-            // No key carries the JSON Pointer escape: it is how a patch PATH spells a
-            // separator of the resource path, and a key is the method path itself.
+            // Every key but the whole-stage one carries its resource path as one escaped
+            // reference token, so a key holds exactly one real separator: the one before the
+            // HTTP method.
             assert!(
-                keys.iter().all(|key| !key.contains('~')),
-                "case {case}: a methodSettings key is a method path, never an escaped patch \
-                 path, got {keys:?}"
+                keys.iter().all(|key| key.matches('/').count() == 1),
+                "case {case}: a methodSettings key carries its resource path as one escaped \
+                 token, got {keys:?}"
             );
             let read = get_stage(&gateway, &api, "prod").await;
             assert_eq!(
