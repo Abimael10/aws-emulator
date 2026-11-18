@@ -810,10 +810,33 @@ impl StoredStack {
     /// client calls it with. Nothing else about the evaluation differs, so the stack's
     /// outputs stay a function of its template, its parameters and its resources.
     pub(super) fn reevaluate_outputs(&mut self) {
-        let Some((declared, parameters)) = self.template_scope() else {
+        let resources = self.current_resources();
+        let Some(outputs) = self.outputs_over(&resources) else {
             return;
         };
-        let resources = self.current_resources();
+        match &mut self.pending_deployment {
+            Some(deployment) => deployment.outputs = outputs,
+            None => self.outputs = outputs,
+        }
+    }
+
+    /// The outputs this stack WOULD report over the resource records `resources`, computed
+    /// and not written anywhere — or `None` for a stack there is nothing to evaluate for.
+    ///
+    /// The reading [`Self::reevaluate_outputs`] installs, over records a caller holds rather
+    /// than over the ones the stack has: a deployment in flight asks what it would PUBLISH
+    /// once the owning services have answered, which is what decides whether its exports can
+    /// be installed at all ([`super::exports`]) — and that question has to be answerable
+    /// before anything is written, since the answer may be that the deployment cannot be
+    /// carried through.
+    ///
+    /// Nothing else about the evaluation differs, so the stack's outputs stay a function of
+    /// its template, its parameters and its resources. `None` where this service cannot read
+    /// the stack's template at all: NOTHING was evaluated, which is not the same as a stack
+    /// that publishes no output — so the writer above leaves what the stack already published
+    /// exactly as it is, and the reader of a deployment's own exports refuses nothing.
+    pub fn outputs_over(&self, resources: &[StoredResource]) -> Option<Vec<StoredOutput>> {
+        let (declared, parameters) = self.template_scope()?;
         let parameter_types = ssm_parameters::parameter_types_in_force(&declared);
         let no_resources = BTreeMap::new();
         // The imports of the deployment in flight where there is one, else the stack's own:
@@ -829,7 +852,7 @@ impl StoredStack {
             None => self.stack_outputs.clone(),
         };
         let mut budget = template::Budget::new();
-        let outputs = self.evaluated_outputs(
+        Some(self.evaluated_outputs(
             &declared,
             template::Scope {
                 stack: template::StackScope {
@@ -846,13 +869,9 @@ impl StoredStack {
                 imports: &imports,
                 stack_outputs: &stack_outputs,
             },
-            &resources,
+            resources,
             &mut budget,
-        );
-        match &mut self.pending_deployment {
-            Some(deployment) => deployment.outputs = outputs,
-            None => self.outputs = outputs,
-        }
+        ))
     }
 
     /// Whether this stack is still part of the live set — the set addressable by stack
@@ -3251,6 +3270,11 @@ impl StoredStack {
             // says whether a resource can be created yet
             // ([`provisioning::StackProvenance::dependencies`]).
             dependencies: provisioning::dependencies_in_flight(self),
+            // A deployment that puts back what this stack already published withdraws no
+            // export, so there is no pre-condition on publishing its exports for the walk to
+            // ask; the operation deploying a CHANGED template installs one
+            // ([`provisioning::StackProvenance::publication`]).
+            publication: None,
             // A deployment that deploys RECORDS rather than declarations withholds nothing for
             // an unresolved read either, for the reason `declarations_resolve_again` records;
             // the operation deploying a template fills this in

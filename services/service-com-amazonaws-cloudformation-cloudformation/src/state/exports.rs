@@ -18,6 +18,15 @@
 //! back, putting the resources it had already changed back as they were. That is also the
 //! stage the other rule about an export name is decided at, below.
 //!
+//! "Putting them back as they were" is what decides WHERE in that stage the question is
+//! asked: a deployment that is cancelled is one CloudFormation carries nothing of through, and
+//! the physical resource a replacement supersedes — or one the template no longer declares —
+//! is taken down in the operation's CLEANUP phase, after the change itself has gone through.
+//! So the rules are asked once the deployment's changes have been made and BEFORE it takes
+//! anything down ([`ExportPublication`]): asked any later, the exported value an importer
+//! holds would already have moved under it, because the resource publishing it would already
+//! be gone.
+//!
 //! Both halves of the relation are derived from the stacks themselves ([`crate::state`]):
 //! an export is what a live stack's output declares an `Export` name for, and an import is
 //! what a live stack's deployed template resolved against one ([`StoredStack::imports`]).
@@ -210,8 +219,21 @@ impl StoredStack {
         importers: &BTreeMap<String, Vec<ImportingStack>>,
     ) -> Option<(String, String)> {
         let deployment = self.pending_deployment.as_ref()?;
+        self.in_use_export_withdrawn_by(&published(&deployment.outputs), importers)
+    }
+
+    /// [`Self::in_use_export_withdrawn`] over the exports `deploying` says the deployment
+    /// would publish, rather than over the ones its record currently carries.
+    ///
+    /// The one place that rule is written, so the walk that asks it of the records an owning
+    /// service has just answered ([`ExportPublication`]) and the reading taken off the
+    /// deployment's own record cannot drift apart.
+    pub fn in_use_export_withdrawn_by(
+        &self,
+        deploying: &BTreeMap<String, String>,
+        importers: &BTreeMap<String, Vec<ImportingStack>>,
+    ) -> Option<(String, String)> {
         let in_force = published(&self.outputs);
-        let deploying = published(&deployment.outputs);
         for (export_name, value) in &in_force {
             if deploying.get(export_name) == Some(value) {
                 continue;
@@ -252,12 +274,134 @@ impl StoredStack {
         publishers: &BTreeMap<String, ExportingStack>,
     ) -> Option<String> {
         let deployment = self.pending_deployment.as_ref()?;
-        published(&deployment.outputs)
-            .into_keys()
-            .find_map(|export_name| {
-                let holder = publishers.get(&export_name)?;
-                (holder.stack_id != self.stack_id)
-                    .then(|| already_exported_reason(&export_name, &holder.stack_name))
+        self.conflicting_export_by(&published(&deployment.outputs), publishers)
+    }
+
+    /// [`Self::conflicting_export`] over the exports `deploying` says the deployment would
+    /// publish, rather than over the ones its record currently carries — the counterpart of
+    /// [`Self::in_use_export_withdrawn_by`], and the one place that rule is written.
+    pub fn conflicting_export_by(
+        &self,
+        deploying: &BTreeMap<String, String>,
+        publishers: &BTreeMap<String, ExportingStack>,
+    ) -> Option<String> {
+        deploying.keys().find_map(|export_name| {
+            let holder = publishers.get(export_name)?;
+            (holder.stack_id != self.stack_id)
+                .then(|| already_exported_reason(export_name, &holder.stack_name))
+        })
+    }
+
+    /// What CloudFormation cannot carry a deployment of this stack through for, of the two
+    /// rules about the exports it would PUBLISH: a name another live stack of the Region
+    /// already publishes ([`Self::conflicting_export_by`]), and an exported value another
+    /// live stack still imports that this deployment would withdraw
+    /// ([`Self::in_use_export_withdrawn_by`]). `None` where both hold.
+    ///
+    /// One reading, because both rules are decided at the same stage — where the deployment
+    /// would install its exports — and a deployment either rule stops is one that is NOT
+    /// carried through, so the two are asked together and the first answer is the reason the
+    /// operation reports.
+    pub fn export_publication_refusal(
+        &self,
+        deploying: &BTreeMap<String, String>,
+        publishers: &BTreeMap<String, ExportingStack>,
+        importers: &BTreeMap<String, Vec<ImportingStack>>,
+    ) -> Option<String> {
+        self.conflicting_export_by(deploying, publishers)
+            .or_else(|| {
+                self.in_use_export_withdrawn_by(deploying, importers).map(
+                    |(export_name, importing_stack_name)| {
+                        canceled_reason(
+                            CanceledOperation::Update,
+                            &export_name,
+                            &importing_stack_name,
+                        )
+                    },
+                )
             })
+    }
+}
+
+/// The pre-condition on PUBLISHING a deployment's exports, as the DEPLOYMENT WALK asks it:
+/// the store, the Region and the stack, so the walk can ask what the records the owning
+/// services have just answered would publish.
+///
+/// ## Why the walk asks it rather than the caller
+///
+/// The rules above are decided where the deployment would install its exports, which is as
+/// the operation completes — so they are asked AFTER the deployment's own changes have been
+/// made, over the identifiers the owning services really assigned. But a deployment they stop
+/// is one that is not carried through, and CloudFormation takes nothing down for an operation
+/// that is not carried through: the physical resource a replacement supersedes, and one the
+/// template no longer declares, are removed in the operation's CLEANUP phase — "the stack
+/// update was successful, and CloudFormation is deleting the old resources" — which a
+/// cancelled operation never reaches. Asking the question only after the walk had finished
+/// would mean asking it after those resources had been taken down, and then the rollback has
+/// nothing left to put back: the exported value an importer holds would move under it exactly
+/// because the pin fired. So the walk asks here, with its changes made and before it takes
+/// anything down ([`crate::state::provisioning::reconcile`]).
+///
+/// Clone-cheap, and shared with the walk as an `Arc`: the walk carries it on the deployment's
+/// own provenance ([`crate::state::provisioning::StackProvenance::publication`]).
+pub struct ExportPublication {
+    state: ::engine::ServiceState<ComAmazonawsCloudformationCloudformationState>,
+    region: String,
+    stack_id: String,
+}
+
+impl ExportPublication {
+    /// The pre-condition for the deployment of `stack_id` in `region`, to be carried on that
+    /// deployment's provenance.
+    ///
+    /// Takes NO lock: it only keeps the store handle, the Region and the stack, so a caller
+    /// may build it wherever it has them. Reading through it ([`Self::refusal`]) is what takes
+    /// the store lock, and the walk that does so holds none — the deployment's own calls reach
+    /// other services' handlers, so it runs with this store unlocked.
+    ///
+    /// Called by the operation that deploys a TEMPLATE over resources the stack already has
+    /// (`UpdateStack`, `ExecuteChangeSet`): those are the deployments that supersede a
+    /// physical resource. A deployment that supersedes nothing — a create, a rollback, a
+    /// revert — carries none, and its exports are decided by the caller as before.
+    pub fn of(
+        state: &::engine::ServiceState<ComAmazonawsCloudformationCloudformationState>,
+        region: &str,
+        stack_id: &str,
+    ) -> ::std::sync::Arc<Self> {
+        ::std::sync::Arc::new(Self {
+            state: state.clone(),
+            region: region.to_string(),
+            stack_id: stack_id.to_string(),
+        })
+    }
+
+    /// What the deployment cannot be carried through for, over the records `resources` the
+    /// walk has in hand, or `None` where its exports can be installed.
+    ///
+    /// TAKES THE STORE LOCK, and answers without holding it: the exports in force and the
+    /// cross-stack index are the store's, and the outputs this deployment would publish are
+    /// that template evaluated over these records ([`StoredStack::outputs_over`]) — the same
+    /// bounded evaluation the writer of those outputs makes under the same lock. The caller is
+    /// the deployment walk, which holds no lock of this store while it runs, so this is the
+    /// only acquisition on the path. Nothing is refused for a stack this store no longer holds
+    /// — there is no deployment left to stop — nor for one whose template this service cannot
+    /// read, where nothing was evaluated to compare.
+    pub fn refusal(&self, resources: &[StoredResource]) -> Option<String> {
+        let store = self.state.lock();
+        let publishers = store.exporting_stacks(&self.region);
+        let importers = store.importers_by_export(&self.region);
+        let stack = store.resolve(&self.region, &self.stack_id)?;
+        let deploying = published(&stack.outputs_over(resources)?);
+        stack.export_publication_refusal(&deploying, &publishers, &importers)
+    }
+}
+
+impl ::std::fmt::Debug for ExportPublication {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("ExportPublication")
+            .field("region", &self.region)
+            .field("stack_id", &self.stack_id)
+            .finish_non_exhaustive()
     }
 }

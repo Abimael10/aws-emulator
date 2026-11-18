@@ -335,7 +335,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region,
             declared,
             previous_resources,
-            provenance,
+            mut provenance,
             refused_deployment,
             role_in_force,
             deletes_the_stack_on_failure,
@@ -862,6 +862,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
+        // ...and the pre-condition on the exports this execution would PUBLISH is the WALK's
+        // to ask, once its changes are made and before it takes down what it supersedes: an
+        // execution the pin cancels must leave the resource publishing the pinned value
+        // exactly where it is ([`crate::state::exports::ExportPublication`]). Installed HERE,
+        // with the store lock released, exactly as `UpdateStack` installs it.
+        provenance.publication = Some(crate::state::exports::ExportPublication::of(
+            &state,
+            &region,
+            &stack_id,
+        ));
+
         // The deployed template's resources are reconciled with the ones the stack already
         // had, exactly as on `CreateStack`/`UpdateStack`: what the template declares again
         // is kept, what it declares anew is created in the service that owns it, and what
@@ -909,16 +920,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the previous template in force and is reported as `UPDATE_FAILED`.
         let unwind = {
             let mut store = state.lock();
-            // Which live stack of this Region already publishes each exported output value,
-            // read BEFORE the stack is resolved for writing: "export names must be unique
-            // within a Region", so a name another stack holds is one this execution cannot
-            // publish ([`crate::state::StoredStack::conflicting_export`]).
-            let publishers = store.exporting_stacks(&request_region);
-            // ...and which of this stack's exports another live stack IMPORTS, read in the
-            // same breath and for the same reason: an export in use is PINNED, so an
-            // execution that would withdraw one is cancelled at that same stage
-            // ([`crate::state::exports`]).
-            let importers = store.importers_by_export(&request_region);
             match store.resolve_mut(&request_region, &stack_id) {
                 None => None,
                 Some(stack) => {
@@ -955,26 +956,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // A deployment whose resources were all made can still be one
                     // CloudFormation cannot carry through: the exports it would publish are
                     // installed when the operation completes, so an export name another live
-                    // stack of the Region already publishes fails it here.
-                    let failure = materialised
-                        .failure
-                        .or_else(|| stack.conflicting_export(&publishers))
-                        // ...and so does an export another live stack still IMPORTS,
-                        // whichever call deploys the template that would withdraw it:
-                        // executing a change set against the publishing stack is cancelled
-                        // exactly as `UpdateStack` is, naming the export and the stack that
-                        // still imports it, and rolled back below.
-                        .or_else(|| {
-                            stack.in_use_export_withdrawn(&importers).map(
-                                |(export_name, importing_stack_name)| {
-                                    crate::state::exports::canceled_reason(
-                                        crate::state::exports::CanceledOperation::Update,
-                                        &export_name,
-                                        &importing_stack_name,
-                                    )
-                                },
-                            )
-                        });
+                    // stack of the Region already publishes, and an exported value another
+                    // live stack still IMPORTS that this execution would withdraw, fail it.
+                    // Both are decided by the WALK, where the deployment's changes are made
+                    // and before it takes down anything it supersedes — so they arrive here as
+                    // its own failure ([`crate::state::exports::ExportPublication`] records
+                    // why that is the stage).
+                    let failure = materialised.failure;
                     match failure {
                         None => {
                             // The execution got through its calls to the owning services and

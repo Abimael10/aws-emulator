@@ -649,6 +649,16 @@ pub struct StackProvenance {
     /// which no re-resolution could produce — so nothing is withheld for one of those: a
     /// resource withheld there would be a resource nothing ever deploys.
     pub declarations_resolve_again: bool,
+    /// The pre-condition on PUBLISHING this deployment's exports, where the deploying
+    /// operation has one ([`super::exports::ExportPublication`]).
+    ///
+    /// Asked by this walk, once its changes have been made and BEFORE it takes down anything
+    /// the deployment supersedes, because a deployment the pre-condition stops is one
+    /// CloudFormation carries nothing of through — that file records the whole of why. `None`
+    /// is a deployment with no such pre-condition (a create has no exports in force to
+    /// withdraw, a rollback and a revert put back what was published), and then nothing is
+    /// asked here.
+    pub publication: Option<::std::sync::Arc<super::exports::ExportPublication>>,
     /// The resources of this deployment whose DECLARATION reads an attribute nothing publishes
     /// yet ([`super::StoredStack::declarations_reading_unpublished_attributes`]).
     ///
@@ -3270,6 +3280,21 @@ pub async fn reconcile(
         outcome.resources.push(resource);
     }
 
+    // The exports this deployment would publish are installed as the operation COMPLETES, so
+    // the two rules about them are decided at this stage — and HERE within it: the walk's own
+    // changes have been made, so the question is asked over the identifiers the owning
+    // services really assigned, and nothing the deployment supersedes has been taken down
+    // yet. A deployment either rule stops is one CloudFormation carries nothing of through,
+    // and what it would have taken down below is removed in the operation's CLEANUP phase —
+    // after the change has gone through — so a deployment refused here takes nothing down and
+    // its rollback has the resources that were in force to put back
+    // ([`super::exports::ExportPublication`] records the whole of why).
+    if outcome.failure.is_none() {
+        if let Some(publication) = &stack.publication {
+            outcome.failure = publication.refusal(&outcome.resources);
+        }
+    }
+
     // The resources this deployment replaced or removed exist in their owning services
     // and the stack no longer records them, so the deployment deletes them — a resource
     // the stack stops recording must not be left behind. Judged against what the stack
@@ -3293,9 +3318,11 @@ pub async fn reconcile(
         return outcome;
     }
     if outcome.failure.is_some() {
-        // A create failed, so this deployment is not the one that replaces anything: the
-        // resources it would have deleted are still there, and the stack keeps their
-        // records so its own deletion still deletes them.
+        // The deployment is not being carried through — a resource failed, or the exports it
+        // would publish cannot be installed — so it is not the one that replaces anything:
+        // the resources it would have deleted are still there, and the stack keeps their
+        // records, so the rollback of this operation puts its own record back onto them and a
+        // later deletion still deletes them.
         outcome.resources.extend(replaced);
         return outcome;
     }
