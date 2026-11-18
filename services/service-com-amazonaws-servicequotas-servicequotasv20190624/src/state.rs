@@ -2933,6 +2933,19 @@ impl QuotaRow {
         self
     }
 
+    /// The CloudWatch usage metric AWS publishes for this quota, for a row that states NO
+    /// window of its own.
+    ///
+    /// A metered quota usually also publishes the `Period` its usage metric is published
+    /// over, which is what [`QuotaRow::metric`] fills in. Where the recorded response for a
+    /// metered row carries the metric but no `Period`, this is the constructor for it: the
+    /// metric names the series usage is read from and the row publishes no window.
+    fn metric_without_period(mut self, metric: MetricInfo) -> Self {
+        self.usage_metric = Some(metric);
+        self.period = None;
+        self
+    }
+
     /// The `Period` of a quota AWS publishes as a rate: so many per unit of time.
     fn period(mut self, value: i32, unit: &str) -> Self {
         self.period = Some(QuotaPeriod {

@@ -32,8 +32,12 @@ fn transactions_per_second(code: &str, api_name: &str, per_second: f64) -> Quota
 /// service-quotas list-aws-default-service-quotas --service-code batch` reports, which is
 /// the "AWS Batch service quotas" table of the AWS Batch User Guide), and the recorded
 /// default-quota listing of that code for which `QuotaCode` names which quota and for the
-/// wording of the throttle rows. Every row carries the `L-` code AWS publishes the quota
+/// text each row is published with. Every row carries the `L-` code AWS publishes the quota
 /// under, so a client that read a code out of AWS's catalog resolves the same quota here.
+///
+/// Batch states its limits in the "Maximum …" voice of its own quota table rather than in a
+/// sentence about the account, and the account's planes are counted "per account, per
+/// region", so that is the wording a row carries.
 ///
 /// Batch publishes its whole default set as NOT adjustable — the recorded listing reports
 /// it so for the account's compute-environment and job-queue limits as much as for its
@@ -52,63 +56,54 @@ pub(in crate::state) fn batch_quotas() -> Vec<QuotaRow> {
         quota("Compute environment limit", 50.0)
             .code("L-144F0CA5")
             .fixed()
-            .describe(
-                "The maximum number of compute environments in this account in the current \
-                 Region.",
-            ),
+            .describe("Maximum number of compute environments per account, per region."),
         quota("Job queue limit", 50.0)
             .code("L-4CEA37AD")
             .fixed()
-            .describe(
-                "The maximum number of job queues in this account in the current Region.",
-            ),
-        quota("Array size limit", 10_000.0)
+            .describe("Maximum number of job queues per account, per region."),
+        quota("Maximum number of compute environments per job queue", 3.0)
             .code("L-61E3E54E")
             .fixed()
-            .describe("The maximum number of child jobs in one array job."),
+            .describe("Maximum number of compute environments per job queue."),
         quota("Maximum number of jobs in SUBMITTED state", 1_000_000.0)
             .code("L-65F8BA2C")
             .fixed()
-            .describe("The maximum number of jobs held in the SUBMITTED state at once."),
-        quota("Scheduling policy limit", 100.0)
+            .describe("Maximum number of jobs in SUBMITTED state."),
+        quota("Job payload size limit", 30.0)
             .code("L-6B86CF1E")
             .fixed()
             .describe(
-                "The maximum number of scheduling policies in this account in the current \
-                 Region.",
+                "Maximum job payload size (for SubmitJob API operations), measured in KiB.",
             ),
-        quota("Maximum number of share identifiers per scheduling policy", 500.0)
+        quota("Service environments per job queue", 1.0)
             .code("L-80D92D24")
             .fixed()
-            .describe("The maximum number of share identifiers in one scheduling policy."),
-        quota("Maximum number of compute environments per job queue", 3.0)
+            .describe("Maximum number of service environments per job queue."),
+        quota("Scheduling policy limit", 100.0)
             .code("L-A2F30F35")
             .fixed()
-            .describe("The maximum number of compute environments one job queue can use."),
-        quota("Maximum number of job dependencies per job", 20.0)
+            .describe("Maximum number of scheduling policies per account, per region."),
+        quota("Job dependencies limit", 20.0)
             .code("L-AD075A76")
             .fixed()
-            .describe("The maximum number of jobs one job can depend on."),
+            .describe("Maximum number of job dependencies per job."),
         quota("Consumable resource limit", 50.0)
             .code("L-B15D0E72")
             .fixed()
-            .describe(
-                "The maximum number of consumable resources in this account in the current \
-                 Region.",
-            ),
+            .describe("Maximum number of consumable resources per account, per region."),
         transactions_per_second("L-C997A649", "RegisterJobDefinition", 50.0),
         quota("Job definition size limit", 24.0)
             .code("L-E6A2743D")
             .fixed()
-            .describe("The maximum size, in KiB, of one job definition."),
+            .describe(
+                "Maximum job definition size (for RegisterJobDefinition API operations), \
+                 measured in KiB.",
+            ),
         transactions_per_second("L-E985971C", "SubmitJob", 50.0),
         transactions_per_second("L-F8102809", "DescribeJobs", 50.0),
-        quota("Service environment limit", 50.0)
+        quota("Maximum array size limit", 10_000.0)
             .code("L-F9381E33")
             .fixed()
-            .describe(
-                "The maximum number of service environments in this account in the current \
-                 Region.",
-            ),
+            .describe("Maximum array size."),
     ]
 }

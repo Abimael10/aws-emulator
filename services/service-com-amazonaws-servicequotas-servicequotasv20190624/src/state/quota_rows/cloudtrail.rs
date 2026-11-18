@@ -7,22 +7,37 @@ use super::*;
 /// The `AWS/Usage` display name CloudTrail publishes its call counts under.
 const CLOUDTRAIL_USAGE_SERVICE: &str = "CloudTrail";
 
+/// The sentence CloudTrail publishes on EVERY row of its per-API throttle class.
+///
+/// The class describes the throttle itself rather than the operation it throttles, so the
+/// text names no API and is one string for the whole class: a row's API is named by its
+/// `QuotaName` and by the `Resource` dimension of its usage metric.
+///
+/// SOURCE: the recorded default-quota listing of `cloudtrail`, which carries this sentence
+/// on the throttle rows of that service.
+const API_THROTTLE_DESCRIPTION: &str =
+    "The maximum number of operation requests you can make per second without being \
+     throttled.";
+
 /// The transactions per second CloudTrail accepts for one of its management APIs.
 ///
 /// CloudTrail publishes a throttle per API operation, and every member but the operation's
 /// own name and the value is the same across the class: the window is one second, the usage
 /// metric is that operation's `AWS/Usage` `CallCount` under the service's own dimension,
-/// and the `Description` is the sentence the class is published with and the operation named
-/// in it. One constructor fills them, so two rows of the class cannot drift apart.
-fn api_throttle(code: &str, quota_name: String, api_name: &str, per_second: f64) -> QuotaRow {
-    quota(quota_name, per_second)
-        .code(code)
-        .period(1, "SECOND")
-        .metric(call_count_metric(CLOUDTRAIL_USAGE_SERVICE, api_name))
-        .describe(&format!(
-            "Maximum number of transactions per second (TPS) for each account for the \
-             {api_name} API."
-        ))
+/// the rate is NOT adjustable — a per-second API throttle is a property of the service, not
+/// a ceiling an account can have raised — and the `Description` is the class's one sentence
+/// ([`API_THROTTLE_DESCRIPTION`]). One constructor fills them, so two rows of the class
+/// cannot drift apart.
+fn api_throttle(code: &str, api_name: &str, per_second: f64) -> QuotaRow {
+    quota(
+        format!("Transactions per second (TPS) for the {api_name} API"),
+        per_second,
+    )
+    .code(code)
+    .fixed()
+    .period(1, "SECOND")
+    .metric(call_count_metric(CLOUDTRAIL_USAGE_SERVICE, api_name))
+    .describe(API_THROTTLE_DESCRIPTION)
 }
 
 /// Every API CloudTrail publishes a per-second throttle for, with the code AWS publishes
@@ -72,6 +87,7 @@ const API_THROTTLES: &[(&str, &str, f64)] = &[
     ("L-8F9F4270", "ListTags", 10.0),
     ("L-9260AF5B", "ListTrails", 10.0),
     ("L-9387CED7", "LookupEvents", 2.0),
+    ("L-A4CD5068", "ListImportFailures", 10.0),
     ("L-961309DE", "PutAuditEvents", 10.0),
     ("L-98AA9EBA", "PutEventConfiguration", 10.0),
     ("L-9B1A1B4A", "PutEventSelectors", 10.0),
@@ -106,29 +122,43 @@ const API_THROTTLES: &[(&str, &str, f64)] = &[
 /// The catalog is mostly the per-API throttle class [`API_THROTTLES`] holds; the rows below
 /// are the planes and the measured limits CloudTrail publishes beside it. Rows are published
 /// in `QuotaCode` order, which is the order the recorded listing of this service carries.
+///
+/// CloudTrail publishes its WHOLE default set as NOT adjustable — the recorded listing
+/// reports it so for the account's trail, event-data-store, channel and dashboard planes
+/// and for its measured limits as much as for its per-API throttles — so every row here is
+/// fixed.
 pub(in crate::state) fn cloudtrail_quotas() -> Vec<QuotaRow> {
     let mut rows = vec![
         quota("Event data stores per Region", 10.0)
             .code("L-08352D4A")
+            .fixed()
             .describe(
                 "The maximum number of event data stores in this account in the current \
                  Region.",
             ),
-        quota("Channels per Region", 5.0).code("L-1568E18E").describe(
-            "The maximum number of channels in this account in the current Region.",
-        ),
+        quota("Channels per Region", 5.0)
+            .code("L-1568E18E")
+            .fixed()
+            .describe(
+                "The maximum number of channels in this account in the current Region.",
+            ),
         quota("Dashboards per Region", 10.0)
             .code("L-262F8D6F")
+            .fixed()
             .describe(
                 "The maximum number of dashboards in this account in the current Region.",
             ),
-        quota("Concurrent queries", 10.0).code("L-33C67BE1").describe(
-            "The maximum number of queries running at once in this account in the current \
-             Region.",
-        ),
+        quota("Concurrent queries", 10.0)
+            .code("L-33C67BE1")
+            .fixed()
+            .describe(
+                "The maximum number of queries running at once in this account in the \
+                 current Region.",
+            ),
         quota("Summarized query results size", 3.0)
             .code("L-3BB16389")
             .unit("Megabytes")
+            .fixed()
             .describe("The maximum size, in MB, of the results a query is summarized over."),
         quota("Event selectors per trail", 5.0)
             .code("L-46286FE1")
@@ -165,21 +195,8 @@ pub(in crate::state) fn cloudtrail_quotas() -> Vec<QuotaRow> {
             .describe("The number of days a query's results stay available for."),
     ];
     for (code, api_name, per_second) in API_THROTTLES {
-        rows.push(api_throttle(
-            code,
-            format!("Transactions per second (TPS) for the {api_name} API"),
-            api_name,
-            *per_second,
-        ));
+        rows.push(api_throttle(code, api_name, *per_second));
     }
-    // The one API of the class AWS publishes the throttle of under the SHORT form of the
-    // name, which is the name the recorded listing of this service carries for it.
-    rows.push(api_throttle(
-        "L-A4CD5068",
-        "TPS for the ListImportFailures API".to_string(),
-        "ListImportFailures",
-        10.0,
-    ));
     rows.sort_by(|left, right| left.code.cmp(&right.code));
     rows
 }
