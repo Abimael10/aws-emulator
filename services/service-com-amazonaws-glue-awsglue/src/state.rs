@@ -266,6 +266,7 @@ mod clock_pump;
 mod column_statistics;
 mod column_statistics_source;
 mod column_statistics_values;
+mod conditional_triggers;
 mod crawl;
 mod crawl_authorization;
 mod crawl_history;
@@ -306,6 +307,7 @@ pub use clock_pump::*;
 pub use column_statistics::*;
 pub use column_statistics_source::*;
 pub use column_statistics_values::*;
+pub use conditional_triggers::*;
 pub use crawl::*;
 pub use crawl_authorization::*;
 pub use crawl_history::*;
@@ -2451,7 +2453,8 @@ impl ComAmazonawsGlueAwsglueState {
     /// workflow run."
     ///
     /// "Total number of Actions in the workflow run" is what the entry point that began the
-    /// run initiates, which the run itself records ([`WorkflowRunEntry::total_actions`]).
+    /// run initiates plus what every gate that has since fired inside it did, which the run
+    /// itself records ([`WorkflowRunEntry::total_actions`]).
     /// Every other count is of the run's actions that are IN one state, so each is taken
     /// from the state the job run that action began has reached by now — the same records
     /// the graph's `JOB` nodes report — rather than from anything stored on the run, so a
@@ -2554,6 +2557,14 @@ impl ComAmazonawsGlueAwsglueState {
         now: SystemTime,
     ) {
         self.settle_due_action_job_runs(region, workflow_name, now);
+        // A CONDITIONAL trigger of this workflow is the GATE between one stage of a run and
+        // the next: it "fires when its predicate is satisfied", and the states that predicate
+        // names are the ones the run's own job runs — just settled above — have reached. So the
+        // firing it was owed the instant the predicate held is materialised HERE, before the
+        // run is asked whether its actions have all come to rest: the actions a gate initiates
+        // are actions of this run, so a run whose next stage has just begun is still running
+        // ([`Self::fire_satisfied_conditional_triggers`]).
+        self.fire_satisfied_conditional_triggers(region, workflow_name, now);
         let awaited = self.workflow_runs_awaiting_their_actions(region, workflow_name, now);
         let Some(workflow) = self.workflow_mut(workflow_name) else {
             return;
@@ -2573,10 +2584,11 @@ impl ComAmazonawsGlueAwsglueState {
     /// all, is absent from the answer: there is nothing left for it to wait for. An action
     /// whose job run the store no longer holds is nothing to wait for either.
     ///
-    /// An action whose job run owes its next state to its own EXECUTION rather than to the
-    /// clock — a run whose script is running, which carries no due instant while it does — is
-    /// waited for one span on and looked at again, so a composite is never reported at rest
-    /// while a run it is made of is still going.
+    /// An action whose job run owes its next state to something other than a FUTURE instant of
+    /// the clock — a run whose script is running, which carries no due instant while it does,
+    /// and one the clock already owes a state this pass has not materialised, as an action a
+    /// gate has just begun inside the run does — is waited for one span on and looked at again,
+    /// so a composite is never reported at rest while a run it is made of is still going.
     ///
     /// The walk is over the runs this workflow holds, bounded by [`MAX_RUNS_PER_WORKFLOW`],
     /// each naming the actions of one trigger.
@@ -2600,9 +2612,12 @@ impl ComAmazonawsGlueAwsglueState {
                 })
                 .filter(|job_run| !job_run.is_terminal())
                 .map(|job_run| {
-                    job_run.settles_at.unwrap_or_else(|| {
-                        now.checked_add(JOB_RUN_SETTLES_AFTER).unwrap_or(now)
-                    })
+                    job_run
+                        .settles_at
+                        .filter(|due| *due > now)
+                        .unwrap_or_else(|| {
+                            now.checked_add(JOB_RUN_SETTLES_AFTER).unwrap_or(now)
+                        })
                 })
                 .max();
             if let Some(latest) = latest {

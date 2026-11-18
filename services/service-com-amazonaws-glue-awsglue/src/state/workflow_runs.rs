@@ -129,7 +129,9 @@ pub struct WorkflowRunEntry {
     /// with it.
     pub error_message: Option<String>,
     /// `WorkflowRunStatistics$TotalActions`: "Total number of Actions in the workflow run",
-    /// which are the actions the trigger that began the run initiates.
+    /// which are the actions the trigger that began the run initiates, plus the actions of
+    /// every gate that has since FIRED inside this run ([`Self::record_trigger_firing`]) —
+    /// each of those is an action of this run too.
     pub total_actions: i32,
     /// The job runs this run's actions began, in the order they were initiated.
     ///
@@ -137,6 +139,16 @@ pub struct WorkflowRunEntry {
     /// reports about it, is read out of the job definition the run belongs to, so a read of
     /// this workflow run reports what the clock has since made of each of its actions.
     pub action_job_runs: Vec<ActionJobRun>,
+    /// The names of the triggers that have already FIRED inside this run.
+    ///
+    /// A run begins at ONE trigger and then passes through the gates of its workflow as the
+    /// states their predicates name are reached
+    /// ([`ComAmazonawsGlueAwsglueState::fire_satisfied_conditional_triggers`]); a predicate
+    /// stays satisfied once it has been, so without this record every later read of the run
+    /// would initiate the same gate's actions again. It is bookkeeping about the run's
+    /// progress through its workflow and no part of what a read reports, and it is bounded by
+    /// the triggers one workflow holds.
+    pub fired_triggers: BTreeSet<String>,
 }
 
 impl WorkflowRunEntry {
@@ -195,7 +207,30 @@ impl WorkflowRunEntry {
             // The actions are initiated by the call that began this run, which records what
             // they began ([`ComAmazonawsGlueAwsglueState::record_workflow_run_job_runs`]).
             action_job_runs: Vec::new(),
+            // A run has passed through no gate of its workflow yet: it has only just begun at
+            // its entry point.
+            fired_triggers: BTreeSet::new(),
         }
+    }
+
+    /// Whether the trigger `trigger_name` has already fired inside this run.
+    pub fn has_fired_trigger(&self, trigger_name: &str) -> bool {
+        self.fired_triggers.contains(trigger_name)
+    }
+
+    /// Record that the trigger `trigger_name` has FIRED inside this run, initiating `actions`
+    /// actions of it.
+    ///
+    /// "Total number of Actions in the workflow run" grows by what the firing initiates,
+    /// because those actions are actions of this run — they run inside it, their job runs are
+    /// counted in its statistics and reported under the `JOB` nodes of its graph, and it comes
+    /// to rest only once they have. A trigger that has already fired in this run records
+    /// nothing further and counts nothing twice.
+    pub fn record_trigger_firing(&mut self, trigger_name: &str, actions: i32) {
+        if !self.fired_triggers.insert(trigger_name.to_string()) {
+            return;
+        }
+        self.total_actions = self.total_actions.saturating_add(actions);
     }
 
     /// Whether this run has finished, by [`TERMINAL_WORKFLOW_RUN_STATUSES`].

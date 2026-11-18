@@ -178,6 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut named = ::std::collections::BTreeSet::new();
             for name in &input.names {
                 store.settle_due_event_batches(&region, name, now);
+                // A CONDITIONAL trigger of a workflow fires inside a run of it the instant
+                // that run's own job runs satisfy its predicate, and the run that gate's
+                // actions begin owes its script an execution like any other — so everything
+                // the clock already owes this workflow's runs is materialised FIRST too, and a
+                // stage a predicate opened in this very request is performed by the step below
+                // rather than left owed to a later call.
+                store.settle_due_workflow_runs(&region, name, now);
                 named.extend(store.action_job_run_job_names(name));
             }
             named.into_iter().collect()

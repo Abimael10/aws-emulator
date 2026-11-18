@@ -195,6 +195,19 @@ impl TriggerEntry {
         self.trigger_type == TRIGGER_TYPE_EVENT && self.state != TRIGGER_STATE_DEACTIVATED
     }
 
+    /// Whether this trigger is WATCHING a predicate, so the states its conditions name can
+    /// fire it.
+    ///
+    /// Only a `CONDITIONAL` trigger has a predicate to be satisfied — every other
+    /// `TriggerType` fires on a caller, the clock or an event — and it watches it only once
+    /// something has armed it: "set to true to start SCHEDULED and CONDITIONAL triggers when
+    /// created" (`CreateTriggerRequest$StartOnCreation`) and "starts an existing trigger"
+    /// (`StartTrigger`) are what leave it in [`TRIGGER_STATE_ACTIVATED`], while a trigger left
+    /// in [`TRIGGER_STATE_CREATED`] and one a stop deactivated are watching nothing.
+    pub fn watches_a_predicate(&self) -> bool {
+        self.trigger_type == TRIGGER_TYPE_CONDITIONAL && self.state == TRIGGER_STATE_ACTIVATED
+    }
+
     /// How many events have to arrive before this trigger fires: "Number of events that
     /// must be received from Amazon EventBridge before EventBridge event trigger fires"
     /// (`EventBatchingCondition$BatchSize`), and [`DEFAULT_EVENT_BATCH_SIZE`] for a trigger
