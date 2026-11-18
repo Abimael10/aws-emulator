@@ -348,32 +348,35 @@ fn serves_the_wire(engine: &str) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 struct Identity {
     resource_id: String,
-    /// The cluster's reader endpoint, which is its own whichever form it takes: the address
-    /// of the read-only listener a served cluster opened, or the DNS name carrying the
-    /// server-assigned label.
-    reader_endpoint: String,
+    /// The DNS name the cluster's reader endpoint carries the server-assigned label in, for
+    /// a cluster that publishes one; `None` for a cluster whose data plane this emulator
+    /// SERVES, which publishes the host that plane is reached at instead — one address of
+    /// this machine, which is not a value minted per cluster.
+    reader_endpoint: Option<String>,
     arn: String,
 }
 
 /// The cluster's READER endpoint, asserting its published form on the way.
 ///
-/// A cluster whose engine this emulator serves publishes the address of its own engine
-/// listeners — the writer's host as `Endpoint`, and the read-only listener's `host:port` as
-/// the reader endpoint, which carries no port member of its own (see
+/// A cluster whose engine this emulator serves publishes the HOST its own engine listeners
+/// are reached at, in both endpoint members: the model gives a DB cluster one `Port` for the
+/// pair, so neither member carries a port of its own (see
 /// `state::data_plane::cluster_endpoint`). Every other cluster publishes the documented DNS
 /// form `<identifier>.cluster-ro-<label>.<region>.<domain>`, where the server-assigned label
 /// is visible.
-fn reader_endpoint(case: &str, identifier: &str, serves_the_wire: bool, endpoint: &str) -> String {
+fn reader_endpoint(
+    case: &str,
+    identifier: &str,
+    serves_the_wire: bool,
+    endpoint: &str,
+) -> Option<String> {
     if serves_the_wire {
-        assert!(
-            endpoint
-                .strip_prefix("127.0.0.1:")
-                .and_then(|port| port.parse::<u16>().ok())
-                .is_some_and(|port| port != 0),
-            "case {case:?}: expected the address of the cluster's read-only listener, got \
+        assert_eq!(
+            endpoint, "127.0.0.1",
+            "case {case:?}: expected the host the cluster's data plane is reached at, got \
              {endpoint:?}"
         );
-        return endpoint.to_string();
+        return None;
     }
     let prefix = format!("{identifier}.cluster-ro-");
     let suffix = format!(".{REGION}.");
@@ -394,7 +397,7 @@ fn reader_endpoint(case: &str, identifier: &str, serves_the_wire: bool, endpoint
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
         "case {case:?}: expected a 12-character server-assigned endpoint label, got {label:?}"
     );
-    endpoint.to_string()
+    Some(endpoint.to_string())
 }
 
 /// The identity one cluster envelope reports, asserting the published form of each member
@@ -479,11 +482,20 @@ async fn every_cluster_is_minted_an_identity_of_its_own() {
                 "clusters {left} and {right} were minted the same DbClusterResourceId {:?}",
                 left_identity.resource_id
             );
-            assert_ne!(
-                left_identity.reader_endpoint, right_identity.reader_endpoint,
-                "clusters {left} and {right} publish the same reader endpoint {:?}",
-                left_identity.reader_endpoint
-            );
+            // The DNS name a cluster publishes carries a label minted for that cluster, so
+            // no two of them are the same. A cluster whose data plane this emulator serves
+            // publishes the one address that plane is reached at instead, which is not a
+            // minted value and is not compared here.
+            if let (Some(left_reader), Some(right_reader)) = (
+                left_identity.reader_endpoint.as_deref(),
+                right_identity.reader_endpoint.as_deref(),
+            ) {
+                assert_ne!(
+                    left_reader, right_reader,
+                    "clusters {left} and {right} publish the same reader endpoint \
+                     {left_reader:?}"
+                );
+            }
             assert_ne!(
                 left_identity.arn, right_identity.arn,
                 "clusters {left} and {right} report the same ARN {:?}",

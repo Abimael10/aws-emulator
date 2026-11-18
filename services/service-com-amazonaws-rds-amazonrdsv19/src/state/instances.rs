@@ -122,6 +122,14 @@ pub struct DbInstanceRecord {
     /// longer used to create new DB instances."
     pub db_security_group_names: Vec<String>,
     pub db_cluster_identifier: Option<String>,
+    /// `PromotionTier`: "the order of priority in which an Aurora Replica is promoted to
+    /// the primary instance after a failure of the existing primary instance" — what the
+    /// request set, else the documented default [`DEFAULT_PROMOTION_TIER`].
+    ///
+    /// Stored for every instance, because every request that creates or modifies one can
+    /// name it, and reported for the instances it orders: the members of a DB cluster
+    /// ([`Self::promotion_tier`]).
+    pub promotion_tier: i32,
     /// `ReadReplicaSourceDBInstanceIdentifier` — "the identifier of the source DB instance
     /// if this DB instance is a read replica", as `CreateDBInstanceReadReplica` resolved it,
     /// and `None` for an instance that replicates nothing.
@@ -590,6 +598,20 @@ impl DbInstanceRecord {
         }
     }
 
+    /// `PromotionTier`: "the order of priority in which an Aurora Replica is promoted to
+    /// the primary instance after a failure of the existing primary instance."
+    ///
+    /// The order is the one a DB CLUSTER promotes its members in, so it is reported for an
+    /// instance that belongs to one and not for an instance that belongs to none — the same
+    /// reading [`Self::db_instance_port`] takes of the port a cluster member listens on.
+    /// A cluster member always reports one, the value the request set or the documented
+    /// default ([`DEFAULT_PROMOTION_TIER`]), which is what the stored value holds.
+    pub fn promotion_tier(&self) -> Option<i32> {
+        self.db_cluster_identifier
+            .as_ref()
+            .map(|_| self.promotion_tier)
+    }
+
     /// `LatestRestorableTime`: "the latest time to which a database in this DB instance
     /// can be restored with point-in-time restore."
     ///
@@ -787,6 +809,9 @@ impl DbInstanceRecord {
             publicly_accessible: Some(self.publicly_accessible),
             storage_type: Some(self.storage_type.clone()),
             db_instance_port: Some(self.db_instance_port()),
+            // `PromotionTier`: the failover order of a cluster member
+            // ([`Self::promotion_tier`]).
+            promotion_tier: self.promotion_tier(),
             db_cluster_identifier: self.db_cluster_identifier.clone(),
             storage_encrypted: Some(self.storage_encrypted),
             kms_key_id: self.kms_key_id.clone(),

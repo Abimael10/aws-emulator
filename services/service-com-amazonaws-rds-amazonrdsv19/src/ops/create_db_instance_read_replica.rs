@@ -710,6 +710,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A replica belongs to no DB cluster: it is a standalone DB instance that
                 // replicates another.
                 db_cluster_identifier: None,
+                // `PromotionTier` is not a member of this operation, so a replica is created
+                // with the documented default rather than with the source's order.
+                promotion_tier: crate::state::DEFAULT_PROMOTION_TIER,
                 domain: input.domain.clone().or(source.domain.clone()),
                 ca_certificate_identifier: input
                     .ca_certificate_identifier
@@ -1393,6 +1396,8 @@ fn resolve_source_cluster(
         // The replica is a STANDALONE DB instance that replicates the cluster: it is not a
         // member of it, which is what keeps it out of `DBClusterMembers`.
         db_cluster_identifier: None,
+        // `PromotionTier` is not a member of this operation; see the sibling settings above.
+        promotion_tier: crate::state::DEFAULT_PROMOTION_TIER,
         read_replica_source_db_instance_identifier: None,
         read_replica_source_db_cluster_identifier: None,
         read_replica_db_instance_identifiers: Vec::new(),

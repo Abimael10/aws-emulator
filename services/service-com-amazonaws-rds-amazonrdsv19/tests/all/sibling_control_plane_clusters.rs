@@ -227,13 +227,13 @@ fn assert_engine_defaults(case: &str, label: &str, cluster: &str, row: &EngineCa
         );
     }
     let reader = text(cluster, "ReaderEndpoint");
-    // The READER endpoint of such a cluster is its read-only listener's own address, written
-    // whole (`host:port`) because the `Port` beside it is the writer's; every other
-    // cluster's is the published DNS form.
+    // The READER endpoint of such a cluster is a HOST too — the one the cluster's data plane
+    // is reached at, since the `Port` beside it is the pair's; every other cluster's is the
+    // published DNS form.
     if row.serves_the_engines_wire {
-        assert!(
-            reader.starts_with("127.0.0.1:"),
-            "case {case:?}: expected the address of the cluster's read-only listener, got \
+        assert_eq!(
+            reader, "127.0.0.1",
+            "case {case:?}: expected the host the cluster's data plane is reached at, got \
              {reader:?} in {cluster}"
         );
     } else {

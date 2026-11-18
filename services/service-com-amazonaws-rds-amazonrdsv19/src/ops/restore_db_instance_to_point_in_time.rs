@@ -872,6 +872,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A restored DB instance is a standalone instance: it joins no DB cluster,
                 // which this operation has no member to name either.
                 db_cluster_identifier: None,
+                // `PromotionTier` is not a member of this operation, so a restored instance
+                // carries the documented default.
+                promotion_tier: crate::state::DEFAULT_PROMOTION_TIER,
                 domain: input.domain.clone().or_else(|| source.domain.clone()),
                 ca_certificate_identifier: input
                     .ca_certificate_identifier

@@ -398,10 +398,10 @@ impl DbClusterEndpointRecord {
     /// accessor rather than copying it, so the two can never disagree. Reporting a name
     /// this machine does not resolve would be no endpoint at all.
     ///
-    /// That is the address the cluster's `Port` goes with, for a `READER` endpoint as much
-    /// as for the other two types: this member carries no port of its own, so the
-    /// read-only listener — which has one, and publishes it as the cluster's own
-    /// `ReaderEndpoint` — is not what a custom endpoint can hand a client here.
+    /// That is the host the cluster's `Port` goes with, for a `READER` endpoint as much as
+    /// for the other two types: no endpoint member of this control plane carries a port of
+    /// its own, so every name in front of a cluster's data plane publishes the host that
+    /// plane is reached at, exactly as the cluster's own two endpoints do.
     fn address_on(&self, cluster: &DbClusterRecord) -> String {
         if cluster.served_endpoint.is_some() {
             return cluster.endpoint();

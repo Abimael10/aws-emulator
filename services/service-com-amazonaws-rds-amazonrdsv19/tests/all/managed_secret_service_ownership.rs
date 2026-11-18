@@ -9,7 +9,7 @@
 //!
 //! * the secret is NAMED under the prefix AWS reserves for the owning service
 //!   (`crate`'s `state::MANAGED_SECRET_NAME_PREFIX`), a form no caller can mint, and then
-//!   the kind of resource it belongs to and that resource's immutable resource id;
+//!   the kind of resource it belongs to and a UUID of the secret's own;
 //! * `DescribeSecret` reports `OwningService` as that service's id — "The ID of the service
 //!   that created this secret";
 //! * the secret carries the AWS-applied tag naming the ARN of the resource whose master
@@ -43,6 +43,22 @@ use crate::managed_master_user_password::{
 enum Owner {
     Instance,
     Cluster,
+}
+
+/// Whether `value` is written as a UUID — the 8-4-4-4-12 lowercase-hexadecimal form AWS
+/// names a secret it manages with.
+fn is_uuid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .map(|group| group.len())
+            .eq([8, 4, 4, 4, 12])
+        && groups.iter().all(|group| {
+            group
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
 }
 
 impl Owner {
@@ -209,8 +225,8 @@ async fn a_managed_master_user_secret_is_named_owned_and_tagged_by_rds() {
                 )
             });
 
-        // 1. The reserved name: `rds!<kind>-<resource id>`, carrying the resource's own
-        //    immutable id, and a form no caller can mint.
+        // 1. The reserved name: `rds!<kind>-<uuid>`, a form no caller can mint, carrying
+        //    the opaque id AWS names a managed secret by rather than the resource's own.
         let name = described.name().unwrap_or_default().to_string();
         let expected_prefix = format!(
             "{}{}",
@@ -230,10 +246,15 @@ async fn a_managed_master_user_secret_is_named_owned_and_tagged_by_rds() {
                 Owner::Cluster => "DbClusterResourceId",
             },
         );
-        assert_eq!(
-            name,
-            format!("{expected_prefix}{resource_id}"),
-            "case {:?}: expected the secret's name to carry the resource's own id \
+        let uuid = name.strip_prefix(&expected_prefix).unwrap_or_default();
+        assert!(
+            is_uuid(uuid),
+            "case {:?}: expected the secret's name to carry a UUID, got {name:?}",
+            row.case
+        );
+        assert!(
+            !name.contains(&resource_id),
+            "case {:?}: a managed secret's name carries an opaque id, not the resource's own \
              {resource_id:?}, got {name:?}",
             row.case
         );
@@ -342,16 +363,22 @@ async fn a_tenant_databases_managed_secret_is_owned_by_rds_too() {
         .unwrap_or_else(|error| {
             panic!("case {case:?}: Secrets Manager holds no secret at {secret_arn}: {error}")
         });
-    assert_eq!(
-        described.name(),
-        Some(
-            format!(
-                "{}tenantdb-{resource_id}-emutenant",
+    assert!(
+        described
+            .name()
+            .and_then(|name| name.strip_prefix(&format!(
+                "{}tenantdb-",
                 st::MANAGED_SECRET_NAME_PREFIX
-            )
-            .as_str()
-        ),
-        "case {case:?}: expected the reserved name carrying the instance's own id, got {:?}",
+            )))
+            .is_some_and(is_uuid),
+        "case {case:?}: expected the reserved name carrying a UUID of the secret's own, got \
+         {:?}",
+        described.name()
+    );
+    assert!(
+        !described.name().unwrap_or_default().contains(&resource_id),
+        "case {case:?}: a managed secret's name carries an opaque id, not the instance's own \
+         {resource_id:?}, got {:?}",
         described.name()
     );
     assert_eq!(

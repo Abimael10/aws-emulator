@@ -155,9 +155,9 @@ fn assert_published_address(case: &str, label: &str, cluster: &str, row: &Addres
                 "case {case:?}: expected the host the cluster's own engine listener is bound \
                  to, got {endpoint:?} in {cluster}"
             );
-            assert!(
-                reader.starts_with("127.0.0.1:"),
-                "case {case:?}: expected the address of the cluster's read-only listener, got \
+            assert_eq!(
+                reader, "127.0.0.1",
+                "case {case:?}: expected the host the cluster's data plane is reached at, got \
                  {reader:?} in {cluster}"
             );
             assert!(

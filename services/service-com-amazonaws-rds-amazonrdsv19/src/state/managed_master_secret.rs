@@ -122,18 +122,40 @@ pub const MANAGED_SECRET_NAME_PREFIX: &str = "rds!";
 
 /// The name of the secret RDS manages for a DB CLUSTER's master user password.
 ///
-/// It carries the cluster's immutable `DbClusterResourceId` rather than its identifier,
-/// which can be renamed, so the secret of a cluster is still the secret of that cluster
-/// afterwards, under the reserved prefix every RDS-managed secret carries
-/// ([`MANAGED_SECRET_NAME_PREFIX`]) and then the kind of resource it belongs to.
+/// AWS names a secret of its own under the reserved prefix every RDS-managed secret
+/// carries ([`MANAGED_SECRET_NAME_PREFIX`]), then the kind of resource it belongs to, then
+/// a UUID: `rds!cluster-<uuid>`. The fixed text is that prefix and the kind; the UUID is
+/// the secret's own and names no other resource of the account, so the cluster's immutable
+/// resource id is what it is derived from ([`managed_secret_uuid`]) rather than written
+/// into the name — a name carrying an RDS resource id is not the form AWS mints, and it is
+/// also not what the secret is addressed by: every later call reads the ARN Secrets
+/// Manager allocated, which the resource stores.
 pub fn cluster_master_user_secret_name(resource_id: &str) -> String {
-    format!("{MANAGED_SECRET_NAME_PREFIX}cluster-{resource_id}")
+    format!(
+        "{MANAGED_SECRET_NAME_PREFIX}cluster-{}",
+        managed_secret_uuid(resource_id)
+    )
 }
 
-/// The name of the secret RDS manages for a DB INSTANCE's master user password, carrying
-/// the instance's immutable `DbiResourceId`; see [`cluster_master_user_secret_name`].
+/// The name of the secret RDS manages for a DB INSTANCE's master user password:
+/// `rds!db-<uuid>`, derived from the instance's immutable `DbiResourceId`; see
+/// [`cluster_master_user_secret_name`] for the form these names share.
 pub fn instance_master_user_secret_name(resource_id: &str) -> String {
-    format!("{MANAGED_SECRET_NAME_PREFIX}db-{resource_id}")
+    format!(
+        "{MANAGED_SECRET_NAME_PREFIX}db-{}",
+        managed_secret_uuid(resource_id)
+    )
+}
+
+/// The UUID the name of one RDS-managed secret carries, derived from the immutable
+/// resource id of the resource whose master user password that secret holds.
+///
+/// Derived rather than stored, and from the one value of a resource that never changes, so
+/// the secret of a resource is still that resource's secret after a rename and two
+/// resources can never be given one name. Being a digest, it carries nothing of the
+/// resource id it was derived from, which is what makes it the opaque id AWS writes here.
+pub fn managed_secret_uuid(resource_id: &str) -> String {
+    super::uuid_of_seed(&format!("managed-master-user-secret:{resource_id}"))
 }
 
 /// The tag AWS applies to the secret RDS manages for a DB INSTANCE's master user

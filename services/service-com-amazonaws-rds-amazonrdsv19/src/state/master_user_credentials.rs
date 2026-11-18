@@ -113,6 +113,7 @@ mod tests {
             master_user_password: None,
             master_user_secret: None,
             endpoint_port: 3306,
+            promotion_tier: DEFAULT_PROMOTION_TIER,
             served_endpoint: None,
             multi_az: false,
             secondary_availability_zone: None,

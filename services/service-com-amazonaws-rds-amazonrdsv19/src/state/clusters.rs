@@ -403,24 +403,25 @@ impl DbClusterRecord {
     /// that are available in a DB cluster": the same form as [`Self::endpoint`] with the
     /// published `cluster-ro-` label.
     ///
-    /// A cluster whose engine this emulator SERVES publishes the address of the READ-ONLY
-    /// listener it opened instead, as `host:port`: the member carries no port of its own
-    /// (the `Port` beside it is the writer's), so the one address a client can dial the
-    /// cluster's replicas at is written whole — the same way every other data plane of this
-    /// emulator publishes a listener it opened
-    /// (`service_common::data_plane_addressing::listener_authority`).
+    /// A HOST, exactly as [`Self::endpoint`] is: the model gives a DB cluster ONE port
+    /// member for both of its endpoints (`DBCluster$Port`, "the port that the database
+    /// engine is listening on"), so neither endpoint member carries a port of its own and
+    /// neither is ever written as a `host:port` authority — a client composes the address it
+    /// dials from the endpoint and that one `Port`.
+    ///
+    /// A cluster whose data plane this emulator SERVES publishes the host that plane is
+    /// reached at, as the writer endpoint does: the address a client dials is this host with
+    /// the published `Port`, which is the cluster's own engine listener. That is also what
+    /// the reader endpoint of a cluster with no Aurora Replica available resolves to — there
+    /// is no replica to distribute a connection to — and the read-only sessions of a cluster
+    /// that HAS replicas are served on each replica's own endpoint, which publishes its own
+    /// address and port.
     pub fn reader_endpoint(&self) -> String {
-        if let Some(served) = &self.served_reader_endpoint {
-            return ::service_common::data_plane_addressing::host_port_authority(
-                &served.host,
-                u16::try_from(served.port).unwrap_or_default(),
-            );
-        }
-        if let Some(served) = &self.served_endpoint {
-            // A cluster whose whole data plane is served at ONE address — an engine served
-            // as an API on this emulator's own endpoint, which has no second read-only
-            // listener ([`crate::state::api_plane_endpoint`]) — answers reads there too, so
-            // the reader endpoint is that same host and the `Port` beside it is its port.
+        if let Some(served) = self
+            .served_reader_endpoint
+            .as_ref()
+            .or(self.served_endpoint.as_ref())
+        {
             return served.host.clone();
         }
         format!(

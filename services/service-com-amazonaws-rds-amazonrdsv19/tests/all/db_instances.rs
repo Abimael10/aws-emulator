@@ -66,13 +66,20 @@ const NO_PARAMS: [(&str, &str); 0] = [];
 /// `pub(crate)` so the sibling suites of this one test target drive the service through
 /// the same front door rather than standing up their own.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// [`emulator`] with the shared engine it was built on, for a suite that reads this
+/// service's own store — the address of a listener the core assigned, say, which no
+/// modelled member carries.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Verifying signatures is the emulator's concern, not this service's; these tests
     // sign nothing, so the check is off and the scope header is read for routing only.
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// The endpoint a client of this service's own AWS front door addresses, which is what

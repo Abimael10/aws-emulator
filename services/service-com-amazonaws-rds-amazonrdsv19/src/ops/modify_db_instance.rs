@@ -1024,6 +1024,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
             record.monitoring_interval = value;
         }
+        // `PromotionTier`: the failover order of a cluster member. `PendingModifiedValues`
+        // carries no member for it, so the change lands as soon as possible whatever
+        // `ApplyImmediately` says, like the settings around it.
+        if let Some(value) = input.promotion_tier {
+            changed = true;
+            record.promotion_tier = value;
+        }
         // The Performance Insights configuration: whether the instance collects that data,
         // the key it is encrypted under and how long it is retained — an instance that
         // collects none retains none, so turning the collection off clears the period the

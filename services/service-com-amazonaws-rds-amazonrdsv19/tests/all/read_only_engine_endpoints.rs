@@ -22,12 +22,16 @@
 //! insert, a row update, a row delete, a table create and a table drop) beside the reads
 //! the same session serves.
 
+use std::sync::Arc;
+
 use crate::db_clusters::{describe_one, the_cluster};
 use crate::db_instance_engine_endpoint::{
     available_instance, endpoint_of, mysql_login, postgres_login, Refusal, Rows, Transport,
     DATABASE, MASTER_PASSWORD, MASTER_USER,
 };
-use crate::db_instances::{call, emulator, expect_ok, text, wait_for_settle};
+use crate::db_instances::{
+    call, emulator, emulator_with_engine, expect_ok, text, wait_for_settle, REGION,
+};
 
 /// Which wire a row's resource is dialled on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +291,7 @@ const CLUSTERS: &[ClusterRow] = &[
 /// publishes and the reader address beside it.
 async fn available_cluster(
     router: &smithy_server_runtime::MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
     row: &ClusterRow,
 ) -> ((String, u16), (String, u16)) {
     let mut params: Vec<(&str, String)> = vec![
@@ -331,37 +336,61 @@ async fn available_cluster(
             text(&settled, "Port")
         )
     });
+    // Both endpoint members are HOSTS: the model gives a DB cluster ONE `Port` for the
+    // pair, so the reader endpoint carries no port of its own and publishes the host the
+    // cluster's data plane is reached at, as the writer endpoint does.
+    let reader_host = text(&settled, "ReaderEndpoint");
+    assert_eq!(
+        reader_host,
+        text(&settled, "Endpoint"),
+        "case {:?}: the reader endpoint publishes the host the cluster's data plane is \
+         reached at",
+        row.case
+    );
     (
         (text(&settled, "Endpoint"), writer_port),
-        dialled(row.case, &text(&settled, "ReaderEndpoint")),
+        (reader_host, reader_listener_port(engine, row)),
     )
 }
 
-/// The host and port a published reader endpoint is DIALLED at.
+/// The port the cluster's READ-ONLY listener answers on, read from this service's own
+/// store.
 ///
-/// The member carries no port of its own — the `Port` beside it is the writer's — so a
-/// cluster this emulator serves publishes the address of its read-only listener whole, as
-/// `host:port`, which is what a client on this machine can reach it at.
-fn dialled(case: &str, published: &str) -> (String, u16) {
-    let (host, port) = published.rsplit_once(':').unwrap_or_else(|| {
+/// The core assigns every listener its port and a DB cluster has ONE modelled `Port` —
+/// its engine endpoint's — so the second listener's port is not a value any member of the
+/// control plane carries: a suite that opens a session on that listener reads the port
+/// where the listener itself lives.
+fn reader_listener_port(engine: &Arc<engine::InMemoryEngine>, row: &ClusterRow) -> u16 {
+    let state = service_com_amazonaws_rds_amazonrdsv19::state::service_state(&**engine)
+        .expect("this service's store");
+    let store = state.lock();
+    let endpoint = store
+        .cluster_engine_endpoint(&(REGION.to_string(), row.identifier.to_string()))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {:?}: the cluster must have opened an engine endpoint",
+                row.case
+            )
+        });
+    let reader = endpoint.reader.as_ref().unwrap_or_else(|| {
         panic!(
-            "case {case:?}: the reader endpoint must publish an address a client can dial, got \
-             {published:?}"
+            "case {:?}: the cluster must have opened its read-only listener",
+            row.case
         )
     });
-    (
-        host.to_string(),
-        port.parse().unwrap_or_else(|_| {
-            panic!("case {case:?}: expected a port in {published:?}, got {port:?}")
-        }),
-    )
+    u16::try_from(reader.port).unwrap_or_else(|_| {
+        panic!(
+            "case {:?}: expected the read-only listener's port, got {}",
+            row.case, reader.port
+        )
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_clusters_reader_endpoint_serves_the_writers_rows_and_refuses_every_write() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     for row in CLUSTERS {
-        let (writer, reader) = available_cluster(&router, row).await;
+        let (writer, reader) = available_cluster(&router, &engine, row).await;
         assert_eq!(
             reader.0, writer.0,
             "case {:?}: both of a cluster's endpoints are listeners of this machine, got \
@@ -391,9 +420,9 @@ async fn a_clusters_reader_endpoint_serves_the_writers_rows_and_refuses_every_wr
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deleting_a_cluster_closes_the_reader_port_with_the_writer_one() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let row = &CLUSTERS[0];
-    let (writer, reader) = available_cluster(&router, row).await;
+    let (writer, reader) = available_cluster(&router, &engine, row).await;
     // Both endpoints serve while the cluster exists.
     {
         let _reads = login(row.case, row.wire, &reader.0, reader.1, row.database).await;

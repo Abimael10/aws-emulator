@@ -376,9 +376,8 @@ fn assert_reported(case: &str, label: &str, xml: &str, row: &ClusterCase) {
     // The cluster's WRITER endpoint is the address a client dials, so a cluster whose
     // engine this emulator serves publishes the host its own engine listener is bound to —
     // the core binds on loopback — and the port that listener answers on. Its READER
-    // endpoint is the address of the read-only listener beside it, written whole
-    // (`host:port`) because the `Port` member beside it is the writer's: a client dials the
-    // cluster's replicas there and is answered read-only.
+    // endpoint is a HOST too: the model gives a cluster ONE `Port` for both of its
+    // endpoints, so neither endpoint member carries a port of its own.
     let endpoint = text(xml, "Endpoint");
     assert_eq!(
         endpoint, "127.0.0.1",
@@ -392,13 +391,10 @@ fn assert_reported(case: &str, label: &str, xml: &str, row: &ClusterCase) {
          {port:?} in {xml}"
     );
     let reader = text(xml, "ReaderEndpoint");
-    assert!(
-        reader
-            .strip_prefix("127.0.0.1:")
-            .and_then(|port| port.parse::<u16>().ok())
-            .is_some_and(|reader_port| reader_port != 0 && reader_port.to_string() != port),
-        "case {case:?}: expected the address of the cluster's own read-only listener, got \
-         {reader:?} beside the writer's port {port:?} in {xml}"
+    assert_eq!(
+        reader, endpoint,
+        "case {case:?}: expected the host the cluster's data plane is reached at, got \
+         {reader:?} in {xml}"
     );
     let resource_id = text(xml, "DbClusterResourceId");
     assert!(

@@ -1113,9 +1113,11 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                     db_instance_identifier: Some(instance.identifier.clone()),
                     is_cluster_writer: Some(position == 0),
                     db_cluster_parameter_group_status: Some(MEMBERSHIP_IN_SYNC.to_string()),
-                    // `PromotionTier` is a property of the MEMBER instance that no
-                    // implemented operation stores, so it is left out rather than invented.
-                    ..DBClusterMember::default()
+                    // `PromotionTier` is "the order in which an Aurora Replica is promoted
+                    // to the primary instance": a property of the MEMBER instance, read off
+                    // that instance's own record, so this member and the `PromotionTier`
+                    // the instance itself reports are one answer.
+                    promotion_tier: instance.promotion_tier(),
                 })
                 .collect(),
             // "Contains one or more identifiers of the read replicas associated with this
@@ -3345,9 +3347,17 @@ pub fn check_region(region: &str) -> Result<(), String> {
 /// one resource rather than to that resource's position in a creation sequence. The digest
 /// is the maintained `sha2` crate's, so nothing here is hand-rolled.
 pub fn mint_uuid_token(label: &str, mint: u64) -> String {
+    uuid_of_seed(&mint_seed(label, mint))
+}
+
+/// The 8-4-4-4-12 lowercase-hexadecimal UUID of `seed`, derived from its digest and from
+/// nothing else — so a value minted for one seed is the same every time any read asks for
+/// it, which is what lets a UUID be derived from a resource's own immutable id rather than
+/// stored beside it. [`mint_uuid_token`] is this reading over the store's counter.
+pub fn uuid_of_seed(seed: &str) -> String {
     use ::sha2::{Digest, Sha256};
 
-    let digest = Sha256::digest(mint_seed(label, mint));
+    let digest = Sha256::digest(seed);
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     let hex = ::hex::encode(bytes);
@@ -3770,6 +3780,12 @@ pub const DEFAULT_CLUSTER_AUTO_MINOR_VERSION_UPGRADE: bool = true;
 /// `UpgradeRolloutOrder` "[second] - Default order for resources not specifically
 /// configured". No operation this service implements configures it.
 pub const DEFAULT_UPGRADE_ROLLOUT_ORDER: &str = "second";
+
+/// The failover order of a DB instance whose request named none:
+/// `CreateDBInstanceMessage$PromotionTier` — "the order of priority in which an Aurora
+/// Replica is promoted to the primary instance after a failure of the existing primary
+/// instance … Default: `1`".
+pub const DEFAULT_PROMOTION_TIER: i32 = 1;
 
 /// The status RDS reports for a group membership that is in effect — the
 /// `ParameterApplyStatus` of an applied DB parameter group and the `Status` of an

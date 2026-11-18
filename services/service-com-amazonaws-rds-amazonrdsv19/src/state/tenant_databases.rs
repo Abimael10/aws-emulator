@@ -79,17 +79,18 @@ pub fn mint_tenant_database_resource_id(mint: u64) -> String {
 }
 
 /// The name of the secret RDS manages for a TENANT DATABASE's master user password: the
-/// tenant database is addressed by its DB instance and its own name, which is what names
-/// the secret, carrying the instance's immutable `DbiResourceId` — under the same reserved
-/// prefix every secret RDS manages carries; see
-/// [`super::cluster_master_user_secret_name`] for the form these names share.
+/// tenant database is addressed by its DB instance and its own name, so the secret of one
+/// is named for that pair — under the same reserved prefix and in the same form every
+/// secret RDS manages takes, a UUID derived from the resource whose credential it holds;
+/// see [`super::cluster_master_user_secret_name`] for the form these names share.
 pub fn tenant_database_master_user_secret_name(
     dbi_resource_id: &str,
     tenant_db_name: &str,
 ) -> String {
     format!(
-        "{}tenantdb-{dbi_resource_id}-{tenant_db_name}",
-        super::MANAGED_SECRET_NAME_PREFIX
+        "{}tenantdb-{}",
+        super::MANAGED_SECRET_NAME_PREFIX,
+        super::managed_secret_uuid(&format!("{dbi_resource_id}/{tenant_db_name}"))
     )
 }
 

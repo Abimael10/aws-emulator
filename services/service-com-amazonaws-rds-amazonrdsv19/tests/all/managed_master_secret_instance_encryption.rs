@@ -260,7 +260,7 @@ async fn a_managed_master_user_secret_is_listed_and_keyed_as_the_request_asked()
 
         // 3. Secrets Manager really holds that secret, and LISTS it for the account: a
         //    client scanning the account's secrets finds the managed one, owned by RDS and
-        //    named after the instance's own immutable id.
+        //    named in the reserved form AWS gives a secret of its own.
         let entry = listed_secret(row.case, &router, &secret_arn).await;
         assert_eq!(
             entry.owning_service(),
@@ -268,14 +268,20 @@ async fn a_managed_master_user_secret_is_listed_and_keyed_as_the_request_asked()
             "case {:?}: expected the listed secret to be owned by RDS, got {entry:?}",
             row.case
         );
-        let resource_id = text(&envelope, "DbiResourceId");
-        let expected_name = format!("{}db-{resource_id}", st::MANAGED_SECRET_NAME_PREFIX);
-        assert_eq!(
-            entry.name(),
-            Some(expected_name.as_str()),
-            "case {:?}: expected the listed secret to be named {expected_name:?}, got {:?}",
+        let expected_prefix = format!("{}db-", st::MANAGED_SECRET_NAME_PREFIX);
+        assert!(
+            entry
+                .name()
+                .is_some_and(|name| name.starts_with(&expected_prefix)),
+            "case {:?}: expected the listed secret to be named {expected_prefix:?}<uuid>, got \
+             {:?}",
             row.case,
             entry.name()
+        );
+        assert!(
+            secret_arn.contains(entry.name().unwrap_or_default()),
+            "case {:?}: expected the secret's ARN to carry its name, got {secret_arn:?}",
+            row.case
         );
 
         // 4. And the key Secrets Manager holds for it is that same key: a secret that names

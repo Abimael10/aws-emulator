@@ -15,11 +15,16 @@
 //! endpoint "load-balances connections across the Aurora Replicas that are available in a DB
 //! cluster", and those replicas are read-only instances reading the same cluster volume: it
 //! is a second listener of the same engine over the same storage, whose sessions are answered
-//! read-only ([`super::EndpointRole`], [`super::read_only`]). A member instance's endpoint is
-//! a third kind of address onto that one volume — "each Aurora DB cluster hosts copies of its
-//! data" — and it serves writes exactly while that member is the one the cluster writes
-//! through, which `FailoverDBCluster` moves ([`serves_reads_only`]). A cluster whose engine
-//! speaks neither wire publishes the DNS name for all of them, and gets no listener for any.
+//! read-only ([`super::EndpointRole`], [`super::read_only`]). The control plane publishes a
+//! HOST for each of the cluster's two endpoints and ONE `Port` beside them — the cluster's
+//! own engine listener's — because that is all the model carries for the pair
+//! ([`crate::state::DbClusterRecord::reader_endpoint`]); the read-only listener's own port is
+//! no member of it. A member instance's endpoint is a third kind of address onto that one
+//! volume — "each Aurora DB cluster hosts copies of its data" — published with its own
+//! address AND port, and it serves writes exactly while that member is the one the cluster
+//! writes through, which `FailoverDBCluster` moves ([`serves_reads_only`]). A cluster whose
+//! engine speaks neither wire publishes the DNS name for all of them, and gets no listener
+//! for any.
 //!
 //! Everything a session on such a listener needs is the same as on a DB instance's — the
 //! two wires, the SQL engine, the server statements are shared — except WHERE the facts of

@@ -250,9 +250,14 @@ pub struct ServedEndpoint {
 pub struct DbEngineEndpoint {
     /// Where the control plane publishes it.
     pub endpoint: ServedEndpoint,
-    /// Where the control plane publishes this engine's READ-ONLY endpoint, for a resource
-    /// that has one: a DB cluster's reader endpoint. `None` for a resource that publishes
-    /// only the one address ([`EndpointRole`]).
+    /// Where this engine's READ-ONLY endpoint listens, for a resource that has one: a DB
+    /// cluster's reader endpoint. `None` for a resource that opens only the one listener
+    /// ([`EndpointRole`]).
+    ///
+    /// The control plane publishes the HOST of this listener as the cluster's
+    /// `ReaderEndpoint` and ONE `Port` for both endpoints — its engine endpoint's — which is
+    /// all the modelled envelope carries for the pair
+    /// ([`crate::state::DbClusterRecord::reader_endpoint`]).
     pub reader: Option<ServedEndpoint>,
     /// Which protocol the listener speaks.
     pub wire: EngineWire,

@@ -869,6 +869,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
             db_security_group_names: input.db_security_groups.unwrap_or_default(),
             db_cluster_identifier,
+            // `PromotionTier`: the failover order the request asked for, else "Default:
+            // `1`".
+            promotion_tier: input
+                .promotion_tier
+                .unwrap_or(crate::state::DEFAULT_PROMOTION_TIER),
             // Nothing is replicated: a DB instance this operation creates replicates no
             // source — neither a DB instance nor a Multi-AZ DB cluster — and a replica of it
             // exists only once `CreateDBInstanceReadReplica` has created one.
