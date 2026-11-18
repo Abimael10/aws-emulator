@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation patches the stored job this service holds under its queue
+//! and farm, and is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every member the request carries replaces what the job held for it and every member it
+//! leaves out leaves the job alone; `targetTaskRunStatus` and `lifecycleStatus` ask the
+//! service to move the job rather than to store a value, so both are applied through
+//! `crate::state::Job`'s own moves ([`crate::state::Job::retarget`] and
+//! [`crate::state::Job::archive`]).
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +170,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateJob"))
+        // A `maxWorkerCount` of 0 describes a job no worker may process, which the member
+        // is documented not to accept: refused before the store is reached, so nothing of
+        // the request is applied (see `crate::state::zero_max_worker_count`).
+        if input.max_worker_count == Some(0) {
+            return Err(UpdateJobErrorModeled::ValidationException(
+                crate::state::zero_max_worker_count(),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateJobErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // `clientToken` is `@idempotencyToken` — the token the server recognizes retries of
+        // the same request by. An update is addressed at ONE job, so the token is scoped to
+        // the job rather than to its queue: the same token spent on two jobs of one queue is
+        // two updates, and a later retry of either is still recognized as the retry it is.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, &input.job_id, token));
+        let remembered = token
+            .as_deref()
+            .and_then(|key| store.remembered_resource(key).map(str::to_string));
+
+        // A job is reached only through its own queue and farm, so each missing level of
+        // the path is a 404 naming that level and nothing is written.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(UpdateJobErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        if store.queue(&input.farm_id, &input.queue_id).is_none() {
+            return Err(UpdateJobErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+            )
+            .into());
+        }
+        let updated_by = crate::state::caller_principal(&*self.engine, ctx);
+        // The update patches the job as it stands NOW, so every move the clock already made
+        // due is materialised first — each was owed at this instant whether or not anybody
+        // called — and this request's patch is applied on top of the result.
+        store.settle_jobs(&input.farm_id, &input.queue_id);
+        let Some(job) = store.job_mut(&input.farm_id, &input.queue_id, &input.job_id) else {
+            return Err(UpdateJobErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_JOB, &input.job_id),
+            )
+            .into());
+        };
+
+        // A retry of an update already applied to this very job answers as that update did
+        // and writes nothing again, so the job keeps the `updatedAt` of the call the caller
+        // actually made.
+        if remembered.as_deref() == Some(input.job_id.as_str()) {
+            return Ok(UpdateJobOutput {});
+        }
+
+        // An archived job is at the end of its life — it can't be scheduled, can't be
+        // archived again and can't be recovered — so no later update of it is accepted and
+        // the refusal names the status it is in.
+        if job.archived() {
+            return Err(UpdateJobErrorModeled::ConflictException(
+                crate::state::job_archived(&input.job_id),
+            )
+            .into());
+        }
+
+        // Every member the request carries replaces what the job held for it, and every
+        // member it leaves out leaves the job's own value alone: the operation is bound to
+        // `PATCH /2023-10-12/farms/{farmId}/queues/{queueId}/jobs/{jobId}`, so an update of
+        // one member is not an erasure of the others.
+        if let Some(name) = input.name {
+            job.name = name;
+        }
+        if let Some(description) = input.description {
+            // The request's `description` is `len 0..2048` while a read of a job reports
+            // `len 1..2048`, so the empty string is how an update takes the description off
+            // the job rather than a description it could report back — the same value a
+            // create stores no description for.
+            job.description = (!description.is_empty()).then_some(description);
+        }
+        if let Some(priority) = input.priority {
+            job.priority = priority;
+        }
+        if let Some(max_failed_tasks_count) = input.max_failed_tasks_count {
+            job.max_failed_tasks_count = max_failed_tasks_count;
+        }
+        if let Some(max_retries_per_task) = input.max_retries_per_task {
+            job.max_retries_per_task = max_retries_per_task;
+        }
+        if let Some(max_worker_count) = input.max_worker_count {
+            job.max_worker_count = Some(max_worker_count);
+        }
+        // The two members that ask the service to DO something to the job rather than to
+        // store a value for it are applied through the state's own moves: the asked-for task
+        // run status is worked through the job's tasks over the span the clock owes that
+        // update, and archiving ends the job's life at once.
+        if let Some(target_task_run_status) = input.target_task_run_status {
+            job.retarget(target_task_run_status);
+        }
+        // `UpdateJobLifecycleStatus` holds ARCHIVED and nothing else, so a request that
+        // carries the member at all is a request to archive the job. Applied last, so an
+        // update that both retargets and archives leaves the job archived.
+        if input.lifecycle_status.is_some() {
+            job.archive();
+        }
+        job.updated_at = Some(::std::time::SystemTime::now());
+        job.updated_by = Some(updated_by);
+
+        if let Some(key) = token {
+            store.remember_resource(key, &input.job_id);
+        }
+
+        Ok(UpdateJobOutput {})
     }
 }

@@ -188,6 +188,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only the template THIS request carries is ever parsed. When the template comes
         // from a source job instead, that job's name was resolved and stored when IT was
         // created, so it is read from state rather than parsed again.
+        // A job's `maxWorkerCount` of 0 is refused wherever it arrives (see
+        // `crate::state::zero_max_worker_count`), before anything is read or stored.
+        if input.max_worker_count == Some(0) {
+            return Err(CreateJobErrorModeled::ValidationException(
+                crate::state::zero_max_worker_count(),
+            )
+            .into());
+        }
         if input.template.is_some() && input.template_type.is_none() {
             return Err(CreateJobErrorModeled::ValidationException(
                 crate::state::field_validation_failed(
@@ -441,6 +449,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             reconcile_due_at: Some(
                 ::std::time::Instant::now() + crate::state::JOB_RECONCILE_AFTER,
             ),
+            // Nothing has asked this job's tasks for another run status yet, so no update
+            // move is owed (see `crate::state::JOB_UPDATE_SUCCEEDED_AFTER`).
+            update_due_at: None,
             steps,
             environments,
             work_fully_read,

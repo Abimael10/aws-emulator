@@ -118,8 +118,36 @@ pub const JOB_LIFECYCLE_CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 pub const JOB_CREATE_COMPLETE_AFTER: Duration = Duration::from_millis(500);
 
 /// `JobLifecycleStatus` a job reaches once the service has reconciled the created job
-/// against what its queue can schedule onto.
+/// against what its queue can schedule onto, and once it has worked an update through the
+/// job's tasks.
 pub const JOB_LIFECYCLE_UPDATE_SUCCEEDED: &str = "UPDATE_SUCCEEDED";
+
+/// `JobLifecycleStatus` a job carries while the service is working an asked-for task run
+/// status through its tasks.
+///
+/// From `smithy_query(query="shape", shape="JobLifecycleStatus")`.
+pub const JOB_LIFECYCLE_UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
+
+/// `JobLifecycleStatus` an archived job carries.
+///
+/// The one value `UpdateJobLifecycleStatus` holds (`smithy_query(query="shape",
+/// shape="UpdateJobLifecycleStatus")`), and TERMINAL: `UpdateJob` documents that an
+/// archived job "can't be scheduled or archived" and "can't be recovered", so no clock-owed
+/// move takes a job back out of it (see [`Job::archive`]).
+pub const JOB_LIFECYCLE_ARCHIVED: &str = "ARCHIVED";
+
+/// How long after `UpdateJob` asked for a task run status the job's
+/// `UPDATE_IN_PROGRESS -> UPDATE_SUCCEEDED` move comes due.
+///
+/// `targetTaskRunStatus` is "the task status to update the job's tasks to"
+/// (`smithy_query(query="doc", shape="UpdateJobRequest", member="targetTaskRunStatus")`):
+/// the service works the job's tasks to it after answering, so the job is left in a
+/// non-terminal lifecycle status and reaching [`JOB_LIFECYCLE_UPDATE_SUCCEEDED`] is owed by
+/// the clock rather than by any later call. AWS documents no duration for it, so this is the
+/// emulator's chosen span: a caller that reads the job straight back still observes the
+/// update in progress, and nothing ever sleeps for it — the due instant is stored and
+/// compared on read.
+pub const JOB_UPDATE_SUCCEEDED_AFTER: Duration = Duration::from_secs(3);
 
 /// `TaskRunStatus` a job carries while the service is still assembling it: the job exists
 /// but none of its tasks can be scheduled yet.
@@ -909,6 +937,10 @@ pub struct Job {
     /// schedules onto comes due; `None` once it has been materialised. See
     /// [`JOB_RECONCILE_AFTER`].
     pub reconcile_due_at: Option<Instant>,
+    /// When the clock-owed `UPDATE_IN_PROGRESS -> UPDATE_SUCCEEDED` move of an update that
+    /// asked for a task run status comes due; `None` once it has been materialised, and for
+    /// a job no update is working through. See [`JOB_UPDATE_SUCCEEDED_AFTER`].
+    pub update_due_at: Option<Instant>,
     /// The steps and tasks the job's template declared, in declared order, minted when the
     /// job was created (see [`steps`] and [`job_template`]).
     pub steps: Vec<Step>,
@@ -975,6 +1007,69 @@ impl Job {
                 self.reconcile_due_at = None;
             }
         }
+        // Last of the three: an update is the latest call made on the job, so where its move
+        // and an earlier one come due in the same instant, the update's is what the job is
+        // left carrying.
+        if let Some(due) = self.update_due_at {
+            if now >= due {
+                self.lifecycle_status = JOB_LIFECYCLE_UPDATE_SUCCEEDED.to_string();
+                self.lifecycle_status_message = "The job was updated.".to_string();
+                let target = self.target_task_run_status.clone();
+                let at = SystemTime::now();
+                // `targetTaskRunStatus` is the status to update the JOB'S TASKS to, so each
+                // task the update can still move carries it. A task that has already
+                // finished is not moved: its run is over, and nothing re-runs it.
+                for task in self.tasks_mut() {
+                    if !task.terminal() {
+                        task.run_status = target.clone();
+                        task.updated_at = Some(at);
+                    }
+                }
+                self.task_run_status = target;
+                // A job that holds tasks reports what they aggregate to, which is also what
+                // dates its start and its end; for a job that holds none this is a no-op and
+                // the status set above stands.
+                self.settle_run_status_from_tasks();
+                self.update_due_at = None;
+            }
+        }
+    }
+
+    /// Record that the service is working this job's tasks to `target`, as `UpdateJob`'s
+    /// `targetTaskRunStatus` asks it to.
+    ///
+    /// The move itself is owed by the clock ([`JOB_UPDATE_SUCCEEDED_AFTER`]), so the job is
+    /// left in [`JOB_LIFECYCLE_UPDATE_IN_PROGRESS`] with the asked-for status as the target
+    /// a read reports. A job whose creation has not converged yet needs nothing further
+    /// owed: creation settles its tasks on the target the job carries, which is now this
+    /// one.
+    pub fn retarget(&mut self, target: String) {
+        self.target_task_run_status = target;
+        if self.create_complete_due_at.is_some() {
+            return;
+        }
+        self.lifecycle_status = JOB_LIFECYCLE_UPDATE_IN_PROGRESS.to_string();
+        self.lifecycle_status_message = "The job is being updated.".to_string();
+        self.update_due_at = Some(Instant::now() + JOB_UPDATE_SUCCEEDED_AFTER);
+    }
+
+    /// Archive this job, as `UpdateJob`'s `lifecycleStatus` asks it to.
+    ///
+    /// [`JOB_LIFECYCLE_ARCHIVED`] is terminal — the job "can't be scheduled or archived"
+    /// and "can't be recovered" — so every move the clock still owed this job is dropped
+    /// with it: nothing may take an archived job back out of that status.
+    pub fn archive(&mut self) {
+        self.lifecycle_status = JOB_LIFECYCLE_ARCHIVED.to_string();
+        self.lifecycle_status_message = "The job was archived.".to_string();
+        self.create_complete_due_at = None;
+        self.reconcile_due_at = None;
+        self.update_due_at = None;
+    }
+
+    /// Whether this job has been archived, which is what refuses a further update of it
+    /// ([`job_archived`]) and keeps the scheduler off it ([`Job::assignable`]).
+    pub fn archived(&self) -> bool {
+        self.lifecycle_status == JOB_LIFECYCLE_ARCHIVED
     }
 
     /// Whether the service still has to find a worker for this job's tasks.
@@ -1007,9 +1102,12 @@ impl Job {
     /// A job holds work only when its template declared a step, and the scheduler places it
     /// only when every step and task that template declared was read out of it — handing a
     /// worker a task set that is not the one the template describes would be worse than
-    /// handing it nothing (see `super::job_template`).
+    /// handing it nothing (see `super::job_template`). An ARCHIVED job is placed on nothing
+    /// either: `UpdateJob` documents that such a job "can't be scheduled".
     pub fn assignable(&self) -> bool {
-        self.work_fully_read && self.steps.iter().any(|step| !step.tasks.is_empty())
+        !self.archived()
+            && self.work_fully_read
+            && self.steps.iter().any(|step| !step.tasks.is_empty())
     }
 }
 
@@ -1711,6 +1809,28 @@ pub fn worker_not_stopped(worker_id: &str, status: &str) -> crate::ops::types::C
     }
 }
 
+/// The 409 this service answers when an update is asked for a job that has been archived.
+///
+/// `UpdateJob` documents an archived job as one that "can't be scheduled or archived" and
+/// "can't be recovered", so [`JOB_LIFECYCLE_ARCHIVED`] is the end of the job's life and no
+/// later call changes it: the job itself is the resource in conflict and the status it is in
+/// is the one value the message varies on, read from the store and never from the request.
+/// Worded the way this crate words the same class of refusal for every other resource whose
+/// status is what refuses the call (see [`worker_not_stopped`]).
+pub fn job_archived(job_id: &str) -> crate::ops::types::ConflictException {
+    crate::ops::types::ConflictException {
+        message: format!("Job is in {JOB_LIFECYCLE_ARCHIVED} status and cannot be updated."),
+        // From `smithy_query(query="shape", shape="ConflictExceptionReason")`:
+        // CONFLICT_EXCEPTION, CONCURRENT_MODIFICATION, RESOURCE_ALREADY_EXISTS,
+        // RESOURCE_IN_USE, STATUS_CONFLICT. What conflicts is the status the job is in, not
+        // another caller's hold on it.
+        reason: "STATUS_CONFLICT".to_string(),
+        resource_id: job_id.to_string(),
+        resource_type: RESOURCE_TYPE_JOB.to_string(),
+        context: None,
+    }
+}
+
 /// The 500 a handler answers when the engine it was built with holds no store for this
 /// service. A handler must never build its own engine instead — that store is private and
 /// is dropped when the request returns.
@@ -1739,6 +1859,23 @@ pub fn field_validation_failed(
         }]),
         context: None,
     }
+}
+
+/// The refusal a job request earns when it asks for a `maxWorkerCount` of 0.
+///
+/// "You can't set the maxWorkerCount to 0. If you set it to -1, there is no maximum number
+/// of workers." (`smithy_query(query="doc", shape="CreateJobRequest",
+/// member="maxWorkerCount")`, and the same two sentences on `UpdateJobRequest`): 0 would
+/// describe a job no worker may ever process, which is not what the member means — the way
+/// to throttle a job to nothing is to suspend it. The value satisfies the modeled
+/// `@range -1..2147483647` on its own, so the relation to that documented rule is the
+/// handler's to refuse, wherever a job's `maxWorkerCount` arrives.
+pub fn zero_max_worker_count() -> crate::ops::types::ValidationException {
+    field_validation_failed(
+        "maxWorkerCount",
+        "You can't set the maxWorkerCount to 0. If you set it to -1, there is no maximum \
+         number of workers.",
+    )
 }
 
 /// The modeled 400 for a payload the service cannot parse as the type the request said it
