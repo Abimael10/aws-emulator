@@ -1840,6 +1840,15 @@ pub struct StoredContinuousDeploymentPolicy {
     /// `ContinuousDeploymentPolicyConfig` as submitted, stored whole: a later read
     /// answers from this record, never from the request that is being served.
     pub config: ContinuousDeploymentPolicyConfig,
+    /// How much of a whole request's worth of the staging distribution's share the viewer
+    /// requests this policy has already routed add up to, in ten-thousandths of a request —
+    /// bookkeeping of this emulator's, which no response carries
+    /// ([`StoredContinuousDeploymentPolicy::routes_weighted_request`]).
+    pub traffic_cursor: i64,
+    /// The viewer SESSIONS this policy's session stickiness holds open, by the address of the
+    /// viewer each one is a session of ([`StickySession`]). Empty for a policy whose traffic
+    /// configuration names no session stickiness, which holds no session open.
+    pub sticky_sessions: BTreeMap<String, StickySession>,
 }
 
 impl StoredContinuousDeploymentPolicy {
@@ -3995,6 +4004,13 @@ pub use tenant_parameters::*;
 /// `crate::state::<name>`.
 mod lambda_edge_execution_role;
 pub use lambda_edge_execution_role::*;
+
+/// How a CONTINUOUS DEPLOYMENT POLICY splits production traffic by weight: the share of the
+/// requests it covers that reach the staging distribution, and the viewer sessions its
+/// session stickiness holds to one side. A SUBMODULE for the same reason [`functions`] is
+/// one; `pub use` keeps every name reachable as `crate::state::<name>`.
+mod continuous_deployment;
+pub use continuous_deployment::*;
 
 /// The ADDRESS a distribution's edge is reached at: the loopback listener the core opens for
 /// each distribution that serves traffic of its own, and the leg that hands a viewer request

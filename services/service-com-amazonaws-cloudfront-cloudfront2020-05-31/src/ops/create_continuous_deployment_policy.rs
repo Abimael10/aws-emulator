@@ -276,6 +276,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Stored whole: every later read of this policy answers from this record,
             // never from the request that was served.
             config,
+            // A policy that has routed nothing yet: the weight's share of the requests it
+            // covers is counted from here, and it holds no viewer session open.
+            traffic_cursor: 0,
+            sticky_sessions: ::std::collections::BTreeMap::new(),
         };
         let policy = stored.to_policy();
         let location = crate::state::location_uri(

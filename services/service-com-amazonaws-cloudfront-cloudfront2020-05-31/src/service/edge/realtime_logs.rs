@@ -261,8 +261,23 @@ pub struct LoggedRequest<'a> {
     /// The `PathPattern` of the cache behaviour that matched, or `None` for the default cache
     /// behaviour, which matches by being last.
     pub path_pattern: Option<&'a str>,
+    /// The PRIMARY distribution this request was addressed to, when a continuous deployment
+    /// policy routed it to that distribution's staging distribution
+    /// ([`super::continuous_deployment`]), and `None` for a request the distribution it
+    /// addressed served itself.
+    pub primary: Option<PrimaryDistribution<'a>>,
     /// How the edge classified the answer.
     pub result_type: ResultType,
+}
+
+/// The primary distribution a STAGING distribution served one request for: the record the two
+/// fields that name a primary report.
+#[derive(Debug, Clone, Copy)]
+pub struct PrimaryDistribution<'a> {
+    /// `Distribution$Id` of the primary.
+    pub id: &'a str,
+    /// `Distribution$DomainName` of the primary.
+    pub domain_name: &'a str,
 }
 
 impl LoggedRequest<'_> {
@@ -361,13 +376,23 @@ impl LoggedRequest<'_> {
             "origin-fbl" | "origin-lbl" => {
                 self.origin_latency.map_or_else(no_value, seconds)
             }
+            // "When this field is used in a staging distribution, this value is the ID /
+            // the domain name of the corresponding primary distribution": a request a
+            // continuous deployment policy routed to the staging distribution reports the
+            // primary it was addressed to, and a request no policy routed has no primary to
+            // report ([`Self::primary`]).
+            "primary-distribution-id" => self
+                .primary
+                .map_or_else(no_value, |primary| primary.id.to_string()),
+            "primary-distribution-dns-name" => self
+                .primary
+                .map_or_else(no_value, |primary| primary.domain_name.to_string()),
             // Every other field of the catalog describes something this request HAS NOT: the
             // edge location and the viewer's port and autonomous system, which an in-process
             // viewer connection has none of; the TLS parameters of a connection whose
             // encryption this plane did not negotiate; the field-level encryption of a
-            // request no profile encrypted; the range of an answer that is not a range; and
-            // the primary distribution of a request not served by a staging one. A name the
-            // catalog does not carry describes nothing about a request either.
+            // request no profile encrypted; and the range of an answer that is not a range. A
+            // name the catalog does not carry describes nothing about a request either.
             _ => no_value(),
         }
     }
@@ -563,7 +588,55 @@ mod tests {
             country: "US",
             request_id: "0123456789abcdef0123456789abcdef",
             path_pattern: None,
+            primary: None,
             result_type,
+        }
+    }
+
+    /// The two fields that name a PRIMARY distribution report one only for a request a
+    /// continuous deployment policy routed to a staging distribution.
+    #[test]
+    fn the_primary_distribution_is_reported_for_a_request_a_staging_distribution_served() {
+        let req = request("/probe.txt", &[("host", "cdn.example.com")]);
+        let no_policy = served(&req, ResultType::Miss);
+        let mut staged = served(&req, ResultType::Miss);
+        staged.primary = Some(PrimaryDistribution {
+            id: "E1PRIMARY00000",
+            domain_name: "d111111abcdef8.cloudfront.net",
+        });
+        // (case, the request, the field, the value it carries)
+        let rows: [(&str, &LoggedRequest<'_>, &str, &str); 4] = [
+            (
+                "the id, for a request no policy routed",
+                &no_policy,
+                "primary-distribution-id",
+                NO_VALUE,
+            ),
+            (
+                "the domain name, for a request no policy routed",
+                &no_policy,
+                "primary-distribution-dns-name",
+                NO_VALUE,
+            ),
+            (
+                "the id, for a request the staging distribution served",
+                &staged,
+                "primary-distribution-id",
+                "E1PRIMARY00000",
+            ),
+            (
+                "the domain name, for a request the staging distribution served",
+                &staged,
+                "primary-distribution-dns-name",
+                "d111111abcdef8.cloudfront.net",
+            ),
+        ];
+        for (case, logged, field, expected) in rows {
+            let actual = logged.value(field);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {field} to report {expected:?}, got {actual:?}"
+            );
         }
     }
 

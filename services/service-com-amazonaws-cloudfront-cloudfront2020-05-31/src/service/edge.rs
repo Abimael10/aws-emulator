@@ -150,6 +150,10 @@ pub mod access_logs;
 pub mod byte_range;
 /// The content encodings the edge compresses an answer with, and the bytes they produce.
 pub mod compression;
+/// CONTINUOUS DEPLOYMENT: which of a continuous deployment's two distributions — the primary
+/// the viewer addressed or the staging distribution its policy routes to — serves one viewer
+/// request.
+pub mod continuous_deployment;
 /// WHICH headers, cookies and query strings the behaviour's policies key on and forward.
 pub mod forwarding;
 /// The CLOUDFRONT FUNCTION the matched behaviour associates, run on the viewer event it
@@ -503,7 +507,16 @@ impl<'a> Addressed<'a> {
 /// distribution, and the viewer path WITHIN its endpoint.
 #[derive(Debug)]
 struct Resolved<'s, 'r> {
+    /// The distribution that SERVES this request — the one whose behaviours, cache and
+    /// origins answer it. The one the viewer addressed, unless a continuous deployment policy
+    /// routed the request to that distribution's staging distribution
+    /// ([`continuous_deployment`]).
     distribution: &'s StoredDistribution,
+    /// The distribution whose PUBLISHED name the viewer addressed: the same record as
+    /// `distribution`, unless a continuous deployment policy routed this request elsewhere.
+    /// It is what the names a viewer may be sent back to, or may have signed a URL for, come
+    /// from — a viewer addresses one distribution however the request is then served.
+    addressed: &'s StoredDistribution,
     viewer_path: &'r str,
 }
 
@@ -522,6 +535,7 @@ fn resolve<'s, 'r>(
         {
             return Some(Resolved {
                 distribution,
+                addressed: distribution,
                 viewer_path: addressed.path,
             });
         }
@@ -534,6 +548,7 @@ fn resolve<'s, 'r>(
             .get(id)
             .map(|distribution| Resolved {
                 distribution,
+                addressed: distribution,
                 viewer_path,
             });
     }
@@ -561,6 +576,7 @@ fn resolve<'s, 'r>(
         })
         .map(|distribution| Resolved {
             distribution,
+            addressed: distribution,
             viewer_path: rest,
         })
 }
@@ -940,12 +956,14 @@ fn viewer_protocol_plan(
 /// `DomainName` or one of its `Aliases` — so a redirect keeps the viewer on the name it
 /// chose. A request that arrived through the reserved data-plane path carries this
 /// service's own host instead of a name of the distribution's, and the name to send such a
-/// viewer to is the one the distribution publishes.
+/// viewer to is the one the distribution publishes. The names read are the ADDRESSED
+/// distribution's, which is the one a viewer can be sent back to whichever of a continuous
+/// deployment's two distributions serves the request ([`continuous_deployment`]).
 fn viewer_host<'a>(addressed: &Addressed<'a>, resolved: &'a Resolved<'_, '_>) -> &'a str {
     addressed
         .host
-        .filter(|host| serves_host(resolved.distribution, host))
-        .unwrap_or(&resolved.distribution.domain_name)
+        .filter(|host| serves_host(resolved.addressed, host))
+        .unwrap_or(&resolved.addressed.domain_name)
 }
 
 /// The `https` URL of the same request: the host the viewer addressed, the viewer path and
@@ -1157,14 +1175,21 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     let served_for;
     let mut plan;
     let realtime_log;
+    // WHICH of a continuous deployment's two distributions serves this request, decided ONCE
+    // here so everything below — the behaviour, its functions, the web ACL, the origin and the
+    // series the answer is counted into — is the same distribution's
+    // ([`continuous_deployment`]). Held across the re-plan a viewer-request function's rewrite
+    // makes, so a rewrite cannot move a request from one distribution to the other.
+    let staging;
     {
         let mut store = state.lock();
         // The edge reads the distribution as every other read does: through the clock,
         // which owes a just-created configuration its deployment.
         store.settle(now);
         cf_id = store.mint_edge_request_id();
-        edge_functions = associated_functions(&store, req);
-        (served_for, plan) = plan_request(&store, req, &cf_id, now);
+        staging = continuous_deployment::staging_distribution(&mut store, req, now);
+        edge_functions = associated_functions(&store, req, staging.as_deref());
+        (served_for, plan) = plan_request(&store, req, &cf_id, now, staging.as_deref());
         // WHETHER this request's log data is delivered at all is the matched behaviour's
         // real-time log configuration to decide, and it is decided HERE, over the sequence of
         // the requests that configuration covers ([`realtime_logs::sampled`]) — the record
@@ -1233,7 +1258,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
                         // keys on and asks the origin for is that request, and the enforcement
                         // in front of the cache is applied to it as it was to the viewer's own.
                         let store = state.lock();
-                        (_, plan) = plan_request(&store, &request, &cf_id, now);
+                        (_, plan) = plan_request(&store, &request, &cf_id, now, staging.as_deref());
                         drop(store);
                         rewritten = Some(request);
                     }
@@ -1285,7 +1310,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
                         // Planned again, for the request the function returned, exactly as a
                         // CloudFront function's rewrite is.
                         let store = state.lock();
-                        (_, plan) = plan_request(&store, &request, &cf_id, now);
+                        (_, plan) = plan_request(&store, &request, &cf_id, now, staging.as_deref());
                         drop(store);
                         rewritten = Some(request);
                     }
@@ -1488,6 +1513,13 @@ pub async fn serve<Eng: Send + Sync + 'static>(
             country: &served.country,
             request_id: &cf_id,
             path_pattern: served.path_pattern.as_deref(),
+            primary: served
+                .primary
+                .as_ref()
+                .map(|(id, domain_name)| realtime_logs::PrimaryDistribution {
+                    id,
+                    domain_name,
+                }),
             result_type: realtime_logs::ResultType::of_answer(
                 served_from,
                 response.status().as_u16(),
@@ -1607,6 +1639,11 @@ struct ServedFor {
     /// `Distribution$DomainName`, which is the name a record reports as the distribution's
     /// own ([`realtime_logs`]).
     domain_name: String,
+    /// The PRIMARY distribution this request was addressed to — its id and its `DomainName` —
+    /// when a continuous deployment policy routed it to that distribution's staging
+    /// distribution, and `None` for a request the distribution it addressed served itself
+    /// ([`continuous_deployment`]).
+    primary: Option<(String, String)>,
     /// The host the VIEWER addressed this distribution by ([`viewer_host`]): a name the
     /// distribution is served on, which is what a record reports as the viewer's `Host`.
     viewer_host: String,
@@ -1653,12 +1690,17 @@ struct EdgeFunctions {
 
 /// The functions the behaviour this request's path selects associates, or `None` when the
 /// request resolves to no distribution of this account or its behaviour associates none.
+///
+/// Read off the distribution that SERVES the request, which `staging` names when a continuous
+/// deployment policy routed it to a staging distribution: the functions a request runs are the
+/// serving distribution's own ([`continuous_deployment`]).
 fn associated_functions(
     store: &ComAmazonawsCloudfrontCloudfront20200531State,
     req: &RtRequest,
+    staging: Option<&str>,
 ) -> Option<EdgeFunctions> {
     let addressed = Addressed::of_request(req);
-    let resolved = resolve(store, &addressed)?;
+    let resolved = continuous_deployment::serving(store, resolve(store, &addressed)?, staging);
     // The SAME behaviour the plan is decided under: "CloudFront compares the path in the
     // viewer request with the path patterns in the cache behaviors", and the path it compares
     // is the one the viewer asked for — so which function runs is the viewer's own path to
@@ -1796,11 +1838,16 @@ fn answer_of_edge_function(answer: functions::Generated, cf_id: &str) -> RtRespo
 
 /// Decide what the edge does with one viewer request, under the store's lock, and name the
 /// distribution the request resolved to — the one whose series it is counted into.
+///
+/// `staging` is the staging distribution a continuous deployment policy routed this request
+/// to, when one did: everything the plan reads — the behaviour, the cache, the origins and the
+/// web ACL — is then that distribution's ([`continuous_deployment`]).
 fn plan_request(
     store: &ComAmazonawsCloudfrontCloudfront20200531State,
     req: &RtRequest,
     cf_id: &str,
     now: SystemTime,
+    staging: Option<&str>,
 ) -> (Option<ServedFor>, Plan) {
     let addressed = Addressed::of_request(req);
     let Some(resolved) = resolve(store, &addressed) else {
@@ -1815,6 +1862,7 @@ fn plan_request(
             },
         );
     };
+    let resolved = continuous_deployment::serving(store, resolved, staging);
     let behavior = select_behavior(resolved.distribution, resolved.viewer_path);
     let served_for = ServedFor {
         id: resolved.distribution.id.clone(),
@@ -1830,6 +1878,16 @@ fn plan_request(
         viewer_path: resolved.viewer_path.to_string(),
         query: addressed.query.to_string(),
         domain_name: resolved.distribution.domain_name.clone(),
+        // The distribution the viewer ADDRESSED, when that is not the one serving the request:
+        // a continuous deployment policy routed this request to the staging distribution, and
+        // the primary it was addressed to is what the record's primary-distribution fields
+        // report ([`realtime_logs::PrimaryDistribution`]).
+        primary: (resolved.addressed.id != resolved.distribution.id).then(|| {
+            (
+                resolved.addressed.id.clone(),
+                resolved.addressed.domain_name.clone(),
+            )
+        }),
         // The name the viewer reached this distribution by, read ONCE here: a request that
         // arrived through the reserved data-plane path carries this service's own host rather
         // than a name of the distribution's, and the name such a viewer addressed the
@@ -1929,7 +1987,7 @@ fn plan_resolved(
             query: addressed.query,
             cookies: req.headers().get(COOKIE).unwrap_or_default(),
             resource_urls: resource_urls(
-                resolved.distribution,
+                resolved.addressed,
                 generated_headers::viewer_scheme(req.uri()),
                 &viewer_path,
                 addressed.query,
