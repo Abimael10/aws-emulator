@@ -263,28 +263,7 @@ struct Governed {
 async fn governed_catalog() -> Governed {
     let router = emulator_with_lake_formation();
     for name in [DATABASE, OTHER_DATABASE] {
-        let (status, body) = call(
-            &router,
-            "CreateDatabase",
-            &json!({
-                "DatabaseInput": { "Name": name, "CreateTableDefaultPermissions": [] },
-            }),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case create database {name:?}: expected 200, got {status} with {body}"
-        );
-        let (status, body) = call(
-            &router,
-            "CreateTable",
-            &json!({ "DatabaseName": name, "TableInput": { "Name": TABLE } }),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case create table {name}.{TABLE}: expected 200, got {status} with {body}"
-        );
+        create_governed_database(&router, &format!("the catalog's {name} database"), name).await;
     }
 
     let trust = format!(
@@ -1095,4 +1074,122 @@ async fn the_principal_that_created_a_table_still_reads_it() {
         status, 200,
         "case {case:?}: expected the creator to still read the table, got {status} with {body}"
     );
+}
+
+/// The length ceiling of `NameString`, the shape a `GetDatabase$Name` is
+/// (`smithy_query(query="shape",shape="NameString")`, this service's model: `len 1..255`).
+/// A row names a database at it, so the refusal is read over the longest name a request may
+/// address as well as over the shortest.
+const NAME_STRING_MAX_LENGTH: usize = 255;
+
+/// A governed database of the catalog, with a table inside it: created by the ACCOUNT's own
+/// credential, and handed NO `IAM_ALLOWED_PRINCIPALS` default for the tables made in it —
+/// the state a client that has handed its catalog to Lake Formation is in.
+///
+/// The one definition of "a governed database with a table in it": both the two databases
+/// [`governed_catalog`] stands up and the per-row database of the suite below are made here.
+async fn create_governed_database(router: &MultiServiceRouter, case: &str, name: &str) {
+    let (status, body) = call(
+        router,
+        "CreateDatabase",
+        &json!({
+            "DatabaseInput": { "Name": name, "CreateTableDefaultPermissions": [] },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: creating the database must answer 200, got {status} with {body}"
+    );
+    let (status, body) = call(
+        router,
+        "CreateTable",
+        &json!({ "DatabaseName": name, "TableInput": { "Name": TABLE } }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: creating the table must answer 200, got {status} with {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_refusal_names_the_database_the_read_addressed() {
+    // The variable part of the refusal on its own: the sentence is the same for every database
+    // and the name it carries is the one the read addressed, so the rows differ along the form
+    // of that name — its length, from one character up to the modelled ceiling, and the
+    // characters in it. Each row then shows the same grant restoring the same read: a
+    // permission on a table INSIDE the database makes the database describable again.
+    let longest = "d".repeat(NAME_STRING_MAX_LENGTH);
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "a one-character name, the shortest a NameString may be",
+            "a".to_string(),
+        ),
+        (
+            "a name carrying digits and underscores",
+            "sales_2024_eu".to_string(),
+        ),
+        (
+            "a name carrying hyphens and digits",
+            "retail-eu-west-1".to_string(),
+        ),
+        ("a name at the NameString length ceiling", longest),
+    ];
+
+    for (case, database) in &cases {
+        let governed = governed_catalog().await;
+        create_governed_database(&governed.router, case, database).await;
+        revoke_default_grant(&governed.router, case, database).await;
+
+        let (status, body) = glue_as(
+            &governed.router,
+            &governed.session_key,
+            "GetDatabase",
+            &json!({ "Name": database }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: with nothing held the read must be refused, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "AccessDeniedException",
+            "case {case:?}: expected AccessDeniedException, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("Insufficient Lake Formation permission(s): Required Describe on {database}"),
+            "case {case:?}: expected the refusal to name the database the read addressed, got \
+             {body}"
+        );
+
+        grant(
+            &governed.router,
+            case,
+            &reader_arn(),
+            json!({ "Table": { "DatabaseName": database, "Name": TABLE } }),
+            &["DESCRIBE"],
+        )
+        .await;
+
+        let (status, body) = glue_as(
+            &governed.router,
+            &governed.session_key,
+            "GetDatabase",
+            &json!({ "Name": database }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the table grant must make the database readable, got {status} with \
+             {body}"
+        );
+        assert_eq!(
+            body["Database"]["Name"].as_str(),
+            Some(database.as_str()),
+            "case {case:?}: expected the database to be answered, got {body}"
+        );
+    }
 }
