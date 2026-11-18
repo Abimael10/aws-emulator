@@ -178,6 +178,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        if !store.services.contains_key(&input.service_arn) {
+            return Err(UpdateServiceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::SERVICE_RESOURCE_TYPE,
+                    &input.service_arn,
+                ),
+            )
+            .into());
+        }
+
+        // Every `associatedSystems` entry is a REFERENCE — to one of the account's systems,
+        // and to the user journeys OF that system — so it is RESOLVED against the store
+        // before anything is merged: the members' patterns are already enforced, and a
+        // well-formed ARN or id says nothing about whether what it names exists. A reference
+        // that resolves to nothing is refused with the validation error this operation
+        // models, naming the offending value as the request supplied it, and the record is
+        // left exactly as it was — otherwise this service would report a membership no
+        // system or journey backs.
+        //
+        // The walk this costs is BOUNDED by the model, whatever the request carries, and the
+        // bounds are enforced before this handler runs: `associatedSystems` targets
+        // `AssociatedSystemList` (`@length max 20`) and each entry's `userJourneyIds` targets
+        // `UserJourneyIdList` (`@length max 20`), so at most 20 systems and 20 ids per system
+        // are resolved — 20 map lookups plus at most 400 more, each a single lookup in a
+        // stored map, with no allocation sized by anything the caller sent.
+        if let Some(unresolved) = input
+            .associated_systems
+            .as_deref()
+            .and_then(|associated| store.unresolved_association_message(associated))
+        {
+            return Err(UpdateServiceErrorModeled::ValidationException(ValidationException {
+                message: unresolved,
+                // `reason` classifies the VALUE of a field (invalid, duplicated, missing);
+                // this value is well formed and it is what it names that is not there, so
+                // none of the modelled reasons states this refusal and the sentence carries
+                // it alone. `fieldList` likewise carries a per-field sentence nothing fixes
+                // for this refusal.
+                reason: None,
+                field_list: None,
+            })
+            .into());
+        }
+
         let Some(record) = store.services.get_mut(&input.service_arn) else {
             return Err(UpdateServiceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(

@@ -781,7 +781,18 @@ async fn tagging_a_resource_that_is_not_there_is_refused() {
 
     for (case, arn, resource_type) in rows {
         let answer = tag_resource(&router, arn, &json!({"team": "payments"})).await;
-        assert_not_found(case, resource_type, arn_resource_id(arn), &answer);
+        // A system reports an identifier of its own (`System$systemId`, the id its ARN
+        // carries after the `system/` qualifier), so that is what a refusal naming one
+        // reports; a service and a policy carry no id member, so theirs is the whole
+        // resource segment.
+        let identifier = if resource_type == SYSTEM_RESOURCE_TYPE {
+            arn_resource_id(arn)
+                .strip_prefix("system/")
+                .unwrap_or_else(|| arn_resource_id(arn))
+        } else {
+            arn_resource_id(arn)
+        };
+        assert_not_found(case, resource_type, identifier, &answer);
     }
 }
 

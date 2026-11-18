@@ -247,6 +247,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             updated_at: now,
             sequence,
+            // A brand-new system has no user journeys yet, and no `CreateUserJourney` token
+            // to replay.
+            user_journeys: Default::default(),
+            user_journey_idempotency: Default::default(),
         };
 
         store

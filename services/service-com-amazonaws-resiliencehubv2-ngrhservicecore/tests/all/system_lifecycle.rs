@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The `System` lifecycle, end to end over HTTP: `CreateSystem` -> `GetSystem`.
+//! The `System` lifecycle, end to end over HTTP: `CreateSystem` -> `GetSystem` ->
+//! `UpdateSystem` -> `DeleteSystem`, and the user journeys a system holds.
 //!
 //! The rules under test:
 //!
@@ -15,7 +16,15 @@
 //!    offered for DIFFERENT creation parameters is refused `ConflictException` and writes
 //!    nothing.
 //! 3. A name a live system already holds is refused `ConflictException`.
-//! 4. A well-formed ARN naming no stored system is refused `ResourceNotFoundException`.
+//! 4. A well-formed ARN naming no stored system is refused `ResourceNotFoundException`,
+//!    which identifies the system by its own `systemId`.
+//! 5. `UpdateSystem` applies the members it carries, leaves the rest untouched, and the
+//!    next read reports what it stored.
+//! 6. `DeleteSystem` removes the system — refused `ConflictException` while a service is
+//!    still associated with it — after which every reader answers 404 and its name is free.
+//! 7. A user journey is created within a system, reads back unchanged, and goes with the
+//!    system when that is deleted.
+//! 8. Every identifier this service mints is a lower-case version-4 UUID.
 //!
 //! Every suite drives the real wire path (`MultiServiceRouter::dispatch`), so the modelled
 //! constraints, the restJson1 (de)serializers and the HTTP status codes are exercised
@@ -179,6 +188,14 @@ fn error_code(body: &Value) -> String {
         .next()
         .unwrap_or("<no __type>")
         .to_string()
+}
+
+/// The `systemId` a system ARN carries: its resource segment without the `system/`
+/// qualifier, which is the identifier a refusal naming a system reports. A segment naming
+/// another kind of resource carries no such id, so it stands as the identifier of whatever
+/// the caller addressed.
+fn system_id_of_arn(arn: &str) -> &str {
+    resource_id_after_kind(arn, SYSTEM_RESOURCE)
 }
 
 /// The `system` member of a successful create or read.
@@ -612,9 +629,12 @@ async fn an_arn_naming_no_stored_system_is_not_found() {
             "ResourceNotFoundException",
             "case {arn:?}: expected ResourceNotFoundException, got {body:?}"
         );
-        // The refusal identifies the resource by the ARN's resource segment, under the
-        // type the model's shape for a system carries.
-        let resource_id = arn.splitn(6, ':').nth(5).unwrap_or(&arn);
+        // The refusal identifies the system by its `systemId` — the id the ARN carries
+        // after the `system/` qualifier, which is the identifier `System$systemId` reports
+        // for a system that IS there — under the type the model's shape for a system
+        // carries. An ARN whose resource segment names another kind of resource has no
+        // such id to strip, so the whole segment identifies what the caller addressed.
+        let resource_id = system_id_of_arn(&arn);
         assert_eq!(
             body["resourceId"].as_str(),
             Some(resource_id),
@@ -710,4 +730,670 @@ async fn a_tag_written_to_a_system_is_visible_to_the_next_read() {
             read["tags"]
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// UpdateSystem, DeleteSystem and the user journeys a system holds
+// ---------------------------------------------------------------------------
+
+/// The modelled routes the suites below drive.
+const UPDATE_SYSTEM: &str = "/v2/update-system";
+const DELETE_SYSTEM: &str = "/v2/delete-system";
+const CREATE_USER_JOURNEY: &str = "/v2/create-user-journey";
+const GET_USER_JOURNEY: &str = "/v2/get-user-journey";
+const CREATE_SERVICE: &str = "/v2/create-service";
+const UPDATE_SERVICE: &str = "/v2/update-service";
+const DELETE_SERVICE: &str = "/v2/delete-service";
+const CREATE_POLICY: &str = "/v2/create-policy";
+
+async fn update_system(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+    call(router, "POST", UPDATE_SYSTEM, Some(body)).await
+}
+
+async fn delete_system(router: &MultiServiceRouter, system_arn: &str) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        DELETE_SYSTEM,
+        Some(json!({"systemArn": system_arn})),
+    )
+    .await
+}
+
+async fn create_user_journey(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+    call(router, "POST", CREATE_USER_JOURNEY, Some(body)).await
+}
+
+async fn get_user_journey(
+    router: &MultiServiceRouter,
+    system_arn: &str,
+    user_journey_id: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "GET",
+        &format!("{GET_USER_JOURNEY}?systemArn={system_arn}&userJourneyId={user_journey_id}"),
+        None,
+    )
+    .await
+}
+
+/// Create a system named `name` and return its ARN and its `systemId`.
+async fn system_named(router: &MultiServiceRouter, name: &str) -> (String, String) {
+    let (status, body) = create_system(router, json!({"name": name})).await;
+    let created = system_of(name, status, &body);
+    (
+        system_arn_of(name, &created),
+        created["systemId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {name:?}: no systemId in {created:?}"))
+            .to_string(),
+    )
+}
+
+/// The simplest body that satisfies `CreateService`'s required members, associated with
+/// `systems`.
+fn service_body(name: &str, systems: Vec<Value>) -> Value {
+    json!({
+        "name": name,
+        "regions": [REGION],
+        "permissionModel": {"invokerRoleName": "ResilienceHubRole"},
+        "associatedSystems": systems,
+    })
+}
+
+/// Create a service associated with `systems` and return its ARN.
+async fn service_associated_with(
+    router: &MultiServiceRouter,
+    name: &str,
+    systems: Vec<Value>,
+) -> String {
+    let (status, body) = call(router, "POST", CREATE_SERVICE, Some(service_body(name, systems))).await;
+    assert_eq!(status, 200, "creating service {name}: got {body:?}");
+    body["service"]["serviceArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no service.serviceArn in {body:?}"))
+        .to_string()
+}
+
+/// Whether `candidate` is a lower-case version-4 UUID in the canonical 8-4-4-4-12 textual
+/// form: five hex groups of those lengths, `4` as the first nibble of the third group and
+/// one of `8`, `9`, `a`, `b` (RFC 9562's variant bits) as the first nibble of the fourth.
+fn is_version_4_uuid(candidate: &str) -> bool {
+    let groups: Vec<&str> = candidate.split('-').collect();
+    if groups.len() != 5 {
+        return false;
+    }
+    if [8usize, 4, 4, 4, 12]
+        .iter()
+        .zip(&groups)
+        .any(|(expected, group)| group.len() != *expected)
+    {
+        return false;
+    }
+    if !candidate
+        .chars()
+        .all(|c| c == '-' || (c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
+    {
+        return false;
+    }
+    groups[2].starts_with('4') && groups[3].starts_with(['8', '9', 'a', 'b'])
+}
+
+/// RULE: `UpdateSystem` applies each PRESENT member to the stored system, leaves every
+/// absent member untouched, bumps `updatedAt`, and the merged record is what every later
+/// read returns.
+///
+/// The rows differ along which members the patch carries and what they carry: a
+/// description on its own, the flag on its own, both at once, the empty description, a
+/// description at `EntityDescription`'s modelled ceiling, and the flag in both directions.
+#[tokio::test]
+async fn a_system_update_lands_and_the_next_read_reports_it() {
+    let longest = "u".repeat(ENTITY_DESCRIPTION_MAX_LENGTH);
+    let patches: Vec<(&str, Value)> = vec![
+        ("description only", json!({"description": "updated"})),
+        ("the empty description", json!({"description": ""})),
+        (
+            "a description at EntityDescription's ceiling",
+            json!({"description": longest}),
+        ),
+        ("sharing enabled", json!({"sharingEnabled": true})),
+        ("sharing disabled", json!({"sharingEnabled": false})),
+        (
+            "description and the flag together",
+            json!({"description": "both", "sharingEnabled": true}),
+        ),
+        ("no member at all", json!({})),
+    ];
+
+    for (index, (case, patch)) in patches.into_iter().enumerate() {
+        let router = emulator();
+        let create_body = json!({
+            "name": format!("Patched-{index}"),
+            "description": "the created description",
+            "sharingEnabled": true,
+            "kmsKeyId": "alias/resilience",
+            "tags": {"team": "payments"},
+        });
+        let (status, body) = create_system(&router, create_body).await;
+        let created = system_of(case, status, &body);
+        let system_arn = system_arn_of(case, &created);
+
+        let mut request = patch.clone();
+        request["systemArn"] = json!(system_arn);
+        let (status, answered) = update_system(&router, request).await;
+        let updated = system_of(case, status, &answered);
+
+        // Each member the patch carried took the value it sent.
+        for (member, sent) in patch.as_object().expect("a patch object") {
+            assert_eq!(
+                &updated[member], sent,
+                "case {case:?}: expected {member} to take {sent:?}, got {:?}",
+                updated[member]
+            );
+        }
+        // Everything the patch did NOT carry is untouched — including the identifiers, the
+        // name, the tags and `createdAt`, none of which this operation takes at all.
+        for member in [
+            "systemArn",
+            "systemId",
+            "name",
+            "kmsKeyId",
+            "tags",
+            "createdAt",
+            "description",
+            "sharingEnabled",
+        ] {
+            if patch.get(member).is_some() {
+                continue;
+            }
+            assert_eq!(
+                updated[member], created[member],
+                "case {case:?}: {member} was not sent, so it must be untouched, got {:?}",
+                updated[member]
+            );
+        }
+        let created_at = updated["createdAt"].as_f64().unwrap_or_default();
+        let updated_at = updated["updatedAt"].as_f64().unwrap_or_default();
+        assert!(
+            updated_at >= created_at,
+            "case {case:?}: expected updatedAt at or past createdAt, got {updated_at} vs \
+             {created_at}"
+        );
+
+        // The next read answers the merged record, not the created one.
+        let (read_status, read_body) = get_system(&router, &system_arn).await;
+        assert_eq!(
+            system_of(case, read_status, &read_body),
+            updated,
+            "case {case:?}: a later read must report what the update stored"
+        );
+    }
+}
+
+/// RULE: an ARN naming no stored system is refused `ResourceNotFoundException` by every
+/// operation that resolves one, the mutating ones included.
+#[tokio::test]
+async fn an_update_or_delete_of_an_absent_system_is_not_found() {
+    let router = emulator();
+    // One stored system, so the refusals are about the ARN rather than an empty store.
+    let (live_arn, _) = system_named(&router, "A-Live-System").await;
+    let absent = format!("arn:aws:resiliencehub:{REGION}:{ACCOUNT}:{SYSTEM_RESOURCE}/absent");
+    let other_kind = format!("arn:aws:resiliencehub:{REGION}:{ACCOUNT}:{SERVICE_RESOURCE}/not-a-system");
+
+    for (case, arn) in [
+        ("an id this store never minted", absent.as_str()),
+        ("an ARN of another resource kind", other_kind.as_str()),
+    ] {
+        for (operation, answer) in [
+            ("UpdateSystem", update_system(&router, json!({"systemArn": arn, "description": "x"})).await),
+            ("DeleteSystem", delete_system(&router, arn).await),
+        ] {
+            let (status, body) = answer;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected HTTP 404 from {operation}, got {status} {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {case:?}: expected ResourceNotFoundException from {operation}, got \
+                 {body:?}"
+            );
+            let identifier = system_id_of_arn(arn);
+            assert_eq!(
+                body["resourceId"].as_str(),
+                Some(identifier),
+                "case {case:?}: expected resourceId {identifier:?} from {operation}, got {:?}",
+                body["resourceId"]
+            );
+        }
+    }
+
+    // The live system is untouched by the refusals.
+    let (status, body) = get_system(&router, &live_arn).await;
+    system_of("the live system", status, &body);
+}
+
+/// RULE: a delete removes the system and echoes its ARN; afterwards every reader reports it
+/// as not found, by its own `systemId`, its name is free for a new system, and the
+/// `clientToken` that created it replays nothing.
+///
+/// The rows differ along what the deleted system carried: the bare required member, a
+/// `clientToken`, tags and the optional members together.
+#[tokio::test]
+async fn a_deleted_system_is_gone_from_every_reader() {
+    let rows: Vec<(&str, Value)> = vec![
+        ("only the required name", json!({"name": "Deleted-Plain"})),
+        (
+            "a clientToken",
+            json!({"name": "Deleted-Token", "clientToken": "deleted-token"}),
+        ),
+        (
+            "tags and every optional member",
+            json!({
+                "name": "Deleted-Full",
+                "description": "a doomed system",
+                "sharingEnabled": true,
+                "kmsKeyId": "alias/resilience",
+                "tags": {"team": "payments"},
+            }),
+        ),
+    ];
+
+    for (case, create_body) in rows {
+        let router = emulator();
+        let (status, body) = create_system(&router, create_body.clone()).await;
+        let created = system_of(case, status, &body);
+        let system_arn = system_arn_of(case, &created);
+        let system_id = created["systemId"].as_str().expect("a systemId").to_string();
+
+        let (status, deleted) = delete_system(&router, &system_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the delete to succeed, got {status} {deleted:?}"
+        );
+        assert_eq!(
+            deleted["systemArn"].as_str(),
+            Some(system_arn.as_str()),
+            "case {case:?}: the delete must echo the ARN it removed, got {deleted:?}"
+        );
+
+        // Every reader of a system reports it gone, naming it by its own id.
+        for (reader, answer) in [
+            ("GetSystem", get_system(&router, &system_arn).await),
+            (
+                "UpdateSystem",
+                update_system(&router, json!({"systemArn": system_arn, "description": "x"})).await,
+            ),
+            ("DeleteSystem", delete_system(&router, &system_arn).await),
+        ] {
+            let (status, body) = answer;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected HTTP 404 from {reader} after the delete, got {status} \
+                 {body:?}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some(format!("{SYSTEM_RESOURCE_TYPE} not found: {system_id}").as_str()),
+                "case {case:?}: {reader} must name the system's own id, got {:?}",
+                body["message"]
+            );
+            assert_eq!(
+                body["resourceId"].as_str(),
+                Some(system_id.as_str()),
+                "case {case:?}: expected resourceId {system_id:?} from {reader}, got {:?}",
+                body["resourceId"]
+            );
+            assert_eq!(
+                body["resourceType"].as_str(),
+                Some(SYSTEM_RESOURCE_TYPE),
+                "case {case:?}: expected resourceType {SYSTEM_RESOURCE_TYPE:?} from {reader}, \
+                 got {:?}",
+                body["resourceType"]
+            );
+        }
+
+        // The name is free again, and the create that takes it is a NEW system — including
+        // for the `clientToken` the deleted one consumed.
+        let (status, recreated) = create_system(&router, create_body).await;
+        let fresh = system_of(case, status, &recreated);
+        assert_ne!(
+            system_arn_of(case, &fresh),
+            system_arn,
+            "case {case:?}: recreating must mint a fresh ARN, got {fresh:?}"
+        );
+    }
+}
+
+/// RULE: a system a service is associated with cannot be deleted — the delete is refused
+/// `ConflictException` while any service still lists it, and succeeds once nothing does.
+///
+/// The rows differ along how the association is released: by deleting the service, by
+/// updating the service onto another system, and by updating it to no associations at all.
+#[tokio::test]
+async fn a_system_a_service_is_associated_with_cannot_be_deleted() {
+    #[derive(Debug, Clone, Copy)]
+    enum Release {
+        DeleteTheService,
+        AssociateAnotherSystem,
+        AssociateNothing,
+    }
+
+    for (case, release) in [
+        ("the service is deleted", Release::DeleteTheService),
+        ("the service moves to another system", Release::AssociateAnotherSystem),
+        ("the service drops every association", Release::AssociateNothing),
+    ] {
+        let router = emulator();
+        let (system_arn, system_id) = system_named(&router, "Held-System").await;
+        let (other_arn, _) = system_named(&router, "Other-System").await;
+        let service_arn = service_associated_with(
+            &router,
+            "Holder-Service",
+            vec![json!({"systemArn": system_arn})],
+        )
+        .await;
+
+        let (status, refused) = delete_system(&router, &system_arn).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: expected HTTP 409 while a service is associated, got {status} \
+             {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ConflictException",
+            "case {case:?}: expected ConflictException, got {refused:?}"
+        );
+        let expected = format!("Cannot delete system with associated services: {system_id}");
+        assert_eq!(
+            refused["message"].as_str(),
+            Some(expected.as_str()),
+            "case {case:?}: expected the refusal {expected:?}, got {:?}",
+            refused["message"]
+        );
+        // The refused delete left the system readable.
+        let (status, body) = get_system(&router, &system_arn).await;
+        system_of(case, status, &body);
+
+        match release {
+            Release::DeleteTheService => {
+                let (status, body) = call(
+                    &router,
+                    "POST",
+                    DELETE_SERVICE,
+                    Some(json!({"serviceArn": service_arn})),
+                )
+                .await;
+                assert_eq!(status, 200, "case {case:?}: deleting the service got {body:?}");
+            }
+            Release::AssociateAnotherSystem => {
+                let (status, body) = call(
+                    &router,
+                    "POST",
+                    UPDATE_SERVICE,
+                    Some(json!({
+                        "serviceArn": service_arn,
+                        "associatedSystems": [{"systemArn": other_arn}],
+                    })),
+                )
+                .await;
+                assert_eq!(status, 200, "case {case:?}: moving the service got {body:?}");
+            }
+            Release::AssociateNothing => {
+                let (status, body) = call(
+                    &router,
+                    "POST",
+                    UPDATE_SERVICE,
+                    Some(json!({"serviceArn": service_arn, "associatedSystems": []})),
+                )
+                .await;
+                assert_eq!(status, 200, "case {case:?}: clearing the association got {body:?}");
+            }
+        }
+
+        let (status, deleted) = delete_system(&router, &system_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the delete must succeed once nothing is associated, got {status} \
+             {deleted:?}"
+        );
+        let (status, body) = get_system(&router, &system_arn).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: the deleted system must be gone, got {status} {body:?}"
+        );
+    }
+}
+
+/// RULE: a user journey is created WITHIN a system, stored there, and read back unchanged
+/// through `GetUserJourney`; the system's own delete takes its journeys with it.
+///
+/// The rows differ along which optional members the create carries and what they carry: the
+/// bare required members, a name carrying the space `EntityLabel` admits, a description at
+/// the modelled ceiling, a `policyArn`, and a `clientToken` replay.
+#[tokio::test]
+async fn a_created_user_journey_reads_back_through_get_user_journey() {
+    let router = emulator();
+    let (system_arn, _) = system_named(&router, "Journeyed-System").await;
+    let policy_arn = format!("arn:aws:resiliencehub:{REGION}:{ACCOUNT}:{POLICY_RESOURCE}/p");
+    let longest = "j".repeat(ENTITY_DESCRIPTION_MAX_LENGTH);
+    let rows: Vec<(&str, Value)> = vec![
+        ("only the required name", json!({"name": "Checkout"})),
+        (
+            "a name with the space EntityLabel admits",
+            json!({"name": "Checkout journey"}),
+        ),
+        (
+            "a description at EntityDescription's ceiling",
+            json!({"name": "Longest-Described", "description": longest}),
+        ),
+        (
+            "a policyArn and a description",
+            json!({
+                "name": "Policy Held",
+                "description": "held to a policy",
+                "policyArn": policy_arn,
+            }),
+        ),
+        (
+            "a clientToken",
+            json!({"name": "Idempotent", "clientToken": "journey-token"}),
+        ),
+    ];
+
+    let mut minted: Vec<String> = Vec::new();
+    for (case, body) in rows {
+        let mut request = body.clone();
+        request["systemArn"] = json!(system_arn);
+        let (status, answered) = create_user_journey(&router, request.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} {answered:?}"
+        );
+        let created = answered["userJourney"].clone();
+        for member in ["name", "description", "policyArn"] {
+            assert_eq!(
+                created[member], body[member],
+                "case {case:?}: expected {member} to echo {:?}, got {:?}",
+                body[member], created[member]
+            );
+        }
+        let journey_id = created["userJourneyId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no userJourneyId in {created:?}"))
+            .to_string();
+        assert!(
+            !minted.contains(&journey_id),
+            "case {case:?}: every create must mint a fresh id, but {journey_id} repeated"
+        );
+        minted.push(journey_id.clone());
+
+        // The read answers the same projection the create did.
+        let (read_status, read_body) = get_user_journey(&router, &system_arn, &journey_id).await;
+        assert_eq!(
+            read_status, 200,
+            "case {case:?}: expected the journey to read back, got {read_status} {read_body:?}"
+        );
+        assert_eq!(
+            read_body["userJourney"], created,
+            "case {case:?}: GetUserJourney must answer what the create stored"
+        );
+
+        // A `clientToken` is an @idempotencyToken: the same call answers the same journey.
+        if body.get("clientToken").is_some() {
+            let (replay_status, replay) = create_user_journey(&router, request).await;
+            assert_eq!(
+                replay_status, 200,
+                "case {case:?}: a replayed token got {replay_status} {replay:?}"
+            );
+            assert_eq!(
+                replay["userJourney"], created,
+                "case {case:?}: a replayed token must answer the first journey"
+            );
+        }
+    }
+
+    // Deleting the system takes its journeys with it: nothing can reach a journey whose
+    // system is gone.
+    let (status, body) = delete_system(&router, &system_arn).await;
+    assert_eq!(status, 200, "deleting the journeyed system got {body:?}");
+    let (status, body) = get_user_journey(&router, &system_arn, &minted[0]).await;
+    assert_eq!(
+        status, 404,
+        "a journey of a deleted system must be gone, got {status} {body:?}"
+    );
+}
+
+/// RULE: a `userJourneyId` is only meaningful within its own system — a read naming another
+/// system's journey, or an id nothing minted, is refused `ResourceNotFoundException` under
+/// the model's own shape name for the resource.
+#[tokio::test]
+async fn a_user_journey_is_only_found_within_its_own_system() {
+    let router = emulator();
+    let (first_arn, _) = system_named(&router, "First-System").await;
+    let (second_arn, _) = system_named(&router, "Second-System").await;
+    let (status, body) =
+        create_user_journey(&router, json!({"systemArn": first_arn, "name": "Only Journey"})).await;
+    assert_eq!(status, 200, "creating the journey got {body:?}");
+    let journey_id = body["userJourney"]["userJourneyId"]
+        .as_str()
+        .expect("a userJourneyId")
+        .to_string();
+
+    for (case, system_arn, requested_id) in [
+        (
+            "the journey of another system",
+            second_arn.as_str(),
+            journey_id.as_str(),
+        ),
+        ("an id nothing minted", first_arn.as_str(), "no-such-journey"),
+    ] {
+        let (status, body) = get_user_journey(&router, system_arn, requested_id).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        let expected = format!("User journey not found: {requested_id}");
+        assert_eq!(
+            body["message"].as_str(),
+            Some(expected.as_str()),
+            "case {case:?}: expected the refusal {expected:?}, got {:?}",
+            body["message"]
+        );
+        assert_eq!(
+            body["resourceType"].as_str(),
+            Some("UserJourney"),
+            "case {case:?}: expected the model's shape name as resourceType, got {:?}",
+            body["resourceType"]
+        );
+    }
+}
+
+/// RULE: every identifier this service mints — the `systemId`, the id in each minted ARN's
+/// resource segment, and the ids of the resources a parent holds — is a lower-case
+/// version-4 UUID, the form AWS hands out for them.
+///
+/// The rows span the resources this crate mints an id for, not only the one the issue
+/// cited, and the systems row repeats so a second mint under the same rule is covered.
+#[tokio::test]
+async fn every_minted_identifier_is_a_version_4_uuid() {
+    let router = emulator();
+
+    let mut identifiers: Vec<(String, String)> = Vec::new();
+    for index in 0..2 {
+        let case = format!("system {index}");
+        let (status, body) = create_system(&router, json!({"name": format!("Minted-{index}")})).await;
+        let created = system_of(&case, status, &body);
+        let system_arn = system_arn_of(&case, &created);
+        let system_id = created["systemId"].as_str().expect("a systemId").to_string();
+        // The id the ARN carries and the id the body reports are the same resource's.
+        assert_eq!(
+            system_id_of_arn(&system_arn),
+            system_id,
+            "case {case:?}: the ARN must carry the systemId it reports, got {system_arn:?}"
+        );
+        identifiers.push((format!("{case} systemId"), system_id.clone()));
+
+        let (status, journey) = create_user_journey(
+            &router,
+            json!({"systemArn": system_arn, "name": format!("Journey {index}")}),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: creating a journey got {journey:?}");
+        identifiers.push((
+            format!("{case} userJourneyId"),
+            journey["userJourney"]["userJourneyId"]
+                .as_str()
+                .expect("a userJourneyId")
+                .to_string(),
+        ));
+    }
+
+    let (status, policy) = call(
+        &router,
+        "POST",
+        CREATE_POLICY,
+        Some(json!({"name": "Minted-Policy"})),
+    )
+    .await;
+    assert_eq!(status, 200, "creating the policy got {policy:?}");
+    identifiers.push((
+        "policy ARN resource id".to_string(),
+        resource_id_after_kind(
+            policy["policy"]["policyArn"].as_str().expect("a policyArn"),
+            POLICY_RESOURCE,
+        )
+        .to_string(),
+    ));
+
+    let service_arn = service_associated_with(&router, "Minted-Service", Vec::new()).await;
+    identifiers.push((
+        "service ARN resource id".to_string(),
+        resource_id_after_kind(&service_arn, SERVICE_RESOURCE).to_string(),
+    ));
+
+    for (case, identifier) in identifiers {
+        assert!(
+            is_version_4_uuid(&identifier),
+            "case {case:?}: expected a lower-case version-4 UUID, got {identifier:?}"
+        );
+    }
+}
+
+/// The id an ARN's resource segment (everything after the fifth `:`) carries after its
+/// `<kind>/` qualifier.
+fn resource_id_after_kind<'a>(arn: &'a str, kind: &str) -> &'a str {
+    let resource_id = arn.splitn(6, ':').nth(5).unwrap_or(arn);
+    resource_id
+        .strip_prefix(kind)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(resource_id)
 }

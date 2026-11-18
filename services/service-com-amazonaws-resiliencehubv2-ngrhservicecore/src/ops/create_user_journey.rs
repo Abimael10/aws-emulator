@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUserJourney
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUserJourney`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUserJourney::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a user journey within the system the request names and stores it in that
+//! system's record, answering the projection every later read of the journey answers from.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUserJourney` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserJourneyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUserJourney"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateUserJourneyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        // The creation parameters of THIS request, which are what a `clientToken` compares a
+        // repeat against: everything the request says about the journey to create, and
+        // nothing the service derives.
+        let requested = crate::state::UserJourneyCreateRequest {
+            name: input.name.clone(),
+            description: input.description.clone(),
+            policy_arn: input.policy_arn.clone(),
+        };
+        let mut store = state.lock();
+        let system_arn = input.system_arn;
+
+        // A journey is created WITHIN a system, so the parent must exist before anything is
+        // stored: a `systemArn` naming no system is a 404, not a journey with no system.
+        // Every refusal below reads the system first, so nothing is minted or consumed until
+        // the call is known to be a create.
+        let Some(system) = store.systems.get(&system_arn) else {
+            return Err(system_not_found(&system_arn).into());
+        };
+
+        // `clientToken` is an @idempotencyToken: it makes a RETRY of this create safe, so a
+        // repeat of the same call answers the journey the first one created rather than
+        // creating a second one. A token already used for a DIFFERENT create is not a retry
+        // — the caller would be asking one token to stand for two distinct journeys — so it
+        // is refused with the conflict this operation models instead of answering a journey
+        // that is not the one asked for.
+        if let Some(consumed) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| system.user_journey_idempotency.get(token))
+        {
+            if consumed.request != requested {
+                return Err(CreateUserJourneyErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::two_requests_one_token_message(
+                            input.client_token.as_deref().unwrap_or_default(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            if let Some(replayed) = system.user_journeys.get(&consumed.user_journey_id) {
+                return Ok(CreateUserJourneyOutput {
+                    user_journey: replayed.to_user_journey(),
+                });
+            }
+        }
+
+        // The store is BOUNDED before it is written: every create grows the parent system's
+        // record by one entry carrying caller-supplied payload, so a caller that repeats
+        // this call would otherwise grow the process's memory without limit. At the ceiling
+        // — a hundred journeys per system, the same per-parent ceiling this store's other
+        // child resources carry, and reported in the refusal's own message below — the
+        // create is refused with the quota error this operation models, before anything is
+        // minted or inserted. The idempotency index is bounded by the same ceiling — a token
+        // already in it replays or is refused above, never inserting a second entry — and
+        // the whole per-system growth is reclaimed when the system is deleted, because the
+        // journeys live inside its record.
+        if system.user_journeys.len() >= crate::state::MAX_USER_JOURNEYS_PER_SYSTEM {
+            return Err(CreateUserJourneyErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of user journeys for system {system_arn} has been \
+                         reached: {}. Delete a user journey before creating another.",
+                        crate::state::MAX_USER_JOURNEYS_PER_SYSTEM
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The call is a create: take the next creation-order position and mint the id.
+        let sequence = store.next_sequence();
+        let user_journey_id = crate::state::mint_user_journey_id(&region);
+        let record = crate::state::UserJourneyRecord {
+            user_journey_id: user_journey_id.clone(),
+            name: requested.name.clone(),
+            description: requested.description.clone(),
+            policy_arn: requested.policy_arn.clone(),
+            created_at: now,
+            // Nothing has changed it yet, so it was last updated when it was created.
+            updated_at: now,
+            sequence,
+        };
+        // The response is projected through the same path every later read answers from.
+        let user_journey = record.to_user_journey();
+        // Re-reached mutably now that the counter has been read: the store has been held
+        // under this one lock throughout, so the system is still there, and a store that
+        // somehow lost it answers the same 404 rather than panicking.
+        let Some(system) = store.systems.get_mut(&system_arn) else {
+            return Err(system_not_found(&system_arn).into());
+        };
+        if let Some(token) = input.client_token {
+            system.user_journey_idempotency.insert(
+                token,
+                crate::state::UserJourneyIdempotencyRecord {
+                    user_journey_id: user_journey_id.clone(),
+                    request: requested,
+                },
+            );
+        }
+        system.user_journeys.insert(user_journey_id, record);
+
+        Ok(CreateUserJourneyOutput { user_journey })
     }
+}
+
+/// The refusal for a `systemArn` that names no stored system: a journey is created within a
+/// system, so without that system there is nothing to create it in.
+fn system_not_found(system_arn: &str) -> CreateUserJourneyErrorModeled {
+    CreateUserJourneyErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        crate::state::SYSTEM_RESOURCE_TYPE,
+        system_arn,
+    ))
 }

@@ -21,11 +21,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
-use crate::ops::types::System;
+use crate::ops::types::{AssociatedSystem, System};
 
 use super::{
-    tag_map_view, to_date_time, ComAmazonawsResiliencehubv2NgrhservicecoreState,
-    ARN_SERVICE_NAMESPACE,
+    not_found_message, tag_map_view, to_date_time, user_journey_not_found_for_system_message,
+    ComAmazonawsResiliencehubv2NgrhservicecoreState, UserJourneyIdempotencyRecord,
+    UserJourneyRecord, ARN_SERVICE_NAMESPACE, SYSTEM_RESOURCE_TYPE,
 };
 
 /// The resource type a system's ARN carries.
@@ -70,6 +71,13 @@ pub struct SystemRecord {
     /// Creation order, from the store's monotonic counter — the order a listing scans
     /// in, and the position a page token names.
     pub sequence: u64,
+    /// The user journeys created on this system, keyed by `userJourneyId`. See
+    /// [`user_journeys`](super::user_journeys): a journey exists only within its system, so
+    /// deleting the system takes its journeys with it.
+    pub user_journeys: BTreeMap<String, UserJourneyRecord>,
+    /// `clientToken` -> what that token created on this system, so a repeat of the
+    /// `CreateUserJourney` call it was first used for answers the journey that call created.
+    pub user_journey_idempotency: BTreeMap<String, UserJourneyIdempotencyRecord>,
 }
 
 impl SystemRecord {
@@ -164,6 +172,79 @@ impl ComAmazonawsResiliencehubv2NgrhservicecoreState {
         records.sort_by_key(|record| record.sequence);
         records
     }
+
+    /// The refusal MESSAGE for the first entry of `associated` that references something
+    /// this store does not hold, or `None` when every reference in every entry resolves.
+    ///
+    /// An `AssociatedSystem` is a REFERENCE, not a value: the shape carries the model's
+    /// `@references` entry for the system resource, its `@required` `systemArn` names one of
+    /// the account's systems, and its `userJourneyIds` are "the list of user journey
+    /// identifiers that associate this system with the service" — identifiers of journeys
+    /// OF that system. Both are resolved against the store before an operation writes an
+    /// association: the members' patterns are already enforced, and a well-formed ARN or id
+    /// is no evidence that what it names exists. The entries are checked in the order the
+    /// request sent them, and the system before the journeys it carries, so a reference that
+    /// cannot resolve names itself in the refusal.
+    pub fn unresolved_association_message(
+        &self,
+        associated: &[AssociatedSystem],
+    ) -> Option<String> {
+        for entry in associated {
+            let Some(system) = self.systems.get(&entry.system_arn) else {
+                return Some(not_found_message(SYSTEM_RESOURCE_TYPE, &entry.system_arn));
+            };
+            let journeys = entry.user_journey_ids.as_deref().unwrap_or_default();
+            if let Some(absent) = journeys
+                .iter()
+                .find(|journey_id| !system.user_journeys.contains_key(*journey_id))
+            {
+                return Some(user_journey_not_found_for_system_message(
+                    absent,
+                    &entry.system_arn,
+                ));
+            }
+        }
+        None
+    }
+
+    /// Whether any stored service still lists `system_arn` among its `associatedSystems`.
+    ///
+    /// What stands between a system and its deletion: a system a service is associated with
+    /// is in use, so removing it would leave that service naming a system that is not
+    /// there.
+    pub fn system_is_associated(&self, system_arn: &str) -> bool {
+        self.services.values().any(|service| {
+            service
+                .associated_systems
+                .iter()
+                .any(|entry| entry.system_arn == system_arn)
+        })
+    }
+
+    /// Remove the system stored under `system_arn`, with the two secondary indexes that
+    /// name it, and answer the record that was removed.
+    ///
+    /// The name is free again for a later create, and no `clientToken` may replay into a
+    /// system that no longer exists — the same cleanup a deleted service takes with it.
+    pub fn remove_system(&mut self, system_arn: &str) -> Option<SystemRecord> {
+        let record = self.systems.remove(system_arn)?;
+        self.system_names.remove(&record.name);
+        self.system_idempotency
+            .retain(|_, consumed| consumed.system_arn != record.system_arn);
+        Some(record)
+    }
+}
+
+/// The refusal MESSAGE for a `DeleteSystem` whose system is still associated with at least
+/// one service.
+///
+/// A system is deletable once no service is associated with it, so the refusal says that is
+/// what stands in the way, and names the system it is about by its own `systemId` — fixed
+/// text around that one value. The services themselves are not part of it: the caller
+/// addressed a system, and which services hold it is what `ListServices(systemArn=…)`
+/// answers.
+pub fn system_in_use_message(system_id: &str) -> String {
+    format!("Cannot delete system with associated services: {system_id}")
 }
 
 /// Mint a fresh system id and the ARN that carries it:

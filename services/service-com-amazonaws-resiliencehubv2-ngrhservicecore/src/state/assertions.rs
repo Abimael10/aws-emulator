@@ -98,9 +98,9 @@ impl ServiceRecord {
 /// Mint a fresh `assertionId`.
 ///
 /// `Assertion$assertionId` is typed `Uuid` (`len 36..36` with the version and variant
-/// nibbles the pattern pins), so the id comes from [`super::mint_modelled_uuid`] rather
-/// than from the custom-version minting the ARNs use; none of its bits comes from the
-/// request, so two assertions carrying the same text never collide.
+/// nibbles the pattern pins), which the version this crate's one minting path stamps
+/// satisfies; none of its bits comes from the request, so two
+/// assertions carrying the same text never collide.
 pub fn mint_assertion_id(region: &str) -> String {
-    super::mint_modelled_uuid(region)
+    super::mint_uuid(region)
 }

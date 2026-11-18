@@ -126,6 +126,48 @@ async fn create_named(router: &MultiServiceRouter, name: &str) -> String {
     service_arn(&body)
 }
 
+/// Create a SYSTEM named `name` and return its ARN, failing the test if the call did not
+/// succeed.
+///
+/// An `associatedSystems` entry references one of the account's systems, which a create or
+/// an update resolves against the store, so a case that associates a system creates it
+/// first and uses the ARN the service minted for it.
+async fn create_system_named(router: &MultiServiceRouter, name: &str) -> String {
+    let (status, body) = call(
+        router,
+        "POST",
+        "/v2/create-system",
+        Some(json!({"name": name})),
+    )
+    .await;
+    assert_eq!(status, 200, "creating system {name}: got {body:?}");
+    body["system"]["systemArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no system.systemArn in {body:?}"))
+        .to_string()
+}
+
+/// Create a USER JOURNEY named `name` on `system_arn` and return its id, failing the test
+/// if the call did not succeed.
+///
+/// An `associatedSystems` entry's `userJourneyIds` reference journeys of the system the
+/// entry names, which a create or an update resolves against that system, so a case that
+/// associates journeys creates them first and uses the ids the service minted for them.
+async fn create_user_journey(router: &MultiServiceRouter, system_arn: &str, name: &str) -> String {
+    let (status, body) = call(
+        router,
+        "POST",
+        "/v2/create-user-journey",
+        Some(json!({"systemArn": system_arn, "name": name})),
+    )
+    .await;
+    assert_eq!(status, 200, "creating user journey {name}: got {body:?}");
+    body["userJourney"]["userJourneyId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no userJourney.userJourneyId in {body:?}"))
+        .to_string()
+}
+
 fn service_arn(body: &Value) -> String {
     body["service"]["serviceArn"]
         .as_str()
@@ -152,8 +194,9 @@ fn summary_names(body: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Whether `candidate` is a UUID in RFC 9562's canonical 8-4-4-4-12 textual form, with a
-/// version nibble in 1..=8 and a variant nibble in `[89ab]`.
+/// Whether `candidate` is a UUID in RFC 9562's canonical 8-4-4-4-12 textual form, with the
+/// version-4 nibble and a variant nibble in `[89ab]` — the one form this service mints its
+/// resource ids in.
 fn is_canonical_uuid(candidate: &str) -> bool {
     let groups: Vec<&str> = candidate.split('-').collect();
     if groups.len() != 5 {
@@ -174,7 +217,7 @@ fn is_canonical_uuid(candidate: &str) -> bool {
     }
     let version = groups[2].chars().next().unwrap_or('0');
     let variant = groups[3].chars().next().unwrap_or('0');
-    ('1'..='8').contains(&version) && "89ab".contains(variant)
+    version == '4' && "89ab".contains(variant)
 }
 
 // ---------------------------------------------------------------------------
@@ -190,8 +233,15 @@ fn is_canonical_uuid(candidate: &str) -> bool {
 /// and which optional members are present at all.
 #[tokio::test]
 async fn a_created_service_is_stored_and_reads_back_identically() {
+    let router = emulator();
     let sixty_char_name = "a".repeat(60);
     let longest_description = "d".repeat(615);
+    // The systems a row associates have to exist before it can associate them, and so do
+    // the user journeys one of them names.
+    let system_one = create_system_named(&router, "linked-system-one").await;
+    let system_two = create_system_named(&router, "linked-system-two").await;
+    let journey_one = create_user_journey(&router, &system_one, "Checkout journey").await;
+    let journey_two = create_user_journey(&router, &system_one, "Refund journey").await;
     let cases: Vec<(&str, Value)> = vec![
         ("required members only, 2-character name", minimal("ab")),
         (
@@ -227,10 +277,10 @@ async fn a_created_service_is_stored_and_reads_back_identically() {
                     ],
                 },
                 "associatedSystems": [
-                    {"systemArn": format!("arn:aws:resiliencehub:us-west-2:{ACCOUNT}:system/s-1"),
+                    {"systemArn": system_one,
                      "systemName": "checkout",
-                     "userJourneyIds": ["j-1", "j-2"]},
-                    {"systemArn": format!("arn:aws:resiliencehub:us-west-2:{ACCOUNT}:system/s-2")}
+                     "userJourneyIds": [journey_one, journey_two]},
+                    {"systemArn": system_two}
                 ],
             }),
         ),
@@ -250,7 +300,6 @@ async fn a_created_service_is_stored_and_reads_back_identically() {
         ),
     ];
 
-    let router = emulator();
     let mut minted = Vec::new();
     for (label, body) in cases {
         let (status, created) = create(&router, body.clone()).await;
@@ -728,13 +777,17 @@ async fn every_filter_selects_by_the_stored_value() {
     let router = emulator();
     let policy_one = format!("arn:aws:resiliencehub:us-east-1:{ACCOUNT}:policy/p-one");
     let policy_two = format!("arn:aws:resiliencehub:us-east-1:{ACCOUNT}:policy/p-two");
-    let system_one = format!("arn:aws:resiliencehub:us-east-1:{ACCOUNT}:system/s-one");
-    let system_two = format!("arn:aws:resiliencehub:us-east-1:{ACCOUNT}:system/s-two");
+    // The filters select by the stored association, so the systems and the journeys one of
+    // them carries are real ones.
+    let system_one = create_system_named(&router, "filter-system-one").await;
+    let system_two = create_system_named(&router, "filter-system-two").await;
+    let journey_one = create_user_journey(&router, &system_one, "Journey one").await;
+    let journey_two = create_user_journey(&router, &system_one, "Journey two").await;
 
     let mut first = minimal("filter-a");
     first["policyArn"] = json!(policy_one);
     first["associatedSystems"] = json!([
-        {"systemArn": system_one, "userJourneyIds": ["j-one", "j-two"]}
+        {"systemArn": system_one, "userJourneyIds": [journey_one, journey_two]}
     ]);
     let (status, body) = create(&router, first).await;
     assert_eq!(status, 200, "creating filter-a got {body:?}");
@@ -765,7 +818,7 @@ async fn every_filter_selects_by_the_stored_value() {
         ("accountId=111111111111".to_string(), vec![]),
         (format!("systemArn={system_one}"), vec!["filter-a"]),
         (format!("systemArn={system_two}"), vec!["filter-b"]),
-        ("userJourneyId=j-two".to_string(), vec!["filter-a"]),
+        (format!("userJourneyId={journey_two}"), vec!["filter-a"]),
         ("userJourneyId=j-absent".to_string(), vec![]),
         ("ouId=ou-abcd-12345678".to_string(), vec![]),
         (
@@ -793,12 +846,13 @@ async fn every_filter_selects_by_the_stored_value() {
 #[tokio::test]
 async fn a_summary_projects_the_stored_record() {
     let router = emulator();
+    let system = create_system_named(&router, "summary-system").await;
     let mut body = minimal("summary-svc");
     body["policyArn"] = json!(format!("arn:aws:resiliencehub:us-east-1:{ACCOUNT}:policy/p"));
     body["regions"] = json!(["us-east-1", "us-west-1"]);
-    body["associatedSystems"] =
-        json!([{"systemArn": format!("arn:aws:resiliencehub:us-east-1:{ACCOUNT}:system/s")}]);
-    let (_, created) = create(&router, body).await;
+    body["associatedSystems"] = json!([{"systemArn": system}]);
+    let (status, created) = create(&router, body).await;
+    assert_eq!(status, 200, "creating summary-svc got {created:?}");
     let service = &created["service"];
 
     let (_, listed) = list(&router, "").await;
@@ -838,36 +892,52 @@ async fn a_summary_projects_the_stored_record() {
 #[tokio::test]
 async fn an_update_applies_only_the_members_it_carries() {
     let policy_two = format!("arn:aws:resiliencehub:us-east-1:{ACCOUNT}:policy/updated");
-    let system_two = format!("arn:aws:resiliencehub:us-east-1:{ACCOUNT}:system/updated");
-    let patches: Vec<(&str, Value)> = vec![
-        ("description only", json!({"description": "updated"})),
+    // The row that patches `associatedSystems` has to name a system that EXISTS, and each
+    // row drives a fresh emulator, so the patch is built from that emulator's own system
+    // ARN rather than from a literal.
+    type Patch = Box<dyn Fn(&str) -> Value>;
+    let patches: Vec<(&str, Patch)> = vec![
+        (
+            "description only",
+            Box::new(|_system| json!({"description": "updated"})),
+        ),
         (
             "regions only",
-            json!({"regions": ["us-east-1", "us-west-2", "eu-west-1"]}),
+            Box::new(|_system| json!({"regions": ["us-east-1", "us-west-2", "eu-west-1"]})),
         ),
-        ("policyArn only", json!({"policyArn": policy_two})),
+        (
+            "policyArn only",
+            Box::new(move |_system| json!({"policyArn": policy_two.clone()})),
+        ),
         (
             "associatedSystems only",
-            json!({"associatedSystems": [{"systemArn": system_two, "systemName": "renamed"}]}),
+            Box::new(|system| {
+                json!({"associatedSystems": [{"systemArn": system, "systemName": "renamed"}]})
+            }),
         ),
         (
             "permissionModel only",
-            json!({"permissionModel": {"invokerRoleName": "AnotherRole"}}),
+            Box::new(|_system| json!({"permissionModel": {"invokerRoleName": "AnotherRole"}})),
         ),
         (
             "reportConfiguration only",
-            json!({"reportConfiguration": {"reportOutputs": [
-                {"s3": {"bucketPath": "other-bucket/reports/", "bucketOwner": ACCOUNT}}
-            ]}}),
+            Box::new(|_system| {
+                json!({"reportConfiguration": {"reportOutputs": [
+                    {"s3": {"bucketPath": "other-bucket/reports/", "bucketOwner": ACCOUNT}}
+                ]}})
+            }),
         ),
         (
             "description and regions together",
-            json!({"description": "both", "regions": ["ap-south-1"]}),
+            Box::new(|_system| json!({"description": "both", "regions": ["ap-south-1"]})),
         ),
     ];
 
-    for (index, (label, patch)) in patches.into_iter().enumerate() {
+    for (index, (label, build_patch)) in patches.into_iter().enumerate() {
         let router = emulator();
+        let original_system = create_system_named(&router, "patch-system-original").await;
+        let replacement_system = create_system_named(&router, "patch-system-replacement").await;
+        let patch = build_patch(&replacement_system);
         let mut body = minimal(&format!("patch-svc-{index}"));
         body["description"] = json!("original");
         body["regions"] = json!(["us-east-1", "us-east-2"]);
@@ -875,9 +945,7 @@ async fn an_update_applies_only_the_members_it_carries() {
             "arn:aws:resiliencehub:us-east-1:{ACCOUNT}:policy/original"
         ));
         body["tags"] = json!({"env": "prod"});
-        body["associatedSystems"] = json!([
-            {"systemArn": format!("arn:aws:resiliencehub:us-east-1:{ACCOUNT}:system/original")}
-        ]);
+        body["associatedSystems"] = json!([{"systemArn": original_system}]);
         let (status, created) = create(&router, body).await;
         assert_eq!(status, 200, "case {label}: create got {created:?}");
         let original = created["service"].clone();
@@ -1186,5 +1254,159 @@ async fn a_status_the_clock_owes_settles_on_its_own() {
         linked_summary["devOpsAgentSpaceArn"],
         created_linked["service"]["devOpsAgentConfiguration"]["agentSpaceArn"],
         "the summary must project the stored Agent Space ARN, got {linked_summary:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The references an `associatedSystems` entry carries
+// ---------------------------------------------------------------------------
+
+/// RULE: an `associatedSystems` entry is a REFERENCE — its `systemArn` names one of the
+/// account's systems and its `userJourneyIds` name journeys OF that system — so a create or
+/// an update carrying one that resolves to nothing is refused `ValidationException` (HTTP
+/// 400) naming the offending value as the request supplied it, and nothing is written.
+///
+/// The rows differ along which reference does not resolve and in what way: a system id
+/// nothing minted, a system ARN in another Region or another account, an extra character
+/// appended to a live system's id, a journey id nothing minted, a journey belonging to
+/// ANOTHER system, a bad entry in second position behind a good one, and — as the positive
+/// control the rule is bounded by — entries whose every reference resolves.
+#[tokio::test]
+async fn an_association_naming_no_stored_system_or_journey_is_refused() {
+    let router = emulator();
+    let system_arn = create_system_named(&router, "referenced-system").await;
+    let other_system = create_system_named(&router, "other-system").await;
+    let journey = create_user_journey(&router, &system_arn, "Checkout journey").await;
+    let other_journey = create_user_journey(&router, &other_system, "Foreign journey").await;
+
+    // The system under test: a service that already carries one resolvable association, so
+    // a refused call can be shown to have left it alone.
+    let mut body = minimal("reference-holder");
+    body["associatedSystems"] = json!([{"systemArn": system_arn, "userJourneyIds": [journey]}]);
+    let (status, created) = create(&router, body).await;
+    assert_eq!(status, 200, "creating the holder got {created:?}");
+    let holder = service_arn(&created);
+    let stored = created["service"]["associatedSystems"].clone();
+
+    let appended = format!("{system_arn}zz");
+    let unknown_id = format!("arn:aws:resiliencehub:us-east-1:{ACCOUNT}:system/no-such-system");
+    let other_region = format!(
+        "arn:aws:resiliencehub:eu-west-1:{ACCOUNT}:system/{}",
+        "11111111-1111-4111-8111-111111111111"
+    );
+    let other_account =
+        "arn:aws:resiliencehub:us-east-1:210987654321:system/22222222-2222-4222-8222-222222222222"
+            .to_string();
+
+    let refused: Vec<(&str, Value, String)> = vec![
+        (
+            "a system id nothing minted",
+            json!([{"systemArn": unknown_id}]),
+            format!("System not found: {unknown_id}"),
+        ),
+        (
+            "a live system's id with characters appended",
+            json!([{"systemArn": appended}]),
+            format!("System not found: {appended}"),
+        ),
+        (
+            "a well-formed ARN in another Region",
+            json!([{"systemArn": other_region}]),
+            format!("System not found: {other_region}"),
+        ),
+        (
+            "a well-formed ARN in another account",
+            json!([{"systemArn": other_account}]),
+            format!("System not found: {other_account}"),
+        ),
+        (
+            "a journey id nothing minted",
+            json!([{"systemArn": system_arn, "userJourneyIds": ["no-such-journey"]}]),
+            format!("User journey not found: no-such-journey for system: {system_arn}"),
+        ),
+        (
+            "a journey belonging to another system",
+            json!([{"systemArn": system_arn, "userJourneyIds": [other_journey]}]),
+            format!("User journey not found: {other_journey} for system: {system_arn}"),
+        ),
+        (
+            "a good entry followed by an unknown system",
+            json!([{"systemArn": system_arn}, {"systemArn": unknown_id}]),
+            format!("System not found: {unknown_id}"),
+        ),
+    ];
+
+    for (index, (case, associated, expected)) in refused.into_iter().enumerate() {
+        for (operation, answer) in [
+            (
+                "CreateService",
+                {
+                    let mut request = minimal(&format!("refused-{index}"));
+                    request["associatedSystems"] = associated.clone();
+                    create(&router, request).await
+                },
+            ),
+            (
+                "UpdateService",
+                call(
+                    &router,
+                    "POST",
+                    "/v2/update-service",
+                    Some(json!({"serviceArn": holder, "associatedSystems": associated})),
+                )
+                .await,
+            ),
+        ] {
+            let (status, body) = answer;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400 from {operation}, got {status} {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {case:?}: expected ValidationException from {operation}, got {body:?}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some(expected.as_str()),
+                "case {case:?}: expected the refusal {expected:?} from {operation}, got {:?}",
+                body["message"]
+            );
+        }
+    }
+
+    // Nothing the refused calls carried was written: the holder still reports the one
+    // association it was created with, and no refused create is listed.
+    let (_, read) = get(&router, &holder).await;
+    assert_eq!(
+        read["service"]["associatedSystems"], stored,
+        "a refused update must leave the stored association untouched, got {read:?}"
+    );
+    let (_, listed) = list(&router, "").await;
+    assert_eq!(
+        summary_names(&listed),
+        vec!["reference-holder".to_string()],
+        "a refused create must store nothing, got {listed:?}"
+    );
+
+    // The positive control: every reference resolves, so the association is stored and read
+    // back — including a second system and both of the first system's journeys.
+    let second_journey = create_user_journey(&router, &system_arn, "Refund journey").await;
+    let accepted = json!([
+        {"systemArn": system_arn, "userJourneyIds": [journey, second_journey]},
+        {"systemArn": other_system, "userJourneyIds": [other_journey]},
+    ]);
+    let (status, updated) = call(
+        &router,
+        "POST",
+        "/v2/update-service",
+        Some(json!({"serviceArn": holder, "associatedSystems": accepted.clone()})),
+    )
+    .await;
+    assert_eq!(status, 200, "the resolvable association got {updated:?}");
+    assert_eq!(
+        updated["service"]["associatedSystems"], accepted,
+        "a resolvable association must be stored as sent, got {updated:?}"
     );
 }

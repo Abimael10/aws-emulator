@@ -10,6 +10,8 @@
 
 use crate::ops::types::ResourceNotFoundException;
 
+use super::SYSTEM_RESOURCE;
+
 /// `resourceType` for a resilience policy — the `Policy` shape's own name, which is what
 /// the type member reports.
 pub const POLICY_RESOURCE_TYPE: &str = "Policy";
@@ -44,18 +46,47 @@ const INPUT_SOURCE_LABEL: &str = "Input source";
 
 /// The refusal for a request whose `arn` names no stored resource of `resource_type`.
 ///
-/// `resourceId` is the IDENTIFIER of the resource, which is the resource segment of the
-/// ARN the request supplied (`<resource-type>/<id>`) rather than the whole ARN — the
-/// account, Region and partition segments say where the resource would live, not which
-/// resource it is. `message` is the resource type followed by `" not found: "` and that
-/// same identifier.
+/// `resourceId` is the IDENTIFIER of the resource, taken from the ARN the request supplied
+/// through [`refusal_resource_id`] — never the whole ARN, whose account, Region and
+/// partition segments say where the resource would live rather than which resource it is.
+/// `message` is worded by [`not_found_message`] around that same identifier.
 pub fn resource_not_found(resource_type: &str, arn: &str) -> ResourceNotFoundException {
-    let resource_id = arn_resource_id(arn);
+    let resource_id = refusal_resource_id(resource_type, arn);
     ResourceNotFoundException {
-        message: format!("{resource_type} not found: {resource_id}"),
+        message: not_found_message(resource_type, resource_id),
         resource_id: Some(resource_id.to_string()),
         resource_type: Some(resource_type.to_string()),
     }
+}
+
+/// The sentence a refusal naming a missing resource of `resource_type` is worded with: the
+/// resource type, fixed text, and the `identifier` of the resource that was not found.
+///
+/// Shared with the refusals that name a missing resource WITHOUT reporting it as the
+/// not-found resource of the request — a request whose own subject exists but whose body
+/// REFERENCES a resource that does not — so one missing resource is worded one way however
+/// it is reached.
+pub fn not_found_message(resource_type: &str, identifier: &str) -> String {
+    format!("{resource_type} not found: {identifier}")
+}
+
+/// The identifier a refusal for `arn` reports: the identifier the resource itself reports.
+///
+/// A system is the one resource of this store that carries an identifier of its OWN beside
+/// its ARN — `System$systemId`, typed `SystemId` ("System ID for cross-account use without
+/// exposing account structure") and reported by every reader of a system — and that id is
+/// the ARN's resource segment WITHOUT the `system/` qualifier, so a refusal naming a system
+/// names that same value. `Service` and `Policy` carry no id member at all, so the
+/// identifier of one of those is the whole resource segment the ARN carries.
+pub fn refusal_resource_id<'a>(resource_type: &str, arn: &'a str) -> &'a str {
+    let resource_id = arn_resource_id(arn);
+    if resource_type != SYSTEM_RESOURCE_TYPE {
+        return resource_id;
+    }
+    resource_id
+        .strip_prefix(SYSTEM_RESOURCE)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(resource_id)
 }
 
 /// The refusal for a `serviceFunctionId` that names no stored service function.
@@ -66,7 +97,7 @@ pub fn resource_not_found(resource_type: &str, arn: &str) -> ResourceNotFoundExc
 /// `resourceType` carries the model's own shape name for it.
 pub fn service_function_not_found(service_function_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("{SERVICE_FUNCTION_LABEL} not found: {service_function_id}"),
+        message: not_found_message(SERVICE_FUNCTION_LABEL, service_function_id),
         resource_id: Some(service_function_id.to_string()),
         resource_type: Some(SERVICE_FUNCTION_RESOURCE_TYPE.to_string()),
     }
@@ -79,7 +110,7 @@ pub fn service_function_not_found(service_function_id: &str) -> ResourceNotFound
 /// function's is.
 pub fn input_source_not_found(input_source_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("{INPUT_SOURCE_LABEL} not found: {input_source_id}"),
+        message: not_found_message(INPUT_SOURCE_LABEL, input_source_id),
         resource_id: Some(input_source_id.to_string()),
         resource_type: Some(INPUT_SOURCE_RESOURCE_TYPE.to_string()),
     }

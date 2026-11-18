@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSystem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSystem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSystem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members the request carries to the system stored under its ARN and answers
+//! that record's projection — the same one `CreateSystem` and `GetSystem` answer with, so a
+//! later read agrees with this call. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +140,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSystem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSystemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSystem"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateSystemErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `systemArn`'s length and `Arn` pattern are modelled, so a malformed one is
+        // already refused with a 400 `ValidationException` before this handler runs. A
+        // well-formed ARN that names no stored system is a 404.
+        let Some(record) = store.systems.get_mut(&input.system_arn) else {
+            return Err(UpdateSystemErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::SYSTEM_RESOURCE_TYPE,
+                    &input.system_arn,
+                ),
+            )
+            .into());
+        };
+
+        // Both members other than `systemArn` are optional, and an absent one means "leave
+        // it alone": the value the caller sent is the system's new one, and a member the
+        // caller did not send keeps what it held. Neither the name nor the ARN, the id, the
+        // tags or `createdAt` is a member of this request, so none of them can change here.
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+        if let Some(sharing_enabled) = input.sharing_enabled {
+            record.sharing_enabled = sharing_enabled;
+        }
+        // The record changed, so this is the instant it was last updated. `createdAt` stays
+        // where it was: the system was not created again.
+        record.updated_at = now;
+
+        // The body comes from the record's own `System` projection — the one path
+        // `CreateSystem` and `GetSystem` answer from as well, so a later read cannot
+        // disagree with what this call reported.
+        Ok(UpdateSystemOutput {
+            system: record.to_system(),
+        })
     }
 }

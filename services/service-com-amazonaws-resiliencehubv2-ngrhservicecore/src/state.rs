@@ -26,8 +26,10 @@
 //! two readers cannot drift from one another or from what was stored.
 //!
 //! The store's other resources live in their own modules beside this one:
-//! [`policies`] holds the `Policy` lifecycle's records and projection, and [`systems`]
-//! the `System` lifecycle's. The state STRUCT stays single
+//! [`policies`] holds the `Policy` lifecycle's records and projection, [`systems`]
+//! the `System` lifecycle's, and [`user_journeys`] the `UserJourney` records a system holds
+//! (a journey lives inside its system's record, so deleting the system takes its journeys
+//! with it). The state STRUCT stays single
 //! ([`ComAmazonawsResiliencehubv2NgrhservicecoreState`]), so one lock covers the whole
 //! store and a policy can be counted against the services that reference it.
 //!
@@ -50,6 +52,7 @@ mod not_found;
 mod policies;
 mod systems;
 mod tagging;
+mod user_journeys;
 
 pub use assertions::{
     mint_assertion_id, AssertionIdempotencyRecord, AssertionRecord, ASSERTION_SOURCE_USER,
@@ -64,15 +67,21 @@ pub use input_sources::{
 };
 pub use invoker_role::{invoker_role_rejection, unassumable_message, SERVICE_PRINCIPAL};
 pub use not_found::{
-    arn_resource_id, input_source_not_found, resource_not_found, service_function_not_found,
-    INPUT_SOURCE_RESOURCE_TYPE, POLICY_RESOURCE_TYPE, SERVICE_FUNCTION_RESOURCE_TYPE,
-    SERVICE_RESOURCE_TYPE, SYSTEM_RESOURCE_TYPE,
+    arn_resource_id, input_source_not_found, not_found_message, refusal_resource_id,
+    resource_not_found, service_function_not_found, INPUT_SOURCE_RESOURCE_TYPE,
+    POLICY_RESOURCE_TYPE, SERVICE_FUNCTION_RESOURCE_TYPE, SERVICE_RESOURCE_TYPE,
+    SYSTEM_RESOURCE_TYPE,
 };
 pub use systems::{
-    mint_system_arn, SystemCreateRequest, SystemIdempotencyRecord, SystemRecord, MAX_SYSTEMS,
-    SYSTEM_RESOURCE,
+    mint_system_arn, system_in_use_message, SystemCreateRequest, SystemIdempotencyRecord,
+    SystemRecord, MAX_SYSTEMS, SYSTEM_RESOURCE,
 };
 pub use tagging::{tagged_resource_type, MAX_TAGS_PER_RESOURCE};
+pub use user_journeys::{
+    mint_user_journey_id, user_journey_not_found, user_journey_not_found_for_system_message,
+    UserJourneyCreateRequest, UserJourneyIdempotencyRecord, UserJourneyRecord,
+    MAX_USER_JOURNEYS_PER_SYSTEM, USER_JOURNEY_RESOURCE_TYPE,
+};
 pub(crate) use tagging::tag_map_view;
 pub use policies::{
     mint_policy_arn, PolicyRecord, MAX_POLICIES, POLICY_RESOURCE, POLICY_VALUE_SOURCE_CROSS_ACCOUNT,
@@ -629,39 +638,24 @@ pub fn mint_service_function_id(region: &str) -> String {
 /// differ even when the clock does not advance between two calls.
 static IDS_MINTED: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
 
-/// A fresh UUID for a minted resource id, in the canonical 8-4-4-4-12 form.
+/// The version nibble every id this service mints carries, in the high nibble of octet 6:
+/// RFC 9562's version 4.
 ///
-/// RFC 9562 reserves version 8 for a UUID whose bits an application constructs itself,
-/// which is what this is: the SHA-256 (from the `sha2` crate, rather than any hand-written
-/// digest) of this process's monotonic mint counter, the current instant in nanoseconds
-/// and the Region, with the version and variant nibbles then set as the RFC requires.
-/// Hashing a counter this process owns makes the id unique without a random-source
-/// dependency, and none of its bits comes from the request body.
+/// It is the version the identifiers of these resources wear — the ids and the ARN resource
+/// segments this service hands out are read by clients, tooling and templates that validate
+/// a resource id as a version-4 UUID — and it is also the only version the model's own
+/// `Uuid` shape admits in that position (its pattern pins the nibble to `0..=5`), so ONE
+/// minting path serves both the ARN-carried ids and the ids typed by that shape.
+const UUID_VERSION: u8 = 0x40;
+
+/// A fresh UUID for a minted resource id, in the canonical lower-case 8-4-4-4-12 form.
+///
+/// The bits are derived rather than random: the SHA-256 (from the `sha2` crate, rather than
+/// any hand-written digest) of this process's monotonic mint counter, the current instant in
+/// nanoseconds and the Region, with the [`UUID_VERSION`] and variant nibbles then set as RFC
+/// 9562 requires. Hashing a counter this process owns makes the id unique without a
+/// random-source dependency, and none of its bits comes from the request body.
 fn mint_uuid(region: &str) -> String {
-    mint_uuid_of_version(region, UUID_VERSION_CUSTOM)
-}
-
-/// A fresh UUID for an identifier the model types `Uuid`.
-///
-/// That shape's pattern admits only a version nibble in `0..=5`, so the custom version
-/// [`mint_uuid`] carries would not satisfy it: this mints the same derived bits under the
-/// version nibble the shape admits, so an id this service hands out is one an operation
-/// taking it back as input accepts.
-pub fn mint_modelled_uuid(region: &str) -> String {
-    mint_uuid_of_version(region, UUID_VERSION_MODELLED)
-}
-
-/// The version nibble [`mint_uuid`] sets, in the high nibble of octet 6: RFC 9562 reserves
-/// version 8 for a UUID whose bits an application constructs itself.
-const UUID_VERSION_CUSTOM: u8 = 0x80;
-
-/// The version nibble [`mint_modelled_uuid`] sets, the one the model's `Uuid` pattern
-/// admits in that position.
-const UUID_VERSION_MODELLED: u8 = 0x40;
-
-/// The shared minting path behind [`mint_uuid`] and [`mint_modelled_uuid`]: the two differ
-/// only in the version nibble they stamp.
-fn mint_uuid_of_version(region: &str, version: u8) -> String {
     use ::sha2::{Digest, Sha256};
 
     let minted = IDS_MINTED.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
@@ -676,9 +670,9 @@ fn mint_uuid_of_version(region: &str, version: u8) -> String {
 
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
-    // The caller's version nibble and the RFC 9562 variant, so the value is a well-formed
-    // UUID rather than 16 arbitrary bytes wearing a UUID's punctuation.
-    bytes[6] = (bytes[6] & 0x0f) | version;
+    // The version and the RFC 9562 variant, so the value is a well-formed UUID rather than
+    // 16 arbitrary bytes wearing a UUID's punctuation.
+    bytes[6] = (bytes[6] & 0x0f) | UUID_VERSION;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let rendered = ::hex::encode(bytes);
     format!(
