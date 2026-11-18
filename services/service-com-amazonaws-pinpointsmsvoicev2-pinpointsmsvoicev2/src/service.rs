@@ -124,14 +124,36 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // wording.
+        //
+        // This service states such a refusal as one sentence naming the request
+        // members it rejected, rather than quoting the constraint that failed: the
+        // sentence is fixed and the bracketed parameter list is taken from the request.
+        // The code stays `ValidationException`, the error this service models for a
+        // bad field, so a client still branches on the same name.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let mut named: Vec<String> = Vec::with_capacity(violations.len());
+                for violation in violations {
+                    // One member can fail two constraints; it is one rejected
+                    // parameter either way.
+                    let quoted = format!("'{}'", violation.path);
+                    if !named.contains(&quoted) {
+                        named.push(quoted);
+                    }
+                }
+                Some(Refused {
+                    code: "ValidationException".to_string(),
+                    message: format!(
+                        "The following parameter is null, empty or invalid: [{}]",
+                        named.join(", ")
+                    ),
+                })
+            }
+            // Authentication is the framework's to word: it refuses before this
+            // service's surface is reached at all.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

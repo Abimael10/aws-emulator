@@ -867,8 +867,16 @@ async fn a_repeated_client_token_creates_nothing_further() {
     ] {
         let (status, response) = emulator.call("CreateConfigurationSet", request).await;
         assert_eq!(
-            (status, error_code(&response).as_str()),
-            (400, "ValidationException"),
+            (
+                status,
+                error_code(&response).as_str(),
+                response.get("Message").and_then(serde_json::Value::as_str),
+            ),
+            (
+                400,
+                "ConflictException",
+                Some(sms_voice::state::CLIENT_TOKEN_CONFLICT_MESSAGE),
+            ),
             "case {case:?}: a token replayed with a different request must be refused, got {status} with {response}"
         );
     }
@@ -895,8 +903,16 @@ async fn a_repeated_client_token_creates_nothing_further() {
     different["NumberType"] = serde_json::Value::String("TOLL_FREE".to_string());
     let (status, response) = emulator.call("RequestPhoneNumber", different).await;
     assert_eq!(
-        (status, error_code(&response).as_str()),
-        (400, "ValidationException"),
+        (
+            status,
+            error_code(&response).as_str(),
+            response.get("Message").and_then(serde_json::Value::as_str),
+        ),
+        (
+            400,
+            "ConflictException",
+            Some(sms_voice::state::CLIENT_TOKEN_CONFLICT_MESSAGE),
+        ),
         "case \"same token, different NumberType\": expected a refusal, got {status} with {response}"
     );
 }
@@ -1091,4 +1107,457 @@ async fn every_caller_driven_store_is_bounded() {
         "case \"5 sends past the message cap\": the newest send must be retained, got {:?}",
         retained_ids.last()
     );
+}
+
+/// One `Timestamp` member of a response body, as the number the wire carried.
+///
+/// `pointer` is a JSON pointer, so a member nested in a list (`DescribePhoneNumbers`)
+/// is reachable too.
+fn timestamp_member(body: &serde_json::Value, pointer: &str) -> serde_json::Value {
+    body.pointer(pointer)
+        .cloned()
+        .unwrap_or_else(|| panic!("expected a timestamp at {pointer} in {body}"))
+}
+
+/// An epoch-seconds instant below every plausible "now", so a stamped value can be told
+/// apart from a zero/default one without asserting on the clock.
+const EPOCH_SECONDS_FLOOR: u64 = 1_700_000_000;
+
+#[tokio::test]
+async fn every_timestamp_this_service_stamps_is_reported_in_whole_epoch_seconds() {
+    let emulator = Emulator::new();
+
+    // Every response member this service stamps with the wall clock, one row each: the
+    // two configuration-set operations that report `CreatedTimestamp` and the three
+    // phone-number ones, named with the JSON pointer the member sits at. Each row is
+    // collected as `(case, member)` and asserted below, so the rule is checked over the
+    // whole class rather than on one operation.
+    let mut stamped: Vec<(&str, serde_json::Value)> = Vec::new();
+
+    let created_set = emulator
+        .ok(
+            "CreateConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "ts-probe"}),
+        )
+        .await;
+    stamped.push((
+        "CreateConfigurationSet.CreatedTimestamp",
+        timestamp_member(&created_set, "/CreatedTimestamp"),
+    ));
+
+    let requested = emulator
+        .ok(
+            "RequestPhoneNumber",
+            number_request("US", "TRANSACTIONAL", "SMS", "SIMULATOR"),
+        )
+        .await;
+    stamped.push((
+        "RequestPhoneNumber.CreatedTimestamp",
+        timestamp_member(&requested, "/CreatedTimestamp"),
+    ));
+    let phone_number_id = as_str(&requested, "PhoneNumberId");
+
+    let described = emulator.ok("DescribePhoneNumbers", serde_json::json!({})).await;
+    stamped.push((
+        "DescribePhoneNumbers.PhoneNumbers[0].CreatedTimestamp",
+        timestamp_member(&described, "/PhoneNumbers/0/CreatedTimestamp"),
+    ));
+
+    let released = emulator
+        .ok(
+            "ReleasePhoneNumber",
+            serde_json::json!({"PhoneNumberId": phone_number_id}),
+        )
+        .await;
+    stamped.push((
+        "ReleasePhoneNumber.CreatedTimestamp",
+        timestamp_member(&released, "/CreatedTimestamp"),
+    ));
+
+    let deleted_set = emulator
+        .ok(
+            "DeleteConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "ts-probe"}),
+        )
+        .await;
+    stamped.push((
+        "DeleteConfigurationSet.CreatedTimestamp",
+        timestamp_member(&deleted_set, "/CreatedTimestamp"),
+    ));
+
+    for (case, member) in &stamped {
+        // `as_u64()` answers `None` for a number the wire carried with a fractional part
+        // (`1794300627.7584016` parses as a float), which is exactly the form under test:
+        // an epoch-seconds timestamp is stamped at whole-second granularity.
+        let Some(seconds) = member.as_u64() else {
+            panic!(
+                "case {case:?}: expected a whole-second epoch timestamp, got {member} \
+                 (a sub-second remainder of the host clock is never reported)"
+            );
+        };
+        assert!(
+            seconds > EPOCH_SECONDS_FLOOR,
+            "case {case:?}: expected an epoch-seconds instant later than \
+             {EPOCH_SECONDS_FLOOR}, got {seconds}"
+        );
+    }
+
+    // The same record read twice reports the same instant: truncation happens on one
+    // shared helper, so it is stable rather than re-derived per response.
+    assert_eq!(
+        timestamp_member(&requested, "/CreatedTimestamp"),
+        timestamp_member(&described, "/PhoneNumbers/0/CreatedTimestamp"),
+        "case \"one record read twice\": the request, describe and release of one number \
+         must report one instant, got {requested} then {described}"
+    );
+    assert_eq!(
+        timestamp_member(&requested, "/CreatedTimestamp"),
+        timestamp_member(&released, "/CreatedTimestamp"),
+        "case \"one record read twice\": the release must report the stamped instant, \
+         got {released}"
+    );
+}
+
+/// The three `Set*` calls that configure one configuration set's defaults, as
+/// `(operation, request member, value)` rows for one case.
+fn default_settings(
+    message_type: &str,
+    sender_id: &str,
+    feedback_enabled: bool,
+) -> Vec<(&'static str, &'static str, serde_json::Value)> {
+    vec![
+        (
+            "SetDefaultMessageType",
+            "MessageType",
+            serde_json::Value::from(message_type),
+        ),
+        (
+            "SetDefaultSenderId",
+            "SenderId",
+            serde_json::Value::from(sender_id),
+        ),
+        (
+            "SetDefaultMessageFeedbackEnabled",
+            "MessageFeedbackEnabled",
+            serde_json::Value::from(feedback_enabled),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_configuration_set_default_that_was_set_is_reported_on_every_later_read() {
+    let emulator = Emulator::new();
+
+    // One row per shape of default. `MessageType` walks the modelled enum
+    // (`MESSAGE_TYPE_VALUES`, the model's `MessageType` values), and the sender ids span
+    // `SenderId`'s own constraint (len 1..11, `^[A-Za-z0-9_-]+$`): one character, the
+    // 11-character maximum, and the `_`/digit forms the pattern allows.
+    let cases: Vec<(&str, &str, &str, bool, bool)> = vec![
+        // (case, MessageType, SenderId, MessageFeedbackEnabled, name the set by ARN)
+        ("shortest sender id, feedback on", MESSAGE_TYPE_VALUES[0], "A", true, false),
+        (
+            "longest sender id, feedback off",
+            MESSAGE_TYPE_VALUES[1],
+            "SENDER-1234",
+            false,
+            false,
+        ),
+        (
+            "underscored sender id, named by ARN, feedback on",
+            MESSAGE_TYPE_VALUES[1],
+            "svc_01",
+            true,
+            true,
+        ),
+    ];
+
+    for (index, (case, message_type, sender_id, feedback_enabled, by_arn)) in
+        cases.iter().enumerate()
+    {
+        let name = format!("defaults-{index}");
+        let created = emulator
+            .ok(
+                "CreateConfigurationSet",
+                serde_json::json!({"ConfigurationSetName": name}),
+            )
+            .await;
+        // A set reports no defaults until one is set: the create-time state, which is
+        // what the later reads must be told apart from.
+        assert_eq!(
+            (
+                created.get("DefaultMessageType"),
+                created.get("DefaultSenderId"),
+            ),
+            (None, None),
+            "case {case:?}: a new set carries no defaults, got {created}"
+        );
+
+        // `ConfigurationSetName` is a `ConfigurationSetNameOrArn`, so one row names the
+        // set by its ARN instead.
+        let named = if *by_arn {
+            format!("arn:aws:sms-voice:{REGION}:{ACCOUNT_ID}:configuration-set/{name}")
+        } else {
+            name.clone()
+        };
+
+        for (operation, member, value) in
+            default_settings(message_type, sender_id, *feedback_enabled)
+        {
+            let response = emulator
+                .ok(
+                    operation,
+                    serde_json::json!({"ConfigurationSetName": named, member: value}),
+                )
+                .await;
+            // The set call answers the value the request named, under the resolved name
+            // and the set's ARN.
+            assert_eq!(
+                (
+                    response.get(member),
+                    as_str(&response, "ConfigurationSetName"),
+                    as_str(&response, "ConfigurationSetArn"),
+                ),
+                (
+                    Some(&value),
+                    name.clone(),
+                    format!("arn:aws:sms-voice:{REGION}:{ACCOUNT_ID}:configuration-set/{name}"),
+                ),
+                "case {case:?}: {operation} must report the {member} it was asked for, got {response}"
+            );
+        }
+
+        // The round trip: the implemented reader reports all three defaults off the
+        // record the `Set*` calls wrote.
+        let deleted = emulator
+            .ok(
+                "DeleteConfigurationSet",
+                serde_json::json!({"ConfigurationSetName": name}),
+            )
+            .await;
+        assert_eq!(
+            (
+                deleted.get("DefaultMessageType").and_then(serde_json::Value::as_str),
+                deleted.get("DefaultSenderId").and_then(serde_json::Value::as_str),
+                deleted
+                    .get("DefaultMessageFeedbackEnabled")
+                    .and_then(serde_json::Value::as_bool),
+            ),
+            (
+                // A read of the set reports the record's canonical capitalization of the
+                // message type, whichever case the request that set it used; the sender
+                // id is a caller-chosen value, reported exactly as it was set.
+                Some(sms_voice::state::canonical_message_type(message_type).as_str()),
+                Some(*sender_id),
+                Some(*feedback_enabled),
+            ),
+            "case {case:?}: the set's configured defaults must be reported back, got {deleted}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn setting_a_default_again_replaces_it_and_an_unknown_set_is_not_found() {
+    let emulator = Emulator::new();
+
+    emulator
+        .ok(
+            "CreateConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "rewritten"}),
+        )
+        .await;
+
+    // Each default is single-valued: a second set replaces the first, including turning
+    // the message-feedback flag back off.
+    for (operation, member, value) in default_settings(MESSAGE_TYPE_VALUES[1], "FIRST", true) {
+        emulator
+            .ok(
+                operation,
+                serde_json::json!({"ConfigurationSetName": "rewritten", member: value}),
+            )
+            .await;
+    }
+    for (operation, member, value) in default_settings(MESSAGE_TYPE_VALUES[0], "SECOND", false) {
+        emulator
+            .ok(
+                operation,
+                serde_json::json!({"ConfigurationSetName": "rewritten", member: value}),
+            )
+            .await;
+    }
+    let deleted = emulator
+        .ok(
+            "DeleteConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "rewritten"}),
+        )
+        .await;
+    assert_eq!(
+        (
+            deleted.get("DefaultMessageType").and_then(serde_json::Value::as_str),
+            deleted.get("DefaultSenderId").and_then(serde_json::Value::as_str),
+            deleted
+                .get("DefaultMessageFeedbackEnabled")
+                .and_then(serde_json::Value::as_bool),
+        ),
+        (
+            Some(sms_voice::state::canonical_message_type(MESSAGE_TYPE_VALUES[0]).as_str()),
+            Some("SECOND"),
+            Some(false),
+        ),
+        "case \"each default set twice\": the last write must be the one reported, got {deleted}"
+    );
+
+    // A default can only be set on a set that exists: an unknown name, and the name of
+    // the set just deleted, are both not-found.
+    for (case, named) in [
+        ("never created", "no-such-set"),
+        ("deleted set", "rewritten"),
+    ] {
+        for (operation, member, value) in default_settings(MESSAGE_TYPE_VALUES[0], "NOBODY", true) {
+            let (status, body) = emulator
+                .call(
+                    operation,
+                    serde_json::json!({"ConfigurationSetName": named, member: value}),
+                )
+                .await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "ResourceNotFoundException"),
+                "case {case:?}: {operation} on a set that does not exist must be \
+                 not-found, got {status} with {body}"
+            );
+        }
+    }
+
+    // The message type a request may name is the modelled `MessageType` value set
+    // (`MESSAGE_TYPE_VALUES`), so the record's capitalization is never one a caller can
+    // ask for: anything outside the set is refused rather than stored.
+    emulator
+        .ok(
+            "CreateConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "strict"}),
+        )
+        .await;
+    for spelling in ["Transactional", "transactional", "URGENT"] {
+        let (status, body) = emulator
+            .call(
+                "SetDefaultMessageType",
+                serde_json::json!({"ConfigurationSetName": "strict", "MessageType": spelling}),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {spelling:?}: a message type outside the modelled set must be refused, \
+             got {status} with {body}"
+        );
+    }
+    let still_unset = emulator
+        .ok(
+            "DeleteConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "strict"}),
+        )
+        .await;
+    assert_eq!(
+        still_unset.get("DefaultMessageType"),
+        None,
+        "case \"refused message types\": a refused set must store nothing, got {still_unset}"
+    );
+}
+
+/// One conflict case: the call that provokes it, and the resource members the refusal
+/// names (`None` for a conflict that names no resource).
+struct ConflictCase {
+    case: &'static str,
+    operation: &'static str,
+    request: serde_json::Value,
+    members: Option<(&'static str, &'static str, String)>,
+}
+
+#[tokio::test]
+async fn a_conflict_reports_the_message_that_restates_its_own_members() {
+    let emulator = Emulator::new();
+
+    emulator
+        .ok(
+            "CreateConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "taken", "ClientToken": "first-token"}),
+        )
+        .await;
+    let mut protected = number_request("US", "TRANSACTIONAL", "SMS", "SIMULATOR");
+    protected["DeletionProtectionEnabled"] = serde_json::Value::Bool(true);
+    let protected_id = request_number(&emulator, protected).await;
+
+    // One row per conflict this slice can report, differing in reason and resource type:
+    // the message restates the exception's own `Reason`, `ResourceType` and `ResourceId`.
+    let cases: Vec<ConflictCase> = vec![
+        ConflictCase {
+            case: "a second configuration set of one name",
+            operation: "CreateConfigurationSet",
+            request: serde_json::json!({"ConfigurationSetName": "taken"}),
+            members: Some((
+                "RESOURCE_ALREADY_EXISTS",
+                "configuration-set",
+                "taken".to_string(),
+            )),
+        },
+        ConflictCase {
+            case: "releasing a deletion-protected number",
+            operation: "ReleasePhoneNumber",
+            request: serde_json::json!({"PhoneNumberId": protected_id.clone()}),
+            members: Some((
+                "DELETION_PROTECTION_ENABLED",
+                "phone-number",
+                protected_id.clone(),
+            )),
+        },
+        ConflictCase {
+            // A replayed token names no resource, so the conflict carries the message
+            // alone and none of the resource members.
+            case: "a ClientToken replayed with a different request",
+            operation: "CreateConfigurationSet",
+            request: serde_json::json!({
+                "ConfigurationSetName": "other",
+                "ClientToken": "first-token",
+            }),
+            members: None,
+        },
+    ];
+
+    for ConflictCase {
+        case,
+        operation,
+        request,
+        members,
+    } in cases
+    {
+        let (status, body) = emulator.call(operation, request).await;
+        let expected_message = match &members {
+            Some((reason, resource_type, resource_id)) => {
+                sms_voice::state::conflict_message(reason, resource_type, resource_id)
+            }
+            None => sms_voice::state::CLIENT_TOKEN_CONFLICT_MESSAGE.to_string(),
+        };
+        assert_eq!(
+            (
+                status,
+                error_code(&body).as_str(),
+                body.get("Message").and_then(serde_json::Value::as_str),
+            ),
+            (400, "ConflictException", Some(expected_message.as_str())),
+            "case {case:?}: expected the conflict AWS words for it, got {status} with {body}"
+        );
+        assert_eq!(
+            (
+                body.get("Reason").and_then(serde_json::Value::as_str),
+                body.get("ResourceType").and_then(serde_json::Value::as_str),
+                body.get("ResourceId").and_then(serde_json::Value::as_str),
+            ),
+            match &members {
+                Some((reason, resource_type, resource_id)) =>
+                    (Some(*reason), Some(*resource_type), Some(resource_id.as_str())),
+                None => (None, None, None),
+            },
+            "case {case:?}: expected the structured members the message restates, got {body}"
+        );
+    }
 }

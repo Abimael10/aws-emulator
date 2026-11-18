@@ -178,7 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(removed) = state.configuration_sets.remove(&name) else {
             return Err(DeleteConfigurationSetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("configuration set {name} not found")),
+                    message: Some(crate::state::resource_not_found_message(
+                        "configuration-set",
+                        &name,
+                    )),
                     resource_type: Some("configuration-set".to_string()),
                     resource_id: Some(name),
                 },

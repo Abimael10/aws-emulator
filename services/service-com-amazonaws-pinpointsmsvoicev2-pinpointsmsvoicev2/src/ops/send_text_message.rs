@@ -237,8 +237,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.find_phone_number(&origination_identity).is_none() {
             return Err(SendTextMessageErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "origination identity {origination_identity} not found"
+                    message: Some(crate::state::resource_not_found_message(
+                        "phone-number",
+                        &origination_identity,
                     )),
                     resource_type: Some("phone-number".to_string()),
                     resource_id: Some(origination_identity),
@@ -256,7 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !state.configuration_sets.contains_key(&name) {
                     return Err(SendTextMessageErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(format!("configuration set {name} not found")),
+                            message: Some(crate::state::resource_not_found_message(
+                                "configuration-set",
+                                &name,
+                            )),
                             resource_type: Some("configuration-set".to_string()),
                             resource_id: Some(name),
                         },
@@ -272,8 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(protect_configuration_id) = input.protect_configuration_id {
             return Err(SendTextMessageErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "protect configuration {protect_configuration_id} not found"
+                    message: Some(crate::state::resource_not_found_message(
+                        "protect-configuration",
+                        &protect_configuration_id,
                     )),
                     resource_type: Some("protect-configuration".to_string()),
                     resource_id: Some(protect_configuration_id),

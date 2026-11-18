@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetDefaultMessageFeedbackEnabled
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetDefaultMessageFeedbackEnabled`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetDefaultMessageFeedbackEnabled::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists the message-feedback flag into the stored configuration set and
+//! answers from the record it wrote, so every operation that reports the set's
+//! message-feedback default (`DeleteConfigurationSet`, a describe) reports what was set.
+//! An unknown configuration set is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +149,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetDefaultMessageFeedbackEnabled` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetDefaultMessageFeedbackEnabledErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetDefaultMessageFeedbackEnabled"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                SetDefaultMessageFeedbackEnabledErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the configuration-set store is unavailable".to_string()),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+
+        // `ConfigurationSetName` here is a `ConfigurationSetNameOrArn`, so the caller may
+        // name the set by ARN; the store is keyed by name.
+        let name = crate::state::name_from_name_or_arn(&input.configuration_set_name).to_string();
+
+        let Some(record) = state.configuration_sets.get_mut(&name) else {
+            return Err(
+                SetDefaultMessageFeedbackEnabledErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            "configuration-set",
+                            &name,
+                        )),
+                        resource_type: Some("configuration-set".to_string()),
+                        resource_id: Some(name),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The whole point of the operation: the flag has to OUTLIVE this request, so the
+        // set reports it on every later read. It is a plain `Boolean`, so turning feedback
+        // back off is the same write with the other value.
+        record.default_message_feedback_enabled = input.message_feedback_enabled;
+
+        // Read the response back out of the record that was just written.
+        Ok(SetDefaultMessageFeedbackEnabledOutput {
+            configuration_set_arn: Some(record.arn.clone()),
+            configuration_set_name: Some(record.name.clone()),
+            message_feedback_enabled: Some(record.default_message_feedback_enabled),
+        })
     }
 }

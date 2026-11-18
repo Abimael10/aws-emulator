@@ -193,17 +193,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             if let Some(seen) = state.client_token_record(Self::NAME, token).cloned() {
                 if seen.fingerprint != fingerprint {
-                    return Err(CreateConfigurationSetErrorModeled::ValidationException(
-                        ValidationException {
+                    return Err(CreateConfigurationSetErrorModeled::ConflictException(
+                        ConflictException {
                             message: Some(
-                                "ClientToken was already used for a different CreateConfigurationSet request"
-                                    .to_string(),
+                                crate::state::CLIENT_TOKEN_CONFLICT_MESSAGE.to_string(),
                             ),
-                            reason: Some("INVALID_PARAMETER".to_string()),
-                            fields: Some(vec![ValidationExceptionField {
-                                name: "ClientToken".to_string(),
-                                message: "already used for a different request".to_string(),
-                            }]),
+                            reason: None,
+                            resource_type: None,
+                            resource_id: None,
                         },
                     )
                     .into());
@@ -217,7 +214,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.configuration_sets.contains_key(&name) {
             return Err(CreateConfigurationSetErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!("configuration set {name} already exists")),
+                    // AWS words this service's conflict message as a restatement of the
+                    // exception's own members, so both carry the same values.
+                    message: Some(crate::state::conflict_message(
+                        "RESOURCE_ALREADY_EXISTS",
+                        "configuration-set",
+                        &name,
+                    )),
                     reason: Some("RESOURCE_ALREADY_EXISTS".to_string()),
                     resource_type: Some("configuration-set".to_string()),
                     resource_id: Some(name),

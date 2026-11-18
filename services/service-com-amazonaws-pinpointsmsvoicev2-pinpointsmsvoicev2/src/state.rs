@@ -81,11 +81,22 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 }
 
 /// A wall-clock instant as the modelled `Timestamp` type.
+///
+/// Truncated to whole seconds: every `Timestamp` this service reports is documented as
+/// a time "in UNIX epoch time format" (e.g.
+/// `DeleteConfigurationSetResult$CreatedTimestamp`, `PhoneNumberInformation$CreatedTimestamp`),
+/// which is the granularity the records are stamped at, so no member carries a
+/// sub-second remainder of the host clock. Truncation is applied here, on the one
+/// helper every stamped member goes through, so the whole service reports one
+/// granularity; the stored instant is unchanged, so repeated reads of one record keep
+/// answering the same value.
 pub fn to_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
-    ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+    ::aws_smithy_types::DateTime::from_secs(
+        i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
+    )
 }
 
 /// The resource name carried by a `<Thing>NameOrArn` / `<Thing>IdOrArn` member: the
@@ -95,6 +106,48 @@ pub fn name_from_name_or_arn(value: &str) -> &str {
         value.split('/').next_back().unwrap_or(value)
     } else {
         value
+    }
+}
+
+/// The message a `ConflictException` carries: this service words it as a restatement of
+/// the exception's own structured members, so a caller reading only `Message` is told the
+/// same `Reason`, `ResourceType` and `ResourceId` the body carries.
+///
+/// `reason` is a `ConflictExceptionReason`, `resource_type` a `ResourceType`.
+pub fn conflict_message(reason: &str, resource_type: &str, resource_id: &str) -> String {
+    format!(
+        "Conflict Occurred - Reason=\"{reason}\" ResourceType=\"{resource_type}\" \
+         ResourceId=\"{resource_id}\""
+    )
+}
+
+/// The message the refusal of a replayed `ClientToken` carries. A token already used for
+/// a DIFFERENT request names no resource, so the conflict is reported with this message
+/// alone and none of `ConflictException`'s resource members.
+pub const CLIENT_TOKEN_CONFLICT_MESSAGE: &str = "Token used for different request";
+
+/// The message a `ResourceNotFoundException` carries: like the conflict message, this
+/// service words it as a restatement of the exception's own structured members.
+///
+/// `resource_type` is a `ResourceType`.
+pub fn resource_not_found_message(resource_type: &str, resource_id: &str) -> String {
+    format!("Resource Not Found - ResourceType=\"{resource_type}\" ResourceId=\"{resource_id}\"")
+}
+
+/// A `MessageType` as a configuration-set record holds it: initial capital, the rest
+/// lower (`Transactional`), which is the capitalization every read of a configuration
+/// set's stored default message type reports, whichever case the request that set it
+/// used. `SetDefaultMessageType`'s own response echoes the request's spelling, so the
+/// canonical form is applied where the record is WRITTEN, not where it is read.
+pub fn canonical_message_type(message_type: &str) -> String {
+    let mut characters = message_type.chars();
+    match characters.next() {
+        Some(first) => format!(
+            "{}{}",
+            first.to_uppercase(),
+            characters.as_str().to_lowercase()
+        ),
+        None => String::new(),
     }
 }
 

@@ -191,7 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(
                             DescribePhoneNumbersErrorModeled::ResourceNotFoundException(
                                 ResourceNotFoundException {
-                                    message: Some(format!("phone number {id} not found")),
+                                    message: Some(crate::state::resource_not_found_message(
+                                        "phone-number",
+                                        id,
+                                    )),
                                     resource_type: Some("phone-number".to_string()),
                                     resource_id: Some(id.clone()),
                                 },

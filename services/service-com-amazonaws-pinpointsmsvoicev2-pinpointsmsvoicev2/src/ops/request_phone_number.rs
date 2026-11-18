@@ -288,17 +288,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = token_key.as_deref() {
             if let Some(seen) = state.client_token_record(Self::NAME, token).cloned() {
                 if seen.fingerprint != fingerprint {
-                    return Err(RequestPhoneNumberErrorModeled::ValidationException(
-                        ValidationException {
+                    return Err(RequestPhoneNumberErrorModeled::ConflictException(
+                        ConflictException {
                             message: Some(
-                                "ClientToken was already used for a different RequestPhoneNumber request"
-                                    .to_string(),
+                                crate::state::CLIENT_TOKEN_CONFLICT_MESSAGE.to_string(),
                             ),
-                            reason: Some("INVALID_PARAMETER".to_string()),
-                            fields: Some(vec![ValidationExceptionField {
-                                name: "ClientToken".to_string(),
-                                message: "already used for a different request".to_string(),
-                            }]),
+                            reason: None,
+                            resource_type: None,
+                            resource_id: None,
                         },
                     )
                     .into());

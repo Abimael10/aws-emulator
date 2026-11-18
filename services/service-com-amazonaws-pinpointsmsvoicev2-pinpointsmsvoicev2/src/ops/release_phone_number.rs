@@ -204,7 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(ReleasePhoneNumberErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("phone number {} not found", input.phone_number_id)),
+                    message: Some(crate::state::resource_not_found_message(
+                        "phone-number",
+                        &input.phone_number_id,
+                    )),
                     resource_type: Some("phone-number".to_string()),
                     resource_id: Some(input.phone_number_id),
                 },
@@ -216,8 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.phone_numbers[&id].deletion_protection_enabled {
             return Err(ReleasePhoneNumberErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "phone number {id} has deletion protection enabled and cannot be released"
+                    // AWS words this service's conflict message as a restatement of the
+                    // exception's own members, so both carry the same values.
+                    message: Some(crate::state::conflict_message(
+                        "DELETION_PROTECTION_ENABLED",
+                        "phone-number",
+                        &id,
                     )),
                     reason: Some("DELETION_PROTECTION_ENABLED".to_string()),
                     resource_type: Some("phone-number".to_string()),
