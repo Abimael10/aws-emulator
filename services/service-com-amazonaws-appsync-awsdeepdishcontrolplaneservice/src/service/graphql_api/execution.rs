@@ -313,6 +313,19 @@ const BATCH_INVOKE_OPERATION: &str = "BatchInvoke";
 const ITEM_ERROR_MESSAGE_MEMBER: &str = "errorMessage";
 const ITEM_ERROR_TYPE_MEMBER: &str = "errorType";
 
+/// The member one element of a batched answer carries ITS OWN item's value under, where the
+/// element is the per-item ENVELOPE rather than the value itself ([`batched_item`]).
+const ITEM_DATA_MEMBER: &str = "data";
+
+/// The members that envelope carries, and only those: an element whose members are all drawn
+/// from them is one item's envelope, and an element carrying anything else is one item's value
+/// as it stands.
+const ITEM_ENVELOPE_MEMBERS: &[&str] = &[
+    ITEM_DATA_MEMBER,
+    ITEM_ERROR_MESSAGE_MEMBER,
+    ITEM_ERROR_TYPE_MEMBER,
+];
+
 /// The names of the two functions a resolver's `code` defines (`Resolver$code`: "the
 /// `resolver` code that contains the request and response functions").
 const REQUEST_FUNCTION: &str = "request";
@@ -1734,11 +1747,16 @@ impl Execution<'_> {
         };
         let mut answers = match invoked {
             Ok(answers) => answers.into_iter(),
-            // The invocation itself produced nothing, so no member of the group resolved.
+            // The invocation itself produced nothing, so no member of the group resolved —
+            // except one whose own request half already answered it.
             Err(failure) => {
                 return prepared
                     .into_iter()
-                    .map(|ready| Err(ready.err().unwrap_or_else(|| failure.clone())))
+                    .map(|ready| match ready {
+                        Ok((_, _, requested)) if requested.early => Ok(requested.value),
+                        Ok(_) => Err(failure.clone()),
+                        Err(own) => Err(own),
+                    })
                     .collect()
             }
         };
@@ -2151,10 +2169,16 @@ fn batches(max_batch_size: i32) -> bool {
 
 /// ONE element of a batched answer, as the result of the sibling it belongs to.
 ///
-/// An element that REPORTS AN ERROR OF ITS OWN ITEM — an object carrying `errorMessage`, with
+/// An element is either the sibling's VALUE as it stands, or the per-item ENVELOPE the answer
+/// may report each item in: `data` carrying that item's own value, beside the `errorMessage`
+/// and `errorType` an item that failed is reported under ([`item_envelope`] tells the two
+/// apart). So an envelope resolves its sibling from the value `data` carries and nothing else
+/// of the envelope reaches the result.
+///
+/// An element that REPORTS AN ERROR OF ITS OWN ITEM — one carrying `errorMessage`, with
 /// `errorType` naming its class where the function named one — is the one sibling that did not
 /// resolve: it reports that error under its own path and resolves to nothing, and no other
-/// sibling of the invocation is affected. Every other element is the value its sibling takes.
+/// sibling of the invocation is affected.
 fn batched_item(element: Json) -> Result<Json, Failure> {
     let member = |name: &str| {
         element
@@ -2163,14 +2187,36 @@ fn batched_item(element: Json) -> Result<Json, Failure> {
             .map(str::to_string)
             .filter(|text| !text.is_empty())
     };
-    match member(ITEM_ERROR_MESSAGE_MEMBER) {
-        Some(message) => Err(Failure::Raised(Box::new(Raised {
+    if let Some(message) = member(ITEM_ERROR_MESSAGE_MEMBER) {
+        return Err(Failure::Raised(Box::new(Raised {
             message,
             error_type: member(ITEM_ERROR_TYPE_MEMBER),
             ..Raised::default()
-        }))),
-        None => Ok(element),
+        })));
     }
+    match item_envelope(&element) {
+        true => Ok(element
+            .get(ITEM_DATA_MEMBER)
+            .cloned()
+            .unwrap_or(Json::Null)),
+        false => Ok(element),
+    }
+}
+
+/// Whether `element` is the per-item ENVELOPE a batched answer may report one item in, rather
+/// than that item's value as it stands.
+///
+/// The envelope is an object and carries NOTHING BUT the members it is made of
+/// ([`ITEM_ENVELOPE_MEMBERS`]), because the item's own value lives under `data`; an element
+/// carrying any other member is a value of its own, and so is one that is not an object at all.
+/// An EMPTY object is a value too: it reports no item and withholds none.
+fn item_envelope(element: &Json) -> bool {
+    element.as_object().is_some_and(|members| {
+        !members.is_empty()
+            && members
+                .keys()
+                .all(|name| ITEM_ENVELOPE_MEMBERS.contains(&name.as_str()))
+    })
 }
 
 /// The data source one step resolves against: its type, the name it is held under, and what a
@@ -3065,5 +3111,87 @@ mod tests {
             "case a logged event: expected no part of the material a caller presented, got \
              {logged}"
         );
+    }
+
+    /// One element of a batched answer is either the per-item ENVELOPE — whose `data` is the
+    /// item's own value, beside the error an item that failed is reported under — or that
+    /// item's value as it stands.
+    #[test]
+    fn one_element_of_a_batched_answer_is_read_as_the_envelope_or_as_the_value() {
+        /// One row: what a failing assertion calls it, the element read, and what the sibling
+        /// it belongs to resolved to — `Err` carrying `(errorType, message)` for the sibling
+        /// that did not resolve.
+        type Element = (
+            &'static str,
+            Json,
+            Result<Json, (Option<&'static str>, &'static str)>,
+        );
+
+        // The rows differ along the FORM of the element: the envelope carrying a value, the
+        // envelope reporting an error of its own item (with and without a class), an envelope
+        // whose value is nothing, and the values an answer carries as they stand — an object,
+        // a scalar, a list, an empty object and one that only looks like an envelope.
+        let cases: [Element; 9] = [
+            (
+                "an envelope carrying the item's value",
+                json!({"data": {"id": "a"}}),
+                Ok(json!({"id": "a"})),
+            ),
+            (
+                "an envelope reporting an error of its own item",
+                json!({"data": null, "errorMessage": "no such item", "errorType": "NotFound"}),
+                Err((Some("NotFound"), "no such item")),
+            ),
+            (
+                "an error of its own item that named no class",
+                json!({"errorMessage": "no such item"}),
+                Err((None, "no such item")),
+            ),
+            (
+                "an envelope whose value is nothing",
+                json!({"data": null}),
+                Ok(Json::Null),
+            ),
+            (
+                "an envelope with no error and every member spelled out",
+                json!({"data": 7, "errorMessage": null, "errorType": null}),
+                Ok(json!(7)),
+            ),
+            (
+                "the item's value as it stands",
+                json!({"id": "a", "title": "a post"}),
+                Ok(json!({"id": "a", "title": "a post"})),
+            ),
+            (
+                "a value carrying a member of its own beside the envelope's",
+                json!({"data": {"id": "a"}, "id": "a"}),
+                Ok(json!({"data": {"id": "a"}, "id": "a"})),
+            ),
+            (
+                "a value that is not an object at all",
+                json!("a scalar"),
+                Ok(json!("a scalar")),
+            ),
+            (
+                "an object with no members, which reports no item",
+                json!({}),
+                Ok(json!({})),
+            ),
+        ];
+        for (case, element, expected) in cases {
+            let actual = batched_item(element);
+            match (&actual, &expected) {
+                (Ok(value), Ok(wanted)) => assert_eq!(
+                    value, wanted,
+                    "case {case:?}: expected the value {wanted}, got {value}"
+                ),
+                (Err(Failure::Raised(raised)), Err((error_type, message))) => assert_eq!(
+                    (raised.error_type.as_deref(), raised.message.as_str()),
+                    (*error_type, *message),
+                    "case {case:?}: expected the error {error_type:?}/{message:?}, got {raised:?}"
+                ),
+                _ => panic!("case {case:?}: expected {expected:?}, got {actual:?}"),
+            }
+        }
     }
 }

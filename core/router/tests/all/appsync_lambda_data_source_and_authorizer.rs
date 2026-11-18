@@ -638,7 +638,21 @@ async fn post_published(
     body: &Value,
     fields: &[(&str, String)],
 ) -> (u16, Value) {
-    let (authority, path) = published_parts(case, &api.graphql_uri);
+    post_published_uri(case, &api.graphql_uri, body, fields).await
+}
+
+/// The same, over a published URL itself rather than over one of this suite's own APIs.
+///
+/// The ONE socket client of this target's AppSync data-plane suites, so there is one reading of
+/// how a client reaches a published GraphQL endpoint rather than one per suite
+/// ([`crate::appsync_lambda_batch_invoke_resolvers`] drives its cases through this too).
+pub(crate) async fn post_published_uri(
+    case: &str,
+    graphql_uri: &str,
+    body: &Value,
+    fields: &[(&str, String)],
+) -> (u16, Value) {
+    let (authority, path) = published_parts(case, graphql_uri);
     let port: u16 = authority
         .rsplit_once(':')
         .and_then(|(_, port)| port.parse().ok())
