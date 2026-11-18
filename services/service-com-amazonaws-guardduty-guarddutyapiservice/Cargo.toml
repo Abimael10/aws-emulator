@@ -60,6 +60,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 # Declares one module per `tests/all/<name>.rs`, so a suite is picked up by being there.
 automod = { workspace = true }
+# Draws the generated inputs of the property-based suites — seeded populations of
+# associations and the listings they are read with — so an invariant is asserted over a
+# generated input space rather than over written-out rows.
+rand = "0.9"
 
 [lints]
 workspace = true

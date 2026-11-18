@@ -45,15 +45,15 @@ use crate::detector_lifecycle::{
 
 /// `ListCustomDetectionRuleAssociations` is `GET /custom-detection-rule/association`
 /// (`smithy_query(operation="ListCustomDetectionRuleAssociations")`).
-const ASSOCIATIONS_PATH: &str = "/custom-detection-rule/association";
+pub(crate) const ASSOCIATIONS_PATH: &str = "/custom-detection-rule/association";
 
 /// The read, the update and the delete of one association are bound at
 /// `/custom-detection-rule/rule/{RuleId}/association/{AssociationId}`
 /// (`smithy_query(operation="GetCustomDetectionRuleAssociation,UpdateCustomDetectionRuleAssociation,DeleteCustomDetectionRuleAssociation")`).
-const RULES_PATH: &str = "/custom-detection-rule/rule";
+pub(crate) const RULES_PATH: &str = "/custom-detection-rule/rule";
 
 /// Every `AssociationMode` member (`smithy_query(shape="AssociationMode")`).
-const MODES: [&str; 2] = ["DRY_RUN", "LIVE"];
+pub(crate) const MODES: [&str; 2] = ["DRY_RUN", "LIVE"];
 
 /// Two Regions, so a listed handle is asserted to be the Region's own rather than
 /// assumed.
@@ -70,15 +70,15 @@ const NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// One listing answer: the bytes it arrived as, and the entries and page token parsed
 /// out of those same bytes.
-struct Listing {
-    raw: String,
-    entries: Vec<Value>,
-    next_token: Option<String>,
+pub(crate) struct Listing {
+    pub(crate) raw: String,
+    pub(crate) entries: Vec<Value>,
+    pub(crate) next_token: Option<String>,
 }
 
 /// Read one page of the listing `region`'s endpoint reports for the query string
 /// `query`, failing the test when it does not succeed.
-async fn listing(router: &Router, region: &str, query: &str, case: &str) -> Listing {
+pub(crate) async fn listing(router: &Router, region: &str, query: &str, case: &str) -> Listing {
     let (status, raw) = call_bytes_in(
         router,
         region,
@@ -103,17 +103,29 @@ async fn listing(router: &Router, region: &str, query: &str, case: &str) -> List
     }
 }
 
-/// Walk every page of the listing `query` addresses one entry at a time, returning each
-/// page's answer in order.
+/// Walk every page of the listing `query` addresses, returning each page's answer in
+/// order.
 ///
-/// Bounded by the number of pages a one-entry page size can possibly need for the
-/// associations a case makes, so a token that failed to advance fails the test instead
-/// of looping.
-async fn page_walk(router: &Router, region: &str, query: &str, pages_max: usize, case: &str) -> Vec<Listing> {
+/// Agnostic to what the query names: the filters, the page size and the absence of either
+/// belong to the caller, and the token is joined to whatever `query` is — including the
+/// empty query a caller that names no filter and no page size sends. Bounded by
+/// `pages_max`, the number of pages the caller's page size can possibly need for the
+/// associations its case made, so a token that failed to advance fails the test instead of
+/// looping.
+pub(crate) async fn page_walk(
+    router: &Router,
+    region: &str,
+    query: &str,
+    pages_max: usize,
+    case: &str,
+) -> Vec<Listing> {
     let mut pages: Vec<Listing> = Vec::new();
     let mut token: Option<String> = None;
     loop {
+        // The token joins the query the walk is of, which a caller that names no filter
+        // and no page size leaves empty.
         let page_query = match token.as_deref() {
+            Some(token) if query.is_empty() => format!("?nextToken={token}"),
             Some(token) => format!("{query}&nextToken={token}"),
             None => query.to_string(),
         };
@@ -135,7 +147,13 @@ async fn page_walk(router: &Router, region: &str, query: &str, pages_max: usize,
 /// Assert the identity rule on ONE serialized entry: its `associationId` is a plain
 /// JSON string, equal to `minted_id` and to the id its own `arn` names, and the bytes
 /// of the page carry both members in exactly that form.
-fn assert_serialized_identity(raw: &str, entry: &Value, minted_id: &str, arn: &str, case: &str) {
+pub(crate) fn assert_serialized_identity(
+    raw: &str,
+    entry: &Value,
+    minted_id: &str,
+    arn: &str,
+    case: &str,
+) {
     let listed = entry["associationId"].as_str().unwrap_or_else(|| {
         panic!("case {case:?}: expected associationId to be a JSON string, got {entry:?}")
     });
@@ -182,12 +200,12 @@ async fn read_association(router: &Router, region: &str, rule_id: &str, id: &str
 
 /// One association a case made: where it lives, what it binds, and the identity the
 /// create reported for it.
-struct Made {
-    region: &'static str,
-    rule_id: String,
-    mode: &'static str,
-    id: String,
-    arn: String,
+pub(crate) struct Made {
+    pub(crate) region: &'static str,
+    pub(crate) rule_id: String,
+    pub(crate) mode: &'static str,
+    pub(crate) id: String,
+    pub(crate) arn: String,
 }
 
 /// The listings that report an association, paired with the label a failure names: the
