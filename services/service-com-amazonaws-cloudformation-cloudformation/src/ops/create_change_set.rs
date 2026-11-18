@@ -57,7 +57,11 @@
 //! already carries ([`crate::state::resource_import`]). A name another stack already MANAGES
 //! is not adoptable: the change set fails naming the stack that holds it
 //! ([`crate::state::physical_name`]), since adopting it would take over a resource
-//! CloudFormation manages elsewhere.
+//! CloudFormation manages elsewhere. Adoption is what the plan DOES rather than a validation
+//! of it, so `DisableValidation` — which turns the pre-deployment validations off — does not
+//! turn it off: the names are read back for either, and only the verdict held against the
+//! plan is the validation's. A name another stack manages is refused either way, since that
+//! is not a validation of the plan but an adoption the plan cannot carry out.
 //!
 //! The parameters whose value lives in AWS Systems Manager Parameter Store are resolved
 //! while the plan is computed ([`crate::state::ssm_parameters`]), so the plan is computed
@@ -638,14 +642,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the reads establish for it is whether the resources it ADOPTS are really there,
         // which is the same question put about the identifiers the request named
         // (`import_candidates`). One read per named resource either way.
+        //
+        // The same reads are what `ImportExistingResources` asks for, and that member is not
+        // a validation: it says what the plan DOES about a name that is already taken ("the
+        // change set auto-imports resources that already exist"), so the names are read back
+        // whenever either the stage or the member needs them — a request that turns the
+        // pre-deployment validations off still gets the resources it asked to adopt, and what
+        // the reads establish is only ever held against the plan while the stage is on.
         let validating = input.disable_validation != Some(true);
+        let adopting = input.import_existing_resources == Some(true);
         let import_plan = if imports_resources {
             crate::state::resource_import::import_changes(&resources_to_import, &named_resources)
         } else {
             Vec::new()
         };
         let import_candidates = crate::state::resource_import::import_candidates(&import_plan);
-        let taken_names = if validating && !imports_resources {
+        let taken_names = if (validating || adopting) && !imports_resources {
             early_validation::taken_names(ctx, &region, &named_resources).await
         } else {
             Vec::new()
@@ -1210,7 +1222,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ImportExistingResources` is what asks for an ADDITION to be adopted instead
         // ("CloudFormation imports it into the stack instead of creating it"); an IMPORT
         // change set already reports what it adopts.
-        let adopting = input.import_existing_resources == Some(true);
         let adoptable: Vec<(&str, &str)> = changes
             .iter()
             .filter(|change| {
@@ -1272,9 +1283,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // CREATE under an identifier an owning service already holds fails the change set,
         // which is then not offered for execution at all. A resource the plan ADOPTS is no
         // longer one it would create, so nothing of it is left for that check to fail — and
-        // a plan stopped by an owner above failed on that, not on this check.
-        let conflicting = managed_elsewhere
-            .is_none()
+        // a plan stopped by an owner above failed on that, not on this check. A request that
+        // turned the stage off is held to nothing here, whatever the reads above answered for
+        // the adoption the request asked for — which is what the `validating` term states: the
+        // reads are taken for either purpose, so only the stage being ON makes this a verdict.
+        let conflicting = (validating && managed_elsewhere.is_none())
             .then(|| early_validation::failing_addition(&changes, &taken_names).cloned())
             .flatten();
         let change_set_id = crate::state::new_change_set_id(&region, &input.change_set_name);
