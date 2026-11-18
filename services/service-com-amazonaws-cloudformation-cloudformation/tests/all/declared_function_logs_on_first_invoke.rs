@@ -299,7 +299,11 @@ async fn configuration(router: &MultiServiceRouter, case: &str, name: &str) -> V
 
 /// The `State` AWS Lambda reports for `name`, looked for again until it is no longer the
 /// provisioning one — which is what the `FunctionActiveV2` waiter does for a client.
-async fn awaited_state(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+///
+/// `pub(crate)` with [`invoke`]: the suite over the log group a stack declares at a function's
+/// own log-group name (`declared_log_group_takes_the_functions_log.rs`) waits on the same
+/// condition and invokes the same way, so neither of them can drift from the other.
+pub(crate) async fn awaited_state(router: &MultiServiceRouter, case: &str, name: &str) -> String {
     let mut last = String::new();
     for _ in 0..LOOKS {
         last = configuration(router, case, name)
@@ -362,7 +366,9 @@ pub(crate) async fn event_messages(
 
 /// Invoke `name` synchronously, and answer what the run reported: a function that RAN carries
 /// no `X-Amz-Function-Error`.
-async fn invoke(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
+///
+/// `pub(crate)` for the reason [`awaited_state`] is.
+pub(crate) async fn invoke(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
     let answered = lambda(
         router,
         "POST",
@@ -383,7 +389,11 @@ async fn invoke(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
 
 /// Look again until `group` holds a stream carrying the run's closing report, and answer that
 /// stream's events; an empty answer means nothing was ever delivered.
-async fn delivered_log(router: &MultiServiceRouter, group: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the reason [`awaited_state`] is: the suite over the group a stack declares
+/// at a function's own log-group name (`declared_log_group_takes_the_functions_log.rs`) waits
+/// for the same delivery through this one loop rather than a second copy of it.
+pub(crate) async fn delivered_log(router: &MultiServiceRouter, group: &str) -> Vec<String> {
     let mut last = Vec::new();
     for _ in 0..LOOKS {
         for stream in stream_names(router, group).await {

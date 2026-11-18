@@ -164,7 +164,15 @@ async fn described_filter(
 }
 
 /// The tags CloudWatch Logs holds for the resource `arn` names, as `(key, value)` pairs.
-async fn group_tags(router: &MultiServiceRouter, case: &str, arn: &str) -> Vec<(String, String)> {
+///
+/// `pub(crate)` for the reason [`described_group`] is: the suite over the group a stack declares
+/// at a function's own log-group name (`declared_log_group_takes_the_functions_log.rs`) reads
+/// that group's tags through this one call rather than a second copy of it.
+pub(crate) async fn group_tags(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+) -> Vec<(String, String)> {
     let (status, document) = logs(
         router,
         "ListTagsForResource",

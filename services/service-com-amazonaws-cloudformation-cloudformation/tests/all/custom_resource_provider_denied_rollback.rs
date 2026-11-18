@@ -121,7 +121,12 @@ async fn logs(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// Every message the log group `group` holds right now.
-async fn logged_lines(router: &MultiServiceRouter, group: &str) -> Vec<String> {
+///
+/// `pub(crate)` because more than one suite of this target reads a group's events through
+/// `FilterLogEvents`, and there is one spelling of that read: the suite over the group a stack
+/// declares at a function's own log-group name
+/// (`declared_log_group_takes_the_functions_log.rs`) reads the run's delivered log through it.
+pub(crate) async fn logged_lines(router: &MultiServiceRouter, group: &str) -> Vec<String> {
     let (status_code, body) = logs(router, "FilterLogEvents", &json!({"logGroupName": group})).await;
     if status_code != 200 {
         return Vec::new();
