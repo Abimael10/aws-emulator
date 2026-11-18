@@ -77,7 +77,7 @@
 //!   response — its status, its headers and its body, unmapped;
 //! * the function ran and returned something else, or raised (the `FunctionError` signal
 //!   Lambda reports): API Gateway "returns a 502 Bad Gateway" for a proxy response not in
-//!   the required format, with the `{"message":"Internal server error"}` body it words such
+//!   the required format, with the `{"message": "Internal server error"}` body it words such
 //!   a response with ([`BAD_GATEWAY_STATUS`]) — and because that `502` is answered from the
 //!   backend's own answer rather than through a gateway response of the api, what was wrong
 //!   with it is said in the EXECUTION LOG of the request: an answer whose SHAPE is not a proxy
@@ -584,11 +584,17 @@ fn bounded(bytes: usize) -> Result<(), UnservedIntegration> {
 /// gateway response type carries that status — so nothing a reader of the response holds says
 /// why it came, and where the answer's own SHAPE is what was wrong the configuration error
 /// travels beside it for the execution log ([`MALFORMED_PROXY_RESPONSE`]).
+///
+/// Being API Gateway's own answer is also what its BODY is serialized as: the envelope the
+/// service renders ITSELF, with the space after the member separator
+/// ([`super::serialized_envelope`]), rather than the compact body a gateway response's
+/// default template produces.
 fn bad_gateway() -> IntegratedResponse {
     IntegratedResponse {
         status: BAD_GATEWAY_STATUS,
         content_type: JSON_CONTENT_TYPE.to_string(),
-        body: json!({ "message": BAD_GATEWAY_MESSAGE }).to_string().into_bytes(),
+        // Under the member every refusal of this endpoint carries its sentence in.
+        body: super::serialized_envelope(super::MESSAGE_MEMBER, BAD_GATEWAY_MESSAGE),
         headers: BTreeMap::new(),
     }
 }

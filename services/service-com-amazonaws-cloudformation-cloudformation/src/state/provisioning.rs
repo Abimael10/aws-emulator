@@ -3896,12 +3896,20 @@ async fn roll_back_failed_resource(
 /// REPLACEMENT is a different event governed by a different attribute —
 /// `UpdateReplacePolicy`, whose action this service reports
 /// ([`super::change_plan::policy_action`]) — so a walk taking one of those down reads THAT
-/// attribute instead ([`Policies::Replaced`]), which takes the same three values and whose
-/// documented default is to delete the resource.
+/// attribute instead ([`Policies::Replaced`]), whose three documented values are the first
+/// three of these and whose documented default is to delete the resource.
+///
+/// WHICH walk this is also answers the one value whose meaning depends on the walk,
+/// `RetainExceptOnCreate` ([`policy_of`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policies {
     /// Each resource's own `DeletionPolicy` decides what becomes of it.
     Honoured,
+    /// Each resource's own `DeletionPolicy` decides what becomes of it, and this walk is the
+    /// ROLLBACK of the operation that CREATED the resources it is taking down — the one
+    /// event `RetainExceptOnCreate` does not keep a resource at
+    /// ([`super::deletion_policy::RETAIN_EXCEPT_ON_CREATE`]).
+    RolledBack,
     /// Each resource's own `UpdateReplacePolicy` decides what becomes of it: this walk is
     /// taking down the old physical resource of a replacement.
     Replaced,
@@ -3911,18 +3919,34 @@ pub enum Policies {
 
 /// What this walk does with one resource: the attribute the walk reads for it, and the
 /// documented default ([`super::deletion_policy::DELETE`]) otherwise — which is also what a
-/// declaration naming no policy, and one naming a value that is none of the three, gets.
+/// declaration naming no policy, and one naming a value that is none of the documented ones,
+/// gets.
+///
+/// `RetainExceptOnCreate` is `DeletionPolicy`'s fourth value, and the one whose answer depends
+/// on the walk: "retain the resource only if the resource creation fails", so it keeps the
+/// resource exactly as `Retain` keeps one wherever the stack STOPS MANAGING a resource it has
+/// — the stack's own deletion, and a deployment that no longer declares it — and the resource
+/// is deleted only where the walk is the rollback of the operation that created it
+/// ([`Policies::RolledBack`]). `UpdateReplacePolicy` documents three values and not that one,
+/// so a declaration stating it THERE states no documented policy and gets the default: the
+/// old resource of a replacement is not one whose creation failed.
 fn policy_of(resource: &StoredResource, policies: Policies) -> &str {
-    match policies {
-        Policies::Ignored => super::deletion_policy::DELETE,
-        Policies::Honoured => resource
-            .deletion_policy
-            .as_deref()
-            .unwrap_or(super::deletion_policy::DELETE),
-        Policies::Replaced => resource
-            .update_replace_policy
-            .as_deref()
-            .unwrap_or(super::deletion_policy::DELETE),
+    let stated = match policies {
+        Policies::Ignored => return super::deletion_policy::DELETE,
+        Policies::Replaced => {
+            return resource
+                .update_replace_policy
+                .as_deref()
+                .unwrap_or(super::deletion_policy::DELETE)
+        }
+        Policies::Honoured | Policies::RolledBack => resource.deletion_policy.as_deref(),
+    };
+    match stated.unwrap_or(super::deletion_policy::DELETE) {
+        super::deletion_policy::RETAIN_EXCEPT_ON_CREATE => match policies {
+            Policies::RolledBack => super::deletion_policy::DELETE,
+            _ => super::deletion_policy::RETAIN,
+        },
+        documented => documented,
     }
 }
 

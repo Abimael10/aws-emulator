@@ -105,20 +105,21 @@ pub mod policy_action {
     pub const REPLACE_AND_SNAPSHOT: &str = "ReplaceAndSnapshot";
 }
 
-/// The `DeletionPolicy` values the resource attribute takes: "with the `DeletionPolicy`
-/// attribute you can preserve, and in some cases, backup a resource when its stack is
-/// deleted… `Delete`, `Retain`, `RetainExceptOnCreate`, `Snapshot`", `Delete` being the
-/// default for a resource that declares none.
-mod deletion_policy {
-    pub const RETAIN: &str = "Retain";
-    pub const RETAIN_EXCEPT_ON_CREATE: &str = "RetainExceptOnCreate";
-    pub const SNAPSHOT: &str = "Snapshot";
-}
+// The `DeletionPolicy` values the resource attribute takes: "with the `DeletionPolicy`
+// attribute you can preserve, and in some cases, backup a resource when its stack is
+// deleted… `Delete`, `Retain`, `RetainExceptOnCreate`, `Snapshot`", `Delete` being the
+// default for a resource that declares none. Read from the one list of them, which the
+// teardown walks read too.
+use super::deletion_policy;
 
 /// The `UpdateReplacePolicy` values the resource attribute takes: "With the
 /// `UpdateReplacePolicy` attribute you can specify how CloudFormation handles the OLD
 /// resource when the resource is replaced… `Delete`, `Retain`, `Snapshot`", `Delete` being
 /// "the default".
+///
+/// A list of its OWN, and three values rather than the four `DeletionPolicy` documents: the
+/// fourth is about a resource whose CREATION failed, which the old resource of a replacement
+/// is not, so a declaration stating it here states no documented policy and gets the default.
 mod update_replace_policy {
     pub const RETAIN: &str = "Retain";
     pub const SNAPSHOT: &str = "Snapshot";

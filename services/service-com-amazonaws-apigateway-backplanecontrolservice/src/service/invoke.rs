@@ -4723,9 +4723,9 @@ fn gateway_response_headers(
 ///
 /// Serialized by hand rather than through a JSON writer because the SEPARATOR is part of
 /// what API Gateway sends: the two bodies its request validator serializes itself carry a
-/// space after it ([`VALIDATION_RESPONSE_TYPES`]) and the ones its gateway-response template
-/// renders carry none, so a client comparing or hashing the payload sees the bytes the
-/// service sends.
+/// space after it ([`VALIDATION_RESPONSE_TYPES`], written by [`serialized_envelope`]) and
+/// the ones its gateway-response template renders carry none, so a client comparing or
+/// hashing the payload sees the bytes the service sends.
 /// The member name and the sentence are both written as JSON strings, so a sentence
 /// carrying a quote or a backslash is escaped as the format requires.
 fn default_refusal_body(refusal: &GatewayRefusal) -> Vec<u8> {
@@ -4736,14 +4736,28 @@ fn default_refusal_body(refusal: &GatewayRefusal) -> Vec<u8> {
     if refusal.content_type() != JSON_CONTENT_TYPE {
         return refusal.message.as_bytes().to_vec();
     }
+    if VALIDATION_RESPONSE_TYPES.contains(&refusal.response_type) {
+        return serialized_envelope(refusal.message_member, &refusal.message);
+    }
     let member = ::serde_json::Value::String(refusal.message_member.to_string()).to_string();
     let message = ::serde_json::Value::String(refusal.message.to_string()).to_string();
-    let separator = if VALIDATION_RESPONSE_TYPES.contains(&refusal.response_type) {
-        ": "
-    } else {
-        ":"
-    };
-    format!("{{{member}{separator}{message}}}").into_bytes()
+    format!("{{{member}:{message}}}").into_bytes()
+}
+
+/// One sentence under one member, serialized the way API Gateway serializes a body it
+/// renders ITSELF rather than through a gateway response's own default template: a SPACE
+/// after the member separator.
+///
+/// The two renderings are what the service sends for two different classes of answer — the
+/// template's is compact ([`crate::state::DEFAULT_GATEWAY_RESPONSE_TEMPLATE`],
+/// `{"message":$context.error.messageString}`) — so both live here rather than in each
+/// caller, and a client comparing or hashing the payload sees the bytes the service sends.
+/// The member name and the sentence are written as JSON strings, so one carrying a quote or
+/// a backslash is escaped as the format requires.
+fn serialized_envelope(member: &str, message: &str) -> Vec<u8> {
+    let member = ::serde_json::Value::String(member.to_string()).to_string();
+    let message = ::serde_json::Value::String(message.to_string()).to_string();
+    format!("{{{member}: {message}}}").into_bytes()
 }
 
 /// One data-plane response: a status, a content type and a body.

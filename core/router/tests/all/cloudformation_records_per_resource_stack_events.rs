@@ -82,17 +82,20 @@ const BUCKET_NAME_LENGTH: &str = "Value with length 2 at '/vectorBucketName' fai
                                   and 63, inclusive";
 
 /// One `StackEvent` as the wire reports it.
+///
+/// `pub(crate)` because the event stream is read by more than one suite of this target: a
+/// second copy of this reader would be a second thing to drift.
 #[derive(Debug, Clone)]
-struct WireEvent {
-    event_id: String,
-    stack_id: String,
-    stack_name: String,
-    logical_id: String,
-    physical_id: Option<String>,
-    resource_type: String,
-    status: String,
-    status_reason: Option<String>,
-    timestamp: String,
+pub(crate) struct WireEvent {
+    pub(crate) event_id: String,
+    pub(crate) stack_id: String,
+    pub(crate) stack_name: String,
+    pub(crate) logical_id: String,
+    pub(crate) physical_id: Option<String>,
+    pub(crate) resource_type: String,
+    pub(crate) status: String,
+    pub(crate) status_reason: Option<String>,
+    pub(crate) timestamp: String,
 }
 
 /// Every event one `DescribeStackEvents` answer carries, in wire order (newest first).
@@ -100,7 +103,9 @@ struct WireEvent {
 /// A `StackEvent` holds no list of its own, so each `<member>` of the answer is one event and
 /// the shared member reader is what separates them — never two document-ordered element lists
 /// zipped, which would misalign the moment one event omitted a member.
-fn wire_events(xml: &str) -> Vec<WireEvent> {
+///
+/// `pub(crate)` for the reason [`WireEvent`] is.
+pub(crate) fn wire_events(xml: &str) -> Vec<WireEvent> {
     members_of(xml)
         .into_iter()
         .map(|entry| {

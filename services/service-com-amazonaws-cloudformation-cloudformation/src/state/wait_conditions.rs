@@ -546,6 +546,13 @@ impl super::StoredStack {
     ///
     /// Called with the stack still in the status of the operation that expired, which is what
     /// says WHICH transition of the resource failed.
+    ///
+    /// The waits still OPEN beside the expired one are the operation's too, and a failed
+    /// operation is not going to get through them: those resources are the ones its failure
+    /// CANCELS ([`transition_cancelled`]), reported in the same failed status with the
+    /// cancellation as their reason and named in the summary beside the resource that failed
+    /// it — a client reading the stack-level field to triage the failure can then enumerate
+    /// every resource the operation did not carry through, not just the first one.
     pub(super) fn fail_expired_wait_resources(&mut self, now: SystemTime, reason: &str) -> String {
         let creating = self.status == super::status::CREATE_IN_PROGRESS;
         let updating = self.status == super::status::UPDATE_IN_PROGRESS;
@@ -553,14 +560,17 @@ impl super::StoredStack {
         // configuration, so a wait condition it puts back waits as any deployment's does, and
         // the resource it is for is one the stack already HAS.
         let rolling_back = !creating && !updating;
-        let expired: Vec<String> = self
+        // Every wait of the operation in flight that is still open, in the order the stack
+        // declared them, paired with whether its own `Timeout` is what ran out: the rest are
+        // the waits this failure cancels.
+        let open: Vec<(String, bool)> = self
             .wait_conditions
             .iter()
-            .filter(|barrier| barrier.has_expired(now) && !self.barrier_satisfied(barrier))
-            .map(|barrier| barrier.logical_id().to_string())
+            .filter(|barrier| !self.barrier_satisfied(barrier))
+            .map(|barrier| (barrier.logical_id().to_string(), barrier.has_expired(now)))
             .collect();
         let mut failed: Vec<(String, &'static str)> = Vec::new();
-        for logical_id in &expired {
+        for (logical_id, has_expired) in &open {
             let deployed_before = self
                 .resources
                 .iter()
@@ -570,13 +580,19 @@ impl super::StoredStack {
             } else {
                 super::resource_status::CREATE_FAILED
             };
-            self.fail_planned_resource_event(logical_id, resource_status, reason);
+            // The expired wait's own diagnosis is the expiry; a wait that had not run out is
+            // one the operation will now never reach the end of.
+            let stated = match has_expired {
+                true => reason,
+                false => transition_cancelled(resource_status),
+            };
+            self.fail_planned_resource_event(logical_id, resource_status, stated);
             if rolling_back {
                 // "You can specify only resources that are in the UPDATE_FAILED state
                 // because a rollback failed" (`ContinueUpdateRollback$ResourcesToSkip`): the
                 // resource the rollback could not get through is the one in that state, so
                 // that is what it reports — with the event that says so.
-                self.fail_deployed_resource(logical_id, resource_status, reason, now);
+                self.fail_deployed_resource(logical_id, resource_status, stated, now);
             }
             failed.push((logical_id.clone(), resource_status));
         }
@@ -848,6 +864,22 @@ impl super::StoredStack {
             needs: super::provisioning::dependencies_in_flight(self),
             policies: self.rolled_back_resource_policies(),
         })
+    }
+}
+
+/// The `ResourceStatusReason` CloudFormation reports on a resource whose transition it
+/// ABANDONED because the operation had already failed elsewhere: the operation is not going
+/// to carry this resource through either, so the resource takes the same failed status with
+/// the cancellation as its diagnosis rather than being left in the status its start left it
+/// in.
+///
+/// One sentence per transition, naming what was cancelled: a resource the operation was
+/// CREATING reports the creation cancelled, and one it was CHANGING the update — read off
+/// the failed status the resource takes, so the two can never disagree.
+fn transition_cancelled(resource_status: &str) -> &'static str {
+    match resource_status == super::resource_status::UPDATE_FAILED {
+        true => "Resource update cancelled",
+        false => "Resource creation cancelled",
     }
 }
 

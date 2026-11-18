@@ -1174,7 +1174,11 @@ impl StoredStack {
     /// `StackEvent$ResourceProperties` — with [`MAX_EVENT_PROPERTIES_BYTES`] the ceiling on
     /// any ONE of them, past which the event reports no properties at all rather than a
     /// document cut in half.
+    ///
+    /// Each appended event takes an instant strictly LATER than the one before it; see
+    /// [`Self::ordered_event_instant`].
     pub(super) fn push_event(&mut self, mut event: StoredEvent) {
+        event.timestamp = self.ordered_event_instant(event.timestamp);
         // "The Amazon SNS topic ARNs to publish stack related events": the notification this
         // event owes goes to the topics the stack carries NOW, so an operation that later
         // clears them does not silence an event already recorded, and one that names a topic
@@ -1210,6 +1214,26 @@ impl StoredStack {
         }
         self.retained_event_properties_bytes += properties_bytes;
         self.events.push_back(event);
+    }
+
+    /// The instant one appended event is recorded at: `at`, or the one step past the event
+    /// before it where `at` is not already later than that event's
+    /// ([`EVENT_TIMESTAMP_STEP`]).
+    ///
+    /// `StackEvent$Timestamp` is "Time the status was updated", and the log a client reads
+    /// is the ORDER the stack and its resources went through those statuses — the only
+    /// ordering `DescribeStackEvents` gives a caller reconstructing what happened. Two
+    /// events recorded at one instant make that ordering unrecoverable: a resource's
+    /// `CREATE_FAILED` and the stack-level rollback it CAUSES are recorded by one call, so
+    /// without this they would carry the identical timestamp and nothing in the stream would
+    /// say which came first. The step is therefore applied wherever the clock has not moved
+    /// on between two records, and an event whose own instant is already later than the last
+    /// one's keeps it.
+    fn ordered_event_instant(&self, at: SystemTime) -> SystemTime {
+        match self.events.back() {
+            Some(last) if at <= last.timestamp => last.timestamp + timeline::RECORD_TICK,
+            _ => at,
+        }
     }
 
     /// Plan the event each RESOURCE transition of a stack operation owes, as the walk that
@@ -3130,11 +3154,14 @@ impl StoredStack {
     /// are deleted when the operation rolls back. This includes newly created resources
     /// marked with a deletion policy of `Retain`" — so under it the rollback deletes them
     /// whatever they declare, and under the documented default (`false`) each resource's own
-    /// policy stands, exactly as it does when the stack itself is deleted.
+    /// policy stands, exactly as it does when the stack itself is deleted. The one policy
+    /// that reads a ROLLBACK differently from a deletion is the resource attribute of the
+    /// same name, which retains everywhere but here
+    /// ([`provisioning::Policies::RolledBack`]).
     pub fn rolled_back_resource_policies(&self) -> provisioning::Policies {
         match self.retain_except_on_create {
             Some(true) => provisioning::Policies::Ignored,
-            _ => provisioning::Policies::Honoured,
+            _ => provisioning::Policies::RolledBack,
         }
     }
 

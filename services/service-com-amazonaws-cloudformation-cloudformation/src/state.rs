@@ -1115,19 +1115,22 @@ pub fn validate_template_for_validation(
 ///
 /// `CreateStackInput$OnFailure` documents `ROLLBACK` as the default behaviour of a failed
 /// create, so the rollback is something the REQUEST asked for — which is what the service
-/// says when it reports one. The clause goes where the failure's own sentence leaves room
-/// for it, whether that sentence is the resource-failure summary
-/// ([`resource_failure_summary`], which ends with its separating space) or a reason of this
-/// service's own.
+/// says when it reports one. The clause goes AFTER the failure's own sentence, and that
+/// sentence is reproduced exactly as it reads: one already carrying the separator the clause
+/// goes in — the resource-failure summary ([`resource_failure_summary`], which ends with its
+/// separating space) — is concatenated with, and one that ends its own text gets that
+/// separator. Nothing of the sentence itself is re-punctuated: a reason built around text the
+/// SUBMITTER wrote (a `Rules` assertion's own `AssertDescription`) carries that text
+/// character for character, so a client matching on what it declared still matches, and the
+/// sentence's final period and CloudFormation's own both survive.
 ///
 /// Worded once, and public so a suite asserting a rolled-back stack's reason reads the same
 /// wording rather than spelling a second copy of it.
 pub fn rollback_requested(reason: &str) -> String {
-    let stated = reason.trim_end();
-    format!(
-        "{}. Rollback requested by user.",
-        stated.strip_suffix('.').unwrap_or(stated)
-    )
+    if reason.ends_with(". ") {
+        return format!("{reason}Rollback requested by user.");
+    }
+    format!("{}. Rollback requested by user.", reason.trim_end())
 }
 
 /// The message CloudFormation answers when a mutating stack operation presents a
@@ -1340,10 +1343,10 @@ pub mod resource_status {
 
 /// The `DeletionPolicy` values the resource attribute takes: "With the `DeletionPolicy`
 /// attribute you can preserve, and in some cases, backup a resource when its stack is
-/// deleted" — `Delete`, `Retain` and `Snapshot`, `Delete` being the default a declaration
-/// that states none gets.
+/// deleted" — `Delete`, `Retain`, `RetainExceptOnCreate` and `Snapshot`, `Delete` being the
+/// default a declaration that states none gets.
 ///
-/// The same three values `UpdateReplacePolicy` takes for the OLD resource of a REPLACEMENT
+/// The same values `UpdateReplacePolicy` takes for the OLD resource of a REPLACEMENT
 /// ([`change_plan::policy_action`]), which is a separate attribute and governs a separate
 /// event: this one is read where a resource the stack manages is REMOVED — the stack's own
 /// deletion, and a deployment that no longer declares the resource.
@@ -1354,6 +1357,11 @@ pub mod deletion_policy {
     /// "CloudFormation keeps the resource without deleting the resource or its contents
     /// when its stack is deleted."
     pub const RETAIN: &str = "Retain";
+    /// "Retain the resource only if the resource creation fails": the resource is kept
+    /// exactly as [`RETAIN`] keeps it wherever the stack stops managing a resource it HAS,
+    /// and the one event it is not kept at is the rollback of the operation that created it
+    /// ([`provisioning::Policies`] is what tells the two apart).
+    pub const RETAIN_EXCEPT_ON_CREATE: &str = "RetainExceptOnCreate";
     /// "For resources that support snapshots, CloudFormation creates a snapshot for the
     /// resource before deleting it."
     pub const SNAPSHOT: &str = "Snapshot";

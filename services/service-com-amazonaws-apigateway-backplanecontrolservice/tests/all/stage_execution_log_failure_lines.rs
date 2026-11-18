@@ -55,8 +55,11 @@ const FUNCTION: &str = "badly-answering-handler";
 const CLOUDWATCH_ROLE: &str = "apigw-execution-failure-lines";
 const CLOUDWATCH_ROLE_PATH: &str = "/service-role/";
 
-/// The status and body API Gateway answers a proxy response it cannot read with.
-const BAD_GATEWAY: (u16, &str) = (502, r#"{"message":"Internal server error"}"#);
+/// The status and body API Gateway answers a proxy response it cannot read with. The body
+/// is the envelope API Gateway serializes ITSELF — a space after the member separator —
+/// rather than the compact body a gateway response's default template renders, because no
+/// gateway response type carries this status.
+const BAD_GATEWAY: (u16, &str) = (502, r#"{"message": "Internal server error"}"#);
 
 /// The sentence API Gateway states that class of configuration error in, as the execution log
 /// of the request carries it.

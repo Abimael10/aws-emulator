@@ -76,17 +76,19 @@ fn is_cleanup_phase(status: &str) -> bool {
         || status == super::status::UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS
 }
 
-/// How far apart the records a step makes at its START are stamped.
+/// How far apart the records a step makes at its START are stamped, which is also the step
+/// [`super::StoredStack::ordered_event_instant`] separates two records of one instant by: the
+/// ONE spelling of how far apart two `StackEvent` instants have to be for a read ordering the
+/// log by `StackEvent$Timestamp` to report them in the order they were made.
 ///
 /// Every event of a step but the last reports work the service that owns the resource has
 /// already been ASKED for, so they all happened as the walk reached the resource rather than
 /// across the span it then spends on it ([`StepTimes::event_at`]). They are stamped this far
-/// apart so each still carries an instant of its own and a read that orders the log by
-/// `StackEvent$Timestamp` reports them in the order the walk made them. This short, because
+/// apart so each still carries an instant of its own. This short, because
 /// what it separates is two records of one answer and not a span anything waits for: the
 /// record that a resource's work has STARTED is in the log by the time any client can read
 /// the log at all, however long the resource then takes.
-const RECORD_TICK: Duration = Duration::from_micros(1);
+pub(super) const RECORD_TICK: Duration = Duration::from_micros(1);
 
 /// One `StackEvent` a step of the walk owes about one resource.
 #[derive(Debug, Clone)]

@@ -75,8 +75,10 @@ const CONFIGURATION_ERROR: (u16, &str) = (500, r#"{"message":"Internal server er
 
 /// The status and body API Gateway answers when the integration's backend answered something
 /// it cannot turn into a response — recorded behaviour of the `execute-api` endpoint, whose
-/// body is fixed text for the class.
-const BAD_GATEWAY: (u16, &str) = (502, r#"{"message":"Internal server error"}"#);
+/// body is fixed text for the class, serialized as API Gateway serializes a body it renders
+/// ITSELF (a space after the member separator) rather than as a gateway response's default
+/// template renders one: no gateway response type carries this status.
+const BAD_GATEWAY: (u16, &str) = (502, r#"{"message": "Internal server error"}"#);
 
 /// The status and body an uncustomized `INTEGRATION_TIMEOUT` gateway response carries, which
 /// is what a call whose backend had not answered by the integration's own `timeoutInMillis`
