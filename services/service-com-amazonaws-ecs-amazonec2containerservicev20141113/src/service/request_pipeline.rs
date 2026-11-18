@@ -5,10 +5,12 @@
 //! the routing key names.
 //!
 //! The order is the one AWS keeps. A request is authorized at the IAM layer first
-//! ([`super::authorization`]) — a caller that may not perform the action is refused
-//! `AccessDeniedException` whatever else is wrong with the request, and nothing it asked for
-//! is read or written — and only then does the service judge the request itself. A request
-//! the gate does not decide is served by the generated operation exactly as it always was.
+//! ([`super::authorization`] for this service's own action, then [`super::pass_role`] for a
+//! role the request hands Amazon ECS) — a caller that may not perform the action, or may not
+//! pass the role, is refused `AccessDeniedException` whatever else is wrong with the request,
+//! and nothing it asked for is read or written — and only then does the service judge the
+//! request itself. A request the gate does not decide is served by the generated operation
+//! exactly as it always was.
 //!
 //! Between the two sits the one refusal this layer words itself: a condition whose sentence
 //! belongs to the OPERATION rather than to the member at fault ([`super::refusal_wording`]),
@@ -71,6 +73,11 @@ impl<Eng: Send + Sync + 'static> RequestPipeline<Eng> {
 
     /// The authorization refusal this request earns, or `None` when IAM permits it (and for
     /// every operation and caller the gate does not decide — see [`super::authorization`]).
+    ///
+    /// Two decisions, in the order AWS takes them: this service's own action on the resource
+    /// the request addresses, and then `iam:PassRole` on each role the request hands Amazon
+    /// ECS ([`super::pass_role`]) — a caller may only pass a role for a call it is allowed to
+    /// make in the first place.
     fn authorization_refusal(
         &self,
         key: &str,
@@ -82,8 +89,13 @@ impl<Eng: Send + Sync + 'static> RequestPipeline<Eng> {
         // A resource ARN names a resource of one Region, so it is built in the Region the
         // request is signed for — the same key every handler reads.
         let region = crate::state::request_region(ctx);
-        let resource = super::authorization::judged_resource(key, protocol, req, &region)?;
-        let denied = super::authorization::authorize(&*self.engine, ctx, key, &resource).err()?;
+        let denied = super::authorization::judged_resource(key, protocol, req, &region)
+            .and_then(|resource| {
+                super::authorization::authorize(&*self.engine, ctx, key, &resource).err()
+            })
+            .or_else(|| {
+                super::pass_role::pass_role_refusal(&*self.engine, ctx, key, protocol, req)
+            })?;
         Some(access_denied_response(definition, req, &denied))
     }
 }

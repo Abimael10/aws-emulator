@@ -41,6 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 pub mod authorization;
+pub mod pass_role;
 pub mod refusal_wording;
 pub mod request_pipeline;
 

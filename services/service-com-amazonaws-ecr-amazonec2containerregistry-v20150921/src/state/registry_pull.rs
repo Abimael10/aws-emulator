@@ -49,6 +49,16 @@
 //! decided either: a caller that names no role states nothing for a policy to be read
 //! against.
 //!
+//! WHOSE registry a reference addresses is decided before any of that, for the caller that
+//! holds a reference rather than a resolved one ([`serve_reference_pull`]): a registry
+//! belongs to ONE account ("the Amazon Web Services account ID associated with the
+//! registry"), its contents are shared only through its own resource-based policy, and this
+//! emulator serves exactly one account's registry — so a reference into another account's is
+//! served by nothing here and is refused as the cross-account call it is
+//! ([`cross_account_refusal`]), never resolved against the same-named repository of this
+//! registry. That question is about the reference and not about who is pulling, so it is
+//! answered for a pull that names no principal too.
+//!
 //! LOCK ORDER: the authorization decision is taken BEFORE this service's store is locked
 //! (it reads the IAM store), and the resolution and the import hold this store's lock
 //! alone. A caller reaches this with no lock of its own held.
@@ -198,6 +208,92 @@ pub fn serve_pull<Eng: Send + Sync + 'static>(
         CacheImport::NotCovered => Err(PullRefusal::NotFound {
             message: not_found_message(&store, reference),
         }),
+    }
+}
+
+/// Serve the pull of the reference `image` spells, whichever Amazon ECR registry it
+/// addresses — the one entry point a compute service standing in for a container runtime
+/// reaches a pull through, so the registry rather than the caller decides whose registry a
+/// reference names.
+///
+/// `None` is a reference this registry does not answer for at all: a path that addresses no
+/// Amazon ECR registry (another registry altogether, or a bare name a container runtime
+/// resolves against a public registry). Otherwise the answer is the pull's: the manifest
+/// digest it served the reference under ([`serve_pull`]), or the refusal it was withheld by.
+///
+/// A reference into another account's registry is never served here: "The Amazon Web Services
+/// account ID associated with the registry" is one account's (`registryId`), the contents of
+/// that registry are shared only through ITS own resource-based policy, and this emulator
+/// serves exactly one account's registry — so no policy that could allow the pull is here to
+/// read, and the repository the reference names in that registry is not the same-named
+/// repository of this one ([`cross_account_refusal`]). WHOSE registry a host names does not
+/// depend on who is pulling, so that refusal is answered for a pull made with no principal
+/// too.
+///
+/// `principal` is the ARN of the ROLE the pull is made as and `now` the instant it is made
+/// at, exactly as [`serve_pull`] takes them.
+pub fn serve_reference_pull<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    image: &str,
+    principal: Option<&str>,
+    now: SystemTime,
+) -> Option<Result<Option<String>, PullRefusal>> {
+    let (addressed_registry, reference) = parse_registry_reference(image)?;
+    if addressed_registry != registry_id() {
+        return Some(Err(cross_account_refusal(
+            &addressed_registry,
+            &reference,
+            principal,
+        )));
+    }
+    Some(serve_pull(engine, &reference, principal, now))
+}
+
+/// The refusal a pull of `reference` into the registry of the account `registry_id` earns,
+/// made as `principal`.
+///
+/// For a pull made AS a role: the manifest call the pull makes ([`BATCH_GET_IMAGE_ACTION`]) on
+/// the repository the reference names IN THAT registry, withheld because only that account's
+/// own resource-based policy could allow it and this emulator holds no such registry. The
+/// sentence is the tree's one wording of a grant no resource-based policy gives
+/// ([`iam::not_authorized_by_resource_policy`]), which is the document AWS names when it
+/// refuses a cross-account call — the same reading `super::authorization::registry_account`
+/// takes for a signed request that addresses another account's registry.
+///
+/// For a pull that names NO principal there is nobody for an authorization sentence to blame,
+/// and what is left is that no repository of that registry is here at all — this registry's
+/// own wording for a repository a registry does not hold
+/// ([`repository_not_found_in_message`]). Either way the pull is refused: a reference into a
+/// registry this emulator does not serve is served by nothing, whoever asks.
+fn cross_account_refusal(
+    registry_id: &str,
+    reference: &RegistryReference,
+    principal: Option<&str>,
+) -> PullRefusal {
+    let Some(role_arn) = principal else {
+        return PullRefusal::NotFound {
+            message: repository_not_found_in_message(&reference.repository_name, registry_id),
+        };
+    };
+    let action = super::authorization::action_for(BATCH_GET_IMAGE_ACTION);
+    let resource = repository_arn_in(&reference.region, registry_id, &reference.repository_name);
+    // The refusal is the security-relevant event of this pull, so it is attributable the way
+    // every other withheld pull of this gate is: who the pull was made as, what it asked for,
+    // and the outcome.
+    ::tracing::info!(
+        target: "emulator::audit",
+        audit = true,
+        operation = "ServeImagePull",
+        outcome = "refused_access_denied",
+        principal = %role_arn,
+        action = %action,
+        resource = %resource,
+        "the registry this pull addresses belongs to another account, which shares none of \
+         it with this principal"
+    );
+    PullRefusal::NotAuthorized {
+        message: iam::not_authorized_by_resource_policy(role_arn, &action, &resource),
+        action,
     }
 }
 

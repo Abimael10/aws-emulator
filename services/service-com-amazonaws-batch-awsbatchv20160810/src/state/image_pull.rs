@@ -20,14 +20,17 @@
 //! The registry the reference names does, and only where this emulator HOLDS that registry:
 //!
 //! * `<account>.dkr.ecr.<region>.amazonaws.com/<repository>[:<tag>|@<digest>]` addresses an
-//!   Amazon ECR private registry, which decides the pull itself — the authorization on the
-//!   principal the pull is made as, the resolution of the reference, and the upstream import a
-//!   pull through cache rule covers
+//!   Amazon ECR private registry, which decides the pull itself — whose registry the
+//!   reference addresses, the authorization on the principal the pull is made as, the
+//!   resolution of the reference, and the upstream import a pull through cache rule covers
 //!   ([`::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull`]).
 //!   AWS Batch pulls as the job's EXECUTION ROLE — `ContainerProperties$executionRoleArn` is
 //!   "the Amazon Resource Name (ARN) of the execution role that Batch can assume ... for
 //!   jobs running on Fargate resources, you must provide an execution role" — so that is the
-//!   principal handed to it.
+//!   principal handed to it. A registry belongs to ONE account, whose contents are shared
+//!   only through that registry's own resource-based policy, so a reference into ANOTHER
+//!   account's registry is a cross-account pull nothing here serves and the job's container
+//!   never runs.
 //! * `public.ecr.aws/<registry alias>/<repository>[:<tag>|@<digest>]` addresses the Amazon ECR
 //!   Public gallery, which answers it the same way against the repositories and tags it holds
 //!   ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull`]) — for
@@ -200,13 +203,13 @@ pub fn settle_job_image_fetches<Eng: Send + Sync + 'static>(engine: &Eng) {
     let verdicts: Vec<(String, ImageFetch)> = waiting
         .into_iter()
         .map(|fetch| {
-            let verdict = if let Some(reference) = registry_pull::parse_reference(&fetch.image) {
-                match registry_pull::serve_pull(
-                    engine,
-                    &reference,
-                    fetch.execution_role_arn.as_deref(),
-                    now,
-                ) {
+            let verdict = if let Some(served) = registry_pull::serve_reference_pull(
+                engine,
+                &fetch.image,
+                fetch.execution_role_arn.as_deref(),
+                now,
+            ) {
+                match served {
                     Ok(_) => ImageFetch::Served,
                     Err(registry_pull::PullRefusal::NotAuthorized { message, .. }) => {
                         ImageFetch::Refused(pull_access_denied_message(&fetch.image, &message))

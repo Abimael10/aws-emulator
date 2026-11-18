@@ -345,15 +345,22 @@ pub fn judged_resource(
 /// `Ok(())` for a request IAM permits and for every caller this gate does not bound (see the
 /// module docs); the modelled `AccessDeniedException` otherwise. It is asked BEFORE anything
 /// the request names is resolved, so a denial says nothing about what the account holds.
+///
+/// This service's own case of [`authorize_action`]: the only thing it adds is the action's
+/// own name ([`ACTION_PREFIX`]), so one `decide`/[`not_authorized`] pairing answers every
+/// action this gate judges.
 pub fn authorize<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     operation: &str,
     resource: &str,
 ) -> Result<(), AccessDeniedException> {
-    let action = format!("{ACTION_PREFIX}:{operation}");
-    decide(engine, ctx, &action, resource)
-        .map_err(|refused| not_authorized(&refused.principal, &action, resource, &refused.reason))
+    authorize_action(
+        engine,
+        ctx,
+        &format!("{ACTION_PREFIX}:{operation}"),
+        resource,
+    )
 }
 
 /// Whether IAM lets this request perform `action` — an action named IN FULL, this service's
@@ -372,6 +379,23 @@ pub fn permits_action<Eng: Send + Sync + 'static>(
     resource: &str,
 ) -> bool {
     decide(engine, ctx, action, resource).is_ok()
+}
+
+/// Whether IAM lets this request perform `action` — named IN FULL, this service's own or
+/// ANOTHER service's — on `resource`, answered as the refusal a caller that may not states.
+///
+/// The counterpart of [`permits_action`] for an operation whose refusal is the modelled
+/// `AccessDeniedException` itself: the decision, the principal it blames and the clause it
+/// closes with are the ones [`authorize`] answers this service's own actions with
+/// ([`not_authorized`]), so one action is worded one way whichever service publishes it.
+pub fn authorize_action<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    resource: &str,
+) -> Result<(), AccessDeniedException> {
+    decide(engine, ctx, action, resource)
+        .map_err(|refused| not_authorized(&refused.principal, action, resource, &refused.reason))
 }
 
 /// Who a decision refused, and which of IAM's rules withheld the grant.

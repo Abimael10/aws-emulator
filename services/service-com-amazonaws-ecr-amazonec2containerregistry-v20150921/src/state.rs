@@ -3661,10 +3661,18 @@ pub fn normalize_prefix(prefix: &str) -> String {
 
 /// The wording ECR uses when a repository does not exist.
 pub fn repository_not_found_message(name: &str) -> String {
-    format!(
-        "The repository with name '{name}' does not exist in the registry with id '{}'",
-        registry_id()
-    )
+    repository_not_found_in_message(name, registry_id())
+}
+
+/// That same wording for a repository of the registry `registry_id` holds — this account's
+/// case of it is [`repository_not_found_message`], and a reference addressing ANOTHER
+/// account's registry is the other ([`registry_pull::serve_reference_pull`]): this emulator
+/// serves one account's registry, so no repository of any other registry is here.
+///
+/// The ONE sentence for a repository that is not in a registry, whichever registry that is,
+/// for the reason [`repository_arn_in`] is the one layout of a repository ARN.
+pub fn repository_not_found_in_message(name: &str, registry_id: &str) -> String {
+    format!("The repository with name '{name}' does not exist in the registry with id '{registry_id}'")
 }
 
 /// The wording ECR uses for an upload id this registry cannot resolve against the

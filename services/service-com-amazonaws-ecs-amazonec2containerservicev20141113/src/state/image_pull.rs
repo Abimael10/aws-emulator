@@ -37,14 +37,17 @@
 //! 2. **an image the registry it names serves**, for an image reference that names a
 //!    registry this emulator HOLDS, which is either of two:
 //!
-//!    * a repository of this account's AMAZON ECR private registry, which Amazon ECS pulls
+//!    * a repository of an AMAZON ECR private registry, which Amazon ECS pulls
 //!      from as the task's EXECUTION ROLE — "the task execution role that grants the Amazon
 //!      ECS container agent permission to make Amazon Web Services API calls on your behalf"
-//!      (`TaskDefinition$executionRoleArn`) — so that registry decides the pull over the
-//!      policies in force on that role and its own repository policy, resolves the
-//!      reference, and caches the upstream image when a pull through cache rule covers the
-//!      repository
-//!      ([`::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull`]);
+//!      (`TaskDefinition$executionRoleArn`) — so Amazon ECR decides the pull: whose registry
+//!      the reference addresses, the policies in force on that role and the repository's own
+//!      policy, the reference itself, and the upstream image it caches when a pull through
+//!      cache rule covers the repository
+//!      ([`::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull`]).
+//!      A registry belongs to one account, which shares its contents only through its own
+//!      resource-based policy, so a reference into ANOTHER account's Amazon ECR registry is a
+//!      cross-account pull nothing here serves and the task does not start;
 //!    * a repository under the registry ALIAS of the one public gallery this emulator
 //!      serves, which resolves the reference against the repositories and tags it holds
 //!      ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull`]).
@@ -335,10 +338,13 @@ impl ImagePullVerdict {
 /// Two registries are this emulator's to answer for, and an image reference names one of
 /// them by its host (the module docs stand this on what each registry documents):
 ///
-/// * this account's AMAZON ECR private registry, which decides the authorization, resolves
-///   the reference and caches an upstream image where a pull through cache rule covers the
-///   repository — which is why the import happens on the FIRST pull of such a reference and
-///   is visible to every later read of that repository;
+/// * an AMAZON ECR private registry, which decides whose registry the reference addresses,
+///   the authorization, the resolution of the reference and the upstream image it caches
+///   where a pull through cache rule covers the repository — which is why the import happens
+///   on the FIRST pull of such a reference and is visible to every later read of that
+///   repository, and why a reference into ANOTHER account's registry is answered as that
+///   registry's own cross-account refusal rather than resolved against the same-named
+///   repository of this account's;
 /// * the one public gallery this emulator serves, which resolves a reference into ITS OWN
 ///   registry alias against the repositories and tags it holds.
 ///
@@ -392,14 +398,17 @@ fn fetch_image<Eng: Send + Sync + 'static>(
     use ::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull;
     use ::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull;
 
+    // Amazon ECR answers for every account's registry its own reading of a reference names,
+    // this one's included, so whose registry it is comes back from there rather than being
+    // decided here.
     let addressed = reference_into_this_registry(image, &launch.task_arn);
-    if let Some(reference) = registry_pull::parse_reference(&addressed) {
-        return match registry_pull::serve_pull(
-            engine,
-            &reference,
-            launch.execution_role_arn.as_deref(),
-            now,
-        ) {
+    if let Some(served) = registry_pull::serve_reference_pull(
+        engine,
+        &addressed,
+        launch.execution_role_arn.as_deref(),
+        now,
+    ) {
+        return match served {
             Ok(digest) => ImageFetch::Served(digest),
             Err(registry_pull::PullRefusal::NotAuthorized { message, .. }) => {
                 ImageFetch::Refused(pull_access_denied_message(image, &message))
@@ -428,7 +437,7 @@ fn fetch_image<Eng: Send + Sync + 'static>(
 }
 
 /// The reference `image` makes into AMAZON ECR, in the AWS-hosted spelling that registry's
-/// own reading of a pull reference takes ([`registry_pull::parse_reference`]).
+/// own reading of a pull reference takes ([`registry_pull::parse_registry_reference`]).
 ///
 /// One registry is addressed by two spellings here, and both name it: AWS's own registry
 /// host (`<account>.dkr.ecr.<region>.<suffix>`), and the ADDRESS the registry announces to a
@@ -439,6 +448,14 @@ fn fetch_image<Eng: Send + Sync + 'static>(
 /// what Amazon ECR handed the client therefore carries that address, so it is rewritten into
 /// the published spelling and resolved exactly like one that carries it already, rather than
 /// read a second time with a reading of this service's own.
+///
+/// A host that ALREADY names an Amazon ECR registry in AWS's published spelling is left
+/// exactly as it is, whichever account it names: such a reference is one that registry reads
+/// itself, so rewriting it would move a reference into another account's registry into this
+/// account's and serve the same-named repository of ours for it. Which account it names is
+/// then Amazon ECR's to decide, as every other part of the pull is. The test for an address
+/// of this emulator cannot answer that question on its own, because a registry host's first
+/// label is an account id and an all-digit label names no service.
 ///
 /// One address serves every Region's registry, so such a reference names no Region of its
 /// own: the Region is the one the TASK runs in, which its own ARN carries. The host is
@@ -455,7 +472,9 @@ fn reference_into_this_registry<'image>(
     let Some((authority, path)) = image.split_once('/') else {
         return ::std::borrow::Cow::Borrowed(image);
     };
-    if !addresses_this_emulators_registry(authority) {
+    if ecr_store::registry_pull::parse_registry_reference(image).is_some()
+        || !addresses_this_emulators_registry(authority)
+    {
         return ::std::borrow::Cow::Borrowed(image);
     }
     let Some(region) = ::service_common::arn::region_of(task_arn, ARN_NAMESPACE) else {
