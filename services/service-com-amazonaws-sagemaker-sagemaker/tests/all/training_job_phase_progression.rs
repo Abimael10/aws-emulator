@@ -43,13 +43,17 @@
 //! run does before it reports: the records its channels hold and how many objects they are
 //! spread over.
 //!
-//! Nothing here is asserted on how fast this host ran it. Every claim about a stage's window
-//! is weighed against the schedule the job itself reports in `SecondaryStatusTransitions`:
-//! the stages of the run begin after the instant the caller held the create's answer, each is
-//! in effect for a whole [`PHASE_SPAN`], and every read is held to the stage that schedule
-//! says was due when the read was made ([`each_read_reports_the_stage_that_was_due`]). So a
-//! loaded host that looks later than an idle one observes a later stage, and no claim rests on
-//! a poll landing inside a window the host could step over.
+//! Nothing here is asserted on how fast this host ran it, and nothing waits for a fixed time:
+//! every wait is a poll that looks again until the condition it waits for holds, and every
+//! claim about a stage's window is weighed against the schedule the job itself reports in
+//! `SecondaryStatusTransitions`. That schedule is anchored on the run this create performed —
+//! after the instant the job reports it was created and no later than the instant the caller
+//! held the create's answer ([`stages_are_laid_out_from_the_run_the_create_performed`]) — each
+//! stage of the run is in effect for a whole [`PHASE_SPAN`], and every read is held to the
+//! stage that schedule says was due when the read was made
+//! ([`each_read_reports_the_stage_that_was_due`]). So a loaded host that looks later than an
+//! idle one observes a later stage, and no claim rests on a poll — or on a response — landing
+//! inside a window the host could step over.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -219,17 +223,32 @@ fn each_read_reports_the_stage_that_was_due(
     }
 }
 
-/// RULE FOUR, weighed against the job's own history rather than against how fast this host
-/// ran: the stages the run performed are laid out from the instant the run REPORTED — which is
-/// inside the create that accepted the job — so every one of them is still ahead of the instant
-/// the caller held that create's answer, each is in effect for exactly one [`PHASE_SPAN`]
-/// however much work the run did, and one of those windows belongs to a stage of the work in
-/// progress for a poller to observe.
+/// RULE FOUR, weighed against the job's OWN schedule rather than against how fast this host
+/// ran anything: the stages the run performed are laid out from the instant the run REPORTED —
+/// which is inside the create that accepted the job, after the job was accepted and before the
+/// caller could hold the answer — each is in effect for exactly one [`PHASE_SPAN`] however much
+/// work the run did, and one of those windows belongs to a stage of the work in progress for a
+/// poller to observe.
 ///
-/// The stage the job was ACCEPTED in is the one exception: it runs from the creation instant
-/// to the first stage of the run, so it lasts a span plus whatever the create spent on the
-/// work before it could report.
-fn stages_are_laid_out_after_the_create_answered(
+/// What is weighed is the schedule's own ANCHOR, which the job reports: the first stage of the
+/// RUN is owed one span after the run reported, so the anchor is that entry's start less a
+/// span, and every stage after it is owed one span per stage ahead of it. That is what makes
+/// the rule checkable on any host:
+///
+/// * the anchor must be strictly later than the instant the job reports it was CREATED, which
+///   is what tells a schedule laid out from the run's report apart from one laid out from the
+///   creation instant — the run does its work inside the create, so the stage the job was
+///   ACCEPTED in covers that work and is in effect for a span plus however long it took, while
+///   each stage of the run is in effect for exactly one span;
+/// * the only instant of this host's own that enters it is the one the caller held the create's
+///   answer at, and a host that runs slowly can only push that instant LATER, i.e. loosen the
+///   comparison: the run reported before the answer reached the caller, whatever the host spent
+///   on delivering it.
+///
+/// So no claim here rests on a stage falling due while this host happened to be looking. What
+/// the poller did observe is weighed by [`each_read_reports_the_stage_that_was_due`], against
+/// this same schedule.
+fn stages_are_laid_out_from_the_run_the_create_performed(
     transitions: &[Stage],
     answered: f64,
     settled: &Value,
@@ -237,12 +256,42 @@ fn stages_are_laid_out_after_the_create_answered(
 ) {
     let span = PHASE_SPAN.as_secs_f64();
     let last = transitions.len().saturating_sub(1);
+    let created = settled
+        .get("CreationTime")
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a CreationTime in {settled}"));
+    // The instant the job's run reported, as the job's own schedule states it: one span ahead
+    // of the first stage the run performed.
+    let (first_of_the_run, anchor) = transitions
+        .get(1)
+        .map(|(status, start, ..)| (status.clone(), start - span))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a stage of the run beside the stage the job was \
+                 accepted in, got {settled}"
+            )
+        });
+    assert!(
+        anchor > created,
+        "case {case:?}: the stages of the run must be laid out from the instant the run \
+         reported, which is later than the {created} the job reports it was created at, got \
+         the {first_of_the_run} stage anchored at {anchor} in {settled}"
+    );
+    assert!(
+        anchor <= answered,
+        "case {case:?}: the run reported inside the create that accepted the job, so its stages \
+         cannot be anchored later than the {answered} the caller held that answer at, got \
+         {anchor} in {settled}"
+    );
+    // The instant the stage at the index being weighed is owed, a span at a time from there.
+    let mut owed = anchor;
     for (index, (status, start, end, _)) in transitions.iter().enumerate() {
         if index > 0 {
+            owed += span;
             assert!(
-                *start > answered,
-                "case {case:?}: the {status} stage must still be ahead of the instant the \
-                 create answered, which was {answered}, got {settled}"
+                (start - owed).abs() <= TIMESTAMP_SLACK,
+                "case {case:?}: the {status} stage is owed one {PHASE_SPAN:?} per stage ahead \
+                 of it, which is {owed}, got {start} in {settled}"
             );
         }
         if index < last {
@@ -425,12 +474,10 @@ async fn an_accepted_job_advances_through_the_canonical_stages_of_its_work() {
                 .remove("InputDataConfig");
         }
         emulator.sagemaker_ok("CreateTrainingJob", &body).await;
-        // The first instant a caller can hold this create's answer, taken with no await
-        // between it and the answer itself. The job is accepted with no stage of its work
-        // begun and the move out of that is the clock's, so at THIS instant the job is
-        // `InProgress` in the stage it was accepted in — which the job's own history is held
-        // to below, pinning the instant the caller got the answer rather than whenever this
-        // host got round to reading.
+        // An instant the create's answer was already in the caller's hands at. The run the
+        // create performed reported before it answered, so the schedule the job reports below
+        // cannot be anchored later than this — a bound a host that delivers the answer slowly
+        // only loosens, since it moves this instant later and never the run's report.
         let answered = epoch_seconds(SystemTime::now());
 
         // And the first read a caller can make, weighed against that history like every other.
@@ -468,10 +515,15 @@ async fn an_accepted_job_advances_through_the_canonical_stages_of_its_work() {
         // The history names every stage the job was in, in the canonical order, each entry
         // beginning where the one before it ended, and the last one ending when the job did.
         let transitions = history(&settled, case);
-        // The stages between the accepted job and its terminal status are observable: each
-        // is in effect for a whole span that begins after this create answered, and every
-        // read this poller made inside one of those windows reported it.
-        stages_are_laid_out_after_the_create_answered(&transitions, answered, &settled, case);
+        // The stages between the accepted job and its terminal status are observable: each is
+        // in effect for a whole span of a schedule anchored on the run this create performed,
+        // and every read this poller made inside one of those windows reported it.
+        stages_are_laid_out_from_the_run_the_create_performed(
+            &transitions,
+            answered,
+            &settled,
+            case,
+        );
         each_read_reports_the_stage_that_was_due(&transitions, &reads, &settled, case);
         let expected: Vec<String> = row
             .stages
@@ -673,17 +725,19 @@ async fn a_runtime_cap_the_work_does_not_fit_inside_ends_the_job_at_the_cap() {
     }
 }
 
-/// RULE FOUR: the first read a caller can make — straight after `CreateTrainingJob` answers —
-/// finds the job `InProgress` in a pre-upload stage, a poller then observes a stage of its
-/// work in progress, and the history names every stage it was in, however much work the run
-/// the create performed server-side had to do before it could report.
+/// RULE FOUR: the stages of a job's work stay observable however much work the run the create
+/// performed server-side had to do before it could report — a caller reading as soon as its
+/// create answers finds the job `InProgress` in a pre-upload stage, a poller then observes a
+/// stage of its work in progress, and the history names every stage it was in.
 ///
-/// Both of those are weighed against the job's own schedule rather than against this host's
-/// speed: the stages of the run all begin after the instant the caller held the create's
-/// answer and each is in effect for a whole span, so the window the first read lands in is a
-/// pre-upload one and a poller looking again more often than a span looks inside a stage of
-/// the work in progress — and every read made inside one of those windows is held to the
-/// stage that window names.
+/// All of that is weighed against the job's own schedule rather than against this host's speed:
+/// the stages of the run are laid out from the instant the run reported inside the create —
+/// later than the instant the job reports it was created, no later than the one the caller held
+/// the answer at — and each is in effect for a whole span, so the window a caller's first read
+/// falls in is a pre-upload one and a poller looking again more often than a span looks inside
+/// a stage of the work in progress. Every read made inside one of those windows is then held to
+/// the stage that window names, so a host that delays a read is held to the stage its own
+/// instant was due rather than to the one an idle host would have found.
 ///
 /// The rows differ along how much work that is: one small object, several objects of wider
 /// records under one prefix, two channels addressed differently, and no channel at all.
@@ -792,13 +846,11 @@ async fn the_stages_stay_observable_however_much_work_the_run_did() {
                 .remove("InputDataConfig");
         }
         emulator.sagemaker_ok("CreateTrainingJob", &body).await;
-        // The first instant a caller can hold this create's answer, taken with no await
-        // between it and the answer itself. However much work the run had to do before the
-        // create could answer, the stages of that work are laid out from the instant the run
-        // REPORTED, so at THIS instant the job is `InProgress` in a pre-upload stage and
-        // neither its upload nor its outcome is due — which the job's own history is held to
-        // below, pinning the instant the caller got the answer rather than whenever this host
-        // got round to reading.
+        // An instant the create's answer was already in the caller's hands at. However much
+        // work the run had to do before the create could answer, the stages of that work are
+        // laid out from the instant the run REPORTED, which is earlier than this one — a bound
+        // a host that delivers the answer slowly only loosens, since it moves this instant
+        // later and never the run's report.
         let answered = epoch_seconds(SystemTime::now());
 
         // And the first read a caller can make, weighed against that history like every other.
@@ -871,12 +923,18 @@ async fn the_stages_stay_observable_however_much_work_the_run_did() {
         // through and the status it ended in, in that order, each beginning after the one
         // before it — and the first of them when the job was created.
         let transitions = history(&settled, case);
-        // However much work the run did, each stage of it is still ahead of the instant this
-        // create answered and is in effect for a whole span, one of them being a stage of the
-        // work in progress — so the first read a caller can make finds a pre-upload stage and
-        // a poller looking again more often than a span observes the work going on. And every
-        // read this poller did make inside one of those windows reported that very stage.
-        stages_are_laid_out_after_the_create_answered(&transitions, answered, &settled, case);
+        // However much work the run did, its stages are laid out from the instant it reported
+        // inside this create — after the job was accepted, before the caller held the answer —
+        // and each is in effect for a whole span, one of them being a stage of the work in
+        // progress: so a caller reading as soon as its create answers finds a pre-upload stage
+        // and a poller looking again more often than a span observes the work going on. And
+        // every read this poller did make inside one of those windows reported that very stage.
+        stages_are_laid_out_from_the_run_the_create_performed(
+            &transitions,
+            answered,
+            &settled,
+            case,
+        );
         each_read_reports_the_stage_that_was_due(&transitions, &reads, &settled, case);
         let expected: Vec<String> = row
             .stages
