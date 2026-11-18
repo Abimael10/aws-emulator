@@ -1323,7 +1323,32 @@ impl Owner {
             Self::Builtin(provisioner) => provisioner.handler_message(class, message),
             // AWS IAM's resource provider reports the service's own message as it came.
             Self::IamPolicy(_) => message.to_string(),
-            // AWS Lambda's resource provider reports the service's own message as it came.
+            // The mapping's provider is written against the CloudFormation
+            // resource-provider plugin and words a refusal through the exception class it put
+            // it in, so an invalid-request refusal of AWS Lambda's reaches the reason as
+            // `Invalid request provided: <the service's message>` — as the recorded
+            // `ResourceStatusReason` of an `AWS::Lambda::EventSourceMapping` whose function's
+            // execution role may not read the queue it polls carries it (in the behavioral
+            // corpus `simparity-behavioral-aws-v1`, check
+            // `cloudformation__lambda__sqs__ssm.sam-sqs-event-role-without-queue-access-fails-the-mapping-create`,
+            // whose reason reads `Resource handler returned message: "Invalid request
+            // provided: <the service's sentence> (Service: Lambda, Status Code: 400, Request
+            // ID: …) (SDK Attempt Count: …)" (RequestToken: …, HandlerErrorCode:
+            // InvalidRequest)`). Every refusal of this type that falls in that class is
+            // worded this way, whichever call made it, and a refusal of any other class is
+            // reported as it came.
+            Self::LambdaEventSourceMapping
+                if class == super::HANDLER_ERROR_INVALID_REQUEST =>
+            {
+                format!(
+                    "{}{message}",
+                    crate::state::provisioner::INVALID_REQUEST_PROVIDED,
+                )
+            }
+            // AWS Lambda's other resource providers report the service's own message as it
+            // came: each type's wording is its provider's own and cannot be derived from the
+            // service they all call, so nothing is added for a type no recorded reason shows
+            // the plugin's wording on.
             Self::LambdaAlias
             | Self::LambdaEventInvokeConfig
             | Self::LambdaEventSourceMapping
