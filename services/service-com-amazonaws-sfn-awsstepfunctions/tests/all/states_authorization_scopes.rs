@@ -8,7 +8,8 @@
 //!
 //! 1. a call that names no resource of its own is decided against every resource of the
 //!    KIND its API is about — `arn:aws:states:<region>:<account>:<type>:*`, the type of
-//!    the API's own category — and a call that names one is decided against that ARN;
+//!    the API's own category, and `:*:*` where the API acts on no resource of the account
+//!    at all — and a call that names one is decided against that ARN;
 //! 2. a state machine named THROUGH an alias or a version is one state machine: the call
 //!    is decided on the state machine's own ARN, with the qualifier carried as
 //!    `states:StateMachineQualifier`, so a grant on the state machine covers every form of
@@ -32,8 +33,8 @@
 use serde_json::{json, Value};
 
 use crate::identity_policy_authorization::{
-    every_resource, message, no_grant, not_authorized, Emulator, ACCESS_DENIED,
-    ACCESS_DENIED_STATUS, ACCOUNT_KEY, STATE_MACHINE_TYPE,
+    every_resource, every_resource_in, message, no_grant, not_authorized, Emulator, ACCESS_DENIED,
+    ACCESS_DENIED_STATUS, ACCOUNT_KEY, EVERY_TYPE, STATE_MACHINE_TYPE,
 };
 use crate::state_machine_lifecycle::{error_code, string, ACCOUNT, HELLO_DEFINITION, REGION, ROLE_ARN};
 
@@ -76,13 +77,16 @@ fn pass_definition() -> String {
 }
 
 /// RULE 1: the resource a refusal names is every resource of the kind the API is about
-/// when the request names none of its own, and the ARN the request named otherwise.
+/// when the request names none of its own, and the ARN the request named otherwise — and
+/// where the API acts on no resource of the account at all, the kind is every resource
+/// type.
 ///
 /// The rows span the API categories — a state machine listing, an activity listing, a
-/// state tested without a state machine, a definition validated without one, a settlement
-/// carrying a token this service never minted, a create (judged against the ARN its name
-/// mints), a read that names an execution ARN, and a tagging read that names a state
-/// machine ARN — and both of IAM's refusal clauses on one of them.
+/// state tested and a definition validated (each deciding only the definition its own
+/// request carries, so about no resource of the account), a settlement carrying a token
+/// this service never minted, a create (judged against the ARN its name mints), a read that
+/// names an execution ARN, and a tagging read that names a state machine ARN — and both of
+/// IAM's refusal clauses on one of them.
 #[tokio::test]
 async fn a_refusal_names_the_resource_pattern_of_the_apis_own_category() {
     let emulator = Emulator::new();
@@ -110,13 +114,13 @@ async fn a_refusal_names_the_resource_pattern_of_the_apis_own_category() {
             "a state tested with no state machine around it",
             "TestState",
             json!({ "definition": r#"{"Type":"Pass","End":true}"#, "roleArn": ROLE_ARN }),
-            every_resource(STATE_MACHINE_TYPE),
+            every_resource(EVERY_TYPE),
         ),
         (
             "a definition validated with no state machine around it",
             "ValidateStateMachineDefinition",
             json!({ "definition": pass_definition() }),
-            every_resource(STATE_MACHINE_TYPE),
+            every_resource(EVERY_TYPE),
         ),
         (
             "a settlement carrying a token this service never minted",
@@ -778,5 +782,332 @@ async fn a_foreign_account_reference_is_refused_as_a_resource_the_caller_cannot_
             stated, expected,
             "case {case:?}: expected {expected:?}, got {stated:?}"
         );
+    }
+}
+
+/// An identity policy allowing `grants` and explicitly denying `denies`, both on every
+/// resource — so what a row below varies is the ACTION half of the decision and never the
+/// resource half.
+fn allowing_and_denying(grants: &[&str], denies: &[&str]) -> Value {
+    let mut statements = vec![json!({
+        "Effect": "Allow",
+        "Action": grants,
+        "Resource": ["*"],
+    })];
+    if !denies.is_empty() {
+        statements.push(json!({
+            "Effect": "Deny",
+            "Action": denies,
+            "Resource": ["*"],
+        }));
+    }
+    json!({ "Version": "2012-10-17", "Statement": statements })
+}
+
+/// An identity policy allowing `actions` on exactly the resources `resources` names, which
+/// is how a grant is scoped to one kind of resource of this service.
+fn allowing_on(actions: &[&str], resources: &[&str]) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{ "Effect": "Allow", "Action": actions, "Resource": resources }]
+    })
+}
+
+/// One refusal the definition-only rule covers: what was called, in which Region, what the
+/// documents in force say, and the action and resource type the refusal must name.
+struct DefinitionOnlyRow {
+    case: &'static str,
+    operation: &'static str,
+    body: Value,
+    /// The Region the call is signed for, which is the Region the refusal's ARN carries.
+    region: &'static str,
+    /// The actions the caller's inline document allows.
+    grants: &'static [&'static str],
+    /// The actions it denies explicitly, beside those grants.
+    denies: &'static [&'static str],
+    /// The action the refusal names: the first one the request asks for that the documents
+    /// in force do not allow.
+    refused: &'static str,
+    /// Whether that action is withheld by an explicit deny rather than by no grant at all,
+    /// which is the other of IAM's two refusal clauses.
+    explicitly_denied: bool,
+    /// The resource TYPE the refusal's ARN carries.
+    resource_type: &'static str,
+}
+
+/// RULE 1, for an API that acts on NO resource of the account: a call that decides only the
+/// definition its own request carries is judged against every resource of this service in
+/// the Region the request was made for — the resource TYPE wildcarded as well as the name —
+/// for EVERY action such a request asks for, while a call of an API that IS about a resource
+/// type keeps that type's wildcard.
+///
+/// The rows differ along what the rule generalises over: the definition-only operation (a
+/// state tested, a definition validated), which of the actions the request asks for is the
+/// one withheld (the operation's own, and the one the `revealSecrets` capability adds), the
+/// Region the call is signed for, which of IAM's two clauses withholds it, and what else the
+/// request carries — including a member naming a state machine that this operation does not
+/// model, so the resource is decided by the API and never by the shape of the body. The last
+/// two rows are the controls: the APIs that ARE about one resource type still name it.
+#[tokio::test]
+async fn a_definition_only_call_is_judged_against_every_resource_type() {
+    let emulator = Emulator::new();
+    let foreign_member = format!("arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:not-modelled");
+    let pass_state = r#"{"Type":"Pass","Result":{"ok":true},"End":true}"#;
+    let rows = vec![
+        DefinitionOnlyRow {
+            case: "a state tested, the operation's own action withheld",
+            operation: "TestState",
+            body: json!({ "definition": pass_state, "input": "{}" }),
+            region: REGION,
+            grants: &["kms:Decrypt"],
+            denies: &[],
+            refused: "states:TestState",
+            explicitly_denied: false,
+            resource_type: EVERY_TYPE,
+        },
+        DefinitionOnlyRow {
+            case: "a state tested revealing secrets, the capability's action withheld",
+            operation: "TestState",
+            body: json!({ "definition": pass_state, "input": "{}", "revealSecrets": true }),
+            region: REGION,
+            grants: &["states:TestState"],
+            denies: &[],
+            refused: "states:RevealSecrets",
+            explicitly_denied: false,
+            resource_type: EVERY_TYPE,
+        },
+        DefinitionOnlyRow {
+            case: "the same call signed for another Region",
+            operation: "TestState",
+            body: json!({ "definition": pass_state, "input": "{}", "revealSecrets": true }),
+            region: "eu-central-1",
+            grants: &["states:TestState"],
+            denies: &[],
+            refused: "states:RevealSecrets",
+            explicitly_denied: false,
+            resource_type: EVERY_TYPE,
+        },
+        DefinitionOnlyRow {
+            case: "a state tested revealing secrets, the capability denied explicitly",
+            operation: "TestState",
+            body: json!({
+                "definition": pass_state,
+                "input": "{}",
+                "inspectionLevel": "DEBUG",
+                "revealSecrets": true,
+            }),
+            region: "ap-southeast-2",
+            grants: &["states:*"],
+            denies: &["states:RevealSecrets"],
+            refused: "states:RevealSecrets",
+            explicitly_denied: true,
+            resource_type: EVERY_TYPE,
+        },
+        DefinitionOnlyRow {
+            case: "a state tested carrying a member the operation does not model",
+            operation: "TestState",
+            body: json!({ "definition": pass_state, "stateMachineArn": foreign_member }),
+            region: REGION,
+            grants: &[],
+            denies: &[],
+            refused: "states:TestState",
+            explicitly_denied: false,
+            resource_type: EVERY_TYPE,
+        },
+        DefinitionOnlyRow {
+            case: "a definition validated",
+            operation: "ValidateStateMachineDefinition",
+            body: json!({ "definition": HELLO_DEFINITION }),
+            region: "eu-central-1",
+            grants: &["states:TestState"],
+            denies: &[],
+            refused: "states:ValidateStateMachineDefinition",
+            explicitly_denied: false,
+            resource_type: EVERY_TYPE,
+        },
+        DefinitionOnlyRow {
+            case: "a definition validated at a severity, denied explicitly",
+            operation: "ValidateStateMachineDefinition",
+            body: json!({
+                "definition": HELLO_DEFINITION,
+                "severity": "WARNING",
+                "maxResults": 1,
+            }),
+            region: "ap-southeast-2",
+            grants: &["states:*"],
+            denies: &["states:ValidateStateMachineDefinition"],
+            refused: "states:ValidateStateMachineDefinition",
+            explicitly_denied: true,
+            resource_type: EVERY_TYPE,
+        },
+        DefinitionOnlyRow {
+            case: "a listing of state machines, an API about one resource type",
+            operation: "ListStateMachines",
+            body: json!({}),
+            region: "eu-central-1",
+            grants: &[],
+            denies: &[],
+            refused: "states:ListStateMachines",
+            explicitly_denied: false,
+            resource_type: STATE_MACHINE_TYPE,
+        },
+        DefinitionOnlyRow {
+            case: "a listing of activities, an API about another resource type",
+            operation: "ListActivities",
+            body: json!({}),
+            region: "ap-southeast-2",
+            grants: &[],
+            denies: &[],
+            refused: "states:ListActivities",
+            explicitly_denied: false,
+            resource_type: ACTIVITY_TYPE,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let caller = emulator
+            .user(
+                &format!("definition-only-{index}"),
+                &allowing_and_denying(row.grants, row.denies),
+            )
+            .await;
+        let (status, answer) = emulator
+            .call_as_in_region(&caller.access_key_id, row.region, row.operation, &row.body)
+            .await;
+        let case = row.case;
+        assert_eq!(
+            (status, error_code(&answer).as_str()),
+            (ACCESS_DENIED_STATUS, ACCESS_DENIED),
+            "case {case:?}: expected the call to be refused, got {status} with {answer:?}"
+        );
+        let reason = if row.explicitly_denied {
+            "with an explicit deny in an identity-based policy".to_string()
+        } else {
+            no_grant(row.refused)
+        };
+        let expected = not_authorized(
+            &caller.arn,
+            row.refused,
+            &every_resource_in(row.region, row.resource_type),
+            &reason,
+        );
+        let stated = message(&answer);
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected {expected:?}, got {stated:?}"
+        );
+    }
+}
+
+/// The same rule read from the GRANT's side: because a definition-only call is judged
+/// against the both-wildcards ARN, a statement scoped to one resource TYPE of this service
+/// does not cover it, while one scoped to every type — or to every resource — does; and a
+/// call of an API about a resource type is covered by its own type's wildcard.
+///
+/// The rows differ along the `Resource` element the grant is written at (one resource type,
+/// another type, every type of this service, every resource at all) and along the call it is
+/// asked about (a state tested, the same test asking for the reveal capability too, a
+/// definition validated, and a listing as the control), with each served call read back
+/// through what it answers.
+#[tokio::test]
+async fn a_grant_scoped_to_one_resource_type_does_not_cover_a_definition_only_call() {
+    let emulator = Emulator::new();
+    let pass_state = r#"{"Type":"Pass","Result":{"ok":true},"End":true}"#;
+    // (case, the `Resource` element the grant of `states:*` is written at)
+    let scopes: Vec<(&str, String)> = vec![
+        (
+            "a grant scoped to the state machines of the Region",
+            every_resource(STATE_MACHINE_TYPE),
+        ),
+        (
+            "a grant scoped to the activities of the Region",
+            every_resource(ACTIVITY_TYPE),
+        ),
+        (
+            "a grant scoped to every resource type of this service",
+            every_resource(EVERY_TYPE),
+        ),
+        ("a grant scoped to every resource", "*".to_string()),
+    ];
+    // (case, operation, the request body, the member a served call answers and its value —
+    // read back so a served row fails for a reason other than authorization too)
+    let calls: Vec<(&str, &str, Value, &str, Value)> = vec![
+        (
+            "a state tested",
+            "TestState",
+            json!({ "definition": pass_state, "input": "{}" }),
+            "status",
+            json!("SUCCEEDED"),
+        ),
+        (
+            "a state tested revealing secrets",
+            "TestState",
+            json!({ "definition": pass_state, "input": "{}", "revealSecrets": true }),
+            "status",
+            json!("SUCCEEDED"),
+        ),
+        (
+            "a definition validated",
+            "ValidateStateMachineDefinition",
+            json!({ "definition": HELLO_DEFINITION }),
+            "result",
+            json!("OK"),
+        ),
+        (
+            "a listing of state machines",
+            "ListStateMachines",
+            json!({}),
+            "stateMachines",
+            json!([]),
+        ),
+    ];
+
+    for (index, (scope_case, scope)) in scopes.iter().enumerate() {
+        let caller = emulator
+            .user(
+                &format!("scoped-grant-{index}"),
+                &allowing_on(&["states:*"], &[scope.as_str()]),
+            )
+            .await;
+        for (call_case, operation, body, member, answered) in &calls {
+            // A statement covers the call exactly when its `Resource` element covers the
+            // ARN the call is judged against: the both-wildcards ARN for the two
+            // definition-only APIs, and the state machines of the Region for the listing.
+            let judged = if *operation == "ListStateMachines" {
+                every_resource(STATE_MACHINE_TYPE)
+            } else {
+                every_resource(EVERY_TYPE)
+            };
+            let covered = scope == "*" || *scope == every_resource(EVERY_TYPE) || *scope == judged;
+            let (status, answer) = emulator
+                .call_as(&caller.access_key_id, operation, body)
+                .await;
+            if covered {
+                assert_eq!(
+                    status, 200,
+                    "case {scope_case:?} / {call_case:?}: expected the call to be served, got \
+                     {status} with {answer:?}"
+                );
+                assert_eq!(
+                    answer.get(*member),
+                    Some(answered),
+                    "case {scope_case:?} / {call_case:?}: expected the served call to answer \
+                     {member}={answered:?}, got {answer:?}"
+                );
+            } else {
+                assert_eq!(
+                    (status, error_code(&answer).as_str()),
+                    (ACCESS_DENIED_STATUS, ACCESS_DENIED),
+                    "case {scope_case:?} / {call_case:?}: expected the call to be refused, got \
+                     {status} with {answer:?}"
+                );
+                let stated = message(&answer);
+                assert!(
+                    stated.contains(&format!("on resource: {judged} ")),
+                    "case {scope_case:?} / {call_case:?}: expected the refusal to name \
+                     {judged:?}, got {stated:?}"
+                );
+            }
+        }
     }
 }

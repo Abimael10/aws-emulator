@@ -66,8 +66,9 @@
 //! otherwise [`any_resource`]: a call that names no resource of this service at all, which
 //! is judged against every resource of the KIND its API is about in the account and Region
 //! the request was made for, written in this service's own ARN form with the resource name
-//! wildcarded rather than as a bare `*`. That ARN is what AWS reports such a call was
-//! refused on, and it is what a statement has to cover to grant it.
+//! wildcarded rather than as a bare `*` — and, for an API that acts on no resource of the
+//! account at all, with the resource TYPE wildcarded too. That ARN is what AWS reports such
+//! a call was refused on, and it is what a statement has to cover to grant it.
 //!
 //! The ARN a request carries may be a QUALIFIED one, and a qualifier is not always part of
 //! the resource: an operation that reaches a state machine THROUGH an alias or a version
@@ -98,20 +99,21 @@ use super::authorization::{caller_action_denial, operation_action, service_actio
 pub const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
 
 /// The resource a request that names no resource of this service in a member of its own is
-/// judged against, as AWS writes it for such a request — a listing, a state tested without a
-/// state machine, a definition validated without one, and a call carrying a task token this
-/// service never minted (see the module docs): every resource of the KIND that request's
-/// API is about, in the Region the request was made for and the account this emulator
-/// serves, written in this service's own ARN form with the resource NAME wildcarded
+/// judged against, as AWS writes it for such a request — a listing, a call carrying a task
+/// token this service never minted, a state tested and a definition validated (see the
+/// module docs): every resource of the KIND that request's API is about, in the Region the
+/// request was made for and the account this emulator serves, written in this service's own
+/// ARN form with the resource NAME wildcarded
 /// (`crate::state::every_resource_of_type_arn`) rather than as a bare `*`.
 ///
 /// That ARN is what AWS reports such a call was refused on, and it is what a statement has
 /// to cover to grant it: an API about state machines is judged against the state machines of
 /// the Region (`arn:<partition>:states:<region>:<account>:stateMachine:*`), one about
 /// activities against its activities, and so on down [`API_RESOURCE_TYPE`]. An API that is
-/// about no one resource type is judged against every resource of this service
-/// ([`crate::state::every_resource_arn`]), the ARN with both the type and the name
-/// wildcarded.
+/// about no one resource type — a tagging call, and the two that decide a definition the
+/// request itself carries, acting on no resource of the account — is judged against every
+/// resource of this service ([`crate::state::every_resource_arn`]), the ARN with both the
+/// type and the name wildcarded.
 #[must_use]
 pub fn any_resource(operation: &str, region: &str) -> String {
     match api_resource_type(operation) {
@@ -131,7 +133,10 @@ pub fn any_resource(operation: &str, region: &str) -> String {
 /// the three `SendTask*` calls a worker settles a task with), an execution API (every read,
 /// stop and redrive of one execution, and the Map Runs of one), or a Map Run API. An empty
 /// row is an API about no one type: the tagging calls take "the ARN for the Step Functions
-/// state machine or activity", so they are about both.
+/// state machine or activity", so they are about both, and the two calls that decide a
+/// DEFINITION the request itself carries act on no resource of the account at all — a call
+/// of one of those is refused on every resource of this service, the TYPE wildcarded as
+/// well as the name.
 ///
 /// Source: every operation `smithy_query(query="digest",model_path="services/service-com-amazonaws-sfn-awsstepfunctions/smithy-model/com-amazonaws-sfn-awsstepfunctions.json")`
 /// binds, with the resource each one's own documentation says it acts on. Public, so the
@@ -195,7 +200,11 @@ pub const API_RESOURCE_TYPE: &[(&str, &str)] = &[
     ("StartSyncExecution", crate::state::STATE_MACHINE_RESOURCE),
     ("StopExecution", crate::state::EXECUTION_RESOURCE),
     ("TagResource", ""),
-    ("TestState", crate::state::STATE_MACHINE_RESOURCE),
+    // "Accepts the definition of a single state and executes it. You can test a state
+    // without creating a state machine or updating an existing state machine": the call
+    // decides the definition its own request carries and reads, writes and mints no
+    // resource of the account, so it is about no one resource type.
+    ("TestState", ""),
     ("UntagResource", ""),
     ("UpdateMapRun", crate::state::MAP_RUN_RESOURCE),
     ("UpdateStateMachine", crate::state::STATE_MACHINE_RESOURCE),
@@ -203,10 +212,10 @@ pub const API_RESOURCE_TYPE: &[(&str, &str)] = &[
         "UpdateStateMachineAlias",
         crate::state::STATE_MACHINE_RESOURCE,
     ),
-    (
-        "ValidateStateMachineDefinition",
-        crate::state::STATE_MACHINE_RESOURCE,
-    ),
+    // "You can validate that a state machine definition is correct without creating a
+    // state machine resource": the same definition-only API as `TestState` above, about no
+    // resource of the account and so about no one resource type.
+    ("ValidateStateMachineDefinition", ""),
 ];
 
 /// The resource type `operation`'s API is about, and `None` for an API about no one type —

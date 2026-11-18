@@ -121,15 +121,32 @@ impl Emulator {
         operation: &str,
         body: &Value,
     ) -> (u16, Value) {
+        self.call_as_in_region(access_key_id, REGION, operation, body)
+            .await
+    }
+
+    /// The same call signed for `region`: the Region a request was made FOR, which is the
+    /// one an ARN this service writes for that request carries — a refusal's resource ARN
+    /// included.
+    pub(crate) async fn call_as_in_region(
+        &self,
+        access_key_id: &str,
+        region: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/{}/aws4_request, \
+            "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/{}/aws4_request, \
              SignedHeaders=host;x-amz-target, Signature=0123456789abcdef",
             SFN.signing_name
         );
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
-            .header("host", format!("{}.{REGION}.amazonaws.com", SFN.signing_name))
+            .header(
+                "host",
+                format!("{}.{region}.amazonaws.com", SFN.signing_name),
+            )
             .header(
                 "content-type",
                 format!("application/x-amz-json-{}", SFN.json_version),
@@ -439,12 +456,23 @@ pub(crate) fn message(body: &Value) -> String {
 /// what a refusal of such a call names — the API's own resource type with the resource name
 /// wildcarded.
 pub(crate) fn every_resource(resource_type: &str) -> String {
-    format!("arn:aws:states:{REGION}:{ACCOUNT}:{resource_type}:*")
+    every_resource_in(REGION, resource_type)
+}
+
+/// The same ARN for a call signed for `region`: the Region a request was made for is the
+/// one the resource a refusal of it names belongs to.
+pub(crate) fn every_resource_in(region: &str, resource_type: &str) -> String {
+    format!("arn:aws:states:{region}:{ACCOUNT}:{resource_type}:*")
 }
 
 /// The resource type the state machine APIs of this service are about, which is the kind of
 /// resource a call of one that names no resource of its own is judged against.
 pub(crate) const STATE_MACHINE_TYPE: &str = "stateMachine";
+
+/// The resource type an API that acts on NO resource of the account is judged against: IAM's
+/// wildcard, standing for every resource type this service's ARNs carry, so
+/// `every_resource(EVERY_TYPE)` is the ARN with both the type and the name wildcarded.
+pub(crate) const EVERY_TYPE: &str = "*";
 
 /// The ARN of the activity `name` in the Region every call below is signed for.
 fn activity_arn(name: &str) -> String {

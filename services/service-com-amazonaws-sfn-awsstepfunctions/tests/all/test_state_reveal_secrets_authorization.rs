@@ -42,7 +42,7 @@ use service_com_amazonaws_sfn_awsstepfunctions::service::identity_authorization;
 
 use crate::identity_policy_authorization::{
     every_resource, message, no_grant, not_authorized, Emulator, Principal, ACCESS_DENIED,
-    ACCESS_DENIED_STATUS, ACCOUNT_KEY, MODEL_PATH, STATE_MACHINE_TYPE,
+    ACCESS_DENIED_STATUS, ACCOUNT_KEY, EVERY_TYPE, MODEL_PATH,
 };
 use crate::state_machine_lifecycle::{error_code, ACCOUNT};
 use crate::sync_execution::document as json_member;
@@ -334,7 +334,7 @@ async fn a_capability_is_served_only_where_its_own_action_is_allowed_too() {
                     let expected = not_authorized(
                         &principal.arn,
                         refused_action,
-                        &every_resource(STATE_MACHINE_TYPE),
+                        &every_resource(EVERY_TYPE),
                         &reason,
                     );
                     let stated = message(&answer);
@@ -405,7 +405,7 @@ async fn granting_and_revoking_the_capability_decides_the_next_call() {
                 let expected = not_authorized(
                     &principal.arn,
                     CAPABILITY_ACTION,
-                    &every_resource(STATE_MACHINE_TYPE),
+                    &every_resource(EVERY_TYPE),
                     &no_grant(CAPABILITY_ACTION),
                 );
                 assert_eq!(
