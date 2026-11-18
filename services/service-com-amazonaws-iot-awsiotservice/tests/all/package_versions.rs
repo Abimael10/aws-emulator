@@ -42,6 +42,15 @@ use service_com_amazonaws_iot_awsiotservice::state::{
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// `ListPackageVersions`: the page of summaries a package's versions are reported as. It
+/// is driven through the same harness, so what a listing says and what this suite's create
+/// and reader say are compared against one emulator. The `#[path]` is what keeps it a
+/// child of THIS suite rather than a second suite beside it: this crate's `tests/all.rs`
+/// declares the suites directly under `tests/all/`, and a module of a `#[path]`-declared
+/// file resolves next to that file unless it says otherwise.
+#[path = "package_versions/listing.rs"]
+mod listing;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.

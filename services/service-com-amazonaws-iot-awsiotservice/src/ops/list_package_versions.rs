@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPackageVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPackageVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPackageVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One page of the versions ONE software package holds
+//! (`crate::state::RegisteredPackage::versions`), ordered by the instant each version
+//! was created — the most recently created first — and narrowed by the request's
+//! `status`: every entry is built from the record `CreatePackageVersion` persisted and
+//! `UpdatePackageVersion` moves through the package version lifecycle, so what this
+//! reports and what `GetPackageVersion` reads are one value, and a version
+//! `DeletePackageVersion` removed is listed by neither.
+//!
+//! A version lives INSIDE the package named by the `{packageName}` path label, so a name
+//! the catalog does not hold holds no versions at all: the request is refused with this
+//! operation's modelled `ValidationException`, in the catalog's own not-found wording
+//! ([`crate::state::missing_package_message`]), rather than answered with an empty page —
+//! an empty page would state that the package exists and holds nothing.
+//!
+//! `maxResults` bounds the page and `nextToken` resumes it: the token is opaque, carries
+//! the listing's own package and status filter, and a token issued for another listing is
+//! refused with the modelled `ValidationException` rather than silently resuming a
+//! different listing from the middle.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +158,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPackageVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPackageVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPackageVersions"))
+        // Every member this listing reports was recorded when its version was created or
+        // last updated, so the listing needs no request metadata of its own.
+        let _ = ctx;
+
+        // WHICH versions the request selects is resolved BEFORE any store is reached: a
+        // `nextToken` this listing never issued is refused whatever the store holds.
+        let scope = token_scope(&input);
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, &scope)?),
+            None => None,
+        };
+
+        // `maxResults` is "The maximum number of results to return at one time", modelled
+        // `range 1..100` and refused outside it before this handler runs, so a request
+        // that names it asks for at least one version and one that does not asks for
+        // every version that matches. The clamp is defensive rather than load-bearing.
+        let page_size = input
+            .max_results
+            .map_or(usize::MAX, |max| max.clamp(1, MAX_PAGE_SIZE) as usize);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPackageVersionsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        // The versions are the package's own: a `packageName` the catalog does not hold
+        // names no version set to page through, which this operation states with the
+        // modelled `ValidationException` (HTTP 400, "The request is not valid") — the one
+        // refusal it models for a request it cannot serve — exactly as
+        // `CreatePackageVersion` states it.
+        let package = store.packages.get(&input.package_name).ok_or_else(|| {
+            ListPackageVersionsErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::missing_package_message(&input.package_name)),
+            })
+        })?;
+
+        // One row per version this listing is about, each carrying the key it is ordered
+        // by: when the version was created, with its name breaking a tie between two
+        // versions created in the same instant (which is what keeps the order — and
+        // therefore every page boundary — total).
+        let mut rows: Vec<(SortKey, PackageVersionSummary)> = package
+            .versions
+            .values()
+            // `status` is "The status of the package version": a version matches only
+            // while it holds that status.
+            .filter(|version| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|wanted| version.status == wanted)
+            })
+            .map(|version| (sort_key(version), version_summary(version)))
+            .collect();
+        drop(store);
+
+        // ONE total order over the whole selection, which is what makes a page boundary
+        // meaningful: by the creation instant, the most recently created version first.
+        rows.sort_by(|(left, _), (right, _)| right.cmp(left));
+
+        // One row beyond the page: its presence is what says the listing is truncated,
+        // and nothing more than that is read.
+        let mut page: Vec<(SortKey, PackageVersionSummary)> = rows
+            .into_iter()
+            // Still to be returned once a page ending at `cursor` has been: in this
+            // order, the versions created BEFORE it.
+            .filter(|(key, _)| resume_after.as_ref().is_none_or(|cursor| key < cursor))
+            .take(page_size.saturating_add(1))
+            .collect();
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+
+        // `nextToken` is "The token for the next set of results", so it is issued only
+        // while there is a next set.
+        let next_token = if truncated {
+            page.last().map(|(key, _)| encode_next_token(&scope, key))
+        } else {
+            None
+        };
+
+        Ok(ListPackageVersionsOutput {
+            // `PackageVersionSummaryList` carries no length constraint, so a package none
+            // of whose versions match answers with an EMPTY list rather than an absent
+            // member: "nothing matches" is an answer, not a missing one.
+            package_version_summaries: Some(page.into_iter().map(|(_, summary)| summary).collect()),
+            next_token,
+        })
     }
+}
+
+/// The largest page `PackageCatalogMaxResults` admits (`range 1..100`,
+/// `smithy_query(query="operation",operation="ListPackageVersions")`).
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The key one version is ordered by: when it was created, as nanoseconds since the
+/// epoch, and its name breaking a tie between two versions created in the same instant.
+type SortKey = (u128, String);
+
+/// The ordering key of a stored package version.
+fn sort_key(version: &crate::state::RegisteredPackageVersion) -> SortKey {
+    (
+        version
+            .creation_date
+            .duration_since(::std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        version.version_name.clone(),
+    )
+}
+
+/// One stored version as the modelled `PackageVersionSummary` a listing carries.
+///
+/// `PackageVersionSummary` is "A summary of information about a package version" of five
+/// members — the package and version names that identify it, the status it holds in the
+/// package version lifecycle, and the dates it was created and last updated
+/// (`smithy_query(query="shape",shape="PackageVersionSummary")`) — each read off the
+/// record the create persisted, so a summary and the version `GetPackageVersion` reports
+/// can never disagree.
+fn version_summary(version: &crate::state::RegisteredPackageVersion) -> PackageVersionSummary {
+    PackageVersionSummary {
+        package_name: Some(version.package_name.clone()),
+        version_name: Some(version.version_name.clone()),
+        status: Some(version.status.clone()),
+        creation_date: Some(::aws_smithy_types::DateTime::from(version.creation_date)),
+        last_modified_date: Some(::aws_smithy_types::DateTime::from(
+            version.last_modified_date,
+        )),
+    }
+}
+
+/// The character that separates the fields of a token's SCOPE. A control character, so it
+/// occurs in no `PackageName` or `VersionName` (`^[a-zA-Z0-9-_.]+$`) and in no
+/// `PackageVersionStatus` value, and cannot occur inside any field it joins.
+const SCOPE_SEPARATOR: char = '\u{1e}';
+
+/// The character that separates a token's scope from the position it resumes after.
+const TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// The LISTING a continuation token belongs to: the package it pages through and the
+/// status it selects, which together decide which versions it walks and therefore what
+/// "the next set of results" means. A token issued for one listing is refused by another.
+fn token_scope(input: &ListPackageVersionsInput) -> String {
+    format!(
+        "{}{SCOPE_SEPARATOR}{}",
+        input.package_name,
+        input.status.clone().unwrap_or_default(),
+    )
+}
+
+/// The opaque `nextToken` that resumes `scope`'s listing after the version whose ordering
+/// key is `key`.
+///
+/// The key, not the name alone: it is the position in the listing's total order, so a page
+/// resumes where the last one ended even if that version has since been deleted.
+/// Hex-encoded so the token is opaque to the caller whatever the names contain. The
+/// encoding carries no integrity protection and claims none: a caller that reverses it can
+/// name any resume point of the listing it is already reading, which selects a page of
+/// that same listing and nothing else.
+fn encode_next_token(scope: &str, key: &SortKey) -> String {
+    let (creation_date, version_name) = key;
+    ::hex::encode(format!(
+        "{scope}{TOKEN_SEPARATOR}{creation_date}{SCOPE_SEPARATOR}{version_name}"
+    ))
+}
+
+/// The position a `nextToken` resumes after, or the modelled `ValidationException` (HTTP
+/// 400, "The request is not valid") when the token is not one [`encode_next_token`] issued
+/// for THIS listing.
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so nothing read out of
+/// it may panic the handler. A token issued for another package or another status filter
+/// is refused rather than silently resuming a different listing from the middle.
+fn decode_next_token(token: &str, scope: &str) -> Result<SortKey, ListPackageVersionsError> {
+    let invalid = || -> ListPackageVersionsError {
+        ListPackageVersionsErrorModeled::ValidationException(ValidationException {
+            message: Some("nextToken is not a continuation token of this listing".to_string()),
+        })
+        .into()
+    };
+    let bytes = ::hex::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    let (token_scope, position) = decoded.split_once(TOKEN_SEPARATOR).ok_or_else(invalid)?;
+    if token_scope != scope {
+        return Err(invalid());
+    }
+    let (creation_date, version_name) = position.split_once(SCOPE_SEPARATOR).ok_or_else(invalid)?;
+    let creation_date: u128 = creation_date.parse().map_err(|_| invalid())?;
+    Ok((creation_date, version_name.to_string()))
 }
