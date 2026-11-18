@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateFaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateFaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Associates faces the named collection holds with one of that collection's users, and
+//! reports what it did: the `FaceId` of each face it associated, one entry per face it
+//! could not, and the `UserStatus` the user carries after the call. The association is
+//! recorded ON the stored face and in the user's own face list, so it is what `ListFaces`
+//! reports and filters by and what `DeleteFaces` refuses to remove.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateFaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each requested face is decided by itself, which is why one call both associates and
+//! refuses: a face the collection does not hold, a face another user of the collection
+//! already holds, and a face whose measured user match confidence stays below
+//! `UserMatchThreshold` are each reported as an unsuccessful association with the reason
+//! the model names for it, while a face THIS user already holds is ignored and reported
+//! nowhere. The confidence is MEASURED: the resemblance between the candidate face and
+//! the faces the user already holds, read off the appearances the detector measured when
+//! they were indexed (see [`crate::state::face_association`]). The threshold applies only
+//! to a user that already holds a face, since there is nothing to match against before
+//! that.
+//!
+//! The call is IDEMPOTENT on its `ClientRequestToken`: the parameters the token committed
+//! are remembered beside the ANSWER it was given ([`crate::state::idempotency`],
+//! [`crate::state::face_association::AssociationAnswers`]), so the same token sent again
+//! with the same request answers with that same response and associates nothing a second
+//! time, while the same token sent with a different request is refused with the modelled
+//! `IdempotentParameterMismatchException`.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +138,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Every modelled error this handler answers with is built through this trait, so each
+// one carries its `Code` member beside its `Message`.
+use crate::state::modeled_error::ModeledError;
+
+// The rules of a face association, the entries it reports per face it could not
+// associate, and the ledger of the answers a `ClientRequestToken` has already committed.
+use crate::state::face_association;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -200,18 +222,182 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateFaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateFacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateFaces"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateFacesErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // A user and its faces live IN a collection, so the collection has to exist before
+        // anything about either is read or written; this is the wording the operations on
+        // the contents of a collection refuse an absent one with.
+        if !state.collections.contains_key(&input.collection_id) {
+            return Err(AssociateFacesErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
+            .into());
+        }
+
+        // What the token committed, if it committed anything: the request's own parameters
+        // beyond the token itself, which is what a reuse is compared against.
+        let requested_faces = input.face_ids.join(",");
+        let requested_threshold = input
+            .user_match_threshold
+            .map(|threshold| threshold.to_string())
+            .unwrap_or_default();
+        let parameters = [
+            ("CollectionId", input.collection_id.as_str()),
+            ("UserId", input.user_id.as_str()),
+            ("FaceIds", requested_faces.as_str()),
+            ("UserMatchThreshold", requested_threshold.as_str()),
+        ];
+        let token_use = input.client_request_token.as_deref().map_or(
+            crate::state::idempotency::TokenUse::First,
+            |token| {
+                state
+                    .client_request_tokens
+                    .classify(Self::NAME, token, &parameters)
+            },
+        );
+        if token_use == crate::state::idempotency::TokenUse::Mismatch {
+            return Err(
+                AssociateFacesErrorModeled::IdempotentParameterMismatchException(
+                    crate::state::modeled_error::idempotent_parameter_mismatch(),
+                )
+                .into(),
+            );
+        }
+        // A request the caller is RETRYING under the token that committed it is answered
+        // with the answer that token was given, and associates nothing a second time. A
+        // token whose answer the bounded ledger has since forgotten is carried out as a
+        // fresh request, which associates the same faces with the same user.
+        if token_use == crate::state::idempotency::TokenUse::Retry {
+            if let Some(recorded) = input
+                .client_request_token
+                .as_deref()
+                .and_then(|token| state.association_answers.recorded(token))
+            {
+                return Ok(recorded.modeled());
+            }
+        }
+
+        let Some(collection) = state.collections.get_mut(&input.collection_id) else {
+            // The collection was there a moment ago, under this same lock, so this cannot
+            // be reached; resolving it again rather than unwrapping keeps the handler free
+            // of any construct a request could panic on.
+            return Err(AssociateFacesErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
+            .into());
+        };
+        // The faces and the users of the collection are both written in the walk below, so
+        // each is borrowed on its own.
+        let faces = &mut collection.faces;
+        let Some(user) = collection.users.get_mut(&input.user_id) else {
+            return Err(AssociateFacesErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::user_id_does_not_exist(&input.user_id),
+            )
+            .into());
+        };
+
+        // "Once a UserID has 100 faces associated with it, no additional faces can be
+        // added. If more API calls are made after the limit is reached, a
+        // ServiceQuotaExceededException will result": a call to a user that is already
+        // full is that case, and it is refused before anything is written.
+        if user.face_ids.len() >= face_association::MAX_FACES_PER_USER {
+            return Err(AssociateFacesErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException::with_message(format!(
+                    "The maximum number of faces ({}) has already been associated with the \
+                     user {}",
+                    face_association::MAX_FACES_PER_USER,
+                    input.user_id
+                )),
+            )
+            .into());
+        }
+
+        let threshold = input
+            .user_match_threshold
+            .unwrap_or(face_association::DEFAULT_USER_MATCH_THRESHOLD);
+        // What a candidate's user match confidence is measured against: the appearance of
+        // every face the user already holds, which grows as this call associates more.
+        let mut held: Vec<crate::state::face_detection::FaceAppearance> = user
+            .face_ids
+            .iter()
+            .filter_map(|face_id| faces.iter().find(|face| &face.face_id == face_id))
+            .map(|face| face.appearance.clone())
+            .collect();
+        let mut associated_face_ids: Vec<String> = Vec::new();
+        let mut unsuccessful: Vec<UnsuccessfulFaceAssociation> = Vec::new();
+
+        // Each requested face is decided on its own, in the order the request lists them,
+        // and the decision is applied before the next one is taken: a request that names
+        // one face twice therefore sees the second occurrence as a face this user already
+        // holds, and one that names more faces than the user has room for fills the room
+        // there is.
+        for face_id in &input.face_ids {
+            let Some(face) = faces.iter_mut().find(|face| &face.face_id == face_id) else {
+                unsuccessful.push(face_association::face_not_found(face_id));
+                continue;
+            };
+            match face.user_id.as_deref() {
+                // "If a given face is already associated with the given UserID, it will be
+                // ignored and will not be returned in the response."
+                Some(holder) if holder == input.user_id => continue,
+                Some(holder) => {
+                    unsuccessful.push(face_association::associated_to_a_different_user(
+                        face_id, holder,
+                    ));
+                    continue;
+                }
+                None => {}
+            }
+            if user.face_ids.len() >= face_association::MAX_FACES_PER_USER {
+                unsuccessful.push(face_association::user_is_full(face_id));
+                continue;
+            }
+            // The threshold is "the minimum user match confidence required for the face to
+            // be associated with a UserID that has at least one FaceID already
+            // associated", so a user with nothing to match against admits the face.
+            if let Some(confidence) =
+                face_association::user_match_confidence(&face.appearance, &held)
+            {
+                if confidence < threshold {
+                    unsuccessful.push(face_association::low_match_confidence(face_id, confidence));
+                    continue;
+                }
+            }
+            held.push(face.appearance.clone());
+            face.user_id = Some(input.user_id.clone());
+            user.face_ids.push(face_id.clone());
+            associated_face_ids.push(face_id.clone());
+        }
+
+        // A call that associated something leaves the user UPDATING until the clock owes
+        // the completion of that update; one that associated nothing changed nothing about
+        // the user, so it reports the status the user already carried.
+        if !associated_face_ids.is_empty() {
+            user.start_update(now);
+        }
+        let recorded = face_association::RecordedAssociation {
+            associated_face_ids,
+            unsuccessful,
+            user_status: user.status_at(now).to_string(),
+        };
+        let answer = recorded.modeled();
+
+        // The token is remembered only now the request has been carried out, so a refused
+        // one leaves the caller free to send the same token again.
+        if let Some(token) = input.client_request_token.as_deref() {
+            state
+                .client_request_tokens
+                .commit(Self::NAME, token, &parameters);
+            state.association_answers.record(token, recorded);
+        }
+
+        Ok(answer)
     }
 }

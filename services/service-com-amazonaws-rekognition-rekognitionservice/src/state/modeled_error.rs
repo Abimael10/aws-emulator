@@ -212,6 +212,20 @@ pub fn user_id_already_exists(user_id: &str) -> ConflictException {
     ConflictException::with_message(format!("The user id: {user_id} already exists"))
 }
 
+/// A `UserId` the named collection holds no user under, as the operations ON a user of a
+/// collection word it: the request's own id between two pieces of fixed text, worded the
+/// way this service words the same class for a collection id that names nothing ("The
+/// collection id: … does not exist") and as the mirror of the create's own refusal
+/// ([`user_id_already_exists`]), since all three say "the id you named is not one this
+/// store holds".
+///
+/// The class is `ResourceNotFoundException`: a user is the resource the request is given,
+/// and the exception the model declares for it describes exactly this — "the resource
+/// specified in the request cannot be found".
+pub fn user_id_does_not_exist(user_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException::with_message(format!("The user id: {user_id} does not exist"))
+}
+
 /// The fixed text an idempotency-token reuse is refused with.
 ///
 /// It describes none of the request, and it does not restate the rule — "a

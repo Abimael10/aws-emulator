@@ -76,6 +76,7 @@
 //! graded score — see its own module docs.
 
 pub mod celebrity_catalogue;
+pub mod face_association;
 pub mod face_detection;
 pub mod idempotency;
 pub mod image_source;
@@ -180,17 +181,23 @@ pub const MAX_FACES_PER_COLLECTION: usize = 1_000;
 /// limit, and the modelled error is the one AWS answers past its own quota.
 pub const MAX_USERS_PER_COLLECTION: usize = 1_000;
 
-/// The `UserStatus` a user carries from the moment `CreateUser` records it.
+/// The `UserStatus` values a user of this store carries; see [`StoredUser::status_at`]
+/// for which of them it carries when.
 ///
 /// `UserStatus` "communicates if the UserID has been updated with latest set of faces
 /// to be associated with the UserID"
 /// (`smithy_query(query="shape",shape="User")`), and its values are
 /// ACTIVE | UPDATING | CREATING | CREATED
-/// (`smithy_query(query="shape",shape="UserStatus")`). A user `CreateUser` has just
-/// recorded is created and has no face associated with it yet, which is `CREATED`; the
-/// other values belong to transitions `AssociateFaces` and `DisassociateFaces` start,
-/// and neither is implemented yet.
+/// (`smithy_query(query="shape",shape="UserStatus")`), documented as "ACTIVE - All
+/// associations or disassociations of FaceID(s) for a UserID are complete. CREATED - A
+/// UserID has been created, but has no FaceID(s) associated with it. UPDATING - A UserID
+/// is being updated and there are current associations or disassociations of FaceID(s)
+/// taking place" (`smithy_query(query="doc",shape="AssociateFaces")`). `CREATING` belongs
+/// to a transition no operation of this service starts: a `CreateUser` that answers has
+/// recorded the user.
 pub const USER_STATUS_CREATED: &str = "CREATED";
+pub const USER_STATUS_UPDATING: &str = "UPDATING";
+pub const USER_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// How many tags one resource of this store will hold: the top of the modelled `TagMap`
 /// length range (`length 0..200`,
@@ -227,11 +234,11 @@ pub struct StoredFace {
     pub bounding_box: Option<BoundingBox>,
     /// The detector's own measured agreement that the box holds a face.
     pub confidence: Option<f32>,
-    /// The user this face is associated with, set by `AssociateFaces` (not yet
-    /// implemented), so it is `None` for every face this slice stores. It is carried
-    /// here, and honoured by `ListFaces`' `UserId` filter and `DeleteFaces`'
-    /// `ASSOCIATED_TO_AN_EXISTING_USER` refusal, as pre-wiring for the rest of the user
-    /// slice: a user exists (`CreateUser`) but nothing associates a face with one yet.
+    /// The user this face is associated with, set by `AssociateFaces` and cleared when the
+    /// face is taken off that user again, and `None` for a face no user holds. It is
+    /// honoured by `ListFaces`' `UserId` filter and `DeleteFaces`'
+    /// `ASSOCIATED_TO_AN_EXISTING_USER` refusal, so one record answers for the face
+    /// wherever the association shows.
     pub user_id: Option<String>,
     /// The digest of the image content this face was indexed from: what lets
     /// `SearchFaces` tell whether two stored faces came from the same image.
@@ -268,17 +275,21 @@ impl StoredFace {
 }
 
 /// One user of a collection, as created by `CreateUser` and populated by
-/// `AssociateFaces` (not implemented yet, so `face_ids` is empty for every user this
-/// slice stores).
+/// `AssociateFaces`.
 #[derive(Debug, Clone)]
 pub struct StoredUser {
     /// `CreateUser.UserId` — the caller's own id for the user and the collection's key
     /// for it, unique within the collection.
     pub user_id: String,
-    /// The user's `UserStatus`; see [`USER_STATUS_CREATED`].
-    pub user_status: String,
-    /// The faces `AssociateFaces` has associated with this user, by their `FaceId`.
+    /// The faces `AssociateFaces` has associated with this user, by their `FaceId`, in
+    /// the order they were associated. Bounded by
+    /// [`face_association::MAX_FACES_PER_USER`].
     pub face_ids: Vec<String>,
+    /// When the update of this user's faces that the last `AssociateFaces` started is
+    /// complete, and `None` while no call has started one. The instant is STORED rather
+    /// than waited for: nothing sleeps, and the status below is computed from the clock
+    /// whenever it is asked for.
+    pub updating_until: Option<SystemTime>,
 }
 
 impl StoredUser {
@@ -287,19 +298,43 @@ impl StoredUser {
     pub fn new(user_id: String) -> Self {
         Self {
             user_id,
-            user_status: USER_STATUS_CREATED.to_string(),
             face_ids: Vec::new(),
+            updating_until: None,
+        }
+    }
+
+    /// Record that an update of this user's faces started at `now`, due to be complete one
+    /// [`face_association::UPDATE_SPAN`] later.
+    pub fn start_update(&mut self, now: SystemTime) {
+        self.updating_until = Some(now + face_association::UPDATE_SPAN);
+    }
+
+    /// This user's `UserStatus` at `now`: updating until the instant the clock owes the
+    /// completion of the update its faces are under, created while no face has been
+    /// associated with it, and active once every association of its faces is complete.
+    pub fn status_at(&self, now: SystemTime) -> &'static str {
+        match self.updating_until {
+            Some(until) if now < until => USER_STATUS_UPDATING,
+            _ if self.face_ids.is_empty() => USER_STATUS_CREATED,
+            _ => USER_STATUS_ACTIVE,
         }
     }
 
     /// This user as the modelled `User`: the id it was created under and the status it
-    /// currently carries, which are the only two members the shape has
+    /// carries at `now`, which are the only two members the shape has
     /// (`smithy_query(query="shape",shape="User")`).
-    pub fn modeled(&self) -> User {
+    pub fn modeled_at(&self, now: SystemTime) -> User {
         User {
             user_id: Some(self.user_id.clone()),
-            user_status: Some(self.user_status.clone()),
+            user_status: Some(self.status_at(now).to_string()),
         }
+    }
+
+    /// This user as the modelled `User` as of this instant; see [`Self::modeled_at`]. The
+    /// status is a function of the clock, so a reader asks for it when it reports the
+    /// user rather than reading a value some earlier call left behind.
+    pub fn modeled(&self) -> User {
+        self.modeled_at(SystemTime::now())
     }
 }
 
@@ -500,6 +535,11 @@ pub struct ComAmazonawsRekognitionRekognitionserviceState {
     /// serves every `Start…`/`Get…` pair rather than a map per operation. Bounded by
     /// [`video_jobs::MAX_REMEMBERED_JOBS`].
     pub video_jobs: video_jobs::VideoJobs,
+    /// What each `AssociateFaces` call that carried an idempotency token answered, so the
+    /// same token answers with it again rather than with what the store says now. Keyed
+    /// by the token alone and service-wide, like the parameter ledger above. Bounded by
+    /// [`idempotency::MAX_REMEMBERED_TOKENS`].
+    pub association_answers: face_association::AssociationAnswers,
 }
 
 impl ComAmazonawsRekognitionRekognitionserviceState {
