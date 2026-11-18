@@ -23,6 +23,16 @@
 //! kind of function), whether the state machine's role may make the call at all, and how
 //! many executions of the row ran in the window — which is what each series' magnitude is
 //! read against.
+//!
+//! Which attempts a per-function series accounts for is therefore a fact about the
+//! `Resource` that named the function rather than about the function: ONE function reached
+//! in both forms is counted there once per attempt of the naming form and never for the
+//! integration token's, and a function reached ONLY through the token is named by no
+//! `Resource` at all, so every series of that family — the counts and the spans — holds
+//! nothing for it, whichever outcome its executions reached. Each magnitude is settled once
+//! the execution it counts has left `RUNNING`: a client POLLING it is answered the same
+//! figures however many times the service has since reported on the same histories, which
+//! is what the rows below that read every series repeatedly are about.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -738,5 +748,405 @@ async fn only_a_resource_that_names_the_function_is_counted_per_function() {
             "case {case:?}: expected {expected} invocation(s) of {name} in \
              {LAMBDA_NAMESPACE}/{INVOCATIONS_SERIES}, got {invoked}"
         );
+    }
+}
+
+// What follows reads the SAME families over ONE function reached in BOTH forms, and reads
+// them REPEATEDLY: which attempts a per-function series accounts for is a fact about the
+// `Resource` that named the function rather than about the function, and the magnitude a
+// client polls for is settled once the execution it counts has left `RUNNING`.
+
+/// See [`STATES_NAMESPACE`].
+const TIMED_OUT_SERIES: &str = "LambdaFunctionsTimedOut";
+/// See [`STATES_NAMESPACE`].
+const SCHEDULE_TIME_SERIES: &str = "LambdaFunctionScheduleTime";
+/// See [`STATES_NAMESPACE`].
+const TIME_SERIES: &str = "LambdaFunctionTime";
+
+/// Every series of the per-function family: the five counts an attempt is scheduled,
+/// started and closed in, and the three spans measured either side of its work.
+const PER_FUNCTION_SERIES: &[&str] = &[
+    SCHEDULED_SERIES,
+    STARTED_SERIES,
+    SUCCEEDED_SERIES,
+    FAILED_SERIES,
+    TIMED_OUT_SERIES,
+    SCHEDULE_TIME_SERIES,
+    RUN_TIME_SERIES,
+    TIME_SERIES,
+];
+
+/// How many times a row's client asks for the series it watches. More than once, because
+/// the rule is about what a POLLING reader converges on: every reading after the first is
+/// taken once the service has reported on the same histories again.
+const POLLS: usize = 3;
+
+/// One leg of the window: the form its `Task` state names its work in, whether its state
+/// machine's role may make the call, and how many executions of it the client ran.
+struct Leg {
+    case: &'static str,
+    form: Form,
+    granted: bool,
+    executions: usize,
+}
+
+/// The legs that share ONE function, so each series below is a reading of the same
+/// function's work taken in both forms, allowed and refused.
+fn legs() -> Vec<Leg> {
+    vec![
+        Leg {
+            case: "the function's own ARN under a role granted the invocation, run twice",
+            form: Form::FunctionArn,
+            granted: true,
+            executions: 2,
+        },
+        Leg {
+            case: "the optimized integration on the same function under that role, run twice",
+            form: Form::Optimized,
+            granted: true,
+            executions: 2,
+        },
+        Leg {
+            case: "the function's own ARN under a role without the grant, run once",
+            form: Form::FunctionArn,
+            granted: false,
+            executions: 1,
+        },
+        Leg {
+            case: "the optimized integration on the same function under that role, run once",
+            form: Form::Optimized,
+            granted: false,
+            executions: 1,
+        },
+    ]
+}
+
+/// How many attempts the legs of `legs` make in `form`, counting only the legs whose role
+/// `granted` where that is asked for.
+fn attempts(legs: &[Leg], form: Form, granted: Option<bool>) -> f64 {
+    let counted: usize = legs
+        .iter()
+        .filter(|leg| leg.form == form && granted.is_none_or(|want| leg.granted == want))
+        .map(|leg| leg.executions)
+        .sum();
+    #[allow(clippy::cast_precision_loss)]
+    {
+        counted as f64
+    }
+}
+
+/// The statements the role of a leg that may, or may not, invoke `function` carries: the
+/// invocation of that function and of its qualified forms, or an action that has nothing
+/// to do with one.
+fn statements(granted: bool, function: &str) -> Value {
+    if granted {
+        json!([
+            allow(INVOKE_ACTION, function),
+            allow(INVOKE_ACTION, &format!("{function}:*")),
+        ])
+    } else {
+        json!([allow("logs:PutLogEvents", "*")])
+    }
+}
+
+/// One execution of a leg ended as that leg's grant decides: an allowed call answers the
+/// run's own result, and a refused one fails under Lambda's base SDK exception.
+fn ended(described: &Value, case: &str, run: usize, granted: bool) {
+    let expected = if granted { "SUCCEEDED" } else { "FAILED" };
+    assert_eq!(
+        described.get("status").and_then(Value::as_str),
+        Some(expected),
+        "case {case:?}: expected run {run} to end {expected}, got {described}"
+    );
+    if !granted {
+        assert_eq!(
+            described.get("error").and_then(Value::as_str),
+            Some(REFUSED_ERROR),
+            "case {case:?}: expected run {run} to end on the refusal, got {described}"
+        );
+    }
+}
+
+/// Whether two magnitudes of a series are the same figure.
+fn same(counted: f64, expected: f64) -> bool {
+    (counted - expected).abs() < f64::EPSILON
+}
+
+/// One function reached in BOTH forms is counted in the per-function series once per
+/// attempt of the form whose `Resource` NAMED it and never for the integration token's,
+/// and the figures a client polls for do not move as it polls them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_function_counts_only_the_attempts_its_own_resource_named() {
+    let chain = Chain::new();
+    let case = "one function, reached in both forms";
+    let name = "converged-shared";
+    let function = chain.given_function(name).await;
+
+    let legs = legs();
+    let mut machines: Vec<String> = Vec::new();
+    let mut executions: Vec<String> = Vec::new();
+    for (index, leg) in legs.iter().enumerate() {
+        let role = chain
+            .role(
+                leg.case,
+                &format!("ConvergedRole{index}"),
+                &statements(leg.granted, &function),
+            )
+            .await;
+        let machine = chain
+            .machine(
+                leg.case,
+                &format!("converged-{index}"),
+                &leg.form.definition(&function),
+                &role,
+            )
+            .await;
+        for run in 0..leg.executions {
+            let described = chain
+                .ran(
+                    leg.case,
+                    &machine,
+                    &format!("run-{run}"),
+                    &json!({ "n": run + 1 }),
+                )
+                .await;
+            ended(&described, leg.case, run, leg.granted);
+            executions.push(string(&described, "executionArn"));
+        }
+        machines.push(machine);
+    }
+
+    // Only the attempts of the form whose `Resource` named the function are counted per
+    // function: each of them was scheduled and then started whether or not the call was
+    // allowed, and closed in the one series its outcome names. No attempt ran out of the
+    // time a state allowed it, so the timed-out series of the family stays empty.
+    let named = attempts(&legs, Form::FunctionArn, None);
+    let counts = [
+        (SCHEDULED_SERIES, named),
+        (STARTED_SERIES, named),
+        (
+            SUCCEEDED_SERIES,
+            attempts(&legs, Form::FunctionArn, Some(true)),
+        ),
+        (
+            FAILED_SERIES,
+            attempts(&legs, Form::FunctionArn, Some(false)),
+        ),
+        (TIMED_OUT_SERIES, 0.0),
+    ];
+    // Lambda meters the invocations it ADMITTED, whichever form asked for them, so the
+    // optimized legs' work is visible there though no per-function series counts it.
+    let admitted = attempts(&legs, Form::FunctionArn, Some(true))
+        + attempts(&legs, Form::Optimized, Some(true));
+
+    for poll in 0..POLLS {
+        for (metric, expected) in counts {
+            let counted = chain
+                .summed(
+                    case,
+                    STATES_NAMESPACE,
+                    metric,
+                    &function_arn_dimensions(&function),
+                )
+                .await;
+            assert!(
+                same(counted, expected),
+                "case {case:?}: poll {poll}: expected {metric} to count {expected} for \
+                 {function}, got {counted}"
+            );
+        }
+        // The spans are sampled once per attempt counted per function — one either side of
+        // the work and one over the whole of it — so the family's counts and its samples
+        // are two readings of the same attempts.
+        for metric in [SCHEDULE_TIME_SERIES, RUN_TIME_SERIES, TIME_SERIES] {
+            let held = chain
+                .datapoints(
+                    case,
+                    STATES_NAMESPACE,
+                    metric,
+                    &function_arn_dimensions(&function),
+                    &["SampleCount"],
+                )
+                .await;
+            let samples: f64 = held
+                .iter()
+                .filter_map(|point| point["SampleCount"].as_f64())
+                .sum();
+            assert!(
+                same(samples, named),
+                "case {case:?}: poll {poll}: expected {named} {metric} sample(s) of {function}, \
+                 got {samples} from {held:?}"
+            );
+        }
+        let invoked = chain
+            .summed(
+                case,
+                LAMBDA_NAMESPACE,
+                INVOCATIONS_SERIES,
+                &function_name_dimensions(name),
+            )
+            .await;
+        assert!(
+            same(invoked, admitted),
+            "case {case:?}: poll {poll}: expected {admitted} invocation(s) of {name} in \
+             {LAMBDA_NAMESPACE}/{INVOCATIONS_SERIES}, got {invoked}"
+        );
+        // Every execution is counted under its own state machine whatever form its `Task`
+        // took, in the one series its outcome names.
+        for (leg, machine) in legs.iter().zip(&machines) {
+            #[allow(clippy::cast_precision_loss)]
+            let ran = leg.executions as f64;
+            for (metric, expected) in [
+                (
+                    EXECUTIONS_SUCCEEDED_SERIES,
+                    if leg.granted { ran } else { 0.0 },
+                ),
+                (
+                    EXECUTIONS_FAILED_SERIES,
+                    if leg.granted { 0.0 } else { ran },
+                ),
+            ] {
+                let counted = chain
+                    .summed(case, STATES_NAMESPACE, metric, &machine_dimensions(machine))
+                    .await;
+                assert!(
+                    same(counted, expected),
+                    "case {:?}: poll {poll}: expected {metric} to count {expected} for {machine}, \
+                     got {counted}",
+                    leg.case
+                );
+            }
+        }
+        // Read every execution back before the next poll: a client watching a workflow
+        // reads its runs as it reads their series, and the service reports on those same
+        // histories again as it serves the reads — which is what the next poll is taken
+        // after, and what a count made twice would show up in.
+        for execution in &executions {
+            let described = chain
+                .sfn(
+                    case,
+                    "DescribeExecution",
+                    &json!({ "executionArn": execution }),
+                )
+                .await;
+            assert_ne!(
+                described.get("status").and_then(Value::as_str),
+                Some("RUNNING"),
+                "case {case:?}: poll {poll}: an execution that ended stays ended, got {described}"
+            );
+        }
+    }
+}
+
+/// A `Task` state whose `Resource` is the optimized integration token names no function,
+/// so the per-function family of the function its request reaches holds nothing at all —
+/// for the allowed call and for the refused one alike, however often the client asks —
+/// while the work both legs did is read off the series that do account for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_optimized_task_leaves_the_per_function_family_empty() {
+    let chain = Chain::new();
+    let case = "the optimized integration, allowed and refused";
+    let name = "converged-optimized";
+    let function = chain.given_function(name).await;
+
+    // The two legs of the window: the same state, under a role that may make the call and
+    // under one that may not.
+    let mut ran: Vec<(bool, String, String)> = Vec::new();
+    for granted in [true, false] {
+        let leg = if granted { "allowed" } else { "refused" };
+        let role = chain
+            .role(
+                case,
+                &format!("ConvergedOptimized-{leg}"),
+                &statements(granted, &function),
+            )
+            .await;
+        let machine = chain
+            .machine(
+                case,
+                &format!("converged-optimized-{leg}"),
+                &Form::Optimized.definition(&function),
+                &role,
+            )
+            .await;
+        let described = chain.ran(case, &machine, "run-0", &json!({ "n": 1 })).await;
+        ended(&described, case, 0, granted);
+        if granted {
+            let output: Value =
+                serde_json::from_str(&string(&described, "output")).unwrap_or_else(|error| {
+                    panic!("case {case:?}: the allowed leg must answer JSON output, got {error}")
+                });
+            assert_eq!(
+                Form::Optimized.answered(&output),
+                json!({ "echo": 1 }),
+                "case {case:?}: expected the allowed leg to answer the handler's own result, got \
+                 {described}"
+            );
+        }
+        ran.push((granted, machine, string(&described, "executionArn")));
+    }
+
+    for poll in 0..POLLS {
+        // Not one series of the per-function family carries a datapoint: the dimension
+        // names a function no `Resource` here named.
+        for metric in PER_FUNCTION_SERIES {
+            let held = chain
+                .datapoints(
+                    case,
+                    STATES_NAMESPACE,
+                    metric,
+                    &function_arn_dimensions(&function),
+                    &["Sum", "SampleCount"],
+                )
+                .await;
+            assert!(
+                held.is_empty(),
+                "case {case:?}: poll {poll}: {metric} accounts for a `Resource` that named the \
+                 function, got {held:?}"
+            );
+        }
+        // And the work both legs did is read off the series that do account for it: Lambda
+        // admitted the allowed leg's invocation and never saw the refused one, and each
+        // execution is counted under its own state machine.
+        let invoked = chain
+            .summed(
+                case,
+                LAMBDA_NAMESPACE,
+                INVOCATIONS_SERIES,
+                &function_name_dimensions(name),
+            )
+            .await;
+        assert!(
+            same(invoked, 1.0),
+            "case {case:?}: poll {poll}: expected the one admitted invocation of {name} in \
+             {LAMBDA_NAMESPACE}/{INVOCATIONS_SERIES}, got {invoked}"
+        );
+        for (granted, machine, _) in &ran {
+            for (metric, expected) in [
+                (
+                    EXECUTIONS_SUCCEEDED_SERIES,
+                    if *granted { 1.0 } else { 0.0 },
+                ),
+                (EXECUTIONS_FAILED_SERIES, if *granted { 0.0 } else { 1.0 }),
+            ] {
+                let counted = chain
+                    .summed(case, STATES_NAMESPACE, metric, &machine_dimensions(machine))
+                    .await;
+                assert!(
+                    same(counted, expected),
+                    "case {case:?}: poll {poll}: expected {metric} to count {expected} for \
+                     {machine}, got {counted}"
+                );
+            }
+        }
+        for (_, _, execution) in &ran {
+            chain
+                .sfn(
+                    case,
+                    "DescribeExecution",
+                    &json!({ "executionArn": execution }),
+                )
+                .await;
+        }
     }
 }
