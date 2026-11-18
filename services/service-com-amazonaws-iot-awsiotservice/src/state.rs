@@ -939,6 +939,20 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// A caller grows this store, so it is bounded: [`MAX_CERTIFICATES`] is the ceiling
     /// `CreateKeysAndCertificate` refuses past.
     pub certificates: BTreeMap<String, RegisteredCertificate>,
+    /// Every CA certificate the account has REGISTERED, keyed by `certificateId`.
+    ///
+    /// The id is the CA certificate's identity — the model binds it as the `@httpLabel`
+    /// of `/cacertificate/{certificateId}` on every single-CA-certificate operation — so
+    /// a `BTreeMap` keyed by id is the CA registry itself. `BTreeMap` (not `HashMap`)
+    /// because `ListCACertificates` is `@paginated` and a page boundary is only
+    /// meaningful over a stable order.
+    ///
+    /// It is a store of its own and not a view over
+    /// [`ComAmazonawsIotAwsiotserviceState::certificates`] because the two families are
+    /// different resources: a CA certificate is registered by the caller rather than
+    /// issued here, is reached through its own URIs, and is reported through its own
+    /// shapes and its own status set (see [`ca_certificates`]).
+    pub ca_certificates: BTreeMap<String, RegisteredCaCertificate>,
     /// Every role alias that exists, keyed by `roleAlias`.
     ///
     /// The name is the alias's identity — the model binds it as the `@httpLabel` of
@@ -3133,6 +3147,21 @@ pub use certificates::{
     PROVISIONING_CLAIM_VALIDITY,
 };
 
+// What a registered CA CERTIFICATE is — the record one holds, and what the account's own
+// state refuses a registration for — lives in `state/ca_certificates.rs`, beside the
+// store accessor for the same reason the device-certificate record does. Its names are
+// re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod ca_certificates;
+pub use ca_certificates::{
+    ca_certificate_arn, ca_registry_full_message, ca_subject_limit_message,
+    not_a_certificate_authority_message, unreadable_ca_certificate_message,
+    verification_certificate_not_allowed_message, verification_certificate_required_message,
+    CaCertificateRegistration, CaCertificateRegistrationRefusal, RegisteredCaCertificate,
+    AUTO_REGISTRATION_DISABLE, AUTO_REGISTRATION_ENABLE, CA_CERTIFICATE_STATUS_ACTIVE,
+    CA_CERTIFICATE_STATUS_INACTIVE, CERTIFICATE_MODE_SNI_ONLY, MAX_CA_CERTIFICATES,
+    MAX_CA_CERTIFICATES_PER_SUBJECT,
+};
+
 // WHICH POLICIES are attached to which target — what a policy target is, how one is
 // resolved against this account's state, and the relation `AttachPolicy`,
 // `DetachPolicy`, `ListAttachedPolicies` and `ListTargetsForPolicy` are four views of —
@@ -3235,10 +3264,10 @@ pub use not_found::{
 // reaches them as `crate::state::<name>`.
 pub mod already_exists;
 pub use already_exists::{
-    existing_certificate_provider_message, existing_command_message, existing_job_message,
-    existing_package_message, existing_policy_message, existing_role_alias_message,
-    existing_thing_group_message, existing_thing_message, existing_thing_type_message,
-    existing_topic_rule_message,
+    existing_certificate_message, existing_certificate_provider_message, existing_command_message,
+    existing_job_message, existing_package_message, existing_policy_message,
+    existing_role_alias_message, existing_thing_group_message, existing_thing_message,
+    existing_thing_type_message, existing_topic_rule_message,
 };
 
 // What an AWS-MANAGED JOB TEMPLATE is — the published catalog `ListManagedJobTemplates`

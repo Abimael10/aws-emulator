@@ -44,6 +44,16 @@ use x509_cert::der::{Decode, DecodePem, Encode};
 use x509_cert::spki::SubjectPublicKeyInfoOwned;
 use x509_cert::Certificate;
 
+/// `RegisterCACertificate` and `DescribeCACertificate`: the CA certificates an account
+/// REGISTERS, which are the other half of this crate's certificate coverage — one case of
+/// that suite offers a certificate this suite's issuance minted as CA material, so the two
+/// are compared against one emulator. The `#[path]` is what keeps it a child of THIS suite
+/// rather than a second suite beside it: this crate's `tests/all.rs` declares the suites
+/// directly under `tests/all/`, and a module of a `#[path]`-declared file resolves next to
+/// that file unless it says otherwise.
+#[path = "device_certificate_issuance/ca_certificate_registry.rs"]
+mod ca_certificate_registry;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.

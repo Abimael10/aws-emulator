@@ -128,6 +128,19 @@ pub fn existing_certificate_provider_message(certificate_provider_name: &str) ->
     format!("Certificate provider [{certificate_provider_name}] already exists for this account")
 }
 
+/// How this service refuses a registration of certificate MATERIAL the account already
+/// holds a certificate for — a `RegisterCACertificate` of a CA certificate that is
+/// registered already.
+///
+/// A certificate is not named by the caller: its identity is its own fingerprint
+/// ([`super::certificate_id`]), so this family states the collision by naming the MEMBER
+/// that identifies the existing record, `certificateId`, parenthesised after the fixed
+/// clause — the same way every certificate refusal names the certificate it is about
+/// ([`super::missing_certificate_message`]).
+pub fn existing_certificate_message(certificate_id: &str) -> String {
+    format!("Certificate already exists (certificateId: {certificate_id})")
+}
+
 /// How this service refuses a `CreatePackage` under a name the catalog already holds.
 ///
 /// This family reports a duplicate REQUEST rather than an existing resource — the create

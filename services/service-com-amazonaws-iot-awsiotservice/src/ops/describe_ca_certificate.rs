@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCACertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCACertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCACertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one record out of this account's CA registry
+//! ([`crate::state::ca_certificates`]) — the registry `RegisterCACertificate` writes —
+//! and reports it as the modelled `CACertificateDescription` beside the registration
+//! configuration that registration named.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCACertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCACertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCACertificate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeCACertificateErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        // A pure read: the record is cloned out as the modelled
+        // `CACertificateDescription`, and an id the registry holds no CA certificate
+        // under is the modelled `ResourceNotFoundException` ("The specified resource does
+        // not exist", HTTP 404), refused with the sentence every reader of a certificate
+        // this service holds none of states — the member the request carried is
+        // `certificateId` here exactly as it is on a device certificate, so the two are
+        // one sentence rather than two.
+        let store = state.lock();
+        let certificate = store.ca_certificates.get(&input.certificate_id).ok_or_else(|| {
+            DescribeCACertificateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::missing_certificate_message(
+                        &input.certificate_id,
+                    )),
+                },
+            )
+        })?;
+
+        // `registrationConfig` is reported OUTSIDE the description, as the modelled
+        // output shape has it, and is absent when the registration named none rather than
+        // an empty configuration the account never configured.
+        Ok(DescribeCACertificateOutput {
+            certificate_description: Some(certificate.description()),
+            registration_config: certificate.registration_config.clone(),
+        })
     }
 }

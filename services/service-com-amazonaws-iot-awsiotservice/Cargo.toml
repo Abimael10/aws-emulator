@@ -129,6 +129,11 @@ service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # An authorizer function's deployment package is a .zip archive, and its handler module is
 # one entry in it.
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# The CA certificates the `RegisterCACertificate` suite registers: a caller's own
+# certificate authority is the input that operation takes, so the suite mints real ones
+# (and real end-entity certificates, to pin what it refuses) with the generator this tree
+# already uses for certificate material.
+rcgen = "0.13"
 
 [lints]
 workspace = true

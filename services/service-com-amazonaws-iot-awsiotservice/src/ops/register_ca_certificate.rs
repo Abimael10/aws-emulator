@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterCACertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterCACertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterCACertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers the CA certificate the request carries in this account's CA registry
+//! ([`crate::state::ca_certificates`]), which is where every later reader of one reads
+//! it: the id and the ARN this call answers are the id and the ARN
+//! `DescribeCACertificate` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +176,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterCACertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterCACertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterCACertificate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RegisterCACertificateErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // `Tag$Key` is `@required` and keys a resource's tag set, so the last value given
+        // for a key is the one the record carries. How MANY tags one request may carry is
+        // bounded, for the reason every other tagged create in this service bounds it:
+        // `TagList` has no modelled maximum, so without the ceiling one request would
+        // choose how large a single record is.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_POLICY_TAGS {
+            return Err(RegisterCACertificateErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "a CA certificate may carry at most {} tags; this request carries {}",
+                        crate::state::MAX_POLICY_TAGS,
+                        requested_tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, Option<String>> = requested_tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let registration = crate::state::CaCertificateRegistration {
+            ca_certificate: input.ca_certificate,
+            verification_certificate: input.verification_certificate,
+            certificate_mode: input.certificate_mode,
+            set_as_active: input.set_as_active,
+            allow_auto_registration: input.allow_auto_registration,
+            registration_config: input.registration_config,
+            tags,
+        };
+
+        // The one write a registration makes, with every rule it follows stated beside
+        // the store it writes ([`crate::state::ComAmazonawsIotAwsiotserviceState::register_ca_certificate`]);
+        // each refusal it answers names the modelled class for what refused it.
+        let registered = state
+            .lock()
+            .register_ca_certificate(
+                &region,
+                ::engine::emulator_account_id(),
+                registration,
+                ::std::time::SystemTime::now(),
+            )
+            .map_err(|refusal| -> Self::Error {
+                match refusal {
+                    crate::state::CaCertificateRegistrationRefusal::InvalidCertificate(message) => {
+                        RegisterCACertificateErrorModeled::CertificateValidationException(
+                            CertificateValidationException {
+                                message: Some(message),
+                            },
+                        )
+                        .into()
+                    }
+                    crate::state::CaCertificateRegistrationRefusal::InvalidRequest(message) => {
+                        RegisterCACertificateErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: Some(message),
+                            },
+                        )
+                        .into()
+                    }
+                    crate::state::CaCertificateRegistrationRefusal::AlreadyRegistered {
+                        message,
+                        certificate_id,
+                        certificate_arn,
+                    } => RegisterCACertificateErrorModeled::ResourceAlreadyExistsException(
+                        ResourceAlreadyExistsException {
+                            message: Some(message),
+                            resource_id: Some(certificate_id),
+                            resource_arn: Some(certificate_arn),
+                        },
+                    )
+                    .into(),
+                    crate::state::CaCertificateRegistrationRefusal::SubjectLimitExceeded(
+                        message,
+                    )
+                    | crate::state::CaCertificateRegistrationRefusal::RegistryFull(message) => {
+                        RegisterCACertificateErrorModeled::LimitExceededException(
+                            LimitExceededException {
+                                message: Some(message),
+                            },
+                        )
+                        .into()
+                    }
+                }
+            })?;
+
+        // The response is built from the record that was persisted, so what this call
+        // reports and what the next `DescribeCACertificate` reads are one value, not two
+        // that could drift.
+        Ok(RegisterCACertificateOutput {
+            certificate_arn: Some(registered.certificate_arn),
+            certificate_id: Some(registered.certificate_id),
+        })
     }
 }

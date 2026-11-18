@@ -15179,6 +15179,7 @@ dependencies = [
  "ipnet",
  "pkcs1",
  "pkcs8 0.10.2",
+ "rcgen",
  "serde_json",
  "service-com-amazonaws-acm-certificatemanager",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
