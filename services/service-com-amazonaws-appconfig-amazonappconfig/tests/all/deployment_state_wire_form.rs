@@ -24,6 +24,10 @@
 //! `crate::environment_state_wire_form` pins. Each enum is asserted against the form that
 //! enum is served in.
 //!
+//! The table also pins the state `StartDeployment` reports on its OWN 201, which is a
+//! projection of its own: a client that branches on the answer to the call it just made,
+//! before any poll, reads the token from there.
+//!
 //! The tables below span what the rule generalises over: WHICH member of the enum (all
 //! seven, including the ones no operation reaches), which OPERATION serves the document
 //! (`StartDeployment`, `GetDeployment`, `ListDeployments`, `StopDeployment`), and WHAT put
@@ -163,6 +167,9 @@ struct Case {
     /// `GrowthType`, `FinalBakeTimeInMinutes` — as `deployment_wire_fidelity`'s row type.
     row: Row,
     settle: Settle,
+    /// The published wire value `StartDeployment`'s own 201 must carry: the first stage of a
+    /// strategy that paces one, and the terminal value of a strategy that paces none.
+    at_start: &'static str,
     /// The published wire value, written out rather than read from the crate under test.
     expected: &'static str,
 }
@@ -176,6 +183,7 @@ const CASES: &[Case] = &[
         // to monitor, so the start itself answers a completed deployment.
         row: ("no window and no bake", 0, 100.0, "LINEAR", 0),
         settle: Settle::Nothing,
+        at_start: "COMPLETE",
         expected: "COMPLETE",
     },
     Case {
@@ -184,23 +192,29 @@ const CASES: &[Case] = &[
         // transition of its own.
         row: ("the longest rollout the model allows", 1440, 1.0, "LINEAR", 0),
         settle: Settle::Nothing,
+        at_start: "DEPLOYING",
         expected: "DEPLOYING",
     },
     Case {
         // No rollout window but the longest bake: the rollout is over after one interval
         // and the bake then holds the deployment.
+        // The rollout of such a strategy is a stage AppConfig performs after the call, so
+        // the call itself answers the deployment rolling out rather than baking.
         row: ("no window, the longest bake", 0, 100.0, "EXPONENTIAL", 1440),
         settle: Settle::Nothing,
+        at_start: "DEPLOYING",
         expected: "BAKING",
     },
     Case {
         row: ("stopped while still rolling out", 1440, 1.0, "LINEAR", 0),
         settle: Settle::Stop,
+        at_start: "DEPLOYING",
         expected: "ROLLED_BACK",
     },
     Case {
         row: ("reverted after completing", 0, 100.0, "LINEAR", 0),
         settle: Settle::Revert,
+        at_start: "COMPLETE",
         expected: "REVERTED",
     },
 ];
@@ -279,7 +293,34 @@ async fn every_operation_serves_the_published_wire_value_of_a_deployments_state(
             started.status,
             String::from_utf8_lossy(&started.body)
         );
-        let number = member(&started.json(), "DeploymentNumber")
+        // The call's OWN answer, before anything polls: a client that branches on the
+        // deployment it just created reads the state from here, so this projection serves
+        // the published value too.
+        let accepted = started.json();
+        let at_start = member(&accepted, "State")
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_published(
+            case,
+            "StartDeployment",
+            expected_case.at_start,
+            at_start.as_str(),
+        );
+        // And which KIND of member that is follows from the strategy the request named
+        // rather than from a spelling: a strategy declaring a rollout window or a final
+        // bake time leaves AppConfig a stage to perform after the call, so the call answers
+        // the deployment at its first stage; one declaring neither leaves nothing to pace,
+        // and the deployment is over by the time the call answers.
+        let (_, duration, _, _, bake) = expected_case.row;
+        let paces_a_stage = duration > 0 || bake > 0;
+        assert_eq!(
+            matches!(at_start.as_str(), "DEPLOYING" | "BAKING"),
+            paces_a_stage,
+            "case {case:?}: a strategy that paces a stage ({paces_a_stage}) is answered at an \
+             in-flight member and one that paces none at a terminal member, got {at_start:?}"
+        );
+        let number = member(&accepted, "DeploymentNumber")
             .as_i64()
             .unwrap_or_else(|| panic!("case {case:?}: StartDeployment answered no number"));
 
