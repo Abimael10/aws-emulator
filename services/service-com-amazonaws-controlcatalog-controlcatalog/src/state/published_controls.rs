@@ -32,13 +32,17 @@
 //!   Tower publishes for the control, where it publishes one.
 //! * `name` and `description` are the control's PUBLISHED text, worded by the surface
 //!   that publishes the control: Control Tower's own control name and description for a
-//!   control Control Tower publishes (a row carrying a `control_tower_identifier`), and
-//!   the implementing AWS Config managed rule's own title and description for a control
-//!   the catalog publishes under a `CONFIG.…` designator. They are catalog CONTENT, not a
-//!   summary of the row written here: `Description` is "[a] description of the control,
-//!   as it may appear in the console" (`smithy_query(query="shape",
-//!   shape="ControlSummary")`), and the catalog is account- and Region-independent, so
-//!   one ARN carries one `Name` and one `Description` for every caller and every run.
+//!   control Control Tower publishes (a row carrying a `control_tower_identifier`), the
+//!   implementing AWS Config managed rule's own title and description for a control
+//!   the catalog publishes under a `CONFIG.…` designator, and the sentence the catalog
+//!   publishes for a Security Hub-implemented control under its `SH.…` designator. They
+//!   are catalog CONTENT reproduced VERBATIM, never re-worded, re-ordered, abridged or
+//!   extended here — not a paraphrase of the implementing service's current
+//!   documentation prose, and not a summary of the row written here: `Description` is
+//!   "[a] description of the control, as it may appear in the console"
+//!   (`smithy_query(query="shape", shape="ControlSummary")`), and the catalog is account-
+//!   and Region-independent, so one ARN carries one `Name` and one `Description` for
+//!   every caller and every run.
 //! * the instant the catalog publishes as a control's release time (`CreateTime`) is
 //!   recorded with its published identity, in [`PUBLISHED_CATALOG_RECORDS`], because like
 //!   the opaque identifier it is a fact the catalog assigns and nothing in the row or the
@@ -995,8 +999,10 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "securityhub-iam-4",
         name: "IAM root user access key should not exist",
-        description: "Checks whether the root user holds an access key, and reports the \
-                      finding in Security Hub.",
+        // The published sentence the catalog serves for this control, reproduced as the
+        // catalog publishes it rather than summarised here.
+        description: "This AWS control checks whether the root user access key is \
+                      available.",
         behavior: DETECTIVE,
         severity: CRITICAL,
         implementation_type: SECURITY_HUB_CONTROL,
@@ -1024,8 +1030,9 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "securityhub-iam-5",
         name: "MFA should be enabled for all IAM users that have a console password",
-        description: "Checks whether every identity with a console password also has \
-                      multi-factor authentication enabled.",
+        description: "This AWS control checks whether AWS Multi-Factor Authentication \
+                      (MFA) is enabled for all AWS Identity and Access Management (IAM) \
+                      users that use a console password.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: SECURITY_HUB_CONTROL,
@@ -1907,11 +1914,10 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         // checks, followed by the condition under which it fails. The check is on the
         // ACCOUNT-level block public access settings, which is also why the control
         // governs every S3 resource type those settings restrict access to.
-        description: "This control checks whether the following Amazon S3 block public \
-                      access settings are configured at the account level: \
-                      ignorePublicAcls, blockPublicPolicy, blockPublicAcls, and \
-                      restrictPublicBuckets. The control fails if one or more of the \
-                      account-level block public access settings is set to false.",
+        description: "This control checks whether the preceding Amazon S3 block public \
+                      access settings are configured at the account level for an S3 \
+                      general purpose bucket. The control fails if one or more of the \
+                      block public access settings are set to false.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: SECURITY_HUB_CONTROL,
@@ -1960,8 +1966,10 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "securityhub-ec2-2",
         name: "VPC default security groups should not allow inbound or outbound traffic",
-        description: "This AWS control checks whether the default security group of a \
-                      VPC allows inbound or outbound traffic.",
+        // The catalog's published sentence for this control, which states the condition
+        // the control requires ("does not allow"), not its negation.
+        description: "This AWS control checks that the default security group of a VPC \
+                      does not allow inbound or outbound traffic.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: SECURITY_HUB_CONTROL,
@@ -1980,8 +1988,8 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         slug: "securityhub-rds-2",
         name: "RDS DB Instances should prohibit public access, as determined by the \
                PubliclyAccessible configuration",
-        description: "This AWS control checks whether Amazon RDS instances are publicly \
-                      accessible by evaluating the PubliclyAccessible field in the \
+        description: "This AWS control checks whether RDS instances are publicly \
+                      accessible by evaluating the publiclyAccessible field in the \
                       instance configuration item.",
         behavior: DETECTIVE,
         severity: CRITICAL,
@@ -2001,7 +2009,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         slug: "securityhub-rds-3",
         name: "RDS DB instances should have encryption at-rest enabled",
         description: "This AWS control checks whether storage encryption is enabled for \
-                      your Amazon RDS DB instances.",
+                      your RDS DB instances.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: SECURITY_HUB_CONTROL,
@@ -2020,11 +2028,11 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         slug: "securityhub-efs-1",
         name: "Elastic File System should be configured to encrypt file data at-rest \
                using AWS KMS",
-        description: "This AWS control checks whether Amazon Elastic File System is \
-                      configured to encrypt file data using AWS KMS. The check fails if \
-                      the encrypted key is set to false on DescribeFileSystems or if the \
-                      KmsKeyId key on DescribeFileSystems doesn't match the KmsKeyId \
-                      parameter for efs-encrypted-check.",
+        description: "This AWS control checks whether Amazon Elastic File System (Amazon \
+                      EFS) is configured to encrypt the file data using AWS Key \
+                      Management Service (AWS KMS). The check will fail if the encrypted \
+                      key is set to false on DescribeFileSystems or if the KmsKeyId key \
+                      on DescribeFileSystems does not match the KmsKeyId parameter.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: SECURITY_HUB_CONTROL,
@@ -2065,12 +2073,12 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         slug: "securityhub-iam-1",
         name: "IAM policies should not allow full \"*\" administrative privileges",
         description: "This AWS control checks whether the default version of AWS \
-                      Identity and Access Management policies (also known as customer \
-                      managed policies) do not have administrator access with a \
+                      Identity and Access Management (IAM) policies (also known as \
+                      customer managed policies) do not have administrator access with a \
                       statement that has \"Effect\": \"Allow\" with \"Action\": \"*\" \
-                      over \"Resource\": \"*\". It only checks for the customer managed \
-                      policies that you created, but does not check for full access to \
-                      individual services, such as \"S3:*\".",
+                      over \"Resource\": \"*\". It only checks for the Customer Managed \
+                      Policies that you created, but not inline and AWS Managed \
+                      Policies.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: SECURITY_HUB_CONTROL,
@@ -2112,10 +2120,9 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "securityhub-kms-4",
         name: "AWS KMS key rotation should be enabled",
-        description: "This AWS control checks whether automatic key rotation is enabled \
-                      for each customer managed AWS KMS key. The control fails if \
-                      automatic key rotation of the KMS key isn't enabled. This control \
-                      doesn't check KMS keys with imported key material.",
+        description: "This AWS control checks that key rotation is enabled for each AWS \
+                      KMS key. It does not check KMS keys that have imported key \
+                      material.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: SECURITY_HUB_CONTROL,
@@ -2156,9 +2163,10 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         slug: "securityhub-config-1",
         name: "AWS Config should be enabled and use the service-linked role for resource \
                recording",
-        description: "This AWS control checks whether AWS Config is enabled in your AWS \
-                      account and region and records resource configurations with the \
-                      AWS Config service-linked role.",
+        description: "This control checks whether AWS Config is enabled in your account \
+                      in the current AWS Region, records all resources that correspond \
+                      to controls that are enabled in the current Region, and uses the \
+                      service-linked AWS Config role.",
         behavior: DETECTIVE,
         severity: CRITICAL,
         implementation_type: SECURITY_HUB_CONTROL,

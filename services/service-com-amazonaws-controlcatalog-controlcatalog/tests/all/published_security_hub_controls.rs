@@ -62,9 +62,9 @@ const SECURITY_HUB_PREFIX: &str = "SH.";
 
 /// Every Security Hub control whose WHOLE published record this catalog records: its
 /// published identity (identifier and release instant) together with the published text and
-/// classification served with it. A control whose identity alone is recorded, its published
-/// text still being the subject of its own open report, is left to that report; its identity
-/// is covered by `all/published_catalog_identity.rs`.
+/// classification served with it. A control the catalog records no published identifier for
+/// is served under a minted one and is left out of this table; its identity is covered by
+/// `all/published_catalog_identity.rs`.
 const PUBLISHED_SECURITY_HUB_CONTROLS: &[PublishedSecurityHubControl] = &[
     PublishedSecurityHubControl {
         designator: "SH.CloudTrail.4",
@@ -83,8 +83,8 @@ const PUBLISHED_SECURITY_HUB_CONTROLS: &[PublishedSecurityHubControl] = &[
         identifier: "dowsaumj3n874siszx3j94m9n",
         implementation_identifier: "EC2.2",
         name: "VPC default security groups should not allow inbound or outbound traffic",
-        description: "This AWS control checks whether the default security group of a \
-                      VPC allows inbound or outbound traffic.",
+        description: "This AWS control checks that the default security group of a VPC \
+                      does not allow inbound or outbound traffic.",
         severity: "HIGH",
         parameter_requirement_summary: "NONE",
         release_time: 1_669_593_600,
@@ -96,11 +96,11 @@ const PUBLISHED_SECURITY_HUB_CONTROLS: &[PublishedSecurityHubControl] = &[
         implementation_identifier: "EFS.1",
         name: "Elastic File System should be configured to encrypt file data at-rest \
                using AWS KMS",
-        description: "This AWS control checks whether Amazon Elastic File System is \
-                      configured to encrypt file data using AWS KMS. The check fails if \
-                      the encrypted key is set to false on DescribeFileSystems or if the \
-                      KmsKeyId key on DescribeFileSystems doesn't match the KmsKeyId \
-                      parameter for efs-encrypted-check.",
+        description: "This AWS control checks whether Amazon Elastic File System (Amazon \
+                      EFS) is configured to encrypt the file data using AWS Key \
+                      Management Service (AWS KMS). The check will fail if the encrypted \
+                      key is set to false on DescribeFileSystems or if the KmsKeyId key \
+                      on DescribeFileSystems does not match the KmsKeyId parameter.",
         severity: "MEDIUM",
         parameter_requirement_summary: "NONE",
         release_time: 1_669_593_600,
@@ -124,12 +124,12 @@ const PUBLISHED_SECURITY_HUB_CONTROLS: &[PublishedSecurityHubControl] = &[
         implementation_identifier: "IAM.1",
         name: "IAM policies should not allow full \"*\" administrative privileges",
         description: "This AWS control checks whether the default version of AWS \
-                      Identity and Access Management policies (also known as customer \
-                      managed policies) do not have administrator access with a \
+                      Identity and Access Management (IAM) policies (also known as \
+                      customer managed policies) do not have administrator access with a \
                       statement that has \"Effect\": \"Allow\" with \"Action\": \"*\" \
-                      over \"Resource\": \"*\". It only checks for the customer managed \
-                      policies that you created, but does not check for full access to \
-                      individual services, such as \"S3:*\".",
+                      over \"Resource\": \"*\". It only checks for the Customer Managed \
+                      Policies that you created, but not inline and AWS Managed \
+                      Policies.",
         severity: "HIGH",
         parameter_requirement_summary: "NONE",
         release_time: 1_669_593_600,
@@ -147,14 +147,41 @@ const PUBLISHED_SECURITY_HUB_CONTROLS: &[PublishedSecurityHubControl] = &[
         release_time: 1_669_593_600,
         governed_resources: &["AWS::IAM::User"],
     },
+    // The control over the account's own root user credentials, which no available
+    // resource type represents — the second row whose governed-resource list is empty.
+    PublishedSecurityHubControl {
+        designator: "SH.IAM.4",
+        identifier: "ezfflnh8xgshxb78grtt5sjc5",
+        implementation_identifier: "IAM.4",
+        name: "IAM root user access key should not exist",
+        description: "This AWS control checks whether the root user access key is \
+                      available.",
+        severity: "CRITICAL",
+        parameter_requirement_summary: "NONE",
+        release_time: 1_669_593_600,
+        governed_resources: &[],
+    },
+    PublishedSecurityHubControl {
+        designator: "SH.IAM.5",
+        identifier: "6g3gbim493yofkc9eg6vvnahm",
+        implementation_identifier: "IAM.5",
+        name: "MFA should be enabled for all IAM users that have a console password",
+        description: "This AWS control checks whether AWS Multi-Factor Authentication \
+                      (MFA) is enabled for all AWS Identity and Access Management (IAM) \
+                      users that use a console password.",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "NONE",
+        release_time: 1_669_593_600,
+        governed_resources: &["AWS::IAM::User"],
+    },
     PublishedSecurityHubControl {
         designator: "SH.RDS.2",
         identifier: "bbns1svmi60sz11i658ot4amf",
         implementation_identifier: "RDS.2",
         name: "RDS DB Instances should prohibit public access, as determined by the \
                PubliclyAccessible configuration",
-        description: "This AWS control checks whether Amazon RDS instances are publicly \
-                      accessible by evaluating the PubliclyAccessible field in the \
+        description: "This AWS control checks whether RDS instances are publicly \
+                      accessible by evaluating the publiclyAccessible field in the \
                       instance configuration item.",
         severity: "CRITICAL",
         parameter_requirement_summary: "NONE",
@@ -167,7 +194,7 @@ const PUBLISHED_SECURITY_HUB_CONTROLS: &[PublishedSecurityHubControl] = &[
         implementation_identifier: "RDS.3",
         name: "RDS DB instances should have encryption at-rest enabled",
         description: "This AWS control checks whether storage encryption is enabled for \
-                      your Amazon RDS DB instances.",
+                      your RDS DB instances.",
         severity: "MEDIUM",
         parameter_requirement_summary: "NONE",
         release_time: 1_669_593_600,
@@ -181,11 +208,10 @@ const PUBLISHED_SECURITY_HUB_CONTROLS: &[PublishedSecurityHubControl] = &[
         identifier: "alm61aw5oxpgfgh3bhmish87u",
         implementation_identifier: "S3.1",
         name: "S3 general purpose buckets should have block public access settings enabled",
-        description: "This control checks whether the following Amazon S3 block public \
-                      access settings are configured at the account level: \
-                      ignorePublicAcls, blockPublicPolicy, blockPublicAcls, and \
-                      restrictPublicBuckets. The control fails if one or more of the \
-                      account-level block public access settings is set to false.",
+        description: "This control checks whether the preceding Amazon S3 block public \
+                      access settings are configured at the account level for an S3 \
+                      general purpose bucket. The control fails if one or more of the \
+                      block public access settings are set to false.",
         severity: "MEDIUM",
         parameter_requirement_summary: "NONE",
         release_time: 1_669_593_600,
@@ -216,10 +242,9 @@ const PUBLISHED_SECURITY_HUB_CONTROLS: &[PublishedSecurityHubControl] = &[
         identifier: "esv514s4zvnxdunuijbgerpn3",
         implementation_identifier: "KMS.4",
         name: "AWS KMS key rotation should be enabled",
-        description: "This AWS control checks whether automatic key rotation is enabled \
-                      for each customer managed AWS KMS key. The control fails if \
-                      automatic key rotation of the KMS key isn't enabled. This control \
-                      doesn't check KMS keys with imported key material.",
+        description: "This AWS control checks that key rotation is enabled for each AWS \
+                      KMS key. It does not check KMS keys that have imported key \
+                      material.",
         severity: "MEDIUM",
         parameter_requirement_summary: "NONE",
         release_time: 1_701_043_200,
@@ -234,9 +259,10 @@ const PUBLISHED_SECURITY_HUB_CONTROLS: &[PublishedSecurityHubControl] = &[
         implementation_identifier: "Config.1",
         name: "AWS Config should be enabled and use the service-linked role for resource \
                recording",
-        description: "This AWS control checks whether AWS Config is enabled in your AWS \
-                      account and region and records resource configurations with the \
-                      AWS Config service-linked role.",
+        description: "This control checks whether AWS Config is enabled in your account \
+                      in the current AWS Region, records all resources that correspond \
+                      to controls that are enabled in the current Region, and uses the \
+                      service-linked AWS Config role.",
         severity: "CRITICAL",
         parameter_requirement_summary: "OPTIONAL",
         release_time: 1_779_840_000,
@@ -609,5 +635,117 @@ async fn the_published_designator_identifies_the_control_it_is_published_for() {
         "case designator forms: the table must span both published forms for the rule to \
          be tested, saw {designators_matching_the_id} of the id form and \
          {designators_of_the_catalogs_own_form} of the catalog's own form"
+    );
+}
+
+/// A control's `Description` is the catalog's own published sentence for that control,
+/// served byte for byte.
+///
+/// `Description` is "[a] description of the control, as it may appear in the console"
+/// (`smithy_query(query="shape", shape="ControlSummary")`) — catalog CONTENT owned by
+/// Amazon Web Services, so what a client reads is the published text character for
+/// character: never re-worded, re-ordered, abridged, or extended with the implementing
+/// surface's own vocabulary (a backing rule identifier, an extra failure condition, a
+/// service-name expansion or contraction, a re-cased configuration-item field). Because
+/// the catalog is account- and Region-independent and read-only, the same text comes back
+/// through `ListControls` and `GetControl`, at every page size, through the type-filtered
+/// listing, and in a second session over its own engine.
+///
+/// The rows are the whole table above rather than one control: they span the text forms
+/// the rule generalises over — a single sentence, several sentences, a sentence carrying
+/// quoted JSON fragments, and one carrying a parenthesised expansion of a service name.
+#[tokio::test]
+async fn a_controls_published_description_is_served_byte_for_byte() {
+    let emulator = Emulator::new();
+
+    for body in requests() {
+        for page_size in PAGE_SIZES {
+            let listed = listed_by_arn(&emulator, page_size, &body).await;
+            for row in PUBLISHED_SECURITY_HUB_CONTROLS {
+                let arn = catalog_arn(row.identifier);
+                let case = format!("{} maxResults={page_size:?} {body}", row.designator);
+                let served = listed
+                    .get(&arn)
+                    .unwrap_or_else(|| panic!("case {case}: the catalog must publish {arn}"));
+                assert_eq!(
+                    served["Description"].as_str(),
+                    Some(row.description),
+                    "case {case}: expected the catalog's published Description {:?}, got \
+                     {:?}",
+                    row.description,
+                    served["Description"]
+                );
+            }
+        }
+    }
+
+    // The rule holds for the WHOLE catalogue, not only the rows above: for every control
+    // the catalog publishes, the text `ListControls` serves is the text `GetControl`
+    // serves, and a second session over its own engine publishes it again unchanged — so
+    // no part of the text is derived from the request, the session or the run.
+    let second_session = Emulator::new();
+    let listed = listed_by_arn(&emulator, None, "{}").await;
+    let in_the_second_session = listed_by_arn(&second_session, Some(1), "{}").await;
+    for (arn, control) in &listed {
+        let published = control["Description"].as_str().unwrap_or_else(|| {
+            panic!(
+                "case {arn}: a control carries its required Description, got {:?}",
+                control["Description"]
+            )
+        });
+        assert!(
+            !published.trim().is_empty(),
+            "case {arn}: expected the catalog's published description, got {published:?}"
+        );
+        let read_back = emulator
+            .ok("/get-control", &format!(r#"{{"ControlArn":"{arn}"}}"#))
+            .await;
+        assert_eq!(
+            read_back["Description"].as_str(),
+            Some(published),
+            "case {arn}: GetControl must report the published description {published:?}, \
+             got {:?}",
+            read_back["Description"]
+        );
+        let elsewhere = in_the_second_session.get(arn).unwrap_or_else(|| {
+            panic!("case {arn}: every session must publish this control")
+        });
+        assert_eq!(
+            elsewhere["Description"].as_str(),
+            Some(published),
+            "case {arn}: a second session must publish the same description \
+             {published:?}, got {:?}",
+            elsewhere["Description"]
+        );
+    }
+
+    // The table spans the published text forms the rule generalises over, so no case
+    // above is read as evidence for a narrower rule than the one under test.
+    let sentences = |description: &str| description.matches(". ").count() + 1;
+    assert!(
+        PUBLISHED_SECURITY_HUB_CONTROLS
+            .iter()
+            .any(|row| sentences(row.description) == 1),
+        "case text form: the table must span a one-sentence published description"
+    );
+    assert!(
+        PUBLISHED_SECURITY_HUB_CONTROLS
+            .iter()
+            .any(|row| sentences(row.description) > 1),
+        "case text form: the table must span a multi-sentence published description"
+    );
+    assert!(
+        PUBLISHED_SECURITY_HUB_CONTROLS
+            .iter()
+            .any(|row| row.description.contains('"')),
+        "case text form: the table must span a published description carrying quoted \
+         JSON fragments"
+    );
+    assert!(
+        PUBLISHED_SECURITY_HUB_CONTROLS
+            .iter()
+            .any(|row| row.description.contains('(')),
+        "case text form: the table must span a published description carrying a \
+         parenthesised service-name expansion"
     );
 }
