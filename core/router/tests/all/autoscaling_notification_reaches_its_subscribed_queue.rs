@@ -55,7 +55,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// One form-wire (`awsQuery` / `ec2Query`) call against the service whose signing name is
 /// `signing_name`, which must answer 200.
-async fn form_call(
+///
+/// `pub(crate)` because the sibling suite
+/// [`crate::asg_notification_configurations_reach_only_their_topics`] drives the same four
+/// services over the same wires: a second copy of this plumbing would drift from this one.
+pub(crate) async fn form_call(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -109,7 +113,7 @@ async fn form_call_answering(
 }
 
 /// One Auto Scaling call that must answer 200.
-async fn autoscaling(
+pub(crate) async fn autoscaling(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -129,7 +133,7 @@ async fn autoscaling(
 }
 
 /// One Amazon EC2 call that must answer 200.
-async fn ec2(
+pub(crate) async fn ec2(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -140,7 +144,7 @@ async fn ec2(
 }
 
 /// One Amazon SQS call (`awsJson1_0`, `AmazonSQS.<Operation>`) that must answer 200.
-async fn sqs(
+pub(crate) async fn sqs(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,

@@ -255,22 +255,55 @@ impl Started {
         request
     }
 
-    /// One CloudFormation call over its awsQuery wire.
-    pub(crate) fn cloudformation(&self, action: &str, members: &[(&str, &str)]) -> (u16, String) {
-        let mut body = format!("Action={action}&Version=2010-05-15");
-        for (key, value) in members {
+    /// One form-wire (`awsQuery` / `ec2Query`) call against the service whose signing name
+    /// is `signing_name`, answered with its status and body text.
+    ///
+    /// The form-body assembly lives here, once, for the reason `query_wire` holds the
+    /// encoder: a leg that writes its own drifts from the others.
+    pub(crate) fn form_call(
+        &self,
+        signing_name: &str,
+        version: &str,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> (u16, String) {
+        let mut body = format!("Action={action}&Version={version}");
+        for (key, value) in params {
             body.push('&');
             body.push_str(&form_encode(key));
             body.push('=');
             body.push_str(&form_encode(value));
         }
         self.call(
-            "cloudformation",
+            signing_name,
             "POST",
             "/",
             &[("content-type", "application/x-www-form-urlencoded")],
             body.into_bytes(),
         )
+    }
+
+    /// One `X-Amz-Target` RPC call against the service whose signing name is
+    /// `signing_name`, answered with its status and body text.
+    pub(crate) fn rpc(
+        &self,
+        signing_name: &str,
+        target: &str,
+        content_type: &str,
+        body: &Value,
+    ) -> (u16, String) {
+        self.call(
+            signing_name,
+            "POST",
+            "/",
+            &[("content-type", content_type), ("x-amz-target", target)],
+            body.to_string().into_bytes(),
+        )
+    }
+
+    /// One CloudFormation call over its awsQuery wire.
+    pub(crate) fn cloudformation(&self, action: &str, members: &[(&str, &str)]) -> (u16, String) {
+        self.form_call("cloudformation", "2010-05-15", action, members)
     }
 
     /// One call against S3's REST surface, path-style.
@@ -574,4 +607,10 @@ fn a_deployed_pipeline_runs_on_the_emulator_a_client_starts() {
     // onwards, whose notification configuration carries a key-name `Filter`.
     crate::s3_notification_converts_on_a_started_emulator::
         an_armed_notification_converts_only_what_its_literal_filter_admits(&emulator);
+
+    // The third leg, on this same started emulator: an Auto Scaling group's own Amazon SNS
+    // notification configurations, which publish through the same in-process callback this
+    // binary makes every cross-service call over.
+    crate::asg_notifications_on_a_started_emulator::
+        an_asg_notification_reaches_its_subscribed_queue(&emulator);
 }
