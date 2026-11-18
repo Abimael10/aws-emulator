@@ -1176,24 +1176,91 @@ impl ScopingPolicies {
     ///
     /// The ONE reading of a resolved scope, so this service's gate and every other service
     /// that decides a request signed with such a credential cannot cap one differently.
+    ///
+    /// For a gate that asks about SEVERAL resources of one request, ask through
+    /// [`Self::prepare`] instead: this reading parses the scope's documents each time it is
+    /// called, and a request addressing many resources would pay that parse per resource.
     #[must_use]
     pub fn decision(
         &self,
         request: &::service_common::iam_authorization::Request<'_>,
     ) -> ::service_common::iam_authorization::Decision {
-        use ::service_common::iam_authorization::{identity_decision, Decision};
+        self.prepare().decision(request)
+    }
 
-        let stated = identity_decision(&self.documents, request);
-        // A scope holding no document caps nothing — unless the mint it came from vends its
-        // permissions through session policies alone, where passing none left the credential
-        // with no permissions at all ([`SessionPolicies::none_means_no_permissions`]), which
-        // is an absence of grant rather than a deny.
-        let caps_nothing =
-            (self.documents.is_empty() && !self.none_means_no_permissions) || self.unreadable;
-        if stated != Decision::Denied && caps_nothing {
+    /// This scope with its documents PARSED ONCE, for a gate that reads it more than once
+    /// per request — the form [`::service_common::iam_authorization::prepare_documents`]
+    /// exists for.
+    #[must_use]
+    pub fn prepare(&self) -> PreparedScopingPolicies {
+        PreparedScopingPolicies {
+            documents: ::service_common::iam_authorization::prepare_documents(&self.documents),
+            caps_nothing: self.caps_nothing(),
+        }
+    }
+
+    /// Whether this scope caps NOTHING, so every reading of it allows the request: a scope
+    /// holding no document — unless the mint it came from vends its permissions through
+    /// session policies alone, where passing none left the credential with no permissions at
+    /// all ([`SessionPolicies::none_means_no_permissions`]), which is an absence of grant
+    /// rather than a deny — and a scope naming a managed session policy whose document this
+    /// emulator does not hold, where refusing on evidence it does not have would deny access
+    /// AWS permits ([`Self::unreadable`]).
+    #[must_use]
+    pub fn caps_nothing(&self) -> bool {
+        (self.documents.is_empty() && !self.none_means_no_permissions) || self.unreadable
+    }
+}
+
+/// A resolved scope whose documents are parsed once, for the gate that reads it several
+/// times while deciding ONE request — once per resource the request addresses.
+///
+/// Both readings a gate needs, in the one place the unprepared
+/// [`ScopingPolicies::decision`] states them, so neither can drift from it: what the scope
+/// says about a request on a NAMED resource ([`Self::decision`]), and whether it allows an
+/// action on any resource at all ([`Self::may_allow_action`]), which is the weaker question
+/// asked where the resource a statement must cover is not known.
+#[derive(Debug, Clone, Default)]
+pub struct PreparedScopingPolicies {
+    /// Every scoping document that could be read, parsed, in the order the mint named them.
+    documents: Vec<::service_common::iam_authorization::PreparedDocument>,
+    /// Carried over from [`ScopingPolicies::caps_nothing`].
+    caps_nothing: bool,
+}
+
+impl PreparedScopingPolicies {
+    /// What this scope says about one request — [`ScopingPolicies::decision`], over the
+    /// documents already parsed.
+    #[must_use]
+    pub fn decision(
+        &self,
+        request: &::service_common::iam_authorization::Request<'_>,
+    ) -> ::service_common::iam_authorization::Decision {
+        use ::service_common::iam_authorization::{identity_decision_prepared, Decision};
+
+        let stated = identity_decision_prepared(&self.documents, request);
+        if stated != Decision::Denied && self.caps_nothing {
             return Decision::Allowed;
         }
         stated
+    }
+
+    /// Whether this scope allows `action` on ANY resource: the weaker question a gate asks
+    /// for a request whose resource it could not read, where a statement scoped to resource
+    /// ARNs may well cover whatever the request addresses
+    /// ([`::service_common::iam_authorization::identity_may_allow_action`]).
+    ///
+    /// A scope that caps nothing allows it, for the reason
+    /// [`ScopingPolicies::caps_nothing`] states; every other scope allows it only by stating
+    /// an `Allow` of the action, so an EMPTY scope on a credential that draws its
+    /// permissions from its session policies alone allows nothing.
+    #[must_use]
+    pub fn may_allow_action(&self, action: &str) -> bool {
+        self.caps_nothing
+            || ::service_common::iam_authorization::identity_may_allow_action(
+                &self.documents,
+                action,
+            )
     }
 }
 

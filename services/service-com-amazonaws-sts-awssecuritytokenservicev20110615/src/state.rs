@@ -189,7 +189,7 @@ pub enum SessionKind {
 /// because a session is this service's: [`Session::policies`] is what a mint records, and
 /// [`Caller::session_policies`] is what the credential presented by a later request carries.
 pub use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::{
-    session_scoping_documents, ScopingPolicies, SessionPolicies,
+    session_scoping_documents, PreparedScopingPolicies, ScopingPolicies, SessionPolicies,
 };
 
 /// One minted session, keyed in [`ComAmazonawsStsAwssecuritytokenservicev20110615State::sessions`]
