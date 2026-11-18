@@ -677,6 +677,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group.launch_configuration_name = None;
             group.launch_template = None;
         }
+        // An update that moved the group to another launch source moved what its
+        // attribute-based selection comes to, so it is resolved again HERE, once, exactly as
+        // the create resolves it ([`crate::state::instance_requirements`]) — and comes to
+        // nothing for a group no longer launching from a mixed instances policy.
+        group.requirements_instance_type =
+            crate::state::instance_requirements::policy_requirements_type(
+                group.mixed_instances_policy.as_ref(),
+            );
         if let Some(value) = input.default_cooldown {
             group.default_cooldown = value;
         }

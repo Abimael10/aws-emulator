@@ -805,6 +805,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region: region.clone(),
             launch_configuration_name: input.launch_configuration_name,
             launch_template,
+            // What the group's attribute-based launch source selected, resolved ONCE here,
+            // as part of the configuration: "Amazon EC2 Auto Scaling will select instance
+            // types with the provided requirements"
+            // (`LaunchTemplateOverrides$InstanceRequirements`), so the selection belongs to
+            // the configuration rather than to each later capacity change
+            // ([`crate::state::instance_requirements`]).
+            requirements_instance_type: crate::state::instance_requirements::policy_requirements_type(
+                mixed_instances_policy.as_ref(),
+            ),
             mixed_instances_policy,
             min_size: input.min_size,
             max_size: input.max_size,

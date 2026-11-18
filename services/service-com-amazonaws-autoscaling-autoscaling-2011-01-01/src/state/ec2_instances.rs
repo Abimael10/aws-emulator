@@ -62,6 +62,15 @@ pub struct LaunchRequest<'a> {
     pub launch_template: Option<&'a LaunchTemplateSpecification>,
     /// The mixed instances policy the group launches from, when it has one.
     pub mixed_instances_policy: Option<&'a MixedInstancesPolicy>,
+    /// The instance type the launch SOURCE states, where it states one: the type an override
+    /// names, or the one its `InstanceRequirements` selected when the group was configured
+    /// ([`super::StoredGroup::launch_instance_type`]). `None` leaves the type to the launch
+    /// template, which is Amazon EC2's own record.
+    pub selected_instance_type: Option<&'a str>,
+    /// Whether that source chooses its instance type by ATTRIBUTES
+    /// ([`super::instance_requirements::selects_by_requirements`]), so that a source with no
+    /// `selected_instance_type` has nothing it may launch at all.
+    pub selects_by_requirements: bool,
     /// The group's tags; the ones marked `PropagateAtLaunch` go on the instances.
     pub tags: &'a [Tag],
 }
@@ -563,6 +572,43 @@ pub fn held<Eng: Send + Sync + 'static>(
         .collect()
 }
 
+/// Which of `instance_ids` the account's own Amazon EC2 store NO LONGER RUNS: the ones
+/// whose record is on its way to `terminated` or already there, and the ones Amazon EC2
+/// holds no record of at all.
+///
+/// A consumer of an instance it did not launch itself — a group that holds one — reads
+/// this to learn that the instance has gone away under it, however it went: terminated by
+/// a caller of Amazon EC2's own API, or no longer held at all.
+///
+/// `None` on an engine carrying no Amazon EC2 store: whether an instance still runs is a
+/// fact of the account's state, so with no state to read there is no evidence either way
+/// and the caller leaves its instances exactly as they are. Amazon EC2's own clock-owed
+/// moves are materialised through EC2's own pass first, for the reason [`held`] states.
+/// EC2's store lock is taken for that one pass and released before this returns.
+pub fn gone<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    instance_ids: &[String],
+) -> Option<Vec<String>> {
+    let state = ec2::service_state(engine)?;
+    if instance_ids.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut store = state.lock();
+    store.materialize_due_transitions();
+    Some(
+        instance_ids
+            .iter()
+            .filter(|instance_id| {
+                store
+                    .instances
+                    .get(instance_id.as_str())
+                    .is_none_or(|record| record.state.is_terminating())
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
 /// Record in the account's own Amazon EC2 store that the instances `instance_ids` names are
 /// now instances of the group `group_name`: the tag Amazon EC2 Auto Scaling itself puts on
 /// every instance of a group ([`GROUP_NAME_TAG`]).
@@ -800,8 +846,15 @@ fn launch_parameters(
             .and_then(|data| data.credit_specification.as_ref())
             .and_then(|specification| ec2::cpu_credits_value(&specification.cpu_credits)),
         image_id,
-        instance_type: override_entry
-            .and_then(|entry| entry.instance_type.clone())
+        // The type the launch source states: the one an override names, or the one its
+        // `InstanceRequirements` selected when the group was configured — resolved by the
+        // caller through the one reading of an override's launch type this crate has
+        // ([`super::instance_requirements`]), so the type launched here is the type the
+        // group's capacity arithmetic counted it as. A launch source that states none leaves
+        // the type to the launch-template version.
+        instance_type: request
+            .selected_instance_type
+            .map(str::to_string)
             .or_else(|| data.as_ref().and_then(|data| data.instance_type.clone())),
         key_name: data.as_ref().and_then(|data| data.key_name.clone()),
         // The security groups the version declares, wherever it declares them: a version that
@@ -1247,6 +1300,15 @@ pub fn launch_failure_reason<Eng: Send + Sync + 'static>(
     engine: &Eng,
     request: &LaunchRequest<'_>,
 ) -> Option<String> {
+    // A launch source that chooses its instance type by ATTRIBUTES can launch only a type
+    // those attributes admit: "if you specify `InstanceRequirements`, you can't specify
+    // `InstanceType`" (`LaunchTemplateOverrides$InstanceRequirements`), so one whose
+    // requirements no offered instance type satisfies has nothing to launch at all — and the
+    // launch records that instead of placing an instance of the type its launch template
+    // happens to name, which those requirements exclude.
+    if request.selects_by_requirements && request.selected_instance_type.is_none() {
+        return Some(unsatisfiable_requirements_message());
+    }
     // The IAM instance profile the instances would run as, resolved against the account's
     // own IAM records: an instance cannot be launched under a profile the account does not
     // hold. Nothing of this service is locked here, and resolving it reads Amazon EC2's
@@ -1255,6 +1317,21 @@ pub fn launch_failure_reason<Eng: Send + Sync + 'static>(
         engine,
         request.launch_template,
         request.mixed_instances_policy,
+    )
+}
+
+/// What a launch whose source's `InstanceRequirements` admit no offered instance type
+/// records.
+///
+/// Ends the way every launch failure of this crate does
+/// ([`super::LAUNCH_FAILED_SENTENCE`]), and names no requirement of the request: what the
+/// client can act on is that the attributes it stated match nothing it could be given.
+#[must_use]
+pub fn unsatisfiable_requirements_message() -> String {
+    format!(
+        "No instance type offered to this account matches the instance requirements of the Auto \
+         Scaling group's launch source, so no instance was launched. {}",
+        super::LAUNCH_FAILED_SENTENCE
     )
 }
 

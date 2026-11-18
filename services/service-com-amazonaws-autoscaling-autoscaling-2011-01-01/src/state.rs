@@ -21,8 +21,9 @@
 //! * a capacity change that asked to honour the group's cooldown waits for that
 //!   cooldown to elapse before it is applied (`HonorCooldown`);
 //! * a running instance refresh replaces one instance of its group per
-//!   [`INSTANCE_REFRESH_REPLACEMENT`] and succeeds once it has replaced them all
-//!   ([`StoredInstanceRefresh`]);
+//!   [`INSTANCE_REFRESH_REPLACEMENT`], waits the warmup it runs under after each
+//!   replacement comes into service ([`StoredInstanceRefresh::instance_warmup`]) and
+//!   succeeds once it has replaced them all ([`StoredInstanceRefresh`]);
 //! * a refresh a caller cancelled is reported `Cancelling` and becomes `Cancelled`
 //!   ([`INSTANCE_REFRESH_CANCELLATION`]);
 //! * a refresh a caller rolled back replaces its OWN replacements back, one per
@@ -239,6 +240,16 @@ pub use attached_instances::{attach_description, AttachRefusal};
 /// each member the request left out at the default this service applies.
 pub mod refresh_preferences;
 
+/// The instances a group holds that the account's Amazon EC2 store no longer runs: the
+/// health check that takes them out of the group and the convergence that replaces them.
+pub mod ec2_health;
+
+pub use ec2_health::{EC2_INSTANCE_GONE_REASON, UNHEALTHY_REPLACEMENT_REASON};
+
+/// The instance type a group's attribute-based launch source launches, and the unit the
+/// group's `DesiredCapacityType` counts its capacity in.
+pub mod instance_requirements;
+
 /// How long a lifecycle transition this service owes takes to come due.
 ///
 /// Amazon EC2 Auto Scaling reports a freshly launched instance as `Pending` and an
@@ -301,12 +312,19 @@ pub const HEALTH_STATUS_HEALTHY: &str = "Healthy";
 
 /// How long ONE instance replacement of an instance refresh takes to come due.
 ///
-/// A replacement is a termination and a launch, so it is owed on the same transient
-/// span as any other lifecycle transition this service owes ([`LIFECYCLE_TRANSITION`]):
-/// chosen, not documented, and never slept for. A refresh of a group holding several
-/// instances therefore takes one span per instance, which is what lets a caller that
-/// reads it straight after starting it still see it running.
-pub const INSTANCE_REFRESH_REPLACEMENT: Duration = LIFECYCLE_TRANSITION;
+/// A replacement is a COMPOSITE of the moves this service owes an instance: the old
+/// instance goes out of service, a new one is launched in its place, and the refresh moves
+/// on only once that replacement is itself in service. So it is owed the span this emulator
+/// gives a transition the clock — rather than a caller — brings about, which is longer than
+/// the single lifecycle span one of those moves takes ([`LIFECYCLE_TRANSITION`]): chosen,
+/// not documented, and never slept for. A refresh of a group holding several instances
+/// therefore takes one span per instance plus one for its own completion, which is what
+/// lets a caller polling it see it `InProgress` while it runs.
+///
+/// This is the span of the replacement ITSELF. What the refresh then waits before moving
+/// on is the warmup it runs under, which the model documents
+/// ([`StoredInstanceRefresh::instance_warmup`]).
+pub const INSTANCE_REFRESH_REPLACEMENT: Duration = Duration::from_secs(3);
 
 /// How long the cancellation of an instance refresh takes to come due.
 ///
@@ -778,6 +796,16 @@ pub struct StoredGroup {
     pub launch_configuration_name: Option<String>,
     pub launch_template: Option<LaunchTemplateSpecification>,
     pub mixed_instances_policy: Option<MixedInstancesPolicy>,
+    /// The instance type the group's ATTRIBUTE-BASED launch source selected, resolved once
+    /// when the group was configured with it
+    /// ([`instance_requirements::policy_requirements_type`]).
+    ///
+    /// `None` for a group whose launch source names its instance type outright or states no
+    /// requirements at all, and `None` for one whose requirements no offered type satisfies
+    /// — [`instance_requirements::selects_by_requirements`] tells those apart. Held here, as
+    /// part of the configuration, so the requests that converge the group afterwards read a
+    /// type rather than walking Amazon EC2's catalog again.
+    pub requirements_instance_type: Option<String>,
     pub min_size: i32,
     pub max_size: i32,
     pub desired_capacity: i32,
@@ -894,13 +922,39 @@ impl StoredGroup {
     }
 
     /// The capacity units one instance of `instance_type` contributes to this group, as a
-    /// number: the weight the group states for that type, or the single unit an unweighted
-    /// instance contributes.
+    /// number: the attribute its `DesiredCapacityType` counts capacity in, or — for a group
+    /// counted in instances — the weight the group states for that type, or the single unit
+    /// an unweighted instance contributes.
+    ///
+    /// "The unit of measurement for the value specified for desired capacity"
+    /// (`CreateAutoScalingGroup$DesiredCapacityType`) decides which: a group counted in
+    /// `vcpu` is fulfilled by its members' vCPUs and one counted in `memory-mib` by their
+    /// memory, both read from Amazon EC2's own published facts for the type
+    /// ([`instance_requirements::capacity_units`]).
     pub fn capacity_units_for_type(&self, instance_type: Option<&str>) -> i32 {
-        self.weighted_capacity_of(instance_type)
-            .as_deref()
-            .and_then(weighted_capacity_units)
+        instance_requirements::capacity_units(self.desired_capacity_type.as_deref(), instance_type)
+            .or_else(|| {
+                self.weighted_capacity_of(instance_type)
+                    .as_deref()
+                    .and_then(weighted_capacity_units)
+            })
             .unwrap_or(UNWEIGHTED_CAPACITY_UNITS)
+    }
+
+    /// The `WeightedCapacity` a read of one of this group's instances reports for an
+    /// instance of `instance_type`: "the number of capacity units contributed by the
+    /// instance based on its instance type" (`Instance$WeightedCapacity`).
+    ///
+    /// The units this group COUNTS that instance for ([`Self::capacity_units_for_type`]),
+    /// so a group counted in `vcpu` reports each member's vCPUs; `None` for an unweighted
+    /// group counted in instances, whose members report no weight at all.
+    pub fn reported_capacity_units(&self, instance_type: Option<&str>) -> Option<String> {
+        if let Some(units) =
+            instance_requirements::capacity_units(self.desired_capacity_type.as_deref(), instance_type)
+        {
+            return Some(units.to_string());
+        }
+        self.weighted_capacity_of(instance_type)
     }
 
     /// The capacity units `instance` contributes to this group, as a number: the weight the
@@ -916,7 +970,7 @@ impl StoredGroup {
     /// THE ONE place a read of this service fills `WeightedCapacity` in, so the weight the
     /// group's members report and the weight its capacity is counted in are the same weight.
     pub fn instance_view(&self, instance: &StoredInstance) -> Instance {
-        instance.to_instance(self.weighted_capacity_of(instance.instance_type.as_deref()))
+        instance.to_instance(self.reported_capacity_units(instance.instance_type.as_deref()))
     }
 
     /// The capacity the group's own members currently provide, in the units its
@@ -949,19 +1003,47 @@ impl StoredGroup {
             })
     }
 
+    /// The instance type ONE launch of this group produces, as far as the group's own
+    /// configuration states it: the type the first override of its mixed instances policy
+    /// names, or the type the attribute-based selection of that override came to when the
+    /// group was configured ([`Self::requirements_instance_type`]).
+    ///
+    /// `None` for a group whose launch source leaves the type to its launch template or its
+    /// launch configuration, which are the other services' records rather than this group's
+    /// own statement — and for one whose requirements admit no offered type, whose launches
+    /// fail instead ([`ec2_instances::launch_failure_reason`]).
+    pub fn launch_instance_type(&self) -> Option<String> {
+        instance_requirements::launch_override(self.mixed_instances_policy.as_ref())
+            .and_then(|entry| entry.instance_type.clone())
+            .or_else(|| self.requirements_instance_type.clone())
+    }
+
     /// The capacity units one instance a launch of this group makes will contribute.
     ///
     /// A launch from a mixed instances policy is made from the FIRST of the policy's
     /// overrides ([`ec2_instances`] resolves the instance type from it, the way an
-    /// allocation strategy prefers the first type it is given), so the weight that override
-    /// carries is what the instance it produces counts for. One unit for a group whose
-    /// launch source states no weight.
+    /// allocation strategy prefers the first type it is given), so what that override
+    /// launches is what the instance it produces counts for: the attribute the group's
+    /// `DesiredCapacityType` counts capacity in, or the weight the override carries. One
+    /// unit for a group whose launch source states no weight.
+    ///
+    /// A group counted in an attribute whose launch source leaves the type to its launch
+    /// template states no type of its own to count, so the units are read off a member it
+    /// has already launched — the group's members all come from that one launch source, so
+    /// what one of them provides is what the next will.
     pub fn launch_capacity_units(&self) -> i32 {
-        self.mixed_instances_policy
-            .as_ref()
-            .and_then(|policy| policy.launch_template.as_ref())
-            .and_then(|template| template.overrides.as_ref())
-            .and_then(|overrides| overrides.first())
+        let launch_instance_type = self.launch_instance_type().or_else(|| {
+            self.active_instances()
+                .next()
+                .and_then(|instance| instance.instance_type.clone())
+        });
+        if let Some(units) = instance_requirements::capacity_units(
+            self.desired_capacity_type.as_deref(),
+            launch_instance_type.as_deref(),
+        ) {
+            return units;
+        }
+        instance_requirements::launch_override(self.mixed_instances_policy.as_ref())
             .and_then(|entry| entry.weighted_capacity.as_deref())
             .and_then(weighted_capacity_units)
             .unwrap_or(UNWEIGHTED_CAPACITY_UNITS)
@@ -1212,6 +1294,28 @@ impl StoredInstanceRefresh {
     /// replacing instances, which is what a cancellation acts on.
     pub fn is_in_progress(&self) -> bool {
         self.status == REFRESH_PENDING || self.status == REFRESH_IN_PROGRESS
+    }
+
+    /// How long this refresh waits after a replacement it made has come into service
+    /// before it moves on.
+    ///
+    /// "A time period, in seconds, during which an instance refresh waits before moving on
+    /// to replacing the next instance after a new instance enters the `InService` state"
+    /// (`smithy_query(query="doc",shape="RefreshPreferences",member="InstanceWarmup")`), so
+    /// the wait is the refresh's OWN effective `InstanceWarmup` — the value the request
+    /// stated, or the group's `DefaultInstanceWarmup`/`HealthCheckGracePeriod` the model
+    /// falls back to, resolved once when the refresh was created
+    /// ([`refresh_preferences::effective`]). A refresh running under no warmup at all waits
+    /// nothing beyond the replacement itself, which is the span this service owes every
+    /// transient state ([`INSTANCE_REFRESH_REPLACEMENT`]).
+    pub fn instance_warmup(&self) -> Duration {
+        let seconds = self
+            .preferences
+            .as_ref()
+            .and_then(|preferences| preferences.instance_warmup)
+            .unwrap_or(0)
+            .max(0);
+        Duration::from_secs(u64::from(seconds.unsigned_abs()))
     }
 }
 
@@ -1723,6 +1827,11 @@ impl AutoScalingState {
             // it was applied straight away or waited for this instant.
             self.override_cooldown(&change.group_name, change.cooldown_override, change.due);
         }
+        // The members the groups have lost to Amazon EC2 itself, and the replacements the
+        // groups are then short of: the health check that notices them is owed on the clock
+        // like everything else in this pass ([`ec2_health`]). Before the refreshes below, so
+        // a refresh reads the instances its group actually holds.
+        self.reconcile_terminated_instances(engine, now);
         // Before the lifecycle pass below, so an instance a replacement launched at
         // an instant already past leaves its transient state in this same call.
         self.advance_instance_refreshes(engine, now);
@@ -2110,6 +2219,20 @@ impl AutoScalingState {
             .as_ref()
             .and_then(|name| self.launch_configurations.get(name))
             .cloned();
+        // The type this launch's source states, where it states one: the group's own stored
+        // resolution of it ([`StoredGroup::launch_instance_type`]), or — for the replacements
+        // of a refresh moving the group to another launch source — that source's own, which
+        // is resolved here because the group has never been configured with it.
+        let selected_instance_type = match request.desired_configuration {
+            Some(_) => instance_requirements::launch_override(mixed_instances_policy.as_ref())
+                .and_then(instance_requirements::override_instance_type),
+            None => group.launch_instance_type(),
+        };
+        // And whether that source chooses its type by ATTRIBUTES, which is what makes a
+        // source with no type to launch a launch that fails rather than one made from some
+        // other type.
+        let selects_by_requirements =
+            instance_requirements::selects_by_requirements(mixed_instances_policy.as_ref());
 
         // Never more than the group can still hold, so neither one request nor a run
         // of them can grow the stored instances past MAX_GROUP_CAPACITY.
@@ -2124,6 +2247,8 @@ impl AutoScalingState {
             launch_configuration: launch_configuration.as_ref(),
             launch_template: launch_template.as_ref(),
             mixed_instances_policy: mixed_instances_policy.as_ref(),
+            selected_instance_type: selected_instance_type.as_deref(),
+            selects_by_requirements,
             tags: &tags,
         };
         // A launch is made only from a configuration that CAN produce an instance, asked
@@ -2465,7 +2590,15 @@ impl AutoScalingState {
                 100
             };
         }
-        refresh.next_step_due = Some(due + INSTANCE_REFRESH_REPLACEMENT);
+        // The replacement this step launched comes into service over the refresh's own span,
+        // and only once it is in service does the refresh's warmup start running: "a time
+        // period, in seconds, during which an instance refresh waits before moving on to
+        // replacing the next instance after a new instance enters the `InService` state"
+        // ([`StoredInstanceRefresh::instance_warmup`]). So the next step — the next
+        // replacement, or this refresh's own completion once none is left — comes due at the
+        // end of that wait.
+        let warmup = refresh.instance_warmup();
+        refresh.next_step_due = Some(due + INSTANCE_REFRESH_REPLACEMENT + warmup);
     }
 
     /// Replace ONE instance of a group: launch its replacement from the configuration
@@ -2917,7 +3050,15 @@ pub fn is_valid_metric_granularity(granularity: &str) -> bool {
 /// The units a `DesiredCapacityType` may name, from the model's own documentation
 /// for `CreateAutoScalingGroup$DesiredCapacityType`: "Valid values: units | vcpu |
 /// memory-mib".
-pub const DESIRED_CAPACITY_TYPES: &[&str] = &["units", "vcpu", "memory-mib"];
+///
+/// Spelled where the arithmetic that reads them lives ([`instance_requirements`]), so the
+/// value a request is accepted with and the unit a group's capacity is then counted in
+/// cannot drift apart.
+pub const DESIRED_CAPACITY_TYPES: &[&str] = &[
+    instance_requirements::CAPACITY_TYPE_UNITS,
+    instance_requirements::CAPACITY_TYPE_VCPU,
+    instance_requirements::CAPACITY_TYPE_MEMORY_MIB,
+];
 
 /// Whether `name` satisfies the character rule the model documents for
 /// `AutoScalingGroupName`: "The name can contain any ASCII character 33 to 126
