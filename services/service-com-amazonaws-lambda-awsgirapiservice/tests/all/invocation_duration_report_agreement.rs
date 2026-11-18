@@ -27,16 +27,23 @@
 //! are made one after another or at the same time — which is what the concurrency gauge
 //! distinguishes.
 //!
+//! A row whose invocations must be IN FLIGHT AT THE SAME INSTANT makes them so by a condition
+//! rather than by a clock: every run of the group reports in and then waits until all of them
+//! have, so the last to start finds the others still running whatever the host is doing at the
+//! time. Nothing here waits for a fixed span, and nothing asserts on how long anything took
+//! other than against the run's own report.
+//!
 //! Every metric, dimension and unit name here is written as a literal, taken from the AWS
 //! Lambda metric reference rather than from this crate's constants, so a series published
 //! under a name no AWS reader would ask for fails here instead of agreeing with itself. The
 //! Lambda-side harness (`send`, `Answer`, the activation window) is `function_lifecycle.rs`'s,
 //! the deployment archive is `synchronous_invoke_run.rs`'s, the CloudWatch call is
-//! `kinesis_event_source_delivery.rs`'s, and the single invocation stream this target's
-//! handler-running suites share is `invoke_request_id.rs`'s.
+//! `kinesis_event_source_delivery.rs`'s, the handler-side CloudWatch SDK call the rendezvous
+//! is made of is `handler_metric_timestamp.rs`'s, and the single invocation stream this
+//! target's handler-running suites share is `invoke_request_id.rs`'s.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -98,15 +105,25 @@ const PERIOD_SECS: i64 = 60;
 /// minute a datapoint was published in is inside it however a row straddles a minute boundary.
 const WINDOW_SECS: f64 = 600.0;
 
-/// The function's own `Timeout`, in seconds: longer than any row's handler sleeps for.
-const FUNCTION_TIMEOUT_SECS: u32 = 10;
+/// The function's own `Timeout`, in seconds: generous room for every row's handler — the span
+/// it sleeps for, and the rendezvous a row whose runs overlap waits at — so no row is bounded
+/// by it.
+const FUNCTION_TIMEOUT_SECS: u32 = 30;
 
-/// How long after the first invocation a row that makes its calls TOGETHER makes the second:
-/// well inside the run the first one started, so the two are in flight at the same instant.
-const SECOND_CALL_AFTER: Duration = Duration::from_millis(100);
+/// The namespace and metric the RENDEZVOUS of a row whose invocations overlap is made of: a
+/// custom namespace of this suite's own, so nothing it publishes is in an `AWS/` series any
+/// assertion below reads.
+const RENDEZVOUS_NAMESPACE: &str = "Emulator/InvocationDurationReportAgreement";
+/// See [`RENDEZVOUS_NAMESPACE`].
+const RENDEZVOUS_METRIC: &str = "RendezvousArrivals";
 
-/// The handler every row runs: it sleeps for as long as the event asks and answers how long
-/// that was, so the run's own time is the row's to choose.
+/// The member of a rendezvous run's answer that reports how many of the group it SAW arrive,
+/// which is what says the runs really did overlap.
+const ARRIVED_MEMBER: &str = "arrived";
+
+/// The handler a row whose invocations are made one after another runs: it sleeps for as long
+/// as the event asks and answers how long that was, so the run's own time is the row's to
+/// choose.
 const SOURCE: &str = r#"
 import time
 
@@ -116,6 +133,68 @@ def lambda_handler(event, context):
     if sleep_ms:
         time.sleep(sleep_ms / 1000.0)
     return {"slept_ms": sleep_ms}
+"#;
+
+/// The handler a row whose invocations must be IN FLIGHT AT THE SAME INSTANT runs: it waits at
+/// a rendezvous with the rest of its group before it sleeps, and answers how many of the group
+/// it saw arrive.
+///
+/// The rendezvous is a series of the handler's own: each run publishes one datapoint into it
+/// through the AWS SDK the runtime ships, then reads that series back until it holds one
+/// datapoint per run of the group. So every run of a group stays in flight until the LAST of
+/// them has started, which is what puts them all on the function at one instant — a condition
+/// each run waited for, not a span anybody timed. A run waiting for a group that never arrives
+/// is bounded by the function's own `Timeout`, as every run is.
+const RENDEZVOUS_SOURCE: &str = r#"
+import datetime
+import time
+
+import boto3
+
+EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+# How often a waiting run LOOKS at the series it is waiting on. It waits for the condition,
+# so this is the gap between two reads of it and not a span the rendezvous takes.
+POLL_SECONDS = 0.01
+
+
+def at(seconds):
+    """The epoch seconds `seconds` as the instant an SDK timestamp member carries."""
+    return EPOCH + datetime.timedelta(seconds=seconds)
+
+
+def rendezvous(asked):
+    """Wait until every run of this group has arrived, and answer how many did."""
+    client = boto3.client("cloudwatch")
+    partners = asked["partners"]
+    client.put_metric_data(
+        Namespace=asked["namespace"],
+        MetricData=[{"MetricName": asked["metric"], "Value": 1, "Unit": "Count"}],
+    )
+    arrived = 0
+    while arrived < partners:
+        answered = client.get_metric_statistics(
+            Namespace=asked["namespace"],
+            MetricName=asked["metric"],
+            StartTime=at(asked["start"]),
+            EndTime=at(asked["end"]),
+            Period=asked["period"],
+            Statistics=["SampleCount"],
+        )
+        arrived = 0
+        for point in answered.get("Datapoints", []):
+            arrived += point.get("SampleCount") or 0
+        if arrived < partners:
+            time.sleep(POLL_SECONDS)
+    return int(arrived)
+
+
+def lambda_handler(event, context):
+    arrived = rendezvous(event["rendezvous"])
+    sleep_ms = event.get("sleep_ms") or 0
+    if sleep_ms:
+        time.sleep(sleep_ms / 1000.0)
+    return {"slept_ms": sleep_ms, "arrived": arrived}
 "#;
 
 /// Lambda and CloudWatch on one engine: the series Lambda publishes is CloudWatch's, so it is
@@ -143,12 +222,14 @@ fn now_secs() -> f64 {
         .as_secs_f64()
 }
 
-/// Create the function a row invokes and bring it to `Active`.
+/// Create the function a row invokes, carrying the handler `source` holds, and bring it to
+/// `Active`.
 async fn create_function(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     case: &str,
     function: &str,
+    source: &str,
 ) {
     let created = send(
         router,
@@ -162,7 +243,7 @@ async fn create_function(
             "Handler": HANDLER,
             "Timeout": FUNCTION_TIMEOUT_SECS,
             "Code": {
-                "ZipFile": base64::engine::general_purpose::STANDARD.encode(package(SOURCE)),
+                "ZipFile": base64::engine::general_purpose::STANDARD.encode(package(source)),
             },
         }))
         .expect("the create body serializes"),
@@ -178,17 +259,48 @@ async fn create_function(
     make_activation_due(engine);
 }
 
-/// One synchronous invocation asking for the log tail the `REPORT` line is read out of.
-async fn invoke(router: &MultiServiceRouter, function: &str, sleep_ms: u64) -> Answer {
+/// One synchronous invocation carrying `event`, asking for the log tail the `REPORT` line is
+/// read out of.
+async fn invoke(router: &MultiServiceRouter, function: &str, event: &Value) -> Answer {
     send(
         router,
         "POST",
         &format!("{FUNCTIONS_URI}/{function}/invocations"),
         "application/json",
-        json!({ "sleep_ms": sleep_ms }).to_string().into_bytes(),
+        event.to_string().into_bytes(),
         &[(LOG_TYPE_HEADER, LOG_TYPE_TAIL.to_string())],
     )
     .await
+}
+
+/// The handler source a row's function carries: the one that waits at the rendezvous for a row
+/// whose invocations overlap, and the plain sleeper for a row whose invocations are made one
+/// after another.
+fn source_for(row: &Row) -> &'static str {
+    if row.together {
+        RENDEZVOUS_SOURCE
+    } else {
+        SOURCE
+    }
+}
+
+/// The event every invocation of `row` carries: how long its handler sleeps, and — for a row
+/// whose invocations must be in flight at the same instant — the rendezvous every run of the
+/// group waits at before it sleeps, over a window wide enough to hold every arrival.
+fn event_for(row: &Row) -> Value {
+    let mut event = json!({ "sleep_ms": row.sleep_ms });
+    if row.together {
+        let now = now_secs();
+        event["rendezvous"] = json!({
+            "namespace": RENDEZVOUS_NAMESPACE,
+            "metric": RENDEZVOUS_METRIC,
+            "partners": row.invocations,
+            "start": now - WINDOW_SECS,
+            "end": now + WINDOW_SECS,
+            "period": PERIOD_SECS,
+        });
+    }
+    event
 }
 
 /// The `Duration` and `Billed Duration`, in milliseconds, the `REPORT` line of `answered`'s
@@ -303,7 +415,8 @@ struct Row {
     sleep_ms: u64,
     /// How many invocations the row makes.
     invocations: usize,
-    /// Whether the invocations are in flight at the same time.
+    /// Whether the invocations are in flight at the same time, which a row makes so by having
+    /// every run of the group wait at a rendezvous until all of them have started.
     together: bool,
     /// The greatest number of executions the function holds at one instant, which is what the
     /// concurrency gauge's `Maximum` must report: one for invocations made one after another,
@@ -358,29 +471,46 @@ async fn every_run_is_measured_once_and_reported_the_same_on_both_planes() {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let router = emulator(&engine);
         let case = row.case;
-        create_function(&router, &engine, case, row.function).await;
+        create_function(&router, &engine, case, row.function, source_for(row)).await;
 
+        let event = event_for(row);
         let answers: Vec<Answer> = if row.together {
             assert_eq!(
                 row.invocations, 2,
                 "case {case:?}: a row whose invocations are made together makes exactly two"
             );
-            // The second call is made a moment after the first, while the first run is still
-            // in flight: that is what puts two executions on the function at one instant.
-            let first = invoke(&router, row.function, row.sleep_ms);
-            let second = async {
-                tokio::time::sleep(SECOND_CALL_AFTER).await;
-                invoke(&router, row.function, row.sleep_ms).await
-            };
-            let (first, second) = tokio::join!(first, second);
+            // Both calls are made at once, and every run of the group stays in flight until
+            // all of them have reported in at the rendezvous its handler waits at: the two
+            // executions are on the function at one instant because each run WAITED for the
+            // other, so nothing here turns on how fast the host served either call.
+            let (first, second) = tokio::join!(
+                invoke(&router, row.function, &event),
+                invoke(&router, row.function, &event),
+            );
             vec![first, second]
         } else {
             let mut answered = Vec::new();
             for _ in 0..row.invocations {
-                answered.push(invoke(&router, row.function, row.sleep_ms).await);
+                answered.push(invoke(&router, row.function, &event).await);
             }
             answered
         };
+
+        if row.together {
+            // The rendezvous HELD: every run saw the whole group arrive before it went on, so
+            // the overlap the gauge is read for below really happened.
+            let expected = u64::try_from(row.invocations).expect("a row's invocations count");
+            for answered in &answers {
+                let payload = answered.json();
+                let arrived = payload[ARRIVED_MEMBER].as_u64();
+                assert_eq!(
+                    arrived,
+                    Some(expected),
+                    "case {case:?}: every run must have waited for all {expected} of the group \
+                     to start, got {payload}"
+                );
+            }
+        }
 
         let reported: Vec<f64> = answers
             .iter()
