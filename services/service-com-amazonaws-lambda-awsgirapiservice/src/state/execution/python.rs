@@ -1311,8 +1311,8 @@ fn clamp_guest_sleep(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<()
 /// asked for cannot outlast the span its function's `Timeout` allows it.
 ///
 /// The wait is spent through the run's own bounds ([`Bounds::wait`]), which is what charges
-/// the span the guest asked for against that `Timeout` and decides how much of THIS HOST's
-/// time really passes over it ([`super::GUEST_WAIT_HOST_SPAN`]).
+/// the span the guest asked for against that `Timeout` and really waits it out, up to
+/// [`super::GUEST_WAIT_HOST_SPAN`].
 ///
 /// A value that is not a finite number of seconds is no wait at all, so nothing is waited
 /// for: the guest decides how long to ask for, never how the host reads it.
@@ -2183,6 +2183,14 @@ pub struct Bounds {
     /// How much of [`super::GUEST_WAIT_HOST_SPAN`] the waits of this run have really spent,
     /// in nanoseconds.
     host_waiting: AtomicU64,
+    /// How much of [`super::INIT_PHASE_LIMIT`] the code OUTSIDE the handler has asked to wait
+    /// for, in nanoseconds — the waits taken before the invoke phase began
+    /// ([`Self::start`]).
+    ///
+    /// The INIT phase has a span of its own, which the function's `Timeout` does not bound, so
+    /// what an initialization spends is counted here and judged against that span
+    /// ([`Self::past_the_init_limit`]).
+    init_waiting: AtomicU64,
 }
 
 impl Bounds {
@@ -2216,6 +2224,7 @@ impl Bounds {
             spending: AtomicBool::new(false),
             waived_waiting: AtomicU64::new(0),
             host_waiting: AtomicU64::new(0),
+            init_waiting: AtomicU64::new(0),
         }
     }
 
@@ -2299,7 +2308,10 @@ impl Bounds {
             self.breach(Stop::HostCeiling);
             return;
         }
-        if self.clock.now() >= self.deadline() || self.past_the_configured_timeout() {
+        if self.clock.now() >= self.deadline()
+            || self.past_the_configured_timeout()
+            || self.past_the_init_limit()
+        {
             self.breach(Stop::Deadline);
             return;
         }
@@ -2342,14 +2354,20 @@ impl Bounds {
     /// The span asked for is charged against what the function's `Timeout` allows the handler
     /// in FULL, so a handler that waits past its own `Timeout` runs out of it exactly as it
     /// does on AWS — the wait is cut at what is left of that span, and the next bound check
-    /// stops the run on its deadline. How much of THIS HOST's own time passes over it is this
-    /// emulator's to choose ([`super::GUEST_WAIT_HOST_SPAN`]): the wait really passes up to
-    /// that span, so a client can observe the run in flight, and the rest of it is time the
-    /// run has spent without the host waiting it out.
+    /// stops the run on its deadline. The wait also REALLY passes on this host, up to
+    /// [`super::GUEST_WAIT_HOST_SPAN`]: a wait is how time goes by for the caller, so a client
+    /// that observes the run while it is in flight, or that measures how long the call took,
+    /// sees the span the handler asked for. What is left of a wait longer than that is time
+    /// the run has spent without the host waiting it out, which is what keeps a handler
+    /// waiting far longer than this host may hold a run answering at all.
     ///
     /// The caller states what the guest asked for; no guest code decides how much of it the
     /// host spends.
     fn wait(&self, asked: Duration) {
+        if self.initializing() {
+            self.wait_in_init(asked);
+            return;
+        }
         let allowed = self
             .wall_clock
             .saturating_sub(self.spent_against_the_timeout());
@@ -2362,6 +2380,57 @@ impl Bounds {
         self.waived_waiting
             .fetch_add(nanoseconds(held.saturating_sub(really)), Ordering::Relaxed);
         self.clock.wait(really);
+    }
+
+    /// Spend a WAIT the code OUTSIDE the handler asked for: one taken while the execution
+    /// environment is still being initialized.
+    ///
+    /// The INIT phase is not bounded by the function's `Timeout` — "the amount of time that
+    /// Lambda allows a FUNCTION to run" is the handler's span — but it is not unbounded
+    /// either: the phase "is limited to 10 seconds" ([`super::INIT_PHASE_LIMIT`]), so a wait
+    /// taken outside the handler is cut at what is LEFT of that span, counted against it, and
+    /// the initialization is given up on once it has spent the whole of it
+    /// ([`Self::past_the_init_limit`]) — which is what a caller of a function whose
+    /// initialization outlasts that span is answered, rather than a result the initialization
+    /// never reached.
+    ///
+    /// How much of THIS HOST's own time passes over it is bounded as it is for the handler's
+    /// own waits ([`super::GUEST_WAIT_HOST_SPAN`]).
+    fn wait_in_init(&self, asked: Duration) {
+        let spent = Duration::from_nanos(self.init_waiting.load(Ordering::Relaxed));
+        let held = asked.min(super::INIT_PHASE_LIMIT.saturating_sub(spent));
+        let host_left = super::GUEST_WAIT_HOST_SPAN
+            .saturating_sub(Duration::from_nanos(self.host_waiting.load(Ordering::Relaxed)));
+        let really = held.min(host_left);
+        self.host_waiting
+            .fetch_add(nanoseconds(really), Ordering::Relaxed);
+        // The span the initialization ASKED for is what it spends of its phase, so a wait
+        // reaching past the phase's span spends the rest of that span and no more: what
+        // follows is the phase being given up on rather than a longer phase.
+        self.init_waiting.fetch_add(
+            nanoseconds(asked.min(super::INIT_PHASE_LIMIT)),
+            Ordering::Relaxed,
+        );
+        self.clock.wait(really);
+    }
+
+    /// Whether the run is still INITIALIZING its execution environment: the invoke phase has
+    /// not begun ([`Self::start`]), so the code running is the deployment package's own
+    /// module-level code rather than the handler.
+    fn initializing(&self) -> bool {
+        !self.spending.load(Ordering::SeqCst)
+    }
+
+    /// Whether an initialization still in flight has spent the whole span the INIT phase is
+    /// allowed ([`super::INIT_PHASE_LIMIT`]).
+    ///
+    /// Read from what the initialization ASKED to wait for ([`Self::wait_in_init`]) rather
+    /// than from this host's own clock, so the phase is judged on what the package's code did
+    /// and not on how long this emulator took to build the interpreter it runs in.
+    fn past_the_init_limit(&self) -> bool {
+        self.initializing()
+            && Duration::from_nanos(self.init_waiting.load(Ordering::Relaxed))
+                >= super::INIT_PHASE_LIMIT
     }
 
     /// Spend one traced event: `None` to carry on, `Some(stop)` for the bound that is now
@@ -2378,7 +2447,10 @@ impl Bounds {
         if self.clock.past_host_ceiling() {
             return Some(self.breach(Stop::HostCeiling));
         }
-        if self.clock.now() >= self.deadline() || self.past_the_configured_timeout() {
+        if self.clock.now() >= self.deadline()
+            || self.past_the_configured_timeout()
+            || self.past_the_init_limit()
+        {
             return Some(self.breach(Stop::Deadline));
         }
         // The run's OWN memory is sampled at EVERY traced event, so there is no sampling

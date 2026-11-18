@@ -36,12 +36,10 @@ const SIGNED_FOR_AMPLIFY: &str = "AWS4-HMAC-SHA256 \
 pub(crate) const ACCOUNT_ID: &str = "000000000000";
 pub(crate) const REGION: &str = "us-east-1";
 
-/// The address an app created through `endpoint` announces its hosting under, which is what
-/// `App$defaultDomain` carries: the address THIS emulator answers on, since a name a client
-/// is handed is one it resolves and then dials — and AWS's own hosting zone,
-/// `<appId>.amplifyapp.com`, only for a caller that resolves AWS's own hosts, which is the
-/// one caller this harness has no address of its own to offer (it mounts the service on a
-/// router rather than on a port).
+/// The address an app announces its hosting under, which is what `App$defaultDomain`
+/// carries: the one name Amplify publishes per app, the app's own id as the leading label of
+/// AWS's hosting zone (`<appId>.amplifyapp.com`), whatever endpoint the create was addressed
+/// at.
 ///
 /// Written here independently of the service, so a suite pins the announced address and not
 /// the code that composes it.
@@ -49,14 +47,11 @@ pub(crate) const REGION: &str = "us-east-1";
 /// `pub(crate)` so the sibling suites that assert the announced domain and compose a site's
 /// address from it read the one spelling rather than each writing it.
 pub(crate) fn announced_domain(endpoint: &str, app_id: &str) -> String {
-    // A host under one of the zones AWS publishes its own endpoints in is a client that
-    // resolves those hosts; anything else a client of this emulator addresses is an address
-    // of this emulator.
-    if endpoint.ends_with(".amazonaws.com") {
-        format!("{app_id}.amplifyapp.com")
-    } else {
-        endpoint.to_string()
-    }
+    // The endpoint a client addressed does not reach the value: an app announces its own id
+    // under the hosting zone however the create was addressed, which is what the rows that
+    // address it differently assert.
+    let _ = endpoint;
+    format!("{app_id}.amplifyapp.com")
 }
 
 /// One response, reduced to what a client branches on.
@@ -550,8 +545,8 @@ async fn create_app_mints_and_persists_a_record_get_app_reads_back_field_for_fie
         assert_eq!(
             string_member(&app, "defaultDomain"),
             announced_domain(&format!("amplify.{REGION}.amazonaws.com"), &app_id),
-            "case {label:?}: defaultDomain must be the address this emulator announces to \
-             the caller that created the app, got {:?}",
+            "case {label:?}: defaultDomain must be the hosting domain this app announces, \
+             got {:?}",
             app.get("defaultDomain")
         );
         assert_eq!(

@@ -5,14 +5,14 @@
 //!
 //! The rules under test are:
 //!
-//! 1. A SOURCE AFI THE COPY CANNOT RESOLVE IS REFUSED WITH ONE ANSWER, whatever made it
-//!    unresolvable: 400 `InvalidFpgaImageID.Malformed` with the id kind's
-//!    `Image ID '<id>' is invalid.` — a value that is not an AFI id at all, and an id inside
-//!    the issued form the store holds no AFI under alike. The copy names its source by an id
-//!    of ANOTHER Region, so it judges the id it was given; the malformed-before-not-found
-//!    PAIR belongs to the operations that resolve one named AFI of the Region they are
-//!    called in, which answer `InvalidFpgaImageID.NotFound` with their own sentence for an
-//!    id inside the form that names nothing — the same id table is run through both.
+//! 1. A SOURCE AFI THE COPY CANNOT RESOLVE IS REFUSED BY THE MALFORMED-BEFORE-NOT-FOUND
+//!    PAIR every operation that takes an AFI id answers: 400
+//!    `InvalidFpgaImageID.Malformed` with the id kind's `Image ID '<id>' is invalid.` for a
+//!    value that is not an AFI id at all, and 400 `InvalidFpgaImageID.NotFound` with
+//!    `Image ID '<id>' not found.` for an id inside the issued form the store holds no AFI
+//!    under — whether an id names a stored AFI is a fact of the store rather than of the
+//!    id's form, so the two causes are told apart. The same id table is run through the
+//!    operations that resolve one named AFI, which answer it the same way.
 //! 2. `SourceRegion` HAS TO NAME A REGION of the account's partition — "the Region that
 //!    contains the source AFI" — so a value that names none is refused with
 //!    `InvalidParameterValue` naming the value that is no Region's name.
@@ -51,12 +51,12 @@ type Params = Vec<(String, String)>;
 /// The HTTP status EC2 answers a `DryRun` request with: 412, carrying `DryRunOperation`.
 const DRY_RUN_STATUS: u16 = 412;
 
-/// The answer `CopyFpgaImage` has for a source id it cannot resolve, whatever made it
-/// unresolvable.
+/// The answer every operation that takes an AFI id has for a value that is not an AFI id at
+/// all — the first half of the malformed-before-not-found pair.
 const UNRESOLVABLE_SOURCE_CODE: &str = "InvalidFpgaImageID.Malformed";
 
-/// The answer the operations that resolve one named AFI OF THEIR OWN REGION have for an id
-/// inside the issued form that names no stored AFI.
+/// The answer those same operations have for an id inside the issued form that names no
+/// stored AFI — the second half of that pair.
 const UNKNOWN_SOURCE_CODE: &str = "InvalidFpgaImageID.NotFound";
 
 /// A well-formed AFI id, in the long (17 hex digit) form EC2 mints today, that the account
@@ -107,10 +107,9 @@ fn stored_afi_count(engine: &engine::InMemoryEngine) -> usize {
 // RULE 1: a source the copy cannot resolve
 // ---------------------------------------------------------------------------
 
-/// `(case, the source id, the code the operations that resolve an AFI OF THEIR OWN REGION
-/// answer it with)`. The ids differ along prefix, suffix length and alphabet, and the two
-/// accepted id FORMS (8 and 17 hex digits) are the rows those operations answer as not
-/// found; the copy answers every row of the table with its own one refusal.
+/// `(case, the source id, the code every operation that resolves one named AFI answers it
+/// with)`. The ids differ along prefix, suffix length and alphabet, and the two accepted id
+/// FORMS (8 and 17 hex digits) are the rows answered as not found.
 fn unresolvable_source_rows() -> [(&'static str, &'static str, &'static str); 9] {
     [
         (
@@ -149,14 +148,15 @@ fn unresolvable_source_rows() -> [(&'static str, &'static str, &'static str); 9]
     ]
 }
 
-/// Every source id `CopyFpgaImage` cannot resolve is refused with its ONE answer — the id
-/// kind's unreadable sentence, for a value that is no AFI id and for an id inside the issued
-/// form nothing is stored under alike — and nothing is stored by a refusal.
+/// Every source id `CopyFpgaImage` cannot resolve is refused by the malformed-before-not-found
+/// pair — the id kind's unreadable sentence for a value that is no AFI id, and the not-found
+/// sentence for an id inside the issued form nothing is stored under — and nothing is stored
+/// by a refusal.
 #[tokio::test]
-async fn a_source_the_copy_cannot_resolve_is_refused_with_one_answer() {
+async fn a_source_the_copy_cannot_resolve_is_refused_malformed_before_not_found() {
     let (router, engine) = emulator();
 
-    for (case, source_fpga_image_id, _regional_code) in unresolvable_source_rows() {
+    for (case, source_fpga_image_id, expected_code) in unresolvable_source_rows() {
         let (status, body) = op(&router, "CopyFpgaImage", &copy_params(source_fpga_image_id)).await;
         assert_eq!(
             status, 400,
@@ -164,11 +164,15 @@ async fn a_source_the_copy_cannot_resolve_is_refused_with_one_answer() {
         );
         assert_eq!(
             error_code(&body),
-            UNRESOLVABLE_SOURCE_CODE,
-            "case {case:?}: expected {UNRESOLVABLE_SOURCE_CODE}, got {body}"
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
         );
         let message = unescaped(&element(&body, "Message").unwrap_or_default());
-        let expected_message = format!("Image ID '{source_fpga_image_id}' is invalid.");
+        let expected_message = if expected_code == UNKNOWN_SOURCE_CODE {
+            format!("Image ID '{source_fpga_image_id}' not found.")
+        } else {
+            format!("Image ID '{source_fpga_image_id}' is invalid.")
+        };
         assert_eq!(
             message, expected_message,
             "case {case:?}: expected the message {expected_message:?}, got {message:?}"
@@ -183,9 +187,9 @@ async fn a_source_the_copy_cannot_resolve_is_refused_with_one_answer() {
     );
 }
 
-/// The classes are the OPERATION's: the operations that resolve an AFI of the Region they are
-/// called in keep the malformed-before-not-found pair over the same id table the copy answers
-/// with one refusal.
+/// The pair is the ID's and not one operation's: the operations that resolve an AFI of the
+/// Region they are called in answer the same malformed-before-not-found pair over the same id
+/// table the copy is held to above.
 #[tokio::test]
 async fn resolving_an_afi_of_this_region_still_answers_malformed_before_not_found() {
     let (router, _engine) = emulator();

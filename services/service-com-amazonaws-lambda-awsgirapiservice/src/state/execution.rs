@@ -333,8 +333,8 @@ pub fn run_memory_claim_mb(memory_size: i32) -> u32 {
 /// otherwise hold a request open for a quarter of an hour. The span the run is JUDGED against
 /// is the function's own clamped `Timeout` ([`run_budget`]) — which is what a run that outlasts
 /// it is reported to have run past — while this is the host time it may really take, so a
-/// handler configured for a longer span is still stopped here. The waits that span allows a
-/// handler are not host time it has to spend ([`GUEST_WAIT_HOST_SPAN`]).
+/// handler configured for a longer span is still stopped here. A WAIT the handler asks for is
+/// spent inside that span and really passes on this host, up to [`GUEST_WAIT_HOST_SPAN`].
 ///
 /// The wait a caller makes runs from the moment this invocation holds the memory to run in —
 /// beside the initialization of the execution environment the handler is called in, which is
@@ -346,15 +346,17 @@ pub const HOST_WAIT_CEILING: Duration = Duration::from_secs(30);
 ///
 /// A wait the handler asks for is part of what the function's `Timeout` allows it, so the span
 /// it asked for is spent against that `Timeout` in full — a handler that waits past its
-/// `Timeout` runs out of it exactly as it does on AWS. How much of this HOST's time that wait
-/// takes is this emulator's to choose, like every other span it serves faster than AWS serves
-/// it: a handler that waits a quarter of an hour inside a `Timeout` that allows it answers
-/// here, rather than being stopped by a ceiling its configuration never asked for.
+/// `Timeout` runs out of it exactly as it does on AWS. A wait is also how TIME GOES BY for the
+/// caller: a client that observes the run while it is in flight, or that measures how long the
+/// call took, sees the span the handler asked for, so a wait really passes up to here.
 ///
-/// It is deliberately not nothing: a client can observe the effects of a run WHILE IT IS IN
-/// FLIGHT — a resource whose creation is held open while the handler behind it runs — so a
-/// wait really passes up to here before the rest of its span is spent against the run alone.
-pub const GUEST_WAIT_HOST_SPAN: Duration = Duration::from_secs(5);
+/// It is stated SHORTER than [`HOST_WAIT_CEILING`] rather than equal to it, because the rest
+/// of that ceiling is what the handler's work AFTER the wait may take: a run whose waits could
+/// spend the whole ceiling would be stopped on its deadline before returning, and a handler
+/// that waits a quarter of an hour inside a `Timeout` that allows it answers here rather than
+/// being held for a span its configuration never asked for. So a wait longer than this spends
+/// this much of the host and the rest of it against the run's own span alone.
+pub const GUEST_WAIT_HOST_SPAN: Duration = Duration::from_secs(20);
 
 /// How long the EXECUTION ENVIRONMENT one invocation runs in may take to be initialized,
 /// which the function's own `Timeout` does not bound.
@@ -1564,8 +1566,8 @@ pub(crate) fn epoch_millis(at: SystemTime) -> i64 {
 /// The span is the CONFIGURED one, not this host's: "the amount of time that Lambda allows a
 /// function to run before stopping it" is what the run is judged against and what a run that
 /// ran past it is reported to have run past. How much of this host's own time the run may
-/// really take is bounded beside it ([`HOST_WAIT_CEILING`]), and the waits the handler asks
-/// for inside its span are not host time it has to spend ([`GUEST_WAIT_HOST_SPAN`]).
+/// really take is bounded beside it ([`HOST_WAIT_CEILING`]), and a wait the handler asks for
+/// inside its span really passes up to [`GUEST_WAIT_HOST_SPAN`].
 ///
 /// The memory bound is the SAME quantity the run's share of the process envelope is charged
 /// in ([`run_memory_claim_mb`]), so what a run may allocate and what it holds of the

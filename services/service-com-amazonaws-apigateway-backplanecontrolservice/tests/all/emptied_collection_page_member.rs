@@ -13,12 +13,11 @@
 //! API.
 //!
 //! The rule, asserted over a TABLE of collections rather than one listing: a collection
-//! emptied of its last element answers with the envelope its OWN recording shows, and with
-//! neither a cursor nor a page-size echo beside it — the page member (`item` on the wire) as
-//! the EMPTY list for every collection of this service but one, and the bare success
-//! envelope for the base path mappings of a domain name, whose recorded empty answer carries
-//! no member at all ([`empty_page_body`]). The DEPLOYMENTS collection is asserted the same
-//! way by `crate::deployment_collection`, which owns it.
+//! emptied of its last element answers with the page member (`item` on the wire) as the
+//! EMPTY list, and with neither a cursor nor a page-size echo beside it — for every
+//! collection of this service, the base path mappings of a domain name included
+//! ([`empty_page_body`]). The DEPLOYMENTS collection is asserted the same way by
+//! `crate::deployment_collection`, which owns it.
 //!
 //! Each row reaches the empty collection by DELETING the one element it created, not by
 //! never creating one, so what is asserted is the answer a collection makes once it is
@@ -180,19 +179,14 @@ async fn emptied(gateway: &Gateway, collection: &str) -> String {
 
 /// The whole body `collection` answers once it holds no element.
 ///
-/// Every collection of this service reports its page member as the empty list, EXCEPT the
-/// base path mappings of a domain name, whose recorded empty answer is the bare success
-/// envelope — no `item`, and no cursor either. The envelope of an empty 200 is a fact of the
-/// operation that answers it, so the table carries one expected body per row rather than one
-/// for all of them.
+/// EVERY collection of this service reports its page member as the empty list — "the current
+/// page of elements from this collection" is a list a client counts — and nothing beside it:
+/// no `item` of any element, no cursor and no page-size echo.
 ///
 /// `pub(crate)` so the sibling `collection_empty_page_member` suite reads the same spelling.
 pub(crate) fn empty_page_body(collection: &str) -> Value {
-    if collection == "GetBasePathMappings" {
-        json!({})
-    } else {
-        json!({ "item": [] })
-    }
+    let _ = collection;
+    json!({ "item": [] })
 }
 
 #[tokio::test]
@@ -208,8 +202,9 @@ async fn an_emptied_collection_reports_the_empty_page_member_and_nothing_beside_
             "case {case}: expected 200, got {} with {:?}",
             answer.status, answer.body
         );
-        // The envelope this collection records for an emptied page, and nothing beside it:
-        // the page holds no element, so it carries on at no cursor and echoes no page size.
+        // The envelope every collection of this service answers an emptied page with, and
+        // nothing beside it: the page holds no element, so it carries on at no cursor and
+        // echoes no page size.
         let expected = empty_page_body(collection);
         assert_eq!(
             answer.body, expected,

@@ -10,9 +10,8 @@
 //! 400 `InvalidFpgaImageID.Malformed` and the FPGA-image kind's own sentence,
 //! `Image ID '<value>' is invalid.`, built from the value the REQUEST sent; an id inside that
 //! form which the account holds no AFI under is answered by the OPERATION's own refusal —
-//! `InvalidFpgaImageID.NotFound` for the operations that resolve one named AFI of their own
-//! Region, so a client can tell a typo from a missing image, and the unreadable answer again
-//! for `CopyFpgaImage`, which judges the id of another Region it was given
+//! `InvalidFpgaImageID.NotFound` for the operations that resolve one named AFI, so a client
+//! can tell a typo from a missing image
 //! (`super::fpga_image_unresolvable_id_refusals` holds that per-operation table). The null
 //! (all-zero) id is outside the form because the mint counts from one, so no AFI can ever
 //! hold it.
@@ -60,9 +59,7 @@ const SOURCE_REGION: &str = REGION;
 /// The parameters each operation that resolves an AFI id is called with, for `fpga_image_id`.
 ///
 /// `CopyFpgaImage` is in the list because it takes an AFI id too — it reads the id of its
-/// SOURCE — and it is the one operation here whose subject does not live in the Region the
-/// call is made in, which is why an id inside the form that names no AFI is the unreadable
-/// answer there rather than the not-found one.
+/// SOURCE — and it reads it the same way: the form first, then the lookup.
 fn resolver_params(action: &str, fpga_image_id: &str) -> Params {
     match action {
         "ResetFpgaImageAttribute" | "DescribeFpgaImageAttribute" => vec![
@@ -77,17 +74,18 @@ fn resolver_params(action: &str, fpga_image_id: &str) -> Params {
     }
 }
 
-/// The operations that resolve an AFI id of the Region they are called in: each keeps the
-/// malformed answer apart from the not-found one.
+/// The operations that resolve ONE named AFI: each keeps the malformed answer apart from the
+/// not-found one.
 ///
-/// The not-found SENTENCE is the answering operation's own — the delete and the reset word it
-/// `Image ID '<id>' not found.`, the attribute describe with EC2's common missing-id sentence
-/// — so the table carries one expected sentence per operation
+/// The not-found SENTENCE is the answering operation's own — the delete, the reset and the
+/// copy word it `Image ID '<id>' not found.`, the attribute describe with EC2's common
+/// missing-id sentence — so the table carries one expected sentence per operation
 /// ([`regional_not_found_message`]).
-const REGIONAL_RESOLVERS: [&str; 3] = [
+const REGIONAL_RESOLVERS: [&str; 4] = [
     "DeleteFpgaImage",
     "ResetFpgaImageAttribute",
     "DescribeFpgaImageAttribute",
+    "CopyFpgaImage",
 ];
 
 /// The not-found sentence `action` answers an id inside the issued form that names no AFI
@@ -209,7 +207,7 @@ async fn an_afi_id_outside_the_issued_form_is_refused_as_malformed() {
             .take(MAX_ECHOED_RESOURCE_ID_CHARS)
             .collect();
         let expected_message = format!("Image ID '{echoed}' is invalid.");
-        for action in REGIONAL_RESOLVERS.iter().chain(["CopyFpgaImage"].iter()) {
+        for action in REGIONAL_RESOLVERS {
             let params = resolver_params(action, &fpga_image_id);
             let (status, body) = op(&router, action, &params).await;
             assert_eq!(
@@ -248,8 +246,8 @@ async fn an_afi_id_outside_the_issued_form_is_refused_as_malformed() {
 }
 
 /// RULE: an id INSIDE the issued form that names no stored AFI is answered by the OPERATION's
-/// own refusal — the not-found code, with that operation's sentence, from the operations that
-/// resolve an AFI of their own Region, and the unreadable answer from the copy.
+/// own refusal — the not-found code, with that operation's sentence, from every operation
+/// that resolves one named AFI.
 #[tokio::test]
 async fn an_afi_id_inside_the_issued_form_is_answered_as_not_found() {
     let (router, _engine) = emulator();
@@ -279,30 +277,6 @@ async fn an_afi_id_inside_the_issued_form_is_answered_as_not_found() {
                  {message:?}"
             );
         }
-
-        // `CopyFpgaImage` names its source by an id of ANOTHER Region, so it judges the id it
-        // was given: an id inside the form that names no AFI is the SAME refusal it answers a
-        // value that is no AFI id at all with, in the same sentence naming the same id.
-        let params = resolver_params("CopyFpgaImage", &fpga_image_id);
-        let (status, body) = op(&router, "CopyFpgaImage", &params).await;
-        assert_eq!(
-            status, REFUSAL_STATUS,
-            "case {case:?} on CopyFpgaImage: expected HTTP {REFUSAL_STATUS}, got {status} with \
-             body {body}"
-        );
-        let answered_code = error_code(&body);
-        assert_eq!(
-            answered_code, INVALID_FPGA_IMAGE_ID_MALFORMED,
-            "case {case:?} on CopyFpgaImage: expected the code \
-             {INVALID_FPGA_IMAGE_ID_MALFORMED:?}, got {answered_code:?} in {body}"
-        );
-        let expected_message = format!("Image ID '{fpga_image_id}' is invalid.");
-        let message = error_message(&body);
-        assert_eq!(
-            message, expected_message,
-            "case {case:?} on CopyFpgaImage: expected the message {expected_message:?}, got \
-             {message:?}"
-        );
     }
 }
 

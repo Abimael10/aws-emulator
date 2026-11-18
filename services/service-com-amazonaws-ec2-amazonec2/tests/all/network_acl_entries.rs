@@ -184,12 +184,11 @@ fn catch_all_entry(egress: bool) -> ReportedEntry {
         cidr_block: Some(ALL_IPV4_ADDRESSES.to_string()),
         ipv6_cidr_block: None,
         egress: egress.to_string(),
-        // An IMPLICIT entry over every protocol: it carries no ports and no ICMP numbers,
-        // and reports each of those two members as a present-but-empty element — which is
-        // what separates an entry the SERVICE wrote from a caller's rule over every
-        // protocol, which leaves both members out.
-        port_range: Some((None, None)),
-        icmp_type_code: Some((None, None)),
+        // An entry over every protocol: it carries no ports and no ICMP numbers, so it
+        // reports neither member — the same reading a caller's rule over every protocol
+        // gets, because what decides the two members is the rule and not who wrote it.
+        port_range: None,
+        icmp_type_code: None,
     }
 }
 

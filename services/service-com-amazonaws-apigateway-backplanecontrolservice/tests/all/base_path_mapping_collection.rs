@@ -20,7 +20,8 @@
 //!   naming no mapping of the collection is the modelled `BadRequestException`;
 //! * a pair that resolves to no stored domain name is that record's missing-resource
 //!   `NotFoundException` rather than an empty page, while a stored record carrying no
-//!   mapping reports an EMPTY page;
+//!   mapping reports an EMPTY page — the page member as the empty list, the way every
+//!   listing of this service reports a page of nothing;
 //! * the listing is computed from the stored records, so a mapping a later call patches is
 //!   reported as the store then holds it — and a delete of the REST API it names is refused
 //!   while the mapping stands, so the listing never reports a mapping whose API has gone;
@@ -95,16 +96,16 @@ async fn get_base_path_mappings_pages_through_creation_order_on_position_and_lim
     let domain_name = "collection.example.com";
     created_domain(&gateway, domain_name, json!({})).await;
 
-    // A domain name that carries no mapping is answered with the SUCCESS ENVELOPE ALONE:
-    // no collection member, and no cursor beside it either. What an empty 200 looks like is
-    // a fact of the OPERATION — this collection's recorded empty answer is the bare object,
-    // where the other listings of this service report the empty list — so it is pinned here,
-    // on the listing that owns it.
+    // A domain name that carries no mapping is answered with the page member as the EMPTY
+    // LIST, and nothing beside it: no cursor, because nothing follows a page that ended the
+    // collection. "The current page of elements from this collection" is a list a client
+    // counts, so the member is there to count — the same envelope every listing of this
+    // service answers a page of nothing with.
     let empty = page_of(&gateway, domain_name, "", "the empty collection").await;
     assert_eq!(
         empty,
-        json!({}),
-        "case the empty collection: expected the bare success envelope, got {empty:?}"
+        json!({ "item": [] }),
+        "case the empty collection: expected the empty page member, got {empty:?}"
     );
 
     // The creates differ along what the rule generalises over: the SPELLING of the base
@@ -506,19 +507,19 @@ async fn the_listing_reports_the_stored_mappings_as_later_calls_leave_them() {
     }
 }
 
-/// RULE: an EMPTY page of this collection is answered with the envelope this listing
-/// records — the bare success object, carrying neither the `item` member nor a `position` —
-/// however the page came to hold nothing, while a page that HOLDS a mapping reports it under
-/// `item` as always.
+/// RULE: an EMPTY page of this collection is answered with the page member as the EMPTY
+/// LIST and nothing beside it — no `position`, since nothing follows a page that ended the
+/// collection — however the page came to hold nothing, which is the envelope every listing
+/// of this service answers a page of nothing with: "the current page of elements from this
+/// collection" is a list a client counts, so it is always there to count.
 ///
 /// The rows differ along what the rule generalises over — how the page came to be empty (a
 /// domain name that never held a mapping, one emptied of its only mapping, one emptied of
 /// several) crossed with the page size the request asked for (none, the smallest, the
 /// published maximum) — so no row is the specification. The last block is the contrast: the
-/// member is omitted because the page holds nothing, not because this listing never writes
-/// it.
+/// list is empty because the page holds nothing, and carries the mapping once there is one.
 #[tokio::test]
-async fn an_empty_page_of_this_collection_is_answered_with_the_bare_success_envelope() {
+async fn an_empty_page_of_this_collection_is_answered_with_the_empty_page_member() {
     /// The page sizes a request may ask of the collection: none at all, the smallest, and
     /// the published maximum ("The maximum number of returned results per page. The default
     /// value is 25 and the maximum value is 500",
@@ -558,13 +559,14 @@ async fn an_empty_page_of_this_collection_is_answered_with_the_bare_success_enve
             let body = page_of(&gateway, &domain_name, query, &case).await;
             assert_eq!(
                 body,
-                json!({}),
-                "case {case}: expected the bare success envelope, got {body:?}"
+                json!({ "item": [] }),
+                "case {case}: expected the empty page member and nothing beside it, got \
+                 {body:?}"
             );
         }
 
-        // The contrast: one mapping created again, and the page carries it — so what the
-        // empty answer omits is a page of nothing, not this listing's member.
+        // The contrast: one mapping created again, and the page carries it — so the empty
+        // list is a page of nothing rather than this listing never filling its member.
         created_mapping(
             &gateway,
             &domain_name,

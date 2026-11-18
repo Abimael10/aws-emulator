@@ -1742,9 +1742,8 @@ impl ComAmazonawsAmplifyAmplifyState {
     ///   (`(shape="App",member="defaultDomain")`), so a request whose host is that
     ///   composition addresses that branch's site. The match is case-insensitive and ignores
     ///   any port, because a host is; and the composition always carries the branch's own
-    ///   label ahead of the domain, so a request addressed to the domain ITSELF — the
-    ///   emulator's own endpoint, which is what an app announces — is no site's address and
-    ///   reaches the control plane as it always did;
+    ///   label ahead of the domain, so a request addressed to the domain ITSELF is no site's
+    ///   address and reaches the control plane as it always did;
     /// * by PATH, where the app is named by its id and the branch by that same display name
     ///   ([`hosted_site_path`]) — compared case-insensitively too, because it is the same
     ///   label. This is how a client that resolves nothing but this emulator's own endpoint

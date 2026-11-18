@@ -3014,25 +3014,11 @@ impl Page {
     /// element at all, one a caller emptied, a filter that selects none, and the window a
     /// caller that walked to the end asks for.
     ///
-    /// One copy for EVERY `position`/`limit` collection of this service, so two listings
-    /// cannot disagree about what an empty page looks like.
+    /// One copy for EVERY `position`/`limit` collection of this service — the base path
+    /// mappings of a domain name included — so no two listings can disagree about what an
+    /// empty page looks like.
     pub fn reported_items<Element>(&self, items: Vec<Element>) -> Option<Vec<Element>> {
         Some(items)
-    }
-
-    /// The page of elements as the BASE PATH MAPPING collection reports it: present only
-    /// when the page HOLDS an element, so a domain name that carries no mapping is answered
-    /// with the success envelope alone — no collection member, and no `position` either,
-    /// since nothing follows a page that ended the collection.
-    ///
-    /// What an empty 200 looks like is a fact of the OPERATION and not of this pager: the
-    /// recorded empty answer of `GetBasePathMappings` is the bare empty object, while the
-    /// other `position`/`limit` listings of this service report the empty list
-    /// ([`Page::reported_items`]). The two readings therefore sit side by side here, so each
-    /// listing reports the envelope its OWN recording shows and neither is worded from the
-    /// other's.
-    pub fn reported_items_when_any<Element>(&self, items: Vec<Element>) -> Option<Vec<Element>> {
-        (!items.is_empty()).then_some(items)
     }
 }
 

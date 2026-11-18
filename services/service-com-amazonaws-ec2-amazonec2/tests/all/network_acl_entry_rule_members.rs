@@ -14,10 +14,9 @@
 //!    (`$IcmpTypeCode`) — so a rule written with ports reports a port range, a rule written with
 //!    an ICMP type and code reports one, and a rule whose protocol has neither (every protocol,
 //!    or a protocol that is not TCP, UDP or ICMP) reports NEITHER member rather than an empty
-//!    one. An empty port range on an all-traffic rule a caller wrote reads as a port
-//!    restriction the rule does not carry. An IMPLICIT entry — one the SERVICE wrote onto the
-//!    ACL — reports both members as present-but-empty elements instead, which is what an ACL a
-//!    create answers carries.
+//!    one. An empty port range on an all-traffic rule reads as a port restriction the rule does
+//!    not carry, and that holds for the catch-all entries the SERVICE writes onto an ACL too:
+//!    they are rules over every protocol, so they report neither member either.
 //!
 //! 2. "The protocol number. A value of `-1` means all protocols" (`$Protocol`): a value that is
 //!    not a protocol number is refused with EC2's own sentence for an unknown IP protocol,
@@ -272,9 +271,8 @@ async fn an_entry_reports_only_the_optional_members_its_rule_carries() {
         );
     }
 
-    // And the catch-all deny the ACL was created with — an IMPLICIT entry the SERVICE wrote,
-    // over every protocol — reports each member as a present-but-empty element, which is what
-    // separates it from a caller's rule over every protocol.
+    // And the catch-all deny the ACL was created with reports NEITHER member either: it is a
+    // rule over every protocol, which has no ports and no ICMP numbers, whoever wrote it.
     let described = ok(
         "the catch-all deny",
         &router,
@@ -295,10 +293,9 @@ async fn an_entry_reports_only_the_optional_members_its_rule_carries() {
                 children,
             );
             assert_eq!(
-                reported,
-                Some((None, None)),
-                "case {case:?} (egress {egress}): an implicit rule over every protocol reports \
-                 {member} as a present-but-empty element, got {reported:?}"
+                reported, None,
+                "case {case:?} (egress {egress}): a rule over every protocol reports no \
+                 {member} at all, got {reported:?}"
             );
         }
     }

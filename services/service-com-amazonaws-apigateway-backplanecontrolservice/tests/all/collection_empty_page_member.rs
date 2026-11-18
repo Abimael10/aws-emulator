@@ -9,13 +9,10 @@
 //! this crate's one wire-test harness, reused from `rest_api_lifecycle`.
 //!
 //! The rule, asserted over a SET of inputs rather than one call: a listing reports "the
-//! current page of elements from this collection" under the envelope its OWN recording
-//! shows — for every collection of this service but one, a page that holds nothing is a
-//! success carrying that member as the EMPTY list, so a client counts the page it was served
-//! rather than branching on a member that is not there. The base path mappings of a domain
-//! name are the exception, and their own recorded empty answer carries no member at all
-//! (`crate::emptied_collection_page_member::empty_page_body`, and the
-//! `base_path_mapping_collection` suite that owns that listing).
+//! current page of elements from this collection" as a LIST a client counts — for every
+//! collection of this service, a page that holds nothing is a success carrying that member
+//! as the EMPTY list, so a client counts the page it was served rather than branching on a
+//! member that is not there (`crate::emptied_collection_page_member::empty_page_body`).
 //!
 //! The rows span the collections of this service a caller fills and empties again,
 //! crossed with the two ways a page comes to hold nothing while the listing still
@@ -33,7 +30,7 @@
 
 use serde_json::{json, Value};
 
-use crate::emptied_collection_page_member::{deleted, empty_page_body};
+use crate::emptied_collection_page_member::deleted;
 use crate::rest_api_lifecycle::{create_api, string_member, Gateway};
 
 /// The collections this suite drives, named by the operation that lists each: an
@@ -422,17 +419,6 @@ async fn every_paginated_listing_of_this_service_reports_its_page_as_a_list() {
 
     for (case, uri, held) in &rows {
         let body = listed(&gateway, uri, case).await;
-        // The one collection whose recorded empty answer carries NO member is asserted as
-        // that whole envelope instead: a page of nothing is the bare success object there.
-        if empty_page_body(case) == json!({}) && *held == Some(0) {
-            assert_eq!(
-                body,
-                json!({}),
-                "case {case}: expected the bare success envelope for an empty page, got \
-                 {body:?}"
-            );
-            continue;
-        }
         let reported = body
             .get("item")
             .unwrap_or_else(|| panic!("case {case}: expected the page member, got {body:?}"));

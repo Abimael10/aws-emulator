@@ -12,12 +12,11 @@
 //!    anything is looked up, and nothing is written by the refusal.
 //! 2. An id INSIDE that form which resolves to no AFI is answered by the OPERATION's own
 //!    refusal, because EC2 words a refusal per operation rather than per id kind:
-//!    * `CopyFpgaImage` and `DescribeFpgaImages` make the SAME answer as for a value that is
-//!      no AFI id at all — one names its source by an id of another Region and the other
-//!      reports on "the AFIs available to you", so each judges the id it was given rather
+//!    * `DescribeFpgaImages` makes the SAME answer as for a value that is no AFI id at all:
+//!      it reports on "the AFIs available to you", so it judges the id it was given rather
 //!      than resolving one resource of the account's own Region;
-//!    * `DeleteFpgaImage` and `ResetFpgaImageAttribute`, which act on ONE named AFI of that
-//!      Region, answer `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not found.`;
+//!    * `CopyFpgaImage`, `DeleteFpgaImage` and `ResetFpgaImageAttribute`, which act on ONE
+//!      named AFI, answer `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not found.`;
 //!    * `DescribeFpgaImageAttribute` answers that same code with EC2's common missing-id
 //!      sentence instead, naming the `fpga-image` resource type.
 //! 3. The two readings are about the ID and not about the operation's subject: the id of a
@@ -56,7 +55,7 @@ enum Unresolved {
     /// they answer a value that is no AFI id at all with as well.
     Unreadable,
     /// `Image ID '<id>' not found.` — the sentence the operations that act on one named AFI
-    /// of their own Region are recorded answering.
+    /// are recorded answering.
     NotFoundImageId,
     /// EC2's common missing-id sentence, naming the `fpga-image` resource type — the
     /// sentence the attribute describe is recorded answering.
@@ -92,7 +91,7 @@ fn unreadable_message(fpga_image_id: &str) -> String {
 /// Every operation that resolves an AFI id, with the answer it makes for an id inside the
 /// issued form that resolves to no AFI.
 const RESOLVERS: [(&str, Unresolved); 5] = [
-    ("CopyFpgaImage", Unresolved::Unreadable),
+    ("CopyFpgaImage", Unresolved::NotFoundImageId),
     ("DescribeFpgaImages", Unresolved::Unreadable),
     ("DeleteFpgaImage", Unresolved::NotFoundImageId),
     ("ResetFpgaImageAttribute", Unresolved::NotFoundImageId),
@@ -231,9 +230,9 @@ async fn a_value_outside_the_issued_afi_id_form_is_refused_the_same_way_everywhe
 }
 
 /// RULE 2: an id inside the issued form that resolves to no AFI is answered by the
-/// OPERATION's own refusal — the one it answers an unreadable id with for the two that judge
-/// the id they were given, and the not-found code with that operation's own sentence for the
-/// three that resolve one named AFI.
+/// OPERATION's own refusal — the one it answers an unreadable id with for the listing that
+/// judges the id it was given, and the not-found code with that operation's own sentence for
+/// the four that resolve one named AFI.
 #[tokio::test]
 async fn an_unresolved_afi_id_is_answered_by_each_operations_own_refusal() {
     let (router, engine) = emulator();

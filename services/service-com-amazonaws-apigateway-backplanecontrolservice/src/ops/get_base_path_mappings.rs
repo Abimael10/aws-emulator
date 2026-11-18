@@ -186,12 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         Ok(Paged::new(
             GetBasePathMappingsOutput {
-                // Reported exactly when the page HOLDS a mapping: the recorded answer for a
-                // domain name that carries none is the success envelope alone, so the member
-                // is left unset rather than materialised as an empty list
-                // (`crate::state::Page::reported_items_when_any`, beside the reading the
-                // other listings of this service keep).
-                items: page.reported_items_when_any(items),
+                // "The current page of elements from this collection" is a list a client
+                // counts, so the member is ALWAYS reported — the empty list for a domain
+                // name that carries no mapping, however it came to carry none
+                // (`crate::state::Page::reported_items`, the one reading every listing of
+                // this service shares).
+                items: page.reported_items(items),
                 position: page.next_position.clone(),
             },
             page.echoed_limit(),
