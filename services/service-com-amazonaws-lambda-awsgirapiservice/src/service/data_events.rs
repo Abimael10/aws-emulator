@@ -126,7 +126,10 @@ pub const FUNCTION_VERSION_MEMBER: &str = "functionVersion";
 /// whose errors carry `application/json` and name their shape in `x-amzn-errortype` — the
 /// same values the generated per-operation shim passes, so a refusal raised ahead of a
 /// handler reads exactly as it did before.
-const JSON_ENVELOPE: PreDispatchProtocol<'static> = PreDispatchProtocol::Json {
+///
+/// Shared with the MANAGEMENT leg ([`super::management_events`]): one protocol, one
+/// envelope, whichever class of event the served call is recorded as.
+pub(super) const JSON_ENVELOPE: PreDispatchProtocol<'static> = PreDispatchProtocol::Json {
     content_type: "application/json",
     errortype_header: true,
 };
@@ -449,7 +452,10 @@ pub fn management_event_log<Eng: Send + Sync + 'static>(
 /// The account's SESSION directory in that same shared engine: the sessions the token service
 /// minted, each keyed by the access key id it was minted under, which is what lets the record
 /// of a call made with one name the session it was made by.
-fn session_audit_directory<Eng: Send + Sync + 'static>(
+///
+/// Read by both legs of this front door ([`super::management_events`] too), so the session a
+/// data event and a management event of one caller are recorded as cannot differ.
+pub(super) fn session_audit_directory<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<SessionAuditDirectory>> {
     (engine as &dyn ::std::any::Any)

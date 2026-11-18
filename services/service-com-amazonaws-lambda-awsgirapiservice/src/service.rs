@@ -130,6 +130,11 @@ pub mod function_url;
 /// worded; see the module's own header.
 mod function_url_refusal;
 
+/// The MANAGEMENT leg of this front door: every control-plane call it serves is a management
+/// event of the account, recorded in the event history CloudTrail's `LookupEvents` reads; see
+/// the module's own header.
+pub mod management_events;
+
 /// The media type an INVOCATION's response announces, which is the media type of the
 /// document the function produced rather than of the binding it travels in; see the
 /// module's own header.
@@ -181,18 +186,29 @@ mod validation;
 /// until.
 pub(crate) const LARGEST_QUOTED_VALUE_BYTES: usize = 2 * 20_480;
 
-/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
-/// [`StatedPerOperation`] and keyed by its operation shape name — the routing key
-/// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
+/// Serve one `crate::ops::<module>::<Operation>` per line through `table`: AUDITED, as a
+/// call of the read/write class the management-event catalog states for it
+/// ([`management_events::recorded_class`]), and still wrapped in [`StatedPerOperation`] —
+/// inside the recorder, so a record reports the operation's own typed input and outcome
+/// while the refusal wording stays this service's. Each row is keyed by its operation shape
+/// name, the routing key `ServerHttpProtocol::routing_key` resolves and the generated table
+/// is keyed by.
+///
+/// A row the catalog holds no class for is skipped rather than guessed at: those are the
+/// INVOCATIONS, which [`data_events`] files as data events of the function they run. So the
+/// list below and that catalog cannot disagree about which calls are management events.
 macro_rules! wrap_operations {
     ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
         $(
-            $table.add_operation(
-                stringify!($operation),
-                ::std::boxed::Box::new(StatedPerOperation::new(
+            if let Some(kind) = management_events::recorded_class(
+                <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+            ) {
+                $table.serve_behind(
                     crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
-                )) as ::std::boxed::Box<dyn ErasedOperation>,
-            );
+                    kind,
+                    |audited, _envelope| StatedPerOperation::new(audited),
+                );
+            }
         )+
     };
 }
@@ -346,18 +362,23 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
-        let mut stated = OperationRoutingTable::new();
+        // The table every modelled operation of this service is served through: the AUDIT
+        // table, so each control-plane call it serves is recorded in the account's event
+        // history where CloudTrail's `LookupEvents` reads it (see [`management_events`]) —
+        // one code path for all of them, rather than a recorder per handler.
+        let mut table = management_events::recording_table(&engine);
         // EVERY operation the generated table holds, because the rule is the SERVICE's and
         // not one operation's: an operation whose input declares no constraint simply never
         // has a violation to state, which the wrapper reads off that operation's own input
         // schema. An operation added later is added here too, or its refusal quotes the
-        // shortened value again; `every_modelled_operation_is_wrapped` below fails when one
-        // is missing. `InvokeWithResponseStream` is the one exception, and not an omission:
+        // shortened value again and its calls are served unrecorded;
+        // `every_modelled_operation_is_wrapped` below fails when one is missing.
+        // `InvokeWithResponseStream` is the one exception, and not an omission:
         // its output binds a `@streaming` union, so it implements no
         // `smithy_server_runtime::Operation` at all and is served by `response_stream`
         // below, which reads and checks its own input against the model.
         wrap_operations!(
-            stated,
+            table,
             engine,
             add_layer_version_permission::AddLayerVersionPermission,
             add_permission::AddPermission,
@@ -445,6 +466,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             update_function_event_invoke_config::UpdateFunctionEventInvokeConfig,
             update_function_url_config::UpdateFunctionUrlConfig,
         );
+        let mut stated = table.finish();
         // The INVOCATIONS, which are the two rows above that are NOT management events of the
         // account: a call that runs a function acts on that function's contents, which
         // CloudTrail records as a DATA event and delivers only into the bucket of a trail

@@ -16,7 +16,9 @@
 //! deserialized input before the handler runs and the handler's own `Result` after, which
 //! is what lets one rule hold for every operation —
 //!
-//! * `eventName` is the operation's modelled name ([`Operation::NAME`]);
+//! * `eventName` is the name the serving service publishes the operation's calls under
+//!   ([`AuditedService::event_name`]), which is the operation's modelled name
+//!   ([`Operation::NAME`]) unless that service spells it otherwise;
 //! * `requestParameters` / `responseElements` are the built input and output rendered
 //!   against their own schemas ([`crate::management_events::recorded_shape`]), so a
 //!   member whose value the serving API withholds is redacted or left out rather than
@@ -247,6 +249,19 @@ pub trait AuditedService: Send + Sync + 'static {
     /// The `eventSource` every record of this service carries: its endpoint prefix in
     /// CloudTrail's `<prefix>.amazonaws.com` form.
     fn event_source(&self) -> &'static str;
+
+    /// The `eventName` CloudTrail PUBLISHES the calls of `operation` under, which for
+    /// almost every service is the operation's own modelled name — the default.
+    ///
+    /// It is a seam because a few services publish a name of their own: a REST API whose
+    /// operations are versioned per URI reports the operation name with that version's
+    /// marker appended, so a client filtering a lookup by `EventName` has to be told the
+    /// name the service publishes rather than the shape name. Only the NAME changes; which
+    /// resources and which additional data a record carries are still asked for under the
+    /// modelled name, so a service states its own spelling once, here.
+    fn event_name(&self, operation: &'static str) -> String {
+        operation.to_string()
+    }
 
     /// The Region the call was served in, read off the request the way this service reads
     /// it everywhere else.
@@ -565,7 +580,11 @@ impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
             .as_deref()
             .and_then(|access_key_id| self.service.recorded_session(access_key_id));
         Some(ServedApiCall {
-            event_name: O::NAME.to_string(),
+            // The name CloudTrail publishes this operation's calls under, which the serving
+            // service spells ([`AuditedService::event_name`]); every other lookup below
+            // stays on the MODELLED name, because that is what this service's own tables
+            // are keyed by.
+            event_name: self.service.event_name(O::NAME),
             event_source: self.service.event_source().to_string(),
             read_only: self.kind.read_only(),
             access_key_id: caller.access_key_id,
