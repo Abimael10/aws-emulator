@@ -8,7 +8,8 @@
 //! Each replacement launches and terminates the account's own Amazon EC2 instances
 //! through the group's single launch path, so the ids the group reports while a
 //! refresh runs are ids Amazon EC2 resolves. A group may have only one active refresh
-//! at a time.
+//! at a time, and a refresh does not START while a CloudWatch monitor its preferences
+//! name is sounding ([`crate::state::refresh_alarms`]).
 //!
 //! ## Shape of an operation
 //!
@@ -216,6 +217,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if preferences.auto_rollback == Some(true) && input.desired_configuration.is_none() {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
                     crate::state::refresh_preferences::AUTO_ROLLBACK_WITHOUT_DESIRED_CONFIGURATION_MESSAGE,
+                ));
+            }
+            // The monitors the refresh would run under are read from the account's own
+            // CloudWatch store BEFORE anything is created: a refresh does not begin while
+            // one of the alarms it is watched against is already sounding
+            // ([`crate::state::refresh_alarms`]). Asked BEFORE this service's store is
+            // locked, so only one store is ever held at a time.
+            if crate::state::refresh_alarms::a_monitor_is_in_alarm(
+                &*self.engine,
+                preferences.alarm_specification.as_ref(),
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::refresh_alarms::MONITOR_IN_ALARM_MESSAGE,
                 ));
             }
         }

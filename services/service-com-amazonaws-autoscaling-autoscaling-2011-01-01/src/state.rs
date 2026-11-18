@@ -240,6 +240,10 @@ pub use attached_instances::{attach_description, AttachRefusal};
 /// each member the request left out at the default this service applies.
 pub mod refresh_preferences;
 
+/// The CloudWatch monitors a refresh's `AlarmSpecification` names, read from the account's
+/// own CloudWatch store: a refresh cannot START while one of them is sounding.
+pub mod refresh_alarms;
+
 /// The instances a group holds that the account's Amazon EC2 store no longer runs: the
 /// health check that takes them out of the group and the convergence that replaces them.
 pub mod ec2_health;

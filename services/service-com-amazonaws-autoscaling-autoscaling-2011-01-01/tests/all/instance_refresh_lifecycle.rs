@@ -15,13 +15,20 @@
 //! model's default, or either value the enum admits), whether the refresh carries a
 //! desired configuration — which the group's own settings reflect once the refresh
 //! succeeds — and whether `SkipMatching` leaves instances that already run the target
-//! configuration alone. A second table spans the requests the operation refuses.
+//! configuration alone. A second table spans the requests the operation refuses, and a
+//! third the CloudWatch monitors a refresh may not START under.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
+use serde_json::json;
 
-use crate::support::{new_engine, query, router_with, tag_value, tag_values, xml_unescape};
+use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
+use service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch_service;
+
+use crate::support::{
+    json_rpc, new_engine, query, router_with, tag_value, tag_values, xml_unescape,
+};
 
 /// The launch template the groups in this suite launch from.
 const LAUNCH_TEMPLATE: &str = "lt-refresh";
@@ -694,6 +701,7 @@ async fn the_refreshes_of_a_group_are_paged_newest_first() {
 
     // A group that has never been refreshed reports no refresh rather than refusing.
     create_group(&router, "asg-never-refreshed", 0).await;
+
     let (status, body) = query(
         &router,
         "DescribeInstanceRefreshes",
@@ -705,4 +713,354 @@ async fn the_refreshes_of_a_group_are_paged_newest_first() {
         tag_values(&body, "InstanceRefreshId").is_empty(),
         "a group nobody has refreshed reports no refresh, got {body}"
     );
+}
+
+/// The sentence a refresh is refused with while one of the CloudWatch monitors its
+/// preferences name is sounding. Fixed text, with no part of the request in it.
+const MONITOR_IN_ALARM_MESSAGE: &str =
+    "A CloudWatch monitor is in alarm. The instance refresh cannot start.";
+
+/// The signing name a client scopes a CloudWatch request to, and the `x-amz-target` prefix
+/// and awsJson version CloudWatch's own protocol names its operations under.
+const CLOUDWATCH_SIGNING_NAME: &str = "monitoring";
+const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
+const CLOUDWATCH_JSON_VERSION: &str = "1.0";
+
+/// A router carrying Amazon EC2 Auto Scaling and CloudWatch on ONE engine: the monitors a
+/// refresh names are CloudWatch's own alarms, so they are created and forced through
+/// CloudWatch's own API rather than written into this service's store.
+fn router_with_cloudwatch() -> smithy_server_runtime::MultiServiceRouter {
+    let engine = new_engine();
+    crate::support::seed_launch_templates(&engine, &[LAUNCH_TEMPLATE]);
+    let mut router = smithy_server_runtime::MultiServiceRouter::new();
+    router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(cloudwatch_service::EmulatedService::new(engine));
+    router
+}
+
+/// One CloudWatch call that must succeed, answered as the JSON a client parses.
+async fn cloudwatch_call(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    let (status, answer) = json_rpc(
+        router,
+        CLOUDWATCH_SIGNING_NAME,
+        CLOUDWATCH_TARGET_PREFIX,
+        CLOUDWATCH_JSON_VERSION,
+        operation,
+        body,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CloudWatch {operation} expected 200, got {status} with {answer}"
+    );
+    answer
+}
+
+/// Create one metric alarm and force it into `state`, both through CloudWatch's own API.
+async fn monitor_in_state(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    name: &str,
+    state: &str,
+) {
+    cloudwatch_call(
+        router,
+        case,
+        "PutMetricAlarm",
+        json!({
+            "AlarmName": name,
+            "Namespace": "Custom/Refresh",
+            "MetricName": "Latency",
+            "Statistic": "Average",
+            "Period": 60,
+            "EvaluationPeriods": 1,
+            "Threshold": 10.0,
+            "ComparisonOperator": "GreaterThanThreshold",
+        }),
+    )
+    .await;
+    cloudwatch_call(
+        router,
+        case,
+        "SetAlarmState",
+        json!({
+            "AlarmName": name,
+            "StateValue": state,
+            "StateReason": "forced by this suite",
+        }),
+    )
+    .await;
+}
+
+/// The `StateValue` CloudWatch's own `DescribeAlarms` reports for one alarm.
+async fn monitor_state(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> String {
+    let answer = cloudwatch_call(
+        router,
+        case,
+        "DescribeAlarms",
+        json!({"AlarmNames": [name]}),
+    )
+    .await;
+    answer["MetricAlarms"][0]["StateValue"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Create one group holding no instance, without waiting for any placement: a group with
+/// no capacity places nothing, and these rows are about what the monitors decide.
+async fn create_empty_group(router: &smithy_server_runtime::MultiServiceRouter, name: &str) {
+    let (status, body) = query(
+        router,
+        "CreateAutoScalingGroup",
+        &[
+            ("AutoScalingGroupName", name),
+            ("LaunchTemplate.LaunchTemplateName", LAUNCH_TEMPLATE),
+            ("MinSize", "0"),
+            ("MaxSize", "2"),
+            ("DesiredCapacity", "0"),
+            ("AvailabilityZones.member.1", ZONE),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateAutoScalingGroup for {name} expected 200, got {status}: {body}"
+    );
+}
+
+/// One row of the monitor table: the state of each monitor the request names, and whether
+/// the refresh is allowed to start.
+struct Monitors {
+    case: &'static str,
+    /// The state each named monitor is in, in the order the request names them; `None`
+    /// creates no alarm of that name at all, so the name resolves to no monitor.
+    states: &'static [Option<&'static str>],
+    /// The healthy-percentage preferences the request carries beside the specification,
+    /// so the gate is pinned for a request that states other preferences too.
+    healthy_percentages: Option<(&'static str, &'static str)>,
+    /// Whether the refresh starts.
+    starts: bool,
+}
+
+/// A refresh does not START while a monitor its `AlarmSpecification` names is in ALARM, and
+/// starts when none of them is.
+///
+/// The rule: "the names of one or more CloudWatch alarms to monitor for the instance
+/// refresh" (`smithy_query(query="doc",shape="AlarmSpecification",member="Alarms")`) — the
+/// alarms named there are what the refresh is watched against, so Amazon EC2 Auto Scaling
+/// refuses to begin one while any of them is sounding, with `ValidationError` and
+/// [`MONITOR_IN_ALARM_MESSAGE`], and creates nothing.
+///
+/// The rows differ along what the rule generalises over: how many monitors the request
+/// names, which of the three `StateValue` values each is in, WHERE in the list the sounding
+/// one sits, whether a named monitor exists at all, and whether the request states other
+/// preferences beside the specification.
+#[tokio::test]
+async fn a_sounding_monitor_refuses_the_start_of_a_refresh() {
+    let rows = [
+        Monitors {
+            case: "no monitor named at all",
+            states: &[],
+            healthy_percentages: None,
+            starts: true,
+        },
+        Monitors {
+            case: "one monitor, in OK",
+            states: &[Some("OK")],
+            healthy_percentages: None,
+            starts: true,
+        },
+        Monitors {
+            case: "one monitor, in INSUFFICIENT_DATA",
+            states: &[Some("INSUFFICIENT_DATA")],
+            healthy_percentages: None,
+            starts: true,
+        },
+        Monitors {
+            case: "one monitor, in ALARM",
+            states: &[Some("ALARM")],
+            healthy_percentages: None,
+            starts: false,
+        },
+        Monitors {
+            case: "one monitor in ALARM, beside the healthy-percentage preferences",
+            states: &[Some("ALARM")],
+            healthy_percentages: Some(("100", "200")),
+            starts: false,
+        },
+        Monitors {
+            case: "two monitors, the first of them sounding",
+            states: &[Some("ALARM"), Some("OK")],
+            healthy_percentages: None,
+            starts: false,
+        },
+        Monitors {
+            case: "three monitors, the last of them sounding",
+            states: &[Some("OK"), Some("INSUFFICIENT_DATA"), Some("ALARM")],
+            healthy_percentages: None,
+            starts: false,
+        },
+        Monitors {
+            case: "three monitors, none of them sounding",
+            states: &[Some("OK"), Some("INSUFFICIENT_DATA"), Some("OK")],
+            healthy_percentages: Some(("90", "110")),
+            starts: true,
+        },
+        Monitors {
+            case: "a name no alarm answers to",
+            states: &[None],
+            healthy_percentages: None,
+            starts: true,
+        },
+        Monitors {
+            case: "a name no alarm answers to, beside one that is sounding",
+            states: &[None, Some("ALARM")],
+            healthy_percentages: None,
+            starts: false,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        // One emulator per row: each row is its own account, so neither a group nor an
+        // alarm of one row explains another's outcome.
+        let router = router_with_cloudwatch();
+        let group = format!("asg-monitored-{index}");
+        create_empty_group(&router, &group).await;
+
+        // The monitors this row names, each created in CloudWatch and forced into the
+        // state the row states — except the ones the row leaves uncreated.
+        let names: Vec<String> = (0..row.states.len())
+            .map(|position| format!("monitor-{index}-{position}"))
+            .collect();
+        for (name, state) in names.iter().zip(row.states) {
+            if let Some(state) = state {
+                monitor_in_state(&router, row.case, name, state).await;
+            }
+        }
+
+        let mut params: Vec<(String, String)> = vec![
+            ("AutoScalingGroupName".to_string(), group.clone()),
+            ("Strategy".to_string(), "Rolling".to_string()),
+        ];
+        for (position, name) in names.iter().enumerate() {
+            params.push((
+                format!(
+                    "Preferences.AlarmSpecification.Alarms.member.{}",
+                    position + 1
+                ),
+                name.clone(),
+            ));
+        }
+        if let Some((min, max)) = row.healthy_percentages {
+            params.push((
+                "Preferences.MinHealthyPercentage".to_string(),
+                min.to_string(),
+            ));
+            params.push((
+                "Preferences.MaxHealthyPercentage".to_string(),
+                max.to_string(),
+            ));
+        }
+        let borrowed = crate::support::borrowed(&params);
+        let (status, body) = query(&router, "StartInstanceRefresh", &borrowed).await;
+
+        if row.starts {
+            assert_eq!(
+                status, 200,
+                "case {:?}: expected the refresh to start, got {status}: {body}",
+                row.case
+            );
+            let id = tag_value(&body, "InstanceRefreshId");
+            assert!(
+                !id.is_empty(),
+                "case {:?}: a started refresh carries an id, got {body}",
+                row.case
+            );
+            let (reported, _) = newest_refresh(&router, &group).await;
+            assert_eq!(
+                reported,
+                vec![id],
+                "case {:?}: the group reports the refresh it started, got {reported:?}",
+                row.case
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected the refresh to be refused, got {status}: {body}",
+            row.case
+        );
+        assert_eq!(
+            tag_value(&body, "Code"),
+            "ValidationError",
+            "case {:?}: expected the ValidationError code, got {body}",
+            row.case
+        );
+        assert_eq!(
+            xml_unescape(&tag_value(&body, "Message")),
+            MONITOR_IN_ALARM_MESSAGE,
+            "case {:?}: expected the fixed monitor sentence, got {body}",
+            row.case
+        );
+        // Nothing was created: the group has no refresh at all, so nothing is left in
+        // flight for a later caller to find.
+        let (reported, _) = newest_refresh(&router, &group).await;
+        assert!(
+            reported.is_empty(),
+            "case {:?}: a refused refresh leaves no refresh behind, got {reported:?}",
+            row.case
+        );
+        // The refusal read the monitors; it did not move one.
+        for (name, state) in names.iter().zip(row.states) {
+            if let Some(state) = state {
+                let held = monitor_state(&router, row.case, name).await;
+                assert_eq!(
+                    held, *state,
+                    "case {:?}: the monitor {name} must still be in {state}, got {held:?}",
+                    row.case
+                );
+            }
+        }
+
+        // With every monitor back in OK the identical call starts a refresh: the gate is
+        // the monitors' CURRENT state, not a mark left on the group.
+        for (name, state) in names.iter().zip(row.states) {
+            if state.is_some() {
+                cloudwatch_call(
+                    &router,
+                    row.case,
+                    "SetAlarmState",
+                    json!({
+                        "AlarmName": name,
+                        "StateValue": "OK",
+                        "StateReason": "cleared by this suite",
+                    }),
+                )
+                .await;
+            }
+        }
+        let (status, body) = query(&router, "StartInstanceRefresh", &borrowed).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: with the monitors cleared the same call must start a refresh, got \
+             {status}: {body}",
+            row.case
+        );
+        assert!(
+            !tag_value(&body, "InstanceRefreshId").is_empty(),
+            "case {:?}: the cleared call carries the refresh's id, got {body}",
+            row.case
+        );
+    }
 }
