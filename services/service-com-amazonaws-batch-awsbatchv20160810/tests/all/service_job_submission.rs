@@ -1071,3 +1071,297 @@ async fn a_service_job_queue_resolves_its_service_environments_by_name_or_arn() 
         );
     }
 }
+
+/// A scheduling policy called `name` carrying the members `policy` states (its
+/// `fairsharePolicy` or its `quotaSharePolicy`); answers the ARN it was minted under.
+async fn scheduling_policy(batch: &Batch, name: &str, policy: Value) -> String {
+    let mut body = json!({"name": name});
+    for (member, value) in policy.as_object().cloned().unwrap_or_default() {
+        body[member] = value;
+    }
+    let created = batch.ok("/v1/createschedulingpolicy", body).await;
+    created["arn"].as_str().unwrap_or_default().to_string()
+}
+
+/// A `SAGEMAKER_TRAINING` queue over `environment` with `policy_arn` attached; answers its
+/// ARN.
+async fn queue_with_policy(
+    batch: &Batch,
+    name: &str,
+    environment: &str,
+    policy_arn: &str,
+) -> String {
+    let created = batch
+        .ok(
+            "/v1/createjobqueue",
+            json!({
+                "jobQueueName": name,
+                "priority": 1,
+                "jobQueueType": state::JOB_QUEUE_TYPE_SAGEMAKER_TRAINING,
+                "serviceEnvironmentOrder": [{"order": 1, "serviceEnvironment": environment}],
+                "schedulingPolicyArn": policy_arn,
+            }),
+        )
+        .await;
+    created["jobQueueArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A quota share called `name` on the queue `queue`, with the members
+/// `CreateQuotaShare` requires.
+async fn quota_share(batch: &Batch, name: &str, queue: &str) {
+    batch
+        .ok(
+            "/v1/createquotashare",
+            json!({
+                "quotaShareName": name,
+                "jobQueue": queue,
+                "capacityLimits": [{"maxCapacity": 4, "capacityUnit": "ml.m5.large"}],
+                "resourceSharingConfiguration": {"strategy": "RESERVE"},
+                "preemptionConfiguration": {"inSharePreemption": "DISABLED"},
+            }),
+        )
+        .await;
+}
+
+/// The body of a minimal `SubmitServiceJob` onto `queue`, carrying `extra` over it.
+fn submit_body(job_name: &str, queue: &str, extra: Value) -> Value {
+    let mut body = json!({
+        "jobName": job_name,
+        "jobQueue": queue,
+        "serviceJobType": SERVICE_JOB_TYPE,
+        "serviceRequestPayload": "{}",
+    });
+    for (member, value) in extra.as_object().cloned().unwrap_or_default() {
+        body[member] = value;
+    }
+    body
+}
+
+/// RULE: a submit is admitted onto a job queue only while that queue's state is `ENABLED`
+/// (`JQState`: "If the job queue state is `DISABLED`, new jobs can't be added to the queue,
+/// but jobs already in the queue can finish"), so a submit onto a queue in any other state
+/// is the modelled `ClientException` (HTTP 400) stating that precondition and the queue's
+/// own ARN, and it persists nothing.
+///
+/// The rows walk the state in BOTH directions — the create's default, disabled, enabled
+/// again, disabled again — and name the queue by name and by ARN, so what decides the
+/// answer is the state the queue carries and not the order or the spelling of the request.
+#[tokio::test]
+async fn a_service_job_is_admitted_only_onto_an_enabled_queue() {
+    let batch = Batch::new();
+    let (queue_name, queue_arn) = environment_and_queue(&batch).await;
+
+    // (case, the state to put the queue in, how the submit names it, the status expected)
+    let rows: Vec<(&str, Option<&str>, String, u16)> = vec![
+        (
+            "the create's default state, by name",
+            None,
+            queue_name.clone(),
+            200,
+        ),
+        (
+            "DISABLED, by name",
+            Some(state::STATE_DISABLED),
+            queue_name.clone(),
+            400,
+        ),
+        (
+            "DISABLED, by ARN",
+            Some(state::STATE_DISABLED),
+            queue_arn.clone(),
+            400,
+        ),
+        (
+            "ENABLED again, by ARN",
+            Some(state::STATE_ENABLED),
+            queue_arn.clone(),
+            200,
+        ),
+        (
+            "DISABLED again, by name",
+            Some(state::STATE_DISABLED),
+            queue_name.clone(),
+            400,
+        ),
+    ];
+
+    for (index, (case, queue_state, reference, expected)) in rows.iter().enumerate() {
+        if let Some(queue_state) = queue_state {
+            batch
+                .ok(
+                    "/v1/updatejobqueue",
+                    json!({"jobQueue": &queue_arn, "state": queue_state}),
+                )
+                .await;
+        }
+        let before = stored_service_jobs(&batch);
+        let (status, body) = submit(
+            &batch,
+            submit_body(&format!("sj-state-{index}"), reference, json!({})),
+        )
+        .await;
+        assert_eq!(
+            status, *expected,
+            "case {case:?}: expected HTTP {expected}, got {status} {body}"
+        );
+        if *expected == 400 {
+            assert_eq!(
+                error_code(&body),
+                "ClientException",
+                "case {case:?}: expected the modelled ClientException, got {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                state::job_queue_not_enabled_message(&queue_arn),
+                "case {case:?}: expected the sentence stating the ENABLED precondition and \
+                 the queue's ARN, got {body}"
+            );
+            assert_eq!(
+                stored_service_jobs(&batch),
+                before,
+                "case {case:?}: a refused submit persists no service job"
+            );
+        } else {
+            assert_eq!(
+                stored_service_jobs(&batch),
+                before + 1,
+                "case {case:?}: an admitted submit persists exactly one service job, got \
+                 {body}"
+            );
+        }
+    }
+}
+
+/// RULE: a submit onto a job queue whose attached scheduling policy divides the queue's
+/// capacity into QUOTA SHARES must name a `quotaShareName` the queue holds a share under
+/// (`SubmitServiceJob$quotaShareName`: "Don't specify this parameter if the job queue
+/// doesn't have a quota share scheduling policy. If the job queue has a quota share
+/// scheduling policy, then this parameter must be specified"), and a submit that names none
+/// — or one no share of that queue answers to — is the modelled `ClientException` (HTTP
+/// 400) that persists nothing.
+///
+/// The rows differ along what the rule generalises over: the KIND of policy attached to the
+/// queue (a quota-share one, a fair-share one, none at all), whether the submit names a
+/// share, and whether the name it gives is one of that queue's shares — including a share
+/// created on ANOTHER queue, which is no share of this one.
+#[tokio::test]
+async fn a_quota_managed_queue_admits_only_a_submit_naming_one_of_its_shares() {
+    let batch = Batch::new();
+    let environment = service_environment(&batch, "se-shares").await;
+
+    let quota_policy = scheduling_policy(
+        &batch,
+        "sp-quota",
+        // `QuotaSharePolicy$idleResourceAssignmentStrategy`'s only documented value.
+        json!({"quotaSharePolicy": {"idleResourceAssignmentStrategy": "FIFO"}}),
+    )
+    .await;
+    let fair_policy = scheduling_policy(
+        &batch,
+        "sp-fair",
+        json!({"fairsharePolicy": {"shareDecaySeconds": 600, "computeReservation": 25}}),
+    )
+    .await;
+
+    let quota_queue = queue_with_policy(&batch, "q-quota", &environment, &quota_policy).await;
+    let fair_queue = queue_with_policy(&batch, "q-fair", &environment, &fair_policy).await;
+    let plain_queue = sagemaker_queue(&batch, "q-plain", &environment).await;
+    quota_share(&batch, "qs-here", &quota_queue).await;
+    // A share of the OTHER queue: the same name is never reachable from the quota-managed
+    // queue, because a share is named under the queue it hangs off.
+    quota_share(&batch, "qs-elsewhere", &plain_queue).await;
+
+    // (case, the queue, the quotaShareName the submit names, the status expected)
+    let rows: Vec<(&str, &String, Option<&str>, u16)> = vec![
+        (
+            "a quota-managed queue, naming one of its shares",
+            &quota_queue,
+            Some("qs-here"),
+            200,
+        ),
+        (
+            "a quota-managed queue, naming no share",
+            &quota_queue,
+            None,
+            400,
+        ),
+        (
+            "a quota-managed queue, naming a share it does not hold",
+            &quota_queue,
+            Some("qs-absent"),
+            400,
+        ),
+        (
+            "a quota-managed queue, naming a share of another queue",
+            &quota_queue,
+            Some("qs-elsewhere"),
+            400,
+        ),
+        (
+            "a fair-share queue, naming no share: the requirement is the quota-share \
+             policy's",
+            &fair_queue,
+            None,
+            200,
+        ),
+        (
+            "a queue with no scheduling policy, naming no share",
+            &plain_queue,
+            None,
+            200,
+        ),
+    ];
+
+    for (index, (case, queue, share, expected)) in rows.iter().enumerate() {
+        let extra = match share {
+            Some(share) => json!({"quotaShareName": share}),
+            None => json!({}),
+        };
+        let before = stored_service_jobs(&batch);
+        let (status, body) = submit(
+            &batch,
+            submit_body(&format!("sj-share-{index}"), queue, extra),
+        )
+        .await;
+        assert_eq!(
+            status, *expected,
+            "case {case:?}: expected HTTP {expected}, got {status} {body}"
+        );
+        if *expected == 400 {
+            assert_eq!(
+                error_code(&body),
+                "ClientException",
+                "case {case:?}: expected the modelled ClientException, got {body}"
+            );
+            let expected_message = match share {
+                // A name no share of the queue answers to is the service's own lookup
+                // missing, worded as this plane words a miss.
+                Some(share) => format!("QuotaShare {share} not found."),
+                // A member the queue's policy requires and the request did not give: the
+                // rule the member documents, stated bare and naming the queue that
+                // requires it, as this plane's state-derived refusals do.
+                None => state::quota_share_name_required_message(queue),
+            };
+            let message = error_message(&body);
+            assert_eq!(
+                message, expected_message,
+                "case {case:?}: expected {expected_message:?}, got {message:?}"
+            );
+            assert_eq!(
+                stored_service_jobs(&batch),
+                before,
+                "case {case:?}: a refused submit persists no service job"
+            );
+        } else {
+            assert_eq!(
+                stored_service_jobs(&batch),
+                before + 1,
+                "case {case:?}: an admitted submit persists exactly one service job, got \
+                 {body}"
+            );
+        }
+    }
+}

@@ -34,7 +34,7 @@ use service_com_amazonaws_batch_awsbatchv20160810::state;
 
 use crate::job_lifecycle::{
     arn, assert_clock_owed_status, assert_reads_agree, bracketed, compute_environment,
-    container_properties, describe_job, job_definition, job_queue, Batch,
+    container_properties, describe_job, job_definition, job_queue, until_status, Batch,
 };
 
 /// The envelope AWS Batch wraps only the refusals it is recorded to wrap in — so a
@@ -638,20 +638,34 @@ async fn a_disabled_queue_accepts_no_new_jobs() {
         );
         if status == 400 {
             let message = answered["message"].as_str().unwrap_or_default();
+            // The refusal states the PRECONDITION the queue did not meet, naming the ARN
+            // the reference resolved to, and states it bare
+            // (`state::job_queue_not_enabled_message`).
+            assert_eq!(
+                message,
+                state::job_queue_not_enabled_message(&queue_arn),
+                "case {case}: expected the bare sentence naming the queue's ARN and the \
+                 ENABLED precondition, got {answered}"
+            );
             assert!(
-                message.contains("DISABLED") && !message.starts_with(REFUSAL_ENVELOPE),
-                "case {case}: expected the bare detail naming the queue's state, got \
-                 {answered}"
+                !message.starts_with(REFUSAL_ENVELOPE),
+                "case {case}: expected the sentence bare, got {answered}"
             );
         }
     }
 
     // "jobs already in the queue can finish": the job submitted while the queue was
     // enabled keeps advancing on the clock, out of SUBMITTED and into RUNNABLE, where it
-    // rests like every other job here rather than being frozen by the queue's state.
-    let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
-    tokio::time::sleep(Duration::from_millis(span * 6)).await;
-    let detail = describe_job(&batch, &queued).await;
+    // rests like every other job here rather than being frozen by the queue's state. The
+    // wait is for that CONDITION, not for a span: `until_status` looks again until the
+    // status is there or its generous deadline passes.
+    let detail = until_status(
+        &batch,
+        "a job already in a disabled queue",
+        &queued,
+        state::JOB_RUNNABLE,
+    )
+    .await;
     assert_eq!(
         detail["status"].as_str(),
         Some(state::JOB_RUNNABLE),

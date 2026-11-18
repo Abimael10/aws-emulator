@@ -39,6 +39,14 @@
 //! serialized in. This service takes it for one framing rule only — an answer that carries
 //! NO CONTENT carries no body — which lives in [`no_content`].
 //!
+//! ## The decision taken in front of every handler
+//!
+//! AWS decides at the IAM layer whether the caller may perform the action a request names,
+//! ahead of the service resolving anything the request named. That decision lives in
+//! [`authorization`] and is taken by the operation wrapper `override_operation` hands back
+//! ([`request_id_header::RequestIdHeaderOperation`]), so a caller whose policies do not allow
+//! the action is refused before any handler reads or writes anything.
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
@@ -60,6 +68,7 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod authorization;
 pub mod no_content;
 pub mod request_id_header;
 
@@ -128,10 +137,11 @@ fn enum_membership_message(violation: &Violation) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// Serves every routable request through the generated routing table and then reports
-    /// the request that answer belongs to; see [`request_id_header`]. Held, not built per
-    /// request: `override_operation` hands back a borrow of it.
-    request_id_header: RequestIdHeaderOperation,
+    /// Serves every routable request behind IAM's decision about the action it names (see
+    /// [`authorization`]) and then reports the request that answer belongs to; see
+    /// [`request_id_header`]. Held, not built per request: `override_operation` hands back a
+    /// borrow of it.
+    request_id_header: RequestIdHeaderOperation<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -140,8 +150,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
-            request_id_header: RequestIdHeaderOperation,
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            request_id_header: RequestIdHeaderOperation::new(engine),
         }
     }
 }
@@ -179,7 +189,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
         // Every request the generated routing table can serve is served through the
-        // header wrapper, which delegates to that same table entry and then reports the
+        // header wrapper, which takes IAM's decision about the action the request names
+        // ([`authorization`]), delegates to that same table entry and then reports the
         // request that answer belongs to in the header AWS carries it in (see
         // [`request_id_header`]). The routing stays the model's: a request whose target
         // names no modelled operation is declined here, so the framework answers it as

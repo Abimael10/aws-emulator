@@ -152,6 +152,53 @@ pub fn quota_share_exists_message(quota_share_name: &str, job_queue: &str) -> St
 /// on the create or replaces the stored one on the update.
 pub const CAPACITY_LIMITS_REQUIRED: &str = "capacityLimits is required and cannot be empty.";
 
+/// What AWS Batch answers a multi-node `nodeProperties` whose `mainNode` is not below its
+/// `numNodes`.
+///
+/// `NodeProperties$mainNode` is "the node index for the main node of a multi-node parallel
+/// job. This node index value must be fewer than the number of nodes", and neither member
+/// carries a `@range` or a cross-member constraint, so the rule is applied in the handler.
+/// The sentence is FIXED: it states which index broke which bound, and carries neither a
+/// member path nor either submitted value — a refusal of this class names no value of the
+/// request.
+pub const MAIN_NODE_OUT_OF_RANGE: &str =
+    "Main node index is out of range, must be less than numNodes.";
+
+/// How AWS Batch words the refusal of a submit onto a job queue whose state is not
+/// `ENABLED`.
+///
+/// `JQState`: "If the job queue state is `DISABLED`, new jobs can't be added to the queue,
+/// but jobs already in the queue can finish." The sentence states that PRECONDITION rather
+/// than the state the queue happens to be in, and its one variable part is the ARN the
+/// request's name-or-ARN reference resolved to — the same `<Kind> <reference> <condition>.`
+/// shape this plane's lookup miss carries ([`super::not_found_exception`]).
+///
+/// Shared by every submit that admits work onto a queue — the job plane's `SubmitJob` and
+/// the service-job plane's `SubmitServiceJob` — because the precondition is the queue's,
+/// not the operation's.
+pub fn job_queue_not_enabled_message(job_queue_arn: &str) -> String {
+    format!("JobQueue {job_queue_arn} not ENABLED.")
+}
+
+/// How AWS Batch words the refusal of a submit that names no `quotaShareName` onto a job
+/// queue whose scheduling policy carries a quota share.
+///
+/// `SubmitServiceJob$quotaShareName`: "Don't specify this parameter if the job queue
+/// doesn't have a quota share scheduling policy. If the job queue has a quota share
+/// scheduling policy, then this parameter must be specified." The member is an optional
+/// unconstrained `String`, so the requirement is CONDITIONAL on the queue the request names
+/// and is decided by the service layer rather than at the boundary — which is why the
+/// sentence is stated BARE, as this plane's other state-derived refusals are, and why it
+/// names the QUEUE it is about the way they name it ([`job_queue_not_enabled_message`],
+/// [`super::not_found_exception`]): the kind, then the ARN the request's reference resolved
+/// to.
+///
+/// The requirement itself is the model's own, restated as the service states a rule: the
+/// member that must be given, and the queue that requires it.
+pub fn quota_share_name_required_message(job_queue_arn: &str) -> String {
+    format!("quotaShareName must be specified for JobQueue {job_queue_arn}.")
+}
+
 /// The smallest capacity a `capacityLimits` entry may allocate.
 ///
 /// Neither `QuotaShareCapacityLimit$maxCapacity` nor `CapacityLimit$maxCapacity` carries a

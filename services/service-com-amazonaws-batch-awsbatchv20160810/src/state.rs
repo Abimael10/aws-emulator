@@ -90,6 +90,7 @@ mod job_logs;
 mod placement;
 mod queue_snapshot;
 mod service_job_dispatch;
+mod share_selection;
 
 pub use array_jobs::*;
 pub use described_collections::*;

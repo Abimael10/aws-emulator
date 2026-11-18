@@ -345,12 +345,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let queue_arn = queue.arn.clone();
             // `JQState`: "If the job queue state is DISABLED, new jobs can't be added to
-            // the queue, but jobs already in the queue can finish." So a submit to a
-            // disabled queue is refused, and the jobs already stored for it keep
-            // advancing.
-            if queue.state == batch::STATE_DISABLED {
+            // the queue, but jobs already in the queue can finish." So a submit onto a
+            // queue that is not ENABLED is refused — stating that precondition and the ARN
+            // the reference resolved to ([`batch::job_queue_not_enabled_message`]) — and
+            // the jobs already stored for it keep advancing.
+            if queue.state != batch::STATE_ENABLED {
                 return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
-                    format!("Job queue {queue_arn} is DISABLED and can't accept new jobs"),
+                    batch::job_queue_not_enabled_message(&queue_arn),
                 ))
                 .into());
             }

@@ -436,13 +436,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Specifies the node index for the main node of a multi-node parallel job. This
         // node index value must be fewer than the number of nodes"
         // (`NodeProperties$mainNode`). Both members target a plain `Integer`, so neither
-        // the index nor its relation to `numNodes` is enforced at the boundary.
+        // the index nor its relation to `numNodes` is enforced at the boundary. The
+        // sentence is the fixed one this rule's class carries
+        // ([`crate::state::MAIN_NODE_OUT_OF_RANGE`]): it states which index broke which
+        // bound, and no value of the request.
         if let Some(node_properties) = input.node_properties.as_ref() {
             if node_properties.main_node >= node_properties.num_nodes {
-                return Err(client_exception(&format!(
-                    "nodeProperties.mainNode {} must be fewer than nodeProperties.numNodes {}",
-                    node_properties.main_node, node_properties.num_nodes
-                )));
+                return Err(client_exception(crate::state::MAIN_NODE_OUT_OF_RANGE));
             }
         }
 

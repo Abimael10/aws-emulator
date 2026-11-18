@@ -28,6 +28,8 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_batch_awsbatchv20160810::state;
+
 use crate::job_lifecycle::{error_code, error_message, Batch};
 
 /// The wire error code every client-side refusal of this service carries: the only
@@ -168,7 +170,8 @@ async fn retry_strategy_attempts_is_held_to_the_documented_range() {
 
 /// RULE: a multi-node definition's `mainNode` must be "fewer than the number of nodes"
 /// (`NodeProperties$mainNode`), so a request stating an index at or past `numNodes` is
-/// refused and nothing is stored.
+/// refused with the FIXED sentence this rule's class carries
+/// ([`state::MAIN_NODE_OUT_OF_RANGE`]) and nothing is stored.
 ///
 /// Rows span several node counts on both sides of the relation, including the first index
 /// past each count.
@@ -215,19 +218,77 @@ async fn a_multi_node_definition_main_node_must_be_fewer_than_num_nodes() {
                 "case {case:?}: the stored revision reports what was registered, got {described}"
             );
         } else {
-            refused(
-                &batch,
-                case,
-                &name,
-                body,
-                &format!(
-                    "nodeProperties.mainNode {main_node} must be fewer than \
-                     nodeProperties.numNodes {num_nodes}"
-                ),
-            )
-            .await;
+            refused(&batch, case, &name, body, state::MAIN_NODE_OUT_OF_RANGE).await;
         }
     }
+}
+
+/// RULE: the sentence a `mainNode`-out-of-range refusal states is FIXED — it names the
+/// index that is out of range and the member it must be below, and carries no member path
+/// and neither submitted value — so every request that breaks the relation is refused with
+/// the SAME message whatever node counts it submitted.
+///
+/// The rows differ in both submitted values, which is exactly what a message that echoed
+/// them would differ along: one message for all of them is the assertion.
+#[tokio::test]
+async fn the_main_node_refusal_states_one_sentence_for_every_pair_of_values() {
+    let batch = Batch::new();
+    // (case, numNodes, mainNode) — each pair breaks the relation differently.
+    let rows: &[(&str, i64, i64)] = &[
+        ("the index at the node count", 2, 2),
+        ("the index far past the node count", 3, 99),
+        ("a single node, the index past it", 1, 1),
+        ("many nodes, the index at the count", 64, 64),
+    ];
+
+    let mut messages: Vec<String> = Vec::new();
+    for (index, (case, num_nodes, main_node)) in rows.iter().enumerate() {
+        let name = format!("jd-mainnode-sentence-{index}");
+        let (status, code, message) = register(
+            &batch,
+            json!({
+                "jobDefinitionName": &name,
+                "type": "multinode",
+                "nodeProperties": {
+                    "numNodes": num_nodes,
+                    "mainNode": main_node,
+                    "nodeRangeProperties": [
+                        {"targetNodes": format!("0:{}", num_nodes - 1), "container": container()}
+                    ],
+                },
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, CLIENT_EXCEPTION),
+            "case {case:?}: expected the modelled {CLIENT_EXCEPTION} at HTTP 400, got \
+             {status} {code:?} with {message:?}"
+        );
+        let detail = message
+            .strip_prefix(ENVELOPE_PREFIX)
+            .and_then(|rest| rest.split(", RequestId: ").next())
+            .unwrap_or(message.as_str())
+            .to_string();
+        assert_eq!(
+            detail, state::MAIN_NODE_OUT_OF_RANGE,
+            "case {case:?}: expected the fixed sentence {:?}, got {detail:?}",
+            state::MAIN_NODE_OUT_OF_RANGE
+        );
+        assert!(
+            !detail.contains(&num_nodes.to_string()) && !detail.contains("nodeProperties."),
+            "case {case:?}: the sentence names no submitted value and no member path, got \
+             {detail:?}"
+        );
+        messages.push(detail);
+    }
+    messages.dedup();
+    assert_eq!(
+        messages.len(),
+        1,
+        "case \"one sentence for every pair\": expected every refusal to state the same \
+         sentence, got {messages:?}"
+    );
 }
 
 /// The vCPU/memory pairs Fargate supports, from `ResourceRequirement$value`'s own

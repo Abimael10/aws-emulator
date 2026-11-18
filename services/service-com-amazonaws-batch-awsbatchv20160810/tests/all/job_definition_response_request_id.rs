@@ -26,6 +26,8 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_batch_awsbatchv20160810::state;
+
 use crate::job_lifecycle::{error_code, error_message, Batch};
 use crate::refusal_contract::{assert_uuid_shaped, enveloped, ENVELOPE_REQUEST_ID};
 
@@ -270,8 +272,7 @@ fn rows() -> Vec<Row> {
                 },
             }),
             answer: Answer::Enveloped(
-                "nodeProperties.mainNode 2 must be fewer than nodeProperties.numNodes 2"
-                    .to_string(),
+                state::MAIN_NODE_OUT_OF_RANGE.to_string(),
             ),
         },
         Row {

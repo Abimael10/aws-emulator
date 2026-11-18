@@ -61,6 +61,13 @@ service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = t
 # service's own resources, read out of its own store in the shared engine. No cycle: that
 # crate does not depend on this one.
 service-com-amazonaws-ecrpublic-spencerfrontendservice = { workspace = true }
+# IAM and STS, which hold WHO a request speaks for and WHAT that principal may do: the
+# authorization decision AWS takes in front of every handler reads the caller's identity out
+# of STS's own session store and the policy documents in force on it out of IAM's own store
+# (`service::authorization`), so a document `iam:PutUserPolicy` wrote takes effect on the
+# next request to this service. No cycle: neither crate depends on this one.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

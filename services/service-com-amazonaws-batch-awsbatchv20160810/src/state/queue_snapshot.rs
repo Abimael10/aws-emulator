@@ -226,9 +226,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         let Some(name) = job.quota_share_name.as_deref() else {
             return true;
         };
-        let Some(share) = self.quota_shares.values().find(|share| {
-            share.job_queue_arn == job.job_queue_arn && share.name == name
-        }) else {
+        let Some(share) = self.quota_share_on_queue(&job.job_queue_arn, name) else {
             return true;
         };
         if share.resource_sharing_configuration.strategy == QUOTA_SHARE_STRATEGY_LEND_AND_BORROW {

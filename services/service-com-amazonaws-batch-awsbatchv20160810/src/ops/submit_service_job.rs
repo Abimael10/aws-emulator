@@ -5,7 +5,9 @@
 //! [`crate::state`]: the queue is resolved by name or ARN, the record is minted in the
 //! non-terminal `SUBMITTED` status with a fresh job id and ARN, and `DescribeServiceJob`
 //! reads it back. A `clientToken` makes the submit idempotent. A queue that resolves to
-//! nothing, a queue that is not of type `SAGEMAKER_TRAINING`, a `jobName`,
+//! nothing, a queue that is not of type `SAGEMAKER_TRAINING`, a queue whose state is not
+//! `ENABLED`, a missing or unknown `quotaShareName` on a queue whose scheduling policy
+//! divides its capacity into quota shares, a `jobName`,
 //! `schedulingPriority` or `retryStrategy.attempts` outside what the member documents, a
 //! `clientToken` reused for a different request, a `serviceRequestPayload` past the bytes
 //! this service stores for one job ([`crate::state::limits::MAX_SERVICE_REQUEST_PAYLOAD_BYTES`])
@@ -276,6 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let queue_arn = queue.arn.clone();
         let queue_type = queue.job_queue_type.clone();
+        let queue_state = queue.state.clone();
 
         // "The job queue must have the type SAGEMAKER_TRAINING."
         if queue_type.as_deref() != Some(batch::JOB_QUEUE_TYPE_SAGEMAKER_TRAINING) {
@@ -286,6 +289,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             ))
             .into());
+        }
+
+        // `JQState`: "If the job queue state is DISABLED, new jobs can't be added to the
+        // queue, but jobs already in the queue can finish." DISABLED is how a queue is
+        // DRAINED, so a submit onto a queue that is not ENABLED is refused — with the same
+        // sentence the job plane's submit states for the same precondition
+        // ([`batch::job_queue_not_enabled_message`]) — and nothing is minted for it, while
+        // the jobs already on the queue keep advancing.
+        if queue_state != batch::STATE_ENABLED {
+            return Err(SubmitServiceJobErrorModeled::ClientException(
+                batch::client_exception(batch::job_queue_not_enabled_message(&queue_arn)),
+            )
+            .into());
+        }
+
+        // `quotaShareName`: "Don't specify this parameter if the job queue doesn't have a
+        // quota share scheduling policy. If the job queue has a quota share scheduling
+        // policy, then this parameter must be specified." The member is an optional
+        // unconstrained `String`, so the requirement is conditional on the QUEUE: a queue
+        // whose attached scheduling policy carries a quota share divides its capacity into
+        // those shares ([`batch::ComAmazonawsBatchAwsbatchv20160810State::queue_divides_capacity_by_quota_share`]),
+        // so a job landing on it has to say which share accounts for it, and a name no
+        // share of that queue answers to picks out none — the service's own lookup missing,
+        // worded as this plane words a miss.
+        if state.queue_divides_capacity_by_quota_share(&queue_arn) {
+            let Some(share_name) = input.quota_share_name.as_deref() else {
+                return Err(SubmitServiceJobErrorModeled::ClientException(
+                    batch::client_exception(batch::quota_share_name_required_message(&queue_arn)),
+                )
+                .into());
+            };
+            if state.quota_share_on_queue(&queue_arn, share_name).is_none() {
+                return Err(SubmitServiceJobErrorModeled::ClientException(
+                    batch::not_found_exception("QuotaShare", share_name),
+                )
+                .into());
+            }
         }
 
         // `clientToken` "is used to ensure idempotency of requests. If this parameter is
