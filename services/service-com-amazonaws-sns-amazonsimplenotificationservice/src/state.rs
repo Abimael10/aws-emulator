@@ -2638,6 +2638,17 @@ pub const DEDUPLICATION_ID_WRONG_TOPIC_TYPE_REFUSAL: &str =
     "Invalid parameter: MessageDeduplicationId Reason: The request includes \
      MessageDeduplicationId parameter that is not valid for this topic type";
 
+/// The sentence SNS refuses a FIFO publish carrying no `MessageDeduplicationId` on a
+/// topic whose `ContentBasedDeduplication` is not enabled with: "If you create a FIFO
+/// topic and this attribute is false, you must specify a value for the
+/// MessageDeduplicationId parameter for the Publish action"
+/// (`GetTopicAttributesResponse$Attributes` doc), and the sentence states the caller's
+/// TWO ways out rather than naming the missing member — it carries no topic, entry or
+/// request value, so it is fixed text for this class.
+pub const CONTENT_BASED_DEDUPLICATION_OR_DEDUPLICATION_ID_REFUSAL: &str =
+    "Invalid parameter: The topic should either have ContentBasedDeduplication enabled \
+     or MessageDeduplicationId provided explicitly";
+
 /// The sentence SNS refuses an ordering id (`MessageGroupId`,
 /// `MessageDeduplicationId`) that is not 1 to [`MAX_ORDERING_ID_CHARS`] alphanumeric
 /// or punctuation characters with: it names the parameter and states the rule, and
@@ -2807,11 +2818,7 @@ pub fn topic_message_refusal(
         None if content_based => Ok(Some(hex::encode(Sha256::digest(
             request.message.as_bytes(),
         )))),
-        None => Err(
-            "Invalid parameter: MessageDeduplicationId - required for a FIFO topic whose \
-             ContentBasedDeduplication is not enabled"
-                .to_string(),
-        ),
+        None => Err(CONTENT_BASED_DEDUPLICATION_OR_DEDUPLICATION_ID_REFUSAL.to_string()),
     }
 }
 

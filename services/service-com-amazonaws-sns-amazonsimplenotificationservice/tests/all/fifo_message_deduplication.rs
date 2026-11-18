@@ -19,12 +19,18 @@
 //! derived), the deduplication scope the topic sets, whether two copies share a message
 //! group, which operation published each copy (`Publish`, `PublishBatch`) and whether the
 //! copies are in one request or in two.
+//!
+//! The last suites assert the other side of the rule: a publish that leaves the topic with
+//! NO token — no `MessageDeduplicationId` and no content-based deduplication to derive one
+//! from — is refused with the sentence SNS states for that condition, on the single as on
+//! the batch path, and each of the two ways out that sentence names makes the same call
+//! succeed.
 
 use std::collections::HashSet;
 
 use sha2::{Digest, Sha256};
 
-use super::topics_subscriptions_publish::Sns;
+use super::topics_subscriptions_publish::{Answer, Sns};
 
 /// One publish of one message: its body, its message group, and the deduplication token
 /// the caller supplied (`None` leaves the topic to derive one).
@@ -463,5 +469,281 @@ async fn a_batched_publish_deduplicates_within_the_batch_and_against_publish() {
         delivered(&sns, &subscription),
         2,
         "the message of an unseen token must be delivered"
+    );
+}
+
+/// The sentence SNS refuses a publish to a FIFO topic that leaves it with NO deduplication
+/// token with: the topic derives one only with `ContentBasedDeduplication` enabled, so the
+/// refusal states the caller's two ways out — "If you create a FIFO topic and this
+/// attribute is false, you must specify a value for the MessageDeduplicationId parameter
+/// for the Publish action" (`GetTopicAttributesResponse$Attributes` doc). It is fixed text
+/// for this class: it names neither the topic, the entry, nor any value of the request.
+const NO_DEDUPLICATION_TOKEN_REFUSAL: &str =
+    "Invalid parameter: The topic should either have ContentBasedDeduplication enabled or \
+     MessageDeduplicationId provided explicitly";
+
+/// One refused publishing call: the case, the attributes its FIFO topic is created with
+/// beside the FIFO flag, the action, and the form parameters it carries beside the topic.
+type RefusedCase<'a> = (
+    &'a str,
+    &'a [(&'a str, &'a str)],
+    &'a str,
+    &'a [(&'a str, &'a str)],
+);
+
+/// Call `action` with `params` beside `topic`.
+async fn publishing(sns: &Sns, topic: &str, action: &str, params: &[(&str, &str)]) -> Answer {
+    let mut all: Vec<(&str, &str)> = vec![("TopicArn", topic)];
+    all.extend_from_slice(params);
+    sns.call(action, &all).await
+}
+
+/// A FIFO publish that leaves the topic with no deduplication token at all is refused with
+/// the service's own sentence for that condition, whichever operation carried it — and a
+/// batch holding one such entry is refused WHOLE, so nothing of it is published.
+#[tokio::test]
+async fn a_fifo_publish_with_no_deduplication_token_is_refused_with_the_services_sentence() {
+    let sns = Sns::new();
+
+    // The rows differ along what the rule generalises over: the operation, the setting the
+    // topic was created with (left at its documented default or written as it), the
+    // deduplication scope, how many entries the batch holds and WHICH of them carries no
+    // id. The attribute names come from the `CreateTopicInput$Attributes` catalog.
+    let rows: &[RefusedCase<'_>] = &[
+        (
+            "a publish with the setting left at its default",
+            &[],
+            "Publish",
+            &[("Message", "a body"), ("MessageGroupId", "g1")],
+        ),
+        (
+            "a publish to a topic whose setting is written as the default",
+            &[("ContentBasedDeduplication", "false")],
+            "Publish",
+            &[
+                ("Message", "another body entirely"),
+                ("MessageGroupId", "another-group"),
+            ],
+        ),
+        (
+            "a publish to a topic deduplicating within each message group",
+            &[("FifoThroughputScope", "MessageGroup")],
+            "Publish",
+            &[("Message", "a third body"), ("MessageGroupId", "g9")],
+        ),
+        (
+            "a batch of one entry carrying no id",
+            &[],
+            "PublishBatch",
+            &[
+                ("PublishBatchRequestEntries.member.1.Id", "only"),
+                ("PublishBatchRequestEntries.member.1.Message", "a body"),
+                ("PublishBatchRequestEntries.member.1.MessageGroupId", "g1"),
+            ],
+        ),
+        (
+            "a batch whose LAST entry carries no id",
+            &[],
+            "PublishBatch",
+            &[
+                ("PublishBatchRequestEntries.member.1.Id", "first"),
+                ("PublishBatchRequestEntries.member.1.Message", "first body"),
+                ("PublishBatchRequestEntries.member.1.MessageGroupId", "g1"),
+                (
+                    "PublishBatchRequestEntries.member.1.MessageDeduplicationId",
+                    "d1",
+                ),
+                ("PublishBatchRequestEntries.member.2.Id", "second"),
+                ("PublishBatchRequestEntries.member.2.Message", "second body"),
+                ("PublishBatchRequestEntries.member.2.MessageGroupId", "g1"),
+            ],
+        ),
+        (
+            "a batch whose FIRST entry carries no id",
+            &[],
+            "PublishBatch",
+            &[
+                ("PublishBatchRequestEntries.member.1.Id", "first"),
+                ("PublishBatchRequestEntries.member.1.Message", "first body"),
+                ("PublishBatchRequestEntries.member.1.MessageGroupId", "g1"),
+                ("PublishBatchRequestEntries.member.2.Id", "second"),
+                ("PublishBatchRequestEntries.member.2.Message", "second body"),
+                ("PublishBatchRequestEntries.member.2.MessageGroupId", "g2"),
+                (
+                    "PublishBatchRequestEntries.member.2.MessageDeduplicationId",
+                    "d2",
+                ),
+            ],
+        ),
+        (
+            "a batch whose MIDDLE entry carries no id",
+            &[("ContentBasedDeduplication", "false")],
+            "PublishBatch",
+            &[
+                ("PublishBatchRequestEntries.member.1.Id", "first"),
+                ("PublishBatchRequestEntries.member.1.Message", "first body"),
+                ("PublishBatchRequestEntries.member.1.MessageGroupId", "g1"),
+                (
+                    "PublishBatchRequestEntries.member.1.MessageDeduplicationId",
+                    "d1",
+                ),
+                ("PublishBatchRequestEntries.member.2.Id", "second"),
+                ("PublishBatchRequestEntries.member.2.Message", "second body"),
+                ("PublishBatchRequestEntries.member.2.MessageGroupId", "g1"),
+                ("PublishBatchRequestEntries.member.3.Id", "third"),
+                ("PublishBatchRequestEntries.member.3.Message", "third body"),
+                ("PublishBatchRequestEntries.member.3.MessageGroupId", "g1"),
+                (
+                    "PublishBatchRequestEntries.member.3.MessageDeduplicationId",
+                    "d3",
+                ),
+            ],
+        ),
+    ];
+
+    for (index, (case, attributes, action, params)) in rows.iter().enumerate() {
+        let topic = fifo_topic(&sns, &format!("no-token-{index:02}"), attributes).await;
+        let subscription = subscribe(&sns, &topic, &format!("no-token-queue-{index:02}")).await;
+
+        let answer = publishing(&sns, &topic, action, params).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected 400, got {} / {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.code(),
+            "InvalidParameter",
+            "case {case:?}: expected the InvalidParameter code, got {}",
+            answer.body
+        );
+        let message = answer.element("Message");
+        assert_eq!(
+            message.as_deref(),
+            Some(NO_DEDUPLICATION_TOKEN_REFUSAL),
+            "case {case:?}: expected the message {NO_DEDUPLICATION_TOKEN_REFUSAL:?}, got \
+             {message:?}"
+        );
+        // Nothing of the request was published: a batch holding one entry the rules refuse
+        // is refused whole, so no entry is reported and no endpoint is delivered to.
+        let ids = answer.elements("MessageId");
+        assert!(
+            ids.is_empty(),
+            "case {case:?}: a refused publishing call reports no message, got {ids:?}"
+        );
+        let delivered_count = delivered(&sns, &subscription);
+        assert_eq!(
+            delivered_count, 0,
+            "case {case:?}: a refused publishing call delivers nothing, got \
+             {delivered_count} deliveries"
+        );
+    }
+}
+
+/// The refusal states TWO ways out, and each one works: supply the id, or enable the
+/// setting that derives one — on the single and on the batch path.
+#[tokio::test]
+async fn either_way_out_the_refusal_names_makes_the_same_publish_succeed() {
+    let sns = Sns::new();
+    let topic = fifo_topic(&sns, "way-out", &[]).await;
+    let subscription = subscribe(&sns, &topic, "way-out-queue").await;
+    let batch: &[(&str, &str)] = &[
+        ("PublishBatchRequestEntries.member.1.Id", "first"),
+        ("PublishBatchRequestEntries.member.1.Message", "first body"),
+        ("PublishBatchRequestEntries.member.1.MessageGroupId", "g1"),
+        (
+            "PublishBatchRequestEntries.member.1.MessageDeduplicationId",
+            "supplied",
+        ),
+        ("PublishBatchRequestEntries.member.2.Id", "second"),
+        ("PublishBatchRequestEntries.member.2.Message", "second body"),
+        ("PublishBatchRequestEntries.member.2.MessageGroupId", "g1"),
+    ];
+
+    // Neither way out taken: both paths refuse, with the one sentence.
+    for (case, action, params) in [
+        (
+            "the single path before either way out",
+            "Publish",
+            &[("Message", "a body"), ("MessageGroupId", "g1")][..],
+        ),
+        ("the batch path before either way out", "PublishBatch", batch),
+    ] {
+        let answer = publishing(&sns, &topic, action, params).await;
+        let message = answer.element("Message");
+        assert_eq!(
+            message.as_deref(),
+            Some(NO_DEDUPLICATION_TOKEN_REFUSAL),
+            "case {case:?}: expected the message {NO_DEDUPLICATION_TOKEN_REFUSAL:?}, got \
+             {message:?}"
+        );
+    }
+
+    // The first way out: the publish supplies the id itself, with the setting untouched.
+    let supplied = publishing(
+        &sns,
+        &topic,
+        "Publish",
+        &[
+            ("Message", "a body"),
+            ("MessageGroupId", "g1"),
+            ("MessageDeduplicationId", "explicit"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        supplied.status, 200,
+        "a publish supplying the id must be accepted, got {} / {}",
+        supplied.status, supplied.body
+    );
+
+    // The second way out: the topic enables the setting, and the SAME calls are accepted.
+    let written = sns
+        .call(
+            "SetTopicAttributes",
+            &[
+                ("TopicArn", topic.as_str()),
+                ("AttributeName", "ContentBasedDeduplication"),
+                ("AttributeValue", "true"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        written.status, 200,
+        "SetTopicAttributes expected 200, got {} / {}",
+        written.status, written.body
+    );
+    let accepted = publishing(
+        &sns,
+        &topic,
+        "Publish",
+        &[("Message", "a body"), ("MessageGroupId", "g1")],
+    )
+    .await;
+    assert_eq!(
+        accepted.status, 200,
+        "a publish to a content-based topic needs no id of its own, got {} / {}",
+        accepted.status, accepted.body
+    );
+    let batched = publishing(&sns, &topic, "PublishBatch", batch).await;
+    assert_eq!(
+        batched.status, 200,
+        "a batch whose entries the content-based topic derives ids for must be accepted, \
+         got {} / {}",
+        batched.status, batched.body
+    );
+    let reported = batched.elements("MessageId");
+    assert_eq!(
+        reported.len(),
+        2,
+        "every entry of the accepted batch must be reported, got {}",
+        batched.body
+    );
+    // Four distinct messages were published: the one carrying the supplied id, the one the
+    // topic derived an id for, and the batch's two entries.
+    let fanned_out = delivered(&sns, &subscription);
+    assert_eq!(
+        fanned_out, 4,
+        "every accepted publish must be delivered, got {fanned_out} deliveries"
     );
 }
