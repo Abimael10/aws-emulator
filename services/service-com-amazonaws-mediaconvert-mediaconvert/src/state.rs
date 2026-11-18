@@ -113,6 +113,7 @@ use crate::ops::types::{
     ReservationPlan, ReservationPlanSettings, Timing, VideoCodecSettings, VideoDescription,
 };
 mod acm_certificates;
+mod certificate_consumers;
 mod job_clock;
 mod job_events;
 mod resource_id_format;
@@ -120,6 +121,7 @@ mod system_catalog;
 mod paging;
 mod version_selection;
 pub use acm_certificates::*;
+pub use certificate_consumers::*;
 pub use job_clock::*;
 pub use job_events::*;
 pub use paging::*;

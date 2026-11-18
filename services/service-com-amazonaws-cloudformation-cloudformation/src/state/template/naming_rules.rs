@@ -771,6 +771,13 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
             Some("DomainName")
         }
         ECR_PUBLIC_REPOSITORY => Some("RepositoryName"),
+        // An AWS Elemental MediaConvert certificate association IS the certificate it trusts:
+        // `AssociateCertificate` and `DisassociateCertificate` each take that `Arn` and no
+        // identifier of their own, and "Ref returns" it — so the declared `Arn` is this
+        // resource's physical id. The type's last segment is `CertificateAssociation`, so
+        // neither `CertificateAssociationName` nor `Name` finds it, and the type publishes no
+        // name property at all.
+        MEDIACONVERT_CERTIFICATE_ASSOCIATION => Some("Arn"),
         // `RegisterInstance$InstanceId` is "an identifier that you want to associate with the
         // instance", which is what identifies a registered instance in Cloud Map and what
         // "Ref returns" for the type — so the declaration's own `InstanceId` is this

@@ -310,6 +310,13 @@ pub const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
         resource_type: "AWS::Logs::LogStream",
         required: &["LogGroupName"],
     },
+    // `AWS::MediaConvert::CertificateAssociation`: the resource IS the certificate the
+    // account's MediaConvert service trusts, and `AssociateCertificate` declares that `Arn`
+    // required — a declaration stating none describes no association at all.
+    RequiredProperties {
+        resource_type: crate::state::template::MEDIACONVERT_CERTIFICATE_ASSOCIATION,
+        required: &["Arn"],
+    },
 ];
 
 /// One group of properties a resource type's schema admits AT MOST ONE of: the `oneOf` that

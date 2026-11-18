@@ -164,10 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing in this operation depends on the request's region: the account's
-        // certificate set is keyed by the ARN the caller sent, and the response carries no
-        // members at all.
-        let _ = ctx;
+        // The account's certificate set is keyed by the ARN the caller sent and the response
+        // carries no members at all, so the request's region matters only to the record
+        // below: the resource an ACM report names as using the certificates is this service
+        // in the Region the request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DisassociateCertificateErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -202,8 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store owns the removal, which reports whether the account had that
         // certificate associated at all — a fact the ANSWER does not depend on, because a
         // request for the state the account is already in is the same success. Removing an
-        // association the account does not hold leaves the set exactly as it was.
-        state.lock().disassociate_certificate(&input.arn);
+        // association the account does not hold leaves the set exactly as it was. The set
+        // the account is left with is recorded in the shared directory under the same
+        // borrow, so Certificate Manager's own report of the certificate stops naming this
+        // service as using it ([`crate::state::record_certificate_consumers`]).
+        let now = ::std::time::SystemTime::now();
+        {
+            let mut store = state.lock();
+            store.disassociate_certificate(&input.arn);
+            crate::state::record_certificate_consumers(&*self.engine, &store, &region, now);
+        }
 
         Ok(DisassociateCertificateOutput {})
     }

@@ -630,6 +630,13 @@ impl Provisioner {
             Self::BackupGatewayHypervisor => {
                 describe_backup_gateway_hypervisor(ctx, region, physical_resource_id).await
             }
+            // MediaConvert publishes no read of its certificate associations, so the trust is
+            // read from the other side: the resources Certificate Manager reports as using
+            // the certificate that is this resource's physical id.
+            Self::MediaConvertCertificateAssociation => {
+                describe_mediaconvert_certificate_association(ctx, region, physical_resource_id)
+                    .await
+            }
         }
     }
 }

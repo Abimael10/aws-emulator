@@ -213,8 +213,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The store owns the membership probe and the insert under one borrow, so two
-        // concurrent associations of the same ARN cannot both add it.
-        let outcome = state.lock().associate_certificate(input.arn);
+        // concurrent associations of the same ARN cannot both add it. The set the account
+        // ends up with is recorded in the shared directory under the same borrow, so
+        // Certificate Manager's own report of the certificate names this service as using
+        // it ([`crate::state::record_certificate_consumers`]).
+        let now = ::std::time::SystemTime::now();
+        let outcome = {
+            let mut store = state.lock();
+            let outcome = store.associate_certificate(input.arn);
+            crate::state::record_certificate_consumers(&*self.engine, &store, &region, now);
+            outcome
+        };
         match outcome {
             crate::state::AssociateCertificateOutcome::Associated
             | crate::state::AssociateCertificateOutcome::AlreadyAssociated => {

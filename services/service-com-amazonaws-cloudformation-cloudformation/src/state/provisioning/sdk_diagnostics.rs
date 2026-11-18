@@ -129,6 +129,18 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
         "CloudWatchLogs",
         SdkDiagnostic::EnvelopeOnRefusedRequest,
     ),
+    // AWS Elemental MediaConvert's SDK names it by that model's own `sdkId`
+    // (`MediaConvert`, `smithy_query(query="service_info")` on that service's model), which
+    // is also the `cloudFormationName` the type names of its resources carry, and words its
+    // diagnostic with the refused OPERATION and that service's error code in it, as the
+    // recorded `ResourceStatusReason` of an `AWS::MediaConvert::CertificateAssociation` whose
+    // declared certificate Certificate Manager never issued carries it (in the behavioral
+    // corpus `simparity-behavioral-aws-v1`, check
+    // `acm__cloudformation__mediaconvert.deploy-mediaconvert-certificateassociation-unknown-certificate-rejected`,
+    // whose reason reads `Resource handler returned message: "<the service's sentence>
+    // (Service: MediaConvert; Operation: AssociateCertificate; Status Code: 404; Error Code:
+    // NotFoundException; Request ID: …)" (RequestToken: …, HandlerErrorCode: NotFound)`).
+    ("mediaconvert", "MediaConvert", SdkDiagnostic::Operation),
     // Neptune Analytics' SDK names it `NeptuneGraph` — that model's own `sdkId`
     // (`Neptune Graph`) written as one word, exactly as Application Auto Scaling's above is —
     // and words the ATTEMPT-counting shape, as the recorded `ResourceStatusReason` of an

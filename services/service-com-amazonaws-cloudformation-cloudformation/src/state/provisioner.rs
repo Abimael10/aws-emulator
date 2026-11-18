@@ -512,6 +512,7 @@ use super::template::{
     KINESIS_STREAM,
     KMS_ALIAS, KMS_KEY,
     MASTER_USER_SECRET_ARN_ATTRIBUTE,
+    MEDIACONVERT_CERTIFICATE_ASSOCIATION,
     MQ_BROKER, MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER, MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH, NEPTUNE_GRAPH_GRAPH_SNAPSHOT,
     OPENSEARCH_DOMAIN, PIPES_PIPE, RBIN_RULE,
@@ -1212,6 +1213,14 @@ pub(super) enum Provisioner {
     /// `ServerArn` every later call on a hypervisor takes
     /// ([`backup_gateway_hypervisors`]).
     BackupGatewayHypervisor,
+    /// `AWS::MediaConvert::CertificateAssociation`: the trust between an AWS Certificate
+    /// Manager certificate and the account's MediaConvert service, which that service's own
+    /// `AssociateCertificate` makes and `DisassociateCertificate` takes away. The resource IS
+    /// the certificate it trusts — neither call takes an identifier of its own — so the
+    /// declared `Arn` is the physical id the naming rules already compute for the type, and
+    /// the association is read back through the resources Certificate Manager reports as using
+    /// the certificate ([`mediaconvert_certificates`]).
+    MediaConvertCertificateAssociation,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -1416,6 +1425,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         NEPTUNE_GRAPH_GRAPH_SNAPSHOT => Some(Provisioner::NeptuneGraphGraphSnapshot),
         RBIN_RULE => Some(Provisioner::RbinRule),
         BACKUP_GATEWAY_HYPERVISOR => Some(Provisioner::BackupGatewayHypervisor),
+        MEDIACONVERT_CERTIFICATE_ASSOCIATION => {
+            Some(Provisioner::MediaConvertCertificateAssociation)
+        }
         _ => None,
     }
 }
@@ -1619,6 +1631,13 @@ impl Provisioner {
             // the binding is not a taggable resource — AWS WAF holds tags on its own
             // entities — so no tags are propagated to one.
             Self::Wafv2WebAclAssociation => associate_web_acl(ctx, region, resource).await,
+            // An association publishes no `Tags` property and `AssociateCertificate` takes
+            // none: the trust is not a taggable resource of MediaConvert's — that service
+            // holds tags on its queues, presets, job templates and jobs — so no tags are
+            // propagated to one.
+            Self::MediaConvertCertificateAssociation => {
+                associate_mediaconvert_certificate(ctx, region, resource).await
+            }
             // An `AWS::Glue::Job`'s properties ARE `CreateJob`'s own members, so the
             // declared document is the request, with the one member CloudFormation decides
             // (the job's name) set on the way out and the tag MAP that call takes merged
@@ -4211,6 +4230,11 @@ impl Provisioner {
             Self::BackupGatewayHypervisor => {
                 delete_backup_gateway_hypervisor(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the association by the CERTIFICATE's ARN, which is this
+            // resource's physical id and the one handle `DisassociateCertificate` takes.
+            Self::MediaConvertCertificateAssociation => {
+                disassociate_mediaconvert_certificate(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -4290,6 +4314,12 @@ mod neptune_graphs;
 /// on one of the Data Catalog tables [`platform_services`] creates, which that service keys
 /// by the catalog, the database, the table and the optimizer's own type together.
 mod glue_table_optimizers;
+/// The AWS Elemental MediaConvert CERTIFICATE ASSOCIATION arm: the trust an
+/// `AWS::MediaConvert::CertificateAssociation` declares between an AWS Certificate Manager
+/// certificate and the account's MediaConvert service, made in the service that owns it so
+/// that service really accepts the certificate and Certificate Manager's own report names it
+/// as using one.
+mod mediaconvert_certificates;
 mod data_and_storage;
 mod iam_identities;
 mod application_services;
@@ -4416,6 +4446,7 @@ use customer_profiles_domains::*;
 use rbin_rules::*;
 use neptune_graphs::*;
 use glue_table_optimizers::*;
+use mediaconvert_certificates::*;
 use iam_identities::*;
 use data_and_storage::*;
 

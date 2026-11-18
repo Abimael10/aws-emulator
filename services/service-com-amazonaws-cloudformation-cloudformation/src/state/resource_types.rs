@@ -90,7 +90,8 @@ use super::template::{
     CLEANROOMSML_TRAINING_DATASET,
     CLOUDFRONT_CONNECTION_FUNCTION, CLOUDFRONT_CONNECTION_GROUP, CLOUDFRONT_FUNCTION,
     CLOUDFRONT_KEY_VALUE_STORE, CLOUDFRONT_MONITORING_SUBSCRIPTION,
-    CUSTOMER_PROFILES_DOMAIN, GLUE_TABLE_OPTIMIZER, MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH,
+    CUSTOMER_PROFILES_DOMAIN, GLUE_TABLE_OPTIMIZER, MEDIACONVERT_CERTIFICATE_ASSOCIATION,
+    MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH,
     NEPTUNE_GRAPH_GRAPH_SNAPSHOT, RBIN_RULE, SES_EMAIL_IDENTITY,
 };
 
@@ -712,7 +713,10 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Macie::CustomDataIdentifier",
     "AWS::Macie::FindingsFilter",
     "AWS::Macie::Session",
-    // AWS Elemental MediaConvert, MediaLive and MediaPackage
+    // AWS Elemental MediaConvert, MediaLive and MediaPackage. The certificate association
+    // is the trust between an ACM certificate and the account's MediaConvert service, made
+    // in the owning service (`super::provisioner`).
+    MEDIACONVERT_CERTIFICATE_ASSOCIATION,
     "AWS::MediaConvert::JobTemplate",
     "AWS::MediaConvert::Preset",
     "AWS::MediaConvert::Queue",

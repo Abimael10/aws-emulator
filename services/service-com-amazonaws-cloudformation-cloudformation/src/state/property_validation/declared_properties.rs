@@ -127,6 +127,13 @@ pub const DECLARED_PROPERTIES: &[DeclaredProperties] = &[
         resource_type: "AWS::Logs::LogStream",
         declared: &["LogGroupName", "LogStreamName"],
     },
+    // `AWS::MediaConvert::CertificateAssociation` publishes ONE property: the `Arn` of the ACM
+    // certificate the account's MediaConvert service is to trust, which is the whole of the
+    // resource.
+    DeclaredProperties {
+        resource_type: crate::state::template::MEDIACONVERT_CERTIFICATE_ASSOCIATION,
+        declared: &["Arn"],
+    },
     // `AWS::CloudFormation::WaitConditionHandle` publishes NO property at all ("this type has
     // no properties"), so every member a declaration of it carries is one the type does not
     // have.

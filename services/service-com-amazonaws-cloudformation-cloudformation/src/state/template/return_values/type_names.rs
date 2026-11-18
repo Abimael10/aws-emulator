@@ -150,6 +150,19 @@ pub const BRAKET_ARN_NAMESPACE: &str = "braket";
 /// for it, from that same pattern.
 pub(super) const BRAKET_SPENDING_LIMIT_PATH: &str = "spending-limit";
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of an AWS Elemental MEDIACONVERT
+/// CERTIFICATE ASSOCIATION: the trust between an AWS Certificate Manager certificate and the
+/// account's MediaConvert service, which that service's own `AssociateCertificate` makes and
+/// `DisassociateCertificate` takes away. The middle segment is that model's own
+/// `awsService.cloudFormationName` (`MediaConvert`).
+///
+/// The type publishes ONE property, the `Arn` of the certificate, and its `Ref` is that ARN —
+/// the only handle either of those calls takes. So the resource's physical id IS the declared
+/// ARN ([`declared_name_property`] names the property it is read from), the type publishes no
+/// `Fn::GetAtt` value of its own, and nothing about its identity is the owning service's to
+/// mint.
+pub const MEDIACONVERT_CERTIFICATE_ASSOCIATION: &str = "AWS::MediaConvert::CertificateAssociation";
+
 /// The `AWS::<cloudFormationName>::<Resource>` type of a CLEAN ROOMS ML TRAINING DATASET: the
 /// metadata record that service's own `CreateTrainingDataset` makes for a Glue table, which an
 /// audience model is then trained from. The middle segment is that model's own
