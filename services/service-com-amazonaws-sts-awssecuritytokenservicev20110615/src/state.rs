@@ -568,15 +568,42 @@ pub struct AuthorizationDecision {
     /// The principal that made the request: its unique id and its ARN.
     pub principal_id: String,
     pub principal_arn: String,
-    /// The requested action and resource.
+    /// The requested action, as the service that took the decision names the operation
+    /// asked for — the operation's own name rather than IAM's service-qualified spelling,
+    /// which is what a POLICY STATEMENT names and what [`MatchedStatement::actions`]
+    /// carries. Both spellings therefore sit in one document, each where it belongs.
     pub action: String,
+    /// The resource the decision was taken on.
     pub resource: String,
     /// The condition keys in the context of the request, each with its values.
     pub conditions: Vec<(String, Vec<String>)>,
-    /// The policy statements the decision matched, each by its statement id and its
-    /// effect. Empty when the request matched none, which is what an implicit deny
-    /// looks like.
-    pub matched_statements: Vec<(String, String)>,
+    /// The policy statements the decision matched, as the decoded message reports each
+    /// one. Empty when the request matched none, which is what an implicit deny looks
+    /// like.
+    pub matched_statements: Vec<MatchedStatement>,
+}
+
+/// One policy statement an authorization decision matched, as the decoded message
+/// reports it: its id and effect, and the elements that made it apply — the principals
+/// it is about, the actions and the resources it names, and its condition keys.
+///
+/// A statement of a document attached to an identity names no `Principal` of its own, so
+/// the principal reported for one is the id of the principal that made the request: the
+/// statement applied to THAT principal and to no other.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MatchedStatement {
+    /// `Sid`, or the empty string for a statement that states none.
+    pub statement_id: String,
+    /// `Effect`, as the decoded message words it.
+    pub effect: String,
+    /// The principals the statement is about.
+    pub principals: Vec<String>,
+    /// The actions it names.
+    pub actions: Vec<String>,
+    /// The resources it names.
+    pub resources: Vec<String>,
+    /// Its condition keys, each with the values the clause tests for.
+    pub conditions: Vec<(String, Vec<String>)>,
 }
 
 /// One encoded authorization message the account has issued, keyed in
@@ -644,21 +671,19 @@ pub fn authorization_decision_document(decision: &AuthorizationDecision) -> Stri
     let matched: Vec<serde_json::Value> = decision
         .matched_statements
         .iter()
-        .map(|(statement_id, effect)| {
-            serde_json::json!({ "statementId": statement_id, "effect": effect })
+        .map(|statement| {
+            serde_json::json!({
+                "statementId": statement.statement_id,
+                "effect": statement.effect,
+                "principals": { "items": valued_items(&statement.principals) },
+                "principalGroups": { "items": [] },
+                "actions": { "items": valued_items(&statement.actions) },
+                "resources": { "items": valued_items(&statement.resources) },
+                "conditions": { "items": keyed_items(&statement.conditions) },
+            })
         })
         .collect();
-    let conditions: Vec<serde_json::Value> = decision
-        .conditions
-        .iter()
-        .map(|(key, values)| {
-            let values: Vec<serde_json::Value> = values
-                .iter()
-                .map(|value| serde_json::json!({ "value": value }))
-                .collect();
-            serde_json::json!({ "key": key, "values": { "items": values } })
-        })
-        .collect();
+    let conditions = keyed_items(&decision.conditions);
     serde_json::json!({
         "allowed": decision.allowed,
         "explicitDeny": decision.explicit_deny,
@@ -674,6 +699,43 @@ pub fn authorization_decision_document(decision: &AuthorizationDecision) -> Stri
         },
     })
     .to_string()
+}
+
+/// A list of values as the decoded message carries one: each value under its own `value`
+/// member, which is the shape every list in that document takes.
+fn valued_items(values: &[String]) -> Vec<serde_json::Value> {
+    values
+        .iter()
+        .map(|value| serde_json::json!({ "value": value }))
+        .collect()
+}
+
+/// A list of condition keys as the decoded message carries one: each key beside the
+/// values it was decided against ([`valued_items`]).
+fn keyed_items(keyed: &[(String, Vec<String>)]) -> Vec<serde_json::Value> {
+    keyed
+        .iter()
+        .map(|(key, values)| {
+            serde_json::json!({ "key": key, "values": { "items": valued_items(values) } })
+        })
+        .collect()
+}
+
+/// The text an authorization failure hands the caller its encoded message with: "some
+/// Amazon Web Services operations additionally return an encoded message that can provide
+/// details about this authorization failure" (`DecodeAuthorizationMessage`, this service's
+/// model), and this is the marker the caller reads the blob off after.
+///
+/// Stated here, beside the registry that issues and decodes such a message, so the service
+/// that HANDS one to a caller and the operation that decodes it cannot word the marker
+/// differently.
+pub const ENCODED_AUTHORIZATION_MESSAGE_MARKER: &str = "Encoded authorization failure message: ";
+
+/// `message`, closed by the encoded authorization message `encoded`: the refusal's own
+/// sentence, then [`ENCODED_AUTHORIZATION_MESSAGE_MARKER`] and the blob.
+#[must_use]
+pub fn message_with_encoded_authorization_message(message: &str, encoded: &str) -> String {
+    format!("{message} {ENCODED_AUTHORIZATION_MESSAGE_MARKER}{encoded}")
 }
 
 /// Issue an encoded authorization message for an authorization decision: record the

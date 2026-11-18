@@ -27,7 +27,7 @@ use service_com_amazonaws_sts_awssecuritytokenservicev20110615 as sts;
 use smithy_server_runtime::MultiServiceRouter;
 use sts::state::{
     AuthorizationDecision, ComAmazonawsStsAwssecuritytokenservicev20110615State as StsState,
-    ENCODED_MESSAGE_VALIDITY, MAX_AUTHORIZATION_MESSAGES,
+    MatchedStatement, ENCODED_MESSAGE_VALIDITY, MAX_AUTHORIZATION_MESSAGES,
 };
 
 use crate::sts_sessions::{call, element, emulator, member, LONG_TERM_KEY};
@@ -98,7 +98,41 @@ fn pseudo_random_bytes(seed: u64, count: usize) -> Vec<u8> {
         .collect()
 }
 
+/// The REQUESTED action a decision records, from the service-qualified spelling of the same
+/// action: the operation's own name, which is what the decoded message of an authorization
+/// failure reports for "the requested action" — the qualified spelling (`ec2:RunInstances`)
+/// is what a policy statement names.
+fn requested_action(qualified: &str) -> String {
+    qualified
+        .split_once(':')
+        .map_or_else(|| qualified.to_string(), |(_, operation)| operation.to_string())
+}
+
+/// One statement a decision matched: its id and effect, the principal it is about, the
+/// action it names and the resource it covers — the elements the decoded message reports
+/// for each matched statement.
+fn matched_statement(
+    statement_id: &str,
+    effect: &str,
+    principal: &str,
+    action: &str,
+) -> MatchedStatement {
+    MatchedStatement {
+        statement_id: statement_id.to_string(),
+        effect: effect.to_string(),
+        principals: vec![principal.to_string()],
+        actions: vec![action.to_string()],
+        resources: vec!["*".to_string()],
+        conditions: Vec::new(),
+    }
+}
+
 /// The decision a denied request recorded, with everything the document carries.
+///
+/// `action` is given in IAM's service-qualified spelling, which is what a POLICY STATEMENT
+/// names and so what the matched statement below carries; the decision's own REQUESTED
+/// action is the operation name that spelling qualifies ([`requested_action`]), which is what
+/// the decoded message of an authorization failure reports.
 fn decision(
     allowed: bool,
     explicit_deny: bool,
@@ -113,7 +147,7 @@ fn decision(
         explicit_deny,
         principal_id: principal.0.to_string(),
         principal_arn: principal.1.to_string(),
-        action: action.to_string(),
+        action: requested_action(action),
         resource: resource.to_string(),
         conditions: conditions
             .iter()
@@ -126,7 +160,7 @@ fn decision(
             .collect(),
         matched_statements: matched
             .iter()
-            .map(|(id, effect)| ((*id).to_string(), (*effect).to_string()))
+            .map(|(id, effect)| matched_statement(id, effect, principal.0, action))
             .collect(),
     }
 }
@@ -304,12 +338,32 @@ async fn an_issued_message_decodes_to_the_decision_the_account_recorded() {
             decided.matched_statements.len(),
             "case {case:?}: matched statement count, got {document}"
         );
-        for (index, (id, effect)) in decided.matched_statements.iter().enumerate() {
+        for (index, statement) in decided.matched_statements.iter().enumerate() {
             assert_eq!(
                 (&matched[index]["statementId"], &matched[index]["effect"]),
-                (&json!(id), &json!(effect)),
+                (&json!(statement.statement_id), &json!(statement.effect)),
                 "case {case:?}: matched statement {index}, got {document}"
             );
+            // Every element of the statement the decision matched, each list in the
+            // document's own `{"items":[{"value":…}]}` shape.
+            for (member, expected) in [
+                ("principals", &statement.principals),
+                ("actions", &statement.actions),
+                ("resources", &statement.resources),
+            ] {
+                let reported: Vec<String> = matched[index][member]["items"]
+                    .as_array()
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: matched statement {index} {member}, got {document}")
+                    })
+                    .iter()
+                    .map(|value| value["value"].as_str().unwrap_or_default().to_string())
+                    .collect();
+                assert_eq!(
+                    &reported, expected,
+                    "case {case:?}: matched statement {index} {member}, got {document}"
+                );
+            }
         }
 
         let conditions = document["context"]["conditions"]["items"]

@@ -91,6 +91,16 @@ pub mod recorded_response_members;
 /// supports resource-level permissions.
 pub mod addressed_resources;
 
+/// The condition keys an EC2 request's own parameters answer, which [`authorization_refusal`]
+/// reads out of the request so the gate decides a statement's `Condition` over the values the
+/// request really carried.
+pub mod request_conditions;
+
+/// The DIAGNOSTIC an authorization failure hands the caller: the encoded authorization
+/// failure message that names the decision [`authorization`] took and the statement it
+/// rested on.
+pub mod authorization_diagnostics;
+
 /// The `DryRun` flag a request carries, and the verdict EC2 gives it for an operation this
 /// emulator has not written yet: the answer [`FinishedEnvelope::served`] puts in place of the
 /// scaffold's 501, because the flag is a question about the CALLER that EC2 answers ahead of
@@ -1082,8 +1092,19 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
     } else {
         addressed_resources::addressed_by(req, &crate::state::request_region(ctx.parts()))
     };
-    let refusal = authorization::authorize(engine, ctx, operation, &resources).err()?;
-    let message = refusal.message();
+    let refusal = authorization::authorize(
+        engine,
+        ctx,
+        operation,
+        &resources,
+        &request_conditions::request_conditions(req),
+    )
+    .err()?;
+    // The refusal's own sentence, closed by the encoded authorization failure message where
+    // the decision carries one — minted into the registry `sts:DecodeAuthorizationMessage`
+    // decodes one from, so a caller that captures the blob off this sentence decodes the very
+    // decision this gate took ([`authorization::refusal_message`]).
+    let message = authorization::refusal_message(engine, operation, &refusal);
     let response = smithy_server_runtime::protocol_error_response_with(
         smithy_server_runtime::PreDispatchProtocol::Query { ec2: true },
         ProtocolError::Unauthenticated {

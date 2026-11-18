@@ -62,7 +62,26 @@
 //! the request's own ids ([`super::addressed_resources`]): one decision per resource, so a
 //! statement scoped to resource ARNs grants the action exactly on the resources it names,
 //! and the first resource no statement allows is the one the request is refused ON — which
-//! the refusal then states.
+//! the refusal then states. An action judged on a resource it CREATES is decided on that
+//! resource FIRST ([`created_resource`]), the request carrying no id for a resource that
+//! does not exist until the call succeeds.
+//!
+//! Each decision is taken in the condition context the REQUEST carries
+//! ([`super::request_conditions`]), so a statement conditioned on a key the request answers
+//! — the instance type a launch asks for — is decided rather than left undecided.
+//!
+//! ## What a refusal hands the caller to decode
+//!
+//! "Only certain Amazon Web Services operations return an encoded message"
+//! (`sts:DecodeAuthorizationMessage`), so the refusals of the operations that do
+//! ([`ENCODED_AUTHORIZATION_MESSAGE_OPERATIONS`]) close with an encoded authorization
+//! failure message ([`refusal_message`]) and every other refusal states its decision in its
+//! own sentence alone. The blob names the decision taken HERE — whether a `Deny` said so
+//! explicitly, the principal, the requested action, the resource it was judged on, the
+//! condition keys it was taken over and the statements it rested on — recorded in the
+//! registry `sts:DecodeAuthorizationMessage` decodes one from
+//! ([`super::authorization_diagnostics`]), so what the caller decodes is this decision
+//! rather than a document written to look like one.
 //!
 //! A request of such an action that addresses no resource this gate could read an ARN for
 //! (a create that names nothing existing, a value of a kind the ARN reading does not carry)
@@ -104,6 +123,8 @@ use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_sto
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
 use ::service_common::iam_authorization::{self as iam, Decision};
 
+use super::authorization_diagnostics as diagnostics;
+
 /// This service's IAM action prefix: an action is `ec2:<OperationName>` ("Actions defined
 /// by Amazon EC2", IAM Service Authorization Reference), which is this service's
 /// `arnNamespace` (`smithy_query(query="service_info")`).
@@ -132,6 +153,88 @@ pub fn judged_over_every_resource(operation: &str) -> bool {
     operation.starts_with(ACCOUNT_WIDE_READ_PREFIX)
 }
 
+/// The id IAM names a resource an action is judged on but the request carries no id for:
+/// the resource does not exist until the call succeeds, so every resource of that type is
+/// what a statement has to cover.
+const CREATED_RESOURCE_ID: &str = "*";
+
+/// The resource TYPE an action that is judged on a resource it CREATES names, keyed by the
+/// operation's own name.
+///
+/// Most actions are judged on the resources the request names by id
+/// ([`super::addressed_resources`]). An action in this catalog is judged on the resource it
+/// would bring into being instead — `RunInstances` on
+/// `arn:${Partition}:ec2:${Region}:${Account}:instance/${InstanceId}`, the `instance`
+/// resource type the IAM Service Authorization Reference lists as the one it requires — and
+/// the request carries no id for it, there being no instance until the launch succeeds. So
+/// the decision is taken on that type with every id ([`CREATED_RESOURCE_ID`]), ahead of the
+/// resources the request references, and that is the resource a refusal names.
+///
+/// An action is in this catalog only where the recorded contract shows the refusal naming
+/// the created resource: `RunInstances` on the `instance` type and `CreateVolume` on the
+/// `volume` type are each recorded that way, while `CreateNetworkInterface`, whose recorded
+/// refusal names the SUBNET the interface would go in rather than an interface, is judged on
+/// the resources the request names and is deliberately absent.
+const CREATED_RESOURCE_TYPE_BY_OPERATION: &[(&str, &str)] =
+    &[("RunInstances", "instance"), ("CreateVolume", "volume")];
+
+/// The ARN of the resource `operation` is judged on and the request carries no id for, in
+/// `region` — `None` for an action judged on the resources the request names.
+#[must_use]
+pub fn created_resource(operation: &str, region: &str) -> Option<String> {
+    CREATED_RESOURCE_TYPE_BY_OPERATION
+        .iter()
+        .find(|(named, _)| *named == operation)
+        .map(|(_, resource_type)| {
+            ::engine::emulator_arn(
+                ACTION_PREFIX,
+                region,
+                &format!("{resource_type}/{CREATED_RESOURCE_ID}"),
+            )
+        })
+}
+
+/// The operations whose refusal hands the caller an ENCODED AUTHORIZATION FAILURE MESSAGE.
+///
+/// "Only certain Amazon Web Services operations return an encoded message. The documentation
+/// for an individual operation indicates whether that operation returns an encoded message
+/// in addition to returning an HTTP code" (`sts:DecodeAuthorizationMessage`, the STS model):
+/// which operations those are is a fact about each operation rather than about the decision,
+/// so it is a catalog, and membership comes from the operation's own recorded contract.
+///
+/// `RunInstances` and `CreateVolume` are each recorded refusing with the trailer — the first
+/// from an explicit `Deny` in a session policy, the second from the absence of any allow in
+/// the principal's identity-based documents, so WHICH document decided is not what decides
+/// whether the caller is handed a blob. `CreateNetworkInterface` is recorded refusing with
+/// the same deny classification as the second and NO trailer, which is why this is a catalog
+/// of operations and not a reading of the decision.
+const ENCODED_AUTHORIZATION_MESSAGE_OPERATIONS: &[&str] = &["RunInstances", "CreateVolume"];
+
+/// Whether `operation`'s refusal hands the caller an encoded authorization failure message
+/// ([`ENCODED_AUTHORIZATION_MESSAGE_OPERATIONS`]).
+#[must_use]
+pub fn hands_over_an_encoded_message(operation: &str) -> bool {
+    ENCODED_AUTHORIZATION_MESSAGE_OPERATIONS.contains(&operation)
+}
+
+/// WHICH document in force on the credential the decision rested on, for a request it
+/// refused.
+///
+/// Read beside the refusal's own wording because it decides one thing more: whether the
+/// decision the refusal's encoded message carries was reached by an explicit `Deny`
+/// ([`Denied::encoded_message_decision`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecidedBy {
+    /// An explicit `Deny` in an identity-based document of the principal.
+    IdentityDeny,
+    /// An explicit `Deny` in a SESSION POLICY the mint of this credential passed.
+    SessionPolicyDeny,
+    /// An explicit `Deny` in the permissions boundary capping the principal.
+    BoundaryDeny,
+    /// The absence of a grant: no document in force allows the action.
+    NoAllow,
+}
+
 /// An authorization refusal: who was refused, which action, on which resource when the
 /// decision was taken on one, and which of IAM's rules withheld the grant.
 #[derive(Debug, Clone)]
@@ -145,6 +248,28 @@ pub struct Denied {
     resource: Option<String>,
     /// Why the grant was withheld, as the refusal's closing clause words it.
     reason: String,
+    /// Everything the refusal's DIAGNOSTIC is built from, held behind one pointer: a
+    /// refusal travels as the error of a decision taken per resource, and what only the
+    /// encoded message reads does not belong in every one of those.
+    diagnosed: Box<Diagnosis>,
+}
+
+/// What the refusal's encoded authorization failure message is built from, beside the
+/// sentence the refusal states.
+#[derive(Debug, Clone)]
+struct Diagnosis {
+    /// The unique id of the principal — the `AssumedRoleId` of a role session — which is
+    /// what identifies it in the decision the encoded message carries.
+    principal_id: String,
+    /// The resource the decision was TAKEN on, which is every resource
+    /// ([`EVERY_RESOURCE`]) where there was none to name.
+    judged: String,
+    /// Which document in force reached that decision.
+    decided_by: DecidedBy,
+    /// The condition keys the decision was taken over, one entry per key.
+    conditions: Vec<(String, Vec<String>)>,
+    /// The statements the decision rested on, as the decoded message reports each.
+    matched: Vec<sts_store::MatchedStatement>,
 }
 
 impl Denied {
@@ -175,11 +300,83 @@ impl Denied {
             ),
         }
     }
+
+    /// The decision this refusal was reached by, for the encoded authorization failure
+    /// message it hands the caller — `None` for a refusal that carries none.
+    ///
+    /// A refusal carries one exactly when the OPERATION is one whose refusals do
+    /// ([`ENCODED_AUTHORIZATION_MESSAGE_OPERATIONS`]), whichever document in force reached
+    /// the decision: the blob is the detail of a decision that "can contain privileged
+    /// information that the user who requested the operation should not see"
+    /// (`sts:DecodeAuthorizationMessage`), so what it carries is the decision itself —
+    /// whether a `Deny` said so explicitly, the principal, the requested action, the
+    /// resource it was judged on, the condition keys it was taken over and the statements it
+    /// rested on, of which a decision reached by the absence of a grant has none.
+    ///
+    /// `operation` is the operation's own name, which is what the decoded message reports as
+    /// "the requested action" — NOT IAM's service-qualified spelling, which is what the
+    /// refusal's own SENTENCE names and what a denying statement carries among its actions.
+    /// The recorded decode of exactly this refusal reports the bare operation name, so that is
+    /// the requirement; the two spellings sit side by side in one document, the qualified one
+    /// under the matched statement and the operation under the request's context.
+    #[must_use]
+    pub fn encoded_message_decision(
+        &self,
+        operation: &str,
+    ) -> Option<sts_store::AuthorizationDecision> {
+        if !hands_over_an_encoded_message(operation) {
+            return None;
+        }
+        Some(sts_store::AuthorizationDecision {
+            allowed: false,
+            // "Whether the request was denied due to an explicit deny or due to the absence
+            // of an explicit allow" (`sts:DecodeAuthorizationMessage`): the decision the
+            // gate reached, read off the document that reached it.
+            explicit_deny: self.diagnosed.decided_by != DecidedBy::NoAllow,
+            principal_id: self.diagnosed.principal_id.clone(),
+            principal_arn: self.principal.clone(),
+            action: operation.to_string(),
+            resource: self.diagnosed.judged.clone(),
+            conditions: self.diagnosed.conditions.clone(),
+            matched_statements: self.diagnosed.matched.clone(),
+        })
+    }
+}
+
+/// The message EC2 answers `refusal` with: its sentence, closed by the encoded
+/// authorization failure message when the refusal carries one
+/// ([`Denied::encoded_message_decision`]).
+///
+/// The blob is minted into the registry `sts:DecodeAuthorizationMessage` decodes one from,
+/// so the caller that captures it off this sentence decodes the very decision this gate
+/// took. An engine carrying no STS store holds no such registry, and the sentence then
+/// stands alone rather than naming a blob nothing could decode.
+#[must_use]
+pub fn refusal_message<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    operation: &str,
+    refusal: &Denied,
+) -> String {
+    let message = refusal.message();
+    let Some(decision) = refusal.encoded_message_decision(operation) else {
+        return message;
+    };
+    let Some(sts) = sts_store::service_state(engine) else {
+        return message;
+    };
+    let encoded = sts_store::encode_authorization_message(
+        &mut sts.lock(),
+        SystemTime::now(),
+        &decision,
+    );
+    sts_store::message_with_encoded_authorization_message(&message, &encoded)
 }
 
 /// Whether IAM lets this request perform the action of `operation` — the operation's own
 /// name, which is the routing key the request named — given `resources`, the ARNs of the
-/// resources the request addresses ([`super::addressed_resources`]).
+/// resources the request addresses ([`super::addressed_resources`]), in the condition
+/// context `conditions` the request itself carries
+/// ([`super::request_conditions::request_conditions`]).
 ///
 /// `Ok(())` for a request IAM permits and for every caller this gate does not bound (see
 /// the module docs); `Err` carries the refusal EC2 answers as `UnauthorizedOperation`.
@@ -188,25 +385,49 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     operation: &str,
     resources: &[String],
+    conditions: &[(String, String)],
 ) -> Result<(), Denied> {
     let action = format!("{ACTION_PREFIX}:{operation}");
     let caller = caller(engine, ctx);
     let documents = Documents::of(&caller);
+    let asked = Asked {
+        action: &action,
+        conditions,
+    };
     // An action that supports no resource-level permissions is judged over EVERY resource,
     // and a refusal of it names no resource because there is none to name.
     if judged_over_every_resource(operation) {
-        return decide(&caller, &documents, &action, EVERY_RESOURCE, None);
+        return decide(&caller, &documents, asked, EVERY_RESOURCE, None);
+    }
+    // An action judged on a resource it CREATES is decided on that resource first, the
+    // request carrying no id for one that does not exist yet.
+    let created = created_resource(operation, &crate::state::request_region(ctx.parts()));
+    if let Some(created) = &created {
+        decide(&caller, &documents, asked, created, Some(created))?;
     }
     // Every other action is judged against the resources the request addresses, one
     // decision per resource: a grant has to cover the resource, so the first one no
     // statement allows is the one the request is refused on.
-    if resources.is_empty() {
-        return decide_over_any_resource(&caller, &documents, &action);
+    if resources.is_empty() && created.is_none() {
+        return decide_over_any_resource(&caller, &documents, asked);
     }
     for resource in resources {
-        decide(&caller, &documents, &action, resource, Some(resource))?;
+        decide(&caller, &documents, asked, resource, Some(resource))?;
     }
     Ok(())
+}
+
+/// What ONE request asks for, as every decision about it is taken over: the IAM action, and
+/// the condition keys the request itself carries.
+///
+/// Held together because a request addressing several resources takes one decision per
+/// resource and every one of them is about the same action in the same context.
+#[derive(Debug, Clone, Copy)]
+struct Asked<'a> {
+    /// The IAM action, this service's prefix included.
+    action: &'a str,
+    /// The condition keys the request carries a value for, as `(key, value)` pairs.
+    conditions: &'a [(String, String)],
 }
 
 /// Every document in force on the caller, PARSED ONCE for the whole request.
@@ -268,14 +489,16 @@ fn identity_grants(caller: &Caller, said: Decision, allows: bool) -> bool {
 fn decide(
     caller: &Caller,
     documents: &Documents,
-    action: &str,
+    asked: Asked<'_>,
     judged: &str,
     named: Option<&str>,
 ) -> Result<(), Denied> {
+    let action = asked.action;
     // The principal spellings travel with the request because that is what a statement's
     // `Principal` element would be matched against; an identity-based document states no
-    // such element, so the decision below rests on the action and the resource.
-    let request = iam::Request::new(action, judged, &caller.principals);
+    // such element, so the decision below rests on the action, the resource and the
+    // condition keys the request carries.
+    let request = iam::Request::new(action, judged, &caller.principals).with_context(asked.conditions);
     let identity_said = iam::identity_decision_prepared(&documents.identity, &request);
     let granted = identity_grants(
         caller,
@@ -316,7 +539,23 @@ fn decide(
     } else {
         iam::no_permissions_boundary_allows(action)
     };
-    Err(caller.refused(action, named, &reason))
+    let decided_by = decided_by(identity_said, scoped, capped);
+    Err(caller.refused(asked, judged, named, &reason, decided_by, &request))
+}
+
+/// WHICH document reached the decision, from what each of the three said about the request
+/// — in the order [`decide`] words the reason in, so the clause a refusal states and the
+/// document its diagnostic names are one reading.
+fn decided_by(identity_said: Decision, scoped: Decision, capped: Decision) -> DecidedBy {
+    if identity_said == Decision::Denied {
+        DecidedBy::IdentityDeny
+    } else if scoped == Decision::Denied {
+        DecidedBy::SessionPolicyDeny
+    } else if capped == Decision::Denied {
+        DecidedBy::BoundaryDeny
+    } else {
+        DecidedBy::NoAllow
+    }
 }
 
 /// IAM's decision about `action` for a request that addresses no resource this gate could
@@ -332,9 +571,11 @@ fn decide(
 fn decide_over_any_resource(
     caller: &Caller,
     documents: &Documents,
-    action: &str,
+    asked: Asked<'_>,
 ) -> Result<(), Denied> {
-    let request = iam::Request::new(action, EVERY_RESOURCE, &caller.principals);
+    let action = asked.action;
+    let request = iam::Request::new(action, EVERY_RESOURCE, &caller.principals)
+        .with_context(asked.conditions);
     let identity_said = iam::identity_decision_prepared(&documents.identity, &request);
     let granted = identity_grants(
         caller,
@@ -376,7 +617,15 @@ fn decide_over_any_resource(
     } else {
         iam::no_permissions_boundary_allows(action)
     };
-    Err(caller.refused(action, None, &reason))
+    let decided_by = decided_by(identity_said, scoped, capped);
+    Err(caller.refused(
+        asked,
+        EVERY_RESOURCE,
+        None,
+        &reason,
+        decided_by,
+        &request,
+    ))
 }
 
 /// Every spelling of the principal this request speaks for: the session ARN
@@ -400,6 +649,10 @@ pub fn request_principals<Eng: Send + Sync + 'static>(
 struct Caller {
     /// The principal's ARN, as `sts:GetCallerIdentity` reports it — what a refusal names.
     arn: String,
+    /// The unique id of that principal, as `sts:GetCallerIdentity` answers it too — the
+    /// `AssumedRoleId` of a role session, the `UserId` of an IAM user — which is what
+    /// identifies the principal in the decision a refusal's diagnostic carries.
+    user_id: String,
     /// Every spelling of the principal: the session ARN STS reports, and the ARN of the
     /// IAM role behind an assumed-role session.
     principals: Vec<String>,
@@ -429,14 +682,55 @@ impl Caller {
         self.account_credential || self.unreadable_attachment
     }
 
-    /// This caller's refusal of `action` on `resource`, closed by `reason`.
-    fn refused(&self, action: &str, resource: Option<&str>, reason: &str) -> Denied {
+    /// This caller's refusal of the action `asked` names on `resource`, closed by `reason`.
+    ///
+    /// `judged` is the resource the decision was TAKEN on and `resource` the one it is stated
+    /// ON, which differ for a decision taken over every resource. `decided_by` is the
+    /// document that reached it, and `request` the request it was taken about — read once
+    /// more here, where a refusal needs the STATEMENTS the decision rested on beside the
+    /// decision itself ([`super::authorization_diagnostics`]), which the decision path does
+    /// not collect.
+    fn refused(
+        &self,
+        asked: Asked<'_>,
+        judged: &str,
+        resource: Option<&str>,
+        reason: &str,
+        decided_by: DecidedBy,
+        request: &iam::Request<'_>,
+    ) -> Denied {
         Denied {
             principal: self.arn.clone(),
-            action: action.to_string(),
+            action: asked.action.to_string(),
             resource: resource.map(str::to_string),
             reason: reason.to_string(),
+            diagnosed: Box::new(Diagnosis {
+                principal_id: self.user_id.clone(),
+                judged: judged.to_string(),
+                decided_by,
+                conditions: diagnostics::folded_conditions(asked.conditions),
+                matched: self.statements_behind(decided_by, request),
+            }),
         }
+    }
+
+    /// The statements the decision rested on, read off the documents it was taken over:
+    /// the session policies for a decision a SESSION POLICY reached, the principal's own
+    /// documents for one an identity-based document reached, and none where the decision
+    /// came from the absence of a grant, there being no statement to name.
+    fn statements_behind(
+        &self,
+        decided_by: DecidedBy,
+        request: &iam::Request<'_>,
+    ) -> Vec<sts_store::MatchedStatement> {
+        let documents: &[String] = match decided_by {
+            DecidedBy::SessionPolicyDeny => &self.scope.documents,
+            DecidedBy::IdentityDeny => &self.documents,
+            DecidedBy::BoundaryDeny => self.boundary.as_slice(),
+            DecidedBy::NoAllow => return Vec::new(),
+        };
+        let outcome = iam::identity_outcome_prepared(&iam::prepare_documents(documents), request);
+        diagnostics::matched_statements(documents, &outcome.matched, &self.user_id)
     }
 
     /// Read what the IAM identity `identity_arn` names may do, through the IAM service's
@@ -503,6 +797,7 @@ fn caller<Eng: Send + Sync + 'static>(
         account_credential: identity.arn == sts_store::ambient_identity().arn,
         principals: vec![identity.arn.clone()],
         arn: identity.arn,
+        user_id: identity.user_id,
         // The inline document the mint passed scopes the credential whether or not an IAM
         // store is there; where there is one, the scope is re-read below so a managed
         // session policy counts at the version in force NOW.
@@ -531,6 +826,7 @@ fn caller<Eng: Send + Sync + 'static>(
         {
             caller.account_credential = false;
             caller.arn = user.arn.clone();
+            caller.user_id = user.user_id.clone();
             caller.principals = vec![user.arn.clone()];
         }
     }
@@ -562,6 +858,31 @@ mod tests {
             &[document.to_string()],
             &iam::Request::new(action, EVERY_RESOURCE, &[]),
         )
+    }
+
+    /// A refusal of `action` for `principal`, stated on `resource` and closed by `reason`,
+    /// reached by `decided_by`: the shape the gate builds when it withholds a grant, with
+    /// nothing read from a store.
+    fn refused_by(
+        principal: &str,
+        action: &str,
+        resource: Option<&str>,
+        reason: &str,
+        decided_by: DecidedBy,
+    ) -> Denied {
+        Denied {
+            principal: principal.to_string(),
+            action: action.to_string(),
+            resource: resource.map(str::to_string),
+            reason: reason.to_string(),
+            diagnosed: Box::new(Diagnosis {
+                principal_id: "AROAEXAMPLEROLEID0001:session-1".to_string(),
+                judged: resource.unwrap_or(EVERY_RESOURCE).to_string(),
+                decided_by,
+                conditions: Vec::new(),
+                matched: Vec::new(),
+            }),
+        }
     }
 
     /// RULE: the action this gate asks about is `ec2:<OperationName>`, so a policy scoped
@@ -627,12 +948,7 @@ mod tests {
             ),
         ];
         for (case, reason) in rows {
-            let refusal = Denied {
-                principal: principal.to_string(),
-                action: action.clone(),
-                resource: None,
-                reason: reason.clone(),
-            };
+            let refusal = refused_by(principal, &action, None, reason, DecidedBy::IdentityDeny);
             let message = refusal.message();
             assert_eq!(
                 message,
@@ -654,12 +970,13 @@ mod tests {
         let action = format!("{ACTION_PREFIX}:CreateNetworkInterface");
         let resource = ::engine::emulator_arn("ec2", "us-west-2", "subnet/subnet-1a2b3c4d");
         let reason = iam::no_identity_policy_allows(&action);
-        let refusal = Denied {
-            principal: principal.to_string(),
-            action: action.clone(),
-            resource: Some(resource.clone()),
-            reason: reason.clone(),
-        };
+        let refusal = refused_by(
+            principal,
+            &action,
+            Some(&resource),
+            &reason,
+            DecidedBy::NoAllow,
+        );
         let message = refusal.message();
         assert_eq!(
             message,
@@ -697,6 +1014,166 @@ mod tests {
                 decided, *expected,
                 "case {operation:?}: expected judged_over_every_resource {expected}, got \
                  {decided}"
+            );
+        }
+    }
+
+    /// RULE: an action judged on a resource it CREATES is decided on that resource type with
+    /// every id, in the Region the request was signed for — the request carries no id for a
+    /// resource that does not exist yet — and every other action is decided on the resources
+    /// the request names, so it asks for none of its own.
+    ///
+    /// The rows span the Region the request addressed and the kinds of action either side of
+    /// the catalog: the launch that creates its resource, a create whose recorded refusal
+    /// names a resource the request DOES name, and a read.
+    #[test]
+    fn an_action_judged_on_what_it_creates_is_decided_on_that_resource_type() {
+        // (the operation, the Region, the resource the decision is taken on)
+        let rows: &[(&str, &str, Option<String>)] = &[
+            (
+                "RunInstances",
+                "us-west-2",
+                Some(::engine::emulator_arn(
+                    ACTION_PREFIX,
+                    "us-west-2",
+                    "instance/*",
+                )),
+            ),
+            (
+                "RunInstances",
+                "eu-central-1",
+                Some(::engine::emulator_arn(
+                    ACTION_PREFIX,
+                    "eu-central-1",
+                    "instance/*",
+                )),
+            ),
+            (
+                "CreateVolume",
+                "us-west-2",
+                Some(::engine::emulator_arn(
+                    ACTION_PREFIX,
+                    "us-west-2",
+                    "volume/*",
+                )),
+            ),
+            ("CreateNetworkInterface", "us-west-2", None),
+            ("CreateVpc", "us-west-2", None),
+            ("DescribeInstances", "us-west-2", None),
+        ];
+        for (operation, region, expected) in rows {
+            let created = created_resource(operation, region);
+            assert_eq!(
+                &created, expected,
+                "case {operation:?} in {region}: expected {expected:?}, got {created:?}"
+            );
+        }
+    }
+
+    /// RULE: the refusals of the operations whose recorded contract hands the caller an
+    /// encoded authorization failure message carry one — whichever document in force reached
+    /// the decision — and the refusals of every other operation carry none. The decision the
+    /// blob names is the one the gate took: not allowed, explicitly denied exactly when a
+    /// `Deny` said so, about the principal, the BARE operation name, the resource the
+    /// decision was taken on and the keys it was taken over.
+    #[test]
+    fn the_operations_recorded_with_a_trailer_carry_the_decision_to_decode() {
+        let principal = "arn:aws:sts::000000000000:assumed-role/launcher/session-1";
+        let resource = ::engine::emulator_arn(ACTION_PREFIX, "us-west-2", "instance/*");
+        // (case, the operation refused, the document the decision rested on, whether a blob
+        // is handed over, whether the decision it names is an explicit deny)
+        let rows: &[(&str, &str, DecidedBy, bool, bool)] = &[
+            (
+                "a launch denied by a session policy",
+                "RunInstances",
+                DecidedBy::SessionPolicyDeny,
+                true,
+                true,
+            ),
+            (
+                "a launch denied by an identity-based policy",
+                "RunInstances",
+                DecidedBy::IdentityDeny,
+                true,
+                true,
+            ),
+            (
+                "a launch denied by the permissions boundary",
+                "RunInstances",
+                DecidedBy::BoundaryDeny,
+                true,
+                true,
+            ),
+            (
+                "a launch no document allows at all",
+                "RunInstances",
+                DecidedBy::NoAllow,
+                true,
+                false,
+            ),
+            (
+                "a volume create no document allows at all",
+                "CreateVolume",
+                DecidedBy::NoAllow,
+                true,
+                false,
+            ),
+            (
+                "an interface create, whose recorded refusal carries no blob",
+                "CreateNetworkInterface",
+                DecidedBy::NoAllow,
+                false,
+                false,
+            ),
+            (
+                "the same interface create under an explicit deny",
+                "CreateNetworkInterface",
+                DecidedBy::SessionPolicyDeny,
+                false,
+                false,
+            ),
+            (
+                "an account-wide read",
+                "DescribeInstances",
+                DecidedBy::IdentityDeny,
+                false,
+                false,
+            ),
+        ];
+        for (case, operation, decided_by, carries, explicit) in rows {
+            let action = format!("{ACTION_PREFIX}:{operation}");
+            let refusal = refused_by(
+                principal,
+                &action,
+                Some(&resource),
+                iam::SESSION_POLICY_EXPLICIT_DENY,
+                *decided_by,
+            );
+            let decision = refusal.encoded_message_decision(operation);
+            assert_eq!(
+                decision.is_some(),
+                *carries,
+                "case {case:?}: expected a decision to encode: {carries}, got {decision:?}"
+            );
+            let Some(decision) = decision else {
+                continue;
+            };
+            assert_eq!(
+                (
+                    decision.allowed,
+                    decision.explicit_deny,
+                    decision.principal_arn.as_str(),
+                    decision.action.as_str(),
+                    decision.resource.as_str(),
+                ),
+                (
+                    false,
+                    *explicit,
+                    principal,
+                    *operation,
+                    resource.as_str()
+                ),
+                "case {case:?}: expected the decision the gate took, got {decision:?}"
             );
         }
     }
