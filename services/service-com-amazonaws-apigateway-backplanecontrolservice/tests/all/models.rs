@@ -27,6 +27,9 @@
 //! * that 409 carries the ONE fixed sentence for the condition, which varies neither with
 //!   the name that collides, nor with what the second request says about the payload, nor
 //!   with the API the name is held under;
+//! * a schema is VALIDATED before it is stored, so a schema whose reference resolves to
+//!   nothing — a fragment the document does not hold, or a model the API does not hold — is
+//!   the modelled 400 and stores nothing;
 //! * `flatten` resolves the model references a schema carries from stored state.
 
 use serde_json::{json, Value};
@@ -623,13 +626,14 @@ async fn flatten_resolves_the_model_references_a_schema_carries() {
             })),
         ),
         (
-            // A reference this API cannot resolve names no model of it, so the document
-            // is reported as stored: a JSON Pointer into the document itself, which is
-            // not an external model reference at all.
+            // A reference that is no MODEL reference names no model of this API, so the
+            // document is reported as stored: a JSON Pointer into the document itself,
+            // which the document resolves on its own.
             "a schema whose only reference is internal",
             json!({
                 "type": "object",
                 "properties": { "front": { "$ref": "#/definitions/leg" } },
+                "definitions": { "leg": { "type": "object" } },
             }),
             None,
         ),
@@ -709,4 +713,301 @@ async fn flatten_resolves_the_model_references_a_schema_carries() {
         serde_json::from_str::<Value>(&reported).is_ok(),
         "case a self-referencing model: expected a JSON schema, got {reported:?}"
     );
+}
+
+/// The sentence API Gateway refuses a model whose schema does not VALIDATE with: the
+/// validation result, whose one error names the model the schema's unresolved reference
+/// stood for. Written out here rather than read from the service, so the test checks the
+/// text instead of restating it.
+fn invalid_model_specified(model_name: &str) -> String {
+    format!(
+        "Invalid model specified: Validation Result: warnings : [], errors : [Invalid model \
+         specified: {model_name}]"
+    )
+}
+
+/// `GetModels` on `api`, as the list a refused create must not appear in.
+async fn model_names(gateway: &Gateway, api: &str) -> Vec<String> {
+    let answer = gateway
+        .call("GET", &format!("/restapis/{api}/models"), None)
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case GetModels: expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body["item"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|model| model["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_schema_whose_reference_resolves_to_nothing_is_refused() {
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "models-schema-validation").await;
+    let (other, _other_root) = create_api(&gateway, "models-schema-validation-other").await;
+
+    // The reference form API Gateway addresses another model of the same API by: the
+    // model's own URL under the API that holds it.
+    let reference = |scope: &str, model: &str| {
+        format!("https://apigateway.amazonaws.com/restapis/{scope}/models/{model}")
+    };
+
+    created_model(
+        &gateway,
+        &api,
+        "the referenced model",
+        json!({
+            "name": "Leg",
+            "contentType": "application/json",
+            "schema": json!({ "type": "object", "properties": { "length": { "type": "number" } } })
+                .to_string(),
+        }),
+    )
+    .await;
+    // A model of the OTHER api, under a name THIS api does not hold: a reference naming it
+    // names no model of the api the schema belongs to.
+    created_model(
+        &gateway,
+        &other,
+        "a model of another api",
+        json!({
+            "name": "Elsewhere",
+            "contentType": "application/json",
+            "schema": json!({ "type": "object" }).to_string(),
+        }),
+    )
+    .await;
+
+    // Rows differ along WHICH KIND of reference the schema states — a fragment of the
+    // document itself, a model of this api — along WHERE it sits in the document (a
+    // property, an array's items, a composition, the document root), along whether what it
+    // names is there, and along the forms that name no schema this service addresses (a
+    // model of another api, a URL of something else), which are stored. `true` is a create
+    // that is refused, and names the model its unresolved reference stood for.
+    let rows: Vec<(&str, Value, Option<&str>)> = vec![
+        (
+            "a property referencing a model the api holds",
+            json!({
+                "type": "object",
+                "properties": { "front": { "$ref": reference(&api, "Leg") } },
+            }),
+            None,
+        ),
+        (
+            "a property referencing a model the api does not hold",
+            json!({
+                "type": "object",
+                "properties": { "front": { "$ref": reference(&api, "Absent") } },
+            }),
+            Some("Absent"),
+        ),
+        (
+            "an array whose items reference a model the api does not hold",
+            json!({
+                "type": "object",
+                "properties": {
+                    "legs": { "type": "array", "items": { "$ref": reference(&api, "Gone") } },
+                },
+            }),
+            Some("Gone"),
+        ),
+        (
+            "a composition naming a model the api does not hold",
+            json!({
+                "type": "object",
+                "allOf": [
+                    { "$ref": reference(&api, "Leg") },
+                    { "$ref": reference(&api, "Nope") },
+                ],
+            }),
+            Some("Nope"),
+        ),
+        (
+            "a document whose root is the reference",
+            json!({ "$ref": reference(&api, "Missing") }),
+            Some("Missing"),
+        ),
+        (
+            "a fragment reference the document resolves",
+            json!({
+                "type": "object",
+                "properties": { "pet": { "$ref": "#/definitions/Pet" } },
+                "definitions": { "Pet": { "type": "object" } },
+            }),
+            None,
+        ),
+        (
+            "a fragment reference the document does not hold",
+            json!({
+                "type": "object",
+                "properties": { "pet": { "$ref": "#/definitions/Pet" } },
+            }),
+            Some("Pet"),
+        ),
+        (
+            "a fragment reference naming a definition beside the ones declared",
+            json!({
+                "type": "object",
+                "properties": { "pet": { "$ref": "#/definitions/Absent" } },
+                "definitions": { "Pet": { "type": "object" } },
+            }),
+            Some("Absent"),
+        ),
+        (
+            "a reference to the document itself",
+            json!({
+                "type": "object",
+                "properties": { "child": { "$ref": "#" } },
+            }),
+            None,
+        ),
+        (
+            "a reference to a model of ANOTHER api",
+            json!({
+                "type": "object",
+                "properties": { "front": { "$ref": reference(&other, "Elsewhere") } },
+            }),
+            None,
+        ),
+        (
+            "a reference that is no model URL at all",
+            json!({
+                "type": "object",
+                "properties": { "front": { "$ref": "urn:example:order" } },
+            }),
+            None,
+        ),
+        (
+            "a schema carrying no reference at all",
+            json!({ "type": "object", "properties": { "id": { "type": "string" } } }),
+            None,
+        ),
+    ];
+
+    for (index, (case, schema, named)) in rows.into_iter().enumerate() {
+        let name = format!("Checked{index}");
+        let answer = create_model(
+            &gateway,
+            &api,
+            json!({
+                "name": name.clone(),
+                "contentType": "application/json",
+                "schema": schema.to_string(),
+            }),
+        )
+        .await;
+        if let Some(named) = named {
+            assert_failure(&answer, 400, BAD_REQUEST, case);
+            // The refusal's one variable part is the model the unresolved reference STOOD
+            // FOR — the name the document declares it under — rather than the pointer that
+            // failed or the record being written.
+            let expected = invalid_model_specified(named);
+            assert_eq!(
+                answer.body["message"].as_str(),
+                Some(expected.as_str()),
+                "case {case}: expected the message {expected:?}, got {:?}",
+                answer.body["message"]
+            );
+            // Nothing was stored: the model is in neither the read nor the list.
+            let read = get_model(&gateway, &api, &name, false).await;
+            assert_failure(&read, 404, NOT_FOUND, case);
+            assert!(
+                !model_names(&gateway, &api).await.contains(&name),
+                "case {case}: expected the refused model to be out of the collection"
+            );
+        } else {
+            assert_eq!(
+                answer.status, 201,
+                "case {case}: expected 201 from CreateModel, got {} with {:?}",
+                answer.status, answer.body
+            );
+        }
+    }
+
+    // A schema referring to the very model being created resolves: the model is one of the
+    // API's own by the time the reference is read.
+    created_model(
+        &gateway,
+        &api,
+        "a schema referring to itself by its own URL",
+        json!({
+            "name": "Recursive",
+            "contentType": "application/json",
+            "schema": json!({
+                "type": "object",
+                "properties": { "parent": { "$ref": reference(&api, "Recursive") } },
+            })
+            .to_string(),
+        }),
+    )
+    .await;
+
+    // The refusal is decided from STATE, not from the schema's text: the very document
+    // refused above is accepted once the API holds the model it names.
+    let schema = json!({
+        "type": "object",
+        "properties": { "front": { "$ref": reference(&api, "Absent") } },
+    })
+    .to_string();
+    created_model(
+        &gateway,
+        &api,
+        "the model the reference names",
+        json!({
+            "name": "Absent",
+            "contentType": "application/json",
+            "schema": json!({ "type": "object" }).to_string(),
+        }),
+    )
+    .await;
+    created_model(
+        &gateway,
+        &api,
+        "the once-refused schema, now resolvable",
+        json!({
+            "name": "Resolvable",
+            "contentType": "application/json",
+            "schema": schema.clone(),
+        }),
+    )
+    .await;
+    let read = get_model(&gateway, &api, "Resolvable", false).await;
+    assert_eq!(
+        string_member(&read.body, "schema", "the once-refused schema"),
+        schema,
+        "case the once-refused schema: expected the stored document back, got {:?}",
+        read.body["schema"]
+    );
+
+    // A model typed as something other than JSON carries its schema in that content type's
+    // own language, which states no JSON Schema reference to resolve — whatever its text
+    // happens to parse as.
+    for (case, name, schema) in [
+        (
+            "an XML model naming a model the api does not hold",
+            "Xml",
+            "<xs:schema><xs:include schemaLocation=\"Nowhere\"/></xs:schema>".to_string(),
+        ),
+        (
+            "an XML model whose schema text parses as a JSON reference",
+            "XmlJson",
+            json!({ "$ref": "#/definitions/Nowhere" }).to_string(),
+        ),
+    ] {
+        created_model(
+            &gateway,
+            &api,
+            case,
+            json!({
+                "name": name,
+                "contentType": "application/xml",
+                "schema": schema,
+            }),
+        )
+        .await;
+    }
 }

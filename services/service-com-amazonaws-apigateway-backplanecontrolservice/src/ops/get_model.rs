@@ -222,19 +222,6 @@ impl From<CreateModelOutput> for GetModelOutput {
 /// whatever the API's models reference.
 const MAX_FLATTEN_REFERENCES: usize = 16;
 
-/// The model of `api` a `$ref` names, when the reference names one.
-///
-/// API Gateway references another model of the same API by the model's own URL,
-/// `.../restapis/{restApiId}/models/{modelName}`, so a reference is read as that tail and
-/// is a model reference only when it names THIS API. Anything else — a JSON Pointer into
-/// the document itself, a reference to another API, a URL of something else — names no
-/// model of this API and is left alone.
-fn referenced_model<'a>(reference: &'a str, rest_api_id: &str) -> Option<&'a str> {
-    let (_, addressed) = reference.rsplit_once("/restapis/")?;
-    let (api, model) = addressed.split_once("/models/")?;
-    (api == rest_api_id && !model.is_empty() && !model.contains('/')).then_some(model)
-}
-
 /// `schema` with every model reference it carries replaced by the referenced model's
 /// schema, from stored state.
 ///
@@ -289,7 +276,9 @@ fn resolve_references(
             if let Some(name) = members
                 .get("$ref")
                 .and_then(::serde_json::Value::as_str)
-                .and_then(|reference| referenced_model(reference, rest_api_id))
+                .and_then(|reference| {
+                    crate::state::referenced_model(reference, rest_api_id)
+                })
             {
                 if *budget > 0 && !expanding.iter().any(|busy| busy == name) {
                     if let Some(referenced) = api

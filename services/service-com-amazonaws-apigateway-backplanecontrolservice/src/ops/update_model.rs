@@ -79,7 +79,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use super::create_model::{validated_schema, MAX_MODEL_SCHEMA_CHARS};
+use super::create_model::{json_schema_text, validated_schema, MAX_MODEL_SCHEMA_CHARS};
 use crate::state::{
     patch_optional_string, InvalidPathRefusal, ModelEntry, Patch, PatchFailure,
     SupportedPatchPaths, MAX_STRING_CHARS,
@@ -265,16 +265,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .rest_apis
             .get_mut(&input.rest_api_id)
             .ok_or_else(|| not_found(crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        // The models this API holds, by name: what a model reference in the patched schema
+        // is resolved against below, read before the record is copied out.
+        let held: ::std::collections::BTreeSet<String> = api.models.keys().cloned().collect();
         // Patched on a COPY: a list whose later op is refused leaves the stored model
         // untouched, rather than keeping the ops before it.
-        let mut updated = api
+        let stored = api
             .models
             .get(&input.model_name)
             .ok_or_else(|| not_found(crate::state::no_such_model(&input.model_name)))?
             .clone();
+        let mut updated = stored.clone();
 
         for patch in &patches {
             apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+
+        // The schema this request WRITES is validated by the check the create runs, for the
+        // reason the create gives: a reference that resolves to nothing leaves the part of
+        // the document it stands for meaning nothing. Read for a model typed as JSON only, by
+        // the create's own rule — a model's `contentType` is not patchable, so that is the
+        // content type the create checked the original schema against. Refused with the
+        // stored model left as it was, naming the model the reference stood for.
+        //
+        // Only a schema this patch CHANGED is read: a request that patches the description
+        // writes no schema, and the document already on the record is not this request's to
+        // answer for — a reference of it may have come to resolve to nothing since, by the
+        // model it named being deleted.
+        let written = (updated.schema != stored.schema)
+            .then(|| json_schema_text(updated.schema.as_deref(), &updated.content_type))
+            .flatten();
+        if let Some(unresolved) = written.and_then(|schema| {
+            crate::state::unresolved_schema_reference(schema, &input.rest_api_id, &|name| {
+                name == updated.name || held.contains(name)
+            })
+        }) {
+            // Metadata only, as the audit record below is: which API and model the patch was
+            // refused for, never the schema or the reference text the request carried.
+            ::tracing::warn!(
+                rest_api = ?input.rest_api_id,
+                model = ?input.model_name,
+                "the patched model schema states a reference that resolves to nothing"
+            );
+            return Err(patch_failure(PatchFailure::BadRequest(
+                crate::state::invalid_model_specified(crate::state::reference_model_name(
+                    &unresolved,
+                )),
+            )));
         }
 
         // Rendered through the one `Model` body this crate builds, so the update reports

@@ -13,7 +13,8 @@
 //! record — which a later `GetModel` reads back member for member — while a patch the
 //! service cannot apply is refused with a modelled error and leaves the stored record
 //! exactly as it was. A patched `schema` is held to the same rule the create holds one
-//! to: it must describe the payload the model's content type names.
+//! to: it must describe the payload the model's content type names, and the models it
+//! references must be ones the API holds.
 //!
 //! The cases assert that rule over SETS of inputs rather than one recorded call: a table
 //! of members, ops, content-type families and schema forms; the paths and ops the
@@ -572,6 +573,158 @@ async fn a_schema_that_is_not_a_document_is_refused_with_the_one_fixed_sentence(
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_patched_schema_is_validated_against_the_apis_own_models() {
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "update-model-schema-validation").await;
+
+    // The reference form API Gateway addresses another model of the same API by: the
+    // model's own URL under the API that holds it.
+    let reference = |model: &str| {
+        format!("https://apigateway.amazonaws.com/restapis/{api}/models/{model}")
+    };
+    let referencing = |model: &str| {
+        json!({
+            "type": "object",
+            "properties": { "front": { "$ref": reference(model) } },
+        })
+        .to_string()
+    };
+
+    created_model(
+        &gateway,
+        &api,
+        "the referenced model",
+        json!({
+            "name": "Leg",
+            "contentType": "application/json",
+            "schema": json!({ "type": "object" }).to_string(),
+        }),
+    )
+    .await;
+    baseline(
+        &gateway,
+        &api,
+        "the model to patch",
+        "Pet",
+        baseline_request(),
+    )
+    .await;
+
+    // The same rule the create is held to, applied to the document a PATCH leaves on the
+    // record: rows differ along which KIND of reference the new schema states, whether what
+    // it names is there, whether the reference is to the patched model itself, and the
+    // reference form that names no schema this service addresses. `Some(name)` is a refused
+    // patch, naming the model its unresolved reference stood for.
+    let rows: &[(&str, String, Option<&str>)] = &[
+        (
+            "a schema referencing a model the api holds",
+            referencing("Leg"),
+            None,
+        ),
+        (
+            "a schema referencing the patched model itself",
+            referencing("Pet"),
+            None,
+        ),
+        (
+            "a schema referencing a model the api does not hold",
+            referencing("Absent"),
+            Some("Absent"),
+        ),
+        (
+            "a schema whose fragment reference the document resolves",
+            json!({
+                "type": "object",
+                "properties": { "pet": { "$ref": "#/definitions/Pet" } },
+                "definitions": { "Pet": { "type": "object" } },
+            })
+            .to_string(),
+            None,
+        ),
+        (
+            "a schema whose fragment reference the document does not hold",
+            json!({
+                "type": "object",
+                "properties": { "pet": { "$ref": "#/definitions/Gone" } },
+            })
+            .to_string(),
+            Some("Gone"),
+        ),
+    ];
+
+    for (case, schema, named) in rows {
+        let before = get_model(&gateway, &api, "Pet", false).await;
+        let stored = string_member(&before.body, "schema", case);
+        let patched = update(&gateway, &api, "Pet", vec![replace("/schema", schema)]).await;
+        match named {
+            None => {
+                assert_eq!(
+                    patched.status, 200,
+                    "case UpdateModel({case}): expected 200, got {} with {:?}",
+                    patched.status, patched.body
+                );
+                let read = get_model(&gateway, &api, "Pet", false).await;
+                assert_members(&read.body, &[("schema", json!(schema))], case, "GetModel");
+            }
+            Some(named) => {
+                assert_failure(&patched, 400, BAD_REQUEST, case);
+                // The refusal's one variable part is the model the unresolved reference
+                // stood for.
+                let expected = format!(
+                    "Invalid model specified: Validation Result: warnings : [], errors : \
+                     [Invalid model specified: {named}]"
+                );
+                assert_eq!(
+                    patched.body["message"].as_str(),
+                    Some(expected.as_str()),
+                    "case UpdateModel({case}): expected {expected:?}, got {:?}",
+                    patched.body["message"]
+                );
+                // The refused patch left the stored schema exactly as it was.
+                let read = get_model(&gateway, &api, "Pet", false).await;
+                assert_members(&read.body, &[("schema", json!(stored))], case, "GetModel");
+            }
+        }
+    }
+
+    // A patch that writes no schema is not held to the document already on the record: the
+    // referenced model is DELETED after the referencing schema was stored, so the stored
+    // document's reference resolves to nothing, and a description-only patch still applies.
+    let case = "a description-only patch on a model whose stored reference resolves to nothing";
+    patch_ok(
+        &gateway,
+        case,
+        &model_uri(&api, "Pet"),
+        vec![replace("/schema", &referencing("Leg"))],
+    )
+    .await;
+    let dropped = gateway
+        .call("DELETE", &format!("/restapis/{api}/models/Leg"), None)
+        .await;
+    assert_eq!(
+        dropped.status, 202,
+        "case {case}: expected 202 from DeleteModel, got {} with {:?}",
+        dropped.status, dropped.body
+    );
+    let patched = patch_ok(
+        &gateway,
+        case,
+        &model_uri(&api, "Pet"),
+        vec![replace("/description", "renamed")],
+    )
+    .await;
+    assert_members(
+        &patched,
+        &[
+            ("description", json!("renamed")),
+            ("schema", json!(referencing("Leg"))),
+        ],
+        case,
+        "UpdateModel",
+    );
 }
 
 #[tokio::test]

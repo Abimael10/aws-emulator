@@ -6,6 +6,11 @@
 //! `#set($inputRoot = $input.path('$'))` preamble followed by an example of the payload the
 //! model's JSON Schema declares. This is the ONLY file to touch for this operation.
 //!
+//! A template maps the MEMBERS of a payload, so every value the generation descends into —
+//! the document's root and any value a `$ref` states — has to declare a structure; one
+//! declaring a scalar data type there is refused rather than answered
+//! ([`unsupported_template_data_type_resolving`]).
+//!
 //! The generation is a pure function of the stored schema ([`generate_sample_payload`]), so
 //! the operation is REPORTING: it reads the store and writes nothing, and two calls on an
 //! unchanged model answer the same template. The model references a schema of this API may
@@ -90,7 +95,9 @@ use super::types::*;
 /// schema language — and re-exported here so the module docs above and the suite that
 /// asserts the bounds a template is generated within name one definition of them.
 pub use ::service_common::model_mapping_template::{
-    generate_sample_payload, Exhausted, MAX_DEPTH, MAX_STEPS, MAX_TEMPLATE_BYTES,
+    generate_sample_payload, unsupported_template_data_type,
+    unsupported_template_data_type_resolving, Exhausted, MAX_DEPTH,
+    MAX_RESOLVED_REFERENCES, MAX_STEPS, MAX_TEMPLATE_BYTES,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -188,17 +195,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
             // A schema of this API may reference another model of it by that model's own
-            // URL, which is no fragment the generator can resolve, so the references are
-            // inlined from stored state first — the one resolution `GetModel`'s `flatten`
-            // performs, bounded there, so the document generated from is at most a bounded
-            // number of model schemas larger than the one stored. A schema that references
-            // nothing is the stored document itself.
+            // URL, which is no fragment of the document itself: the referenced models'
+            // schemas are copied out beside it ([`crate::state::referenced_model_schemas`],
+            // bounded in how many it copies), so what the reading below resolves a reference
+            // against is stored state, and the generation itself runs on the document with
+            // those references already INLINED — the one resolution `GetModel`'s `flatten`
+            // performs, so the document generated from is at most a bounded number of model
+            // schemas larger than the one stored. A schema that references nothing is the
+            // stored document itself. Only the TEXTS are copied here: reading them as
+            // documents is work this guard must not hold.
+            let stored = model.schema.clone();
             TemplatedModel {
                 name: model.name.clone(),
                 content_type: model.content_type.clone(),
-                schema: model.schema.as_deref().map(|schema| {
+                referenced: stored
+                    .as_deref()
+                    .map(|schema| {
+                        crate::state::referenced_model_schemas(api, &input.rest_api_id, schema)
+                    })
+                    .unwrap_or_default(),
+                flattened: stored.as_deref().map(|schema| {
                     super::get_model::flattened_schema(api, &input.rest_api_id, schema)
                 }),
+                schema: stored,
             }
         };
 
@@ -220,12 +239,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
+        // A template MAPS a payload onto the structure the schema declares, so every value
+        // the generation descends into — the document's ROOT, which is the payload being
+        // mapped, and any value a `$ref` STATES, which is how a schema names the structures
+        // it is composed of — has to declare a structure. A value declaring a SCALAR type
+        // there has no members to map, so API Gateway reports that data type as one it does
+        // not generate a mapping template for rather than answering a sample that maps
+        // nothing — the one rule both gateway control planes refuse such a model by
+        // ([`unsupported_template_data_type_resolving`]).
+        //
+        // A reference naming another model of this API is resolved from that model's stored
+        // schema, so it is read as the reference it is. Each referenced schema is READ ONCE,
+        // here, into the documents the resolution below hands back by lookup: a schema naming
+        // one model a thousand times therefore costs one reading of it rather than a thousand,
+        // and the reading resolves at most
+        // [`::service_common::model_mapping_template::MAX_RESOLVED_REFERENCES`] of them.
+        let resolved: ::std::collections::BTreeMap<&str, ::serde_json::Value> = model
+            .referenced
+            .iter()
+            .filter_map(|(name, schema)| {
+                ::serde_json::from_str::<::serde_json::Value>(schema)
+                    .ok()
+                    .map(|document| (name.as_str(), document))
+            })
+            .collect();
+        let resolve = |reference: &str| {
+            crate::state::referenced_model(reference, &input.rest_api_id)
+                .and_then(|name| resolved.get(name))
+        };
+        if let Some(message) = unsupported_template_data_type_resolving(&document, &resolve) {
+            return Err(
+                GetModelTemplateErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
         // Generation is bounded in descent, in steps and in output size, and a
         // schema that does not fit those bounds is REFUSED rather than expanded: one
         // request therefore costs at most a fixed amount of work and returns at most a
         // fixed amount of output, however the stored schema branches or refers back to
-        // itself.
-        let value = generate_sample_payload(&document).map_err(|exhausted| {
+        // itself. It runs on the document with this API's model references INLINED, because
+        // such a reference addresses another model by its URL, which the generator itself
+        // cannot read.
+        let generated = model
+            .flattened_json_schema()
+            .and_then(|schema| ::serde_json::from_str::<::serde_json::Value>(schema).ok())
+            .unwrap_or(document);
+        let value = generate_sample_payload(&generated).map_err(|exhausted| {
             GetModelTemplateErrorModeled::BadRequestException(BadRequestException {
                 message: Some(format!(
                     "Unable to generate a template for model {}: its schema expands past \
@@ -243,8 +305,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// What a generation needs of the stored model: its name, for the refusal that names it,
-/// the content type whose language its schema is written in, and the schema itself with
-/// this API's model references already resolved.
+/// the content type whose language its schema is written in, the schema as STORED — the
+/// document whose own references the data-type reading resolves — the same schema with this
+/// API's model references already inlined, which is what the sample is generated from, and
+/// the schemas of the models it references.
 ///
 /// Copied out of the store so the generation runs on an owned record and holds no lock.
 #[derive(Debug)]
@@ -252,6 +316,8 @@ struct TemplatedModel {
     name: String,
     content_type: String,
     schema: Option<String>,
+    flattened: Option<String>,
+    referenced: ::std::collections::BTreeMap<String, String>,
 }
 
 impl TemplatedModel {
@@ -261,6 +327,15 @@ impl TemplatedModel {
     fn json_schema(&self) -> Option<&str> {
         let content_type: ::mime::Mime = self.content_type.parse().ok()?;
         self.schema
+            .as_deref()
+            .filter(|_| super::create_model::is_json_media_type(&content_type))
+    }
+
+    /// The same schema with this API's model references inlined, for a model whose schema is
+    /// a JSON Schema document: what the sample is generated from.
+    fn flattened_json_schema(&self) -> Option<&str> {
+        let content_type: ::mime::Mime = self.content_type.parse().ok()?;
+        self.flattened
             .as_deref()
             .filter(|_| super::create_model::is_json_media_type(&content_type))
     }

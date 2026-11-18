@@ -1175,26 +1175,16 @@ pub fn warnings_refusal(warnings: &[String]) -> String {
     message
 }
 
-/// The model a `$ref` names: the last token of its JSON Pointer, which is the name the
-/// document declares that model under (`#/components/schemas/<name>` in OpenAPI 3,
-/// `#/definitions/<name>` in Swagger 2.0) and the name an import reports the reference
-/// by. A reference carrying no separator at all names that model directly.
-fn referenced_model(reference: &str) -> &str {
-    reference
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(reference)
-}
-
 /// The warnings a document earns for the MODEL REFERENCES it does not itself resolve, in
 /// document order and one per PLACE the import resolves each of them.
 ///
 /// A `$ref` names the model a part of the document stands for, so one whose target the
 /// document does not declare — or whose target is outside the document altogether — names
-/// no model at all: API Gateway reports it by the MODEL's own name ([`referenced_model`])
-/// rather than by the pointer that failed, and carries on with the rest of the document,
-/// which is what "Ignoring." says. It reports it ONCE PER RESOLUTION rather than once per
+/// no model at all: API Gateway reports it by the MODEL's own name
+/// ([`crate::state::reference_model_name`], the one reading of the name a reference stands
+/// for) rather than by the pointer that failed, and carries on with the rest of the
+/// document, which is what "Ignoring." says. It reports it ONCE PER RESOLUTION rather than
+/// once per
 /// reference: once where the document CARRIES the reference, and once more for every media
 /// type that declares its model by it ([`media_type_bindings`]), which is why a document
 /// declaring one unresolvable schema under a media type earns the sentence twice.
@@ -1213,7 +1203,7 @@ pub fn model_reference_warnings(document: &Node) -> Vec<String> {
     for reference in unresolved_references(document) {
         let warning = format!(
             "Reference to model '{}' not found. Ignoring.",
-            referenced_model(&reference)
+            crate::state::reference_model_name(&reference)
         );
         let resolutions = 1 + bindings.get(&reference).copied().unwrap_or_default();
         for _ in 0..resolutions {

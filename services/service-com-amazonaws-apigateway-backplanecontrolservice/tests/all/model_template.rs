@@ -12,7 +12,9 @@
 //! that value is the example. The generation is a function of the STORED record, so it
 //! reads the store and writes nothing: two calls on an unchanged model answer the same
 //! template and the model survives them. A model the API does not hold is the modelled 404;
-//! a model that declares no JSON Schema to describe, and one whose schema does not fit the
+//! a model that declares no JSON Schema to describe, one whose schema declares a SCALAR data
+//! type at its root — which has no members for a template to map, so API Gateway names that
+//! data type as one it generates no template for — and one whose schema does not fit the
 //! bounds a template is generated within, are the modelled 400.
 //!
 //! The rows vary what the rule generalises over: the JSON type the schema declares
@@ -49,6 +51,11 @@ const MAX_STEPS: usize =
 /// How deep a generation descends before it renders the value as one of unknown shape.
 const MAX_DEPTH: usize =
     service_com_amazonaws_apigateway_backplanecontrolservice::ops::get_model_template::MAX_DEPTH;
+
+/// How many references OUTSIDE the document one read resolves — the models of the API a
+/// schema names — read from the service for the same reason.
+const MAX_RESOLVED_REFERENCES: usize =
+    service_com_amazonaws_apigateway_backplanecontrolservice::ops::get_model_template::MAX_RESOLVED_REFERENCES;
 
 /// A whole template: the preamble, then `body`.
 fn template(body: &str) -> String {
@@ -568,9 +575,10 @@ async fn a_generated_sample_resolves_the_model_references_the_schema_carries() {
     )
     .await;
 
-    // Rows differ along WHERE the reference sits in the document: a referenced property, a
-    // reference inside a list, and a reference this API cannot resolve, whose value is then
-    // one the schema declares nothing about.
+    // Rows differ along WHERE the reference sits in the document: a referenced property and
+    // a reference inside a list. A reference this API cannot resolve follows the table: a
+    // schema is validated against the API's own models when it is written, so that document
+    // is reached by deleting the model it names rather than by creating it dangling.
     let rows: Vec<(&str, Value, String)> = vec![
         (
             "a referenced property",
@@ -597,14 +605,6 @@ async fn a_generated_sample_resolves_the_model_references_the_schema_carries() {
             ]
             .join("\n"),
         ),
-        (
-            "a reference to a model this API does not hold",
-            json!({
-                "type": "object",
-                "properties": { "front": { "$ref": reference("Wing") } }
-            }),
-            ["{", "  \"front\" : null", "}"].join("\n"),
-        ),
     ];
 
     for (index, (case, schema, expected_body)) in rows.into_iter().enumerate() {
@@ -617,6 +617,45 @@ async fn a_generated_sample_resolves_the_model_references_the_schema_carries() {
             template(&expected_body)
         );
     }
+
+    // A reference this API cannot resolve names no schema, so the value it stands for is one
+    // the document declares nothing about. The model that held it is DELETED after the
+    // referencing schema was stored, which is how a stored reference comes to resolve to
+    // nothing: a write of such a schema is refused.
+    let case = "a reference to a model this API no longer holds";
+    model_of(
+        &gateway,
+        &api,
+        "the model the reference names",
+        "Wing",
+        &json!({ "type": "object", "properties": { "span": { "type": "number" } } }),
+    )
+    .await;
+    let name = model_of(
+        &gateway,
+        &api,
+        case,
+        "Dangling",
+        &json!({
+            "type": "object",
+            "properties": { "front": { "$ref": reference("Wing") } }
+        }),
+    )
+    .await;
+    let dropped = gateway
+        .call("DELETE", &format!("/restapis/{api}/models/Wing"), None)
+        .await;
+    assert_eq!(
+        dropped.status, 202,
+        "case {case}: expected 202 from DeleteModel, got {} with {:?}",
+        dropped.status, dropped.body
+    );
+    let value = generated_template(&gateway, &api, &name, case).await;
+    let expected = template(&["{", "  \"front\" : null", "}"].join("\n"));
+    assert_eq!(
+        value, expected,
+        "case {case:?}: expected {expected:?}, got {value:?}"
+    );
 }
 
 #[tokio::test]
@@ -669,6 +708,234 @@ async fn generating_a_template_changes_nothing_a_later_caller_sees() {
         read.body, stored,
         "case GetModel after the generations: expected the stored model {stored:?}, got {:?}",
         read.body
+    );
+}
+
+#[tokio::test]
+async fn a_schema_declaring_a_scalar_at_its_root_has_no_mapping_template() {
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "model-template-data-types").await;
+
+    // A template MAPS the members of a payload, so the ROOT of the schema has to declare a
+    // structure that has members: the two composite JSON Schema types. The rows span every
+    // type draft-04 §5.5.2 names at the root — the two composite ones, each of the five
+    // scalars — plus the forms that state a type without the keyword (`properties`, `items`)
+    // or state none at all, and the union spelling, which is read through its first name
+    // that is not `null`. `None` is a template; `Some(type)` is the refusal naming that
+    // type.
+    let rows: &[(&str, Value, Option<&str>)] = &[
+        (
+            "an object",
+            json!({ "type": "object", "properties": { "id": { "type": "string" } } }),
+            None,
+        ),
+        (
+            "an array",
+            json!({ "type": "array", "items": { "type": "string" } }),
+            None,
+        ),
+        (
+            "an object typed only by declaring properties",
+            json!({ "properties": { "id": { "type": "string" } } }),
+            None,
+        ),
+        (
+            "an array typed only by declaring items",
+            json!({ "items": { "type": "integer" } }),
+            None,
+        ),
+        ("a schema declaring no type at all", json!({}), None),
+        (
+            "a union naming the object type",
+            json!({ "type": ["object", "null"] }),
+            None,
+        ),
+        (
+            "a union whose first name is null and whose second is composite",
+            json!({ "type": ["null", "array"], "items": { "type": "string" } }),
+            None,
+        ),
+        (
+            "a string",
+            json!({
+                "$schema": "http://json-schema.org/draft-04/schema#",
+                "title": "Scalar",
+                "type": "string"
+            }),
+            Some("string"),
+        ),
+        ("an integer", json!({ "type": "integer" }), Some("integer")),
+        ("a number", json!({ "type": "number" }), Some("number")),
+        ("a boolean", json!({ "type": "boolean" }), Some("boolean")),
+        ("null", json!({ "type": "null" }), Some("null")),
+        (
+            "a union naming a scalar type",
+            json!({ "type": ["string", "null"] }),
+            Some("string"),
+        ),
+        (
+            "a union whose first name is null and whose second is a scalar",
+            json!({ "type": ["null", "integer"] }),
+            Some("integer"),
+        ),
+        (
+            // draft-04 section 7: the root may be STATED by a reference to a definition, and
+            // what the instance must satisfy is then what that definition declares.
+            "a root referencing a definition that declares an object",
+            json!({
+                "$schema": "http://json-schema.org/draft-04/schema#",
+                "$ref": "#/definitions/Pet",
+                "definitions": { "Pet": { "type": "object", "properties": { "id": { "type": "string" } } } }
+            }),
+            None,
+        ),
+        (
+            "a root referencing a definition that declares a scalar",
+            json!({
+                "$schema": "http://json-schema.org/draft-04/schema#",
+                "title": "Measure",
+                "$ref": "#/definitions/measure",
+                "definitions": { "measure": { "type": "string" } }
+            }),
+            Some("string"),
+        ),
+        (
+            "a root composed of a subschema declaring a scalar",
+            json!({ "allOf": [{ "type": "number" }] }),
+            Some("number"),
+        ),
+        (
+            "a root composed of a subschema declaring an object",
+            json!({ "allOf": [{ "type": "object", "properties": { "id": { "type": "string" } } }] }),
+            None,
+        ),
+    ];
+
+    for (index, (case, schema, unsupported)) in rows.iter().enumerate() {
+        let name = format!("DataType{index}");
+        let stored = model_of(&gateway, &api, case, &name, schema).await;
+        match unsupported {
+            None => {
+                let value = generated_template(&gateway, &api, &stored, case).await;
+                assert!(
+                    value.starts_with(PREAMBLE),
+                    "case {case}: expected a generated template, got {value:?}"
+                );
+            }
+            Some(data_type) => {
+                let answer = get_model_template(&gateway, &api, &stored).await;
+                assert_failure(&answer, 400, BAD_REQUEST, case);
+                // The refusal names the data type the model's own schema declares: the
+                // fixed sentence plus that one token.
+                let expected = format!("Unsupported data type for mapping template: {data_type}");
+                assert_eq!(
+                    answer.body["message"].as_str(),
+                    Some(expected.as_str()),
+                    "case {case}: expected the message {expected:?}, got {:?}",
+                    answer.body["message"]
+                );
+            }
+        }
+    }
+
+    // The refusal is a READ's: the model it named is still stored, and a second call is
+    // refused the same way rather than differently.
+    let refused = model_of(
+        &gateway,
+        &api,
+        "a model the refusal survives",
+        "Survives",
+        &json!({ "type": "string" }),
+    )
+    .await;
+    for attempt in 1..=2 {
+        let answer = get_model_template(&gateway, &api, &refused).await;
+        assert_failure(&answer, 400, BAD_REQUEST, "a repeated call on one model");
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some("Unsupported data type for mapping template: string"),
+            "attempt {attempt}: expected the same refusal, got {:?}",
+            answer.body["message"]
+        );
+    }
+    let read = get_model(&gateway, &api, &refused, false).await;
+    assert_eq!(
+        read.status, 200,
+        "case the refused model survives: expected 200 from GetModel, got {} with {:?}",
+        read.status, read.body
+    );
+}
+
+#[tokio::test]
+async fn a_schema_naming_one_model_thousands_of_times_is_read_within_the_bounds() {
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "model-template-fanned-references").await;
+
+    let reference =
+        |model: &str| format!("https://apigateway.amazonaws.com/restapis/{api}/models/{model}");
+
+    // The model every reference names, itself a document of some size: resolving it is what a
+    // reference costs, so a schema naming it thousands of times is how a small request would
+    // otherwise buy one reading of this document per reference.
+    let shared: serde_json::Map<String, Value> = (0..200)
+        .map(|index| (format!("field{index}"), json!({ "type": "string" })))
+        .collect();
+    model_of(
+        &gateway,
+        &api,
+        "the referenced model",
+        "Shared",
+        &json!({ "type": "object", "properties": Value::Object(shared) }),
+    )
+    .await;
+
+    // Far more references than the read resolves, in ONE schema that still fits the published
+    // 400 KB maximum a model's schema may carry.
+    let fan = MAX_RESOLVED_REFERENCES * 200;
+    let properties: serde_json::Map<String, Value> = (0..fan)
+        .map(|index| (format!("p{index}"), json!({ "$ref": reference("Shared") })))
+        .collect();
+    let name = model_of(
+        &gateway,
+        &api,
+        "a schema naming one model thousands of times",
+        "Fanned",
+        &json!({ "type": "object", "properties": Value::Object(properties) }),
+    )
+    .await;
+
+    // The request is ANSWERED — with a template, or refused on a bound the generation names —
+    // rather than read once per reference: either way the answer is one of the modelled ones.
+    let case = "a schema naming one model thousands of times";
+    let answer = get_model_template(&gateway, &api, &name).await;
+    match answer.status {
+        200 => {
+            let value = answer.body["value"].as_str().unwrap_or_default();
+            assert!(
+                value.starts_with(PREAMBLE) && value.len() <= MAX_TEMPLATE_BYTES,
+                "case {case}: expected a bounded template, got {} bytes",
+                value.len()
+            );
+        }
+        400 => {
+            let message = answer.body["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(&MAX_STEPS.to_string())
+                    || message.contains(&MAX_TEMPLATE_BYTES.to_string()),
+                "case {case}: expected the refusal to name the bound it hit, got {message:?}"
+            );
+        }
+        status => panic!(
+            "case {case}: expected 200 or the modelled 400, got {status} with {:?}",
+            answer.body
+        ),
+    }
+
+    // The API is still serving: the referenced model's own template is answered as before.
+    let value = generated_template(&gateway, &api, "Shared", "the referenced model").await;
+    assert!(
+        value.starts_with(PREAMBLE),
+        "case the referenced model: expected its own template, got {value:?}"
     );
 }
 

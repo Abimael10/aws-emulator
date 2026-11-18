@@ -11,44 +11,15 @@
 //! a schema whose root declares a scalar type (`string`, `integer`, `number`, `boolean`,
 //! `null`) declares no members at all, and API Gateway answers such a request by naming that
 //! data type as one it does not generate a mapping template for.
+//!
+//! The rule itself is stated ONCE, in the shared crate that states the reading of that
+//! schema language, because BOTH gateway control planes generate a mapping template from the
+//! same documents and refuse the same data types; this module is the name this service's
+//! state reaches it by, and the cases below are what hold it to the reading.
 
-/// The JSON Schema types a mapping template is generated for: the two COMPOSITE types, whose
-/// members are what a template maps.
-const TEMPLATED_DATA_TYPES: [&str; 2] = ["object", "array"];
-
-/// How API Gateway words the refusal: the fixed text `Unsupported data type for mapping
-/// template: ` and the data type the model's own schema declares.
-pub fn unsupported_template_data_type_message(data_type: &str) -> String {
-    format!("Unsupported data type for mapping template: {data_type}")
-}
-
-/// The message a model whose schema declares a data type no mapping template maps is refused
-/// with, or `None` when a template can be generated for it.
-///
-/// `document` is the model's parsed JSON Schema. A schema that declares NO type at all names
-/// no data type to refuse — the generator reads such a value's structure from its
-/// `properties` or `items`, and maps a value of unknown shape by reference — so it is
-/// generated for; a `type` written as a union of names is read as the generator reads it,
-/// through the first name that is not `null`.
-pub fn unsupported_template_data_type(document: &::serde_json::Value) -> Option<String> {
-    let declared = declared_data_type(document)?;
-    (!TEMPLATED_DATA_TYPES.contains(&declared))
-        .then(|| unsupported_template_data_type_message(declared))
-}
-
-/// The data type a schema's root declares, read the way
-/// `::service_common::model_mapping_template` reads it: the `type` keyword as a name, or the
-/// first name of a union that is not `null` (JSON Schema draft-04 §5.5.2 admits both forms).
-fn declared_data_type(document: &::serde_json::Value) -> Option<&str> {
-    match document.get("type") {
-        Some(::serde_json::Value::String(name)) => Some(name.as_str()),
-        Some(::serde_json::Value::Array(names)) => names
-            .iter()
-            .filter_map(::serde_json::Value::as_str)
-            .find(|name| *name != "null"),
-        _ => None,
-    }
-}
+pub use ::service_common::model_mapping_template::{
+    unsupported_template_data_type, unsupported_template_data_type_message,
+};
 
 #[cfg(test)]
 mod tests {

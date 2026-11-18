@@ -210,6 +210,216 @@ pub fn generate_template(document: &::serde_json::Value) -> Result<String, Exhau
     Ok(writer.template)
 }
 
+/// The JSON Schema types a mapping template is generated for: the two COMPOSITE types,
+/// whose members are what a template maps.
+const TEMPLATED_DATA_TYPES: [&str; 2] = ["object", "array"];
+
+/// How a gateway words the refusal of a model whose declared data type no mapping template
+/// maps: the fixed text and the data type the model's own schema declares.
+pub fn unsupported_template_data_type_message(data_type: &str) -> String {
+    format!("Unsupported data type for mapping template: {data_type}")
+}
+
+/// The message a model whose schema declares a data type no mapping template maps is
+/// refused with, or `None` when a template can be generated for it.
+///
+/// A template MAPS a payload onto the structure the schema declares, so every value the
+/// generation has to DESCEND INTO has to declare a structure: an `object` is mapped property
+/// by property and an `array` item by item, while a value declaring a SCALAR type (`string`,
+/// `integer`, `number`, `boolean`, `null`) has no members at all. Two kinds of value are
+/// descended into: the document's ROOT, which is the payload being mapped, and a value
+/// STATED BY A REFERENCE — draft-04 section 7 makes the referenced schema what the instance
+/// must satisfy, and a gateway's references name the structures a model is composed of. A
+/// scalar reached at either of those is reported as a data type no mapping template is
+/// generated for, naming that type. A scalar declared INLINE is a leaf the generation
+/// renders in place, which is the ordinary case and no refusal.
+///
+/// A value that declares NO type names no data type to refuse — the generations above read
+/// such a value's structure from its `properties` or `items`, and map a value of unknown
+/// shape by reference — and a reference that resolves to nothing is such a value. A `type`
+/// written as a union of names is read as those generations read it, through the first name
+/// that is not `null`.
+///
+/// Bounded exactly as a generation is: the descent is bounded by [`MAX_DEPTH`], the work by
+/// [`MAX_STEPS`] and the references resolved OUTSIDE the document by
+/// [`MAX_RESOLVED_REFERENCES`], and a document that does not fit those bounds is reported as
+/// generating no refusal — the generation that follows is what refuses it, on the bound it
+/// hit.
+///
+/// Stated HERE, beside the generations themselves, because the question belongs to the
+/// schema language both gateway control planes read rather than to either one's operation.
+pub fn unsupported_template_data_type(document: &::serde_json::Value) -> Option<String> {
+    unsupported_template_data_type_resolving(document, &|_| None)
+}
+
+/// How many references one reading resolves through the CALLER's own resolution — a
+/// reference to a schema that is no fragment of the document being read.
+///
+/// Each such resolution brings a whole further document into the reading, so the count is
+/// bounded as well as the work done inside it: a reference past the bound is read as one that
+/// resolves to nothing. The same figure a flattened read inlines references within, so a
+/// reading covers the references a generation would have inlined.
+pub const MAX_RESOLVED_REFERENCES: usize = 16;
+
+/// [`unsupported_template_data_type`], with the references the DOCUMENT cannot resolve
+/// resolved by `resolve`.
+///
+/// A gateway model's schema may reference another model of the same api by that model's own
+/// URL, which is no fragment of this document: `resolve` is handed the reference exactly as
+/// the schema spells it and ANSWERS A DOCUMENT IT ALREADY HOLDS, so one reading resolves a
+/// reference by a lookup rather than by reading a stored schema again — however many times
+/// the document names it. A caller that has no other schemas to resolve against passes
+/// [`unsupported_template_data_type`].
+pub fn unsupported_template_data_type_resolving<'doc>(
+    document: &'doc ::serde_json::Value,
+    resolve: &dyn Fn(&str) -> Option<&'doc ::serde_json::Value>,
+) -> Option<String> {
+    let mut writer = Writer::new();
+    let mut resolutions = MAX_RESOLVED_REFERENCES;
+    unsupported_data_type(
+        document,
+        document,
+        0,
+        true,
+        resolve,
+        &mut resolutions,
+        &mut writer,
+    )
+    .ok()
+    .flatten()
+}
+
+/// The first data type under `schema` that no mapping template maps, as the refusal states
+/// it.
+///
+/// `mapped` is whether the value at this node is one the generation DESCENDS INTO — the
+/// document's root, or a value stated by a reference — rather than a leaf it renders in
+/// place. `depth` is the descent [`MAX_DEPTH`] bounds, counted as a generation counts it, and
+/// every node charges one step, so this reading costs no more work than the generation it
+/// precedes. `resolutions` is how many references it may still resolve outside the document
+/// ([`MAX_RESOLVED_REFERENCES`]), spent across the whole reading, so the documents one reading
+/// draws in are bounded by a constant rather than by how many times the schema names them.
+fn unsupported_data_type<'doc>(
+    root: &'doc ::serde_json::Value,
+    schema: &'doc ::serde_json::Value,
+    depth: usize,
+    mapped: bool,
+    resolve: &dyn Fn(&str) -> Option<&'doc ::serde_json::Value>,
+    resolutions: &mut usize,
+    writer: &mut Writer,
+) -> Result<Option<String>, Exhausted> {
+    writer.step()?;
+    if depth >= MAX_DEPTH {
+        // Past the descent bound the generation renders the value without reading further,
+        // so there is nothing more to report on either.
+        return Ok(None);
+    }
+    // A REFERENCE states the value: what the instance must satisfy is the schema it names,
+    // so the reading continues there — in this document when the reference addresses it, and
+    // through the caller's own resolution otherwise, while that budget lasts.
+    if let Some(reference) = schema.get("$ref").and_then(::serde_json::Value::as_str) {
+        if let Some(target) = referenced(root, schema, writer)? {
+            return unsupported_data_type(
+                root,
+                target,
+                depth + 1,
+                true,
+                resolve,
+                resolutions,
+                writer,
+            );
+        }
+        if *resolutions == 0 {
+            return Ok(None);
+        }
+        return match resolve(reference) {
+            // The referenced schema is a document of its own, so its own fragments resolve
+            // against it.
+            Some(target) => {
+                *resolutions -= 1;
+                unsupported_data_type(
+                    target,
+                    target,
+                    depth + 1,
+                    true,
+                    resolve,
+                    resolutions,
+                    writer,
+                )
+            }
+            // A reference that resolves to nothing names no data type.
+            None => Ok(None),
+        };
+    }
+    // What the instance must satisfy is the schema together with the subschemas it is
+    // composed of, which is how the generations read a declaration too.
+    let sources = composed(root, schema, writer)?;
+    if mapped {
+        if let Some(declared) = sources
+            .iter()
+            .find_map(|source| declared_data_type(source))
+            .filter(|declared| !TEMPLATED_DATA_TYPES.contains(declared))
+        {
+            return Ok(Some(unsupported_template_data_type_message(declared)));
+        }
+    }
+    // Then DOWN the structure, exactly where the generation descends: an object through the
+    // properties it declares, an array through the schema of its items.
+    match sources
+        .iter()
+        .map(|source| kind(source))
+        .find(|kind| *kind != Kind::Unknown)
+        .unwrap_or(Kind::Unknown)
+    {
+        Kind::Object => {
+            for (_, property) in declared_properties_of(&sources, writer)? {
+                if let Some(message) = unsupported_data_type(
+                    root,
+                    property,
+                    depth + 1,
+                    false,
+                    resolve,
+                    resolutions,
+                    writer,
+                )? {
+                    return Ok(Some(message));
+                }
+            }
+            Ok(None)
+        }
+        Kind::Array => match sources.iter().find_map(|source| declared_items(source)) {
+            Some(items) => unsupported_data_type(
+                root,
+                items,
+                depth + 1,
+                false,
+                resolve,
+                resolutions,
+                writer,
+            ),
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// The data type `schema` declares for its value, as the NAME the document spells: the
+/// `type` keyword, or the first name of a union that is not `null` (JSON Schema draft-04
+/// §5.5.2 admits both forms).
+///
+/// The one reading of that keyword in this module, so what [`kind`] generates from and what
+/// [`unsupported_template_data_type`] reports cannot disagree.
+fn declared_data_type(schema: &::serde_json::Value) -> Option<&str> {
+    match schema.get("type") {
+        Some(::serde_json::Value::String(name)) => Some(name.as_str()),
+        Some(::serde_json::Value::Array(names)) => names
+            .iter()
+            .filter_map(::serde_json::Value::as_str)
+            .find(|name| *name != "null"),
+        _ => None,
+    }
+}
+
 /// The JSON type a schema node declares for its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -513,15 +723,7 @@ fn kind(schema: &::serde_json::Value) -> Kind {
     let Some(object) = schema.as_object() else {
         return Kind::Unknown;
     };
-    let declared = match object.get("type") {
-        Some(::serde_json::Value::String(name)) => Some(name.as_str()),
-        Some(::serde_json::Value::Array(names)) => names
-            .iter()
-            .find_map(::serde_json::Value::as_str)
-            .filter(|name| *name != "null"),
-        _ => None,
-    };
-    if let Some(declared) = declared {
+    if let Some(declared) = declared_data_type(schema) {
         return match declared {
             "object" => Kind::Object,
             "array" => Kind::Array,
@@ -707,4 +909,93 @@ fn quoted(value: &str) -> String {
 /// generated document.
 fn compact(value: &::serde_json::Value) -> String {
     value.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_roots_data_type_is_read_through_the_references_and_compositions_it_is_stated_by() {
+        // The rows span HOW a document states its root's type: inline, through an
+        // in-document reference to a definition, through a chain of them, through the
+        // composition keywords draft-04 sections 5.5.3 to 5.5.5 name, and through a
+        // reference that resolves to nothing or back to itself — each paired with a
+        // composite and with a scalar target, which is what the rule turns on.
+        let rows: &[(&str, ::serde_json::Value, Option<&str>)] = &[
+            (
+                "an inline object",
+                ::serde_json::json!({ "type": "object" }),
+                None,
+            ),
+            (
+                "an inline scalar",
+                ::serde_json::json!({ "type": "string" }),
+                Some("string"),
+            ),
+            (
+                "a root referencing a definition that declares an object",
+                ::serde_json::json!({
+                    "$ref": "#/definitions/Pet",
+                    "definitions": { "Pet": { "type": "object", "properties": {} } }
+                }),
+                None,
+            ),
+            (
+                "a root referencing a definition that declares a scalar",
+                ::serde_json::json!({
+                    "$schema": "http://json-schema.org/draft-04/schema#",
+                    "title": "Scalar",
+                    "$ref": "#/definitions/Measure",
+                    "definitions": { "Measure": { "type": "string" } }
+                }),
+                Some("string"),
+            ),
+            (
+                "a chain of references ending at a scalar",
+                ::serde_json::json!({
+                    "$ref": "#/definitions/First",
+                    "definitions": {
+                        "First": { "$ref": "#/definitions/Second" },
+                        "Second": { "type": "integer" }
+                    }
+                }),
+                Some("integer"),
+            ),
+            (
+                "a root composed with allOf of a scalar",
+                ::serde_json::json!({ "allOf": [{ "type": "number" }] }),
+                Some("number"),
+            ),
+            (
+                "a root composed with oneOf of an object",
+                ::serde_json::json!({ "oneOf": [{ "type": "object" }, { "type": "string" }] }),
+                None,
+            ),
+            (
+                "a root declaring its own type beside a composition",
+                ::serde_json::json!({ "type": "object", "allOf": [{ "type": "string" }] }),
+                None,
+            ),
+            (
+                "a root whose reference resolves to nothing",
+                ::serde_json::json!({ "$ref": "#/definitions/Absent" }),
+                None,
+            ),
+            (
+                "a root that references itself",
+                ::serde_json::json!({ "$ref": "#" }),
+                None,
+            ),
+        ];
+        for (case, document, unsupported) in rows {
+            let refused = unsupported_template_data_type(document);
+            let expected = unsupported.map(unsupported_template_data_type_message);
+            assert_eq!(
+                refused.as_deref(),
+                expected.as_deref(),
+                "case {case:?}: expected unsupported={unsupported:?}, got {refused:?}"
+            );
+        }
+    }
 }

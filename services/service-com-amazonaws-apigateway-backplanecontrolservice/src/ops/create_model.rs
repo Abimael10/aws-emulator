@@ -8,7 +8,8 @@
 //!
 //! The request is refused BEFORE anything is stored when it does not describe a payload:
 //! a `name` that is not alphanumeric, a `contentType` that is not a media type, and — for
-//! a model typed as JSON — a `schema` that is not a JSON Schema document.
+//! a model typed as JSON — a `schema` that is not a JSON Schema document or that references
+//! a model the API does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -155,6 +156,25 @@ pub(crate) fn validated_schema(
         }
     }
     Ok(Some(schema))
+}
+
+/// The schema as a JSON SCHEMA document, for a model whose content type says it is one.
+///
+/// "For application/json models, this should be JSON schema draft 4 model"
+/// (`CreateModel$schema`), so the keywords of that language — the `$ref` a reference is
+/// stated with among them — are read only for a model of that content-type family
+/// ([`is_json_media_type`]). A model typed as something else carries its schema in that
+/// content type's own language, which states no JSON Schema reference whatever its text
+/// happens to parse as, and a model carrying no schema states nothing at all.
+///
+/// `pub(crate)` because `UpdateModel` reads the document a patch leaves on the record by the
+/// same rule.
+pub(crate) fn json_schema_text<'a>(schema: Option<&'a str>, content_type: &str) -> Option<&'a str> {
+    content_type
+        .parse::<::mime::Mime>()
+        .ok()
+        .filter(is_json_media_type)
+        .and(schema)
 }
 
 /// The `Model` body for a stored model — the one place this crate renders that shape, so
@@ -322,6 +342,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreateModelErrorModeled::ConflictException(ConflictException {
                     message: Some(crate::state::MODEL_NAME_ALREADY_EXISTS.to_string()),
                 })
+                .into());
+            }
+            // The schema is VALIDATED before it is stored: a reference states what an
+            // instance of that part of the document must satisfy, so one that resolves to
+            // nothing — a fragment the document does not hold, or a model this API does not
+            // hold ([`crate::state::unresolved_schema_reference`]) — leaves that part of the
+            // document meaning nothing. API Gateway answers the result of validating the
+            // model, naming the model the reference stood for, which is why a client's
+            // schema mistake surfaces at the write rather than at the method the model is
+            // later attached to. The model being created counts as held, so a schema that
+            // refers to itself is one of its own references that resolves.
+            //
+            // Read only for a model typed as JSON, the family whose schema language a `$ref`
+            // belongs to ([`json_schema_text`]): a model of another content type carries its
+            // schema in that content type's own language, which states no JSON Schema
+            // reference however the text happens to read.
+            if let Some(unresolved) = json_schema_text(input.schema.as_deref(), &input.content_type)
+                .and_then(|schema| {
+                    crate::state::unresolved_schema_reference(
+                        schema,
+                        &input.rest_api_id,
+                        &|name| name == input.name || api.models.contains_key(name),
+                    )
+                })
+            {
+                // Metadata only, as the audit record below is: which API and model the write
+                // was refused for, never the schema or the reference text the request
+                // carried.
+                ::tracing::warn!(
+                    rest_api = ?input.rest_api_id,
+                    model = ?input.name,
+                    "the model's schema states a reference that resolves to nothing"
+                );
+                return Err(CreateModelErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::invalid_model_specified(
+                            crate::state::reference_model_name(&unresolved),
+                        )),
+                    },
+                )
                 .into());
             }
         }

@@ -4854,6 +4854,13 @@ pub use stringified_policy::*;
 mod method_settings;
 pub use method_settings::*;
 
+/// The MODEL REFERENCES a model's schema carries, and whether they resolve to models of the
+/// API that holds the schema — what a write of a schema is validated against and what a
+/// flattened read inlines; re-exported whole, so a handler still reaches each name as
+/// `crate::state::…`.
+mod model_schema;
+pub use model_schema::*;
+
 /// What NAMES one domain name access association — the pair its ARN spells, how this service
 /// reads that ARN back into the pair, and the lookups that resolve the pair against the
 /// records the account holds; re-exported whole, so a handler still reaches each name as
