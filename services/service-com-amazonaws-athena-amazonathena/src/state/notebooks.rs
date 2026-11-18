@@ -279,11 +279,12 @@ pub fn notebook_name_exists(work_group: &str, name: &str) -> String {
 
 /// The message an operation that needs a Spark enabled workgroup
 /// ([`is_spark_enabled`]) is refused with when the workgroup it named runs Athena SQL.
-/// Worded beside [`work_group_disabled`], the other per-workgroup refusal this emulator
-/// words itself, so both name the addressed workgroup the same way.
-pub fn work_group_not_spark_enabled(name: &str) -> String {
-    format!("WorkGroup {name} is not a Spark enabled workgroup.")
-}
+///
+/// Athena states this class of refusal about the workgroup's ENGINE VERSION rather than
+/// about the workgroup that was addressed, so the sentence is fixed text end to end: it
+/// carries no name, no id and no value from the request, and reads the same whichever
+/// workgroup — a named SQL one or the account's default — the request pointed at.
+pub const WORK_GROUP_ENGINE_VERSION_NOT_SPARK: &str = "Workgroup EngineVersion is not Spark.";
 
 /// The message an import that names neither source, or both, is refused with.
 ///

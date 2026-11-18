@@ -28,10 +28,7 @@ use service_com_amazonaws_athena_amazonathena::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, error_code, message, router, settled, start};
-
-/// The wire error code every refusal below carries.
-const INVALID_REQUEST: &str = "InvalidRequestException";
+use crate::harness::{assert_refusal, call, message, router, settled, start};
 
 /// Where the queries in this suite write their results, so the refusal each row is about
 /// is the one it names rather than the missing-location one.
@@ -43,32 +40,6 @@ fn query(sql: &str) -> Value {
         "QueryString": sql,
         "ResultConfiguration": { "OutputLocation": OUTPUT_LOCATION },
     })
-}
-
-/// Assert one refusal: HTTP 400, the `InvalidRequestException` envelope, the class code,
-/// and `expected` word for word.
-fn assert_refusal(case: &str, status: u16, body: &Value, code: &str, expected: &str) {
-    assert_eq!(
-        status, 400,
-        "case {case:?}: expected HTTP 400, got {status} with {body:?}"
-    );
-    assert_eq!(
-        error_code(body),
-        INVALID_REQUEST,
-        "case {case:?}: expected {INVALID_REQUEST}, got {:?}",
-        error_code(body)
-    );
-    assert_eq!(
-        body["AthenaErrorCode"].as_str(),
-        Some(code),
-        "case {case:?}: expected AthenaErrorCode {code:?}, got {body:?}"
-    );
-    assert_eq!(
-        message(body),
-        expected,
-        "case {case:?}: expected the message {expected:?}, got {:?}",
-        message(body)
-    );
 }
 
 /// The `DataCatalog` the registry holds under `name`, or `None` where it holds none.

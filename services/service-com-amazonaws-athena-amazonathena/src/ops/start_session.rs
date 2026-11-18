@@ -271,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // session either, the same refusal a named SQL workgroup gets below.
         let Some(work_group) = store.work_groups.get(&input.work_group).cloned() else {
             return Err(invalid_request(
-                crate::state::work_group_not_spark_enabled(&input.work_group),
+                crate::state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK,
             ));
         };
         // "The state of the workgroup: ENABLED or DISABLED" — a disabled workgroup accepts
@@ -287,7 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // workgroup — Athena's own default workgroup among them — runs no session.
         if !crate::state::is_spark_enabled(&work_group) {
             return Err(invalid_request(
-                crate::state::work_group_not_spark_enabled(&input.work_group),
+                crate::state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK,
             ));
         }
         // A session bound to a notebook is bound to one this account holds: the same miss a

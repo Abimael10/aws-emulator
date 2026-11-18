@@ -223,6 +223,37 @@ pub fn error_code(body: &Value) -> String {
     raw.rsplit(['#', '/']).next().unwrap_or(raw).to_string()
 }
 
+/// Assert ONE refusal this service states itself: HTTP 400, the `InvalidRequestException`
+/// envelope, the refusal CLASS `code` under BOTH of the names the wire gives it
+/// (`AthenaErrorCode` and the `ErrorCode` alias), and `expected_message` word for word.
+///
+/// Shared here because that envelope is the same for every operation, so a suite asserting
+/// it needs no copy of its own; `case` names the row under test in each failure.
+pub fn assert_refusal(case: &str, status: u16, body: &Value, code: &str, expected_message: &str) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with {body:?}"
+    );
+    assert_eq!(
+        error_code(body),
+        "InvalidRequestException",
+        "case {case:?}: expected InvalidRequestException, got {body:?}"
+    );
+    for member in ["AthenaErrorCode", "ErrorCode"] {
+        assert_eq!(
+            body[member].as_str(),
+            Some(code),
+            "case {case:?}: expected {member} {code:?}, got {body:?}"
+        );
+    }
+    assert_eq!(
+        message(body),
+        expected_message,
+        "case {case:?}: expected the message {expected_message:?}, got {:?}",
+        message(body)
+    );
+}
+
 /// The refusal wording of an error body, under either casing of the `Message` member.
 pub fn message(body: &Value) -> String {
     body["Message"]

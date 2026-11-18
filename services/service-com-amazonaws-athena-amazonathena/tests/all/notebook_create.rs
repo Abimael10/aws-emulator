@@ -217,13 +217,13 @@ async fn a_create_needs_a_spark_enabled_workgroup_that_holds_the_name_free() {
             "an Athena SQL workgroup",
             SQL_WORK_GROUP,
             "new",
-            state::work_group_not_spark_enabled(SQL_WORK_GROUP),
+            state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK.to_string(),
         ),
         (
             "the account's default workgroup",
             DEFAULT_WORK_GROUP,
             "new",
-            state::work_group_not_spark_enabled(DEFAULT_WORK_GROUP),
+            state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK.to_string(),
         ),
         (
             "a name the workgroup already holds",

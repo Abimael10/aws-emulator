@@ -570,13 +570,13 @@ async fn a_start_a_workgroup_cannot_run_is_refused() {
             "an Athena SQL workgroup",
             json!({ "WorkGroup": SQL_WORK_GROUP, "EngineConfiguration": {} }),
             ERROR_CODE_INVALID_INPUT,
-            state::work_group_not_spark_enabled(SQL_WORK_GROUP),
+            state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK.to_string(),
         ),
         (
             "the account's default workgroup",
             json!({ "WorkGroup": DEFAULT_WORK_GROUP, "EngineConfiguration": {} }),
             ERROR_CODE_INVALID_INPUT,
-            state::work_group_not_spark_enabled(DEFAULT_WORK_GROUP),
+            state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK.to_string(),
         ),
         (
             "a notebook no import or create minted",

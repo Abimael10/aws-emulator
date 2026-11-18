@@ -700,12 +700,12 @@ async fn a_start_refuses_a_workgroup_that_holds_no_sessions() {
         (
             "a workgroup created without any Spark member",
             "sql-workgroup".to_string(),
-            state::work_group_not_spark_enabled("sql-workgroup"),
+            state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK.to_string(),
         ),
         (
             "the account's default workgroup, which runs Athena SQL",
             state::DEFAULT_WORK_GROUP.to_string(),
-            state::work_group_not_spark_enabled(state::DEFAULT_WORK_GROUP),
+            state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK.to_string(),
         ),
     ];
     for (case, work_group, stated) in cases {

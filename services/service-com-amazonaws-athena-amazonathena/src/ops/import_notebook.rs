@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(crate::state::is_spark_enabled);
         if !spark_enabled {
             return Err(invalid_request(
-                crate::state::work_group_not_spark_enabled(&input.work_group),
+                crate::state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK,
             ));
         }
 

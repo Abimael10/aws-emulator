@@ -30,22 +30,7 @@ use service_com_amazonaws_athena_amazonathena::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, create_work_group, router};
-
-/// The wire error code (`__type`) of a refusal body, with the shape-id prefix the awsJson
-/// protocols may carry stripped.
-fn error_code(body: &Value) -> String {
-    let raw = body["__type"].as_str().unwrap_or("<no __type>");
-    raw.rsplit(['#', '/']).next().unwrap_or(raw).to_string()
-}
-
-/// The `Message` a refusal body carries.
-fn message(body: &Value) -> String {
-    body["Message"]
-        .as_str()
-        .unwrap_or("<no Message>")
-        .to_string()
-}
+use crate::harness::{assert_refusal, call, create_work_group, error_code, message, router};
 
 /// Where the queries in this suite write their results. Nothing is written to it; what
 /// matters is that a query HAS a location, so the refusals below are the ones each row
@@ -68,34 +53,11 @@ async fn state_of(router: &MultiServiceRouter, id: &str) -> String {
         .to_string()
 }
 
-/// Assert one refusal: HTTP 400, the `InvalidRequestException` envelope, the class code
-/// under BOTH names, and `expected_message` word for word.
-fn assert_refusal(case: &str, body: &Value, status: u16, code: &str, expected_message: &str) {
-    assert_eq!(
-        status, 400,
-        "case {case:?}: expected HTTP 400, got {status} with {body:?}"
-    );
-    assert_eq!(
-        error_code(body),
-        "InvalidRequestException",
-        "case {case:?}: expected InvalidRequestException, got {body:?}"
-    );
-    assert_eq!(
-        body["AthenaErrorCode"].as_str(),
-        Some(code),
-        "case {case:?}: expected AthenaErrorCode {code:?}, got {body:?}"
-    );
-    assert_eq!(
-        body["ErrorCode"].as_str(),
-        Some(code),
-        "case {case:?}: expected ErrorCode {code:?} beside AthenaErrorCode, got {body:?}"
-    );
-    assert_eq!(
-        message(body),
-        expected_message,
-        "case {case:?}: expected the message {expected_message:?}, got {:?}",
-        message(body)
-    );
+/// Assert one refusal through the harness, in the argument order this suite's rows keep:
+/// HTTP 400, the `InvalidRequestException` envelope, the class code under BOTH names, and
+/// `expected_message` word for word.
+fn assert_refusal_body(case: &str, body: &Value, status: u16, code: &str, expected_message: &str) {
+    assert_refusal(case, status, body, code, expected_message);
 }
 
 /// Every refusal Athena states itself carries its class code under both names, with the
@@ -308,7 +270,7 @@ async fn a_refusal_carries_its_class_code_under_both_names_with_its_own_sentence
 
     for (case, operation, request, code, expected_message) in rows {
         let (status, body) = call(&router, operation, &request).await;
-        assert_refusal(case, &body, status, code, &expected_message);
+        assert_refusal_body(case, &body, status, code, &expected_message);
     }
 }
 

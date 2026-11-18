@@ -567,13 +567,13 @@ async fn an_import_needs_a_spark_enabled_workgroup_that_holds_the_name_free() {
             "Athena's own default workgroup, which runs SQL",
             state::DEFAULT_WORK_GROUP,
             "new.ipynb",
-            state::work_group_not_spark_enabled(state::DEFAULT_WORK_GROUP),
+            state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK.to_string(),
         ),
         (
             "an Athena SQL workgroup",
             "sql-workgroup",
             "new.ipynb",
-            state::work_group_not_spark_enabled("sql-workgroup"),
+            state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK.to_string(),
         ),
         (
             "a name the workgroup already holds a notebook under",
