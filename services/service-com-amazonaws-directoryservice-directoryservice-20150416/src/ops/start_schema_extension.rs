@@ -3,9 +3,10 @@
 //! @op StartSchemaExtension
 //!
 //! Persists a schema extension of a stored Managed Microsoft AD directory in
-//! [`crate::state`], which `ListSchemaExtensions` then reports. The status transition the
-//! start owes (`Initializing` to `Completed`) is stored as a due instant and materialised
-//! by
+//! [`crate::state`], which `ListSchemaExtensions` then reports. Applying it is a CHAIN of
+//! phases the clock owes — the `Initializing` this call answers in, the snapshot phase
+//! when the request asked for one, `UpdatingSchema`, `Replicating` and then `Completed` —
+//! stored as the next phase's due instant and materialised by
 //! [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`].
 //! A request that asked to be snapshotted first takes a manual snapshot of the directory
 //! through the same store `CreateSnapshot` writes, which is what the modelled
@@ -257,9 +258,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_reason: None,
             start_date_time: now,
             // An extension that is still being applied has no end instant yet; the
-            // transition this call owes is what gives it one.
+            // terminal status the walk this call owes ends on is what gives it one.
             end_date_time: None,
-            status_due_at: Some(now + crate::state::TRANSITION_SPAN),
+            // "If true, creates a snapshot of the directory before applying the schema
+            // extension" — so this start, and only this one, is reported in the snapshot
+            // phase of the walk.
+            snapshot_first: input.create_snapshot_before_schema_extension,
+            status_due_at: Some(now + crate::state::SCHEMA_EXTENSION_PHASE_SPAN),
             seq,
         };
         let directory = store

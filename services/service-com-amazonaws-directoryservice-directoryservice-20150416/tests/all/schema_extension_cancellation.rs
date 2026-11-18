@@ -9,29 +9,51 @@
 //!
 //! The rule under test is that a cancel winds back the stored extension the request names
 //! whenever that extension's own status is one the operation documents as cancellable,
-//! leaving it in the transient `CancelInProgress` the clock settles on `Cancelled`, and
+//! leaving it in the transient `CancelInProgress` whose rollback walk the clock settles on
+//! `Cancelled`, and
 //! refuses every other request from the same stored record: an id naming no stored
 //! directory or no extension of it is the modelled "entity does not exist", and an
-//! extension past the cancellable states is the modelled client error. The table rows
+//! extension past the cancellable states — one replicating to the domain controllers, or
+//! already finished — is the modelled client error. The table rows
 //! differ along everything a start varies in (description form and length, LDIF size,
-//! whether a snapshot was taken first) and, for the refusals, along the status the stored
-//! extension is in.
+//! whether a snapshot was taken first) and, for the window rule, along the phase of its
+//! application the cancel arrives in.
+
+use std::cell::RefCell;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::directory_lifecycle::PAST_ONE_SPAN;
 use crate::harness::{call, ok, refused, service, string};
-use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
+use crate::schema_extensions::{
+    directory_in_service, extension_status, poll_until_extension, poll_until_extension_status,
+    reported_extension, STATUS_COMPLETED, STATUS_CREATING_SNAPSHOT, STATUS_INITIALIZING,
+    STATUS_REPLICATING, STATUS_UPDATING_SCHEMA,
+};
 
-/// The values of the modelled `SchemaExtensionStatus` enum this suite names
-/// (`smithy_query(query="shape",shape="SchemaExtensionStatus")` lists `Initializing`,
-/// `CreatingSnapshot`, `UpdatingSchema`, `Replicating`, `CancelInProgress`,
-/// `RollbackInProgress`, `Cancelled`, `Failed`, `Completed`).
-const STATUS_INITIALIZING: &str = "Initializing";
+/// The values of the modelled `SchemaExtensionStatus` enum a cancel puts an extension
+/// through (`smithy_query(query="shape",shape="SchemaExtensionStatus")` lists
+/// `Initializing`, `CreatingSnapshot`, `UpdatingSchema`, `Replicating`,
+/// `CancelInProgress`, `RollbackInProgress`, `Cancelled`, `Failed`, `Completed`).
 const STATUS_CANCEL_IN_PROGRESS: &str = "CancelInProgress";
+const STATUS_ROLLBACK_IN_PROGRESS: &str = "RollbackInProgress";
 const STATUS_CANCELLED: &str = "Cancelled";
-const STATUS_COMPLETED: &str = "Completed";
+
+/// The statuses `CancelSchemaExtension`'s own documentation admits a cancel in: "A schema
+/// extension can be canceled during any of the following states; Initializing,
+/// CreatingSnapshot, and UpdatingSchema."
+const CANCELLABLE_STATUSES: [&str; 3] = [
+    STATUS_INITIALIZING,
+    STATUS_CREATING_SNAPSHOT,
+    STATUS_UPDATING_SCHEMA,
+];
+
+/// The statuses the rollback a cancel starts walks, in order.
+const ROLLBACK_WALK: [&str; 3] = [
+    STATUS_CANCEL_IN_PROGRESS,
+    STATUS_ROLLBACK_IN_PROGRESS,
+    STATUS_CANCELLED,
+];
 
 /// The maximum length of the modelled `Description`, from its `@length` trait
 /// (`min: 0, max: 128`).
@@ -42,14 +64,6 @@ const ABSENT_DIRECTORY_ID: &str = "d-9f0c3a7b12";
 
 /// A well-formed `SchemaExtensionId` (`^e-[0-9a-f]{10}$`) that is never minted.
 const ABSENT_SCHEMA_EXTENSION_ID: &str = "e-1a2b3c4d5e";
-
-/// A Managed Microsoft AD directory past the stage transition its create owes, so it is
-/// in service for the extensions the cases apply.
-async fn directory_in_service(router: &MultiServiceRouter, name: &str, case: &str) -> String {
-    let id = create_microsoft_ad(router, minimal_microsoft_ad(name), case).await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
-    id
-}
 
 /// Start a schema extension of `directory_id`, returning its minted id.
 async fn start(
@@ -98,43 +112,6 @@ async fn cancel(
         json!({}),
         "case {case:?}: expected an empty CancelSchemaExtension result, got {answer}"
     );
-}
-
-/// The reported extension `schema_extension_id` of `directory_id`, read back through
-/// `ListSchemaExtensions`.
-async fn reported(
-    router: &MultiServiceRouter,
-    directory_id: &str,
-    schema_extension_id: &str,
-    case: &str,
-) -> Value {
-    let answer = ok(
-        router,
-        "ListSchemaExtensions",
-        json!({ "DirectoryId": directory_id }),
-        case,
-    )
-    .await;
-    let found = answer["SchemaExtensionsInfo"]
-        .as_array()
-        .unwrap_or_else(|| panic!("case {case:?}: expected SchemaExtensionsInfo, got {answer}"))
-        .clone();
-    found
-        .iter()
-        .find(|entry| entry["SchemaExtensionId"] == json!(schema_extension_id))
-        .unwrap_or_else(|| panic!("case {case:?}: expected {schema_extension_id} among {found:?}"))
-        .clone()
-}
-
-/// The `SchemaExtensionStatus` of one reported extension.
-async fn status(
-    router: &MultiServiceRouter,
-    directory_id: &str,
-    schema_extension_id: &str,
-    case: &str,
-) -> String {
-    let entry = reported(router, directory_id, schema_extension_id, case).await;
-    string(&entry, "SchemaExtensionStatus", case)
 }
 
 /// A numeric member of a reported extension, in epoch seconds — the unit an `awsJson1_1`
@@ -217,7 +194,7 @@ async fn a_cancel_winds_back_an_extension_still_in_a_cancellable_status() {
             case,
         )
         .await;
-        let before = status(&router, &directory, &id, case).await;
+        let before = extension_status(&router, &directory, &id, case).await;
         assert_eq!(
             before, STATUS_INITIALIZING,
             "case {case:?}: expected a fresh extension in {STATUS_INITIALIZING}, got {before:?}"
@@ -227,7 +204,7 @@ async fn a_cancel_winds_back_an_extension_still_in_a_cancellable_status() {
 
         // The cancel answers before the winding back is done, so a caller listing
         // straight afterwards sees the transient status and no end instant yet.
-        let entry = reported(&router, &directory, &id, case).await;
+        let entry = reported_extension(&router, &directory, &id, case).await;
         assert_eq!(
             entry["SchemaExtensionStatus"],
             json!(STATUS_CANCEL_IN_PROGRESS),
@@ -248,19 +225,13 @@ async fn a_cancel_winds_back_an_extension_still_in_a_cancellable_status() {
         cancelled.push((row, id));
     }
 
-    tokio::time::sleep(PAST_ONE_SPAN).await;
-
-    // Once the transition the cancel owes has fallen due every cancelled extension has
-    // settled on the terminal status, with an end instant at or after its start.
+    // Once every phase of the rollback the cancel owes has fallen due, each cancelled
+    // extension has settled on the terminal status, with an end instant at or after its
+    // start. The wait is for the CONDITION, not for a span of time.
     for (row, id) in &cancelled {
         let case = row.case;
-        let entry = reported(&router, &directory, id, case).await;
-        assert_eq!(
-            entry["SchemaExtensionStatus"],
-            json!(STATUS_CANCELLED),
-            "case {case:?}: expected {STATUS_CANCELLED} once the owed transition fell due, got \
-             {entry}"
-        );
+        let entry =
+            poll_until_extension_status(&router, &directory, id, STATUS_CANCELLED, case).await;
         let started_at = epoch_member(&entry, "StartDateTime", case);
         let ended_at = epoch_member(&entry, "EndDateTime", case);
         assert!(
@@ -270,7 +241,7 @@ async fn a_cancel_winds_back_an_extension_still_in_a_cancellable_status() {
         );
 
         // A listing is a read: the settled status does not move on being read again.
-        let again = status(&router, &directory, id, case).await;
+        let again = extension_status(&router, &directory, id, case).await;
         assert_eq!(
             again, STATUS_CANCELLED,
             "case {case:?}: expected {STATUS_CANCELLED} to hold across reads, got {again:?}"
@@ -278,12 +249,16 @@ async fn a_cancel_winds_back_an_extension_still_in_a_cancellable_status() {
     }
 
     // A cancel winds back only the extension its request named: the one nothing cancelled
-    // completed on the transition its own start owed.
-    let bystander_status = status(&router, &directory, &bystander, "the bystander").await;
+    // walked the phases its own start owed through to the end.
+    let case = "the bystander";
+    let bystander_status =
+        poll_until_extension_status(&router, &directory, &bystander, STATUS_COMPLETED, case)
+            .await;
     assert_eq!(
-        bystander_status, STATUS_COMPLETED,
-        "expected the extension nothing cancelled to reach {STATUS_COMPLETED}, got \
-         {bystander_status:?}"
+        bystander_status["SchemaExtensionStatus"],
+        json!(STATUS_COMPLETED),
+        "case {case:?}: expected the extension nothing cancelled to reach {STATUS_COMPLETED}, \
+         got {bystander_status}"
     );
 }
 
@@ -335,12 +310,19 @@ async fn a_cancel_is_refused_for_an_absent_or_uncancellable_extension() {
         .await;
     }
 
-    // The refused cancels wound nothing back: the other directory's extension is still
-    // the service's to complete.
+    // The refused cancels wound nothing back: the other directory's extension is still on
+    // the walk its own start set, which no cancel status is part of.
     let case = "an extension of another directory";
-    let untouched = status(&router, &other, &other_directorys, case).await;
+    let untouched = extension_status(&router, &other, &other_directorys, case).await;
     assert!(
-        untouched == STATUS_INITIALIZING || untouched == STATUS_COMPLETED,
+        [
+            STATUS_INITIALIZING,
+            STATUS_CREATING_SNAPSHOT,
+            STATUS_UPDATING_SCHEMA,
+            STATUS_REPLICATING,
+            STATUS_COMPLETED,
+        ]
+        .contains(&untouched.as_str()),
         "case {case:?}: expected a refused cancel to leave the extension on the path its own \
          start set, got {untouched:?}"
     );
@@ -349,11 +331,17 @@ async fn a_cancel_is_refused_for_an_absent_or_uncancellable_extension() {
     // error: one the clock already completed, one this emulator is still winding back,
     // and one already cancelled.
     let completed = start(&router, &directory, "already_done", ldif, false, "completed").await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
-    let settled = status(&router, &directory, &completed, "completed").await;
-    assert_eq!(
-        settled, STATUS_COMPLETED,
-        "expected the extension to have completed before the cancel, got {settled:?}"
+    let settled = poll_until_extension_status(
+        &router,
+        &directory,
+        &completed,
+        STATUS_COMPLETED,
+        "completed",
+    )
+    .await;
+    assert!(
+        !settled["EndDateTime"].is_null(),
+        "expected the completed extension to report an EndDateTime, got {settled}"
     );
 
     let winding_back = start(
@@ -367,13 +355,13 @@ async fn a_cancel_is_refused_for_an_absent_or_uncancellable_extension() {
     .await;
     cancel(&router, &directory, &winding_back, "cancel in progress").await;
 
-    for (case, schema_extension_id, expected_status) in [
-        ("an extension already completed", &completed, STATUS_COMPLETED),
+    for (case, schema_extension_id, terminal_status) in [
         (
-            "an extension still being cancelled",
-            &winding_back,
-            STATUS_CANCEL_IN_PROGRESS,
+            "an extension already completed",
+            &completed,
+            Some(STATUS_COMPLETED),
         ),
+        ("an extension still being cancelled", &winding_back, None),
     ] {
         let (status_code, parsed) = call(
             &router,
@@ -393,30 +381,50 @@ async fn a_cancel_is_refused_for_an_absent_or_uncancellable_extension() {
             wire_type.contains("ClientException"),
             "case {case:?}: expected ClientException, got {parsed}"
         );
+        // The message names the status that refused the cancel and the states that admit
+        // one. For a record that has settled that status is fixed; for one still being
+        // wound back the clock may have carried it to the next phase of the rollback, so
+        // any status of that walk is the status it was in.
+        let named: Vec<&str> = match terminal_status {
+            Some(status) => vec![status],
+            None => ROLLBACK_WALK.to_vec(),
+        };
         let message = parsed["Message"].as_str().unwrap_or_default();
         assert!(
-            message.contains(expected_status) && message.contains(STATUS_INITIALIZING),
-            "case {case:?}: expected the message to name the status {expected_status} that \
-             refused the cancel and the states that admit one, got {message:?}"
+            named.iter().any(|status| message.contains(status))
+                && message.contains(STATUS_INITIALIZING),
+            "case {case:?}: expected the message to name the status that refused the cancel \
+             (one of {named:?}) and the states that admit one, got {message:?}"
         );
 
-        // The refusal left the stored status where it was.
-        let after = status(&router, &directory, schema_extension_id, case).await;
-        assert_eq!(
-            after, expected_status,
-            "case {case:?}: expected the refused cancel to leave the status at \
-             {expected_status}, got {after:?}"
-        );
+        // The refusal left the stored status where it was: a refused cancel starts no
+        // rollback, and an extension already being wound back stays on the rollback it
+        // was on.
+        let after = extension_status(&router, &directory, schema_extension_id, case).await;
+        match terminal_status {
+            Some(status) => assert_eq!(
+                after, status,
+                "case {case:?}: expected the refused cancel to leave the settled status at \
+                 {status}, got {after:?}"
+            ),
+            None => assert!(
+                ROLLBACK_WALK.contains(&after.as_str()),
+                "case {case:?}: expected the refused cancel to leave the extension on the \
+                 rollback walk {ROLLBACK_WALK:?}, got {after:?}"
+            ),
+        }
     }
 
-    // Once the cancel it is winding back settles, a further cancel of the terminal record
-    // is refused the same way.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
-    let settled = status(&router, &directory, &winding_back, "already cancelled").await;
-    assert_eq!(
-        settled, STATUS_CANCELLED,
-        "expected the cancelled extension to settle on {STATUS_CANCELLED}, got {settled:?}"
-    );
+    // Once the rollback it is winding back settles, a further cancel of the terminal
+    // record is refused the same way.
+    poll_until_extension_status(
+        &router,
+        &directory,
+        &winding_back,
+        STATUS_CANCELLED,
+        "already cancelled",
+    )
+    .await;
     refused(
         &router,
         "CancelSchemaExtension",
@@ -428,9 +436,154 @@ async fn a_cancel_is_refused_for_an_absent_or_uncancellable_extension() {
         "an extension already cancelled",
     )
     .await;
-    let after = status(&router, &directory, &winding_back, "already cancelled").await;
+    let after = extension_status(&router, &directory, &winding_back, "already cancelled").await;
     assert_eq!(
         after, STATUS_CANCELLED,
         "expected the refused cancel to leave the status at {STATUS_CANCELLED}, got {after:?}"
+    );
+}
+
+/// One row of the cancel-window table: the phase of the extension's application the cancel
+/// arrives in, how the start that reached it was made, and whether the operation's own
+/// documentation admits a cancel there.
+struct WindowCase {
+    case: &'static str,
+    snapshot_first: bool,
+    cancel_in: &'static str,
+    accepted: bool,
+}
+
+/// Start the extension one window row describes, wait for the phase that row's cancel is
+/// to arrive in, and assert the cancel is accepted — and then wound back phase by phase —
+/// or refused, as that phase requires.
+///
+/// Its own function so the rows can be driven CONCURRENTLY: each row waits out the
+/// service's own clock-owed chain, so driving them at once costs one walk rather than one
+/// per row, and each row only ever reads the extension it started.
+async fn drive_window_case(router: &MultiServiceRouter, directory: &str, row: &WindowCase) {
+    let case = row.case;
+    // Whether the row expects the cancel to be accepted is the operation's own documented
+    // set, not a value chosen row by row.
+    assert_eq!(
+        CANCELLABLE_STATUSES.contains(&row.cancel_in),
+        row.accepted,
+        "case {case:?}: the documented cancellable states {CANCELLABLE_STATUSES:?} and this \
+         row's expectation for {:?} disagree",
+        row.cancel_in
+    );
+    let ldif = "dn: CN=Window,CN=Schema,CN=Configuration,DC=corp,DC=example,DC=com\n";
+    let id = start(
+        router,
+        directory,
+        "window_case",
+        ldif,
+        row.snapshot_first,
+        case,
+    )
+    .await;
+    // The phase has to last long enough for a client that polls for it to act in it:
+    // this wait IS that client.
+    poll_until_extension_status(router, directory, &id, row.cancel_in, case).await;
+
+    if row.accepted {
+        cancel(router, directory, &id, case).await;
+
+        // The cancel starts a rollback that is reported phase by phase, exactly as the
+        // application it replaced was.
+        let seen = RefCell::new(Vec::<String>::new());
+        poll_until_extension(
+            router,
+            directory,
+            &id,
+            "settle on the cancelled status",
+            case,
+            |observed| {
+                let mut seen = seen.borrow_mut();
+                if seen.last().map(String::as_str) != Some(observed) {
+                    seen.push(observed.to_string());
+                }
+                observed == STATUS_CANCELLED
+            },
+        )
+        .await;
+        let walked = seen.into_inner();
+        let walked: Vec<&str> = walked.iter().map(String::as_str).collect();
+        assert_eq!(
+            walked,
+            ROLLBACK_WALK.to_vec(),
+            "case {case:?}: expected the cancelled extension to be reported in \
+             {ROLLBACK_WALK:?}, got {walked:?}"
+        );
+    } else {
+        refused(
+            router,
+            "CancelSchemaExtension",
+            json!({
+                "DirectoryId": directory,
+                "SchemaExtensionId": &id,
+            }),
+            "ClientException",
+            case,
+        )
+        .await;
+        let after = extension_status(router, directory, &id, case).await;
+        assert!(
+            !ROLLBACK_WALK.contains(&after.as_str()),
+            "case {case:?}: expected the refused cancel to leave the extension on the \
+             application walk, got {after:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_phase_a_cancel_arrives_in_decides_whether_it_is_accepted() {
+    let router = service();
+    let directory = directory_in_service(&router, "corp.example.com", "the cancel window").await;
+
+    // "A schema extension can be canceled during any of the following states;
+    // Initializing, CreatingSnapshot, and UpdatingSchema" — and "once a schema extension
+    // has started replicating to all domain controllers, the task can no longer be
+    // canceled". One row per phase of the application the extension can be reported in,
+    // the cancellable ones and the two past them, each reached by POLLING for it the way a
+    // client does.
+    let cases = [
+        WindowCase {
+            case: "a cancel while the extension is initializing",
+            snapshot_first: false,
+            cancel_in: STATUS_INITIALIZING,
+            accepted: true,
+        },
+        WindowCase {
+            case: "a cancel while the snapshot asked for is being taken",
+            snapshot_first: true,
+            cancel_in: STATUS_CREATING_SNAPSHOT,
+            accepted: true,
+        },
+        WindowCase {
+            case: "a cancel while the schema is being updated",
+            snapshot_first: false,
+            cancel_in: STATUS_UPDATING_SCHEMA,
+            accepted: true,
+        },
+        WindowCase {
+            case: "a cancel once the change is replicating",
+            snapshot_first: false,
+            cancel_in: STATUS_REPLICATING,
+            accepted: false,
+        },
+        WindowCase {
+            case: "a cancel once the extension has completed",
+            snapshot_first: true,
+            cancel_in: STATUS_COMPLETED,
+            accepted: false,
+        },
+    ];
+
+    tokio::join!(
+        drive_window_case(&router, &directory, &cases[0]),
+        drive_window_case(&router, &directory, &cases[1]),
+        drive_window_case(&router, &directory, &cases[2]),
+        drive_window_case(&router, &directory, &cases[3]),
+        drive_window_case(&router, &directory, &cases[4]),
     );
 }

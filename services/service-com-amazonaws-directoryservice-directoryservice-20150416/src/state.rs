@@ -23,7 +23,7 @@
 //!   assessment leaving `IN_PROGRESS`, a
 //!   registered certificate leaving `Registering`, an organization directory share
 //!   leaving `Sharing` (and an unshared one leaving the store), a schema extension
-//!   leaving `Initializing` or `CancelInProgress`, a domain controller leaving
+//!   walking the phases of its application (and a cancelled one its rollback), a domain controller leaving
 //!   `Creating` (and a retired one
 //!   leaving the store)).
 //!   Every handler calls it before reading or writing, so a reporting operation reports
@@ -659,32 +659,78 @@ pub const MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY: usize = 5;
 /// end. Past it `CreateSnapshot` is refused.
 pub const MAX_SNAPSHOTS: usize = MAX_DIRECTORIES * MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY;
 
-/// The `SchemaExtensionStatus` an extension carries between `StartSchemaExtension` and
-/// [`TRANSITION_SPAN`]: the first value of the modelled `SchemaExtensionStatus` enum.
+/// The `SchemaExtensionStatus` an extension carries from `StartSchemaExtension` until the
+/// first phase of its application falls due: the first value of the modelled
+/// `SchemaExtensionStatus` enum.
 ///
-/// `StartSchemaExtension` answers while the extension is still being applied, so the
-/// move to [`SCHEMA_EXTENSION_STATUS_COMPLETED`] is owed by the clock rather than by any
-/// later call, on the same span a create's stage transition uses.
+/// `StartSchemaExtension` answers while the extension is still being applied, so every
+/// status after this one is owed by the clock rather than by any later call — one phase
+/// per [`SCHEMA_EXTENSION_PHASE_SPAN`], as
+/// [`SchemaExtensionRecord::next_status`] lays the walk out.
 pub const SCHEMA_EXTENSION_STATUS_INITIALIZING: &str = "Initializing";
 
-/// The `SchemaExtensionStatus` an extension reaches once [`TRANSITION_SPAN`] has
-/// elapsed: the `Completed` value of the modelled `SchemaExtensionStatus` enum.
-pub const SCHEMA_EXTENSION_STATUS_COMPLETED: &str = "Completed";
-
-/// The `SchemaExtensionStatus` an extension carries between `CancelSchemaExtension` and
-/// [`TRANSITION_SPAN`]: the `CancelInProgress` value of the modelled
+/// The `SchemaExtensionStatus` an extension asked to snapshot the directory first carries
+/// while that snapshot is being taken: the `CreatingSnapshot` value of the modelled
 /// `SchemaExtensionStatus` enum.
 ///
+/// Only an extension whose start asked for it
+/// (`CreateSnapshotBeforeSchemaExtension`, "If true, creates a snapshot of the directory
+/// before applying the schema extension") passes through this phase — there is nothing
+/// being snapshotted otherwise.
+pub const SCHEMA_EXTENSION_STATUS_CREATING_SNAPSHOT: &str = "CreatingSnapshot";
+
+/// The `SchemaExtensionStatus` an extension carries while the LDIF it was called with is
+/// being applied to the directory's schema: the `UpdatingSchema` value of the modelled
+/// `SchemaExtensionStatus` enum. The last phase a cancel is still admitted in (see
+/// [`CANCELLABLE_SCHEMA_EXTENSION_STATUSES`]).
+pub const SCHEMA_EXTENSION_STATUS_UPDATING_SCHEMA: &str = "UpdatingSchema";
+
+/// The `SchemaExtensionStatus` an extension carries while the applied change is being
+/// replicated to the directory's domain controllers: the `Replicating` value of the
+/// modelled `SchemaExtensionStatus` enum.
+///
+/// The phase `CancelSchemaExtension`'s own documentation names as the point of no return:
+/// "Once a schema extension has started replicating to all domain controllers, the task
+/// can no longer be canceled."
+pub const SCHEMA_EXTENSION_STATUS_REPLICATING: &str = "Replicating";
+
+/// The `SchemaExtensionStatus` an extension settles on once every phase of its
+/// application has fallen due: the `Completed` value of the modelled
+/// `SchemaExtensionStatus` enum.
+pub const SCHEMA_EXTENSION_STATUS_COMPLETED: &str = "Completed";
+
+/// The `SchemaExtensionStatus` an extension carries from `CancelSchemaExtension` until
+/// the first phase of its rollback falls due: the `CancelInProgress` value of the
+/// modelled `SchemaExtensionStatus` enum.
+///
 /// The cancel answers while the extension is still being wound back — the enum carries
-/// both the transient `CancelInProgress` and the settled
-/// [`SCHEMA_EXTENSION_STATUS_CANCELLED`] — so the move to the settled status is owed by
-/// the clock rather than by any later call, on the same span the start's transition uses.
+/// the transient `CancelInProgress`, the
+/// [`SCHEMA_EXTENSION_STATUS_ROLLBACK_IN_PROGRESS`] the change is undone in and the
+/// settled [`SCHEMA_EXTENSION_STATUS_CANCELLED`] — so the statuses after this one are
+/// owed by the clock rather than by any later call, one per
+/// [`SCHEMA_EXTENSION_PHASE_SPAN`].
 pub const SCHEMA_EXTENSION_STATUS_CANCEL_IN_PROGRESS: &str = "CancelInProgress";
 
-/// The `SchemaExtensionStatus` a cancelled extension settles on once
-/// [`TRANSITION_SPAN`] has elapsed: the `Cancelled` value of the modelled
+/// The `SchemaExtensionStatus` a cancelled extension carries while the change it had
+/// already applied is undone: the `RollbackInProgress` value of the modelled
 /// `SchemaExtensionStatus` enum.
+pub const SCHEMA_EXTENSION_STATUS_ROLLBACK_IN_PROGRESS: &str = "RollbackInProgress";
+
+/// The `SchemaExtensionStatus` a cancelled extension settles on once its rollback has
+/// fallen due: the `Cancelled` value of the modelled `SchemaExtensionStatus` enum.
 pub const SCHEMA_EXTENSION_STATUS_CANCELLED: &str = "Cancelled";
+
+/// How long each phase of a schema extension's application — and each phase of the
+/// rollback a cancel starts — is reported before the next one falls due.
+///
+/// Its own span rather than [`TRANSITION_SPAN`], for the same reason
+/// [`DIRECTORY_BUILD_SPAN`] has one: applying a schema extension to a Managed Microsoft
+/// AD directory is minutes of work whose phases a client is expected to POLL, so each
+/// phase has to be observable by a caller that looks again at human intervals, and the
+/// phases a cancel is admitted in have to last long enough for that caller to issue the
+/// cancel. Compressed to the few seconds the project's emulator contract allows a
+/// clock-owed transition.
+pub const SCHEMA_EXTENSION_PHASE_SPAN: Duration = Duration::from_secs(3);
 
 /// The `SchemaExtensionStatus` values an extension can be cancelled in.
 ///
@@ -695,8 +741,8 @@ pub const SCHEMA_EXTENSION_STATUS_CANCELLED: &str = "Cancelled";
 /// modelled enum is past the point of no return (or already finished).
 pub const CANCELLABLE_SCHEMA_EXTENSION_STATUSES: [&str; 3] = [
     SCHEMA_EXTENSION_STATUS_INITIALIZING,
-    "CreatingSnapshot",
-    "UpdatingSchema",
+    SCHEMA_EXTENSION_STATUS_CREATING_SNAPSHOT,
+    SCHEMA_EXTENSION_STATUS_UPDATING_SCHEMA,
 ];
 
 /// The most schema extensions this emulator keeps for one directory.
@@ -3144,8 +3190,12 @@ pub struct SchemaExtensionRecord {
     /// "The date and time that the schema extension was completed": `None` until the
     /// extension reaches a status that has an end.
     pub end_date_time: Option<SystemTime>,
-    /// When the status transition the start owes falls due; `None` once there is no
-    /// transition left to make. See [`TRANSITION_SPAN`].
+    /// Whether the start asked for a snapshot of the directory before the extension was
+    /// applied (`CreateSnapshotBeforeSchemaExtension`), which is what decides whether the
+    /// walk reports the [`SCHEMA_EXTENSION_STATUS_CREATING_SNAPSHOT`] phase at all.
+    pub snapshot_first: bool,
+    /// When the next status of the walk this record is on falls due; `None` once there is
+    /// no status left to reach. See [`SCHEMA_EXTENSION_PHASE_SPAN`].
     pub status_due_at: Option<SystemTime>,
     /// Creation rank, from
     /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::next_seq`], shared
@@ -3161,14 +3211,74 @@ impl SchemaExtensionRecord {
     }
 
     /// Cancel this extension as of `now`: it enters the transient
-    /// [`SCHEMA_EXTENSION_STATUS_CANCEL_IN_PROGRESS`] and owes the clock the move to
-    /// [`SCHEMA_EXTENSION_STATUS_CANCELLED`] one [`TRANSITION_SPAN`] later, which is what
-    /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`]
-    /// materialises — so a caller listing straight after the cancel still sees the
-    /// winding back under way, and the status the start owed is no longer owed.
+    /// [`SCHEMA_EXTENSION_STATUS_CANCEL_IN_PROGRESS`] and owes the clock the rollback walk
+    /// that settles on [`SCHEMA_EXTENSION_STATUS_CANCELLED`], which is what
+    /// [`Self::advance_clock`] materialises — so a caller listing straight after the
+    /// cancel still sees the winding back under way, and the phases the start owed are no
+    /// longer owed.
     pub fn cancel(&mut self, now: SystemTime) {
         self.status = SCHEMA_EXTENSION_STATUS_CANCEL_IN_PROGRESS.to_string();
-        self.status_due_at = Some(now + TRANSITION_SPAN);
+        self.status_due_at = Some(now + SCHEMA_EXTENSION_PHASE_SPAN);
+    }
+
+    /// The status this extension reaches when the phase it is in falls due, or `None`
+    /// once it is in one it never leaves on its own.
+    ///
+    /// THE walk of the modelled `SchemaExtensionStatus` enum this service reports, in one
+    /// place: applying an extension goes `Initializing`, the snapshot phase when the start
+    /// asked for one, `UpdatingSchema`, `Replicating` and then `Completed`; cancelling one
+    /// goes `CancelInProgress`, `RollbackInProgress` and then `Cancelled`. A terminal
+    /// status (and `Failed`, which nothing here records) has no next one.
+    #[must_use]
+    pub fn next_status(&self) -> Option<&'static str> {
+        match self.status.as_str() {
+            SCHEMA_EXTENSION_STATUS_INITIALIZING => Some(if self.snapshot_first {
+                SCHEMA_EXTENSION_STATUS_CREATING_SNAPSHOT
+            } else {
+                SCHEMA_EXTENSION_STATUS_UPDATING_SCHEMA
+            }),
+            SCHEMA_EXTENSION_STATUS_CREATING_SNAPSHOT => {
+                Some(SCHEMA_EXTENSION_STATUS_UPDATING_SCHEMA)
+            }
+            SCHEMA_EXTENSION_STATUS_UPDATING_SCHEMA => Some(SCHEMA_EXTENSION_STATUS_REPLICATING),
+            SCHEMA_EXTENSION_STATUS_REPLICATING => Some(SCHEMA_EXTENSION_STATUS_COMPLETED),
+            SCHEMA_EXTENSION_STATUS_CANCEL_IN_PROGRESS => {
+                Some(SCHEMA_EXTENSION_STATUS_ROLLBACK_IN_PROGRESS)
+            }
+            SCHEMA_EXTENSION_STATUS_ROLLBACK_IN_PROGRESS => Some(SCHEMA_EXTENSION_STATUS_CANCELLED),
+            _ => None,
+        }
+    }
+
+    /// Materialise every phase of this extension's walk the clock has already made due,
+    /// as of `now`.
+    ///
+    /// Each phase stores the NEXT phase's due instant, so the walk is driven by the
+    /// instant the phase fell due rather than by the call that happens to observe it: an
+    /// extension nobody read for the whole of its application is reported in exactly the
+    /// status it would have been had every phase been polled. A terminal status is where
+    /// the walk stops, and it is the first status that has an end instant to report —
+    /// "the date and time that the schema extension was completed".
+    pub fn advance_clock(&mut self, now: SystemTime) {
+        while let Some(due) = self.status_due_at {
+            if now < due {
+                break;
+            }
+            let Some(next) = self.next_status() else {
+                self.status_due_at = None;
+                break;
+            };
+            self.status = next.to_string();
+            if matches!(
+                next,
+                SCHEMA_EXTENSION_STATUS_COMPLETED | SCHEMA_EXTENSION_STATUS_CANCELLED
+            ) {
+                self.end_date_time = Some(due);
+                self.status_due_at = None;
+            } else {
+                self.status_due_at = Some(due + SCHEMA_EXTENSION_PHASE_SPAN);
+            }
+        }
     }
 
     /// This schema extension as the modelled `SchemaExtensionInfo` structure.
@@ -3804,28 +3914,16 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             // `DisableLDAPS` switch a setting of a directory this service already holds,
             // so each of them records the settled status itself (see
             // [`LDAPS_STATUS_ENABLED`]).
-            // The status transitions the schema-extension writes owe: the transient
-            // `Initializing` a start answers in settles on `Completed`, and the transient
-            // `CancelInProgress` a cancel answers in settles on `Cancelled`. Either way
-            // the extension is finished with, which is when it first has an end instant to
-            // report.
+            // The status walks the schema-extension writes owe: applying an extension is
+            // a CHAIN of phases — the `Initializing` a start answers in, the snapshot
+            // phase when the start asked for one, `UpdatingSchema`, `Replicating` and then
+            // `Completed` — and so is the rollback a cancel starts, which walks
+            // `CancelInProgress` and `RollbackInProgress` before settling on `Cancelled`.
+            // Every phase the clock has already made due is materialised, however long ago
+            // the call that started the walk ran, and the record's own terminal status is
+            // where it stops — which is when it first has an end instant to report.
             for extension in directory.schema_extensions.values_mut() {
-                let Some(due) = extension.status_due_at else {
-                    continue;
-                };
-                if now < due {
-                    continue;
-                }
-                let settled = match extension.status.as_str() {
-                    SCHEMA_EXTENSION_STATUS_INITIALIZING => SCHEMA_EXTENSION_STATUS_COMPLETED,
-                    SCHEMA_EXTENSION_STATUS_CANCEL_IN_PROGRESS => {
-                        SCHEMA_EXTENSION_STATUS_CANCELLED
-                    }
-                    _ => continue,
-                };
-                extension.status = settled.to_string();
-                extension.end_date_time = Some(due);
-                extension.status_due_at = None;
+                extension.advance_clock(now);
             }
             // The status transitions the domain-controller writes owe: the transient
             // `Creating` a placement answers in settles on `Active`, the status a

@@ -3,8 +3,8 @@
 //! @op CancelSchemaExtension
 //!
 //! Cancels a schema extension `StartSchemaExtension` persisted for a stored directory:
-//! the stored record enters the transient `CancelInProgress` and owes the clock the move
-//! to `Cancelled`, which
+//! the stored record enters the transient `CancelInProgress` and owes the clock the
+//! rollback walk — `RollbackInProgress`, then `Cancelled` — which
 //! [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`]
 //! materialises and `ListSchemaExtensions` then reports. An extension past the states
 //! this operation documents as cancellable is refused rather than wound back.

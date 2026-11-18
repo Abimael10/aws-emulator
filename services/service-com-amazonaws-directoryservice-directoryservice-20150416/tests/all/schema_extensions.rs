@@ -8,33 +8,48 @@
 //! persisted state cannot pass.
 //!
 //! The rule under test is that `StartSchemaExtension` persists the extension the request
-//! describes and `ListSchemaExtensions` reports it back from that record: the table rows
+//! describes and `ListSchemaExtensions` reports it back from that record, walking the
+//! modelled `SchemaExtensionStatus` phases of its application one clock-owed span at a
+//! time: the table rows
 //! differ along everything a start varies in — the `Description` form and length, the
 //! size and shape of the `LdifContent`, and whether the directory was to be snapshotted
 //! first — and each row asserts the stored extension reports ITS OWN description, a
-//! freshly minted `SchemaExtensionId`, the transient status the clock owes a transition
-//! from, and the snapshot the request asked for (or no snapshot when it did not). The
-//! remaining suites assert the invariants: the owed transition settles exactly once,
-//! pagination walks every extension once, an extension needs a Managed Microsoft AD
+//! freshly minted `SchemaExtensionId`, the first status of that walk, and the snapshot the
+//! request asked for (or no snapshot when it did not). The
+//! remaining suites assert the invariants: every phase of the walk is reported in turn and
+//! settles exactly once, pagination walks every extension once, an extension needs a
+//! Managed Microsoft AD
 //! directory that is in service, a snapshot-first request is bound by the same manual
 //! snapshot quota `CreateSnapshot` is, and an extension does not outlive its directory.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_directoryservice_directoryservice_20150416::state::SCHEMA_EXTENSION_PHASE_SPAN;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::directory_lifecycle::{create_directory, minimal_create, PAST_ONE_SPAN};
-use crate::harness::{ok, refused, service, string};
+use crate::directory_lifecycle::{create_directory, minimal_create};
+use crate::harness::{ok, poll_until_in_service, poll_until_reported, refused, service, string};
 use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 
-/// The `SchemaExtensionStatus` an extension carries until the transition the start owes
-/// falls due, and the one it reaches after: two values of the modelled
-/// `SchemaExtensionStatus` enum (`smithy_query(query="shape",shape="SchemaExtensionStatus")`
-/// lists `Initializing`, `CreatingSnapshot`, `UpdatingSchema`, `Replicating`,
+/// The values of the modelled `SchemaExtensionStatus` enum an extension's application
+/// walks (`smithy_query(query="shape",shape="SchemaExtensionStatus")` lists
+/// `Initializing`, `CreatingSnapshot`, `UpdatingSchema`, `Replicating`,
 /// `CancelInProgress`, `RollbackInProgress`, `Cancelled`, `Failed`, `Completed`).
-const STATUS_INITIALIZING: &str = "Initializing";
-const STATUS_COMPLETED: &str = "Completed";
+pub(crate) const STATUS_INITIALIZING: &str = "Initializing";
+pub(crate) const STATUS_CREATING_SNAPSHOT: &str = "CreatingSnapshot";
+pub(crate) const STATUS_UPDATING_SCHEMA: &str = "UpdatingSchema";
+pub(crate) const STATUS_REPLICATING: &str = "Replicating";
+pub(crate) const STATUS_COMPLETED: &str = "Completed";
+
+/// How long a polled extension status may take to reach what a case waits for: far longer
+/// than the whole walk of phases this service publishes, so a loaded machine does not
+/// decide the outcome. DERIVED from the span the service itself publishes, so a change to
+/// it moves every wait with it.
+pub(crate) const EXTENSION_POLL_DEADLINE: Duration =
+    SCHEMA_EXTENSION_PHASE_SPAN.saturating_mul(20);
 
 /// The maximum length of the modelled `Description`, from its `@length` trait
 /// (`min: 0, max: 128`).
@@ -59,11 +74,15 @@ fn assert_schema_extension_id(id: &str, case: &str) {
     );
 }
 
-/// A Managed Microsoft AD directory past the stage transition its create owes, so it is
+/// A Managed Microsoft AD directory past the stage chain its create owes, so it is
 /// in service for the extensions the cases apply.
-async fn directory_in_service(router: &MultiServiceRouter, name: &str, case: &str) -> String {
+pub(crate) async fn directory_in_service(
+    router: &MultiServiceRouter,
+    name: &str,
+    case: &str,
+) -> String {
     let id = create_microsoft_ad(router, minimal_microsoft_ad(name), case).await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    poll_until_in_service(router, &id, case).await;
     id
 }
 
@@ -115,6 +134,73 @@ fn reported<'a>(found: &'a [Value], schema_extension_id: &str, case: &str) -> &'
         .unwrap_or_else(|| {
             panic!("case {case:?}: expected {schema_extension_id} among {found:?}")
         })
+}
+
+/// The one reported extension `schema_extension_id` of `directory_id`, read back through
+/// `ListSchemaExtensions`.
+///
+/// THE reader the extension suites share, so every case asserts on what a client reads.
+pub(crate) async fn reported_extension(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    schema_extension_id: &str,
+    case: &str,
+) -> Value {
+    let found = list(router, directory_id, case).await;
+    reported(&found, schema_extension_id, case).clone()
+}
+
+/// The `SchemaExtensionStatus` one reported extension carries.
+pub(crate) async fn extension_status(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    schema_extension_id: &str,
+    case: &str,
+) -> String {
+    let entry = reported_extension(router, directory_id, schema_extension_id, case).await;
+    string(&entry, "SchemaExtensionStatus", case)
+}
+
+/// Poll `ListSchemaExtensions` until the status of `schema_extension_id` satisfies
+/// `settled`, and answer the entry reported then.
+///
+/// The `ListSchemaExtensions` PROBE of the extension suites; the bounded loop it is driven
+/// through is the harness's one ([`poll_until_reported`]), with this suite's own deadline.
+pub(crate) async fn poll_until_extension(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    schema_extension_id: &str,
+    awaited: &str,
+    case: &str,
+    settled: impl Fn(&str) -> bool,
+) -> Value {
+    poll_until_reported(
+        case,
+        &format!("{schema_extension_id} to {awaited}"),
+        EXTENSION_POLL_DEADLINE,
+        || reported_extension(router, directory_id, schema_extension_id, case),
+        |entry: &Value| settled(&string(entry, "SchemaExtensionStatus", case)),
+    )
+    .await
+}
+
+/// Poll until `schema_extension_id` reports exactly `awaited_status`.
+pub(crate) async fn poll_until_extension_status(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    schema_extension_id: &str,
+    awaited_status: &str,
+    case: &str,
+) -> Value {
+    poll_until_extension(
+        router,
+        directory_id,
+        schema_extension_id,
+        &format!("report {awaited_status}"),
+        case,
+        |observed| observed == awaited_status,
+    )
+    .await
 }
 
 /// The `SchemaExtensionId`s of a reported list, in the order reported.
@@ -276,28 +362,21 @@ async fn a_started_schema_extension_is_reported_from_persisted_state() {
         "expected every started extension once in start order, got {found:?}"
     );
 
-    tokio::time::sleep(PAST_ONE_SPAN).await;
-
-    // Once the owed transition has fallen due every extension has settled, and its
-    // description is still its own.
-    let found = list(&router, &directory, "after the transition").await;
+    // Once every phase of the walk has fallen due each extension has settled, and its
+    // description is still its own. The wait is for the CONDITION — the terminal status a
+    // client's waiter polls for — not for a span of time.
     for (row, id) in &started {
         let case = row.case;
-        let entry = reported(&found, id, case);
-        assert_eq!(
-            entry["SchemaExtensionStatus"],
-            json!(STATUS_COMPLETED),
-            "case {case:?}: expected {STATUS_COMPLETED} once the owed transition fell due, got \
-             {entry}"
-        );
+        let entry =
+            poll_until_extension_status(&router, &directory, id, STATUS_COMPLETED, case).await;
         assert_eq!(
             entry["Description"],
             json!(row.description),
-            "case {case:?}: expected Description {:?} to survive the transition, got {entry}",
+            "case {case:?}: expected Description {:?} to survive the walk, got {entry}",
             row.description
         );
-        let started_at = epoch_member(entry, "StartDateTime", case);
-        let ended_at = epoch_member(entry, "EndDateTime", case);
+        let started_at = epoch_member(&entry, "StartDateTime", case);
+        let ended_at = epoch_member(&entry, "EndDateTime", case);
         assert!(
             ended_at >= started_at,
             "case {case:?}: expected EndDateTime {ended_at} at or after StartDateTime \
@@ -409,7 +488,7 @@ async fn an_extension_needs_a_managed_microsoft_ad_directory_in_service() {
     // "Applies a schema extension to a Microsoft AD directory": a Simple AD directory is
     // not one, so the id the request named is the invalid parameter.
     let simple_ad = create_directory(&router, minimal_create("simple.example.net"), "simple").await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    poll_until_in_service(&router, &simple_ad, "simple").await;
     refused(
         &router,
         "StartSchemaExtension",
@@ -431,8 +510,9 @@ async fn an_extension_needs_a_managed_microsoft_ad_directory_in_service() {
     )
     .await;
 
-    // Neither refusal persisted anything.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    // Neither refusal persisted anything — not even once the directory the second named
+    // has finished being built.
+    poll_until_in_service(&router, &still_building, "a directory still being built").await;
     for (case, directory) in [
         ("a Simple AD directory", &simple_ad),
         ("a directory still being built", &still_building),
@@ -618,5 +698,136 @@ async fn a_schema_extension_does_not_outlive_its_directory() {
     assert!(
         found.is_empty(),
         "expected a fresh directory to report no extensions, got {found:?}"
+    );
+}
+
+/// One row of the walk table: what the start asked for, and the values of the modelled
+/// `SchemaExtensionStatus` enum the extension must then be reported in, in order.
+struct WalkCase {
+    case: &'static str,
+    snapshot_first: bool,
+    description: String,
+    ldif: String,
+    expected: Vec<&'static str>,
+}
+
+/// Start the extension one walk row describes and assert it is then reported in exactly
+/// the phases that row expects, in order.
+///
+/// Its own function so the rows can be driven CONCURRENTLY: each walk is the service's
+/// own clock-owed chain, so driving them at once costs one walk rather than one per row.
+async fn drive_walk_case(router: &MultiServiceRouter, directory: &str, row: &WalkCase) {
+    let case = row.case;
+    let id = start(
+        router,
+        start_body(directory, &row.description, &row.ldif, row.snapshot_first),
+        case,
+    )
+    .await;
+
+    // Look again until the extension settles, recording every status it is reported
+    // in on the way: what a polling client observes IS the walk.
+    let seen = RefCell::new(Vec::<String>::new());
+    let settled = poll_until_extension(
+        router,
+        directory,
+        &id,
+        "settle on a terminal status",
+        case,
+        |observed| {
+            let mut seen = seen.borrow_mut();
+            if seen.last().map(String::as_str) != Some(observed) {
+                seen.push(observed.to_string());
+            }
+            observed == STATUS_COMPLETED
+        },
+    )
+    .await;
+
+    let walked = seen.into_inner();
+    let walked: Vec<&str> = walked.iter().map(String::as_str).collect();
+    assert_eq!(
+        walked, row.expected,
+        "case {case:?}: expected the extension to be reported in {:?}, got {walked:?}",
+        row.expected
+    );
+
+    // The terminal status is the first one that has an end instant to report.
+    let started_at = epoch_member(&settled, "StartDateTime", case);
+    let ended_at = epoch_member(&settled, "EndDateTime", case);
+    assert!(
+        ended_at >= started_at,
+        "case {case:?}: expected EndDateTime {ended_at} at or after StartDateTime {started_at}"
+    );
+}
+
+#[tokio::test]
+async fn an_extension_is_reported_in_every_phase_of_its_application() {
+    let router = service();
+    let directory = directory_in_service(&router, "corp.example.com", "the walked directory").await;
+
+    // Applying a schema extension is a CHAIN of phases, so every phase of it is reported
+    // in turn. The rows differ along the one thing the chain's shape depends on — whether
+    // the start asked for a snapshot of the directory first, which is the only phase that
+    // is conditional — and along the description and LDIF form it does not depend on.
+    let cases = [
+        WalkCase {
+            case: "no snapshot first",
+            snapshot_first: false,
+            description: "Add_user_attributes".to_string(),
+            ldif: "dn: CN=Shoe-Size,CN=Schema,CN=Configuration,DC=corp,DC=example,DC=com\n\
+                   changetype: add\nobjectClass: attributeSchema\n"
+                .to_string(),
+            expected: vec![
+                STATUS_INITIALIZING,
+                STATUS_UPDATING_SCHEMA,
+                STATUS_REPLICATING,
+                STATUS_COMPLETED,
+            ],
+        },
+        WalkCase {
+            case: "snapshot first",
+            snapshot_first: true,
+            description: "pre-flight schema change #2 @ 03:00".to_string(),
+            ldif: "dn: CN=Badge-Id,CN=Schema,CN=Configuration,DC=corp,DC=example,DC=com\n"
+                .to_string(),
+            expected: vec![
+                STATUS_INITIALIZING,
+                STATUS_CREATING_SNAPSHOT,
+                STATUS_UPDATING_SCHEMA,
+                STATUS_REPLICATING,
+                STATUS_COMPLETED,
+            ],
+        },
+    ];
+
+    // Each row's extension walks the phases of its own application, so the rows are
+    // driven at once: the chains overlap, and a record is only ever read by the row that
+    // started it.
+    tokio::join!(
+        drive_walk_case(&router, &directory, &cases[0]),
+        drive_walk_case(&router, &directory, &cases[1]),
+    );
+
+    // The walk is the CLOCK's, not the reader's: an extension nobody polled while it was
+    // being applied is reported in exactly the status every phase of it falling due
+    // leaves it in.
+    let case = "an extension nobody polled";
+    let unpolled = start(
+        &router,
+        start_body(
+            &directory,
+            "unpolled",
+            "dn: CN=Unpolled,CN=Schema,CN=Configuration,DC=corp,DC=example,DC=com\n",
+            true,
+        ),
+        case,
+    )
+    .await;
+    let entry = poll_until_extension_status(&router, &directory, &unpolled, STATUS_COMPLETED, case)
+        .await;
+    assert!(
+        !entry["EndDateTime"].is_null(),
+        "case {case:?}: expected a settled extension to report an EndDateTime, got {entry}"
     );
 }

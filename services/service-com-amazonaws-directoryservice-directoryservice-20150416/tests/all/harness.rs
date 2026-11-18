@@ -52,7 +52,7 @@ pub(crate) async fn delete_directory_and_wait(
         case,
     )
     .await;
-    tokio::time::sleep(PAST_THE_TEARDOWN).await;
+    poll_until_absent(router, directory_id, case).await;
 }
 
 /// The stage the reporting operation gives for `directory_id`, or `None` once the account
@@ -123,9 +123,6 @@ pub(crate) async fn poll_until_absent(
 
 /// Poll the reporting operation for `directory_id` until the stage it reports satisfies
 /// `settled`, or fail naming the case, what was waited for and the last stage observed.
-///
-/// THE one polling loop of this harness, so every condition a suite waits for is bounded
-/// the same way and no case waits a fixed span instead.
 async fn poll_until(
     router: &MultiServiceRouter,
     directory_id: &str,
@@ -133,16 +130,45 @@ async fn poll_until(
     awaited: &str,
     settled: impl Fn(Option<&str>) -> bool,
 ) {
+    poll_until_reported(
+        case,
+        &format!("{directory_id} to {awaited}"),
+        POLL_DEADLINE,
+        || reported_stage(router, directory_id, case),
+        |observed: &Option<String>| settled(observed.as_deref()),
+    )
+    .await;
+}
+
+/// Poll `probe` until the value it answers satisfies `settled`, and answer that value — or
+/// fail naming the case, what was waited for and the last value observed.
+///
+/// THE one polling loop of this harness, so every condition a suite waits for is bounded
+/// the same way and no case waits a fixed span instead: a case waits for the CONDITION a
+/// client's waiter waits for, so none of them depends on how fast the host runs. `probe`
+/// is the reporting operation the condition is about, and `deadline` is the waiting
+/// suite's own bound — far beyond every span the subject it waits on publishes.
+pub(crate) async fn poll_until_reported<T, P, F>(
+    case: &str,
+    awaited: &str,
+    deadline: Duration,
+    probe: P,
+    settled: impl Fn(&T) -> bool,
+) -> T
+where
+    T: std::fmt::Debug,
+    P: Fn() -> F,
+    F: std::future::Future<Output = T>,
+{
     let started = Instant::now();
     loop {
-        let observed = reported_stage(router, directory_id, case).await;
-        if settled(observed.as_deref()) {
-            return;
+        let observed = probe().await;
+        if settled(&observed) {
+            return observed;
         }
         assert!(
-            started.elapsed() < POLL_DEADLINE,
-            "case {case:?}: expected {directory_id} to {awaited} within {POLL_DEADLINE:?}, \
-             last observed {observed:?}"
+            started.elapsed() < deadline,
+            "case {case:?}: expected {awaited} within {deadline:?}, last observed {observed:?}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
