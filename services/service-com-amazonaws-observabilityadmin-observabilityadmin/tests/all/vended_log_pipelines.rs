@@ -21,11 +21,13 @@
 //! 2. a POSITION of such a section's processor sequence naming a processor that branch of
 //!    the schema does not define at all is reported as the undefined property it is, at
 //!    that position's path;
-//! 3. a read of a pipeline whose vended source declares no data source names that data
-//!    source the way the log event metadata names one — the pipeline's name as an
-//!    IDENTIFIER, which separates its words with `_` where the resource name separates
-//!    them with `-` — while a data source the document DOES declare is reported exactly
-//!    as declared.
+//! 3. a read of a pipeline names each of its data sources the way `DataSource$Name` says
+//!    that KIND of source names one: a source reading AWS-vended log events reports the
+//!    `data_source_name` the log event metadata carries — the one the document declares
+//!    for it, or, for the events vended for the pipeline itself, the pipeline's own name
+//!    as an IDENTIFIER, which separates its words with `_` where the resource name
+//!    separates them with `-` — while a third-party source reports the configured name,
+//!    or the plugin's own name when the document configures none.
 
 use serde_json::{json, Value};
 
@@ -316,22 +318,42 @@ async fn a_vended_log_section_is_reported_against_every_branch_it_violates() {
 }
 
 // =============================================================================
-// Rule 3 — how a read names a vended source's own data source
+// Rule 3 — how a read names a source's data sources, by the kind of source
 // =============================================================================
 
-/// A vended source that declares no data source reads the events vended for the pipeline
-/// itself, so the read names that data source with the pipeline's name in IDENTIFIER
-/// form; a data source the document declares is reported exactly as declared.
+/// How a read NAMES a pipeline's data sources is `DataSource$Name`'s split by the KIND of
+/// source — `smithy_query(query="doc", shape="DataSource", member="Name")`: "For
+/// CloudWatch Logs sources, this corresponds to the `data_source_name` from the log event
+/// metadata. For third-party sources, this is either the configured `data_source_name` or
+/// defaults to the plugin name if not specified."
 ///
-/// The rows differ along what the rule generalises over: how many words the pipeline's
-/// name separates (none, two, several), which vended source reads them, whether the
-/// document declares the data source at all, and whether a declared name itself carries
+/// So a source reading AWS-vended log events reports the `data_source_name` the metadata
+/// carries: the one the document declares for it when it declares one, and otherwise the
+/// events vended for the pipeline ITSELF, which the metadata names by the pipeline's own
+/// IDENTIFIER — its resource name with every `-` replaced by `_`, a form
+/// `TelemetryPipelineName`'s pattern (`[a-z][a-z0-9\-]+`) admits no pipeline name in. A
+/// third-party source reports the configured name, or the plugin's own when the document
+/// configures none.
+///
+/// That identifier is a function of the name THIS request carried and of nothing else, so
+/// two pipelines whose names differ only in a trailing token report data sources that
+/// differ in exactly that token.
+///
+/// The rows differ along what the rule generalises over: the kind of source (two
+/// different AWS-vended ones, two different third-party ones), how many words the
+/// pipeline's name separates (none, two, several) and which token ends it, how much of the
+/// data source the document declares (nothing, a name, a name and a type, the
+/// `data_source_name`/`data_source_type` pair on the plugin's own block) and in which
+/// form, how many data sources it declares, and whether a declared name itself carries
 /// the resource separator.
+///
+/// The same derivation feeds a LISTING's `TelemetryPipelineSummary.ConfigurationSummary`,
+/// so every row is asserted on `ListTelemetryPipelines` as well as on the read.
 #[tokio::test]
-async fn a_vended_sources_own_data_source_is_named_by_the_pipelines_identifier() {
+async fn a_data_source_is_named_the_way_its_source_kind_names_one() {
     let emulator = emulator();
 
-    for (case, name, body, expected) in [
+    let cases = [
         (
             "a CloudWatch Logs source declaring no data source",
             "probe-pipe-one",
@@ -353,6 +375,14 @@ async fn a_vended_sources_own_data_source_is_named_by_the_pipelines_identifier()
             json!([{ "Name": "sim2real_probe_pipe_a1b2", "Type": "default" }]),
         ),
         (
+            "the same pipeline shape under a name ending in a different token, which is \
+             the only part of the data source's name that moves with it",
+            "sim2real-probe-pipe-c7fd",
+            "pipeline:\n  source:\n    cloudwatch_logs: {}\n  \
+             sink:\n    - cloudwatch_logs: {}\n",
+            json!([{ "Name": "sim2real_probe_pipe_c7fd", "Type": "default" }]),
+        ),
+        (
             "another vended source declaring no data source",
             "flow-logs-pipe",
             "source:\n  amazon_vpc_flow: {}\nsink:\n  - cloudwatch_logs: {}\n",
@@ -360,11 +390,41 @@ async fn a_vended_sources_own_data_source_is_named_by_the_pipelines_identifier()
         ),
         (
             "a vended source declaring a data source whose own name carries the \
-             resource separator",
+             resource separator, which the metadata carries as declared",
             "declared-feed-pipe",
             "source:\n  cloudwatch_logs:\n    data_sources:\n      - custom-feed\n\
              sink:\n  - cloudwatch_logs: {}\n",
             json!([{ "Name": "custom-feed", "Type": "default" }]),
+        ),
+        (
+            "a vended source declaring a data source the vended-log schema knows by \
+             name",
+            "trail-feed-pipe",
+            "pipeline:\n  source:\n    cloudwatch_logs:\n      data_sources:\n        \
+               - aws_cloudtrail\n  sink:\n    - cloudwatch_logs: {}\n",
+            json!([{ "Name": "aws_cloudtrail", "Type": "default" }]),
+        ),
+        (
+            "a vended source naming its data source by the pair the log metadata names, \
+             with a type of its own",
+            "paired-feed-pipe",
+            "source:\n  cloudwatch_logs:\n    data_source_name: some_other_label\n    \
+               data_source_type: custom\n\
+             sink:\n  - cloudwatch_logs: {}\n",
+            json!([{ "Name": "some_other_label", "Type": "custom" }]),
+        ),
+        (
+            "a vended source listing two data sources, one summary entry per declared \
+             data source",
+            "two-feeds-pipe",
+            "source:\n  cloudwatch_logs:\n    data_sources:\n      \
+               - name: aws_cloudtrail\n      \
+               - name: aws_security_hub_cspm\n        type: custom\n\
+             sink:\n  - cloudwatch_logs: {}\n",
+            json!([
+                { "Name": "aws_cloudtrail", "Type": "default" },
+                { "Name": "aws_security_hub_cspm", "Type": "custom" },
+            ]),
         ),
         (
             "a third-party source declaring no data source, which defaults to the \
@@ -374,7 +434,25 @@ async fn a_vended_sources_own_data_source_is_named_by_the_pipelines_identifier()
              sink:\n  - cloudwatch_logs: {}\n",
             json!([{ "Name": "s3" }]),
         ),
-    ] {
+        (
+            "a third-party source declaring its data source, which is reported exactly \
+             as configured",
+            "archive-feed-pipe",
+            "source:\n  s3:\n    data_source_name: archive-logs\n\
+             sink:\n  - cloudwatch_logs: {}\n",
+            json!([{ "Name": "archive-logs" }]),
+        ),
+        (
+            "another third-party source listing two data sources, each reported as \
+             configured",
+            "http-feeds-pipe",
+            "source:\n  http:\n    data_sources:\n      - first-feed\n      - second-feed\n\
+             sink:\n  - cloudwatch_logs: {}\n",
+            json!([{ "Name": "first-feed" }, { "Name": "second-feed" }]),
+        ),
+    ];
+
+    for (case, name, body, expected) in &cases {
         let (status, created) = call(
             &emulator,
             HOME_REGION,
@@ -400,15 +478,45 @@ async fn a_vended_sources_own_data_source_is_named_by_the_pipelines_identifier()
         );
         assert_eq!(
             read.pointer("/Pipeline/ConfigurationSummary/DataSources"),
-            Some(&expected),
+            Some(expected),
             "case {case:?}: expected those data sources for {body:?}, got {read:?}"
         );
-        // The identifier form is the DATA SOURCE's name only: the pipeline resource
-        // keeps the name it was created with, which is the one a later read takes.
+        // The identifier form is a DATA SOURCE name the service derives: the pipeline
+        // resource keeps the name it was created with, which is the one a later read
+        // takes, so the two forms never swap places.
         assert_eq!(
             read.pointer("/Pipeline/Name").and_then(Value::as_str),
-            Some(name),
+            Some(*name),
             "case {case:?}: the pipeline keeps its own name, got {read:?}"
+        );
+    }
+
+    // The listing derives its summaries from the same stored documents, so it reports
+    // every row's data sources identically to the read of that pipeline.
+    let (status, listed) = call(
+        &emulator,
+        HOME_REGION,
+        "/ListTelemetryPipelines",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "listing must answer 200, got {status} {listed:?}");
+    let summaries = listed
+        .get("PipelineSummaries")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("the listing reports the pipelines, got {listed:?}"));
+    for (case, name, body, expected) in &cases {
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.get("Name").and_then(Value::as_str) == Some(*name))
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the listing reports {name:?}, got {listed:?}")
+            });
+        assert_eq!(
+            summary.pointer("/ConfigurationSummary/DataSources"),
+            Some(expected),
+            "case {case:?}: the listing reports the same data sources for {body:?}, \
+             got {summary:?}"
         );
     }
 }
