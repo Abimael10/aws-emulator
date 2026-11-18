@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Re-applying a rate that is already in force through `UpdateProvisionedLimit`,
+//! Asking `UpdateProvisionedLimit` for the rate the account has ALREADY provisioned,
 //! driven through the router exactly as an SDK drives it (`POST /` with
 //! `X-Amz-Target: AWSCognitoIdentityProviderService.UpdateProvisionedLimit`).
 //!
@@ -39,8 +39,8 @@ use super::log_delivery_configuration::{call, error_code, error_message, ok};
 /// the first repeat.
 const REPEATS: usize = 3;
 
-/// How far above a limit's included rate a granted Service Quotas increase
-/// raises the account's ceiling, in the rows that open the range.
+/// How far above a limit's included rate a granted Service Quotas increase raises the
+/// account's ceiling, in the rows that open the range.
 const GRANTED_INCREASE: i32 = 500;
 
 /// One emulator with just this service mounted, beside the engine its state —
@@ -94,9 +94,9 @@ fn same_as_provisioned_message() -> String {
 /// Record a granted Service Quotas increase raising this account's ceiling for
 /// `category` to `ceiling`, and return the ceiling now in force.
 ///
-/// A Service Quotas increase is the only thing that moves this ceiling and is
-/// not an operation of this service, so it is applied to the account's own
-/// quota state rather than over the wire.
+/// A Service Quotas increase is the only thing that moves this ceiling and is not an
+/// operation of this service, so it is applied to the account's own quota state rather
+/// than over the wire.
 fn granted_increase(
     engine: &Arc<engine::InMemoryEngine>,
     category: &cognito_idp::state::ApiCategory,

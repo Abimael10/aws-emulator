@@ -80,9 +80,12 @@ pub const MAX_STATEMENT_DEPTH: usize = 16;
 /// Where in the statement text one token sits.
 ///
 /// A refusal that reports a position reports it as `<line>:<column>:<length>` — the
-/// line and column the statement spells the offending run at, counted in characters
-/// from 1, and how many characters it takes — so every part of it is a fact of the
-/// text the request sent.
+/// line and column the statement spells the TOKEN the refused construct opens at,
+/// counted in characters from 1, and how many characters that token takes — so every
+/// part of it is a fact of the text the request sent. A construct spelled over SEVERAL
+/// tokens (a source path and its qualifier, a call and its operands) is reported at the
+/// token it opens with, with that token's own width, which is what every positioned
+/// sentence of this surface states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Position {
     line: usize,
@@ -94,24 +97,6 @@ impl Position {
     /// This position as a refusal reports it.
     fn stated(&self) -> String {
         format!("{}:{}:{}", self.line, self.column, self.width)
-    }
-
-    /// The position of the RUN that opens here and ends with the token at `closes`.
-    ///
-    /// A refusal about a run of SEVERAL tokens — a source path and its qualifiers, say —
-    /// reports the one run: where it opens and how many characters it takes, both read off
-    /// the two tokens' own positions. A run the statement spells across a line break has no
-    /// single width, so it is reported as the run its first line holds.
-    fn through(self, closes: Self) -> Self {
-        Self {
-            line: self.line,
-            column: self.column,
-            width: if closes.line == self.line {
-                (closes.column + closes.width).saturating_sub(self.column)
-            } else {
-                self.width
-            },
-        }
     }
 }
 
@@ -271,10 +256,10 @@ fn incorrect_operand_count(operator_or_function: &str, operands: usize) -> Reque
 /// An index projects a table's items and is written through no statement ("attributes
 /// that are copied (projected) from the table into the global secondary index",
 /// `GlobalSecondaryIndex$Projection`), so the clause naming the source of an `INSERT`, an
-/// `UPDATE` or a `DELETE` names one table and nothing else. The position reported is the
-/// run the statement spells that SOURCE PATH at — its qualifier included, because the
-/// whole path is what holds more than the single table name the sentence is about — so
-/// every part of the message is a fact of the request.
+/// `UPDATE` or a `DELETE` names one table and nothing else. The position reported is
+/// where the statement OPENS that source path — the token the path begins with, with
+/// that token's own width ([`Position`]) — so every part of the message is a fact of the
+/// request.
 fn single_table_in_data_manipulation(at: Position) -> RequestError {
     RequestError::Validation(format!(
         "FROM clause may only contain a single table name in data manipulation statements at {}",
@@ -1023,8 +1008,8 @@ impl ReturnedValues {
 }
 
 /// The source a statement's `FROM` clause names: the table and the index of it a read
-/// is served through, with the run of statement text the whole path sits in — what a
-/// refusal about that path reports its position as.
+/// is served through, with the position of the token the path OPENS at — what a refusal
+/// about that path reports its position as ([`Position`]).
 #[derive(Debug, Clone)]
 struct StatementSource {
     table: String,
@@ -1734,8 +1719,8 @@ impl StatementParser<'_> {
             // A `DELETE` removes an item of the TABLE, and an index holds a projection
             // of one rather than items of its own, so a qualified source names more than
             // the single table a data-manipulation statement's clause may: the positioned
-            // sentence over the run that path sits in, the same refusal the other two
-            // verbs' targets earn ([`single_table_in_data_manipulation`]).
+            // sentence over the token that path opens with, the same refusal the other
+            // two verbs' targets earn ([`single_table_in_data_manipulation`]).
             return Err(single_table_in_data_manipulation(source.at));
         }
         let filter = self.required_where_clause()?;
@@ -1763,10 +1748,8 @@ impl StatementParser<'_> {
     /// `table.index`, either part quoted or bare.
     fn read_source(&mut self, continues: &[&str]) -> Result<StatementSource, RequestError> {
         let opens_at = self.position();
-        let mut closes_at = opens_at;
         let table = self.path_component()?;
         let index = if self.accept(&Token::Dot) {
-            closes_at = self.position();
             Some(self.path_component()?)
         } else {
             None
@@ -1781,7 +1764,7 @@ impl StatementParser<'_> {
         let source = StatementSource {
             table,
             index,
-            at: opens_at.through(closes_at),
+            at: opens_at,
         };
         self.read_table_alias(continues);
         Ok(source)
@@ -1798,28 +1781,27 @@ impl StatementParser<'_> {
     }
 
     /// The target a write names DIRECTLY — an `INSERT`'s `INTO` and an `UPDATE`'s own
-    /// source: the components of the path, and the run of statement text that whole path
-    /// sits in.
+    /// source: the components of the path, and the position of the token the path opens
+    /// at.
     ///
     /// The path is READ whole, qualifier included, so a statement whose target carries one
-    /// is refused for the target rather than for the token after it. WHICH refusal that is
-    /// belongs to the verb, because it depends on whether the verb names its source inside
-    /// a clause ([`StatementParser::insert`], [`StatementParser::update`]).
+    /// is refused for the target rather than for the token after it, and the position that
+    /// comes back is where the path OPENS ([`Position`]). WHICH refusal that is belongs to
+    /// the verb, because it depends on whether the verb names its source inside a clause
+    /// ([`StatementParser::insert`], [`StatementParser::update`]).
     fn write_target(
         &mut self,
         continues: &[&str],
     ) -> Result<(Vec<String>, Position), RequestError> {
         let opens_at = self.position();
-        let mut closes_at = opens_at;
         let mut components = vec![self.path_component()?];
         while self.accept(&Token::Dot) {
-            closes_at = self.position();
             components.push(self.path_component()?);
         }
         if components.len() == 1 {
             self.read_table_alias(continues);
         }
-        Ok((components, opens_at.through(closes_at)))
+        Ok((components, opens_at))
     }
 
     /// The ONE table a source path names, for a verb that spells that path inside a clause
@@ -1827,9 +1809,9 @@ impl StatementParser<'_> {
     ///
     /// Such a clause names one table and nothing else, so a path of two components is
     /// refused with the positioned single-table sentence
-    /// ([`single_table_in_data_manipulation`]) and a longer one is past what any source
-    /// path may spell at all, which is the arity sentence a read's source earns too
-    /// ([`FROM_PATH_ARITY_MESSAGE`]).
+    /// ([`single_table_in_data_manipulation`]), at the token the path opens with, and a
+    /// longer one is past what any source path may spell at all, which is the arity
+    /// sentence a read's source earns too ([`FROM_PATH_ARITY_MESSAGE`]).
     fn one_table_in_clause(components: &[String], at: Position) -> Result<String, RequestError> {
         match components {
             [table] => Ok(table.clone()),

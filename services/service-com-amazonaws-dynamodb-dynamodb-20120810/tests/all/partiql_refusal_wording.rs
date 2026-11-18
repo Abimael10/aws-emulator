@@ -32,9 +32,10 @@ fn parse_failure(reason: &str) -> String {
 }
 
 /// Where `run` sits in `statement`, as a refusal reports a position:
-/// `<line>:<column>:<length>`, counted in characters from 1. Every positioned row
-/// below derives what it expects from the statement it sends, so the expectation is
-/// the rule and not one transcribed figure.
+/// `<line>:<column>:<length>`, counted in characters from 1 — where `run` is the ONE
+/// TOKEN the refused construct opens at, since that is what a positioned sentence of
+/// this surface names. Every positioned row below derives what it expects from the
+/// statement it sends, so the expectation is the rule and not one transcribed figure.
 fn position_of(statement: &str, run: &str) -> String {
     let offset = statement
         .find(run)
@@ -349,7 +350,7 @@ fn operand_rows() -> Vec<Row> {
 /// A verb that names its source inside a CLAUSE — a `SELECT`'s and a `DELETE`'s `FROM`,
 /// an `INSERT`'s `INTO` — is held to what that clause may spell: at most two components
 /// at all (the arity sentence), and, for a write, the single table name (the positioned
-/// sentence, over the run the whole path sits in). An `UPDATE` names its target with no
+/// sentence, over the token the path opens at). An `UPDATE` names its target with no
 /// clause around it, so a qualifier there asks for the update through an index and earns
 /// the fixed index sentence.
 fn source_rows() -> Vec<Row> {
@@ -405,32 +406,28 @@ fn source_rows() -> Vec<Row> {
         },
     ];
     // The two verbs that name their source inside a clause earn the one positioned
-    // sentence, and the position it reports is the run the statement spells that whole
-    // path at — the qualifier included, since the path is what holds more than the single
-    // table name the clause may.
-    for (case, statement, path) in [
+    // sentence, and the position it reports is where the statement OPENS that source
+    // path: the token the path begins with, with that token's own width, so a qualifier
+    // spelled after it moves neither the column nor the width.
+    for (case, statement, opens) in [
         (
             "an INSERT through an index qualifier",
             format!("INSERT INTO \"keyed\".\"{INDEX}\" VALUE {{'pk':'b','sk':2}}"),
-            format!("\"keyed\".\"{INDEX}\""),
+            "\"keyed\"".to_string(),
         ),
         (
             "a DELETE through an index qualifier",
             format!("DELETE FROM \"keyed\".\"{INDEX}\" WHERE pk = 'a' AND sk = 1"),
-            format!("\"keyed\".\"{INDEX}\""),
+            "\"keyed\"".to_string(),
         ),
         (
             "a DELETE through a bare index qualifier",
             "DELETE FROM keyed.anyindex WHERE pk = 'a' AND sk = 1".to_string(),
-            "keyed.anyindex".to_string(),
+            "keyed".to_string(),
         ),
     ] {
         rows.push(Row {
-            expected: format!(
-                "FROM clause may only contain a single table name in data manipulation \
-                 statements at {}",
-                position_of(&statement, &path)
-            ),
+            expected: single_table_at(&statement, &opens),
             case,
             statement,
             parameters: Value::Null,
@@ -569,13 +566,9 @@ async fn a_batch_slot_states_the_same_sentence_its_own_statement_earns() {
         (
             "a write addressed through an index qualifier",
             format!("INSERT INTO {TABLE}.gsi VALUE {{'pk':'q'}}"),
-            format!(
-                "FROM clause may only contain a single table name in data manipulation \
-                 statements at {}",
-                position_of(
-                    &format!("INSERT INTO {TABLE}.gsi VALUE {{'pk':'q'}}"),
-                    &format!("{TABLE}.gsi")
-                )
+            single_table_at(
+                &format!("INSERT INTO {TABLE}.gsi VALUE {{'pk':'q'}}"),
+                TABLE,
             ),
         ),
     ];
@@ -1038,25 +1031,30 @@ async fn a_reported_position_is_counted_in_the_statements_own_lines_and_characte
         );
     }
 
-    // The positioned sentence a write through an index qualifier earns reports the run the
-    // statement spells the whole SOURCE PATH at, counted off the line that spells it.
-    let statement = format!("INSERT\nINTO \"keyed\".\"{INDEX}\"\nVALUE {{'pk':'b','sk':2}}");
-    let path = format!("\"keyed\".\"{INDEX}\"");
-    let stated = refused(
-        &router,
-        "a source path on the second line",
-        json!({"Statement": statement}),
-    )
-    .await;
-    let expected = format!(
-        "FROM clause may only contain a single table name in data manipulation statements at {}",
-        position_of(&statement, &path)
-    );
-    assert_eq!(
-        stated, expected,
-        "case a source path on the second line: statement {statement:?} expected \
-         {expected:?}, got {stated:?}"
-    );
+    // The positioned sentence a write through an index qualifier earns reports where the
+    // statement OPENS the source path, counted off the line that spells it: the rows
+    // differ along which line that is and the indentation before it.
+    for (case, statement) in [
+        (
+            "a source path on the second line",
+            format!("INSERT\nINTO \"keyed\".\"{INDEX}\"\nVALUE {{'pk':'b','sk':2}}"),
+        ),
+        (
+            "a source path on the third line",
+            format!("INSERT\nINTO\n\"keyed\".\"{INDEX}\"\nVALUE {{'pk':'b','sk':2}}"),
+        ),
+        (
+            "a source path behind leading indentation",
+            format!("DELETE\n        FROM \"keyed\".\"{INDEX}\"\n    WHERE pk = 'a'"),
+        ),
+    ] {
+        let stated = refused(&router, case, json!({"Statement": statement})).await;
+        let expected = single_table_at(&statement, "\"keyed\"");
+        assert_eq!(
+            stated, expected,
+            "case {case}: statement {statement:?} expected {expected:?}, got {stated:?}"
+        );
+    }
 }
 
 /// The sentence a WRITE whose source path carries an index qualifier earns, over every
@@ -1067,48 +1065,58 @@ async fn a_reported_position_is_counted_in_the_statements_own_lines_and_characte
 /// refused `ValidationException`, and WHICH sentence it states follows how the verb spells
 /// that source. A verb that names it inside a clause (`INSERT INTO`, `DELETE FROM`) is
 /// held to what that clause may spell: the single table name, stated with the position of
-/// the run the whole path sits in, and at most two components at all, past which the arity
+/// the TOKEN the path opens at, and at most two components at all, past which the arity
 /// sentence is what the clause earns. An `UPDATE` names its target with no clause around
 /// it, so a qualifier there asks for the write through an index and states that. The same
 /// two-component path is a legal source for a READ, which is the control below.
 ///
 /// The rows differ along what the rule generalises over: the verb (`INSERT`, `UPDATE`,
 /// `DELETE`), how each component is spelled (`"quoted"` or bare, and the two mixed), the
-/// whitespace the path carries around its separator, and how many components the path
-/// holds (two and three). Every expected position is computed from the statement the row
-/// sends.
+/// whitespace the path carries around its separator, how wide the qualifier spelled after
+/// the opening token is (which the position must not follow), and how many components the
+/// path holds (two and three). Every expected position is computed from the statement the
+/// row sends.
 #[tokio::test]
 async fn a_write_through_a_qualified_source_names_the_rule_its_verb_broke() {
     let router = seeded().await;
 
-    /// The sentence a qualified source CLAUSE earns, over the run the path sits in.
-    fn single_table(statement: &str, path: &str) -> String {
-        format!(
-            "FROM clause may only contain a single table name in data manipulation statements \
-             at {}",
-            position_of(statement, path)
-        )
-    }
-
     /// The sentence an `UPDATE` through a qualified target earns.
     const ON_AN_INDEX: &str = "This operation is not supported on an index";
 
-    // Each two-component path, spelled four ways and once with whitespace around its
-    // separator, in each of the three verbs that write.
-    for (spelling, path) in [
-        ("both components quoted", format!("\"keyed\".\"{INDEX}\"")),
-        ("both components bare", "keyed.anyindex".to_string()),
+    // Each two-component path, spelled four ways, once with whitespace around its
+    // separator and once with a qualifier far wider than the table it qualifies, in each
+    // of the three verbs that write. `opens` is the token the path begins with, which is
+    // the whole of what the position reports however the rest of the path is spelled.
+    for (spelling, path, opens) in [
+        (
+            "both components quoted",
+            format!("\"keyed\".\"{INDEX}\""),
+            "\"keyed\"",
+        ),
+        (
+            "both components bare",
+            "keyed.anyindex".to_string(),
+            "keyed",
+        ),
         (
             "a quoted table and a bare qualifier",
             "\"keyed\".qualifier".to_string(),
+            "\"keyed\"",
         ),
         (
             "a bare table and a quoted qualifier",
             format!("keyed.\"{INDEX}\""),
+            "keyed",
         ),
         (
             "whitespace around the separator",
             format!("\"keyed\" . \"{INDEX}\""),
+            "\"keyed\"",
+        ),
+        (
+            "a qualifier much wider than the table",
+            "keyed.\"a-qualifier-wider-than-the-table-it-qualifies\"".to_string(),
+            "keyed",
         ),
     ] {
         for (verb, statement, names_a_clause) in [
@@ -1131,7 +1139,7 @@ async fn a_write_through_a_qualified_source_names_the_rule_its_verb_broke() {
             let case = format!("{verb} with {spelling}");
             let stated = refused(&router, &case, json!({"Statement": statement})).await;
             let expected = if names_a_clause {
-                single_table(&statement, &path)
+                single_table_at(&statement, opens)
             } else {
                 ON_AN_INDEX.to_string()
             };
@@ -1213,6 +1221,144 @@ async fn a_write_through_a_qualified_source_names_the_rule_its_verb_broke() {
         assert_eq!(
             status, 200,
             "case {case}: statement {statement:?} must be served, got {status} with {answered}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WHERE a positioned sentence points
+//
+// RULE: a positioned sentence states the position of the single TOKEN the refused
+// construct OPENS at — `<line>:<column>:<length>`, the line and column counted in
+// characters from 1 and the length that token's own, in characters — so a construct
+// spelled over several tokens (a source path and the qualifier after it, a call and its
+// operands) is reported at its opening token and the text that follows moves neither the
+// column nor the length.
+// ---------------------------------------------------------------------------
+
+/// The tables the rows below address. Their names differ in WIDTH, because the length a
+/// refusal reports is the opening token's: a row whose table name is wide and whose
+/// qualifier is narrow, and one spelled the other way round, report different lengths at
+/// the same column. Both are spellable bare, so a row can vary the quoting too.
+const NARROW_TABLE: &str = "tiny";
+const WIDE_TABLE: &str = "orders_by_customer_and_created_at";
+
+/// A qualifier far wider than either table name, so an expectation that followed the
+/// whole path rather than its opening token could not agree with one that follows the
+/// token.
+const WIDE_QUALIFIER: &str = "a-qualifier-wider-than-the-table-it-qualifies";
+
+/// An emulator holding the two tables of different name widths, each ready.
+async fn two_widths() -> MultiServiceRouter {
+    let router = emulator();
+    for table in [NARROW_TABLE, WIDE_TABLE] {
+        create_active_table(&router, table, &[("pk", "HASH", "S")]).await;
+    }
+    router
+}
+
+/// The sentence a write whose source clause names more than one table earns, over the
+/// token `opens` that the clause's path begins with.
+fn single_table_at(statement: &str, opens: &str) -> String {
+    format!(
+        "FROM clause may only contain a single table name in data manipulation statements at {}",
+        position_of(statement, opens)
+    )
+}
+
+#[tokio::test]
+async fn a_qualified_write_source_is_reported_at_the_token_the_path_opens_with() {
+    let router = two_widths().await;
+
+    // Each row is a source path and the token it opens with: the rows differ along the
+    // width of that token, the width of what the path spells after it, the quoting of
+    // each component, and the characters the opening token itself spells — one of them
+    // wider than a byte, since the length is counted in characters. Both verbs that name
+    // their source inside a clause run every row.
+    let paths: Vec<(String, String, String)> = vec![
+        (
+            "a narrow bare table and a wide quoted qualifier".to_string(),
+            format!("{NARROW_TABLE}.\"{WIDE_QUALIFIER}\""),
+            NARROW_TABLE.to_string(),
+        ),
+        (
+            "a wide quoted table and a narrow bare qualifier".to_string(),
+            format!("\"{WIDE_TABLE}\".q"),
+            format!("\"{WIDE_TABLE}\""),
+        ),
+        (
+            "a wide bare table and a wide quoted qualifier".to_string(),
+            format!("{WIDE_TABLE}.\"{WIDE_QUALIFIER}\""),
+            WIDE_TABLE.to_string(),
+        ),
+        (
+            "both components quoted".to_string(),
+            format!("\"{WIDE_TABLE}\".\"{WIDE_QUALIFIER}\""),
+            format!("\"{WIDE_TABLE}\""),
+        ),
+        (
+            "whitespace around the separator".to_string(),
+            format!("\"{WIDE_TABLE}\"   .   \"{WIDE_QUALIFIER}\""),
+            format!("\"{WIDE_TABLE}\""),
+        ),
+        (
+            "an opening token spelling characters wider than a byte".to_string(),
+            "\"piñata-señal\".\"q\"".to_string(),
+            "\"piñata-señal\"".to_string(),
+        ),
+    ];
+
+    for (spelling, path, opens) in &paths {
+        for (verb, statement) in [
+            ("INSERT", format!("INSERT INTO {path} VALUE {{'pk':'b'}}")),
+            ("DELETE", format!("DELETE FROM {path} WHERE pk = 'a'")),
+        ] {
+            let case = format!("{verb} with {spelling}");
+            let stated = refused(&router, &case, json!({"Statement": statement})).await;
+            let expected = single_table_at(&statement, opens);
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: statement {statement:?} expected {expected:?}, got {stated:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_call_is_reported_at_the_name_it_opens_with_whatever_its_operands_are() {
+    let router = two_widths().await;
+
+    // The same rule on another construct: a call to a function the dialect does not
+    // define is reported at the NAME, with the name's own width, so the operands after it
+    // move neither the column nor the length. The rows differ along the width of the name
+    // and the width of what follows it.
+    let rows: Vec<(&str, String, &str)> = vec![
+        (
+            "a narrow name with one operand",
+            format!("SELECT * FROM {NARROW_TABLE} WHERE fx(pk)"),
+            "fx",
+        ),
+        (
+            "a narrow name with wide operands",
+            format!("SELECT * FROM {NARROW_TABLE} WHERE fx(pk, 'a long literal operand')"),
+            "fx",
+        ),
+        (
+            "a wide name with one operand",
+            format!("SELECT * FROM {WIDE_TABLE} WHERE a_function_this_dialect_does_not_define(pk)"),
+            "a_function_this_dialect_does_not_define",
+        ),
+    ];
+
+    for (case, statement, name) in &rows {
+        let stated = refused(&router, case, json!({"Statement": statement})).await;
+        let expected = format!(
+            "Unrecognized function: {name} at {}",
+            position_of(statement, name)
+        );
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: statement {statement:?} expected {expected:?}, got {stated:?}"
         );
     }
 }
