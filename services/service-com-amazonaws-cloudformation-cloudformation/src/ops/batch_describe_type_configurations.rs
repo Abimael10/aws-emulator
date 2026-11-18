@@ -3,7 +3,14 @@
 //! @op BatchDescribeTypeConfigurations
 //! Reading the account-level CONFIGURATIONS this account and Region holds for a batch of
 //! extensions: one entry per identifier the request names, and this batch's own error entry
-//! for an identifier that names no extension.
+//! for an identifier the registry holds no configuration for.
+//!
+//! `TypeConfigurations` reports the configurations the registry HOLDS, and nothing beside
+//! them: an identifier no extension of this account and Region answers to and one whose
+//! extension holds no configuration under the alias or the ARN it names are both the batch's
+//! own error entry — the same miss the modelled `TypeConfigurationNotFoundException` (404) is
+//! when it is the whole request — so a client can tell a configuration set to nothing from one
+//! that was never set.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`BatchDescribeTypeConfigurations::handle`] with real behaviour and
@@ -210,36 +217,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // An identifier no extension of this account and Region answers to is
                 // reported as this batch's own error entry, naming the identifier it came
                 // from: the read as a whole succeeds, which is what makes a batch a batch.
-                errors.push(BatchDescribeTypeConfigurationsError2 {
-                    error_code: Some(NOT_FOUND_ERROR_CODE.to_string()),
-                    error_message: Some(NOT_FOUND_ERROR_MESSAGE.to_string()),
-                    type_configuration_identifier: Some(identifier.clone()),
-                });
+                errors.push(not_found_entry(identifier));
                 continue;
             };
             let held = match identifier.type_configuration_arn.as_deref() {
                 Some(configuration_arn) => extension.configuration_by_arn(configuration_arn),
                 None => extension.configuration_with_alias(&alias),
             };
+            let Some(held) = held else {
+                // The extension is in this registry, but no configuration of it was ever set
+                // under what this identifier names. That is the OTHER thing the batch's error
+                // channel reports, and it is reported the same way: the request asked for a
+                // configuration, and this is the batch's entry for one the registry does not
+                // hold — which is what the modelled `TypeConfigurationNotFoundException` (404,
+                // "the specified extension configuration can't be found") says when the same
+                // miss is the whole request. A reported row instead would be a configuration
+                // this account never wrote, indistinguishable from one it did.
+                errors.push(not_found_entry(identifier));
+                continue;
+            };
             details.push(TypeConfigurationDetails {
-                // "If a configuration hasn't been set for a specified extension,
-                // CloudFormation returns `{}`" — and `null` for when it was last updated,
-                // there being no write to report the instant of.
-                configuration: Some(
-                    held.map_or_else(
-                        || NO_CONFIGURATION.to_string(),
-                        |held| held.configuration.clone(),
-                    ),
-                ),
-                arn: held.map(|held| held.arn.clone()),
-                alias: held.map(|held| held.alias.clone()),
-                last_updated: held.map(|held| crate::state::timestamp(held.last_updated)),
+                // Exactly what the write recorded, under the alias and the ARN it was written
+                // at, and the instant of that write.
+                configuration: Some(held.configuration.clone()),
+                arn: Some(held.arn.clone()),
+                alias: Some(held.alias.clone()),
+                last_updated: Some(crate::state::timestamp(held.last_updated)),
                 type_arn: Some(extension.arn.clone()),
                 type_name: Some(extension.type_name.clone()),
                 is_default_configuration: Some(
-                    held.is_some_and(|held| {
-                        held.alias == registry::DEFAULT_CONFIGURATION_ALIAS
-                    }),
+                    held.alias == registry::DEFAULT_CONFIGURATION_ALIAS,
                 ),
             });
         }
@@ -255,6 +262,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // configurations that CloudFormation could not process for any reason".
             unprocessed_type_configurations: Some(unprocessed.to_vec()),
         })
+    }
+}
+
+/// This batch's own entry for an identifier whose configuration the registry does not hold —
+/// whether no extension of this account and Region answers to it, or the extension holds no
+/// configuration under what it names: the identifier it came from, under the status and the
+/// sentence of the not-found refusal.
+fn not_found_entry(
+    identifier: &TypeConfigurationIdentifier,
+) -> BatchDescribeTypeConfigurationsError2 {
+    BatchDescribeTypeConfigurationsError2 {
+        error_code: Some(NOT_FOUND_ERROR_CODE.to_string()),
+        error_message: Some(NOT_FOUND_ERROR_MESSAGE.to_string()),
+        type_configuration_identifier: Some(identifier.clone()),
     }
 }
 
@@ -283,7 +304,3 @@ const NOT_FOUND_ERROR_CODE: &str = "404";
 /// `TypeConfigurationIdentifier` — so it is a fixed sentence, the way
 /// [`crate::state::resource_scans::NOT_FOUND`] is, rather than one built from the request.
 const NOT_FOUND_ERROR_MESSAGE: &str = "TypeConfiguration not found";
-
-/// What `Configuration` reports for an extension no configuration has been set for: "if a
-/// configuration hasn't been set for a specified extension, CloudFormation returns `{}`".
-const NO_CONFIGURATION: &str = "{}";

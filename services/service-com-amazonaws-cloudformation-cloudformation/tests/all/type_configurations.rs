@@ -9,15 +9,16 @@
 //! `SetTypeConfiguration` persists the account-level configuration of the
 //! extension THAT ARN names and answers the ARN of the configuration data; and
 //! `BatchDescribeTypeConfigurations` reads that same configuration, alias and ARN back,
-//! reporting an identifier that resolves to no extension as this batch's own error entry
-//! rather than refusing the whole read.**
+//! reporting an identifier the registry holds no configuration for as this batch's own error
+//! entry rather than refusing the whole read.**
 //!
 //! The rows differ along what the rule generalises over: the kind of extension (a Hook, a
-//! resource, a module), how the request names the public extension (`PublicTypeArn`, or
+//! resource type), how the request names the public extension (`PublicTypeArn`, or
 //! `Type` + `TypeName` + `PublisherId`), whether the activation takes an alias, whether the
 //! configuration is set under an alias of its own or the default one, and how the read
 //! identifies the configuration (by the type's ARN, by the configuration's own ARN, by kind
-//! and name).
+//! and name). The MODULE category, which holds no configuration at all, is the table in
+//! `module_type_configurations.rs`.
 //!
 //! The second rule, about WHICH publisher a request may name: **CloudFormation does not hold
 //! a request's `PublisherId` to the modelled third-party form — Amazon Web Services publishes
@@ -109,9 +110,9 @@ fn extension_cases() -> Vec<ExtensionCase> {
             configuration: r#"{"Credentials":{"ApiKey":"{{resolve:secretsmanager:key}}"}}"#,
         },
         ExtensionCase {
-            case: "a module activated by its public ARN, configuration naming one member",
-            kind: "MODULE",
-            type_name: "Example::Network::Subnets::MODULE",
+            case: "a resource type activated by its public ARN, configuration naming one member",
+            kind: "RESOURCE",
+            type_name: "Example::Network::Subnets",
             alias: None,
             by_public_arn: true,
             configuration_alias: Some("Alias2"),
@@ -419,7 +420,7 @@ async fn an_identifier_that_resolves_to_nothing_is_this_batch_s_own_error_entry(
 }
 
 #[tokio::test]
-async fn an_extension_no_configuration_was_set_for_reports_an_empty_configuration() {
+async fn an_extension_no_configuration_was_set_for_is_this_batch_s_own_error_entry() {
     let router = router();
     let case = &extension_cases()[0];
     let (code, body) = activate(&router, case).await;
@@ -436,16 +437,36 @@ async fn an_extension_no_configuration_was_set_for_reports_an_empty_configuratio
     )
     .await;
     assert_eq!(code, 200, "expected the batch to succeed, got {code} {body}");
-    let read = details(&body);
+    // The extension is in the registry and no configuration of it was ever set, so there is
+    // no configuration to report: the read reports the miss through the batch's own error
+    // channel instead, which is what tells a client it still has to set one.
+    assert!(
+        xml_blocks(&body, "TypeConfigurations")
+            .first()
+            .is_some_and(String::is_empty),
+        "expected no configuration reported for an extension none was set for, got {body}"
+    );
+    let errors = xml_blocks(&body, "Errors")
+        .into_iter()
+        .next()
+        .unwrap_or_default();
     assert_eq!(
-        reported(&read, "Configuration"),
-        "{}",
-        "expected an extension with no configuration to report an empty one, got {read:?}"
+        xml_blocks(&errors, "member").len(),
+        1,
+        "expected exactly one error entry, got {body}"
     );
     assert_eq!(
-        reported(&read, "Alias"),
-        "",
-        "expected no alias for a configuration that was never set, got {read:?}"
+        (
+            xml_text(&errors, "ErrorCode").unwrap_or_default().as_str(),
+            xml_text(&errors, "ErrorMessage").unwrap_or_default().as_str(),
+        ),
+        ("404", "TypeConfiguration not found"),
+        "expected the registry's own wording for a configuration it does not hold, got {body}"
+    );
+    assert_eq!(
+        xml_text(&errors, "TypeArn").as_deref(),
+        Some(activated_arn.as_str()),
+        "expected the error entry to carry the identifier it came from, got {body}"
     );
 }
 

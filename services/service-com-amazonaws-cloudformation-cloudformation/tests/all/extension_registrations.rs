@@ -15,7 +15,11 @@
 //! after; registering "includes validating the extension schema", so an archive the
 //! registration can read no schema of the extension out of — an object that is not a ZIP
 //! archive, an archive carrying no schema of this extension — registers nothing and its
-//! request concludes `FAILED` instead; a name in one of the organization namespaces AWS
+//! request concludes `FAILED` instead (the package every row that expects a registration to
+//! succeed is staged from is the project package `cfn submit` builds, carrying the handler
+//! artifact beside the schema, which a resource type's and a Hook's registration needs — the
+//! rule `schema_handler_package_contents.rs` is the table for); a name in one of the
+//! organization namespaces AWS
 //! reserves, text that addresses no Amazon S3 object at all, and an object Amazon S3 will not
 //! hand over are each refused with the modelled `CFNRegistryException` (400) and start no
 //! registration at all; and a resubmission under one `ClientRequestToken` is that same
@@ -58,7 +62,7 @@ async fn wait_for_the_conclusion() {
 }
 
 /// The bucket a client stages its handler packages in.
-const PACKAGE_BUCKET: &str = "cfn-extension-packages";
+pub(crate) const PACKAGE_BUCKET: &str = "cfn-extension-packages";
 
 /// The error code the registry's own modelled refusal carries on the wire
 /// (`CFNRegistryException`'s `awsQueryError`).
@@ -87,14 +91,14 @@ const FIRST_VERSION: &str = "00000001";
 ///
 /// Source: `smithy_query(query="doc", shape="DescribeTypeOutput", member="ProvisioningType")`,
 /// which states the provisioning behaviour each set gives a resource type.
-const EVERY_HANDLER: &[&str] = &["create", "read", "update", "delete", "list"];
+pub(crate) const EVERY_HANDLER: &[&str] = &["create", "read", "update", "delete", "list"];
 const NO_UPDATE_HANDLER: &[&str] = &["create", "read", "delete"];
 const NO_DELETE_HANDLER: &[&str] = &["create", "read", "update"];
 
 /// One provider definition schema: the document that declares `type_name`, the handlers
 /// named, and a description no request member carries — so an answer reporting it can only
 /// have come from the package that was read.
-fn schema_of(type_name: &str, handlers: &[&str]) -> String {
+pub(crate) fn schema_of(type_name: &str, handlers: &[&str]) -> String {
     let declared: serde_json::Map<String, serde_json::Value> = handlers
         .iter()
         .map(|handler| {
@@ -123,22 +127,44 @@ fn description_of(type_name: &str) -> String {
 /// read the only entry.
 ///
 /// The archive format is the `zip` crate's, here and in the handler that reads it back.
-fn package_of(schema: Option<&str>) -> Vec<u8> {
-    let mut buffer = Cursor::new(Vec::new());
-    let mut writer = zip::ZipWriter::new(&mut buffer);
-    for (name, content) in [
-        (".rpdk-config", "{\"artifact_type\": \"RESOURCE\"}".to_string()),
-        ("README.md", "# an extension project".to_string()),
+///
+/// It carries the project's declaration documents AND the handler artifact the extension's
+/// handlers are invoked from, which is what `cfn submit` builds into a package for a resource
+/// type or a Hook: a registration of one of those kinds needs the artifact, so the package
+/// every row that expects a registration to succeed is staged from carries it.
+pub(crate) fn package_of(schema: Option<&str>) -> Vec<u8> {
+    package_entries(&[
+        (".rpdk-config", b"{\"artifact_type\": \"RESOURCE\"}".to_vec()),
+        ("README.md", b"# an extension project".to_vec()),
         (
             "schema.json",
-            schema.unwrap_or("{\"notATypeName\": true}").to_string(),
+            schema.unwrap_or("{\"notATypeName\": true}").as_bytes().to_vec(),
         ),
-    ] {
+        (HANDLER_ARTIFACT, HANDLER_CODE.to_vec()),
+    ])
+}
+
+/// A package carrying the schema document and NOTHING else: the project's declaration without
+/// the handler code the extension's handlers would be invoked from.
+pub(crate) fn package_of_the_schema_alone(schema: &str) -> Vec<u8> {
+    package_entries(&[("schema.json", schema.as_bytes().to_vec())])
+}
+
+/// The entry a package carries the built handler code in, and its bytes: the artifact
+/// `cfn submit` builds for a resource type or a Hook.
+pub(crate) const HANDLER_ARTIFACT: &str = "ResourceProvider.zip";
+const HANDLER_CODE: &[u8] = b"the built handler code of an extension project";
+
+/// One archive, written entry by entry.
+fn package_entries(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut buffer = Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(&mut buffer);
+    for (name, content) in entries {
         writer
-            .start_file(name, zip::write::SimpleFileOptions::default())
+            .start_file(*name, zip::write::SimpleFileOptions::default())
             .expect("an archive entry starts");
         writer
-            .write_all(content.as_bytes())
+            .write_all(content)
             .expect("an archive entry is written");
     }
     writer.finish().expect("the archive closes");
@@ -155,7 +181,7 @@ fn package_of_nothing() -> Vec<u8> {
 }
 
 /// Create the package bucket, once per router.
-async fn create_package_bucket(router: &MultiServiceRouter) {
+pub(crate) async fn create_package_bucket(router: &MultiServiceRouter) {
     let created = s3(router, "PUT", &format!("/{PACKAGE_BUCKET}"), b"").await;
     assert_eq!(
         created.status, 200,
@@ -165,7 +191,7 @@ async fn create_package_bucket(router: &MultiServiceRouter) {
 }
 
 /// Stage one package object, as a client's own `PutObject` stores it.
-async fn stage(router: &MultiServiceRouter, key: &str, body: &[u8]) {
+pub(crate) async fn stage(router: &MultiServiceRouter, key: &str, body: &[u8]) {
     let stored = s3(router, "PUT", &format!("/{PACKAGE_BUCKET}/{key}"), body).await;
     assert_eq!(
         stored.status, 200,
@@ -179,7 +205,7 @@ async fn stage(router: &MultiServiceRouter, key: &str, body: &[u8]) {
 /// Source: Amazon S3's documented request styles — virtual-hosted and path-style — beside the
 /// `s3://<bucket>/<key>` URI form the member's own `S3Url` target admits.
 #[derive(Clone, Copy, Debug)]
-enum Style {
+pub(crate) enum Style {
     S3Uri,
     PathAddressed,
     VirtualHosted,
@@ -187,7 +213,7 @@ enum Style {
 
 impl Style {
     /// The URL this style spells for one object of the package bucket.
-    fn url(self, key: &str) -> String {
+    pub(crate) fn url(self, key: &str) -> String {
         match self {
             Style::S3Uri => format!("s3://{PACKAGE_BUCKET}/{key}"),
             Style::PathAddressed => {
@@ -201,7 +227,7 @@ impl Style {
 }
 
 /// One `RegisterType` call, as an SDK sends it.
-async fn register(
+pub(crate) async fn register(
     router: &MultiServiceRouter,
     type_kind: Option<&str>,
     type_name: &str,
@@ -230,7 +256,7 @@ fn with_handler_configuration() -> Vec<(String, String)> {
 }
 
 /// `RegisterType` for a case that expects it to SUCCEED: the registration token it answered.
-async fn register_ok(
+pub(crate) async fn register_ok(
     case: &str,
     router: &MultiServiceRouter,
     type_kind: Option<&str>,
@@ -249,16 +275,16 @@ async fn register_ok(
 }
 
 /// What one `DescribeTypeRegistration` read reports about a registration request.
-struct Monitored {
-    progress: String,
+pub(crate) struct Monitored {
+    pub(crate) progress: String,
     /// `Description`, "the description of the extension registration request".
-    description: Option<String>,
-    type_arn: Option<String>,
-    type_version_arn: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) type_arn: Option<String>,
+    pub(crate) type_version_arn: Option<String>,
 }
 
 /// One `DescribeTypeRegistration` read of a request the service issued a token for.
-async fn describe_registration(
+pub(crate) async fn describe_registration(
     case: &str,
     router: &MultiServiceRouter,
     token: &str,
@@ -287,7 +313,7 @@ async fn describe_registration(
 /// The conclusion is owed at an instant and nothing in the service sleeps for it, so this
 /// looks again rather than waiting out a duration: what the case is about is the status the
 /// clock has made due, never how fast this host runs.
-async fn concluded_registration(
+pub(crate) async fn concluded_registration(
     case: &str,
     router: &MultiServiceRouter,
     token: &str,
@@ -309,7 +335,7 @@ async fn concluded_registration(
 
 /// One `DescribeType` read of a registered extension, by kind and name, optionally at one
 /// version: the HTTP status and the XML body.
-async fn describe_type(
+pub(crate) async fn describe_type(
     router: &MultiServiceRouter,
     type_kind: &str,
     type_name: &str,

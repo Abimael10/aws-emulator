@@ -16,10 +16,10 @@
 //! `SetTypeDefaultVersion` moves it.
 //!
 //! What the version carries is read out of the SCHEMA HANDLER PACKAGE the request addresses
-//! in Amazon S3 ([`schema_in`]), which is the only place the extension's own schema exists:
-//! the package is a ZIP archive, the schema is the provider definition document in it that
-//! declares the extension being registered, and the provisioning behaviour is the one that
-//! document's handlers give the type
+//! in Amazon S3 ([`package_contents`]), which is the only place the extension's own schema
+//! exists: the package is a ZIP archive, the schema is the provider definition document in it
+//! that declares the extension being registered, and the provisioning behaviour is the one
+//! that document's handlers give the type
 //! ([`crate::state::resource_schema::declared_provisioning_type`]).
 //!
 //! RETRIEVING that package is part of ACCEPTING the registration: "the user registering the
@@ -31,7 +31,15 @@
 //! REGISTRATION's own business, since registering "includes validating the extension schema":
 //! an object that is not a ZIP archive and an archive carrying no schema of this extension
 //! each leave the registration with nothing to register, so the request is accepted and it
-//! concludes `FAILED` with the reason instead of registering a version.
+//! concludes `FAILED` with the reason instead of registering a version. So does a package that
+//! carries the schema and NOT the handler code the schema's handlers are invoked from: the
+//! member addresses "the extension project package that contains the necessary files for the
+//! extension you want to register", and registering also "includes determining which handlers,
+//! if any, have been specified for the extension" and "making the extension available for use
+//! in your account" — an extension whose handlers CloudFormation holds no code for is not
+//! available for use at all ([`carries_the_handler_artifact`]). A MODULE is the one kind with
+//! no handlers to hold code for: it is a package of template fragments CloudFormation splices
+//! into a template, so its package carries none and none is required of it.
 //!
 //! Registration is ASYNCHRONOUS: the request is answered with a registration token, and the
 //! request itself is a record of its own ([`crate::state::registry::StoredTypeRegistration`])
@@ -316,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the retrieved archive CARRIES decides whether the registration can register a
         // version — registering "includes validating the extension schema" — so whatever this
         // finds leaves the REQUEST accepted.
-        let schema = schema_in(&archive, &input.type_name).await;
+        let package = package_contents(&archive, &input.type_name).await;
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
@@ -348,7 +356,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it reports.
         let registration_token = registry::new_registration_token();
         let concluded_at = now + registry::REGISTRATION_SPAN;
-        let schema = match schema {
+        // What the package has to carry for the extension being registered: the schema that
+        // declares it, and — for a kind whose extensions are RUN by handlers — the handler code
+        // those handlers are invoked from.
+        let validated = match package {
+            Err(reason) => Err(reason),
+            Ok(package)
+                if handlers_are_required(&type_kind) && !package.carries_the_handler_artifact =>
+            {
+                Err(no_handler_artifact_for(&input.type_name))
+            }
+            Ok(package) => Ok(package.schema),
+        };
+        let schema = match validated {
             Ok(schema) => schema,
             Err(reason) => {
                 let mut registration = registry::StoredTypeRegistration::failing(
@@ -438,9 +458,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The provider definition schema an extension's handler package carries for `type_name`, or
-/// `Err(reason)` — the reason the REGISTRATION concludes failed — for an archive none can be
-/// read out of.
+/// What a registration reads out of one schema handler package: the provider definition
+/// schema of the extension being registered, and whether the package carries the HANDLER
+/// ARTIFACT beside it.
+#[derive(Debug)]
+struct PackageContents {
+    /// The archive's JSON document that declares the extension being registered.
+    schema: String,
+    /// Whether the archive carries the code the extension's handlers are invoked from:
+    /// [`carries_the_handler_artifact`].
+    carries_the_handler_artifact: bool,
+}
+
+/// Which kinds of extension are RUN by handlers, so a package of one has to carry the code
+/// those handlers are invoked from.
+///
+/// A resource type is provisioned by its handlers ("for resource type extensions, the
+/// provisioning behavior of the resource type", read from the handlers the schema declares)
+/// and a Hook is invoked on a stack operation, so both are code CloudFormation runs. A MODULE
+/// is not: "for modules, `company_or_organization::service::type::MODULE`"
+/// (`RegisterTypeInput$TypeName`) names a package of template fragments CloudFormation splices
+/// into a template, with no handlers at all — which is why a module's version carries no
+/// provisioning behaviour either.
+fn handlers_are_required(type_kind: &str) -> bool {
+    type_kind == registry::registry_type::RESOURCE || type_kind == registry::registry_type::HOOK
+}
+
+/// Whether one archive entry is the HANDLER ARTIFACT of an extension project package — the
+/// code CloudFormation invokes the extension's handlers from — rather than one of the
+/// documents the project DECLARES itself with.
+///
+/// A project package carries both: the provider definition schema and the other documents
+/// beside it (its project configuration, its JSON and YAML declarations, its documentation),
+/// and the built artifact the handlers run. Only the second makes the extension "available for
+/// use in your account", so it is what this looks for, and what it looks for it by is the one
+/// thing an archive entry states about itself without being decompressed: its name.
+///
+/// The suffixes below are the DOCUMENT ones, chosen rather than published: CloudFormation
+/// states no manifest of a package's entries, so this emulator reads "the necessary files for
+/// the extension you want to register" (`RegisterTypeInput$SchemaHandlerPackage`) as the
+/// artifact being whatever the package carries that is not one of its own declarations. A
+/// directory entry carries nothing at all, and an entry whose own name begins with a dot is
+/// project configuration (the CloudFormation CLI's `.rpdk-config` among them).
+fn carries_the_handler_artifact(name: &str) -> bool {
+    if name.ends_with('/') {
+        return false;
+    }
+    let entry = match name.rsplit_once('/') {
+        Some((_, entry)) => entry,
+        None => name,
+    };
+    if entry.is_empty() || entry.starts_with('.') {
+        return false;
+    }
+    let entry = entry.to_ascii_lowercase();
+    !DECLARATION_SUFFIXES
+        .iter()
+        .any(|suffix| entry.ends_with(suffix))
+}
+
+/// The suffixes of the entries an extension project package DECLARES itself with, which are
+/// therefore not the handler artifact ([`carries_the_handler_artifact`]).
+const DECLARATION_SUFFIXES: &[&str] = &[
+    JSON_SUFFIX, ".yaml", ".yml", ".md", ".txt", ".rst", ".cfg", ".ini", ".toml",
+];
+
+/// The provider definition schema an extension's handler package carries for `type_name` and
+/// what else that package carries, or `Err(reason)` — the reason the REGISTRATION concludes
+/// failed — for an archive no schema can be read out of.
 ///
 /// Every failure here is the registration's rather than the request's: an object that is not a
 /// ZIP archive and an archive carrying no provider definition schema of the extension being
@@ -465,11 +550,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// The schema is the archive's JSON document that DECLARES the extension being registered
 /// (`typeName`, the member the provider definition meta-schema fixes), so which file in the
-/// package holds it is the package's business rather than a name this emulator fixes.
-async fn schema_in(archive: &[u8], type_name: &str) -> Result<String, String> {
+/// package holds it is the package's business rather than a name this emulator fixes. The walk
+/// looks at every entry's NAME whatever it finds, since whether the package carries the
+/// handler artifact is a property of the archive as a whole rather than of one entry.
+async fn package_contents(archive: &[u8], type_name: &str) -> Result<PackageContents, String> {
     let mut archive = ::zip::ZipArchive::new(::std::io::Cursor::new(archive))
         .map_err(|why| not_a_zip_package(&why.to_string()))?;
     let mut budget = MAX_PACKAGE_READ_BYTES;
+    let mut schema: Option<String> = None;
+    let mut handler_artifact = false;
     for index in 0..archive.len().min(MAX_PACKAGE_ENTRIES) {
         ::tokio::task::yield_now().await;
         let Ok(mut entry) = archive.by_index(index) else {
@@ -480,6 +569,14 @@ async fn schema_in(archive: &[u8], type_name: &str) -> Result<String, String> {
         let Ok(name) = entry.name().map(|name| name.to_string()) else {
             continue;
         };
+        if carries_the_handler_artifact(&name) {
+            handler_artifact = true;
+        }
+        // Past the schema, nothing further is decompressed: the rest of the walk is over the
+        // entries' names.
+        if schema.is_some() {
+            continue;
+        }
         if name.ends_with('/') || !name.ends_with(JSON_SUFFIX) {
             continue;
         }
@@ -512,10 +609,16 @@ async fn schema_in(archive: &[u8], type_name: &str) -> Result<String, String> {
         if crate::state::resource_schema::declared_type_name(&document).as_deref()
             == Some(type_name)
         {
-            return Ok(document);
+            schema = Some(document);
         }
     }
-    Err(no_schema_for(type_name))
+    match schema {
+        Some(schema) => Ok(PackageContents {
+            schema,
+            carries_the_handler_artifact: handler_artifact,
+        }),
+        None => Err(no_schema_for(type_name)),
+    }
 }
 
 /// The suffix the JSON documents of a handler package carry, which is where its schema is.
@@ -598,6 +701,22 @@ fn no_schema_for(type_name: &str) -> String {
     format!(
         "The schema handler package contains no schema defining {type_name}, so the extension \
          schema could not be validated"
+    )
+}
+
+/// The reason a registration whose package carries the schema and no handler code CONCLUDES as
+/// failed: the package addressed is "the extension project package that contains the necessary
+/// files for the extension you want to register", registering "includes determining which
+/// handlers, if any, have been specified for the extension" and "making the extension
+/// available for use in your account", and an extension CloudFormation holds no handler code
+/// for cannot be invoked at all.
+///
+/// The artifact the package did not carry is what the sentence names, and the extension being
+/// registered is the only variable part of it.
+fn no_handler_artifact_for(type_name: &str) -> String {
+    format!(
+        "The handler artifact is missing from the schema handler package for {type_name}, so \
+         the extension handlers could not be registered"
     )
 }
 

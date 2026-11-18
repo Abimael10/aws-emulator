@@ -4,6 +4,13 @@
 //! The account-level CONFIGURATION of one activated extension: the configuration data this
 //! account and Region holds for it, and the ARN of that data.
 //!
+//! The extension is resolved first — a kind and name, or an ARN, no record of this Region's
+//! registry answers to is the modelled `TypeNotFoundException` (404) — and the CATEGORY of the
+//! record that resolves decides whether it can hold a configuration at all: a MODULE is a
+//! package of template fragments, with no handlers to hand configuration data to and so no
+//! configuration document to validate one against, and a configuration of one is refused with
+//! the registry's own modelled `CFNRegistryException` (400) before anything is written.
+//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`SetTypeConfiguration::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -199,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The extension the configuration belongs to, in the Region the request was served
         // in: "specifies the configuration data for… an extension… in the given account and
         // Region", so an extension of another Region's registry names nothing here.
-        let arn = store
+        let resolved = store
             .extensions_in(&region)
             .find(|extension| match identifier {
                 Identifier::TypeArn(type_arn) => extension.arn == type_arn,
@@ -208,8 +215,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     type_name,
                 } => extension.type_kind == type_kind && extension.type_name == type_name,
             })
-            .map(|extension| extension.arn.clone())
-            .ok_or_else(|| type_not_found(identifier.named()))?;
+            .map(|extension| (extension.arn.clone(), extension.type_kind.clone()));
+        let Some((arn, type_kind)) = resolved else {
+            return Err(type_not_found(identifier.named()));
+        };
+
+        // The CATEGORY the resolved extension is of decides whether it has a configuration
+        // surface at all, and a MODULE has none: a module is "a package of template
+        // fragments" CloudFormation splices into a template
+        // ([`registry::PUBLIC_EXTENSION_CATALOG`]), with no handlers to hand configuration
+        // data to and so no configuration document to validate one against — which is why
+        // `DescribeType` reports no `ConfigurationSchema` for one. The refusal is the registry's
+        // own modelled 400, answered BEFORE anything is written, since a configuration stored
+        // against a module would be one nothing could ever apply.
+        if type_kind == registry::registry_type::MODULE {
+            return Err(registry_exception(configuration_not_supported(&type_kind)));
+        }
 
         let Some(extension) = store.extension_by_arn_mut(&region, &arn) else {
             // Unreachable: the record was resolved just above, under the same lock. Answered
@@ -295,6 +316,13 @@ fn registry_exception(message: String) -> SetTypeConfigurationError {
         message: Some(message),
     })
     .into()
+}
+
+/// The message answered a request to configure an extension of a category that holds no
+/// account-level configuration, which is the MODULE: fixed text naming the category refused,
+/// and nothing of the request or of the store beside it.
+fn configuration_not_supported(type_kind: &str) -> String {
+    format!("TypeConfiguration is not supported for {type_kind} types")
 }
 
 /// The modelled 404: "The specified extension doesn't exist in the CloudFormation
