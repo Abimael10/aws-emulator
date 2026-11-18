@@ -30,13 +30,26 @@
 //! ReplicationDestination,TableRecordExpirationSettings,
 //! StorageClass,VersionToken,IAMRole")`).
 //!
+//! One half of the enumerated-set requirement is an ORDER rather than a
+//! sentence: the bracketed list states the values the type admits SORTED,
+//! whatever order the model declares them in, and the order belongs to the
+//! enumerated TYPE rather than to the member, the operation, the depth or the
+//! request that carried the value. The rows for it span two of this model's types
+//! (each declared in an order that is NOT its sorted one), the three operations
+//! that carry one of them in the same nested structure, a query member for the
+//! other, a resource the call addresses and one nothing created, and the
+//! spellings a refused value arrives in; a test of its own reads the set off the
+//! service's own message and holds it to the sorted order of the model's
+//! declaration rather than to a literal.
+//!
 //! The accepted rows keep the refusals honest: the value AT each published bound
 //! is served, so what is refused is the values outside the bound and not the
-//! whole member.
+//! whole member — and for the enumerated type, the values it DOES admit are put
+//! and read back, while a refused one leaves what a later read reports as it was.
 
 use serde_json::{json, Value};
 
-use crate::harness::{expected_bucket_arn, query_string, Emulator};
+use crate::harness::{encode, expected_bucket_arn, query_string, Emulator};
 use crate::table_record_expiration::{create_table, mark_managed};
 
 /// The region every case works in.
@@ -57,6 +70,46 @@ const IAM_ROLE_PATTERN: &str = "arn:.+:iam::[0-9]{12}:role/.+";
 /// An IAM role ARN of the form `IAMRole` accepts, for the rows that refuse
 /// something else.
 const ROLE: &str = "arn:aws:iam::000000000000:role/s3tables-replication";
+
+/// The bracketed set a clause about a `StorageClass` member lists: the values
+/// that type admits, SORTED. The model declares them `STANDARD`,
+/// `INTELLIGENT_TIERING` (`smithy_query(query="shape", shape="StorageClass")`),
+/// so the order below is the one this service states the set in and not the
+/// declaration's.
+const STORAGE_CLASS_SET: &str = "[INTELLIGENT_TIERING, STANDARD]";
+
+/// The same for `TableBucketType` — the second type this model declares in an
+/// order of its own (`customer`, `aws`, by
+/// `smithy_query(query="shape", shape="TableBucketType")`), and the one carried
+/// by a QUERY member rather than inside a body.
+const TABLE_BUCKET_TYPE_SET: &str = "[aws, customer]";
+
+/// `StorageClass`'s values in the order the MODEL declares them, for the test
+/// that holds a stated set to the sorted order of the declaration rather than to
+/// a literal.
+const STORAGE_CLASS_DECLARED: [&str; 2] = ["STANDARD", "INTELLIGENT_TIERING"];
+
+/// `TableBucketType`'s values, the same way.
+const TABLE_BUCKET_TYPE_DECLARED: [&str; 2] = ["customer", "aws"];
+
+/// The requirement an enum constraint states over `value_set`.
+fn enum_requirement(value_set: &str) -> String {
+    format!("Member must satisfy enum value set: {value_set}")
+}
+
+/// The spellings of a value outside `StorageClass` a caller can send: a name no
+/// storage class carries, an admitted value in the wrong case, a name of another
+/// service's storage tier, and the empty string.
+const REFUSED_STORAGE_CLASSES: [&str; 5] = [
+    "ULTRA_FAST_TIER",
+    "NOT_A_REAL_STORAGE_CLASS",
+    "standard",
+    "GLACIER",
+    "",
+];
+
+/// The spellings of a value outside `TableBucketType` a caller can send.
+const REFUSED_BUCKET_TYPES: [&str; 3] = ["ULTRA", "AWS", "Customer"];
 
 /// One refused request: how it is addressed, which member path the refusal must
 /// name, the requirement it must state, and the values the request carried that
@@ -195,12 +248,16 @@ fn cases(bucket: &str, table_arn: &str) -> Vec<Case> {
         });
     }
 
-    // An enumerated set on a member of a create's own nested structure: the
-    // storage class a table bucket's tables are stored in (`STANDARD`,
-    // `INTELLIGENT_TIERING`).
-    for class in ["ULTRA", "standard", "GLACIER"] {
+    // An enumerated set, on the one member of this model three operations carry
+    // the same nested structure for: the storage class a table bucket's tables
+    // are stored in. The constraint belongs to the MEMBER, so the clause does not
+    // move with the operation — a create that names the class, a create of a
+    // table in that bucket, and the put that sets the bucket's default all state
+    // the same member path and the same set, in the order this service states it
+    // in ([`STORAGE_CLASS_SET`]).
+    for class in REFUSED_STORAGE_CLASSES {
         cases.push(Case {
-            label: format!("a storage class spelled {class:?}"),
+            label: format!("a bucket create naming the storage class {class:?}"),
             method: "PUT",
             path: "/buckets".to_string(),
             body: Some(json!({
@@ -208,9 +265,68 @@ fn cases(bucket: &str, table_arn: &str) -> Vec<Case> {
                 "storageClassConfiguration": { "storageClass": class },
             })),
             member_path: "storageClassConfiguration.storageClass",
-            requirement: "Member must satisfy enum value set: [STANDARD, INTELLIGENT_TIERING]"
-                .to_string(),
+            requirement: enum_requirement(STORAGE_CLASS_SET),
             sent: vec![class.to_string()],
+        });
+        cases.push(Case {
+            label: format!("a put of the storage class {class:?}"),
+            method: "PUT",
+            path: format!("/buckets/{}/storage-class", encode(bucket)),
+            body: Some(json!({
+                "storageClassConfiguration": { "storageClass": class },
+            })),
+            member_path: "storageClassConfiguration.storageClass",
+            requirement: enum_requirement(STORAGE_CLASS_SET),
+            sent: vec![class.to_string()],
+        });
+        cases.push(Case {
+            label: format!("a table create naming the storage class {class:?}"),
+            method: "PUT",
+            path: format!("/tables/{}/resident", encode(bucket)),
+            body: Some(json!({
+                "name": "paramvalidation",
+                "format": "ICEBERG",
+                "storageClassConfiguration": { "storageClass": class },
+            })),
+            member_path: "storageClassConfiguration.storageClass",
+            requirement: enum_requirement(STORAGE_CLASS_SET),
+            sent: vec![class.to_string()],
+        });
+    }
+
+    // The same put addressed to a bucket the store does not hold: the value is
+    // refused for its shape before anything is looked up, so the clause is the
+    // one above rather than the modelled not-found.
+    cases.push(Case {
+        label: "a put of a storage class on a bucket nothing created".to_string(),
+        method: "PUT",
+        path: format!(
+            "/buckets/{}/storage-class",
+            encode(&expected_bucket_arn(REGION, "parameter-validation-absent"))
+        ),
+        body: Some(json!({
+            "storageClassConfiguration": { "storageClass": "ULTRA_FAST_TIER" },
+        })),
+        member_path: "storageClassConfiguration.storageClass",
+        requirement: enum_requirement(STORAGE_CLASS_SET),
+        sent: vec!["ULTRA_FAST_TIER".to_string()],
+    });
+
+    // A SECOND enumerated type, carried as a query member of a list rather than
+    // inside a body, and declared in an order of its own as well: the type a
+    // listing filters table buckets by.
+    for bucket_type in REFUSED_BUCKET_TYPES {
+        cases.push(Case {
+            label: format!("a listing filtered by the bucket type {bucket_type:?}"),
+            method: "GET",
+            path: format!(
+                "/buckets{}",
+                query_string(&[("type", bucket_type.to_string())])
+            ),
+            body: None,
+            member_path: "type",
+            requirement: enum_requirement(TABLE_BUCKET_TYPE_SET),
+            sent: vec![bucket_type.to_string()],
         });
     }
 
@@ -441,4 +557,150 @@ async fn a_value_at_every_published_bound_is_served() {
         served.text("versionToken"),
         "the read must report the configuration the put stored"
     );
+}
+
+/// The bracketed value set a requirement states, or `None` for a message
+/// stating none.
+fn stated_set(message: &str) -> Option<String> {
+    let (_, set) = message.split_once("enum value set: ")?;
+    Some(set.trim().to_string())
+}
+
+/// The values a bracketed set lists, in the order it lists them.
+fn listed_values(value_set: &str) -> Vec<String> {
+    value_set
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(", ")
+        .map(str::to_string)
+        .collect()
+}
+
+/// `declared` sorted — the order a refusal must state an enumerated type's
+/// values in, derived from the model's declaration rather than restated.
+fn sorted(declared: &[&str]) -> Vec<String> {
+    let mut values: Vec<String> = declared.iter().map(|value| (*value).to_string()).collect();
+    values.sort_unstable();
+    values
+}
+
+#[tokio::test]
+async fn an_enumerated_types_value_set_is_stated_sorted_whatever_carried_it() {
+    let emulator = Emulator::new();
+    let (bucket, table_arn) = fixture(&emulator).await;
+
+    // The set each refusal states is read off the SERVICE's own message and then
+    // held to the sorted order of the values the model declares — so what is
+    // pinned is the order and the completeness of the set rather than one
+    // literal. Every row carrying one type states the SAME set, however the value
+    // was spelled and whichever operation, member depth or addressed resource
+    // carried it.
+    for case in cases(&bucket, &table_arn) {
+        let Some(expected_set) = [
+            (STORAGE_CLASS_SET, &STORAGE_CLASS_DECLARED),
+            (TABLE_BUCKET_TYPE_SET, &TABLE_BUCKET_TYPE_DECLARED),
+        ]
+        .into_iter()
+        .find(|(set, _)| case.requirement.ends_with(set))
+        .map(|(_, declared)| sorted(declared)) else {
+            // A row about another constraint class: the orders below are only
+            // about an enumerated type's value set.
+            continue;
+        };
+
+        let refused = emulator
+            .call(case.method, &case.path, REGION, case.body.as_ref())
+            .await;
+        let message = refused.message();
+        let stated = stated_set(&message).unwrap_or_else(|| {
+            panic!(
+                "case {label:?}: the message states no enum value set, got {message:?}",
+                label = case.label
+            )
+        });
+        let listed = listed_values(&stated);
+        assert_eq!(
+            listed, expected_set,
+            "case {label:?}: the clause must list every declared value sorted \
+             ({expected_set:?}), got {listed:?}",
+            label = case.label
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_class_changes_nothing_and_every_admitted_class_is_served() {
+    let emulator = Emulator::new();
+    let (bucket, _) = fixture(&emulator).await;
+
+    /// The storage class `GetTableBucketStorageClass` reports for `arn`.
+    async fn reported(emulator: &Emulator, arn: &str, case: &str) -> String {
+        let read = emulator.get_table_bucket_storage_class(REGION, arn).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: GetTableBucketStorageClass must succeed, got {status} {body}",
+            status = read.status,
+            body = read.body
+        );
+        read.body
+            .get("storageClassConfiguration")
+            .and_then(|configuration| configuration.get("storageClass"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the read must carry \
+                     storageClassConfiguration.storageClass, got {body}",
+                    body = read.body
+                )
+            })
+            .to_string()
+    }
+
+    // A refused put has no effect: the class the bucket reports after it is the
+    // one it reported before.
+    for class in REFUSED_STORAGE_CLASSES {
+        let before = reported(&emulator, &bucket, class).await;
+        let refused = emulator
+            .put_table_bucket_storage_class(
+                REGION,
+                &bucket,
+                &json!({ "storageClass": class }),
+            )
+            .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {class:?}: expected status 400, got {status} {body}",
+            status = refused.status,
+            body = refused.body
+        );
+        let after = reported(&emulator, &bucket, class).await;
+        assert_eq!(
+            after, before,
+            "case {class:?}: a refused put must leave the reported class at {before:?}, got \
+             {after:?}"
+        );
+    }
+
+    // And every value the type DOES admit is served and read back, so what the
+    // rows above refuse is the values outside the type and not the member.
+    for class in STORAGE_CLASS_DECLARED {
+        let put = emulator
+            .put_table_bucket_storage_class(
+                REGION,
+                &bucket,
+                &json!({ "storageClass": class }),
+            )
+            .await;
+        assert_eq!(
+            put.status, 200,
+            "case {class:?}: PutTableBucketStorageClass must succeed, got {status} {body}",
+            status = put.status,
+            body = put.body
+        );
+        let read = reported(&emulator, &bucket, class).await;
+        assert_eq!(
+            read, class,
+            "case {class:?}: the read must report the class the put named, got {read:?}"
+        );
+    }
 }
