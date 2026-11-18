@@ -17,7 +17,7 @@
 //! * the status reported is the one the query has already reached on the clock, and only a
 //!   query that has started has results;
 //! * every aggregate the `stats` command documents is computed over the group's own values,
-//!   and a group of records carrying NO value for the grouping field reports no value for it;
+//!   and a record carrying NO value for the grouping field joins no group at all;
 //! * `maxItems` pages the results and the `nextToken` of one query's results continues that
 //!   query's enumeration and no other;
 //! * a `queryId` this account holds no query under is refused as an incorrectly specified
@@ -859,6 +859,33 @@ async fn a_query_string_the_service_cannot_run_reports_the_failed_status() {
             format!("filter {}", "(".repeat(9_000)),
         ),
         (
+            // Every key a `sort` names is computed for every record and held in the key table
+            // it orders by, so the list's length is bounded the way an aggregation's list of
+            // aggregates is.
+            "a sort command naming more keys than the service orders by",
+            "CWLI",
+            format!(
+                "fields @message | sort {}",
+                (0..200)
+                    .map(|index| format!("k{index}"))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ),
+        ),
+        (
+            // Every grouping key a `stats` names is computed for every record and held in
+            // every group's own key, so that list is bounded the way its aggregates are.
+            "a stats command grouping by more keys than the service groups by",
+            "CWLI",
+            format!(
+                "stats count(*) as n by {}",
+                (0..200)
+                    .map(|index| format!("k{index}"))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ),
+        ),
+        (
             "a stats command naming no aggregate",
             "CWLI",
             "stats by level".to_string(),
@@ -1227,7 +1254,7 @@ const AGGREGATE_GROUP: &str = "/insights/results-aggregates";
 
 /// The events those cases aggregate, as `(offset from the base instant, message)` pairs:
 /// three events of one service, two of another, and one that names NO service — which is what
-/// makes the group of records carrying no value for the grouping key a case of its own.
+/// makes a record the grouping key is unset on a case of its own: it joins no group.
 const AGGREGATE_EVENTS: [(i64, &str); 6] = [
     (1_000, r#"{"svc":"api","ms":10,"user":"u1"}"#),
     (2_000, r#"{"svc":"api","ms":20,"user":"u2"}"#),
@@ -1293,9 +1320,9 @@ async fn every_documented_stats_aggregate_is_computed_over_the_group() {
     .await;
     let produced = rows(&answer);
 
-    // One row per group, the group carrying no `svc` last: a sort places a value the record
-    // does not carry after every value it does.
-    let expected: [(&str, Vec<(&str, &str)>); 3] = [
+    // One row per group, and the event naming no service forms none: a record carrying no
+    // value for the grouping key joins no group of the aggregation.
+    let expected: [(&str, Vec<(&str, &str)>); 2] = [
         (
             "the three events of api",
             vec![
@@ -1322,18 +1349,6 @@ async fn every_documented_stats_aggregate_is_computed_over_the_group() {
                 ("p50", "100"),
             ],
         ),
-        (
-            "the event naming no service",
-            vec![
-                ("n", "1"),
-                ("total", "5"),
-                ("mean", "5"),
-                ("fastest", "5"),
-                ("slowest", "5"),
-                ("users", "1"),
-                ("p50", "5"),
-            ],
-        ),
     ];
     assert_eq!(
         produced.len(),
@@ -1353,11 +1368,12 @@ async fn every_documented_stats_aggregate_is_computed_over_the_group() {
     }
 }
 
-/// RULE: a group of records that carry NO value for the grouping field reports no value for
-/// it — the key member is absent from that row — so "the field is missing" is told apart from
-/// "the field is present and empty".
+/// RULE: an aggregation groups only the records its grouping key is DEFINED on — a record
+/// carrying no value for the key joins no group and contributes to no aggregate — while a
+/// record whose key is present and EMPTY text keeps a group of its own, so "the field is
+/// missing" is told apart from "the field is present and empty".
 #[tokio::test]
-async fn a_group_with_no_value_for_the_key_omits_the_key_from_its_row() {
+async fn a_record_with_no_value_for_the_grouping_key_joins_no_group() {
     let logs = Logs::new();
     const GROUP_KEYS: &str = "/insights/results-group-keys";
     // One event carrying a value, one carrying EMPTY text under the same field, and one
@@ -1383,27 +1399,28 @@ async fn a_group_with_no_value_for_the_key_omits_the_key_from_its_row() {
     let produced = rows(&answer);
     assert_eq!(
         produced.len(),
-        3,
-        "case {case:?}: the three events form three groups — a value, empty text and no value \
-         at all, got {produced:?}"
+        2,
+        "case {case:?}: the event carrying no svc forms no group, so only the value and the \
+         empty text do, got {produced:?}"
     );
 
-    // The group of the records with no value for the key: exactly one row carries no `svc`
-    // member, and it is the one the keyless event formed.
+    // No row stands for the records the key is unset on: neither one missing the `svc` member
+    // nor one whose aggregates cover the event that carries no `svc`.
     let keyless: Vec<&BTreeMap<String, String>> = produced
         .iter()
         .filter(|row| !row.contains_key("svc"))
         .collect();
-    assert_eq!(
-        keyless.len(),
-        1,
-        "case {case:?}: one group holds the records with no value for the key, got {produced:?}"
+    assert!(
+        keyless.is_empty(),
+        "case {case:?}: no group holds the records with no value for the key, got {produced:?}"
     );
+    let summed: f64 = produced
+        .iter()
+        .map(|row| value(row, "total").parse::<f64>().unwrap_or(0.0))
+        .sum();
     assert_eq!(
-        (value(keyless[0], "n"), value(keyless[0], "total")),
-        ("1".to_string(), "3".to_string()),
-        "case {case:?}: that group holds the one event carrying no svc, got {:?}",
-        keyless[0]
+        summed, 3.0,
+        "case {case:?}: only the two grouped events are aggregated (1 + 2), got {produced:?}"
     );
 
     // The record carrying EMPTY text under the field is a group of its own, keyed by that
@@ -1504,13 +1521,9 @@ async fn the_spread_of_a_groups_values_is_computed_over_the_group() {
     let produced = rows(&answer);
 
     // Hand-computed from [`AGGREGATE_EVENTS`]: api holds 10, 20 and 30 around a mean of 20,
-    // db holds 100 and 300 around a mean of 200, and the keyless group holds one value, which
-    // is no distance from its own mean.
-    let expected: [(&str, f64); 3] = [
-        ("api", (200.0f64 / 3.0).sqrt()),
-        ("db", 100.0),
-        ("the group naming no service", 0.0),
-    ];
+    // and db holds 100 and 300 around a mean of 200. The event naming no service forms no
+    // group, so there is no third spread to report.
+    let expected: [(&str, f64); 2] = [("api", (200.0f64 / 3.0).sqrt()), ("db", 100.0)];
     assert_eq!(
         produced.len(),
         expected.len(),

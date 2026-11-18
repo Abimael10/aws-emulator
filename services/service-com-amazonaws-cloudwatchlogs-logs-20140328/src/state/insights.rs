@@ -32,9 +32,10 @@
 //!
 //! The query string is `@length(0..10000)` (`QueryString`), and the records one run reads
 //! are capped at [`MAX_SCANNED_EVENTS`] events and [`MAX_SCANNED_BYTES`] message bytes, the
-//! newest of the window first. Every stage then works over that bounded set, and the rows a
-//! run answers are capped at [`MAX_RESULT_ROWS`] — the most "log event results from a query"
-//! the API hands back.
+//! newest of the window first — and at [`MAX_MATERIALISED_BYTES`] of the fields those
+//! messages expand into, since what one message names as fields is a factor of its own.
+//! Every stage then works over that bounded set, and the rows a run answers are capped at
+//! [`MAX_RESULT_ROWS`] — the most "log event results from a query" the API hands back.
 //!
 //! Those bound each FACTOR; the [`Budget`] bounds their product. One run may spend only so
 //! many expression evaluations ([`MAX_EXECUTION_STEPS`]), so many computed bytes
@@ -219,15 +220,30 @@ impl Budget {
         self.spend(1)
     }
 
-    /// Spend one unit of the run's step budget, reading the clock once per batch.
+    /// Spend `units` of such work AT ONCE: the cost of a bounded operation a run performs as a
+    /// whole rather than one step at a time — the comparisons ordering a stage's records takes,
+    /// the rows of a table it indexes. `false` once the run is over budget, which is what stops
+    /// the operation before it is started rather than part way through it.
+    pub fn charge(&self, units: u64) -> bool {
+        self.spend(units.max(1))
+    }
+
+    /// Spend `units` of the run's step budget, reading the clock once per batch.
     fn spend(&self, units: u64) -> bool {
         if self.exhausted() {
             return false;
         }
-        let left = self
+        // Saturating, so a batch larger than what is left spends what is left rather than
+        // wrapping the counter round.
+        let previous = self
             .steps
-            .fetch_sub(units, std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(units);
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |left| Some(left.saturating_sub(units)),
+            )
+            .unwrap_or(0);
+        let left = previous.saturating_sub(units);
         if left == 0 {
             self.abandon(format!(
                 "the query asked for more than {MAX_EXECUTION_STEPS} units of work"
@@ -235,8 +251,11 @@ impl Budget {
             return false;
         }
         // The clock is read once per batch of steps, so the deadline bounds a run whose
-        // steps are individually cheap but numerous.
-        if left.is_multiple_of(STEPS_BETWEEN_CLOCK_READS)
+        // steps are individually cheap but numerous. A batch spent at once
+        // ([`Budget::charge`]) CROSSES a batch boundary rather than landing on one, so what is
+        // looked for is the crossing — otherwise a run that charges in batches could step over
+        // every boundary and never have its deadline read at all.
+        if previous / STEPS_BETWEEN_CLOCK_READS != left / STEPS_BETWEEN_CLOCK_READS
             && std::time::Instant::now() >= self.deadline
         {
             self.abandon(format!(
@@ -311,10 +330,27 @@ impl Budget {
 /// ones included: one JSON message can name arbitrarily many keys.
 const MAX_FIELDS_PER_EVENT: usize = 200;
 
-/// THE EMULATOR'S OWN CEILING on how deep the flattening of a JSON message descends, so a
-/// discovered field's name length is bounded here rather than by whatever nesting the parser
-/// admits.
+/// THE EMULATOR'S OWN CEILING on how deep the flattening of a JSON message descends, so one
+/// message cannot name a field whose nesting the parser admits and this store would walk
+/// recursively per record.
 const MAX_FIELD_DEPTH: usize = 8;
+
+/// THE EMULATOR'S OWN CEILING on how long a discovered field's NAME may be. A nested key is
+/// reached under the names of every key above it, so without this one message could name
+/// [`MAX_FIELDS_PER_EVENT`] fields each carrying a prefix as long as the message itself. A
+/// field whose name would be longer than this is not discovered, and neither is anything under
+/// it: a name further down only grows.
+const MAX_FIELD_NAME_BYTES: usize = 512;
+
+/// THE EMULATOR'S OWN CEILING on the bytes ONE scan MATERIALISES as records — every field's
+/// name and value, the generated fields included.
+///
+/// The events a scan reads ([`MAX_SCANNED_EVENTS`]) and the message bytes it reads
+/// ([`MAX_SCANNED_BYTES`]) bound its INPUT; what one message expands into as fields is a
+/// factor of its own, so the product is bounded here, the way the bytes a run COMPUTES are
+/// ([`MAX_COMPUTED_BYTES`]). The cut falls on the oldest events of the window, as the other
+/// two do.
+const MAX_MATERIALISED_BYTES: usize = 16 * 1024 * 1024;
 
 /// One record of a query's pipeline: the fields it carries, each under its own name.
 ///
@@ -337,6 +373,18 @@ impl Record {
     /// Set `field` to `value`, replacing whatever this record carried under that name.
     pub fn set(&mut self, field: &str, value: impl Into<String>) {
         self.values.insert(field.to_string(), value.into());
+    }
+
+    /// How many bytes this record's fields hold, names and values alike: what MATERIALISING it
+    /// costs the scan that read it ([`MAX_MATERIALISED_BYTES`]).
+    pub fn byte_size(&self) -> usize {
+        self.values
+            .iter()
+            .fold(0usize, |total, (field, value)| {
+                total
+                    .saturating_add(field.len())
+                    .saturating_add(value.len())
+            })
     }
 }
 
@@ -673,20 +721,28 @@ pub fn scan(store: &State, groups: &[String], query: &QueryRecord, budget: &Budg
         ..Scan::default()
     };
     // Ascending in the reversed order is descending in the candidates' own: the newest first.
+    let mut materialised = 0usize;
     for std::cmp::Reverse(candidate) in selected.into_sorted_vec() {
-        if scan.scanned >= MAX_SCANNED_EVENTS || scan.bytes >= MAX_SCANNED_BYTES {
+        if scan.scanned >= MAX_SCANNED_EVENTS
+            || scan.bytes >= MAX_SCANNED_BYTES
+            // What the messages read EXPAND into as fields is bounded as well as the messages
+            // themselves ([`MAX_MATERIALISED_BYTES`]).
+            || materialised >= MAX_MATERIALISED_BYTES
+        {
             break;
         }
         scan.scanned = scan.scanned.saturating_add(1);
         scan.bytes = scan.bytes.saturating_add(candidate.event.message.len());
-        scan.records.push(record_of(
+        let record = record_of(
             candidate.group,
             candidate.stream,
             candidate.event,
             candidate.timestamp,
             candidate.seq,
             account,
-        ));
+        );
+        materialised = materialised.saturating_add(record.byte_size());
+        scan.records.push(record);
     }
     scan
 }
@@ -731,8 +787,11 @@ fn record_of(
 /// reached by: a nested object contributes `parent.child`, a list contributes `parent.0`, and
 /// a scalar contributes its own path. A container contributes no value of its own, so an
 /// empty object or list adds nothing.
+///
+/// A path longer than a field name may be ([`MAX_FIELD_NAME_BYTES`]) names no field, and the
+/// members under it name none either — their own names are longer still.
 fn flatten_json(path: &str, value: &::serde_json::Value, depth: usize, into: &mut Record) {
-    if into.values.len() >= MAX_FIELDS_PER_EVENT {
+    if into.values.len() >= MAX_FIELDS_PER_EVENT || path.len() > MAX_FIELD_NAME_BYTES {
         return;
     }
     match value {

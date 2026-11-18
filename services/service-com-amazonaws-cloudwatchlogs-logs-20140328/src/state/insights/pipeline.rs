@@ -21,8 +21,9 @@
 //!   joins — is reported as a column of the result ([`declare_fields`]), so a pipeline that
 //!   creates fields and projects nothing further answers the fields it created and not the
 //!   default columns it never asked for;
-//! * `stats` aggregates the records into one row per group, and `pattern` groups them by the
-//!   shape of their messages;
+//! * `stats` aggregates the records into one row per group — only the records every grouping
+//!   key is DEFINED on, so one carrying no value for a key joins no group — and `pattern`
+//!   groups them by the shape of their messages;
 //! * `sort`, `limit`/`head` and `dedup` order, bound and deduplicate what is left;
 //! * `lookup` joins the rows of one of this account's lookup tables onto each record;
 //! * `unmask` reveals nothing further here, because this store holds every event's raw
@@ -344,7 +345,7 @@ fn apply(
         "filter" | "where" => filter(rows, arguments, budget),
         "parse" => parse_stage(rows, arguments, budget),
         "eval" => eval(rows, arguments, budget),
-        "rename" => rename(rows, arguments),
+        "rename" => rename(rows, arguments, budget),
         "stats" => stats(rows, arguments, budget),
         "pattern" | "patterns" => pattern(rows, arguments, budget),
         "sort" => sort(rows, arguments, dialect, budget),
@@ -444,6 +445,11 @@ fn fields(
             // An expression defines the field its `as` clause names, computed per record.
             (Ok(expression), Some(alias)) => {
                 for record in &mut rows.records {
+                    // Computing one record's value is work the run pays for, so a projection
+                    // stops where the budget does.
+                    if !budget.tick() {
+                        break;
+                    }
                     let value = expression::evaluate(&expression, record, budget);
                     if !matches!(value, Value::Null) {
                         store(record, &alias, value.rendered(), budget);
@@ -455,6 +461,9 @@ fn fields(
             // text that computes it, which is how a result reports one.
             (Ok(expression), None) => {
                 for record in &mut rows.records {
+                    if !budget.tick() {
+                        break;
+                    }
                     let value = expression::evaluate(&expression, record, budget);
                     if !matches!(value, Value::Null) {
                         store(record, &text, value.rendered(), budget);
@@ -471,6 +480,11 @@ fn fields(
     if dropping {
         // `fields - a, b` drops the named fields and leaves the rest.
         for record in &mut rows.records {
+            // Dropping one record's fields is work the run pays for, as every other
+            // per-record walk of a stage is.
+            if !budget.charge(u64::try_from(columns.len()).unwrap_or(u64::MAX)) {
+                break;
+            }
             for column in &columns {
                 record.values.remove(column);
             }
@@ -594,6 +608,11 @@ fn eval(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Executi
         let name = super::trim_identifier(name).to_string();
         let expression = expression::parse(text).map_err(ExecutionFailure::new)?;
         for record in &mut rows.records {
+            // Computing one record's value is work the run pays for, so the definition stops
+            // where the budget does.
+            if !budget.tick() {
+                break;
+            }
             let value = expression::evaluate(&expression, record, budget);
             store(record, &name, value.rendered(), budget);
         }
@@ -603,7 +622,7 @@ fn eval(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Executi
 }
 
 /// `rename`: carry a field's value under a new name, as PPL writes it (`rename a as b`).
-fn rename(rows: &mut Rows, arguments: &str) -> Result<(), ExecutionFailure> {
+fn rename(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), ExecutionFailure> {
     for item in split_items(arguments) {
         let (from, Some(to)) = split_alias(&item) else {
             return Err(ExecutionFailure::new(
@@ -612,6 +631,11 @@ fn rename(rows: &mut Rows, arguments: &str) -> Result<(), ExecutionFailure> {
         };
         let from = super::trim_identifier(&from).to_string();
         for record in &mut rows.records {
+            // Carrying one record's value over is work the run pays for, as every other
+            // per-record stage's is.
+            if !budget.tick() {
+                break;
+            }
             if let Some(value) = record.values.remove(&from) {
                 record.set(&to, value);
             }
@@ -632,6 +656,11 @@ fn rename(rows: &mut Rows, arguments: &str) -> Result<(), ExecutionFailure> {
 /// The aggregates come first and the grouping follows a `by` clause (`stats count(*) as
 /// total by level, bin(5m)`). The result's columns are the grouped fields and then the
 /// aggregates, each named by its `as` clause or by the text that computes it.
+///
+/// The aggregation is over the records the grouping keys are DEFINED on: a record carrying no
+/// value for one of them — a field it does not hold, a `parse` capture whose pattern did not
+/// match it, an expression that computes nothing on it — joins no group, so it contributes to
+/// no aggregate and forms no group of its own.
 fn stats(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), ExecutionFailure> {
     let (aggregate_text, group_text) = split_on_keyword(arguments, BY);
     let mut aggregates: Vec<(String, Aggregate)> = Vec::new();
@@ -666,24 +695,41 @@ fn stats(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Execut
         let name = alias.unwrap_or_else(|| reported_name(&expression, &text));
         groupings.push((name, Grouping::read(&expression)?));
     }
+    // Every grouping key is computed for every record and held in the key one group is kept
+    // under, so this list's length is a factor of the work and the caller writes it — the same
+    // reason the aggregates, a sort's keys and a lookup's columns are bounded.
+    if groupings.len() > MAX_GROUPING_KEYS {
+        return Err(ExecutionFailure::new(format!(
+            "a stats command groups by at most {MAX_GROUPING_KEYS} keys"
+        )));
+    }
 
     // One accumulator per aggregate per group, FOLDED record by record: an aggregate keeps a
     // fixed amount of state, so a group costs the same whatever it holds, and the groups
     // themselves are bounded ([`MAX_GROUPS`]). Kept in the order of the group's key values,
     // so one store answers one query the same way every time.
-    let mut groups: BTreeMap<Vec<Option<String>>, Vec<expression::Accumulator>> = BTreeMap::new();
+    let mut groups: BTreeMap<Vec<String>, Vec<expression::Accumulator>> = BTreeMap::new();
+    // One record costs the record itself plus the key each grouping computes on it, which is
+    // what the budget is charged for it.
+    let per_record = u64::try_from(groupings.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
     for record in &rows.records {
-        if !budget.tick() {
+        if !budget.charge(per_record) {
             break;
         }
-        // A record carrying NO value for a grouping key is grouped under the ABSENCE of one,
-        // which is a group of its own rather than a group keyed by empty text: the two are told
-        // apart here, so the row a group reports can state which of them it is
-        // ([`Grouping::key`]).
-        let key: Vec<Option<String>> = groupings
+        // A record carrying NO value for one of the grouping keys belongs to NO group: the
+        // aggregation is over the records the key is defined on ([`Grouping::key`]), so such a
+        // record contributes to no aggregate rather than to a group keyed by nothing. A record
+        // whose key is present and EMPTY text is grouped under that empty text, which is a
+        // value the record carries.
+        let Some(key) = groupings
             .iter()
             .map(|(_, grouping)| grouping.key(record, budget))
-            .collect();
+            .collect::<Option<Vec<String>>>()
+        else {
+            continue;
+        };
         if !groups.contains_key(&key) && groups.len() >= MAX_GROUPS {
             return Err(ExecutionFailure::new(format!(
                 "a stats command groups the records into at most {MAX_GROUPS} groups"
@@ -710,12 +756,10 @@ fn stats(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Execut
         .map(|(key, collected)| {
             let mut record = Record::default();
             for ((name, _), value) in groupings.iter().zip(key) {
-                // The group of the records that carry no value for this key reports no value
-                // for it: the key member is ABSENT from such a row rather than present with
-                // nothing in it, so a reader can tell that group from one keyed by empty text.
-                if let Some(value) = value {
-                    store(&mut record, name, value, budget);
-                }
+                // Every group has a value for every key it is grouped by — a record carrying
+                // none for one of them joined no group at all — so the row reports each of
+                // them, whatever text it holds.
+                store(&mut record, name, value, budget);
             }
             for ((name, aggregate), accumulator) in aggregates.iter().zip(collected.iter()) {
                 store(
@@ -741,6 +785,10 @@ const BY: &str = "by";
 /// factor of the work and the caller writes it.
 const MAX_AGGREGATES: usize = 64;
 
+/// THE EMULATOR'S OWN CEILING on how many keys ONE `stats` command may group by, for the same
+/// reason: each of them is computed for every record and held in every group's key.
+const MAX_GROUPING_KEYS: usize = 64;
+
 /// THE EMULATOR'S OWN CEILING on how many groups ONE aggregation may build: a group's key
 /// comes from the records, so a grouping by a field whose values are all different would
 /// otherwise hold one group per record.
@@ -760,6 +808,12 @@ fn reported_name(expression: &Expr, text: &str) -> String {
 /// `pattern`: group the records by the SHAPE of a field's text, which is what that command
 /// finds ("automatically cluster your log data into patterns"). Each group reports the
 /// pattern, how many records carry it and what share of the records that is.
+///
+/// A record carrying no value under the clustered field has no shape to be clustered by, so
+/// it joins no pattern — the rule an aggregation's grouping follows as well
+/// ([`Grouping::key`]). The share a pattern reports is still of the records ANALYSED —
+/// `@ratio` is "the ratio of events that match the pattern compared to the total number of
+/// events analyzed" — so a record that joined no pattern counts in that total.
 fn pattern(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), ExecutionFailure> {
     let field = split_items(arguments)
         .into_iter()
@@ -773,7 +827,9 @@ fn pattern(rows: &mut Rows, arguments: &str, budget: &Budget) -> Result<(), Exec
         if !budget.tick() {
             break;
         }
-        let text = record.get(&field).unwrap_or_default();
+        let Some(text) = record.get(&field) else {
+            continue;
+        };
         *counts.entry(message_pattern(text)).or_default() += 1;
         if counts.len() > MAX_GROUPS {
             return Err(ExecutionFailure::new(format!(
@@ -856,8 +912,18 @@ fn sort(
     dialect: Dialect,
     budget: &Budget,
 ) -> Result<(), ExecutionFailure> {
+    let items = split_items(arguments);
+    // Every key is computed for EVERY record and held in the key table the sort orders by, so
+    // the list's length is a factor of the work and the caller writes it: a command naming
+    // more keys than this is the execution that produced nothing, as an aggregation naming
+    // more aggregates than it may is ([`MAX_AGGREGATES`]).
+    if items.len() > MAX_SORT_KEYS {
+        return Err(ExecutionFailure::new(format!(
+            "a sort command names at most {MAX_SORT_KEYS} keys"
+        )));
+    }
     let mut keys: Vec<(Expr, bool)> = Vec::new();
-    for item in split_items(arguments) {
+    for item in items {
         let mut text = item.trim().to_string();
         let mut descending = false;
         if dialect == Dialect::Ppl {
@@ -869,9 +935,9 @@ fn sort(
             }
         }
         for (suffix, flag) in [(" desc", true), (" asc", false)] {
-            if text.to_lowercase().ends_with(suffix) {
+            if let Some(rest) = strip_suffix_ignoring_ascii_case(&text, suffix) {
                 descending = flag;
-                text.truncate(text.len() - suffix.len());
+                text = rest;
             }
         }
         keys.push((
@@ -882,22 +948,35 @@ fn sort(
     // The keys are computed ONCE PER RECORD and the records are then ordered by the computed
     // keys: a comparator that evaluated them would evaluate each record's keys once per
     // comparison, which is a multiple of the records rather than one pass over them.
-    let mut keyed: Vec<(Vec<Value>, Record)> = rows
-        .records
-        .drain(..)
-        .map(|record| {
-            let computed = keys
-                .iter()
-                .map(|(key, _)| expression::evaluate(key, &record, budget))
-                .collect();
-            (computed, record)
-        })
-        .collect();
+    //
+    // Computing one record's keys is work the run pays for, so the key table this stage
+    // materialises cannot outlast the budget either: once it is spent no further keys are
+    // computed, and the run is reported as the failure the budget recorded rather than as the
+    // rows of a sort that kept going.
+    let mut keyed: Vec<(Vec<Value>, Record)> = Vec::with_capacity(rows.records.len());
+    for record in rows.records.drain(..) {
+        if !budget.tick() {
+            keyed.push((Vec::new(), record));
+            continue;
+        }
+        let computed = keys
+            .iter()
+            .map(|(key, _)| expression::evaluate(key, &record, budget))
+            .collect();
+        keyed.push((computed, record));
+    }
+    // Ordering the records is work the run pays for as WELL, and it is charged for all of it
+    // before the first comparison: a comparator answers the one total order over the computed
+    // keys every time it is asked — one whose answer depended on how much budget was left part
+    // way through a sort would be no order at all — so the budget is consulted here, where it
+    // can still stop the stage, and a run that cannot pay leaves the records where they stand
+    // and is reported as the failure the budget recorded.
+    if !budget.charge(comparison_cost(keyed.len())) {
+        rows.records = keyed.into_iter().map(|(_, record)| record).collect();
+        return Ok(());
+    }
     // `sort_by` is STABLE, so records sharing every key keep the order they arrived in.
     keyed.sort_by(|(left, _), (right, _)| {
-        // Ordering two records is work the run pays for, so a sort of the whole scan cannot
-        // outlast the budget however many comparisons it takes.
-        let _ = budget.tick();
         for (index, (_, descending)) in keys.iter().enumerate() {
             let ordering = match (left.get(index), right.get(index)) {
                 (Some(left), Some(right)) => expression::total_ordering(left, right),
@@ -916,6 +995,34 @@ fn sort(
     });
     rows.records = keyed.into_iter().map(|(_, record)| record).collect();
     Ok(())
+}
+
+/// THE EMULATOR'S OWN CEILING on how many keys ONE `sort` command may name: each key is
+/// computed for every record and held in the key table the sort orders by, so the list's
+/// length is a factor of the work and the caller writes it — the same reason an aggregation's
+/// list is bounded ([`MAX_AGGREGATES`]).
+const MAX_SORT_KEYS: usize = 64;
+
+/// What ordering `records` records costs the run: a stable sort makes on the order of
+/// `n·log2(n)` comparisons, so that product is what the budget is charged before the sort runs.
+fn comparison_cost(records: usize) -> u64 {
+    let depth = u64::from(usize::BITS - records.leading_zeros()).max(1);
+    u64::try_from(records)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(depth)
+}
+
+/// `text` without its trailing `suffix`, compared without ASCII case, or `None` when it does
+/// not end with it.
+///
+/// The comparison and the strip are over the SAME bytes of `text`: lowercasing is not
+/// length-preserving, so a length taken from a lowercased copy is no offset into the original,
+/// and a text whose tail is not a character boundary ends with no suffix here.
+fn strip_suffix_ignoring_ascii_case(text: &str, suffix: &str) -> Option<String> {
+    let start = text.len().checked_sub(suffix.len())?;
+    let tail = text.get(start..)?;
+    tail.eq_ignore_ascii_case(suffix)
+        .then(|| text[..start].to_string())
 }
 
 /// `dedup`: keep the FIRST record carrying each distinct combination of the named fields,
@@ -1010,26 +1117,57 @@ fn lookup(
             );
         }
     }
+    // The list is joined onto EVERY record, so its length is a factor of the work and the
+    // caller writes it ([`MAX_LOOKUP_OUTPUTS`]), as an aggregation's and a sort's lists are.
+    if joined.len() > MAX_LOOKUP_OUTPUTS {
+        return Err(ExecutionFailure::new(format!(
+            "a lookup command joins at most {MAX_LOOKUP_OUTPUTS} columns"
+        )));
+    }
 
+    // The table is indexed ONCE per stage — the rows by the value of the key column, the
+    // joined columns by their position — so joining one record is a lookup in that index
+    // rather than a scan of the table, and what one record costs is what the budget charges
+    // for it below. Indexing is work of its own, bounded by the rows one stage reads
+    // ([`MAX_LOOKUP_ROWS`]) and charged for here.
+    if !budget.charge(u64::try_from(table_rows.len()).unwrap_or(u64::MAX)) {
+        return Ok(());
+    }
+    let mut by_key: BTreeMap<&str, &Vec<String>> = BTreeMap::new();
+    for row in &table_rows {
+        if let Some(value) = row.get(key_column) {
+            // The FIRST row carrying a key is the row that key joins, as a scan of the table
+            // in order would find.
+            by_key.entry(value.as_str()).or_insert(row);
+        }
+    }
+    // A joined column the table does not have resolves to no position, so it joins no value —
+    // while still being a column the stage declares, as it was before.
+    let resolved: Vec<(usize, &String)> = joined
+        .iter()
+        .filter_map(|(column, name)| {
+            columns
+                .iter()
+                .position(|candidate| candidate == column)
+                .map(|index| (index, name))
+        })
+        .collect();
+
+    // One record's join costs the record itself plus the columns joined onto it, which is
+    // what the budget is charged for it.
+    let per_record = u64::try_from(resolved.len()).unwrap_or(u64::MAX).saturating_add(1);
     for record in &mut rows.records {
-        if !budget.tick() {
+        if !budget.charge(per_record) {
             break;
         }
         let Some(key) = record.get(&record_key).map(ToString::to_string) else {
             continue;
         };
-        let Some(row) = table_rows
-            .iter()
-            .find(|row| row.get(key_column).is_some_and(|value| *value == key))
-        else {
+        let Some(row) = by_key.get(key.as_str()) else {
             continue;
         };
-        for (column, name) in &joined {
-            let value = columns
-                .iter()
-                .position(|candidate| candidate == column)
-                .and_then(|index| row.get(index));
-            if let Some(value) = value {
+        for (index, name) in &resolved {
+            if let Some(value) = row.get(*index) {
                 store(record, name, value.clone(), budget);
             }
         }
@@ -1039,6 +1177,11 @@ fn lookup(
     declare_fields(rows, joined.into_iter().map(|(_, name)| name));
     Ok(())
 }
+
+/// THE EMULATOR'S OWN CEILING on how many columns ONE `lookup` command joins: every one of
+/// them is read and stored for every record, so the list's length is a factor of the work and
+/// the caller writes it ([`MAX_AGGREGATES`], [`MAX_SORT_KEYS`]).
+const MAX_LOOKUP_OUTPUTS: usize = 64;
 
 /// The keyword that opens the column list a `lookup` command joins.
 const OUTPUT: &str = "output";
@@ -1177,8 +1320,9 @@ impl Grouping {
     }
 
     /// This key's value for one record, or `None` when the record carries no value to be
-    /// grouped by: such records aggregate into ONE group whose row omits the key, which is what
-    /// tells "no value for this field" apart from "this field is empty text".
+    /// grouped by: such a record belongs to no group of the aggregation, so it contributes to
+    /// no aggregate — while a record whose value is present and EMPTY text is grouped under
+    /// that empty text.
     fn key(&self, record: &Record, budget: &Budget) -> Option<String> {
         match self {
             Self::Value(expression) => match expression::evaluate(expression, record, budget) {
@@ -1186,12 +1330,15 @@ impl Grouping {
                 value => Some(value.rendered()),
             },
             Self::Bin { field, width } => {
-                let timestamp = record
-                    .get(field)
-                    .and_then(super::parse_timestamp)
-                    .unwrap_or_default();
-                let floored = timestamp - timestamp.rem_euclid(*width);
-                Some(super::format_timestamp(floored))
+                // A record whose timestamp field is absent, or carries text that is no
+                // instant, has no instant to be grouped by — so it carries no value for this
+                // key rather than the instant the epoch stands at.
+                let timestamp = record.get(field).and_then(super::parse_timestamp)?;
+                // A span names the whole multiple of its width the instant falls in; an
+                // instant no multiple of this width stands below names no span.
+                timestamp
+                    .checked_sub(timestamp.rem_euclid(*width))
+                    .map(super::format_timestamp)
             }
         }
     }
@@ -1223,8 +1370,16 @@ fn duration_ms(text: &str) -> Option<i64> {
         _ => return None,
     };
     let span = count * millis;
-    (span >= 1.0).then_some(span as i64)
+    // A span is a whole number of milliseconds: one below a millisecond is no span of time,
+    // and one past what a span may be is no duration either — a converting cast would
+    // SATURATE such a number into a width that looks legitimate ([`MAX_SPAN_MS`]).
+    (span >= 1.0 && span <= MAX_SPAN_MS as f64).then_some(span as i64)
 }
+
+/// THE EMULATOR'S OWN CEILING on the span of time a `bin`/`span` grouping may be written with:
+/// a hundred years of milliseconds, beyond any window a query reads — so what it rules out is
+/// a number that is no duration rather than a grouping a caller meant.
+const MAX_SPAN_MS: i64 = 100 * 365 * 86_400_000;
 
 /// Split a command's argument text on its TOP-LEVEL commas: the separator of a list of
 /// fields, aggregates or sort keys. A comma inside brackets, a quoted string or a
