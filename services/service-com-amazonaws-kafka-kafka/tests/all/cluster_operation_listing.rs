@@ -401,14 +401,15 @@ async fn pages_the_operations_a_cluster_recorded_latest_first() {
 
 /// A `ClusterArn` that names no cluster of this endpoint, and a `NextToken`
 /// this listing did not mint for the cluster being listed, are refused rather
-/// than answered with a page. The rows differ along how the value fails: the
-/// wrong resource type, a truncated resource path, a foreign service, something
-/// that is no ARN at all, a cluster this region does not hold, and a real
-/// cluster read through another region's endpoint.
+/// than answered with a page. The rows differ along how the value fails: a value
+/// that is no ARN at all keeps the parameter refusal, while an ARN that names no
+/// cluster — the wrong resource type, a truncated resource path, a foreign
+/// service — is refused by authorization; a cluster this region does not hold, and
+/// a real cluster read through another region's endpoint, are the miss.
 #[tokio::test(flavor = "current_thread")]
 async fn refuses_a_cluster_arn_that_names_no_cluster() {
     let emulator = Emulator::new();
-    let malformed = [
+    let naming_no_cluster = [
         (
             "operation-arn",
             format!(
@@ -424,21 +425,28 @@ async fn refuses_a_cluster_arn_that_names_no_cluster() {
             "other-service",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:cluster/a-cluster/cluster-id"),
         ),
-        ("not-an-arn", "a-cluster".to_string()),
     ];
-    for (case, value) in malformed {
+    for (case, value) in naming_no_cluster {
         let reply = list(&emulator, &value, "").await;
         assert_eq!(
-            reply.status, 400,
-            "case {case}: expected 400 for {value:?}, got {} {}",
-            reply.status, reply.body
-        );
-        assert!(
-            reply.error_code().ends_with("BadRequestException"),
-            "case {case}: expected a BadRequestException for {value:?}, got {:?}",
-            reply.error_code()
+            (reply.status, reply.error_code()),
+            (403, "AccessDeniedException"),
+            "case {case}: expected the authorization refusal for {value:?}, got {} {}",
+            reply.status,
+            reply.body
         );
     }
+    let reply = list(&emulator, "a-cluster", "").await;
+    assert_eq!(
+        reply.status, 400,
+        "case not-an-arn: expected 400, got {} {}",
+        reply.status, reply.body
+    );
+    assert!(
+        reply.error_code().ends_with("BadRequestException"),
+        "case not-an-arn: expected a BadRequestException, got {:?}",
+        reply.error_code()
+    );
 
     // Well formed, and held by nobody: the cluster does not exist, so there is
     // no history to serve — which is not the same answer as an empty one.

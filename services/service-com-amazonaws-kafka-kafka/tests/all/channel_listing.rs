@@ -490,8 +490,9 @@ async fn the_listing_filters_by_topic_and_refuses_what_it_cannot_resolve() {
     );
 
     // Rows: each way the request can fail to resolve, with the status and code it
-    // is refused with. A cluster ARN another endpoint's region holds, one no
-    // cluster holds, and a value that is not a cluster ARN at all.
+    // is refused with. A cluster ARN no cluster holds (the miss), a value that is
+    // not an ARN at all (the parameter refusal), an ARN that names no cluster
+    // (refused by authorization ahead of the resolution), and two unusable tokens.
     let absent = format!(
         "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/11111111-2222-4333-8444-555555555555-1"
     );
@@ -506,8 +507,8 @@ async fn the_listing_filters_by_topic_and_refuses_what_it_cannot_resolve() {
         (
             format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/filter-host/abc-1"),
             String::new(),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         // A token this listing never minted, and one minted for another list.
         (

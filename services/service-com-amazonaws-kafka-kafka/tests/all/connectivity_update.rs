@@ -561,10 +561,11 @@ async fn update_connectivity_refuses_what_it_cannot_apply() {
         .to_string();
 
     // Rows: every way the request can fail, as `(case, ARN, signing region,
-    // body, status, error code)`. The ARN rows walk the grammar the service
-    // parses — not an ARN, the wrong service, the wrong resource type, an extra
-    // segment, an empty region — then a well-formed ARN no cluster holds, and
-    // this cluster's own ARN seen from another region's endpoint.
+    // body, status, error code)`. A value that is no ARN at all is the parameter
+    // refusal; the wrong service, the wrong resource type, an extra segment and an
+    // empty region each name no cluster, which authorization refuses before
+    // anything resolves; then a well-formed ARN no cluster holds, and this
+    // cluster's own ARN seen from another region's endpoint.
     let rows: Vec<(&str, String, &str, Value, u16, &str)> = vec![
         (
             "not-an-arn",
@@ -579,32 +580,32 @@ async fn update_connectivity_refuses_what_it_cannot_apply() {
             format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/refusals/abc-1"),
             REGION,
             json!({ "currentVersion": version, "connectivityInfo": connectivity }),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "wrong-resource-type",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/refusals/abc"),
             REGION,
             json!({ "currentVersion": version, "connectivityInfo": connectivity }),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "extra-segment",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/refusals/abc/extra"),
             REGION,
             json!({ "currentVersion": version, "connectivityInfo": connectivity }),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "empty-region",
             format!("arn:aws:kafka::{ACCOUNT}:cluster/refusals/abc-1"),
             REGION,
             json!({ "currentVersion": version, "connectivityInfo": connectivity }),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "absent-cluster",

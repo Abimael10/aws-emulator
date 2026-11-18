@@ -710,8 +710,11 @@ async fn a_create_for_an_absent_or_malformed_cluster_is_refused() {
         .to_string();
 
     // `(cluster ARN, expected status, expected error code)`: a well-formed ARN no
-    // live cluster holds, each way a cluster can be absent, and each way the ARN
-    // grammar can fail.
+    // live cluster holds and each way a cluster can be absent (the resolution's
+    // miss), a value that is no ARN at all (the parameter refusal), and each way an
+    // ARN can name no cluster — another vendor's namespace, another resource kind of
+    // this service, an empty region segment — which authorization refuses before
+    // the cluster is resolved and before the channel body is read.
     let rows: Vec<(String, u16, &str)> = vec![
         (
             format!(
@@ -725,18 +728,18 @@ async fn a_create_for_an_absent_or_malformed_cluster_is_refused() {
         ("not-an-arn".to_string(), 400, "BadRequestException"),
         (
             format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/live/abc-1"),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:channel/live/abc-1/c/9"),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             format!("arn:aws:kafka::{ACCOUNT}:cluster/live/abc-1"),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
     ];
 

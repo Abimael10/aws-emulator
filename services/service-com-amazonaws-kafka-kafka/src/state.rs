@@ -180,6 +180,12 @@ pub mod scram_secret_admission;
 /// beside this module rather than in it.
 pub mod server_properties;
 
+/// What the REGION segment of a configuration `Arn` says about where the
+/// configuration it names lives, which the whole configuration family reads before
+/// the lookups below. It is decided from the ARN as submitted and the Region the
+/// endpoint serves, so it sits beside this module rather than in it.
+pub mod configuration_arn;
+
 /// The state precondition a call that CHANGES a resource applies, and the one
 /// sentence the service refuses it with when the resource is in some other state.
 /// It is a function of the accepted-state set and nothing this module holds, which
@@ -1785,7 +1791,7 @@ pub fn configuration_arn_not_found() -> BadRequestException {
         // `InvalidParameter` reports the parameter as the API names it on the
         // wire — the configuration operations bind their `Arn` label as `arn` —
         // not as the Smithy structure member is spelled.
-        invalid_parameter: Some("arn".to_string()),
+        invalid_parameter: Some(configuration_arn::CONFIGURATION_ARN_MEMBER.to_string()),
         message: Some(CONFIGURATION_ARN_NOT_FOUND_MESSAGE.to_string()),
     }
 }

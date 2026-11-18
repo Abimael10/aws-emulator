@@ -365,15 +365,17 @@ async fn describes_the_operation_each_update_files() {
     }
 }
 
-/// A value that is not a cluster-operation ARN is refused as a bad request,
-/// whatever it is; a well-formed one this region holds no operation for is a
-/// resource that does not exist. The rows differ along how the value fails:
-/// the wrong resource type, a truncated resource path, a foreign service, and
-/// something that is no ARN at all.
+/// A value that is no ARN at all is refused as a bad request; a value that IS an
+/// ARN and names no cluster operation is refused by authorization before anything
+/// resolves it, since nothing can hold a permission scoped to a resource it does
+/// not name; and a well-formed cluster-operation ARN this region holds no
+/// operation for is a resource that does not exist. The rows differ along how the
+/// value fails: the wrong resource type, a truncated resource path, a foreign
+/// service, and something that is no ARN at all.
 #[tokio::test(flavor = "current_thread")]
 async fn refuses_a_value_that_names_no_operation() {
     let emulator = Emulator::new();
-    let malformed = [
+    let naming_no_operation = [
         (
             "cluster-arn",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/a-cluster/11111111-2222-3333-4444-555555555555-1"),
@@ -386,21 +388,28 @@ async fn refuses_a_value_that_names_no_operation() {
             "other-service",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:cluster-operation/a-cluster/cluster-id/operation-id"),
         ),
-        ("not-an-arn", "a-cluster-operation".to_string()),
     ];
-    for (case, value) in malformed {
+    for (case, value) in naming_no_operation {
         let reply = describe_v2(&emulator, &value).await;
         assert_eq!(
-            reply.status, 400,
-            "case {case}: expected 400 for {value:?}, got {} {}",
-            reply.status, reply.body
-        );
-        assert!(
-            reply.error_code().ends_with("BadRequestException"),
-            "case {case}: expected a BadRequestException for {value:?}, got {:?}",
-            reply.error_code()
+            (reply.status, reply.error_code()),
+            (403, "AccessDeniedException"),
+            "case {case}: expected the authorization refusal for {value:?}, got {} {}",
+            reply.status,
+            reply.body
         );
     }
+    let reply = describe_v2(&emulator, "a-cluster-operation").await;
+    assert_eq!(
+        reply.status, 400,
+        "case not-an-arn: expected 400, got {} {}",
+        reply.status, reply.body
+    );
+    assert!(
+        reply.error_code().ends_with("BadRequestException"),
+        "case not-an-arn: expected a BadRequestException, got {:?}",
+        reply.error_code()
+    );
 
     // Well formed, and held by nobody: the operation does not exist. The second
     // row is a real operation read through ANOTHER region's endpoint, which

@@ -446,20 +446,13 @@ async fn reject_refuses_a_reference_it_cannot_act_on() {
     // The rows walk both references through every form the service cannot act
     // on: a value of no ARN shape, an ARN of the wrong kind, a well-formed
     // connection ARN naming nothing, and a connection belonging to another
-    // cluster. A CLUSTER ARN naming no cluster is not among them: nothing grants
-    // the action on a cluster the registry does not hold, so that is the
-    // authorization refusal asserted below.
+    // cluster. A CLUSTER ARN is not among them: one naming no cluster of this
+    // service, and one naming a cluster the registry does not hold, both reach no
+    // grant, so they are the authorization refusals asserted below.
     let rows: Vec<(&str, String, String, &str, &str)> = vec![
         (
             "a-cluster-arn-that-is-not-an-arn",
             "not-an-arn".to_string(),
-            connection.clone(),
-            CLUSTER_ARN_MEMBER,
-            CLUSTER_ARN_NOT_VALID_MESSAGE,
-        ),
-        (
-            "a-cluster-arn-of-another-resource-kind",
-            connection.clone(),
             connection.clone(),
             CLUSTER_ARN_MEMBER,
             CLUSTER_ARN_NOT_VALID_MESSAGE,
@@ -503,6 +496,46 @@ async fn reject_refuses_a_reference_it_cannot_act_on() {
         for (owner, arn) in [(&cluster, &connection), (&other_cluster, &other_connection)] {
             assert_every_reader_reports(&emulator, REGION, case, owner, arn, AVAILABLE).await;
         }
+    }
+
+    // A `ClusterArn` that IS an ARN and names no cluster of this service — here a
+    // VPC-connection ARN of this very service — matches no resource-scoped
+    // permission anything can hold, so the reject reaches no grant before it reads
+    // the connection reference, and it moves nothing either. The sentence is the
+    // one the service answers a value that names a resource no statement of the
+    // caller's covers.
+    let no_cluster = connection.clone();
+    let denied = emulator
+        .reject_client_vpc_connection(&no_cluster, &connection)
+        .await;
+    assert_eq!(
+        (denied.status, denied.error_code()),
+        (403, "AccessDeniedException"),
+        "case a-cluster-arn-of-another-resource-kind: expected the authorization refusal, got {} {}",
+        denied.status,
+        denied.body
+    );
+    assert_eq!(
+        denied.error_message(),
+        format!(
+            "User: {} is not authorized to perform: kafka:RejectClientVpcConnection on resource: \
+             {no_cluster} because no identity-based policy allows the \
+             kafka:RejectClientVpcConnection action",
+            caller_principal()
+        ),
+        "case a-cluster-arn-of-another-resource-kind: expected the default-deny sentence, got {:?}",
+        denied.error_message()
+    );
+    for (owner, arn) in [(&cluster, &connection), (&other_cluster, &other_connection)] {
+        assert_every_reader_reports(
+            &emulator,
+            REGION,
+            "a-cluster-arn-of-another-resource-kind",
+            owner,
+            arn,
+            AVAILABLE,
+        )
+        .await;
     }
 
     // A well-formed cluster ARN of this account that this endpoint holds no

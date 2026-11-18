@@ -516,10 +516,28 @@ async fn a_reboot_is_refused_unless_the_cluster_is_an_active_provisioned_one() {
         not_found.body
     );
 
-    // Values that are not cluster ARNs at all: the rows differ along which field
-    // of the ARN form is wrong.
-    let malformed: &[(&str, String)] = &[
-        ("not an ARN", "a-cluster".to_string()),
+    // A value that is no ARN at all names no resource for a policy to be matched
+    // against, so it keeps the parameter refusal naming the member that carried it.
+    let not_an_arn = reboot(&emulator, "a-cluster", &["1"]).await;
+    assert_eq!(
+        (not_an_arn.status, not_an_arn.error_code()),
+        (400, "BadRequestException"),
+        "case \"not an ARN\": expected a 400 BadRequestException, got {} {}",
+        not_an_arn.status,
+        not_an_arn.body
+    );
+    assert_eq!(
+        not_an_arn.at("/invalidParameter").as_str(),
+        Some("clusterArn"),
+        "case \"not an ARN\": expected the refusal to name clusterArn, got {}",
+        not_an_arn.body
+    );
+
+    // Values that ARE ARNs and name no MSK cluster: nothing can hold a permission
+    // scoped to a cluster they do not name, so authorization refuses them before
+    // anything resolves or parses the target. The rows differ along which field of
+    // the ARN form makes it name no cluster.
+    let naming_no_cluster: &[(&str, String)] = &[
         (
             "another service's ARN",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:cluster/orders/{GHOST_ID}"),
@@ -533,19 +551,13 @@ async fn a_reboot_is_refused_unless_the_cluster_is_an_active_provisioned_one() {
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/orders"),
         ),
     ];
-    for (case, value) in malformed {
+    for (case, value) in naming_no_cluster {
         let reply = reboot(&emulator, value, &["1"]).await;
         assert_eq!(
             (reply.status, reply.error_code()),
-            (400, "BadRequestException"),
-            "case {case:?}: expected a 400 BadRequestException, got {} {}",
+            (403, "AccessDeniedException"),
+            "case {case:?}: expected the authorization refusal, got {} {}",
             reply.status,
-            reply.body
-        );
-        assert_eq!(
-            reply.at("/invalidParameter").as_str(),
-            Some("clusterArn"),
-            "case {case:?}: expected the refusal to name clusterArn, got {}",
             reply.body
         );
     }

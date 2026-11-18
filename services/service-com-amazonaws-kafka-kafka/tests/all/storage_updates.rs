@@ -554,16 +554,34 @@ async fn an_unknown_cluster_is_not_found_whatever_the_body_asks_for() {
         }
     }
 
-    // Rows: one per way the ARN grammar can fail, as the readers of this service
-    // already separate a request it cannot parse from a resource it cannot find.
-    let malformed = vec![
-        "not-an-arn".to_string(),
+    // A value that is no ARN at all stays this surface's parameter refusal, as the
+    // readers of this service already separate a request it cannot parse from a
+    // resource it cannot find.
+    let reply = update_storage(
+        &emulator,
+        "not-an-arn",
+        json!({ "currentVersion": version, "volumeSizeGB": 1000 }),
+    )
+    .await;
+    assert_eq!(
+        (reply.status, reply.error_code()),
+        (400, "BadRequestException"),
+        "case arn=\"not-an-arn\": expected 400 BadRequestException, got {} {}",
+        reply.status,
+        reply.body
+    );
+
+    // Rows: one per way an ARN can name no cluster — another vendor's namespace,
+    // another resource kind of this service, an extra resource segment, an empty
+    // region. Nothing can hold a permission scoped to a cluster they do not name,
+    // so authorization refuses each before the update resolves anything.
+    let naming_no_cluster = vec![
         format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/present/abc-1"),
         format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/present/abc"),
         format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/present/abc/extra"),
         format!("arn:aws:kafka::{ACCOUNT}:cluster/present/abc-1"),
     ];
-    for arn in &malformed {
+    for arn in &naming_no_cluster {
         let reply = update_storage(
             &emulator,
             arn,
@@ -572,8 +590,8 @@ async fn an_unknown_cluster_is_not_found_whatever_the_body_asks_for() {
         .await;
         assert_eq!(
             (reply.status, reply.error_code()),
-            (400, "BadRequestException"),
-            "case arn={arn:?}: expected 400 BadRequestException, got {} {}",
+            (403, "AccessDeniedException"),
+            "case arn={arn:?}: expected the authorization refusal, got {} {}",
             reply.status,
             reply.body
         );
@@ -814,8 +832,8 @@ async fn each_update_records_its_own_operation() {
         );
     }
 
-    // Rows: a well-formed operation ARN nothing holds, and values that are not
-    // operation ARNs at all.
+    // Rows: a well-formed operation ARN nothing holds, a value that is no ARN at
+    // all, and values that ARE ARNs and name no cluster operation.
     let unknown = format!(
         "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/history/11111111-2222-4333-8444-555555555555-1/99999999-8888-4777-8666-555555555555"
     );
@@ -827,17 +845,24 @@ async fn each_update_records_its_own_operation() {
         reply.status,
         reply.body
     );
-    for malformed in [
-        "not-an-arn".to_string(),
+    let reply = describe_operation(&emulator, "not-an-arn").await;
+    assert_eq!(
+        (reply.status, reply.error_code()),
+        (400, "BadRequestException"),
+        "case arn=\"not-an-arn\": expected 400 BadRequestException, got {} {}",
+        reply.status,
+        reply.body
+    );
+    for naming_no_operation in [
         format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/history/abc-1"),
         format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster-operation/history/abc-1/def"),
         format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster-operation/history/abc-1"),
     ] {
-        let reply = describe_operation(&emulator, &malformed).await;
+        let reply = describe_operation(&emulator, &naming_no_operation).await;
         assert_eq!(
             (reply.status, reply.error_code()),
-            (400, "BadRequestException"),
-            "case arn={malformed:?}: expected 400 BadRequestException, got {} {}",
+            (403, "AccessDeniedException"),
+            "case arn={naming_no_operation:?}: expected the authorization refusal, got {} {}",
             reply.status,
             reply.body
         );

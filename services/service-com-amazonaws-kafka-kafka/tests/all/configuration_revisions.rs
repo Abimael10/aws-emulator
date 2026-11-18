@@ -419,11 +419,13 @@ async fn an_unknown_or_malformed_arn_is_refused_by_update_and_by_the_revision_re
     );
 
     // A configuration lives in one region, so another region's endpoint holds
-    // neither the configuration nor its revisions.
+    // neither the configuration nor its revisions: the ARN names a resource that
+    // endpoint does not serve, which is the not-found refusal — on the write and
+    // on the revision read alike.
     let elsewhere = update_in(&emulator, "eu-central-1", &arn, &row).await;
     assert_eq!(
         (elsewhere.status, elsewhere.error_code()),
-        (400, "BadRequestException"),
+        (404, "NotFoundException"),
         "case region=eu-central-1: another region's endpoint must not update it, got {} {}",
         elsewhere.status,
         elsewhere.body
@@ -431,7 +433,7 @@ async fn an_unknown_or_malformed_arn_is_refused_by_update_and_by_the_revision_re
     let read_elsewhere = describe_revision_in(&emulator, "eu-central-1", &arn, 1).await;
     assert_eq!(
         (read_elsewhere.status, read_elsewhere.error_code()),
-        (400, "BadRequestException"),
+        (404, "NotFoundException"),
         "case region=eu-central-1: another region's endpoint must not read its revisions, \
          got {} {}",
         read_elsewhere.status,

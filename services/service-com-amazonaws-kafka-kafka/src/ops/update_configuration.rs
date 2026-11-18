@@ -175,6 +175,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = std::time::SystemTime::now();
 
+        // The `Arn`'s own REGION segment, read before anything is resolved or
+        // appended, through the family's one reading of it
+        // ([`crate::state::configuration_arn`]): a configuration of another Region
+        // is a resource this endpoint does not serve, so an update carrying an ARN
+        // that was taken across Regions can never land on the configuration this
+        // endpoint holds; a Region segment that is no Region at all is a mistyped
+        // parameter.
+        if let Some(refusal) =
+            crate::state::configuration_arn::region_refusal(&input.arn, &region)
+        {
+            use crate::state::configuration_arn::ArnRegionRefusal;
+            return Err(match refusal {
+                ArnRegionRefusal::NotFound(error) => {
+                    UpdateConfigurationErrorModeled::NotFoundException(error)
+                }
+                ArnRegionRefusal::BadRequest(error) => {
+                    UpdateConfigurationErrorModeled::BadRequestException(error)
+                }
+            }
+            .into());
+        }
+
         // A configuration IS a `server.properties` file, and MSK configures a
         // published set of broker properties, so the body this update appends is
         // admitted on exactly the terms the create's is
@@ -200,10 +222,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
         // ONE condition, one refusal: an `Arn` that resolves to no configuration
-        // of this endpoint's region — malformed, never minted, deleted and gone,
-        // or another region's — is the configuration family's unresolvable-
+        // of this endpoint's region — malformed, never minted, deleted and gone —
+        // is the configuration family's unresolvable-
         // reference bad request, resolved before anything is appended so a
-        // refused update stores nothing.
+        // refused update stores nothing. An ARN of another Region never gets here:
+        // the region gate above answered it.
         let Some(configuration) = state.settled_configuration_in_mut(&region, &input.arn, now)
         else {
             return Err(UpdateConfigurationErrorModeled::BadRequestException(

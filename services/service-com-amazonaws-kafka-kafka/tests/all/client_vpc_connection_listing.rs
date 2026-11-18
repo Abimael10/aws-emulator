@@ -561,10 +561,11 @@ async fn a_deleted_connection_leaves_the_listing() {
     }
 }
 
-/// RULE: a `ClusterArn` that is not a cluster ARN of this service, and a
-/// well-formed one this Region holds no cluster for, are refused as a bad
-/// request naming the cluster-ARN member — this operation models no not-found
-/// error — and so is a `NextToken` it did not mint for this cluster.
+/// RULE: a value that is no ARN at all, and a well-formed cluster ARN this Region
+/// holds no cluster for, are refused as a bad request naming the cluster-ARN member
+/// — this operation models no not-found error — and so is a `NextToken` it did not
+/// mint for this cluster. A value that IS an ARN and names no cluster is refused
+/// earlier still, by authorization.
 #[tokio::test]
 async fn an_unresolvable_request_is_refused() {
     let emulator = Emulator::new();
@@ -594,21 +595,6 @@ async fn an_unresolvable_request_is_refused() {
         (
             "not an ARN at all",
             "client-refusals".to_string(),
-            String::new(),
-            CLUSTER_ARN_MEMBER,
-        ),
-        (
-            "an ARN of another service",
-            format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0a1b2c3d"),
-            String::new(),
-            CLUSTER_ARN_MEMBER,
-        ),
-        (
-            "a VPC-connection ARN of this service",
-            format!(
-                "arn:aws:kafka:{REGION}:{ACCOUNT}:vpc-connection/{ACCOUNT}/client-refusals/\
-                 11111111-2222-3333-4444-555555555555-1"
-            ),
             String::new(),
             CLUSTER_ARN_MEMBER,
         ),
@@ -656,6 +642,34 @@ async fn an_unresolvable_request_is_refused() {
             reply.at("/invalidParameter").as_str(),
             Some(*member),
             "case {case}: expected the refusal to name {member}, got {}",
+            reply.body
+        );
+    }
+
+    // The values that ARE ARNs and name no cluster: nothing can hold a permission
+    // scoped to a cluster they do not name, so authorization answers them before
+    // this listing resolves anything. The rows differ along what makes the value
+    // name no cluster: another vendor's resource, and another kind of this
+    // service's.
+    for (case, value) in [
+        (
+            "an ARN of another service",
+            format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0a1b2c3d"),
+        ),
+        (
+            "a VPC-connection ARN of this service",
+            format!(
+                "arn:aws:kafka:{REGION}:{ACCOUNT}:vpc-connection/{ACCOUNT}/client-refusals/\
+                 11111111-2222-3333-4444-555555555555-1"
+            ),
+        ),
+    ] {
+        let reply = emulator.list_client_vpc_connections(&value, "").await;
+        assert_eq!(
+            (reply.status, reply.error_code()),
+            (403, "AccessDeniedException"),
+            "case {case}: expected the authorization refusal, got {} {}",
+            reply.status,
             reply.body
         );
     }

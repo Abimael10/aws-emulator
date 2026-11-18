@@ -326,19 +326,21 @@ async fn a_created_configuration_is_reported_by_every_later_list() {
 }
 
 /// RULE: a configuration ARN resolves only at the regional endpoint that holds
-/// it, and an `Arn` that resolves to no configuration there is refused HTTP 400
-/// `BadRequestException` — whether it is not an MSK configuration ARN at all or
-/// a well-formed one this region holds no configuration for.
+/// it. An `Arn` of THIS region that resolves to no configuration is refused HTTP
+/// 400 `BadRequestException` — whether it is not an MSK configuration ARN at all
+/// or a well-formed one this region holds no configuration for — while an `Arn`
+/// whose region segment names ANOTHER Region names a resource this endpoint does
+/// not serve, which is HTTP 404 `NotFoundException`.
 #[tokio::test]
 async fn an_unknown_or_malformed_configuration_arn_is_refused() {
     let emulator = Emulator::new();
     let arn = create_ok(&emulator, &ConfigurationRequest::named("present")).await;
 
     // `(arn, expected status, expected error code)`: a well-formed ARN of this
-    // kind that names no stored configuration (including one in another
-    // region), then values that are not configuration ARNs at all — not an ARN,
-    // another service, another resource type, too many segments, and an empty
-    // region field.
+    // kind that names no stored configuration, one whose region segment names
+    // another Region (the not-found), then values that are not configuration ARNs
+    // of this region at all — not an ARN, another service, another resource type,
+    // too many segments, and an empty region field.
     let rows: Vec<(String, u16, &str)> = vec![
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/absent/11111111-2222-4333-8444-555555555555-9"),
@@ -347,8 +349,8 @@ async fn an_unknown_or_malformed_configuration_arn_is_refused() {
         ),
         (
             format!("arn:aws:kafka:eu-central-1:{ACCOUNT}:configuration/present/11111111-2222-4333-8444-555555555555-1"),
-            400,
-            "BadRequestException",
+            404,
+            "NotFoundException",
         ),
         ("not-an-arn".to_string(), 400, "BadRequestException"),
         (
@@ -395,7 +397,7 @@ async fn an_unknown_or_malformed_configuration_arn_is_refused() {
     let elsewhere = describe_in(&emulator, "eu-central-1", &arn).await;
     assert_eq!(
         (elsewhere.status, elsewhere.error_code()),
-        (400, "BadRequestException"),
+        (404, "NotFoundException"),
         "case region=eu-central-1: another region's endpoint must not resolve it, got {} {}",
         elsewhere.status,
         elsewhere.body

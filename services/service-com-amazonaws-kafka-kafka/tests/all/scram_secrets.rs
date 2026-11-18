@@ -453,9 +453,13 @@ async fn a_disassociation_removes_exactly_the_secrets_it_names() {
     }
 }
 
-/// RULE: a batch carrying a value that is not an AWS Secrets Manager secret ARN
-/// is refused as a bad request, and stores none of its secrets — neither the
-/// association nor the disassociation applies part of a batch.
+/// RULE: the ASSOCIATION reads each `SecretArnList` entry as a secret ARN, so a
+/// batch carrying a value that is not one is refused as a bad request and stores
+/// none of its secrets. The DISASSOCIATION has NO such pass: an entry that is no
+/// secret ARN at all names no association of the cluster for exactly the same
+/// reason a well-formed but never-associated secret ARN names none, so the two go
+/// through ONE contract and are answered identically — whether that answer is the
+/// cluster's own not-found refusal or the removal of nothing.
 #[tokio::test]
 async fn a_value_that_is_not_a_secret_arn_is_refused_and_stores_nothing() {
     let emulator = Emulator::new();
@@ -469,10 +473,15 @@ async fn a_value_that_is_not_a_secret_arn_is_refused_and_stores_nothing() {
         "the association that seeds the stored set must succeed first"
     );
 
+    // The reference the unusable entries are compared against: a well-formed
+    // secret ARN this cluster never held, which is the other half of the
+    // disassociation's single contract.
+    let never_associated = secret_arn("AmazonMSK_never-held-2b3c4d");
+
     for value in values_that_are_not_secret_arns() {
         let case = format!("secret-arn={value:?}");
         // Alone, and behind a usable ARN: one unusable entry refuses the whole
-        // batch either way.
+        // association either way.
         for batch in [
             vec![value.to_string()],
             vec![secret_arn("AmazonMSK_also-good-8p9q0r"), value.to_string()],
@@ -486,17 +495,87 @@ async fn a_value_that_is_not_a_secret_arn_is_refused_and_stores_nothing() {
                 associated.body
             );
 
-            let disassociated = disassociate(&emulator, &cluster, &batch).await;
-            assert_bad_request(&disassociated, &case);
+            // The same batch with the unusable entry replaced by a secret this
+            // cluster never held: the disassociation answers both the same way.
+            let reference: Vec<String> = batch
+                .iter()
+                .map(|entry| {
+                    if entry == value {
+                        never_associated.clone()
+                    } else {
+                        entry.clone()
+                    }
+                })
+                .collect();
+            let unusable = disassociate(&emulator, &cluster, &batch).await;
+            let unheld = disassociate(&emulator, &cluster, &reference).await;
+            assert_eq!(
+                (
+                    unusable.status,
+                    unusable.error_code(),
+                    unusable.error_message()
+                ),
+                (unheld.status, unheld.error_code(), unheld.error_message()),
+                "case {case}: the disassociation must answer an unreadable entry exactly as it \
+                 answers a never-associated one, got {} {} against {} {}",
+                unusable.status,
+                unusable.body,
+                unheld.status,
+                unheld.body
+            );
 
             let stored = listed(&list(&emulator, &cluster, "").await, &case);
             assert_eq!(
                 stored,
                 vec![good.clone()],
-                "case {case}: expected a refused batch to leave the stored set alone, got \
-                 {stored:?}"
+                "case {case}: expected neither call to change the stored set, got {stored:?}"
             );
         }
+    }
+}
+
+/// RULE (the same contract from the other side): on a cluster this endpoint does
+/// NOT hold, the disassociation answers its one not-found refusal whatever the
+/// `SecretArnList` carried — an entry that is no ARN at all and a well-formed
+/// secret ARN that was never associated are told exactly the same thing, because
+/// neither names an association and the cluster is what is missing.
+#[tokio::test]
+async fn the_disassociation_funnels_every_unassociated_secret_through_one_contract() {
+    let emulator = Emulator::new();
+
+    // A well-formed cluster ARN of this endpoint's region that was never issued,
+    // so the call is past the authorization gate and into the resolution.
+    let absent = format!(
+        "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/never-issued/\
+         00000000-0000-0000-0000-000000000000-1"
+    );
+
+    // The rows differ along what makes the entry name no association: it is no ARN
+    // at all, it is an ARN of another vendor or of this very service, or it is a
+    // well-formed secret ARN nothing ever associated.
+    let entries: Vec<(&str, String)> = vec![
+        ("not an ARN at all", "not-an-arn-at-all".to_string()),
+        ("another vendor's ARN", format!("arn:aws:kms:{REGION}:{ACCOUNT}:key/1a2b3c4d")),
+        (
+            "an ARN of this service",
+            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/other/0000-1"),
+        ),
+        ("an empty entry", String::new()),
+        (
+            "a well-formed secret ARN never associated",
+            secret_arn("AmazonMSK_does-not-exist-x1y2z3"),
+        ),
+    ];
+
+    for (case, entry) in &entries {
+        let reply = disassociate(&emulator, &absent, std::slice::from_ref(entry)).await;
+        assert_eq!(
+            (reply.status, reply.error_code(), reply.error_message()),
+            (404, "NotFoundException", RESOURCE_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the one not-found refusal, got {} {}",
+            reply.status,
+            reply.body
+        );
     }
 }
 
@@ -566,28 +645,48 @@ async fn a_cluster_that_does_not_authenticate_sasl_scram_holds_no_secrets() {
     }
 }
 
-/// RULE: a `ClusterArn` the service cannot parse is a bad request, and a
-/// well-formed cluster ARN this endpoint's region holds no cluster for is a
-/// not-found — on all three operations, so the writers and the reader draw the
-/// same line.
+/// RULE: a `ClusterArn` that is no ARN at all is a bad request; a value that IS
+/// an ARN and names no MSK cluster is refused by authorization before anything
+/// resolves it; and a well-formed cluster ARN this endpoint's region holds no
+/// cluster for is a not-found — on all three operations, so the writers and the
+/// reader draw the same lines.
 #[tokio::test]
 async fn a_cluster_arn_this_endpoint_cannot_resolve_is_refused() {
     let emulator = Emulator::new();
     let secrets = vec![secret_arn("AmazonMSK_unresolved-4v5w6x")];
 
-    // Values that are not an MSK cluster ARN at all: not an ARN, another
-    // service's namespace, another MSK resource type, a cluster ARN missing its
-    // id segment.
+    // A value that is not an ARN at all names no resource for a policy to be
+    // matched against, so it stays this surface's parameter refusal.
+    for value in ["not-an-arn", "not an arn at all"] {
+        let case = format!("cluster-arn={value:?}");
+        assert_bad_request(&associate(&emulator, value, &secrets).await, &case);
+        assert_bad_request(&disassociate(&emulator, value, &secrets).await, &case);
+        assert_bad_request(&list(&emulator, value, "").await, &case);
+    }
+
+    // Values that ARE ARNs and name no MSK cluster: another service's namespace,
+    // another MSK resource type, a cluster ARN missing its id segment. Nothing can
+    // hold a permission scoped to a cluster they do not name, so the authorization
+    // gate answers them — before anything reads what this registry holds.
     for value in [
-        "not-an-arn",
         "arn:aws:secretsmanager:us-west-2:000000000000:secret:AmazonMSK_not-a-cluster",
         &format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/cfg/00000000-0000-0000-0000-000000000000-1"),
         &format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/no-id-segment"),
     ] {
         let case = format!("cluster-arn={value:?}");
-        assert_bad_request(&associate(&emulator, value, &secrets).await, &case);
-        assert_bad_request(&disassociate(&emulator, value, &secrets).await, &case);
-        assert_bad_request(&list(&emulator, value, "").await, &case);
+        for reply in [
+            associate(&emulator, value, &secrets).await,
+            disassociate(&emulator, value, &secrets).await,
+            list(&emulator, value, "").await,
+        ] {
+            assert_eq!(
+                (reply.status, reply.error_code()),
+                (403, "AccessDeniedException"),
+                "case {case}: expected the authorization refusal, got {} {}",
+                reply.status,
+                reply.body
+            );
+        }
     }
 
     // A well-formed cluster ARN that was never minted, and a cluster that lives

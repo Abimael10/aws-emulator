@@ -481,28 +481,13 @@ async fn the_node_listing_refuses_an_unresolvable_request() {
         .to_string();
 
     // Rows: every way the request can fail to resolve — (case, ARN, query,
-    // status, the message the refusal must carry when the service fixes one).
+    // status, the message the refusal must carry when the service fixes one). A
+    // value that IS an ARN and names no cluster is a different gate, asserted
+    // after the table: authorization answers it before anything resolves.
     let rows: Vec<(&str, String, String, u16, Option<&str>)> = vec![
         (
             "not an ARN at all",
             "nodes-refusals".to_string(),
-            String::new(),
-            400,
-            None,
-        ),
-        (
-            "an ARN of another service",
-            format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0a1b2c3d"),
-            String::new(),
-            400,
-            None,
-        ),
-        (
-            "a topic ARN of this service",
-            format!(
-                "arn:aws:kafka:{REGION}:{ACCOUNT}:topic/nodes-refusals/\
-                 11111111-2222-3333-4444-555555555555-1/orders"
-            ),
             String::new(),
             400,
             None,
@@ -579,6 +564,33 @@ async fn the_node_listing_refuses_an_unresolvable_request() {
                 reply.error_message()
             );
         }
+    }
+
+    // A `ClusterArn` that IS an ARN and names no MSK cluster matches no
+    // resource-scoped permission, so the listing is refused by authorization
+    // before it resolves anything. The rows differ along what makes the value name
+    // no cluster: another vendor's resource, and another kind of this service's.
+    for (case, value) in [
+        (
+            "an ARN of another service",
+            format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0a1b2c3d"),
+        ),
+        (
+            "a topic ARN of this service",
+            format!(
+                "arn:aws:kafka:{REGION}:{ACCOUNT}:topic/nodes-refusals/\
+                 11111111-2222-3333-4444-555555555555-1/orders"
+            ),
+        ),
+    ] {
+        let reply = list_nodes(&emulator, &value, "").await;
+        assert_eq!(
+            (reply.status, reply.error_code()),
+            (403, "AccessDeniedException"),
+            "case {case}: expected the authorization refusal, got {} {}",
+            reply.status,
+            reply.body
+        );
     }
 
     // A cluster lives in one region, so another region's endpoint holds none for

@@ -687,14 +687,36 @@ async fn an_arn_that_names_no_policy_is_refused() {
     let not_an_arn: Vec<(&str, String)> = vec![
         ("not-an-arn", "not-an-arn".to_string()),
         ("truncated-arn", "arn:aws:kafka".to_string()),
-        ("configuration-arn", configuration_arn),
-        ("another-service-namespace", held.replace(":kafka:", ":kafka-cluster:")),
     ];
     for (case, arn) in &not_an_arn {
         assert_not_a_cluster_arn(&delete(&emulator, arn).await, &format!("delete {case}"));
         assert_not_a_cluster_arn(&get(&emulator, arn).await, &format!("get {case}"));
         let refused = put(&emulator, arn, &document, None).await;
         assert_not_a_cluster_arn(&refused, &format!("put {case}"));
+    }
+
+    // A value that IS an ARN and names no cluster is not a parameter this surface
+    // cannot read either: there is no cluster resource for a permission to be
+    // scoped to, so the authorization decision answers it before any lookup — the
+    // same gate the account-segment row above meets.
+    let naming_no_cluster: Vec<(&str, String)> = vec![
+        ("configuration-arn", configuration_arn),
+        ("another-service-namespace", held.replace(":kafka:", ":kafka-cluster:")),
+    ];
+    for (case, arn) in &naming_no_cluster {
+        for (operation, reply) in [
+            ("delete", delete(&emulator, arn).await),
+            ("get", get(&emulator, arn).await),
+            ("put", put(&emulator, arn, &document, None).await),
+        ] {
+            assert_eq!(
+                (reply.status, reply.error_code()),
+                (403, "AccessDeniedException"),
+                "case {operation} {case}: expected the authorization refusal, got {} {}",
+                reply.status,
+                reply.body
+            );
+        }
     }
 
     // Nothing above removed anything: the policy this endpoint holds is still

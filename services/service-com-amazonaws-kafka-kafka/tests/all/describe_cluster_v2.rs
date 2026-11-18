@@ -300,9 +300,12 @@ async fn describe_v2_refuses_an_unknown_or_malformed_cluster_arn() {
         .await;
     sleep_past_activation();
 
-    // Rows: (ClusterArn, expected status, expected error code). The malformed ones
-    // differ along which part of the ARN grammar they break — service, resource
-    // type, missing segments, an extra one, a non-ARN string.
+    // Rows: (ClusterArn, expected status, expected error code). This reader's
+    // action is one only a cluster's OWN resource-based policy can grant, so a
+    // request that names no cluster reaches no grant whatever the value's shape:
+    // the wrong service, the wrong resource type, a missing segment, an extra one
+    // and a value that is no ARN at all are each the authorization refusal, taken
+    // before anything resolves.
     let rows: Vec<(String, u16, &str)> = vec![
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/00000000-0000-4000-8000-000000000000-1"),
@@ -318,25 +321,25 @@ async fn describe_v2_refuses_an_unknown_or_malformed_cluster_arn() {
         ),
         (
             format!("arn:aws:kinesis:{REGION}:{ACCOUNT}:cluster/wrong-service/00000000-0000-4000-8000-000000000000-1"),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/not-a-cluster/1"),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/missing-id"),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/too/many/segments"),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
-        ("not-an-arn-at-all".to_string(), 400, "BadRequestException"),
+        ("not-an-arn-at-all".to_string(), 403, "AccessDeniedException"),
     ];
 
     for (arn, status, code) in &rows {

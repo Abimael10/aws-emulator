@@ -156,6 +156,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Decided FIRST, before anything the request names is resolved: AWS
+        // authorizes at the IAM layer ahead of the service, so a value that names
+        // no cluster operation of this account matches no resource-scoped
+        // permission and is told it is not authorized rather than told what this
+        // registry holds. See [`crate::state::authorization`].
+        crate::state::authorization::authorize_cluster_operation_target(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.cluster_operation_arn,
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DescribeClusterOperationErrorModeled::InternalServerErrorException(

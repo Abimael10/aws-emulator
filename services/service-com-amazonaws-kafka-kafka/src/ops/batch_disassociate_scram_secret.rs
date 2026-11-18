@@ -10,10 +10,20 @@
 //! the same way: a secret the cluster does not hold is removed from nothing, so
 //! repeating a disassociation leaves the stored set unchanged.
 //!
-//! The request-level refusals are the association's: a `ClusterArn` that is not
-//! an MSK cluster ARN and a `SecretArnList` entry that is not a Secrets Manager
-//! secret ARN are `BadRequestException`, and a well-formed cluster ARN this
-//! endpoint's region holds no cluster for is `NotFoundException`. A cluster
+//! A `ClusterArn` that is not an MSK cluster ARN is `BadRequestException`, and a
+//! well-formed cluster ARN this endpoint's region holds no cluster for is
+//! `NotFoundException`.
+//!
+//! The `SecretArnList` entries are NOT given a syntax pass of their own, which is
+//! where this operation parts company with the association: the documented
+//! contract is ONE refusal for a reference that resolves to no association of this
+//! cluster, whether the entry names a secret that was never associated or is no
+//! secret ARN at all. Both resolve to nothing associated, so both are answered the
+//! same way — the cluster's own not-found refusal when the cluster is not there,
+//! and the removal of nothing when it is — and neither is reported as a request
+//! the service cannot read.
+//!
+//! A cluster
 //! whose client authentication does not turn SASL/SCRAM on holds no secret set
 //! to remove from, so it is refused with
 //! [`crate::state::SASL_SCRAM_NOT_ENABLED_MESSAGE`] — and, unlike the
@@ -201,30 +211,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Every entry must name a Secrets Manager secret, as it must to be
-        // associated in the first place. Checked before the lock and before
-        // anything is removed, so a batch carrying one unusable ARN
-        // disassociates none of its secrets.
-        if input
-            .secret_arn_list
-            .iter()
-            .any(|arn| !crate::state::is_secrets_manager_secret_arn(arn))
-        {
-            return Err(
-                BatchDisassociateScramSecretErrorModeled::BadRequestException(
-                    BadRequestException {
-                        invalid_parameter: Some("SecretArnList".to_string()),
-                        // The service's fixed sentence for this condition, so
-                        // the offending entry is not echoed back into it.
-                        message: Some(
-                            crate::state::SECRET_ARN_INVALID_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-
+        // No syntax pass over `SecretArnList`: this operation's contract is about
+        // what the cluster HOLDS, so an entry that is not a secret ARN at all
+        // names no association of this cluster for exactly the same reason a
+        // well-formed secret ARN that was never associated names none. Both are
+        // carried to the removal below, which takes off exactly the secrets the
+        // cluster holds — so the two are answered identically, and the
+        // association's own shape refusal stays the association's.
         let mut state = state.lock();
         let Some(cluster) = state.settled_cluster_in_mut(
             &region,
@@ -260,15 +253,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Removal goes through the record's own path, which drops exactly the
-        // secrets the cluster holds and leaves the rest of the set alone.
+        // secrets the cluster holds and leaves the rest of the set alone: an entry
+        // that resolves to no association of this cluster is removed from nothing,
+        // whether it is unreadable or simply never associated, which is the one
+        // answer this operation's contract gives both.
         cluster.disassociate_scram_secrets(&input.secret_arn_list);
 
         Ok(BatchDisassociateScramSecretOutput {
             // The STORED cluster's ARN, so the answer names the record the
             // secrets were taken off rather than echoing the request.
             cluster_arn: Some(cluster.arn.clone()),
-            // Nothing was left unprocessed: every condition that stops a secret
-            // being disassociated refuses the whole call above.
+            // Nothing is left unprocessed: the conditions that stop this call
+            // refuse it whole above (the cluster, and its client
+            // authentication), and withdrawing a credential this cluster does not
+            // hold is not one of them — there is nothing left for it to take off,
+            // so the removal above cannot fail on an entry.
             unprocessed_scram_secrets: Some(Vec::new()),
         })
     }

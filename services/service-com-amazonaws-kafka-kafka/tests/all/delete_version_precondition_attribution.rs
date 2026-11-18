@@ -19,12 +19,14 @@
 //!
 //! The rows span what the rule generalises over: which delete answers (the
 //! cluster one and the replicator one, each with its own ARN member and its own
-//! fixed sentence), what makes the reference unreadable (nine forms, from "not an
-//! ARN at all" to a cluster ARN missing a segment and a non-ASCII value), and
+//! fixed sentence), what makes the reference unreadable (five forms, from "not an
+//! ARN at all" to a non-ASCII value), and
 //! which version the request quotes (absent, a well-formed version token, one no
 //! cluster is ever minted at, a lower-cased one and a value that is not shaped
 //! like a version at all) — the attribution is the surface's, not one version
-//! string's.
+//! string's. A reference that IS an ARN and names no resource is a different
+//! gate on the CLUSTER delete: its action applies to a cluster, so authorization
+//! answers it before the reference is read, which the same suite asserts.
 //!
 //! The controls hold the rest of the surface fixed: a reference the service CAN
 //! read is answered on the resource (a well-formed ARN holding nothing is the
@@ -63,6 +65,10 @@ struct Delete {
     arn_member: &'static str,
     message: &'static str,
     blames_quoted_version: bool,
+    /// Whether this surface's target is a CLUSTER, in which case a value that IS
+    /// an ARN and names no cluster is refused by authorization before the
+    /// reference is read at all.
+    targets_a_cluster: bool,
 }
 
 impl Delete {
@@ -95,6 +101,7 @@ fn deletes() -> Vec<Delete> {
             arn_member: CLUSTER_ARN_MEMBER,
             message: BAD_REQUEST_MESSAGE,
             blames_quoted_version: true,
+            targets_a_cluster: true,
         },
         Delete {
             name: "DeleteReplicator",
@@ -102,20 +109,31 @@ fn deletes() -> Vec<Delete> {
             arn_member: REPLICATOR_ARN_MEMBER,
             message: VALUE_NOT_VALID_MESSAGE,
             blames_quoted_version: false,
+            targets_a_cluster: false,
         },
     ]
 }
 
-/// Every way a submitted reference can fail to be an ARN of the kind either
-/// delete resolves — none of these is an MSK cluster ARN, and none is an MSK
-/// replicator ARN either, so one table serves both operations. The account
-/// segment of each ARN-shaped row is the emulator's own, so no row is refused on
-/// authorization before its shape is read.
+/// Every way a submitted reference can fail to be an ARN AT ALL, which neither
+/// delete can read and neither can decide an authorization question over.
 fn unreadable_references() -> Vec<(&'static str, String)> {
     vec![
         ("not-an-arn-at-all", "not-a-resource-arn".to_string()),
         ("free-text-with-spaces", "not an arn at all".to_string()),
         ("truncated-arn", "arn:aws:kafka".to_string()),
+        (
+            "a-long-opaque-value",
+            format!("not-a-valid-arn-{}", "x".repeat(200)),
+        ),
+        ("a-non-ascii-value", "ニセのクラスター-arn".to_string()),
+    ]
+}
+
+/// Every way a submitted reference can BE an ARN and still name neither an MSK
+/// cluster nor an MSK replicator. The account segment of each row is the
+/// emulator's own, so no row is refused on the account it names.
+fn arns_naming_no_resource() -> Vec<(&'static str, String)> {
+    vec![
         (
             "another-service-namespace",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0a1b2c3d"),
@@ -132,11 +150,6 @@ fn unreadable_references() -> Vec<(&'static str, String)> {
             "cluster-arn-with-an-extra-segment",
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/a-cluster/{GHOST_ID}/extra"),
         ),
-        (
-            "a-long-opaque-value",
-            format!("not-a-valid-arn-{}", "x".repeat(200)),
-        ),
-        ("a-non-ascii-value", "ニセのクラスター-arn".to_string()),
     ]
 }
 
@@ -225,6 +238,38 @@ async fn an_unreadable_reference_is_blamed_on_the_input_its_surface_names() {
                     &reference,
                     probe,
                 );
+            }
+        }
+
+        // A value that IS an ARN and names no resource: on the CLUSTER delete the
+        // action asks for a cluster nothing can hold a permission over, so
+        // authorization answers before the reference is read and the attribution
+        // never arises; the replicator delete, whose target is a replicator,
+        // blames its own ARN member as before.
+        for (form, reference) in arns_naming_no_resource() {
+            for probe in version_probes() {
+                let case = format!("{}/{form}/currentVersion={probe:?}", delete.name);
+                let reply = emulator
+                    .call("DELETE", &delete.uri(&reference, probe), None)
+                    .await;
+                if delete.targets_a_cluster {
+                    assert_eq!(
+                        (reply.status, reply.error_code()),
+                        (403, "AccessDeniedException"),
+                        "case {case}: expected the authorization refusal, got {} {}",
+                        reply.status,
+                        reply.body
+                    );
+                } else {
+                    assert_blamed(
+                        &reply,
+                        &case,
+                        delete.arn_member,
+                        delete.message,
+                        &reference,
+                        probe,
+                    );
+                }
             }
         }
     }

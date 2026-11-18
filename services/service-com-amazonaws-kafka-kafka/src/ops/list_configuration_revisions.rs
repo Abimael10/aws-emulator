@@ -14,10 +14,14 @@
 //! configuration and the revision the page stopped at — absent from the last page.
 //!
 //! A configuration is addressed by ARN, so an `Arn` this endpoint resolves to no
-//! configuration — malformed, absent, already deleted, or another region's — is
+//! configuration — malformed, absent, already deleted — is
 //! the configuration family's one unresolvable-reference bad request
 //! ([`crate::state::configuration_arn_not_found`]) rather than an empty page: the
-//! same refusal `DescribeConfigurationRevision` and the delete answer.
+//! same refusal `DescribeConfigurationRevision` and the delete answer. An `Arn` of
+//! another Region is a resource this endpoint does not serve at all, which the
+//! family's one reading of the region segment
+//! ([`crate::state::configuration_arn`]) answers first, as the `NotFoundException`
+//! (404) — and a region segment that is no Region is the parameter refusal (400).
 //!
 //! A reporting operation: it only reads the registry. A configuration is created
 //! `ACTIVE` and a stored revision never changes, so the clock owes this read no
@@ -222,6 +226,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         let now = std::time::SystemTime::now();
+
+        // The `Arn`'s own REGION segment, read before anything is resolved, through
+        // the family's one reading of it ([`crate::state::configuration_arn`]): a
+        // configuration of another Region is a resource this endpoint does not
+        // serve, and a Region segment that is no Region at all is a mistyped
+        // parameter.
+        if let Some(refusal) =
+            crate::state::configuration_arn::region_refusal(&input.arn, &region)
+        {
+            use crate::state::configuration_arn::ArnRegionRefusal;
+            return Err(match refusal {
+                ArnRegionRefusal::NotFound(error) => {
+                    ListConfigurationRevisionsErrorModeled::NotFoundException(error)
+                }
+                ArnRegionRefusal::BadRequest(error) => {
+                    ListConfigurationRevisionsErrorModeled::BadRequestException(error)
+                }
+            }
+            .into());
+        }
 
         // Reporting only: nothing here writes.
         let state = state.lock();

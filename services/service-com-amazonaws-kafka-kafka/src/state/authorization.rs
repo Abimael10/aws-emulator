@@ -26,15 +26,31 @@
 //! request, and whether THAT request is permitted is the identity-based half of the
 //! decision below. A value that is not an ARN at all
 //! carries no account to decide against, so the account test passes it; whether it
-//! is then refused depends on where the request carried it. An `@httpLabel` ARN of
-//! a CONTROL-plane operation names a path segment the caller can only have
-//! mistyped, and the handler's own ARN check answers it as the bad parameter it is.
-//! The TARGET of `CreateVpcConnection` is decided instead by
-//! [`authorize_target_cluster`], and a TOPIC call's `ClusterArn` by
-//! [`authorize_cluster_connect`]: the action applies to a cluster, so a value that
-//! READS as an ARN and names no cluster leaves nothing for a policy to be scoped
-//! to, and the decision — taken by [`no_grant_for_cluster`] — refuses the call
-//! before anything the request names is resolved or any member of the body is read.
+//! is then refused depends on what could have granted the action.
+//!
+//! A value that READS as an ARN and names no cluster is the first case: the action
+//! a cluster-scoped call asks for applies to a CLUSTER, and a permission for it is
+//! scoped to the cluster resource it is granted on, so such a value leaves nothing
+//! for a statement to be matched against, reaches no grant, and is refused by
+//! [`no_grant_for_cluster`] before anything the request names is resolved or any
+//! member of the body is read. A value that is no ARN AT ALL names no resource for
+//! a statement to be matched against either, so for those actions it is left to the
+//! operation's own parameter refusal, which is what the service answers for a
+//! mistyped path segment.
+//!
+//! For the four actions a cluster's own resource-based policy GOVERNS
+//! ([`CLUSTER_POLICY_ACTIONS`]) there is nothing else a grant can rest on: that
+//! document lives ON the cluster, so a request that names no cluster can reach no
+//! grant whatever the value's shape, and the authorization refusal is the answer
+//! for a value that is no ARN too — which is why `CreateVpcConnection`'s target
+//! has always been decided that way ([`authorize_target_cluster`]).
+//!
+//! That is one decision for every call whose target is a cluster, whichever plane
+//! it acts on: the control-plane gate ([`authorize_caller_operation`], taken by
+//! every operation that names a cluster by `ClusterArn`), the data-plane one a
+//! TOPIC call takes ([`authorize_cluster_connect`]), and the readers of one cluster
+//! OPERATION ([`authorize_cluster_operation_target`]), whose target is a resource
+//! of this service named by ARN just the same.
 //!
 //! An operation that CHANGES the cluster its ARN names and models no way to report
 //! the cluster's absence takes one step more ([`authorize_registered_cluster`]): an
@@ -136,17 +152,119 @@ pub fn authorize_cluster_connect<Eng: Send + Sync + 'static, E>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     cluster_arn: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    authorize_caller_action(engine, ctx, CLUSTER_CONNECT_ACTION, cluster_arn)?;
-    if ::service_common::arn::parse(cluster_arn).is_none() || crate::state::is_cluster_arn(cluster_arn)
-    {
-        return Ok(());
-    }
-    Err(no_grant_for_cluster(
+    authorize_cluster_action(engine, ctx, CLUSTER_CONNECT_ACTION, cluster_arn)
+}
+
+/// The same decision for the CONTROL-plane action of `operation` on the cluster its
+/// request names: the gate every operation whose target is one cluster takes,
+/// before it resolves that cluster or reads anything else of the request.
+///
+/// `kafka:<ApiName>` applies to a CLUSTER resource, and a permission for it is
+/// scoped to the cluster it is granted on — so the decision needs a value that
+/// names one. A value that IS an ARN and names no MSK cluster (another vendor's
+/// resource, another kind of this service's, or a `cluster/<name>/<id>` resource
+/// field it does not have) matches no resource-scoped permission of the caller's,
+/// reaches no grant, and is refused with the authorization refusal rather than with
+/// a description of what the value looks like: authorization is evaluated ahead of
+/// the service, so the request never reaches the parameter check that would describe
+/// the target, and the caller learns nothing about what this registry holds.
+///
+/// `operation` is the caller's own `Operation::NAME`, so the action can never drift
+/// from the operation taking the decision.
+pub fn authorize_caller_operation<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    cluster_arn: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    authorize_cluster_action(engine, ctx, &control_plane_action(operation), cluster_arn)
+}
+
+/// The same decision for an operation whose target is one cluster OPERATION,
+/// named by `ClusterOperationArn`.
+///
+/// Same rule, same reason: `kafka:<ApiName>` applies to the resource the request
+/// names, a permission for it is scoped to that resource, and a value that IS an
+/// ARN and names no cluster operation of this service matches none — so the
+/// decision is the authorization refusal rather than a description of the value's
+/// shape, taken before the operation is resolved.
+pub fn authorize_cluster_operation_target<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    operation_arn: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    authorize_named_resource(
         engine,
         ctx,
-        CLUSTER_CONNECT_ACTION,
+        &control_plane_action(operation),
+        operation_arn,
+        crate::state::is_cluster_operation_arn(operation_arn),
+        grantable_by_cluster_policy(&control_plane_action(operation)),
+    )
+}
+
+/// BOTH decisions over the cluster `cluster_arn` is meant to name, for `action` (a
+/// fully qualified IAM action): what the caller's own policies and the ARN's account
+/// say ([`authorize_caller_action`]), and then whether the value names a cluster for
+/// a resource-scoped permission to be matched against at all.
+///
+/// The ONE implementation behind the control-plane gate
+/// ([`authorize_caller_operation`]) and the data-plane one
+/// ([`authorize_cluster_connect`]), so the two cannot drift apart on which values
+/// reach a grant.
+fn authorize_cluster_action<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    cluster_arn: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    authorize_named_resource(
+        engine,
+        ctx,
+        action,
         cluster_arn,
-    ))
+        crate::state::is_cluster_arn(cluster_arn),
+        grantable_by_cluster_policy(action),
+    )
+}
+
+/// The decision for `action` on the resource `value` is meant to name, where
+/// `names_the_resource` says whether it names one of the kind the action applies
+/// to and `only_a_resource_policy_can_grant` whether the only document that can
+/// grant the action is the RESOURCE's own.
+///
+/// The ONE place the order lives, for every target this service decides over: the
+/// caller's own policies and the ARN's account first
+/// ([`authorize_caller_action`]), then whether there is a resource for a grant to
+/// rest on at all.
+///
+/// Where an identity-based document can grant the action, the decision is taken
+/// over the RESOURCE the value names: a value that IS an ARN and names no resource
+/// of the right kind matches no resource-scoped permission and reaches no grant,
+/// while a value that is no ARN at all names no resource for a statement to be
+/// matched against either way, so it is left to the operation's own parameter
+/// refusal — which is what this service answers for a mistyped path segment.
+///
+/// Where only the resource's OWN policy can grant it ([`CLUSTER_POLICY_ACTIONS`]),
+/// there is nothing else to fall back on: that document lives ON the cluster, so a
+/// value naming no cluster reaches no grant whatever its shape, and the
+/// authorization refusal is the answer for a value that is no ARN too.
+fn authorize_named_resource<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    value: &str,
+    names_the_resource: bool,
+    only_a_resource_policy_can_grant: bool,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    authorize_caller_action(engine, ctx, action, value)?;
+    let reads_as_a_resource =
+        only_a_resource_policy_can_grant || ::service_common::arn::parse(value).is_some();
+    if names_the_resource || !reads_as_a_resource {
+        return Ok(());
+    }
+    Err(no_grant_for_cluster(engine, ctx, action, value))
 }
 
 /// The wire error code an authorization refusal carries.
@@ -247,8 +365,12 @@ pub fn authorize_caller_action<Eng: Send + Sync + 'static, E>(
     authorize_action(action, target_arn)
 }
 
-/// The same gate for the control-plane action of `operation`.
-pub fn authorize_caller_operation<Eng: Send + Sync + 'static, E>(
+/// The same gate for the control-plane action of `operation`, over a target that is
+/// NOT a cluster of this service: it takes the caller's own policies and the ARN's
+/// account into account and nothing else. The operations whose target IS a cluster
+/// take [`authorize_caller_operation`], which also decides whether the value names
+/// one.
+fn authorize_caller_operation_only<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     operation: &str,
@@ -266,30 +388,17 @@ pub const ANY_RESOURCE: &str = "*";
 /// `target_arn` is meant to name, taken before anything resolves or parses that
 /// target.
 ///
-/// `kafka:<ApiName>` applies to a cluster resource, so the decision needs one: a
-/// value that names a cluster of another account is refused as
-/// [`authorize_caller_action`] refuses it, and a value that names no cluster of
-/// this account AT ALL leaves the action with no resource to be granted on, which
-/// [`no_grant_for_cluster`] answers. Either way the answer is the authorization
-/// refusal rather than a complaint about the value's shape: the decision comes
-/// first, so the request never reaches the parameter validation that would
-/// describe the target, and nothing of what this registry holds is disclosed.
+/// Every action this is taken for is one a cluster POLICY can grant, so it is
+/// [`authorize_caller_operation`] under another name — kept because
+/// `CreateVpcConnection` names its target in the BODY rather than in a path
+/// segment, which is the one place a reader of that handler looks.
 pub fn authorize_target_cluster<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     operation: &str,
     target_arn: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    authorize_caller_operation(engine, ctx, operation, target_arn)?;
-    if crate::state::is_cluster_arn(target_arn) {
-        return Ok(());
-    }
-    Err(no_grant_for_cluster(
-        engine,
-        ctx,
-        &control_plane_action(operation),
-        target_arn,
-    ))
+    authorize_caller_operation(engine, ctx, operation, target_arn)
 }
 
 /// The refusal for a request whose target value names no cluster of this service:
@@ -355,7 +464,7 @@ fn no_grant_for_cluster<Eng: Send + Sync + 'static, E>(
 /// no cluster of this service at all is left to the operation's own parameter
 /// refusal, which is what the service answers for a mistyped path segment; the
 /// caller's own policies and another account's ARN are decided first, by
-/// [`authorize_caller_operation`].
+/// [`authorize_caller_action`].
 pub fn authorize_registered_cluster<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -363,7 +472,7 @@ pub fn authorize_registered_cluster<Eng: Send + Sync + 'static, E>(
     cluster_arn: &str,
     region: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    authorize_caller_operation(engine, ctx, operation, cluster_arn)?;
+    authorize_caller_operation_only(engine, ctx, operation, cluster_arn)?;
     // A value that is not this service's cluster ARN names no cluster for the
     // decision to be taken over, and the operation answers it as the parameter it
     // is.

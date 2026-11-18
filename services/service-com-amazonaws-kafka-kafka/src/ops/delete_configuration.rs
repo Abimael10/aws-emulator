@@ -23,14 +23,21 @@
 //! stops holding the configuration down once those clusters are gone.
 //!
 //! An `Arn` this endpoint's region holds no configuration for — not shaped like an MSK
-//! configuration ARN, absent, deleted and gone, or belonging to another region — is a
+//! configuration ARN, absent, or deleted and gone — is a
 //! `BadRequestException` carrying
 //! [`crate::state::CONFIGURATION_ARN_NOT_FOUND_MESSAGE`], and NOT the
 //! `NotFoundException` the other resource families answer: every operation of the
-//! configuration family, this delete included, reports an ARN it cannot resolve as a
-//! bad request, through the one [`crate::state::configuration_arn_not_found`]
+//! configuration family, this delete included, reports an ARN of its OWN region that it
+//! cannot resolve as a bad request, through the one
+//! [`crate::state::configuration_arn_not_found`]
 //! envelope. One lookup decides it, since only an ARN the registry minted can resolve
 //! at all.
+//!
+//! An `Arn` of ANOTHER Region names a resource this endpoint does not serve, which the
+//! family's one reading of the region segment ([`crate::state::configuration_arn`])
+//! answers before the lookup, as the `NotFoundException` (404) — so a delete carrying a
+//! configuration ARN across Regions can never take this endpoint's own configuration.
+//! A region segment that is no Region at all is the parameter refusal (400).
 //!
 //! ## Shape of an operation
 //!
@@ -179,13 +186,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = std::time::SystemTime::now();
 
+        // The `Arn`'s own REGION segment, read before anything is resolved or
+        // written, through the family's one reading of it
+        // ([`crate::state::configuration_arn`]): a configuration of another Region
+        // is a resource this endpoint does not serve, so a delete carrying an ARN
+        // that was taken across Regions can never take the configuration this
+        // endpoint holds; a Region segment that is no Region at all is a mistyped
+        // parameter.
+        if let Some(refusal) =
+            crate::state::configuration_arn::region_refusal(&input.arn, &region)
+        {
+            use crate::state::configuration_arn::ArnRegionRefusal;
+            return Err(match refusal {
+                ArnRegionRefusal::NotFound(error) => {
+                    DeleteConfigurationErrorModeled::NotFoundException(error)
+                }
+                ArnRegionRefusal::BadRequest(error) => {
+                    DeleteConfigurationErrorModeled::BadRequestException(error)
+                }
+            }
+            .into());
+        }
+
         let mut state = state.lock();
         // One condition, one refusal: an `Arn` that resolves to no configuration
-        // of this region is a bad request, whether it is malformed, names a
-        // configuration another region holds, or named one whose asynchronous
-        // delete has already completed. Resolved before anything is written,
-        // through the same regional lookup the readers use, so a delete and a
-        // describe agree on which configurations this endpoint holds.
+        // of this region is a bad request, whether it is malformed, never minted,
+        // or named one whose asynchronous delete has already completed. Resolved
+        // before anything is written, through the same regional lookup the readers
+        // use, so a delete and a describe agree on which configurations this
+        // endpoint holds.
         let Some(configuration) = state.configuration_in(&region, &input.arn, now) else {
             return Err(DeleteConfigurationErrorModeled::BadRequestException(
                 crate::state::configuration_arn_not_found(),

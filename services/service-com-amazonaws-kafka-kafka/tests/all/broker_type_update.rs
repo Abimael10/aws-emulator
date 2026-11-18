@@ -485,10 +485,12 @@ async fn an_update_to_a_cluster_this_endpoint_does_not_hold_is_refused() {
         .create_ok_in("eu-central-1", &ClusterRequest::named("elsewhere"))
         .await;
 
-    // The rows differ along the KIND of ARN: not an ARN at all, an ARN of another
-    // service, the right service with the wrong resource type, a cluster resource
-    // missing its id, a well-formed ARN of no cluster, a deleted cluster and a
-    // cluster of another region.
+    // The rows differ along the KIND of ARN: not an ARN at all (the parameter
+    // refusal), an ARN of another service, the right service with the wrong
+    // resource type and a cluster resource missing its id (each an ARN that names
+    // no cluster, which authorization refuses before anything resolves), then a
+    // well-formed ARN of no cluster, a deleted cluster and a cluster of another
+    // region (the resolution's own miss).
     let unknown = format!(
         "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/ghost/11111111-2222-4333-8444-555555555555-9"
     );
@@ -497,20 +499,20 @@ async fn an_update_to_a_cluster_this_endpoint_does_not_hold_is_refused() {
         (
             "wrong-service",
             "arn:aws:s3:::my-bucket",
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "wrong-resource-type",
             "arn:aws:kafka:us-west-2:000000000000:configuration/demo/abc-1",
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "no-cluster-id",
             "arn:aws:kafka:us-west-2:000000000000:cluster/demo",
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         ("unknown-cluster", &unknown, 404, "NotFoundException"),
         ("deleted-cluster", &deleted_arn, 404, "NotFoundException"),

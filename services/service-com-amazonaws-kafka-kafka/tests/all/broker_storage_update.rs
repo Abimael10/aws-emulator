@@ -476,9 +476,12 @@ async fn an_update_outside_the_rule_is_refused_and_changes_nothing() {
     );
 
     // `(case, cluster arn, currentVersion, targetBrokerEBSVolumeInfo, status, code)`.
-    // Rows: each way the ARN can fail, each way the target list can fail (count,
-    // broker id, nothing to set), each bound of `EBSStorageInfo$VolumeSize` passed
-    // by one, a shrink, and a stale version.
+    // Rows: each way the ARN can fail — a value that is no ARN at all is the
+    // parameter refusal, one that IS an ARN and names no cluster is refused by
+    // authorization before anything resolves, and a well-formed cluster ARN this
+    // endpoint holds no cluster for is the miss — then each way the target list can
+    // fail (count, broker id, nothing to set), each bound of
+    // `EBSStorageInfo$VolumeSize` passed by one, a shrink, and a stale version.
     let rows: Vec<(&str, &str, &str, Value, u16, &str)> = vec![
         (
             "malformed-arn",
@@ -493,8 +496,8 @@ async fn an_update_outside_the_rule_is_refused_and_changes_nothing() {
             wrong_resource_type.as_str(),
             version.as_str(),
             json!([target("ALL", Some(200), None)]),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "absent-cluster",

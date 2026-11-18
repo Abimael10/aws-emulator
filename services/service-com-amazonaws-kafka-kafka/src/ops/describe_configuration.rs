@@ -13,14 +13,22 @@
 //! empty string.
 //!
 //! A configuration ARN belongs to one region, so a regional endpoint resolves
-//! only its own. ONE condition, one refusal: an `Arn` this endpoint resolves to
-//! no configuration — not shaped like an MSK configuration ARN, never minted,
-//! deleted and gone, or belonging to another region — is a `BadRequestException`
-//! (400) carrying [`crate::state::CONFIGURATION_ARN_NOT_FOUND_MESSAGE`], the one
+//! only its own — and WHICH region an `Arn` names is read before anything is
+//! resolved ([`crate::state::configuration_arn`]): an ARN of another Region AWS
+//! publishes names a resource this endpoint does not serve, which is a
+//! `NotFoundException` (404) carrying
+//! [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`], and an ARN whose region segment
+//! is no Region at all is the earlier parameter refusal (400,
+//! [`crate::state::BAD_REQUEST_MESSAGE`]).
+//!
+//! Behind that gate, ONE condition, one refusal: an `Arn` of THIS endpoint's
+//! region that resolves to no configuration — not shaped like an MSK
+//! configuration ARN, never minted, or deleted and gone — is a
+//! `BadRequestException` (400) carrying
+//! [`crate::state::CONFIGURATION_ARN_NOT_FOUND_MESSAGE`], the one
 //! envelope every operation of the configuration family reports an unresolvable
 //! configuration reference with
-//! ([`crate::state::configuration_arn_not_found`]), and NOT the
-//! `NotFoundException` the other resource families answer. One lookup decides
+//! ([`crate::state::configuration_arn_not_found`]). One lookup decides
 //! it, since only an ARN the registry minted can resolve at all.
 //!
 //! Authentication and authorization are NOT this handler's business: the emulator
@@ -183,6 +191,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         let now = std::time::SystemTime::now();
+
+        // The `Arn`'s own REGION segment, read before anything is resolved: a
+        // configuration of another Region is a resource this endpoint does not
+        // serve (the not-found refusal), and a Region segment that is no Region at
+        // all is a mistyped parameter — one reading for the whole family
+        // ([`crate::state::configuration_arn`]), so no operation resolves an ARN of
+        // another Region to a configuration of this one.
+        if let Some(refusal) =
+            crate::state::configuration_arn::region_refusal(&input.arn, &region)
+        {
+            use crate::state::configuration_arn::ArnRegionRefusal;
+            return Err(match refusal {
+                ArnRegionRefusal::NotFound(error) => {
+                    DescribeConfigurationErrorModeled::NotFoundException(error)
+                }
+                ArnRegionRefusal::BadRequest(error) => {
+                    DescribeConfigurationErrorModeled::BadRequestException(error)
+                }
+            }
+            .into());
+        }
 
         // Reporting only: nothing here writes. A configuration a delete has
         // accepted is still a resource of this endpoint until the clock owes its

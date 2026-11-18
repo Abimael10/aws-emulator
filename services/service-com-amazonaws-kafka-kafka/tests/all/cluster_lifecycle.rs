@@ -1087,10 +1087,14 @@ async fn a_cluster_is_only_visible_in_its_own_region() {
     );
 }
 
-/// RULE: a reader that models both errors separates a `ClusterArn` it cannot
-/// parse (`BadRequestException`, 400) from a well-formed one no live cluster holds
-/// (`NotFoundException`, 404); `GetBootstrapBrokers`, which models no
-/// `NotFoundException`, refuses both as a bad request.
+/// RULE: a reader that models both errors separates a well-formed `ClusterArn` no
+/// live cluster holds (`NotFoundException`, 404) from one that names no cluster at
+/// all, which is refused earlier still, by authorization
+/// (`AccessDeniedException`, 403), since nothing can hold a permission scoped to a
+/// cluster it does not name. `GetBootstrapBrokers`, which models no
+/// `NotFoundException`, answers the same code and status as the readers for the
+/// same reference; the DELETE, whose action no cluster policy governs, keeps the
+/// parameter refusal for a value that is no ARN at all.
 #[tokio::test]
 async fn an_unknown_or_malformed_cluster_arn_is_refused() {
     let emulator = Emulator::new();
@@ -1098,8 +1102,10 @@ async fn an_unknown_or_malformed_cluster_arn_is_refused() {
 
     // `(arn, expected status, expected error code)` for DescribeCluster and
     // DeleteCluster. Rows: well-formed but absent (two regions), then one row per
-    // way the ARN grammar can fail — not an ARN at all, wrong service, wrong
-    // resource type, an extra resource segment, and an empty region.
+    // way an ARN can name no cluster — wrong service, wrong resource type, an
+    // extra resource segment, and an empty region. A value that is not an ARN at
+    // all is answered differently by the two operations and is asserted after the
+    // table.
     let rows: Vec<(String, u16, &str)> = vec![
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/11111111-2222-4333-8444-555555555555-1"),
@@ -1111,26 +1117,25 @@ async fn an_unknown_or_malformed_cluster_arn_is_refused() {
             404,
             "NotFoundException",
         ),
-        ("not-an-arn".to_string(), 400, "BadRequestException"),
         (
             format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/present/abc-1"),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/present/abc"),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             format!("arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/present/abc/extra"),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
         (
             format!("arn:aws:kafka::{ACCOUNT}:cluster/present/abc-1"),
-            400,
-            "BadRequestException",
+            403,
+            "AccessDeniedException",
         ),
     ];
 
@@ -1154,8 +1159,9 @@ async fn an_unknown_or_malformed_cluster_arn_is_refused() {
             deleted.body
         );
         // `GetBootstrapBrokers` models no `NotFoundException`, yet the service
-        // answers the same code and status for the same reference: a malformed
-        // ARN is the bad request, an absent one the not-found.
+        // answers the same code and status for the same reference: an absent
+        // cluster is the not-found, and an ARN naming no cluster the authorization
+        // refusal.
         let brokers = emulator.bootstrap_brokers(arn).await;
         assert_eq!(
             (brokers.status, brokers.error_code()),
@@ -1163,6 +1169,38 @@ async fn an_unknown_or_malformed_cluster_arn_is_refused() {
             "case arn={arn:?}: expected {status} {code} from GetBootstrapBrokers, got {} {}",
             brokers.status,
             brokers.body
+        );
+    }
+
+    // A value that is no ARN at all names no resource for a statement to be
+    // matched against, so the DELETE keeps the service's parameter refusal. The
+    // two READERS' action is one only a cluster's own policy can grant, and that
+    // document lives on a cluster the request does not name, so no grant can rest
+    // on anything: they answer the authorization refusal instead.
+    let no_arn = "not-an-arn";
+    let deleted = emulator
+        .call("DELETE", &format!("/v1/clusters/{}", pct(no_arn)), None)
+        .await;
+    assert_eq!(
+        (deleted.status, deleted.error_code()),
+        (400, "BadRequestException"),
+        "case arn={no_arn:?}: expected the parameter refusal from DeleteCluster, got {} {}",
+        deleted.status,
+        deleted.body
+    );
+    for (case, reply) in [
+        ("DescribeCluster", emulator.describe(no_arn).await),
+        (
+            "GetBootstrapBrokers",
+            emulator.bootstrap_brokers(no_arn).await,
+        ),
+    ] {
+        assert_eq!(
+            (reply.status, reply.error_code()),
+            (403, "AccessDeniedException"),
+            "case arn={no_arn:?}: expected the authorization refusal from {case}, got {} {}",
+            reply.status,
+            reply.body
         );
     }
 

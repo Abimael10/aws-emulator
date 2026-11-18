@@ -9,10 +9,16 @@
 //! unresolvable-reference `BadRequestException`
 //! ([`crate::state::configuration_arn_not_found`]), the same refusal the delete
 //! and the other configuration readers answer. It is that one refusal whether
-//! the `Arn` resolves to no configuration (malformed, absent, already deleted,
-//! or another region's) or the configuration it resolves to holds no revision of
-//! the number asked for: neither reference resolves, so neither is reported as
+//! the `Arn` resolves to no configuration of THIS endpoint's region (malformed,
+//! absent, already deleted) or the configuration it resolves to holds no revision
+//! of the number asked for: neither reference resolves, so neither is reported as
 //! the missing resource the other resource families answer with.
+//!
+//! WHICH region the `Arn` names is read first, through the family's one reading of
+//! it ([`crate::state::configuration_arn`]): a revision of a configuration of
+//! another Region is a resource this endpoint does not serve, which is the
+//! `NotFoundException` (404), and a region segment that is no Region at all is the
+//! earlier parameter refusal (400).
 //!
 //! ## Shape of an operation
 //!
@@ -170,6 +176,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         let now = std::time::SystemTime::now();
+
+        // The `Arn`'s own REGION segment, read before anything is resolved, through
+        // the family's one reading of it ([`crate::state::configuration_arn`]): a
+        // configuration of another Region is a resource this endpoint does not
+        // serve, and a Region segment that is no Region at all is a mistyped
+        // parameter.
+        if let Some(refusal) =
+            crate::state::configuration_arn::region_refusal(&input.arn, &region)
+        {
+            use crate::state::configuration_arn::ArnRegionRefusal;
+            return Err(match refusal {
+                ArnRegionRefusal::NotFound(error) => {
+                    DescribeConfigurationRevisionErrorModeled::NotFoundException(error)
+                }
+                ArnRegionRefusal::BadRequest(error) => {
+                    DescribeConfigurationRevisionErrorModeled::BadRequestException(error)
+                }
+            }
+            .into());
+        }
 
         // Reporting only: nothing here writes. A stored revision never changes,
         // and a configuration whose delete is in flight still holds the

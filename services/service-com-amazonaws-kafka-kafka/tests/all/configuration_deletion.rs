@@ -402,10 +402,6 @@ async fn an_arn_that_names_no_configuration_is_refused() {
         ("never-minted-configuration", never_minted),
         ("another-account", other_account),
         ("another-service-namespace", other_service),
-        // Well formed and really registered — in ANOTHER region, which this
-        // endpoint does not serve.
-        ("another-regions-configuration", elsewhere.clone()),
-        ("this-regions-arn-with-another-region", wrong_region),
         // Registered once, taken by the delete above.
         ("already-deleted", already_deleted.clone()),
     ];
@@ -413,6 +409,29 @@ async fn an_arn_that_names_no_configuration_is_refused() {
     for (case, arn) in &refused {
         let reply = delete(&emulator, arn).await;
         assert_configuration_arn_resolves_to_nothing(&reply, case, arn, REGION);
+    }
+
+    // A configuration of ANOTHER Region is a different answer: the ARN names a
+    // resource this endpoint does not serve at all, which is the not-found refusal
+    // — so a delete carrying a configuration ARN across Regions can never take
+    // this endpoint's own. The rows are a configuration really registered
+    // elsewhere and this region's own ARN with only its region segment rewritten.
+    for (case, arn) in [
+        ("another-regions-configuration", elsewhere.clone()),
+        ("this-regions-arn-with-another-region", wrong_region),
+    ] {
+        let reply = delete(&emulator, &arn).await;
+        assert_eq!(
+            (reply.status, reply.error_code(), reply.error_message()),
+            (
+                404,
+                "NotFoundException",
+                "The requested resource doesn\u{2019}t exist."
+            ),
+            "case {case}: expected the not-found refusal, got {} {}",
+            reply.status,
+            reply.body
+        );
     }
 
     // Nothing above deleted anything: the configuration this endpoint holds is

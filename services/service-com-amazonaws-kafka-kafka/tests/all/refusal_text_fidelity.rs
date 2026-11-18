@@ -311,10 +311,14 @@ async fn a_reserved_tag_key_is_refused_in_the_services_fixed_words_whatever_its_
 }
 
 /// RULE: a `SecretArnList` entry that is not an AWS Secrets Manager secret ARN
-/// is refused with HTTP 400 `BadRequestException` carrying [`SECRET_ARN_INVALID`]
-/// as its whole message — the same sentence for both SCRAM batch operations,
-/// whatever the entry was and wherever in the list it sat, and with the entry
-/// itself not echoed back.
+/// is refused by `BatchAssociateScramSecret` with HTTP 400 `BadRequestException`
+/// carrying [`SECRET_ARN_INVALID`] as its whole message — whatever the entry was
+/// and wherever in the list it sat, and with the entry itself not echoed back.
+///
+/// The association is the only surface with this pass: `BatchDisassociateScramSecret`
+/// runs no syntax check over the list, because an entry that is no secret ARN names
+/// no association of the cluster for the same reason a never-associated one does, so
+/// both go through that operation's single contract (`scram_secrets.rs`).
 #[tokio::test]
 async fn a_secret_arn_that_names_no_secret_is_refused_in_the_services_fixed_words() {
     let emulator = Emulator::new();
@@ -341,10 +345,7 @@ async fn a_secret_arn_that_names_no_secret_is_refused_in_the_services_fixed_word
         ),
         ("an empty entry", String::new()),
     ];
-    let operations = [
-        ("BatchAssociateScramSecret", "POST"),
-        ("BatchDisassociateScramSecret", "PATCH"),
-    ];
+    let operations = [("BatchAssociateScramSecret", "POST")];
 
     for (operation, method) in operations {
         for (entry_case, entry) in &unusable {

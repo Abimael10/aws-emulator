@@ -585,9 +585,10 @@ async fn the_cluster_is_resolved_before_the_body() {
         "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/11111111-2222-4333-8444-555555555555-1"
     );
     let not_found: Vec<String> = vec![absent, elsewhere];
-    let bad_request: Vec<String> = vec![
-        "not-an-arn".to_string(),
-        String::new(),
+    let bad_request: Vec<String> = vec!["not-an-arn".to_string(), String::new()];
+    // Values that ARE ARNs and name no cluster: authorization refuses them before
+    // the cluster is resolved and before the body is read at all.
+    let unauthorized: Vec<String> = vec![
         format!("arn:aws:s3:{REGION}:{ACCOUNT}:cluster/present/abc-1"),
         format!("arn:aws:kafka:{REGION}:{ACCOUNT}:configuration/present/abc-1"),
         format!("arn:aws:kafka::{ACCOUNT}:cluster/present/abc-1"),
@@ -612,14 +613,15 @@ async fn the_cluster_is_resolved_before_the_body() {
         .iter()
         .map(|arn| (arn, 404))
         .chain(bad_request.iter().map(|arn| (arn, 400)))
+        .chain(unauthorized.iter().map(|arn| (arn, 403)))
     {
         for (body_case, body) in bodies {
             let case = format!("arn={arn:?} body={body_case}");
             let reply = update_version(&emulator, arn, body.clone()).await;
-            let code = if expected == 404 {
-                "NotFoundException"
-            } else {
-                "BadRequestException"
+            let code = match expected {
+                404 => "NotFoundException",
+                403 => "AccessDeniedException",
+                _ => "BadRequestException",
             };
             assert_eq!(
                 (reply.status, reply.error_code()),
@@ -631,7 +633,10 @@ async fn the_cluster_is_resolved_before_the_body() {
             // A malformed ARN names the member by its WIRE name, with the
             // service's one fixed parameter sentence; the not-found refusal of a
             // well-formed ARN is a different condition, so it keeps its own
-            // wording and token.
+            // wording and token; the authorization refusal names neither.
+            if expected == 403 {
+                continue;
+            }
             let member = if expected == 404 {
                 "ClusterArn"
             } else {

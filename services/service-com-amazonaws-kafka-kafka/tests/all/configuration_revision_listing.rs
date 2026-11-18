@@ -462,11 +462,12 @@ async fn an_unknown_or_malformed_arn_is_refused() {
     }
 
     // A configuration lives in one region, so another region's endpoint holds
-    // neither the configuration nor its revisions.
+    // neither the configuration nor its revisions: the ARN names a resource that
+    // endpoint does not serve, which is the not-found refusal.
     let elsewhere = list_in(&emulator, "eu-central-1", &arn, "").await;
     assert_eq!(
         (elsewhere.status, elsewhere.error_code()),
-        (400, "BadRequestException"),
+        (404, "NotFoundException"),
         "case region=eu-central-1: another region's endpoint must not list its revisions, \
          got {} {}",
         elsewhere.status,
