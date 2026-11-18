@@ -16,7 +16,13 @@
 //!   reached, so a delete arriving while the deployment is still in flight
 //!   answers 200 and leaves the name holding no plan — the model binds the
 //!   delete as an `@idempotent` `DELETE` answering 200 with an empty body, and
-//!   the only condition it refuses is a name the account holds no plan under.
+//!   the only condition it refuses is a name the account holds no plan under:
+//!   never `ConflictException`, which belongs to a concurrent action on the
+//!   plan and not to any span this emulator chose for the deployment, so a
+//!   create/use/delete sequence needs no retry and no settling wait;
+//! * the one condition the delete DOES refuse states the service's not-found
+//!   sentence verbatim — the same sentence the read of an unheld name states
+//!   (`report_plan_wire_form.rs`, which owns the spelling).
 //!
 //! Every case drives real HTTP through the router; the harness is the shared one
 //! in `vault_and_backup_job.rs`. The in-flight case states when the deployment
@@ -32,6 +38,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_backup_cryocontrollerusermanager::state::service_state;
 
 use crate::recovery_point_deletion::router_with_engine;
+use crate::report_plan_wire_form::not_found_message;
 use crate::vault_and_backup_job::{call_reported, error_code, router, string_at, ACCOUNT};
 
 /// The non-terminal status a fresh report plan's deployment carries, and the
@@ -461,6 +468,150 @@ async fn a_delete_during_the_deployment_removes_the_plan() {
         assert!(
             names_the_plan_and_the_account(&string_at(&missing, "Message"), name),
             "case {case:?}: the refusal must name the plan and the account, got {missing:?}"
+        );
+    }
+}
+
+/// The rows the no-retry table walks: the body the plan is created from, and how
+/// many READS the case makes between the create and the delete.
+///
+/// That count is the stage of the plan's own deployment the delete arrives at —
+/// nothing in the row waits for or polls that deployment, so the delete is sent
+/// as fast as the host will send it, which is exactly what a programmatic
+/// create/use/delete sequence does. The bodies differ along what the rule
+/// generalises over: the report template, whether a description, a key prefix,
+/// delivery formats, covered frameworks and tags are stated, and the name's
+/// length — a plain one, the shortest the model admits and the published maximum.
+fn immediate_delete_cases() -> Vec<(&'static str, Value, usize)> {
+    vec![
+        (
+            "the delete is the very next call after the create",
+            minimal_body("report_noretry_bare", REPORT_TEMPLATES[2]),
+            0,
+        ),
+        (
+            "one read of the plan between the create and the delete",
+            json!({
+                "ReportPlanName": "report_noretry_restore",
+                "ReportPlanDescription": "restore jobs of the day",
+                "ReportDeliveryChannel": {
+                    "S3BucketName": "audit-reports",
+                    "S3KeyPrefix": "restore/daily",
+                    "Formats": ["JSON", "CSV"],
+                },
+                "ReportSetting": {
+                    "ReportTemplate": REPORT_TEMPLATES[4],
+                    "FrameworkArns": [
+                        format!("arn:aws:backup:us-west-2:{ACCOUNT}:framework:one-1"),
+                    ],
+                },
+                "ReportPlanTags": {"team": "audit"},
+            }),
+            1,
+        ),
+        (
+            "two reads between the create and the delete, shortest name",
+            json!({
+                "ReportPlanName": plan_name_of_length(1),
+                "ReportDeliveryChannel": {"S3BucketName": "audit-reports"},
+                "ReportSetting": {"ReportTemplate": REPORT_TEMPLATES[0]},
+            }),
+            2,
+        ),
+        (
+            "the delete is the very next call, longest name the model admits",
+            json!({
+                "ReportPlanName": plan_name_of_length(MAX_NAME_LENGTH),
+                "ReportDeliveryChannel": {
+                    "S3BucketName": "audit-reports-two",
+                    "Formats": ["JSON"],
+                },
+                "ReportSetting": {
+                    "ReportTemplate": REPORT_TEMPLATES[1],
+                    "Accounts": ["ROOT"],
+                },
+            }),
+            0,
+        ),
+    ]
+}
+
+/// A delete of a plan the account holds is SERVED however recently that plan was
+/// created: it answers 200 with an empty body and the plan is gone, so a client
+/// never has to retry a teardown. The only condition the delete refuses is a
+/// name the account holds no plan under, and it states this service's not-found
+/// sentence verbatim for it.
+#[tokio::test]
+async fn a_delete_following_its_create_is_served_without_a_retry() {
+    for (case, body, reads_before_delete) in immediate_delete_cases() {
+        // One router per row: the row's account holds nothing another row stored.
+        let router = router();
+        let name = body["ReportPlanName"]
+            .as_str()
+            .expect("the create body names the plan")
+            .to_string();
+        create_one_plan(&router, case, &body).await;
+
+        // Reads only — nothing waits for the deployment the clock owes the plan,
+        // so whichever status it reports here the delete below must still be
+        // served.
+        for read_index in 0..reads_before_delete {
+            let (status, _errortype, read) = describe_plan(&router, &name).await;
+            let deployment_status = string_at(&read_plan(&read), "DeploymentStatus");
+            assert_eq!(
+                status, 200,
+                "case {case:?}: read {read_index} of the plan expected 200, got {status} {read:?}"
+            );
+            assert!(
+                [STATUS_CREATE_IN_PROGRESS, STATUS_COMPLETED].contains(&deployment_status.as_str()),
+                "case {case:?}: read {read_index} must report a modelled deployment status, got \
+                 {deployment_status:?}"
+            );
+        }
+
+        // ONE delete, not a retry loop: the first one must be served.
+        let (status, errortype, deleted) = delete_plan(&router, &name).await;
+        assert_eq!(
+            (status, errortype.as_str(), deleted.clone()),
+            (200, "<unset>", Value::Null),
+            "case {case:?}: the first delete must be served with an empty body, got {status} \
+             {errortype} {deleted:?}"
+        );
+
+        // And the plan is gone: the read of its name states the not-found
+        // sentence, as does a further delete of it.
+        let (status, errortype, missing) = describe_plan(&router, &name).await;
+        assert_eq!(
+            (
+                status,
+                errortype.as_str(),
+                error_code(&missing).as_str(),
+                string_at(&missing, "Message").as_str(),
+            ),
+            (
+                400,
+                "ResourceNotFoundException",
+                "ResourceNotFoundException",
+                not_found_message(&name).as_str(),
+            ),
+            "case {case:?}: the deleted plan must be gone, got {status} {missing:?}"
+        );
+        let (status, errortype, again) = delete_plan(&router, &name).await;
+        assert_eq!(
+            (
+                status,
+                errortype.as_str(),
+                error_code(&again).as_str(),
+                string_at(&again, "Message").as_str(),
+            ),
+            (
+                400,
+                "ResourceNotFoundException",
+                "ResourceNotFoundException",
+                not_found_message(&name).as_str(),
+            ),
+            "case {case:?}: the delete of a name holding no plan states the not-found sentence, \
+             got {status} {again:?}"
         );
     }
 }

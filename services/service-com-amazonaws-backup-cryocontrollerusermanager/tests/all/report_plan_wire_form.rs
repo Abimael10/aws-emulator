@@ -113,7 +113,11 @@ fn service_report_timing() -> Value {
 
 /// The sentence this service states for "the report plan asked about is not one
 /// this account holds".
-fn not_found_message(name: &str) -> String {
+///
+/// `pub(crate)` so the sibling suite that drives the same refusal through the
+/// DELETE binding (`report_plan_deletion.rs`) asserts against THIS spelling
+/// rather than keeping a second copy of it.
+pub(crate) fn not_found_message(name: &str) -> String {
     format!("Report plan {name} not found in account {ACCOUNT}.")
 }
 
