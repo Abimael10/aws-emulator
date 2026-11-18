@@ -471,8 +471,12 @@ pub fn group_does_not_exist(name: &str) -> String {
 /// associated schedules are deleted" (`DeleteScheduleGroup`): the group is on its
 /// way out, so it holds no schedule a write could address — which is a statement
 /// about the request, not a conflict a client may retry.
+///
+/// The leading clause is part of the refusal AWS words: it is what tells a client
+/// the group is on its way out and may be re-created, rather than that some other
+/// input was wrong.
 pub fn group_is_being_deleted(name: &str) -> String {
-    format!("Schedule group {name} is being deleted.")
+    format!("You cannot perform this operation because schedule group {name} is being deleted.")
 }
 
 /// The `ResourceNotFoundException` message for a schedule the addressed group

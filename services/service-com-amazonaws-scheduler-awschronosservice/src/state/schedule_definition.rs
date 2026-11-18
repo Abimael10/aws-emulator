@@ -23,10 +23,10 @@
 //!   schedule can invoke its target" (`CreateSchedule$StartDate` /
 //!   `$EndDate`): together they are an interval, and an interval that holds no
 //!   instant is a schedule that can never fire ([`schedule_window_violation`]).
-//! * both instants are stored at MILLISECOND resolution
+//! * both instants are stored at MILLISECOND resolution, at the NEAREST
+//!   millisecond to the instant the request stated
 //!   ([`to_millisecond_precision`]), which is the resolution a schedule's
-//!   timestamps are reported back at, and at the millisecond the request stated
-//!   rather than one below it.
+//!   timestamps are reported back at.
 //!
 //! The expression grammars are read by maintained parsers — the `cron` crate for
 //! a `cron(...)` body and `chrono` for an `at(...)` instant — rather than by a
@@ -224,9 +224,12 @@ fn cron_field_parses(index: usize, field: &str) -> bool {
         .is_ok()
 }
 
-/// How this service states a time zone no IANA zone answers to.
+/// How this service states a time zone no IANA zone answers to: the zone class of
+/// the failure, with the value the request carried, which is the only place the
+/// service reports WHICH member it rejected — so it is worded apart from the
+/// expression class ([`invalid_expression`]).
 fn invalid_timezone(timezone: &str) -> String {
-    format!("Invalid Schedule Expression Timezone {timezone}.")
+    format!("Invalid timezone {timezone}.")
 }
 
 /// Refuse a `ScheduleExpressionTimezone` that names no time zone; `None` for an
@@ -244,7 +247,7 @@ pub fn schedule_expression_timezone_violation(timezone: Option<&str>) -> Option<
 }
 
 /// How this service states a window whose boundaries are in the wrong order.
-const START_DATE_BEFORE_END_DATE: &str = "StartDate must be earlier than EndDate.";
+const START_DATE_BEFORE_END_DATE: &str = "The StartDate you specify must come before the EndDate.";
 
 /// How this service states a window that closed before it was asked for.
 const END_DATE_IN_THE_FUTURE: &str = "EndDate must be in the future.";
@@ -432,15 +435,23 @@ mod tests {
 
     /// An instant is held at the millisecond NEAREST the one the request stated,
     /// so a remainder the wire's floating-point form lands just short of is held
-    /// at the millisecond it names rather than the one below it.
+    /// at the millisecond it names rather than the one below it, and one in the
+    /// upper half of its millisecond lands on the millisecond above.
     #[test]
     fn an_instant_is_held_to_the_nearest_millisecond() {
         // (case, submitted nanos, the second held, the nanos held)
-        let rows: [(&str, u32, i64, u32); 9] = [
+        let rows: [(&str, u32, i64, u32); 15] = [
             ("a whole second", 0, 7, 0),
             ("whole milliseconds", 123_000_000, 7, 123_000_000),
+            // A remainder in the LOWER half of its millisecond keeps it.
             ("microseconds", 123_456_000, 7, 123_000_000),
             ("nanoseconds", 123_456_789, 7, 123_000_000),
+            ("under half a millisecond", 499_999, 7, 0),
+            ("half a second", 500_000_000, 7, 500_000_000),
+            // A remainder in the UPPER half lands on the millisecond above.
+            ("past half a millisecond", 123_600_000, 7, 124_000_000),
+            ("microseconds rounding up", 777_777_000, 7, 778_000_000),
+            ("nanoseconds rounding up", 613_600_001, 7, 614_000_000),
             // Just short of a whole millisecond is that millisecond: this is the
             // shape a decimal remainder read through a binary float arrives in.
             ("a nanosecond under a millisecond", 999_999, 7, 1_000_000),
@@ -450,11 +461,13 @@ mod tests {
                 7,
                 120_000_000,
             ),
-            ("past half a millisecond", 123_600_000, 7, 124_000_000),
+            // Exactly half a millisecond rounds up, away from zero.
+            ("half a millisecond", 500_000, 7, 1_000_000),
+            ("half a millisecond into the second", 1_500_000, 7, 2_000_000),
             // A remainder that rounds up to a whole second carries into the next
             // second and leaves no remainder behind.
             ("a nanosecond under a second", 999_999_999, 8, 0),
-            ("half a second", 500_000_000, 7, 500_000_000),
+            ("half a millisecond under the second", 999_500_000, 8, 0),
         ];
 
         for (case, submitted, held_secs, held_nanos) in rows {
@@ -464,6 +477,11 @@ mod tests {
                 (held_secs, held_nanos),
                 "case {case:?}: expected the instant held at {held_secs}s {held_nanos}ns, got \
                  {normalised:?}"
+            );
+            assert_eq!(
+                normalised.subsec_nanos() % NANOS_PER_MILLISECOND,
+                0,
+                "case {case:?}: a held instant carries whole milliseconds, got {normalised:?}"
             );
         }
     }

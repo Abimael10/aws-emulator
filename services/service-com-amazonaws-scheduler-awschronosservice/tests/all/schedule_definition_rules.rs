@@ -411,6 +411,14 @@ async fn an_instant_round_trips_at_the_resolution_the_service_holds_it() {
     }
 }
 
+/// How long a suite keeps looking for a deleted group's removal: generous next to
+/// the span the service holds a group in `DELETING` for, so the wait ends on the
+/// condition and not on the host's speed.
+const GROUP_REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long one look for that removal waits before looking again.
+const GROUP_REMOVAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
 #[tokio::test]
 async fn a_group_whose_deletion_is_under_way_takes_no_write() {
     let router = scheduler_router();
@@ -460,7 +468,9 @@ async fn a_group_whose_deletion_is_under_way_takes_no_write() {
     );
     assert_eq!(
         error_message(&body),
-        format!("Schedule group {group} is being deleted."),
+        format!(
+            "You cannot perform this operation because schedule group {group} is being deleted."
+        ),
         "expected the refusal to name the group being deleted, got {body}"
     );
 
@@ -488,7 +498,22 @@ async fn a_group_whose_deletion_is_under_way_takes_no_write() {
     // operation addressed into it reports the GROUP as missing: the group a request
     // names is resolved before the schedule inside it, so a request into a group that
     // no longer exists never names the schedule that group would have held.
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    // The removal is due a short span after the delete; this waits for the
+    // CONDITION (the group is gone) rather than for a fixed time, looking again
+    // until a deadline far longer than that span has passed.
+    let deadline = std::time::Instant::now() + GROUP_REMOVAL_PATIENCE;
+    loop {
+        let (status, _) = call(&router, "GET", &format!("/schedule-groups/{group}"), None).await;
+        if status == 404 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case \"the group's removal becomes due\": GetScheduleGroup still answers \
+             {status} for {group}"
+        );
+        tokio::time::sleep(GROUP_REMOVAL_POLL_INTERVAL).await;
+    }
     for (case, method, expected) in [
         (
             "GetSchedule",
