@@ -33,10 +33,14 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::harness::{rpc, Emulator, REGION};
 
 /// The IAM action an invocation performs, which is what a grant for this service has to name.
-const INVOKE_ACTION: &str = "lambda:InvokeFunction";
+pub(crate) const INVOKE_ACTION: &str = "lambda:InvokeFunction";
 
 /// The principal AWS has a client grant a Lambda alarm action to.
-const ALARM_ACTION_PRINCIPAL: &str = "lambda.alarms.cloudwatch.amazonaws.com";
+pub(crate) const ALARM_ACTION_PRINCIPAL: &str = "lambda.alarms.cloudwatch.amazonaws.com";
+
+/// The `StatementId` the grant below is written under, which is also how it is addressed to be
+/// withdrawn again (`RemovePermission`).
+pub(crate) const STATEMENT_ID: &str = "cloudwatch-alarm-action";
 
 /// The module and attribute the deployment package carries its handler as.
 const HANDLER: &str = "lambda_function.lambda_handler";
@@ -47,7 +51,7 @@ const ROLE: &str = "arn:aws:iam::000000000000:role/lambda-exec";
 
 /// What the handler prints, which is the line a client reading the function's log group looks
 /// for.
-const PRINTED_PREFIX: &str = "ALARMED:";
+pub(crate) const PRINTED_PREFIX: &str = "ALARMED:";
 
 /// How long this suite waits for work another service's clock owes — a created function
 /// becoming `Active`, the asynchronous invocation, and the handler's own log delivery — before
@@ -63,7 +67,7 @@ const LOOK_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// "During this time, you can't invoke or modify the function" (`CreateFunction`), so an
 /// invocation withheld after this is the policy's refusal and not the lifecycle's.
-async fn until_active(emulator: &Emulator, case: &str, function: &str) {
+pub(crate) async fn until_active(emulator: &Emulator, case: &str, function: &str) {
     let looks = WORK_WAIT.as_millis() / LOOK_INTERVAL.as_millis().max(1);
     let mut last = Value::Null;
     for _ in 0..looks {
@@ -97,7 +101,7 @@ def lambda_handler(event, context):
 /// `core/router/src/lib.rs` mounts them: the invocation CloudWatch makes reaches Lambda's own
 /// handler, which runs the function, and the lines it printed are delivered into the log group
 /// this suite reads.
-fn emulator_with_lambda() -> Emulator {
+pub(crate) fn emulator_with_lambda() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -127,7 +131,12 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// One AWS Lambda call over its `restJson1` wire, answering its status and parsed body.
-async fn lambda(emulator: &Emulator, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+pub(crate) async fn lambda(
+    emulator: &Emulator,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
     let payload = body.map(|value| value.to_string()).unwrap_or_default();
     let request = http::Request::builder()
         .method(method)
@@ -163,7 +172,7 @@ async fn logs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value
 }
 
 /// One CloudWatch call that must answer 200.
-async fn monitoring(emulator: &Emulator, operation: &str, body: &Value) -> Value {
+pub(crate) async fn monitoring(emulator: &Emulator, operation: &str, body: &Value) -> Value {
     rpc(
         emulator,
         "monitoring",
@@ -224,7 +233,7 @@ fn package() -> String {
 }
 
 /// Create the function an alarm action names, and answer the ARN Lambda assigned it.
-async fn create_function(emulator: &Emulator, case: &str, name: &str) -> String {
+pub(crate) async fn create_function(emulator: &Emulator, case: &str, name: &str) -> String {
     let (status, created) = lambda(
         emulator,
         "POST",
@@ -251,7 +260,7 @@ async fn create_function(emulator: &Emulator, case: &str, name: &str) -> String 
 
 /// Add one statement to the function's resource-based policy through `AddPermission`, which is
 /// how a client grants this service the invocation.
-async fn add_permission(
+pub(crate) async fn add_permission(
     emulator: &Emulator,
     case: &str,
     function: &str,
@@ -259,7 +268,7 @@ async fn add_permission(
     source_arn: Option<&str>,
 ) {
     let mut body = json!({
-        "StatementId": "cloudwatch-alarm-action",
+        "StatementId": STATEMENT_ID,
         "Action": action,
         "Principal": ALARM_ACTION_PRINCIPAL,
     });
@@ -282,7 +291,7 @@ async fn add_permission(
 /// The lines `FilterLogEvents` reports for the function's own log group — "By default, Lambda
 /// functions send logs to a default log group named `/aws/lambda/<function name>`"
 /// (`LoggingConfig$LogGroup`).
-async fn logged(emulator: &Emulator, function: &str) -> Vec<String> {
+pub(crate) async fn logged(emulator: &Emulator, function: &str) -> Vec<String> {
     let (status, body) = logs(
         emulator,
         "FilterLogEvents",
@@ -305,7 +314,7 @@ async fn logged(emulator: &Emulator, function: &str) -> Vec<String> {
 
 /// Wait until the function's log group holds the line the handler prints, and answer every line
 /// it holds by then. The wait is for the CONDITION rather than for a span.
-async fn until_logged(emulator: &Emulator, function: &str) -> Vec<String> {
+pub(crate) async fn until_logged(emulator: &Emulator, function: &str) -> Vec<String> {
     let looks = WORK_WAIT.as_millis() / LOOK_INTERVAL.as_millis().max(1);
     for _ in 0..looks {
         let lines = logged(emulator, function).await;
@@ -318,7 +327,7 @@ async fn until_logged(emulator: &Emulator, function: &str) -> Vec<String> {
 }
 
 /// The `Action` history items the alarm `name` holds, as `DescribeAlarmHistory` reports them.
-async fn action_items(emulator: &Emulator, name: &str) -> Vec<Value> {
+pub(crate) async fn action_items(emulator: &Emulator, name: &str) -> Vec<Value> {
     let body = monitoring(
         emulator,
         "DescribeAlarmHistory",
