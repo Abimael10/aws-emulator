@@ -152,6 +152,32 @@ pub struct SigningCaller {
     /// Set when the credential the request presented is a session that has already expired, so
     /// it speaks for nobody at all ([`EXPIRED_CREDENTIAL_MESSAGE`]).
     expired: bool,
+    /// Who that principal IS, as `sts:GetCallerIdentity` reports it — its unique id, the
+    /// account it belongs to and its ARN. The facts a call names its caller by
+    /// ([`Self::authenticated`]); empty for a credential that speaks for nobody.
+    identity: sts_store::Identity,
+    /// The access key id the request presented, which is the credential a call reports the
+    /// caller signed with ([`Self::authenticated`]).
+    access_key_id: String,
+}
+
+/// Who API Gateway AUTHENTICATED for one call, as the call names its caller.
+///
+/// An `AWS_IAM` method's request is authenticated as the principal its SigV4 credential speaks
+/// for ([`signing_caller`]), so such a call knows who made it and reports it: the access key
+/// the request signed with, the account that principal belongs to, the principal's own unique
+/// id and its ARN. A method that authenticates nobody has none of this to report.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedCaller {
+    /// The access key id the request signed with.
+    pub access_key: String,
+    /// The account the principal belongs to.
+    pub account_id: String,
+    /// The principal's unique id, as `sts:GetCallerIdentity` reports it — an IAM user's own
+    /// id, and a role session's `<role id>:<session name>`.
+    pub principal_id: String,
+    /// The principal's ARN, the same value a refusal naming it carries.
+    pub arn: String,
 }
 
 impl SigningCaller {
@@ -186,6 +212,24 @@ impl SigningCaller {
         self.expired
     }
 
+    /// Who this credential authenticates its request as, for the call to report
+    /// ([`AuthenticatedCaller`]).
+    ///
+    /// `None` for a credential that speaks for nobody: a session the clock has run out on, and
+    /// a request that presented no access key id at all.
+    #[must_use]
+    pub fn authenticated(&self) -> Option<AuthenticatedCaller> {
+        if self.expired || self.access_key_id.is_empty() || self.identity.arn.is_empty() {
+            return None;
+        }
+        Some(AuthenticatedCaller {
+            access_key: self.access_key_id.clone(),
+            account_id: self.identity.account.clone(),
+            principal_id: self.identity.user_id.clone(),
+            arn: self.identity.arn.clone(),
+        })
+    }
+
     /// Read what the IAM identity `identity_arn` names may do, through IAM's own accessors.
     fn read_policies_of(
         &mut self,
@@ -199,6 +243,16 @@ impl SigningCaller {
             self.unreadable_attachment = !policies.uncarried.is_empty();
         }
         self.boundary = store.permissions_boundary_document(identity_arn);
+    }
+}
+
+/// The identity of a credential that speaks for NOBODY: a session the clock has run out on
+/// names no principal, so there is no id, no account and no ARN for a call to report.
+fn nobody() -> sts_store::Identity {
+    sts_store::Identity {
+        user_id: String::new(),
+        account: String::new(),
+        arn: String::new(),
     }
 }
 
@@ -224,8 +278,8 @@ pub fn signing_caller<Eng: Send + Sync + 'static>(
     });
     // No STS store on this engine: the only identity a request can present is the account's
     // own published credential, which no mint scoped.
-    let (identity_arn, session_policies) = match resolved {
-        Some(Ok(caller)) => (caller.identity.arn.clone(), caller.session_policies.clone()),
+    let (identity, session_policies) = match resolved {
+        Some(Ok(caller)) => (caller.identity.clone(), caller.session_policies.clone()),
         // The session credential has expired, so it speaks for nobody: no documents, no
         // principal spelling, and the invoke it asks for is refused as an expired credential
         // rather than as an authorization failure. The key id it presented is NOT quoted back,
@@ -242,14 +296,17 @@ pub fn signing_caller<Eng: Send + Sync + 'static>(
                 account_credential: false,
                 unreadable_attachment: false,
                 expired: true,
+                identity: nobody(),
+                access_key_id: access_key_id.to_string(),
             };
         }
         None => (
-            sts_store::ambient_identity().arn,
+            sts_store::ambient_identity(),
             sts_store::SessionPolicies::default(),
         ),
     };
 
+    let identity_arn = identity.arn.clone();
     let mut caller = SigningCaller {
         account_credential: identity_arn == sts_store::ambient_identity().arn,
         spellings: vec![identity_arn.clone()],
@@ -262,6 +319,8 @@ pub fn signing_caller<Eng: Send + Sync + 'static>(
         scope: sts_store::session_scoping_documents(None, &session_policies),
         unreadable_attachment: false,
         expired: false,
+        identity,
+        access_key_id: access_key_id.to_string(),
     };
     let Some(iam) = iam_store::service_state(engine) else {
         return caller;
@@ -272,16 +331,15 @@ pub fn signing_caller<Eng: Send + Sync + 'static>(
     // minted is the account's ambient identity — but IAM's store maps an access key id to the
     // user that owns it, so a request signed with one speaks for THAT user and is judged on the
     // user's policies. A key the IAM store does not hold either really is the account's own
-    // published credential.
+    // published credential. WHICH identity a long-term key speaks for is STS's own reading of
+    // IAM's records ([`sts_store::long_term_identity`]), called rather than repeated here.
     if caller.account_credential {
-        if let Some(user) = store
-            .access_keys
-            .get(access_key_id)
-            .and_then(|record| store.users.get(&record.user_key))
-        {
+        let long_term = sts_store::long_term_identity(Some(&store), access_key_id);
+        if long_term.arn != sts_store::ambient_identity().arn {
             caller.account_credential = false;
-            caller.arn = user.arn.clone();
-            caller.spellings = vec![user.arn.clone()];
+            caller.arn = long_term.arn.clone();
+            caller.spellings = vec![long_term.arn.clone()];
+            caller.identity = long_term;
         }
     }
     if let Some(role_name) = ::service_common::iam_role::assumed_role_session_role_name(&caller.arn)
@@ -478,6 +536,56 @@ mod tests {
             account_credential: false,
             unreadable_attachment: false,
             expired: false,
+            identity: sts_store::Identity {
+                user_id: "AROAEXAMPLEPOOLAUTH01:CognitoIdentity".to_string(),
+                account: "000000000000".to_string(),
+                arn: "arn:aws:sts::000000000000:assumed-role/pool-authenticated/CognitoIdentity"
+                    .to_string(),
+            },
+            access_key_id: "ASIAEXAMPLESESSION001".to_string(),
+        }
+    }
+
+    /// RULE: a credential that authenticates reports the principal it speaks for — the key it
+    /// signed with, that principal's account, its unique id and its ARN — and one that speaks
+    /// for nobody reports none of it.
+    #[test]
+    fn a_caller_reports_the_principal_its_credential_speaks_for() {
+        let live = session(&[]);
+        let authenticated = live
+            .authenticated()
+            .expect("case \"a live session\": expected a principal to be reported");
+        assert_eq!(
+            (
+                authenticated.access_key.as_str(),
+                authenticated.account_id.as_str(),
+                authenticated.principal_id.as_str(),
+                authenticated.arn.as_str(),
+            ),
+            (
+                "ASIAEXAMPLESESSION001",
+                "000000000000",
+                "AROAEXAMPLEPOOLAUTH01:CognitoIdentity",
+                "arn:aws:sts::000000000000:assumed-role/pool-authenticated/CognitoIdentity",
+            ),
+            "case \"a live session\": got {authenticated:?}"
+        );
+
+        // Rows differ along WHY the credential speaks for nobody.
+        let mut expired = session(&[]);
+        expired.expired = true;
+        expired.identity = nobody();
+        let mut unsigned = session(&[]);
+        unsigned.access_key_id = String::new();
+        for (case, caller) in [
+            ("a session the clock has run out on", expired),
+            ("a request carrying no access key id", unsigned),
+        ] {
+            let reported = caller.authenticated();
+            assert!(
+                reported.is_none(),
+                "case {case:?}: expected no principal to be reported, got {reported:?}"
+            );
         }
     }
 

@@ -199,6 +199,11 @@ const FORWARDED_FOR_HEADER: &str = super::FORWARDED_FOR_HEADER;
 /// The request header the caller's user agent travels in; see [`FORWARDED_FOR_HEADER`].
 const USER_AGENT_HEADER: &str = super::USER_AGENT_HEADER;
 
+/// The `$context` member path prefix of every value naming who made the call, which is the
+/// namespace this event reports as its `requestContext.identity`; see
+/// [`super::IDENTITY_MEMBER_PREFIX`].
+const IDENTITY_MEMBER_PREFIX: &str = super::IDENTITY_MEMBER_PREFIX;
+
 /// The request headers the event does NOT carry over from the caller's request: the two the
 /// caller's own SigV4 CREDENTIAL travels in.
 ///
@@ -1048,12 +1053,17 @@ fn request_context(call: &MethodRequest, stage: &str) -> Value {
     Value::Object(reported)
 }
 
-/// The `identity` of the event: what the REQUEST says about who made it, and nothing else.
+/// The `identity` of the event: what the REQUEST says about who made it, and WHO the method's
+/// own authorization authenticated for it.
 ///
-/// Only the two values a request off the wire carries are reported — the address the request
-/// came from and the user agent it declared — because every other member of this object
-/// names a principal API Gateway authenticated, and a method is authenticated by its own
-/// `authorizationType` rather than by this object.
+/// The two values a request off the wire carries are the address it came from and the user
+/// agent it declared. Beside them stand the members that name the PRINCIPAL API Gateway
+/// authenticated for this call — `accessKey`, `accountId`, `caller`, `user` and `userArn` of an
+/// `AWS_IAM` method's SigV4 caller — which the call carries under the `$context.identity`
+/// member paths this object reports them by ([`super::IDENTITY_MEMBER_PREFIX`]), read from
+/// there rather than resolved again: the event the function is handed and the record the stage
+/// logs name one caller one way. A method API Gateway authenticates nobody for carries none of
+/// them, so this object reports none.
 ///
 /// `sourceIp` is "the source IP address of the TCP connection making the request": the
 /// FIRST hop a forwarder recorded where the request reached the emulator through one, and
@@ -1070,6 +1080,11 @@ fn identity(call: &MethodRequest) -> Value {
     );
     if let Some(agent) = header_of(call, USER_AGENT_HEADER) {
         reported.insert("userAgent".to_string(), json!(agent));
+    }
+    for (member, value) in &call.inputs.context {
+        if let Some(name) = member.strip_prefix(IDENTITY_MEMBER_PREFIX) {
+            reported.insert(name.to_string(), json!(value));
+        }
     }
     Value::Object(reported)
 }

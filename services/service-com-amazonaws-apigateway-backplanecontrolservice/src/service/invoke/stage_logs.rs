@@ -104,6 +104,11 @@ pub(super) struct Recorded {
     /// `$context` member path a reference reads it by, which a record's format may name as
     /// `$context.authorizer.<member>`; empty for a request no authorizer decided.
     pub(super) authorized: BTreeMap<String, String>,
+    /// WHO the request's own authorization AUTHENTICATED, each under the `$context.identity`
+    /// member path a reference reads it by ([`super::authenticated_identity`]); empty for a
+    /// call API Gateway authenticated no principal for, which is every method whose
+    /// `authorizationType` is not `AWS_IAM`.
+    pub(super) authenticated: BTreeMap<String, String>,
     /// The configuration error the method's integration ran into, for a request the stage
     /// could not serve through it and for one whose backend answered something API Gateway
     /// could not use; `None` for every request whose integration answered usably, was
@@ -371,6 +376,16 @@ fn planned<Eng: Send + Sync + 'static>(
     context.extend(
         recorded
             .authorized
+            .iter()
+            .map(|(member, value)| (member.clone(), value.clone())),
+    );
+    // WHO the request's authorization authenticated, under the `$context.identity` member
+    // paths the address and the user agent of the call sit under: `$context.identity.caller`
+    // and the members beside it are access-log variables, and the values they report are the
+    // ones the serving resolved — never a second reading of the caller taken after the fact.
+    context.extend(
+        recorded
+            .authenticated
             .iter()
             .map(|(member, value)| (member.clone(), value.clone())),
     );

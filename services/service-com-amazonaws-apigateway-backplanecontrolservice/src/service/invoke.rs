@@ -1808,6 +1808,37 @@ async fn serving<Eng: Send + Sync + 'static>(
             // never set on carries none, which is the empty map to resolve against.
             let stage_variables = stage.variables.clone().unwrap_or_default();
 
+            let mut context = call_context(
+                &api.id,
+                &stage.stage_name,
+                matched_path,
+                // The path the CLIENT addressed within the api, which `$context.path` reports
+                // stage-qualified: the template `matched_path` carries a parameter's name, and
+                // the path asked for carries its value.
+                &resource_path,
+                req,
+                request_id,
+                SystemTime::now(),
+            );
+            // WHO the method's authorization authenticated for this call, under the same
+            // `$context.identity` member paths the address and the user agent it carries sit
+            // under ([`authenticated_identity`]). A method that authenticates nobody — every
+            // `authorizationType` but `AWS_IAM` — adds none of them, and the call reports none.
+            let authenticated = signing
+                .as_ref()
+                .and_then(execute_api_authorization::SigningCaller::authenticated)
+                .map(authenticated_identity)
+                .unwrap_or_default();
+            context.extend(
+                authenticated
+                    .iter()
+                    .map(|(member, value)| (member.clone(), value.clone())),
+            );
+            // The STAGE's own access-log record names the caller from the same reading, so what
+            // was authenticated travels to the funnel that delivers it ([`stage_logs`]) rather
+            // than being resolved a second way there.
+            recorded.authenticated = authenticated;
+
             let mut call = MethodRequest::of_request(
                 req,
                 // What a mapping template of this call renders against: the method request as
@@ -1819,19 +1850,7 @@ async fn serving<Eng: Send + Sync + 'static>(
                     querystring: sent_query_parameters(query_of(req.uri())),
                     header: sent_headers(req),
                     stage_variables: stage_variables.clone(),
-                    context: call_context(
-                        &api.id,
-                        &stage.stage_name,
-                        matched_path,
-                        // The path the CLIENT addressed within the api, which
-                        // `$context.path` reports stage-qualified: the template
-                        // `matched_path` carries a parameter's name, and the path asked for
-                        // carries its value.
-                        &resource_path,
-                        req,
-                        request_id,
-                        SystemTime::now(),
-                    ),
+                    context,
                 },
                 // What a PROXY integration's event names this call by, which a template has
                 // no reference for: the request as the CLIENT sent it (its own verb, every
@@ -4335,6 +4354,48 @@ fn call_context(
         context.insert("identity.userAgent".to_string(), agent.to_string());
     }
     context
+}
+
+/// The `$context` member path prefix of every value that says WHO made a call — the address
+/// it came from, the user agent it declared, and the principal its authorization
+/// authenticated ([`authenticated_identity`]).
+///
+/// `pub(super)` because a PROXY integration's event reports that whole namespace as its
+/// `requestContext.identity` ([`lambda_proxy`]): one reading of who called, so the event the
+/// function is handed, the template the integration renders and the record the stage logs
+/// cannot name one caller three ways.
+pub(super) const IDENTITY_MEMBER_PREFIX: &str = "identity.";
+
+/// The `$context.identity` members that name the PRINCIPAL a method's authorization
+/// authenticated for a call, keyed by the member path a reference reads each by.
+///
+/// `$context.identity.accessKey` is "the AWS access key associated with the request",
+/// `accountId` "the AWS account ID associated with the request", `caller` "the principal
+/// identifier of the caller making the request", `user` "the principal identifier of the user
+/// making the request" and `userArn` "the Amazon Resource Name (ARN) of the effective user of
+/// the request" — all of them facts about the credential the request SIGNED with, so each is
+/// read off the principal that credential speaks for
+/// ([`execute_api_authorization::AuthenticatedCaller`]) and off nothing else. API Gateway
+/// authenticates such a principal for an `AWS_IAM` method and for no other
+/// `authorizationType`, so a call it authenticated nobody for carries none of these members
+/// at all rather than carrying them empty.
+///
+/// What is reported of the credential is its access key ID — the identifier AWS names in this
+/// very member, which authenticates nothing on its own. The secret the request signed with,
+/// the session token it presented and the signature it computed are reported nowhere: the
+/// headers they travel in stay withheld from an integration's event and from a
+/// passed-through request ([`lambda_proxy`]).
+fn authenticated_identity(
+    authenticated: execute_api_authorization::AuthenticatedCaller,
+) -> BTreeMap<String, String> {
+    let member = |name: &str| format!("{IDENTITY_MEMBER_PREFIX}{name}");
+    BTreeMap::from([
+        (member("accessKey"), authenticated.access_key),
+        (member("accountId"), authenticated.account_id),
+        (member("caller"), authenticated.principal_id.clone()),
+        (member("user"), authenticated.principal_id),
+        (member("userArn"), authenticated.arn),
+    ])
 }
 
 /// The path the api's OWN endpoint carries for a call of `stage` that addressed
