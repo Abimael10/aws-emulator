@@ -294,8 +294,11 @@ async fn every_accepted_update_mints_the_next_version_and_applies_it() {
             request["ApplicationName"] = json!(name);
             // The two members an update addresses a version by — "you must provide the
             // CurrentApplicationVersionId or the ConditionalToken" — used in turn, so the
-            // advance is asserted for both ways of naming the version in force.
-            if step % 2 == 0 {
+            // advance is asserted for both ways of naming the version in force. A Studio
+            // notebook's version is addressed by its ID alone
+            // (`cloud_watch_logging_options.rs` asserts that rule), so the notebook chain
+            // names the ID throughout.
+            if step % 2 == 0 || runtime.starts_with("ZEPPELIN-") {
                 request["CurrentApplicationVersionId"] = json!(in_force);
             } else {
                 request["ConditionalToken"] = json!(tokens
@@ -411,26 +414,36 @@ async fn a_refused_update_mints_no_version() {
              superseding 1, got {before}"
         );
         let in_force = token_of(&before, chain_case);
+        // A Studio notebook's version is addressed by `CurrentApplicationVersionId` alone, so
+        // a token addresses no version there at all and the refusal is about the member that
+        // is missing rather than about an address that is stale
+        // (`cloud_watch_logging_options.rs` asserts that rule).
+        let token_refusal = if runtime.starts_with("ZEPPELIN-") {
+            "InvalidArgumentException"
+        } else {
+            "ConcurrentModificationException"
+        };
 
         // Each row breaks one requirement of an accepted update and names the modelled
         // error that requirement is refused with: a version other than the one in force is
-        // `ConcurrentModificationException` (HTTP 409, "attempting to modify an application
-        // without using the current application ID"), while an input the operation cannot
-        // act on at all — neither member naming a version, or an element of the
-        // configuration the application does not hold — is `InvalidArgumentException`
-        // (HTTP 400). Statuses and codes from
+        // `ConcurrentModificationException` ("attempting to modify an application without
+        // using the current application ID"), while an input the operation cannot act on at
+        // all — neither member naming a version, or an element of the configuration the
+        // application does not hold — is `InvalidArgumentException`. Both travel with this
+        // service's client-error status, whatever `@httpError` the shape carries
+        // (`modeled_client_errors.rs` asserts that). Codes from
         // `smithy_query(query="operation",operation="UpdateApplication")`.
         let refusals: [(&str, Value, u16, &str); 5] = [
             (
                 "a consumed version id",
                 json!({"ApplicationName": name, "CurrentApplicationVersionId": 1}),
-                409,
+                400,
                 "ConcurrentModificationException",
             ),
             (
                 "a version id no version carried",
                 json!({"ApplicationName": name, "CurrentApplicationVersionId": 999}),
-                409,
+                400,
                 "ConcurrentModificationException",
             ),
             (
@@ -439,8 +452,8 @@ async fn a_refused_update_mints_no_version() {
                     "ApplicationName": name,
                     "ConditionalToken": "not-the-token-in-force",
                 }),
-                409,
-                "ConcurrentModificationException",
+                400,
+                token_refusal,
             ),
             (
                 "neither member",

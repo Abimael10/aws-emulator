@@ -988,13 +988,13 @@ async fn an_update_is_refused_unless_it_names_the_version_in_force() {
         (
             "a version that is not the one in force",
             json!({"CurrentApplicationVersionId": 7}),
-            409,
+            400,
             "ConcurrentModificationException",
         ),
         (
             "a token that is not the one in force",
             json!({"ConditionalToken": "not-the-stored-token"}),
-            409,
+            400,
             "ConcurrentModificationException",
         ),
         (
@@ -1006,7 +1006,7 @@ async fn an_update_is_refused_unless_it_names_the_version_in_force() {
         (
             "the token of a version that has been consumed",
             json!({"ConditionalToken": token}),
-            409,
+            400,
             "ConcurrentModificationException",
         ),
     ];

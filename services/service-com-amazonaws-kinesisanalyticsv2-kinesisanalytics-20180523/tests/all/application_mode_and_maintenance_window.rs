@@ -41,17 +41,34 @@ const RUNTIME_MODES: [(&str, &str); 13] = [
 /// An application reports a mode whether or not its create named one: the mode the
 /// creator supplied, else the one its runtime implies — and the same value on every
 /// reader of it.
+///
+/// The rows differ along the runtime (every family this API creates applications for) and
+/// along what the create names: the mode its runtime runs applications in, and — where that
+/// mode is the one an omitted member is read as — no mode at all.
 #[tokio::test]
 async fn every_application_reports_the_mode_its_runtime_implies() {
     for (runtime, implied) in RUNTIME_MODES {
-        // The row's two inputs: a create that names the mode, and one that leaves it out.
-        for supplied in [None, Some(implied)] {
+        // The row's inputs: a create that names the mode, and — on a streaming runtime,
+        // whose mode is the one a create naming none runs in — one that leaves it out. A
+        // notebook create has to ask for the interactive mode, which
+        // `a_create_naming_a_mode_its_runtime_does_not_run_is_refused` asserts.
+        let supplied_modes: Vec<Option<&str>> = if implied == "STREAMING" {
+            vec![None, Some(implied)]
+        } else {
+            vec![Some(implied)]
+        };
+        for supplied in supplied_modes {
             let router = router();
             let name = "mode-probe";
             let case = format!("{runtime} mode={supplied:?}");
             let mut body = create_body(name, runtime);
-            if let Some(mode) = supplied {
-                body["ApplicationMode"] = json!(mode);
+            match supplied {
+                Some(mode) => body["ApplicationMode"] = json!(mode),
+                None => {
+                    body.as_object_mut()
+                        .expect("a create body is a JSON object")
+                        .remove("ApplicationMode");
+                }
             }
 
             let (status, response) = call(&router, "CreateApplication", &body).await;
@@ -82,32 +99,83 @@ async fn every_application_reports_the_mode_its_runtime_implies() {
     }
 }
 
-/// A mode a create names explicitly is the one stored, including on a runtime whose
-/// family implies the other one: what the creator asked for is what the application runs
-/// in.
+/// A create whose `ApplicationMode` is not the mode its `RuntimeEnvironment` runs
+/// applications in is REFUSED, and nothing is stored under the name: an application is either
+/// a Managed Service for Apache Flink application (STREAMING) or a Studio notebook
+/// (INTERACTIVE), and which it is follows from its runtime, so the two modes are not
+/// interchangeable.
+///
+/// The rows span the class: every runtime family this API creates applications for, each
+/// paired with the mode of the OTHER kind of application, plus — on the notebook runtimes,
+/// whose mode an omitted member is not read as — a create that names no mode at all, which
+/// the refusal quotes as the absent value the request sent.
 #[tokio::test]
-async fn a_create_that_names_a_mode_stores_that_mode() {
-    // (runtime, the mode named, which is NOT the one the runtime implies)
-    let cases = [
-        ("FLINK-1_20", "INTERACTIVE"),
-        ("ZEPPELIN-FLINK-3_0", "STREAMING"),
-    ];
-    for (runtime, mode) in cases {
-        let router = router();
-        let name = "explicit-mode";
-        let mut body = create_body(name, runtime);
-        body["ApplicationMode"] = json!(mode);
-        let (status, response) = call(&router, "CreateApplication", &body).await;
-        assert_eq!(
-            status, 200,
-            "case {runtime:?}/{mode:?}: CreateApplication got {response}"
-        );
-        let described = describe(&router, name).await;
-        assert_eq!(
-            described["ApplicationMode"].as_str(),
-            Some(mode),
-            "case {runtime:?}/{mode:?}: expected the mode the create named, got {described}"
-        );
+async fn a_create_naming_a_mode_its_runtime_does_not_run_is_refused() {
+    for (runtime, implied) in RUNTIME_MODES {
+        let other = if implied == "STREAMING" {
+            "INTERACTIVE"
+        } else {
+            "STREAMING"
+        };
+        // (what the create names, how the refusal quotes it)
+        let mut rows: Vec<(Option<&str>, &str)> = vec![(Some(other), other)];
+        if implied == "INTERACTIVE" {
+            rows.push((None, "null"));
+        }
+        for (named, quoted) in rows {
+            let router = router();
+            let name = "mode-refusal-probe";
+            let case = format!("{runtime} mode={named:?}");
+            let mut body = create_body(name, runtime);
+            match named {
+                Some(mode) => body["ApplicationMode"] = json!(mode),
+                None => {
+                    body.as_object_mut()
+                        .expect("a create body is a JSON object")
+                        .remove("ApplicationMode");
+                }
+            }
+
+            let (status, refused) = call(&router, "CreateApplication", &body).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected the create to be refused, got {status} {refused}"
+            );
+            assert_eq!(
+                error_code(&refused),
+                "InvalidArgumentException",
+                "case {case:?}: expected InvalidArgumentException, got {refused}"
+            );
+            let expected = format!(
+                "Invalid configuration provided. ApplicationMode '{quoted}' is not applicable \
+                 to runtime environment : {runtime}"
+            );
+            assert_eq!(
+                error_message(&refused),
+                expected,
+                "case {case:?}: expected {expected:?}, got {refused}"
+            );
+
+            // Nothing was stored: the refusal is not a half-create, so the name is free and
+            // the reader of it misses.
+            let (status, described) = call(
+                &router,
+                "DescribeApplication",
+                &json!({"ApplicationName": name}),
+            )
+            .await;
+            assert_eq!(
+                (status, error_code(&described).as_str()),
+                (400, "ResourceNotFoundException"),
+                "case {case:?}: expected the name to hold no application, got {status} \
+                 {described}"
+            );
+            assert_eq!(
+                error_message(&described),
+                format!("Application '{name}' does not exist."),
+                "case {case:?}: expected the lookup-miss sentence, got {described}"
+            );
+        }
     }
 }
 
@@ -492,13 +560,17 @@ async fn a_conditional_token_is_stable_per_version_and_rotates_with_it() {
         );
 
         // The token names the CURRENT version, so an update that moves the version
-        // rotates it.
-        let (status, updated) = call(
-            &router,
-            "UpdateApplication",
-            &json!({"ApplicationName": name, "ConditionalToken": token}),
-        )
-        .await;
+        // rotates it. The update addresses that version by whichever member the
+        // application's runtime admits: the token on a streaming application, and the
+        // version ID on a Studio notebook, whose version the token does not address
+        // (`a_notebook_change_that_names_no_version_id_is_refused` asserts that rule).
+        let mut update = json!({"ApplicationName": name});
+        if runtime.starts_with("ZEPPELIN-") {
+            update["CurrentApplicationVersionId"] = described["ApplicationVersionId"].clone();
+        } else {
+            update["ConditionalToken"] = json!(token);
+        }
+        let (status, updated) = call(&router, "UpdateApplication", &update).await;
         assert_eq!(status, 200, "case {name:?}: UpdateApplication got {updated}");
         let rotated = token_of(&updated["ApplicationDetail"], name);
         assert_ne!(

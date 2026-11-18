@@ -207,6 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let status = application.status.clone();
         let version_in_force = application.version_id;
         let token_in_force = application.conditional_token.clone();
+        let runtime_environment = application.runtime_environment.clone();
         let attached = application.cloud_watch_logging_options.len();
 
         // The change is made against a NAMED version of the application, by whichever of
@@ -219,6 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.conditional_token.as_deref(),
             version_in_force,
             token_in_force.as_deref(),
+            &runtime_environment,
         ) {
             return Err(version_refusal(refusal));
         }

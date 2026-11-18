@@ -52,11 +52,11 @@ const CASES: [(&str, &str, Option<&str>, &str, &str); 5] = [
         "ZEPPELIN-FLINK-3_0",
     ),
     (
-        "streaming-on-a-notebook-runtime",
-        "ZEPPELIN-FLINK-3_0",
+        "streaming-on-the-newest-runtime",
+        "FLINK-2_2",
         Some("STREAMING"),
         "STREAMING",
-        "FLINK-2_2",
+        "FLINK-2_3",
     ),
 ];
 
@@ -120,9 +120,12 @@ async fn an_accepted_update_echoes_the_stored_detail_with_a_fresh_token() {
             let mut request = update;
             // The two members an update addresses a version by — "You must provide the
             // CurrentApplicationVersionId or the ConditionalToken" — used in turn, so the
-            // answer is asserted for both ways of naming the version in force.
+            // answer is asserted for both ways of naming the version in force. A Studio
+            // notebook's version is addressed by its ID alone
+            // (`cloud_watch_logging_options.rs` asserts that rule), so a notebook row names
+            // the ID throughout.
             request["ApplicationName"] = json!(name);
-            if step % 2 == 0 {
+            if step % 2 == 0 || runtime.starts_with("ZEPPELIN-") {
                 request["CurrentApplicationVersionId"] = json!(version);
             } else {
                 request["ConditionalToken"] = json!(token.clone());

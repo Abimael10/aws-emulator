@@ -213,8 +213,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let tags = input.tags.clone().unwrap_or_default();
-        // "the maximum number of user-defined application tags is 50" — the
+        // Which KIND of application this create makes — a Managed Service for Apache Flink
+        // application or a Studio notebook — follows from the runtime it names, and the two
+        // run in different `ApplicationMode`s, so a create naming the other kind's mode is
+        // refused rather than stored (`crate::state::application_mode_refusal`). A property
+        // of the request alone, so it is judged here: before the catalog and the role are
+        // resolved, and before the store is read for the name.
+        if let Some(message) = crate::state::application_mode_refusal(
+            &input.runtime_environment,
+            input.application_mode.as_deref(),
+        ) {
+            return Err(CreateApplicationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // How many parallel tasks per KPU the application is asked to run is bounded by what
+        // the service runs an application at, and the bound is the service's own rather than
+        // the modelled range (`crate::state::parallelism_per_kpu_refusal`). A property of the
+        // request alone, so it is judged beside the mode above.
+        if let Some(message) = input
+            .application_configuration
+            .as_ref()
+            .and_then(crate::state::configured_parallelism_per_kpu)
+            .and_then(|per_kpu| {
+                crate::state::parallelism_per_kpu_refusal(
+                    &input.application_name,
+                    Some(per_kpu),
+                )
+            })
+        {
+            return Err(CreateApplicationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let tags = input.tags.clone().unwrap_or_default();        // "the maximum number of user-defined application tags is 50" — the
         // `CreateApplication$Tags` doc; the modelled `Tags` bound (1..200) counts system
         // tags too, so the user-tag ceiling is the service's own rule, stated once in
         // `crate::state` because `TagResource` holds every application to the same one.

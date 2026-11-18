@@ -67,7 +67,9 @@ fn cases() -> Vec<Case> {
         Case {
             name: "logs-studio-two",
             runtime: "ZEPPELIN-FLINK-3_0",
-            address: Address::Token,
+            // A Studio notebook's version is addressed by its ID alone, which
+            // `a_notebook_change_that_names_no_version_id_is_refused` asserts.
+            address: Address::VersionId,
             streams: vec![
                 stream("logs-studio-two", "errors"),
                 stream("logs-studio-two", "operator-metrics"),
@@ -431,10 +433,10 @@ async fn every_version_reports_the_log_streams_it_ran_with() {
     }
 }
 
-/// A change addressed to anything other than the version in force is refused — 409
-/// `ConcurrentModificationException` for a consumed address, 400
-/// `InvalidArgumentException` for a request that addresses no version at all — and writes
-/// nothing: the descriptions and the version stay exactly as they were.
+/// A change addressed to anything other than the version in force is refused — the modelled
+/// `ConcurrentModificationException` for a consumed address, `InvalidArgumentException` for a
+/// request that addresses no version at all, both on this service's client-error status — and
+/// writes nothing: the descriptions and the version stay exactly as they were.
 #[tokio::test]
 async fn a_change_not_addressed_to_the_version_in_force_is_refused_and_writes_nothing() {
     let router = router();
@@ -450,7 +452,7 @@ async fn a_change_not_addressed_to_the_version_in_force_is_refused_and_writes_no
         (
             "the version just consumed",
             json!({"CurrentApplicationVersionId": version - 1}),
-            409,
+            400,
             "ConcurrentModificationException",
             "The provided application version ID does not match the most recent version for \
              the application."
@@ -459,7 +461,7 @@ async fn a_change_not_addressed_to_the_version_in_force_is_refused_and_writes_no
         (
             "a version never reached",
             json!({"CurrentApplicationVersionId": version + 1}),
-            409,
+            400,
             "ConcurrentModificationException",
             "The provided application version ID does not match the most recent version for \
              the application."
@@ -468,7 +470,7 @@ async fn a_change_not_addressed_to_the_version_in_force_is_refused_and_writes_no
         (
             "the top of the modelled version range",
             json!({"CurrentApplicationVersionId": 999_999_999_i64}),
-            409,
+            400,
             "ConcurrentModificationException",
             "The provided application version ID does not match the most recent version for \
              the application."
@@ -477,7 +479,7 @@ async fn a_change_not_addressed_to_the_version_in_force_is_refused_and_writes_no
         (
             "a token that is not the stored one",
             json!({"ConditionalToken": format!("{token}xy")}),
-            409,
+            400,
             "ConcurrentModificationException",
             "The provided ConditionalToken does not match the most recent version for the \
              application."
@@ -535,6 +537,111 @@ async fn a_change_not_addressed_to_the_version_in_force_is_refused_and_writes_no
                 described, attached,
                 "case {label}: a refused change leaves the stored options untouched"
             );
+        }
+    }
+}
+
+/// A change made against a STUDIO NOTEBOOK's version has to name
+/// `CurrentApplicationVersionId`: the either-or both members' docs state holds for an
+/// application a `ConditionalToken` addresses a version of, and a notebook is not one — so a
+/// change that names no version ID is refused naming the runtime the application runs on,
+/// whether or not it carried the token in force, and nothing is written.
+///
+/// The rows span the class the rule covers: both of the operations that share the
+/// version-addressing rule plus `UpdateApplication`, two Zeppelin runtime versions against a
+/// streaming runtime, and both ways of naming no version ID (nothing at all, and the token in
+/// force). The streaming rows are the control: there the token DOES address the version, and
+/// a request naming neither member is refused with the either-or sentence instead.
+#[tokio::test]
+async fn a_notebook_change_that_names_no_version_id_is_refused() {
+    // (runtime, what the refusal names the application's runtime as)
+    let applications = [
+        ("ZEPPELIN-FLINK-3_0", true),
+        ("ZEPPELIN-FLINK-2_0", true),
+        ("FLINK-1_20", false),
+    ];
+    for (runtime, is_notebook) in applications {
+        for address in ["nothing", "the token in force"] {
+            for (operation, request) in [
+                ("UpdateApplication", "update"),
+                ("AddApplicationCloudWatchLoggingOption", "attach"),
+                ("DeleteApplicationCloudWatchLoggingOption", "detach"),
+            ] {
+                // One application per row, so an accepted control row cannot move the
+                // version the next row addresses.
+                let router = router();
+                let name = "logs-version-address";
+                create(&router, name, runtime).await;
+                let (version, token, _) = stored(&router, name, name).await;
+
+                let label = format!("{runtime}/{address}/{request}");
+                let mut body = match operation {
+                    "AddApplicationCloudWatchLoggingOption" => json!({
+                        "ApplicationName": name,
+                        "CloudWatchLoggingOption": {"LogStreamARN": stream(name, "errors")},
+                    }),
+                    "DeleteApplicationCloudWatchLoggingOption" => json!({
+                        "ApplicationName": name,
+                        "CloudWatchLoggingOptionId": "0000ffff-1111-2222-3333-444455556666",
+                    }),
+                    _ => json!({"ApplicationName": name}),
+                };
+                if address == "the token in force" {
+                    body["ConditionalToken"] = json!(token);
+                }
+                let (status, answered) = call(&router, operation, &body).await;
+
+                // A streaming application addressed by the token in force is ACCEPTED, so
+                // only the rows that address no version at all are refused there. The two
+                // logging changes can still be refused on the log stream the request names
+                // — a detach of an option nothing holds — so what is asserted for them is
+                // that the refusal is not about the version the change is made against.
+                if !is_notebook && address == "the token in force" {
+                    if operation == "UpdateApplication" {
+                        assert_eq!(
+                            status, 200,
+                            "case {label}: expected the token to address the version, got \
+                             {status} {answered}"
+                        );
+                    } else {
+                        let message = error_message(&answered);
+                        assert!(
+                            !message.contains("CurrentApplicationVersionId"),
+                            "case {label}: expected the token to address the version, got \
+                             {status} {answered}"
+                        );
+                    }
+                    continue;
+                }
+
+                let expected_message = if is_notebook {
+                    format!(
+                        "CurrentApplicationVersionId parameter should be provided for \
+                         application with RuntimeEnvironment: {runtime}"
+                    )
+                } else {
+                    "You must provide the CurrentApplicationVersionId or the ConditionalToken."
+                        .to_string()
+                };
+                assert_eq!(
+                    (status, error_code(&answered).as_str()),
+                    (400, "InvalidArgumentException"),
+                    "case {label}: expected 400 InvalidArgumentException, got {status} {answered}"
+                );
+                assert_eq!(
+                    error_message(&answered),
+                    expected_message,
+                    "case {label}: expected {expected_message:?}, got {answered}"
+                );
+
+                // A refused change consumes no version and mints no token.
+                let (still, same_token, _) = stored(&router, &label, name).await;
+                assert_eq!(
+                    (still, same_token.as_str()),
+                    (version, token.as_str()),
+                    "case {label}: a refused change moves the application nowhere"
+                );
+            }
         }
     }
 }

@@ -20,20 +20,24 @@
 //!   `InvalidRequestException`, stating the status the application is in and the status the
 //!   operation requires;
 //! * a value outside an enumerated type's set is refused with that set stated in
-//!   lexicographic order, whatever order the model declares its members in.
+//!   lexicographic order, whatever order the model declares its members in — except for a
+//!   shape whose own refusal of this service states it otherwise, which
+//!   `stated_enum_value_set.rs` owns.
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::types::{
     APPLICATION_MODE_VALUES, APPLICATION_RESTORE_TYPE_VALUES, CODE_CONTENT_TYPE_VALUES,
-    LOG_LEVEL_VALUES, URL_TYPE_VALUES,
+    URL_TYPE_VALUES,
 };
 
 use super::harness::{
     call, create_body, create_startable, describe, error_code, error_message, router,
     with_code_content, ACCOUNT, SETTLE_WAIT,
 };
-use super::stated_enum_value_set::NAMED_RUNTIME_ENVIRONMENT_VALUES;
+use super::stated_enum_value_set::{
+    NAMED_RUNTIME_ENVIRONMENT_VALUES, STATED_LOG_LEVEL_VALUES,
+};
 
 // ---------------------------------------------------------------------------
 // A name the store already holds
@@ -378,6 +382,10 @@ struct EnumCase {
     path: &'static str,
     submitted: &'static str,
     values: &'static [&'static str],
+    /// Whether `values` is already written in the order the refusal states it — true for a
+    /// shape this service's own refusal pins the order of (`stated_enum_value_set.rs`), false
+    /// for one stated lexicographically, which is sorted here rather than written out.
+    as_listed: bool,
 }
 
 /// A value outside a modelled enumerated type is refused with HTTP 400
@@ -390,8 +398,9 @@ struct EnumCase {
 /// rule is about every enum of this service rather than the one the issue cited. Each
 /// expected set is the generated value list for that type
 /// (`src/ops/types/shared_types.rs`, which the model's own enum shapes generate), sorted
-/// here rather than taken as it is listed — except `RuntimeEnvironment`, whose set the
-/// SERVICE names rather than the model (`stated_enum_value_set.rs` owns that rule).
+/// here rather than taken as it is listed — except the shapes whose set or order the SERVICE
+/// states rather than the model (`RuntimeEnvironment` and `LogLevel`;
+/// `stated_enum_value_set.rs` owns that rule).
 #[tokio::test]
 async fn an_enumerated_value_set_is_stated_in_lexicographic_order() {
     let base = create_body("enum-probe", "FLINK-1_20");
@@ -403,6 +412,7 @@ async fn an_enumerated_value_set_is_stated_in_lexicographic_order() {
             path: "runtimeEnvironment",
             submitted: "FLINK-99_9",
             values: NAMED_RUNTIME_ENVIRONMENT_VALUES,
+            as_listed: true,
         },
         EnumCase {
             case: "the mode a create names",
@@ -415,6 +425,7 @@ async fn an_enumerated_value_set_is_stated_in_lexicographic_order() {
             path: "applicationMode",
             submitted: "BATCH",
             values: APPLICATION_MODE_VALUES,
+            as_listed: false,
         },
         EnumCase {
             case: "a member nested in the application configuration",
@@ -429,6 +440,7 @@ async fn an_enumerated_value_set_is_stated_in_lexicographic_order() {
             path: "applicationConfiguration.applicationCodeConfiguration.codeContentType",
             submitted: "JARFILE",
             values: CODE_CONTENT_TYPE_VALUES,
+            as_listed: false,
         },
         EnumCase {
             case: "a member nested three structures deep",
@@ -448,7 +460,8 @@ async fn an_enumerated_value_set_is_stated_in_lexicographic_order() {
             path: "applicationConfiguration.flinkApplicationConfiguration.\
                    monitoringConfiguration.logLevel",
             submitted: "TRACE",
-            values: LOG_LEVEL_VALUES,
+            values: STATED_LOG_LEVEL_VALUES,
+            as_listed: true,
         },
         EnumCase {
             case: "the url type a presigned-url request names",
@@ -457,6 +470,7 @@ async fn an_enumerated_value_set_is_stated_in_lexicographic_order() {
             path: "urlType",
             submitted: "FLINK_SQL_URL",
             values: URL_TYPE_VALUES,
+            as_listed: false,
         },
         EnumCase {
             case: "the restore type a start names",
@@ -472,6 +486,7 @@ async fn an_enumerated_value_set_is_stated_in_lexicographic_order() {
             path: "runConfiguration.applicationRestoreConfiguration.applicationRestoreType",
             submitted: "RESTORE_FROM_ANY_SNAPSHOT",
             values: APPLICATION_RESTORE_TYPE_VALUES,
+            as_listed: false,
         },
     ];
 
@@ -491,6 +506,7 @@ async fn an_enumerated_value_set_is_stated_in_lexicographic_order() {
         path,
         submitted,
         values,
+        as_listed,
     } in rows
     {
         let (status, refused) = call(&router, operation, &body).await;
@@ -503,10 +519,14 @@ async fn an_enumerated_value_set_is_stated_in_lexicographic_order() {
             "ValidationException",
             "case {case:?}: expected ValidationException, got {refused}"
         );
+        let stated = if as_listed {
+            values.join(", ")
+        } else {
+            stated_order(values)
+        };
         let expected = format!(
             "1 validation error detected: Value '{submitted}' at '{path}' failed to \
-             satisfy constraint: Member must satisfy enum value set: [{}]",
-            stated_order(values)
+             satisfy constraint: Member must satisfy enum value set: [{stated}]"
         );
         let actual = error_message(&refused);
         assert_eq!(

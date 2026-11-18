@@ -10,11 +10,12 @@
 //!
 //! * a refusal of a value outside an enumerated member states the admissible set the
 //!   SERVICE names for the enum that member targets, which the public model can declare
-//!   more values than — it is published from the SDK's view of the API — and states it in
-//!   lexicographic order. The set is a property of the SHAPE, so every member targeting it,
-//!   in any operation, is stated the same way;
-//! * every other enumerated type of this model is stated as the model declares it, so the
-//!   rule is one table entry rather than a sentence per enum;
+//!   more values than — it is published from the SDK's view of the API — and states it in the
+//!   order that service's own refusal of the shape shows, which is not always the
+//!   lexicographic one. The set and its order are a property of the SHAPE, so every member
+//!   targeting it, in any operation, is stated the same way;
+//! * every other enumerated type of this model is stated in lexicographic order, so the
+//!   rule is a short table of shapes rather than a sentence per enum;
 //! * what the refusal NAMES is not what the boundary ACCEPTS: a runtime the stated set
 //!   leaves out is still taken by a create, and is read back on the stored application.
 
@@ -23,8 +24,8 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::types::{
-    ARTIFACT_TYPE_VALUES, CONFIGURATION_TYPE_VALUES, KEY_TYPE_VALUES, METRICS_LEVEL_VALUES,
-    RUNTIME_ENVIRONMENT_VALUES,
+    ARTIFACT_TYPE_VALUES, CONFIGURATION_TYPE_VALUES, KEY_TYPE_VALUES, LOG_LEVEL_VALUES,
+    METRICS_LEVEL_VALUES, RUNTIME_ENVIRONMENT_VALUES,
 };
 
 use super::harness::{call, create_body, describe, error_code, error_message, router};
@@ -50,6 +51,14 @@ pub(crate) const NAMED_RUNTIME_ENVIRONMENT_VALUES: &[&str] = &[
     "ZEPPELIN-FLINK-3_0",
 ];
 
+/// The admissible set a refusal NAMES for `LogLevel`, in the ORDER it names them — every
+/// value the model declares, in neither the model's declaration order (`INFO`, `WARN`,
+/// `ERROR`, `DEBUG`) nor the lexicographic one.
+///
+/// SOURCE: the bracketed set in the service's own refusal of a log level outside it, which is
+/// service data about the enum rather than one request's answer.
+pub(crate) const STATED_LOG_LEVEL_VALUES: &[&str] = &["WARN", "ERROR", "INFO", "DEBUG"];
+
 /// This service's Smithy model, as it ships beside this crate. Read at test time rather than
 /// embedded: it is megabytes of JSON that no non-test build needs.
 const MODEL_PATH: &str = concat!(
@@ -62,10 +71,16 @@ const MODEL_PATH: &str = concat!(
 fn expected_message(submitted: &str, path: &str, values: &[&str]) -> String {
     let mut stated: Vec<&str> = values.to_vec();
     stated.sort_unstable();
+    expected_message_listing(submitted, path, &stated)
+}
+
+/// The whole message a refusal of one off-enum value states, over `values` in exactly the
+/// order they are given — for a shape whose ORDER this service's own refusal pins.
+fn expected_message_listing(submitted: &str, path: &str, values: &[&str]) -> String {
     format!(
         "1 validation error detected: Value '{submitted}' at '{path}' failed to satisfy \
          constraint: Member must satisfy enum value set: [{}]",
-        stated.join(", ")
+        values.join(", ")
     )
 }
 
@@ -203,8 +218,121 @@ async fn an_enumerated_set_is_stated_as_the_service_names_it() {
     assert_rows(rows).await;
 }
 
-/// Every OTHER enumerated type of this model is stated as the model declares it, so the one
-/// shape the service names differently is the exception and not the rule.
+/// Every value outside `LogLevel` is refused with that set stated in the order the SERVICE
+/// lists it — not the order the model declares its members in, and not the lexicographic one.
+///
+/// The rows differ along the member that reaches the shape — the log level of a streaming
+/// application's monitoring configuration, of a Studio notebook's, and of each of those in an
+/// UPDATE of one, in two operations and at three different depths — and along the FORM of the
+/// rejected value: a published level in lower case, one in mixed case, a level no logging
+/// framework of this service publishes, and the empty string.
+#[tokio::test]
+async fn the_log_level_set_is_stated_in_the_order_the_service_lists_it() {
+    // (case, operation, body, the member path the clause names, the value submitted)
+    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
+        (
+            "a published level in lower case, on a notebook update",
+            "UpdateApplication",
+            json!({
+                "ApplicationName": "enum-probe",
+                "CurrentApplicationVersionId": 1,
+                "ApplicationConfigurationUpdate": {
+                    "ZeppelinApplicationConfigurationUpdate": {
+                        "MonitoringConfigurationUpdate": {"LogLevelUpdate": "debug"}
+                    }
+                },
+            }),
+            "applicationConfigurationUpdate.zeppelinApplicationConfigurationUpdate.\
+             monitoringConfigurationUpdate.logLevelUpdate",
+            "debug",
+        ),
+        (
+            "a published level in mixed case, on a streaming update",
+            "UpdateApplication",
+            json!({
+                "ApplicationName": "enum-probe",
+                "CurrentApplicationVersionId": 1,
+                "ApplicationConfigurationUpdate": {
+                    "FlinkApplicationConfigurationUpdate": {
+                        "MonitoringConfigurationUpdate": {
+                            "ConfigurationTypeUpdate": "CUSTOM",
+                            "LogLevelUpdate": "Warn"
+                        }
+                    }
+                },
+            }),
+            "applicationConfigurationUpdate.flinkApplicationConfigurationUpdate.\
+             monitoringConfigurationUpdate.logLevelUpdate",
+            "Warn",
+        ),
+        (
+            "a level nothing publishes, on a create",
+            "CreateApplication",
+            configured(json!({
+                "FlinkApplicationConfiguration": {
+                    "MonitoringConfiguration": {
+                        "ConfigurationType": "CUSTOM",
+                        "LogLevel": "TRACE"
+                    }
+                }
+            })),
+            "applicationConfiguration.flinkApplicationConfiguration.\
+             monitoringConfiguration.logLevel",
+            "TRACE",
+        ),
+        (
+            "the empty string, on a notebook create",
+            "CreateApplication",
+            configured(json!({
+                "ZeppelinApplicationConfiguration": {
+                    "MonitoringConfiguration": {"LogLevel": ""}
+                }
+            })),
+            "applicationConfiguration.zeppelinApplicationConfiguration.\
+             monitoringConfiguration.logLevel",
+            "",
+        ),
+    ];
+
+    let router = router();
+    let (status, created) = call(
+        &router,
+        "CreateApplication",
+        &create_body("enum-probe", "FLINK-1_20"),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateApplication got {status} {created}");
+
+    for (case, operation, body, path, submitted) in rows {
+        let (status, refused) = call(&router, operation, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {refused}"
+        );
+        let expected = expected_message_listing(submitted, path, STATED_LOG_LEVEL_VALUES);
+        let actual = error_message(&refused);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected {expected:?}, got {actual:?}"
+        );
+        // The order is the SERVICE's: neither the model's declaration order nor the
+        // lexicographic one a shape with no stated order is listed in.
+        let mut sorted: Vec<&str> = STATED_LOG_LEVEL_VALUES.to_vec();
+        sorted.sort_unstable();
+        assert!(
+            !actual.contains(&sorted.join(", ")),
+            "case {case:?}: the set must not be stated lexicographically, got {actual:?}"
+        );
+    }
+}
+
+/// Every enumerated type whose order this service pins no refusal of is stated
+/// LEXICOGRAPHIC, so the shapes it states otherwise are the exception and not the rule.
 ///
 /// The rows differ along the enumerated type and along the FORM the member takes: a required
 /// member of a nested structure, an optional one beside it, a member two structures deep, and
@@ -354,6 +482,34 @@ fn the_named_set_belongs_to_one_enum_of_the_model_and_names_only_values_it_decla
         undeclared.is_empty(),
         "case \"the named set's values\": expected every named runtime to be one the model \
          declares, got {undeclared:?}"
+    );
+
+    // The same two guards for the OTHER shape the service pins: the set keyed on belongs to
+    // exactly one enum of the model, and the stated order is a re-ordering of that enum's
+    // values rather than a set of its own.
+    let levels: BTreeSet<String> = LOG_LEVEL_VALUES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    let matching: Vec<&str> = enums
+        .iter()
+        .filter(|(_, values)| *values == levels)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert_eq!(
+        matching,
+        vec!["com.amazonaws.kinesisanalyticsv2#LogLevel"],
+        "case \"the keyed log-level set\": exactly one enum of this model may declare it, got \
+         {matching:?}"
+    );
+    let stated: BTreeSet<String> = STATED_LOG_LEVEL_VALUES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    assert_eq!(
+        stated, levels,
+        "case \"the stated log-level set\": expected the values the model declares, got \
+         {STATED_LOG_LEVEL_VALUES:?}"
     );
 }
 

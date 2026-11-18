@@ -24,7 +24,8 @@
 //! the merge an update applies
 //! to a stored configuration ([`Application::apply_configuration_update`]), the version a
 //! change is addressed to ([`addressed_version_refusal`]), the mode an
-//! application runs in when its create named none ([`default_application_mode`]), the
+//! application runs in when its create named none ([`default_application_mode`]) and whether
+//! the mode a create named is one its runtime runs ([`application_mode_refusal`]), the
 //! maintenance window every application carries
 //! ([`Application::maintenance_configuration`]), the resolution of a Studio notebook's
 //! catalog against the Glue Data Catalog ([`catalog_database_refusal`]), the resolution of
@@ -1857,6 +1858,43 @@ pub fn default_application_mode(runtime_environment: &str) -> &'static str {
     }
 }
 
+/// How an `ApplicationMode` the request did not carry is QUOTED BACK by a refusal about it:
+/// the absent value itself, not the mode the application would otherwise have run in.
+const ABSENT_APPLICATION_MODE: &str = "null";
+
+/// How this service words a create whose `ApplicationMode` is not the mode its
+/// `RuntimeEnvironment` runs applications in: the mode the REQUEST carried and the runtime it
+/// named, both echoed from the request.
+pub fn inapplicable_application_mode_message(mode: Option<&str>, runtime: &str) -> String {
+    format!(
+        "Invalid configuration provided. ApplicationMode '{}' is not applicable to runtime \
+         environment : {runtime}",
+        mode.unwrap_or(ABSENT_APPLICATION_MODE)
+    )
+}
+
+/// The refusal the `RuntimeEnvironment`/`ApplicationMode` pair a create names earns, or
+/// `None` when the mode is the one that runtime runs its applications in.
+///
+/// An application is either a Managed Service for Apache Flink application or a Studio
+/// notebook, and WHICH it is follows from its runtime — the Zeppelin family is the notebook
+/// one ([`default_application_mode`]). The two modes are not interchangeable (`ApplicationMode`:
+/// "Use the STREAMING mode to create a Managed Service for Apache Flink application. To create
+/// a Managed Service for Apache Flink Studio notebook, use the INTERACTIVE mode"), so a create
+/// naming the mode of the other kind of application is refused instead of stored, whichever of
+/// the two it named.
+///
+/// A create that names NO mode is judged on the mode it would then run in — `STREAMING`, the
+/// mode of a streaming application — so it is taken on a streaming runtime and refused on a
+/// notebook one, where the interactive mode has to be asked for; that refusal quotes the
+/// absent value the request sent rather than the mode it was read as.
+pub fn application_mode_refusal(runtime_environment: &str, mode: Option<&str>) -> Option<String> {
+    let applicable = default_application_mode(runtime_environment);
+    let running_in = mode.unwrap_or(APPLICATION_MODE_STREAMING);
+    (running_in != applicable)
+        .then(|| inapplicable_application_mode_message(mode, runtime_environment))
+}
+
 /// The `ApplicationMaintenanceWindowStartTime` an application is created with.
 ///
 /// Maintenance runs on every application in a window the service keeps for it, so a
@@ -1921,6 +1959,19 @@ pub const CONDITIONAL_TOKEN_MEMBER: &str = "ConditionalToken";
 pub const VERSION_OR_TOKEN_REQUIRED: &str =
     "You must provide the CurrentApplicationVersionId or the ConditionalToken.";
 
+/// What AWS answers a change made against an application whose version a `ConditionalToken`
+/// does not address, so the version ID is the only member that addresses it: the runtime the
+/// application runs on.
+///
+/// Read off the STORED application rather than off the request, because what decides the
+/// requirement is the application the change is made against.
+pub fn version_id_required_message(runtime: &str) -> String {
+    format!(
+        "CurrentApplicationVersionId parameter should be provided for application with \
+         RuntimeEnvironment: {runtime}"
+    )
+}
+
 /// Why the version a change is addressed to is refused.
 ///
 /// The two cases are different error CLASSES, which is why they are distinguished here and
@@ -1949,7 +2000,19 @@ pub fn addressed_version_refusal(
     supplied_token: Option<&str>,
     version_in_force: i64,
     token_in_force: Option<&str>,
+    runtime_environment: &str,
 ) -> Option<AddressedVersionRefusal> {
+    // The either-or holds for an application a `ConditionalToken` addresses a version of; a
+    // Studio notebook is not one, so on the Zeppelin runtime family
+    // ([`is_notebook_runtime`]) the version is addressed by `CurrentApplicationVersionId`
+    // ALONE and a change naming no ID is refused naming that runtime, whether or not it
+    // named a token. Decided on the runtime of the STORED application, so it answers for
+    // every operation of this service that is made against a named version.
+    if supplied_version_id.is_none() && is_notebook_runtime(runtime_environment) {
+        return Some(AddressedVersionRefusal::NotAddressed(
+            version_id_required_message(runtime_environment),
+        ));
+    }
     match (supplied_version_id, supplied_token) {
         (None, None) => Some(AddressedVersionRefusal::NotAddressed(
             VERSION_OR_TOKEN_REQUIRED.to_string(),
@@ -1986,6 +2049,22 @@ pub fn now_timestamp() -> DateTime {
 /// wording — but the sentence a `ResourceNotFoundException` carries is this one.
 pub fn missing_application_message(name: &str) -> String {
     format!("Application '{name}' does not exist.")
+}
+
+/// How this service words a `CreateTimestamp` that does not identify the application the
+/// caller addressed it to: the name the request named, and the reader that answers the value
+/// in force.
+///
+/// The stamp is the caller's proof that it is acting on the application it last read, so a
+/// value that does not match belongs to a read something else has since superseded — which is
+/// why the sentence sends the caller back to `DescribeApplication` rather than telling it the
+/// value is malformed. Neither stamp is stated: naming the one in force would hand a client a
+/// way past the check.
+pub fn stale_create_timestamp_message(name: &str) -> String {
+    format!(
+        "The application with name: '{name}' has a different create timestamp than the one \
+         you provided. Please call DescribeApplication to fetch valid create timestamp."
+    )
 }
 
 /// How the SNAPSHOT operations word the same lookup miss: the name the caller asked for and
@@ -2265,6 +2344,45 @@ pub fn configured_catalog_database_arn(cfg: &ApplicationConfiguration) -> Option
         .as_ref()
         .and_then(|zeppelin| zeppelin.catalog_configuration.as_ref())
         .map(|catalog| catalog.glue_data_catalog_configuration.database_arn.as_str())
+}
+
+/// The greatest `ParallelismPerKPU` this service runs an application at.
+///
+/// NOT a modelled bound: `ParallelismPerKPU` declares only `@range` min 1
+/// (`smithy_query(query="shape",shape="ParallelismPerKPU")`), so a value past the one the
+/// service supports satisfies the model and is refused by the handler, with the modelled
+/// `InvalidArgumentException`, rather than at the boundary.
+pub const MAX_PARALLELISM_PER_KPU: i32 = 8;
+
+/// How this service words a `ParallelismPerKPU` outside the values it runs an application at:
+/// the application the configuration was supplied for, and what the value had to be.
+pub fn parallelism_per_kpu_message(application: &str) -> String {
+    format!(
+        "FlinkApplicationParallelismPerKPU provided for the application {application} should \
+         be a positive integer and should not be larger than the supported value of \
+         {MAX_PARALLELISM_PER_KPU}"
+    )
+}
+
+/// The refusal a `ParallelismPerKPU` a request configures earns, or `None` when it is one the
+/// service runs an application at — and `None` for a request that configures none, which
+/// leaves the application on the service's own default.
+///
+/// One rule for the create that supplies the configuration and for the update that replaces
+/// it, so the two cannot bound the same member differently.
+pub fn parallelism_per_kpu_refusal(application: &str, configured: Option<i32>) -> Option<String> {
+    configured
+        .filter(|per_kpu| *per_kpu < 1 || *per_kpu > MAX_PARALLELISM_PER_KPU)
+        .map(|_| parallelism_per_kpu_message(application))
+}
+
+/// The `ParallelismPerKPU` a configuration supplied to a create asks the application to run
+/// at, or `None` when it configures no parallelism.
+pub fn configured_parallelism_per_kpu(cfg: &ApplicationConfiguration) -> Option<i32> {
+    cfg.flink_application_configuration
+        .as_ref()
+        .and_then(|flink| flink.parallelism_configuration.as_ref())
+        .and_then(|parallelism| parallelism.parallelism_per_kpu)
 }
 
 /// The region every ARN this service mints carries: the one the caller signed for.

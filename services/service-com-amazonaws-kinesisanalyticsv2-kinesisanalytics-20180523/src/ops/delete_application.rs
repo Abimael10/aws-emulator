@@ -187,19 +187,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CreateTimestamp` is the caller's proof that it is deleting the application it
         // last read ("Use the DescribeApplication operation to get this value"), so a
         // value that does not identify the stored application is refused rather than
-        // ignored. Timestamps are stored and reported at whole-second resolution, so the
-        // comparison is on the same unit the wire carries.
+        // ignored. A well-formed stamp that is not the one in force says the caller read the
+        // application before something else changed it, which is this API's
+        // optimistic-concurrency signal rather than a malformed parameter — so the refusal is
+        // the modelled `ConcurrentModificationException` and sends the caller back to the
+        // reader that answers the stamp in force
+        // (`crate::state::stale_create_timestamp_message`). Timestamps are stored and
+        // reported at whole-second resolution, so the comparison is on the same unit the
+        // wire carries.
         if application.create_timestamp.secs() != input.create_timestamp.secs() {
-            return Err(DeleteApplicationErrorModeled::InvalidArgumentException(
-                InvalidArgumentException {
-                    message: Some(format!(
-                        "CreateTimestamp {} does not match the create timestamp of \
-                         application {name}",
-                        input.create_timestamp.secs()
-                    )),
-                },
-            )
-            .into());
+            return Err(
+                DeleteApplicationErrorModeled::ConcurrentModificationException(
+                    ConcurrentModificationException {
+                        message: Some(crate::state::stale_create_timestamp_message(&name)),
+                    },
+                )
+                .into(),
+            );
         }
 
         store.applications.remove(&name);

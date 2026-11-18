@@ -17,8 +17,8 @@ use serde_json::{json, Value};
 // The wire plumbing lives in `tests/all/harness.rs`, shared with every other suite in
 // this crate, so both read one response envelope.
 use super::harness::{
-    call, call_in, create, create_body, create_startable, describe, error_code, router, router_on,
-    ACCOUNT, SETTLE_WAIT,
+    call, call_in, create, create_body, create_startable, describe, error_code, error_message,
+    router, router_on, ACCOUNT, SETTLE_WAIT,
 };
 
 // ---------------------------------------------------------------------------
@@ -587,7 +587,10 @@ async fn delete_removes_the_application_from_every_reader() {
         .as_i64()
         .expect("the stored create timestamp");
 
-    // A create timestamp that does not identify the stored application is refused.
+    // A create timestamp that does not identify the stored application is refused as a
+    // concurrent modification: the stamp is the caller's proof that it is deleting the
+    // application it last read, so a value that is not the one in force belongs to a read
+    // something else has superseded.
     for wrong in [create_timestamp - 1, create_timestamp + 60, 0] {
         let (status, body) = call(
             &router,
@@ -598,8 +601,14 @@ async fn delete_removes_the_application_from_every_reader() {
         assert_eq!(status, 400, "case CreateTimestamp={wrong}: expected 400, got {status} {body}");
         assert_eq!(
             error_code(&body),
-            "InvalidArgumentException",
-            "case CreateTimestamp={wrong}: expected InvalidArgumentException, got {body}"
+            "ConcurrentModificationException",
+            "case CreateTimestamp={wrong}: expected ConcurrentModificationException, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            "The application with name: 'remove-me' has a different create timestamp than the \
+             one you provided. Please call DescribeApplication to fetch valid create timestamp.",
+            "case CreateTimestamp={wrong}: expected the stale-stamp sentence, got {body}"
         );
     }
     assert_eq!(

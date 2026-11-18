@@ -20,7 +20,11 @@
 //!   its own model declares for that path — `ResourceNotFoundException` for the readers,
 //!   `InvalidArgumentException` for `CreateApplicationSnapshot` — and never as a 5xx;
 //! * `StartApplication` refuses an application whose stored configuration carries no code
-//!   content with `InvalidApplicationConfigurationException`, and leaves it unstarted.
+//!   content with `InvalidApplicationConfigurationException`, and leaves it unstarted;
+//! * a `ParallelismPerKPU` past the value the service runs an application at is refused with
+//!   `InvalidArgumentException`, on the create and on the update alike;
+//! * every modelled client error travels with this service's client-error status, whatever
+//!   `@httpError` its shape carries.
 
 use serde_json::{json, Value};
 
@@ -560,6 +564,242 @@ async fn a_snapshot_of_a_running_application_is_stored_and_read_back() {
         assert!(
             !error_message(&response).is_empty(),
             "case {case}: expected a Message naming what was not found, got {response}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The parallelism an application is asked to run at
+// ---------------------------------------------------------------------------
+
+/// `ParallelismPerKPU` is bounded by the value this service runs an application at: a
+/// configuration past it is refused with the modelled `InvalidArgumentException`, naming the
+/// application the configuration was supplied for, and nothing is stored or changed — while a
+/// value within it is taken and read back.
+///
+/// The rule is the service's own, not the model's (`ParallelismPerKPU` declares only `@range`
+/// min 1), so it is asserted on both operations that carry the member — the create that
+/// supplies the configuration and the update that replaces it — over a table that spans the
+/// class: the lowest value the model admits, the greatest the service runs, the first value
+/// past it, a value far past it, and the largest an `integer` carries.
+#[tokio::test]
+async fn a_parallelism_per_kpu_past_the_supported_value_is_refused() {
+    const SUPPORTED: i32 = 8;
+    // (case, the value configured, whether the service runs an application at it)
+    let rows: [(&str, i32, bool); 5] = [
+        ("the lowest value the model admits", 1, true),
+        ("the greatest value the service runs", SUPPORTED, true),
+        ("the first value past it", SUPPORTED + 1, false),
+        ("a value far past it", 1_000, false),
+        ("the largest an integer carries", i32::MAX, false),
+    ];
+
+    for (case, per_kpu, supported) in rows {
+        let router = router();
+        let name = "parallelism-probe";
+        let mut body = create_body(name, "FLINK-1_20");
+        body["ApplicationConfiguration"] = json!({
+            "FlinkApplicationConfiguration": {
+                "ParallelismConfiguration": {
+                    "ConfigurationType": "CUSTOM",
+                    "ParallelismPerKPU": per_kpu,
+                }
+            }
+        });
+        let expected_message = format!(
+            "FlinkApplicationParallelismPerKPU provided for the application {name} should be \
+             a positive integer and should not be larger than the supported value of \
+             {SUPPORTED}"
+        );
+
+        let (status, answered) = call(&router, "CreateApplication", &body).await;
+        if supported {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the create to be accepted, got {status} {answered}"
+            );
+            let described = answered["ApplicationDetail"]["ApplicationConfigurationDescription"]
+                ["FlinkApplicationConfigurationDescription"]
+                ["ParallelismConfigurationDescription"]["ParallelismPerKPU"]
+                .as_i64();
+            assert_eq!(
+                described,
+                Some(i64::from(per_kpu)),
+                "case {case:?}: expected the configured value to be stored, got {answered}"
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&answered).as_str()),
+                (400, "InvalidArgumentException"),
+                "case {case:?}: expected the create to be refused, got {status} {answered}"
+            );
+            assert_eq!(
+                error_message(&answered),
+                expected_message,
+                "case {case:?}: expected {expected_message:?}, got {answered}"
+            );
+            // Nothing was stored, so the name still holds no application.
+            let (status, described) = call(
+                &router,
+                "DescribeApplication",
+                &json!({"ApplicationName": name}),
+            )
+            .await;
+            assert_eq!(
+                (status, error_code(&described).as_str()),
+                (400, "ResourceNotFoundException"),
+                "case {case:?}: a refused create stores nothing, got {status} {described}"
+            );
+        }
+
+        // The same bound on the UPDATE that replaces the parallelism of an application the
+        // store already holds, which is left on the version and the configuration it was on.
+        let updated = "parallelism-update-probe";
+        let (status, created) = call(
+            &router,
+            "CreateApplication",
+            &create_body(updated, "FLINK-1_20"),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: CreateApplication got {created}");
+        let (status, answered) = call(
+            &router,
+            "UpdateApplication",
+            &json!({
+                "ApplicationName": updated,
+                "CurrentApplicationVersionId": 1,
+                "ApplicationConfigurationUpdate": {
+                    "FlinkApplicationConfigurationUpdate": {
+                        "ParallelismConfigurationUpdate": {
+                            "ConfigurationTypeUpdate": "CUSTOM",
+                            "ParallelismPerKPUUpdate": per_kpu,
+                        }
+                    }
+                },
+            }),
+        )
+        .await;
+        if supported {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the update to be accepted, got {status} {answered}"
+            );
+        } else {
+            let expected_message = expected_message.replace(name, updated);
+            assert_eq!(
+                (status, error_code(&answered).as_str()),
+                (400, "InvalidArgumentException"),
+                "case {case:?}: expected the update to be refused, got {status} {answered}"
+            );
+            assert_eq!(
+                error_message(&answered),
+                expected_message,
+                "case {case:?}: expected {expected_message:?}, got {answered}"
+            );
+            let (status, described) = call(
+                &router,
+                "DescribeApplication",
+                &json!({"ApplicationName": updated}),
+            )
+            .await;
+            assert_eq!(
+                (status, described["ApplicationDetail"]["ApplicationVersionId"].as_i64()),
+                (200, Some(1)),
+                "case {case:?}: a refused update mints no version, got {status} {described}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The status a modelled client error travels with
+// ---------------------------------------------------------------------------
+
+/// Every modelled CLIENT error of this service travels with HTTP 400, whatever `@httpError`
+/// its shape carries: this is an RPC (`awsJson1_1`) service, whose envelope discriminates a
+/// failure by the error TYPE in the body rather than by the transport status.
+///
+/// `ConcurrentModificationException` is the shape that makes the rule observable — the model
+/// marks it `@httpError(409)`
+/// (`smithy_query(query="shape",shape="ConcurrentModificationException")`) — so the rows
+/// reach it from the three refusals that raise it, over two operations and both members a
+/// change addresses a version by, beside one row per other client error class this suite can
+/// reach, each of which the model already annotates 400.
+#[tokio::test]
+async fn every_modelled_client_error_travels_with_the_client_error_status() {
+    let router = router();
+    let name = "wire-status-app";
+    let (status, created) = call(
+        &router,
+        "CreateApplication",
+        &create_body(name, "FLINK-1_20"),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateApplication got {status} {created}");
+    let created_at = created["ApplicationDetail"]["CreateTimestamp"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("expected a CreateTimestamp, got {created}"));
+    let token = created["ApplicationDetail"]["ConditionalToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a ConditionalToken, got {created}"))
+        .to_string();
+
+    // (case, operation, request, the error code the model declares for that refusal)
+    let rows: Vec<(&str, &str, Value, &str)> = vec![
+        (
+            "an update addressed to a version that is not in force",
+            "UpdateApplication",
+            json!({"ApplicationName": name, "CurrentApplicationVersionId": 7}),
+            "ConcurrentModificationException",
+        ),
+        (
+            "an update addressed by a token that is not in force",
+            "UpdateApplication",
+            json!({"ApplicationName": name, "ConditionalToken": format!("{token}xy")}),
+            "ConcurrentModificationException",
+        ),
+        (
+            "a delete naming a create timestamp that is not the stored one",
+            "DeleteApplication",
+            json!({"ApplicationName": name, "CreateTimestamp": created_at + 60}),
+            "ConcurrentModificationException",
+        ),
+        (
+            "a create of a name the store already holds",
+            "CreateApplication",
+            create_body(name, "FLINK-1_20"),
+            "ResourceInUseException",
+        ),
+        (
+            "a read of a name nothing is stored under",
+            "DescribeApplication",
+            json!({"ApplicationName": "wire-status-absent"}),
+            "ResourceNotFoundException",
+        ),
+        (
+            "a create on the retired SQL runtime family",
+            "CreateApplication",
+            create_body("wire-status-sql", "SQL-1_0"),
+            "UnsupportedOperationException",
+        ),
+        (
+            "a value outside a modelled enumerated type",
+            "CreateApplication",
+            create_body("wire-status-enum", "FLINK-99_9"),
+            "ValidationException",
+        ),
+    ];
+
+    for (case, operation, request, expected_code) in rows {
+        let (status, refused) = call(&router, operation, &request).await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, expected_code),
+            "case {case:?}: expected HTTP 400 {expected_code}, got {status} {refused}"
+        );
+        assert!(
+            !error_message(&refused).is_empty(),
+            "case {case:?}: expected a message stating the refusal, got {refused}"
         );
     }
 }

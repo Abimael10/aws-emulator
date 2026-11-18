@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What this update has to decide against, read under the store's guard and the
         // guard RELEASED before the Glue Data Catalog is asked anything: no two services'
         // store locks are ever held at once.
-        let (status, version_id, stored_token, stored_catalog_arn) = {
+        let (status, version_id, stored_token, stored_catalog_arn, runtime_environment) = {
             let mut store = state.lock();
             store.settle_named(&name);
             let Some(application) = store.applications.get(&name) else {
@@ -221,6 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 application.version_id,
                 application.conditional_token.clone(),
                 application.catalog_database_arn().map(str::to_string),
+                application.runtime_environment.clone(),
             )
         };
 
@@ -234,6 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.conditional_token.as_deref(),
             version_id,
             stored_token.as_deref(),
+            &runtime_environment,
         ) {
             return Err(version_refusal(refusal));
         }
@@ -252,6 +254,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::TRANSITION_UPDATED,
                         &status,
                     )),
+                },
+            )
+            .into());
+        }
+
+        // The parallelism the update moves the application to is bounded by what the service
+        // runs an application at, the same bound a create is held to
+        // (`crate::state::parallelism_per_kpu_refusal`), and judged before anything is
+        // written so a refused update leaves the stored configuration as it was.
+        if let Some(message) = input
+            .application_configuration_update
+            .as_ref()
+            .and_then(|update| update.flink_application_configuration_update.as_ref())
+            .and_then(|flink| flink.parallelism_configuration_update.as_ref())
+            .and_then(|parallelism| parallelism.parallelism_per_kpu_update)
+            .and_then(|per_kpu| crate::state::parallelism_per_kpu_refusal(&name, Some(per_kpu)))
+        {
+            return Err(UpdateApplicationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
                 },
             )
             .into());

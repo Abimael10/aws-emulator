@@ -367,8 +367,8 @@ async fn an_accepted_streaming_source_is_stored_and_versions_the_application() {
 }
 
 /// A `CurrentApplicationVersionId` that is not the version the application is on is refused
-/// with HTTP 409 `ConcurrentModificationException` and the fixed sentence for that class,
-/// and stores nothing.
+/// with the modelled `ConcurrentModificationException` and the fixed sentence for that class,
+/// on this service's client-error status, and stores nothing.
 ///
 /// The rows span the stale values a caller can send inside the modelled range
 /// (`ApplicationVersionId` 1..999999999): the version after the current one, a version far
@@ -385,8 +385,8 @@ async fn a_stale_application_version_is_refused_as_a_concurrent_modification() {
     for stale in [2_i64, 7, 999_999_999] {
         let (status, refused) = add_input(&router, name, stale, &source).await;
         assert_eq!(
-            status, 409,
-            "case {stale}: expected HTTP 409 for a stale version, got {status} {refused}"
+            status, 400,
+            "case {stale}: expected a stale version to be refused, got {status} {refused}"
         );
         assert_eq!(
             error_code(&refused),
@@ -420,7 +420,7 @@ async fn a_stale_application_version_is_refused_as_a_concurrent_modification() {
     let (status, refused) = add_input(&router, name, 1, &source).await;
     assert_eq!(
         (status, error_code(&refused).as_str()),
-        (409, "ConcurrentModificationException"),
+        (400, "ConcurrentModificationException"),
         "case consumed: expected a consumed version to be refused, got {status} {refused}"
     );
 }

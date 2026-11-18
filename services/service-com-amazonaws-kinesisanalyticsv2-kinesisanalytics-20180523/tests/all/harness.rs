@@ -116,13 +116,27 @@ pub(crate) fn error_message(body: &Value) -> String {
         .to_string()
 }
 
-/// A minimal valid `CreateApplication` body.
+/// A minimal valid `CreateApplication` body: the mode named is the one its runtime runs
+/// applications in, since a create that names the other kind of application's mode — or, on a
+/// Studio-notebook runtime, none at all — is refused rather than stored
+/// (`application_mode_and_maintenance_window.rs` asserts that rule).
 pub(crate) fn create_body(name: &str, runtime: &str) -> Value {
     json!({
         "ApplicationName": name,
         "RuntimeEnvironment": runtime,
+        "ApplicationMode": runtime_mode(runtime),
         "ServiceExecutionRole": "arn:aws:iam::000000000000:role/kda-service-role",
     })
+}
+
+/// The `ApplicationMode` an application on `runtime` runs in: `INTERACTIVE` for the
+/// Studio-notebook (Zeppelin) runtime family, `STREAMING` for every other.
+pub(crate) fn runtime_mode(runtime: &str) -> &'static str {
+    if runtime.starts_with("ZEPPELIN-") {
+        "INTERACTIVE"
+    } else {
+        "STREAMING"
+    }
 }
 
 /// `body` with the inline code content a streaming application needs before
