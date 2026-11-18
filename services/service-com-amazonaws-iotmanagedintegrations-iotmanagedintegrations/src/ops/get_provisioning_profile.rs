@@ -162,11 +162,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         // A provisioning profile is regional, as every resource of this service is: only the
-        // region that created it resolves it. A profile whose deletion the clock has already
-        // finished resolves nowhere, which is what makes this read agree with every other.
+        // region that created it resolves it. A profile a delete has removed resolves nowhere
+        // from that call on, which is what makes this read agree with every other.
         let region = crate::state::request_region(ctx.parts());
         let profile = store
-            .provisioning_profile_in(&region, &input.identifier, ::std::time::SystemTime::now())
+            .provisioning_profile_in(&region, &input.identifier)
             .ok_or_else(|| {
                 GetProvisioningProfileErrorModeled::ResourceNotFoundException(
                     crate::state::provisioning_profile_not_found(&input.identifier),

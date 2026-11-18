@@ -1636,7 +1636,7 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
                 .filter(|locker| locker.arn == arn)
                 .map(|locker| &locker.tags),
             PROVISIONING_PROFILE_ARN_SEGMENT => self
-                .provisioning_profile_in(region, parts.id, SystemTime::now())
+                .provisioning_profile_in(region, parts.id)
                 .filter(|profile| profile.arn == arn)
                 .map(|profile| &profile.tags),
             _ => None,
@@ -1666,7 +1666,7 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
                 .filter(|locker| locker.region == region && locker.arn == arn)
                 .map(|locker| &mut locker.tags),
             PROVISIONING_PROFILE_ARN_SEGMENT => self
-                .provisioning_profile_in_mut(region, parts.id, SystemTime::now())
+                .provisioning_profile_in_mut(region, parts.id)
                 .filter(|profile| profile.arn == arn)
                 .map(|profile| &mut profile.tags),
             _ => None,

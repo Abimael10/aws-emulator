@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let selected: Vec<&crate::state::ProvisioningProfile> = store
-            .provisioning_profiles_in(&region, ::std::time::SystemTime::now())
+            .provisioning_profiles_in(&region)
             .filter(|profile| profile.sequence >= resume_at)
             .collect();
 

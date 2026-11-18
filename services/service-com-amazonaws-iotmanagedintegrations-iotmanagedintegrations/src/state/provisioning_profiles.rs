@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The provisioning-profile half of this service's state: the record a create writes, the
-//! claim certificate material minted with it, and the removal a delete hands to the clock.
+//! claim certificate material minted with it, and the removal a delete performs.
 //!
 //! A child module of [`super`] rather than more of `state.rs`: a provisioning profile is
 //! one concern, and it is the only resource of this service that holds certificate material
@@ -20,9 +20,17 @@ use crate::ops::types::ProvisioningProfileSummary;
 /// resource kind an [`IdempotencyKey`] of a `CreateProvisioningProfile` carries.
 pub const PROVISIONING_PROFILE_RESOURCE_TYPE: &str = "ProvisioningProfile";
 
-/// The provisioning-profile resource as the subject of the sentence a 404 of this service
-/// words, the way [`CLOUD_CONNECTOR_RESOURCE_SUBJECT`] is a cloud connector's.
-pub const PROVISIONING_PROFILE_RESOURCE_SUBJECT: &str = "Provisioning profile";
+/// The one sentence this service states for a provisioning profile it holds none of under
+/// the identifier a request named, whatever operation resolved it.
+///
+/// It is FIXED text: it quotes no identifier and no other request value, so every absent
+/// profile — never created, deleted, or created in another region — is stated the same way,
+/// the way the recorded 404 of a get after a delete words it. The sentence names the KIND of
+/// resource that was not found rather than which one, as a managed thing's read 404 does
+/// ([`resource_not_found_message`]); this resource's backend ends it without a full stop, as
+/// a connector destination's does ([`resource_name_not_found_message`]). The identifier the
+/// caller sent is still reported, on the `ResourceId` member the shape declares for it.
+pub const PROVISIONING_PROFILE_ABSENT_REASON: &str = "Provisioning Profile resource not found";
 
 /// The resource-type segment a provisioning profile's ARN carries, which is both what the
 /// `ProvisioningProfileArn` pattern
@@ -36,23 +44,6 @@ pub const PROVISIONING_PROFILE_ARN_SEGMENT: &str = "provisioning-profile";
 /// the clock: the claim certificate is minted and the record stored inside the call, and
 /// `CREATE_IN_PROGRESS` and `CREATE_FAILED` are statuses no creation of this emulator enters.
 pub const PROVISIONING_PROFILE_STATUS_CREATED: &str = "CREATED";
-
-/// The `ProvisioningProfileStatus` a provisioning profile carries once a delete has been
-/// accepted for it and before the record is gone.
-pub const PROVISIONING_PROFILE_STATUS_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
-
-/// How long after `DeleteProvisioningProfile` the profile it was called for is gone.
-///
-/// The deletion OUTLIVES the call that asks for it: `ProvisioningProfileStatus` declares
-/// `DELETE_IN_PROGRESS` (`smithy_query(query="shape",shape="ProvisioningProfileStatus")`), so
-/// a profile is reported on its way out rather than vanishing with the call, and that is the
-/// status every reader reports for it until this span is up — from then on no reader resolves
-/// it at all. AWS publishes no duration for it, so the span is CHOSEN: the same one this
-/// service's other clock-owed completion uses ([`DEVICE_DISCOVERY_DURATION`]), long enough
-/// that a client acting on the answer to the delete still sees the deleting phase and the
-/// record it names. It is stored as a due instant ([`ProvisioningProfile::gone_at`]) and never
-/// slept on.
-pub const PROVISIONING_PROFILE_DELETION_DURATION: Duration = DEVICE_DISCOVERY_DURATION;
 
 /// The most provisioning profiles one store holds, for the same reason and on the same terms
 /// as [`MAX_MANAGED_THINGS`]: a bound CHOSEN for the emulator, not a published AWS quota.
@@ -102,47 +93,19 @@ pub struct ProvisioningProfile {
     pub created_at: SystemTime,
     /// `ProvisioningProfileStatus` enum value, one of
     /// [`crate::ops::types::PROVISIONING_PROFILE_STATUS_VALUES`]: what the create that
-    /// minted this profile stored for it ([`PROVISIONING_PROFILE_STATUS_CREATED`]), and what
-    /// an accepted delete moves it to ([`PROVISIONING_PROFILE_STATUS_DELETE_IN_PROGRESS`]) —
-    /// which is what every operation that reports the profile reports. It is a FIELD rather
-    /// than a value each reader names, so one record is the single source of the status.
+    /// minted this profile stored for it ([`PROVISIONING_PROFILE_STATUS_CREATED`]), which is
+    /// what every operation that reports the profile reports. It is a FIELD rather than a
+    /// value each reader names, so one record is the single source of the status.
     ///
-    /// `CREATE_IN_PROGRESS`, `CREATE_FAILED` and `DELETE_FAILED` are the other values the
-    /// model declares, and no profile of this emulator is ever in one: a create mints the
-    /// material and stores the record inside the call, so no creation is left in flight or
-    /// fails, and no accepted deletion fails either.
+    /// `CREATE_IN_PROGRESS`, `CREATE_FAILED`, `DELETE_IN_PROGRESS` and `DELETE_FAILED` are
+    /// the other values the model declares, and no profile of this emulator is ever in one: a
+    /// create mints the material and stores the record inside the call, so no creation is
+    /// left in flight or fails, and an accepted delete removes the record inside its own
+    /// call, so no profile is ever reported on its way out either.
     pub status: String,
-    /// The instant this profile is GONE: `None` until a delete is accepted for it, and from
-    /// then on one [`PROVISIONING_PROFILE_DELETION_DURATION`] after that call. Until it every
-    /// reader still resolves the record and reports it deleting; from it none resolves it —
-    /// see [`Self::is_gone_at`]. Storing the due instant is what keeps a read a pure read:
-    /// that the profile is gone is DERIVED from the clock, so nothing is written when it
-    /// becomes due.
-    pub gone_at: Option<SystemTime>,
     /// Monotonic insertion sequence. `ListProvisioningProfiles` pages by it, so a page token
     /// keeps resuming at the right place even when records are deleted in between.
     pub sequence: u64,
-}
-
-impl ProvisioningProfile {
-    /// Whether this profile's deletion is already over at `now`, which is what makes it a
-    /// record no reader resolves any more.
-    pub fn is_gone_at(&self, now: SystemTime) -> bool {
-        self.gone_at.is_some_and(|due| now >= due)
-    }
-
-    /// Accept a delete for this profile at `now`: the record reports the deleting status from
-    /// here, and is gone one [`PROVISIONING_PROFILE_DELETION_DURATION`] later.
-    ///
-    /// A delete of a profile already on its way out leaves the due instant where the first one
-    /// put it, so repeating the call neither postpones the removal nor restarts it — the
-    /// operation is `@idempotent`.
-    pub fn begin_deletion(&mut self, now: SystemTime) {
-        if self.gone_at.is_none() {
-            self.status = PROVISIONING_PROFILE_STATUS_DELETE_IN_PROGRESS.to_string();
-            self.gone_at = Some(now + PROVISIONING_PROFILE_DELETION_DURATION);
-        }
-    }
 }
 
 /// Written by hand rather than derived: the record holds the claim certificate's PRIVATE key,
@@ -160,7 +123,6 @@ impl ::std::fmt::Debug for ProvisioningProfile {
             .field("provisioning_type", &self.provisioning_type)
             .field("status", &self.status)
             .field("created_at", &self.created_at)
-            .field("gone_at", &self.gone_at)
             .field("sequence", &self.sequence)
             .field(
                 "claim_certificate_private_key",
@@ -181,21 +143,19 @@ pub fn provisioning_profile_arn(region: &str, id: &str) -> String {
 }
 
 /// The modelled `ResourceNotFoundException` every operation of this service answers for a
-/// provisioning profile no reader resolves under the identifier a request named: the sentence
-/// this service's backend words an absent resource with from the resource itself
-/// ([`subject_not_found_message`]), plus the `ResourceId` and `ResourceType` members its 404s
-/// report the identifier and the kind on.
+/// provisioning profile no reader resolves under the identifier a request named: the one
+/// sentence this resource's backend states its absence with
+/// ([`PROVISIONING_PROFILE_ABSENT_REASON`]), plus the `ResourceId` and `ResourceType` members
+/// its 404s report the identifier and the kind on.
 ///
 /// ONE reason, read and mutation alike, as a cloud connector's and an account association's
 /// 404s carry ([`cloud_connector_not_found`], [`account_association_not_found`]): the read
 /// 404s of this service are not one sentence — each resource's backend words its own — and
-/// this is the sentence the resources whose absence is stated from the RESOURCE rather than
-/// from the request carry, which is what a provisioning profile's absence is.
+/// this is the sentence recorded for a profile a delete had just removed, from a get of it and
+/// from the repeated delete of it alike.
 pub fn provisioning_profile_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(subject_not_found_message(
-            PROVISIONING_PROFILE_RESOURCE_SUBJECT,
-        )),
+        message: Some(PROVISIONING_PROFILE_ABSENT_REASON.to_string()),
         ..super::resource_not_found(PROVISIONING_PROFILE_RESOURCE_TYPE, identifier)
     }
 }
@@ -306,49 +266,40 @@ fn offset_date_time(at: SystemTime) -> Option<::time::OffsetDateTime> {
 }
 
 impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
-    /// The provisioning profile `region`'s endpoint resolves under `id` at `now`, if any.
+    /// The provisioning profile `region`'s endpoint resolves under `id`, if any.
     ///
     /// A profile created in another region is not visible here, as for every regional
-    /// resource, and neither is one whose deletion the clock has already finished
-    /// ([`ProvisioningProfile::is_gone_at`]) — so every operation that resolves a profile
-    /// stops resolving it at the same instant, whether or not a mutation has come along to
-    /// drop the record ([`Self::retire_deleted_provisioning_profiles`]).
-    pub fn provisioning_profile_in(
-        &self,
-        region: &str,
-        id: &str,
-        now: SystemTime,
-    ) -> Option<&ProvisioningProfile> {
+    /// resource, and neither is one a delete has removed: the record is gone from the store
+    /// with the call that asked for its removal ([`Self::remove_provisioning_profile_in`]), so
+    /// every operation that resolves a profile stops resolving it from that call on.
+    pub fn provisioning_profile_in(&self, region: &str, id: &str) -> Option<&ProvisioningProfile> {
         self.provisioning_profiles
             .get(id)
-            .filter(|profile| profile.region == region && !profile.is_gone_at(now))
+            .filter(|profile| profile.region == region)
     }
 
-    /// [`Self::provisioning_profile_in`], mutably: what a tagging call writes to and what a
-    /// delete marks, so the write side resolves a profile by exactly the rule the read side
-    /// resolves it by.
+    /// [`Self::provisioning_profile_in`], mutably: what a tagging call writes to, so the write
+    /// side resolves a profile by exactly the rule the read side resolves it by.
     pub fn provisioning_profile_in_mut(
         &mut self,
         region: &str,
         id: &str,
-        now: SystemTime,
     ) -> Option<&mut ProvisioningProfile> {
         self.provisioning_profiles
             .get_mut(id)
-            .filter(|profile| profile.region == region && !profile.is_gone_at(now))
+            .filter(|profile| profile.region == region)
     }
 
-    /// Every provisioning profile `region`'s endpoint resolves at `now`, in the order they
-    /// were created: what a list reports, and what bounds its paging.
+    /// Every provisioning profile `region`'s endpoint resolves, in the order they were
+    /// created: what a list reports, and what bounds its paging.
     pub fn provisioning_profiles_in<'a>(
         &'a self,
         region: &'a str,
-        now: SystemTime,
     ) -> impl Iterator<Item = &'a ProvisioningProfile> {
         self.provisioning_profile_order
             .iter()
             .filter_map(|id| self.provisioning_profiles.get(id))
-            .filter(move |profile| profile.region == region && !profile.is_gone_at(now))
+            .filter(move |profile| profile.region == region)
     }
 
     /// Store `profile`, keyed by its own id and appended to the order every operation that
@@ -359,24 +310,24 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
             .insert(profile.id.clone(), profile);
     }
 
-    /// Drop every provisioning profile whose deletion the clock has already finished at `now`,
-    /// with its certificate material and the `ClientToken` records that replayed into it.
+    /// Remove the provisioning profile `region`'s endpoint resolves under `id`, with its
+    /// certificate material and the `ClientToken` records that replayed into it. `true` when a
+    /// profile was removed, `false` when this region holds none under that id — which is what
+    /// makes a delete of an identifier nothing names the modelled 404.
     ///
-    /// The record is invisible to every reader by then
-    /// ([`Self::provisioning_profile_in`]), so this changes no answer: it is what keeps a
-    /// deleted profile from occupying the store, and it runs on the MUTATING paths, which are
-    /// free to write.
-    pub fn retire_deleted_provisioning_profiles(&mut self, now: SystemTime) {
-        let gone: Vec<String> = self
-            .provisioning_profiles
-            .values()
-            .filter(|profile| profile.is_gone_at(now))
-            .map(|profile| profile.id.clone())
-            .collect();
-        for id in gone {
-            self.provisioning_profiles.remove(&id);
-            self.provisioning_profile_order.retain(|held| held != &id);
-            self.forget_idempotency_tokens_for(PROVISIONING_PROFILE_RESOURCE_TYPE, &id);
+    /// The removal is performed INSIDE the call that asks for it, so the next request of any
+    /// caller resolves nothing under that id: the record, not a mark on it, is what the
+    /// readers resolve.
+    pub fn remove_provisioning_profile_in(&mut self, region: &str, id: &str) -> bool {
+        if self.provisioning_profile_in(region, id).is_none() {
+            return false;
         }
+        self.provisioning_profiles.remove(id);
+        self.provisioning_profile_order.retain(|held| held != id);
+        // A `ClientToken` whose profile is gone must not replay into it: a create presenting
+        // that token again mints a new profile rather than answering one nothing can
+        // provision with any more.
+        self.forget_idempotency_tokens_for(PROVISIONING_PROFILE_RESOURCE_TYPE, id);
+        true
     }
 }

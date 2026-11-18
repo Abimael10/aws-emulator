@@ -18,10 +18,10 @@
 //! key, which no read shape declares — the list in creation order, cut at `MaxResults` with a
 //! `NextToken` that resumes exactly where the page stopped; an identifier the caller's
 //! region holds no profile under is the modelled `ResourceNotFoundException` (HTTP 404); and
-//! `DeleteProvisioningProfile` (DELETE `/provisioning-profiles/{Identifier}`) hands the
-//! removal to the clock: the profile reports `DELETE_IN_PROGRESS` for the span the clock owes
-//! its deletion, and from then on no reader resolves it and the `ClientToken` that minted it
-//! replays into nothing.
+//! `DeleteProvisioningProfile` (DELETE `/provisioning-profiles/{Identifier}`) removes the
+//! profile INSIDE its own call: from the moment it answers no reader resolves it, the
+//! `ClientToken` that minted it replays into nothing, and every operation that resolves that
+//! identifier answers this resource's one fixed 404.
 //!
 //! The recorded units this was derived from
 //! (`iot-managed-integrations.provisioning-profile-lifecycle-status`,
@@ -38,15 +38,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::ops::types::PROVISIONING_TYPE_VALUES;
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::state::{
-    PROVISIONING_PROFILE_DELETION_DURATION, PROVISIONING_PROFILE_PAGE_LIMIT,
+    PROVISIONING_PROFILE_ABSENT_REASON, PROVISIONING_PROFILE_PAGE_LIMIT,
     PROVISIONING_PROFILE_RESOURCE_TYPE, PROVISIONING_PROFILE_STATUS_CREATED,
-    PROVISIONING_PROFILE_STATUS_DELETE_IN_PROGRESS,
 };
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::{
     ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState as ServiceState, EmulatedService,
@@ -90,17 +88,6 @@ const PRIVATE_KEY_LABEL: &str = "PRIVATE KEY";
 /// (`smithy_query(query="operation",operation="ListProvisioningProfiles")` -> `MaxResults`
 /// range 1..1000).
 const MAX_RESULTS_BOUNDS: (i64, i64) = (1, 1000);
-
-/// How often the client polling a profile on its way out reads it: one sixth of the span the
-/// clock owes the deletion, so a loop that waits for the record to go reads it several times
-/// on the way.
-const POLL_INTERVAL: Duration =
-    Duration::from_nanos((PROVISIONING_PROFILE_DELETION_DURATION.as_nanos() / 6) as u64);
-
-/// The most polls that loop takes before giving up — a generous deadline, many times the span
-/// the clock owes — so a profile that never goes fails the test rather than hanging it, and a
-/// slow or loaded host still finishes it.
-const MAX_POLLS: usize = 120;
 
 /// One HTTP answer, reduced to what the assertions read.
 struct Reply {
@@ -259,15 +246,10 @@ async fn delete_in(router: &MultiServiceRouter, region: &str, id: &str) -> Reply
     call_in(router, region, "DELETE", &format!("{COLLECTION}/{id}"), None).await
 }
 
-/// [`delete_in`] in [`REGION`].
-async fn delete(router: &MultiServiceRouter, id: &str) -> Reply {
-    delete_in(router, REGION, id).await
-}
-
 /// `ListTagsForResource`: GET `/tags/{ResourceArn}`. `ResourceArn` is a NON-greedy
 /// `@httpLabel`, so the ARN fills ONE path segment and every byte outside the unreserved set
 /// is percent-encoded, which is what an SDK puts on the wire.
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Reply {
+async fn list_tags_in(router: &MultiServiceRouter, region: &str, arn: &str) -> Reply {
     let label: String = arn
         .bytes()
         .map(|byte| match byte {
@@ -277,7 +259,12 @@ async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Reply {
             other => format!("%{other:02X}"),
         })
         .collect();
-    call_in(router, REGION, "GET", &format!("/tags/{label}"), None).await
+    call_in(router, region, "GET", &format!("/tags/{label}"), None).await
+}
+
+/// [`list_tags_in`] in [`REGION`].
+async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Reply {
+    list_tags_in(router, REGION, arn).await
 }
 
 /// The DER bytes a PEM block of `label` carries, or `None` when `pem` carries no such block
@@ -933,17 +920,20 @@ async fn the_list_pages_over_what_the_creates_stored() {
     }
 }
 
-/// RULE: a delete hands the removal to the clock. The call is accepted, the profile reports
-/// `DELETE_IN_PROGRESS` to every reader for the span the clock owes its deletion, and from
-/// then on no reader resolves it: the get answers the resource's 404, the list omits it and a
-/// repeated delete answers that same 404. The `ClientToken` that minted it replays into
-/// nothing from the moment the delete is accepted. A delete of an identifier this region holds
-/// nothing under is that same 404.
+/// RULE: a delete removes the profile INSIDE the call it was asked in. The call is accepted,
+/// and from the moment it answers no operation resolves that identifier any more: the VERY
+/// NEXT get and the very next delete answer this resource's modelled
+/// `ResourceNotFoundException` (404, the `x-amzn-errortype` discriminator, the one fixed
+/// reason this resource states its absence with, the identifier on `ResourceId` and the kind
+/// on `ResourceType`), the list omits it, the ARN it was minted under resolves no tags, the
+/// record itself is out of the store and the `ClientToken` that minted it replays into
+/// nothing. There is no window in which a removed profile still reads back, and the profiles
+/// the call did not name are untouched.
 #[tokio::test]
-async fn a_delete_takes_the_profile_out_in_the_span_the_clock_owes_it() {
-    // The rows differ along the member set the profile was created with, and along which of
-    // several stored profiles is deleted — so a delete taking the head, the middle and the
-    // tail is covered rather than only a store of one.
+async fn a_delete_removes_the_profile_from_every_reader_at_once() {
+    // The rows differ along the member set the profile was created with, along which of
+    // several stored profiles is deleted — the head, the middle and the tail, rather than only
+    // a store of one — and along the region the whole exchange is signed for.
     let bodies = [
         json!({"ProvisioningType": "FLEET_PROVISIONING", "ClientToken": "deleted-token-0"}),
         json!({
@@ -954,17 +944,25 @@ async fn a_delete_takes_the_profile_out_in_the_span_the_clock_owes_it() {
         }),
         json!({"ProvisioningType": "JITR", "ClientToken": "deleted-token-2"}),
     ];
-    for victim in 0..bodies.len() {
-        let case = format!("delete index {victim}");
+    for (region, victim) in [
+        (REGION, 0usize),
+        (REGION, 1),
+        (REGION, 2),
+        ("eu-west-1", 1),
+        ("ap-southeast-2", 2),
+    ] {
+        let case = format!("delete index {victim} in {region}");
         let engine = Arc::new(engine::InMemoryEngine::new());
         let router = emulator_over(Arc::clone(&engine));
         let mut ids: Vec<String> = Vec::new();
+        let mut arns: Vec<String> = Vec::new();
         for (n, body) in bodies.iter().enumerate() {
-            let created = create(&router, body.clone()).await;
+            let created = create_in(&router, region, body.clone()).await;
             ids.push(accepted_id(&format!("{case} seed-{n}"), &created));
+            arns.push(created.string("Arn").unwrap_or_default().to_string());
         }
 
-        let removed = delete(&router, &ids[victim]).await;
+        let removed = delete_in(&router, region, &ids[victim]).await;
         assert_eq!(
             removed.status, 200,
             "case {case:?}: expected HTTP 200 from DeleteProvisioningProfile, got {} with body \
@@ -972,103 +970,100 @@ async fn a_delete_takes_the_profile_out_in_the_span_the_clock_owes_it() {
             removed.status, removed.body
         );
 
-        // A caller acting straight after the delete still resolves the profile, and every
-        // reader reports it on its way out.
-        let deleting = get(&router, &ids[victim]).await;
-        assert_eq!(
-            deleting.status, 200,
-            "case {case:?}: expected the profile to still resolve while its deletion is not \
-             over, got {} with body {:?}",
-            deleting.status, deleting.body
-        );
-        assert_eq!(
-            deleting.string("Status"),
-            Some(PROVISIONING_PROFILE_STATUS_DELETE_IN_PROGRESS),
-            "case {case:?}: expected the deleting status, got {:?}",
-            deleting.string("Status")
-        );
-        let listed = list(&router, "").await;
-        assert_eq!(
-            listed
-                .items()
-                .iter()
-                .find(|item| item.get("Id").and_then(Value::as_str) == Some(ids[victim].as_str()))
-                .and_then(|item| item.get("Status"))
-                .and_then(Value::as_str),
-            Some(PROVISIONING_PROFILE_STATUS_DELETE_IN_PROGRESS),
-            "case {case:?}: expected the list to report the same deleting status, got {:?}",
-            listed.items()
-        );
-        // The operation is `@idempotent`: repeating it on a profile already on its way out is
-        // accepted and moves nothing.
-        let repeated = delete(&router, &ids[victim]).await;
-        assert_eq!(
-            repeated.status, 200,
-            "case {case:?}: expected a repeated delete to be accepted, got {} with body {:?}",
-            repeated.status, repeated.body
-        );
-
-        // The token of the deleted profile replays into nothing, so presenting it again
-        // creates a NEW profile rather than answering the one on its way out.
-        let retried = create(&router, bodies[victim].clone()).await;
-        let reborn = accepted_id(&format!("{case} token after delete"), &retried);
-        assert_ne!(
-            reborn, ids[victim],
-            "case {case:?}: expected the token to mint a new profile once its own was deleted"
-        );
-
-        // Wait for the CONDITION, not for a fixed time: read until no reader resolves the
-        // profile any more, or the generous deadline passes.
-        let mut gone = false;
-        for poll in 0..MAX_POLLS {
-            let read = get(&router, &ids[victim]).await;
-            if read.status == 404 {
-                gone = true;
-                break;
-            }
-            assert_eq!(
-                read.string("Status"),
-                Some(PROVISIONING_PROFILE_STATUS_DELETE_IN_PROGRESS),
-                "case {case:?}: poll {poll} expected a profile on its way out to report the \
-                 deleting status, got {:?} in body {:?}",
-                read.string("Status"),
-                read.body
-            );
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-        assert!(
-            gone,
-            "case {case:?}: expected the profile to be gone within {MAX_POLLS} polls of \
-             {POLL_INTERVAL:?}"
-        );
-
-        let read = get(&router, &ids[victim]).await;
+        // The request right after the delete already resolves nothing: nothing is slept on and
+        // no span is owed.
+        let read = get_in(&router, region, &ids[victim]).await;
         assert_refused(&case, &read, 404, NOT_FOUND);
-        let listed = list(&router, "").await;
+        assert_eq!(
+            read.message(),
+            PROVISIONING_PROFILE_ABSENT_REASON,
+            "case {case:?}: expected this resource's fixed not-found reason, got {:?}",
+            read.message()
+        );
+        assert_eq!(
+            read.string("ResourceId"),
+            Some(ids[victim].as_str()),
+            "case {case:?}: expected the 404 to report the identifier it was given, got {:?}",
+            read.string("ResourceId")
+        );
+        assert_eq!(
+            read.string("ResourceType"),
+            Some(PROVISIONING_PROFILE_RESOURCE_TYPE),
+            "case {case:?}: expected the 404 to report this resource's type, got {:?}",
+            read.string("ResourceType")
+        );
+
+        // Repeating the delete finds nothing to remove: the same 404, worded the same way.
+        let repeated = delete_in(&router, region, &ids[victim]).await;
+        assert_refused(&case, &repeated, 404, NOT_FOUND);
+        assert_eq!(
+            repeated.message(),
+            PROVISIONING_PROFILE_ABSENT_REASON,
+            "case {case:?}: expected the repeated delete to state the same reason, got {:?}",
+            repeated.message()
+        );
+
+        // The list reports the survivors and nothing else, and the ARN the removed profile was
+        // minted under resolves no tags any more.
+        let listed = list_in(&router, region, "").await;
         assert!(
             !listed.item_ids().contains(&ids[victim]),
-            "case {case:?}: expected the gone profile to be out of the list, got {:?}",
+            "case {case:?}: expected the removed profile to be out of the list, got {:?}",
             listed.item_ids()
         );
         assert_eq!(
             listed.item_ids().len(),
-            ids.len(),
-            "case {case:?}: expected the surviving profiles and the re-minted one to be \
-             listed, got {:?}",
+            ids.len() - 1,
+            "case {case:?}: expected only the surviving profiles to be listed, got {:?}",
             listed.item_ids()
         );
-        // Deleting it now finds nothing to delete: the same 404 the read answers.
-        let again = delete(&router, &ids[victim]).await;
-        assert_refused(&case, &again, 404, NOT_FOUND);
-        // And the record itself is out of the store, not just hidden from the readers.
+        let tagged = list_tags_in(&router, region, &arns[victim]).await;
+        assert_eq!(
+            tagged.status, 404,
+            "case {case:?}: expected the ARN of a removed profile to resolve nothing, got {} \
+             with body {:?}",
+            tagged.status, tagged.body
+        );
+
+        // The record itself is out of the store, not merely hidden from the readers.
         assert!(
             !engine
                 .state::<ServiceState>()
                 .lock()
                 .provisioning_profiles
                 .contains_key(&ids[victim]),
-            "case {case:?}: expected the store to hold no record for a profile that is gone"
+            "case {case:?}: expected the store to hold no record for a removed profile"
         );
+
+        // The token of the removed profile replays into nothing, so presenting it again mints
+        // a NEW profile rather than answering one nothing can provision with.
+        let retried = create_in(&router, region, bodies[victim].clone()).await;
+        let reborn = accepted_id(&format!("{case} token after delete"), &retried);
+        assert_ne!(
+            reborn, ids[victim],
+            "case {case:?}: expected the token to mint a new profile once its own was removed"
+        );
+
+        // Every profile the delete did not name is untouched by it.
+        for (n, id) in ids.iter().enumerate() {
+            if n == victim {
+                continue;
+            }
+            let survivor = get_in(&router, region, id).await;
+            assert_eq!(
+                survivor.status, 200,
+                "case {case:?}: expected the profile at index {n} to survive the delete, got {} \
+                 with body {:?}",
+                survivor.status, survivor.body
+            );
+            assert_eq!(
+                survivor.string("Status"),
+                Some(PROVISIONING_PROFILE_STATUS_CREATED),
+                "case {case:?}: expected the surviving profile at index {n} to stay created, \
+                 got {:?}",
+                survivor.string("Status")
+            );
+        }
     }
 }
 
@@ -1101,6 +1096,14 @@ async fn an_identifier_this_region_holds_no_profile_under_is_refused() {
     ] {
         let read = get(&router, &identifier).await;
         assert_refused(case, &read, 404, NOT_FOUND);
+        // The reason is FIXED text: it is the same sentence whatever identifier was asked
+        // for, and the identifier is reported on `ResourceId` rather than inside it.
+        assert_eq!(
+            read.message(),
+            PROVISIONING_PROFILE_ABSENT_REASON,
+            "case {case:?}: expected this resource's fixed not-found reason, got {:?}",
+            read.message()
+        );
         assert_eq!(
             read.string("ResourceId"),
             Some(identifier.as_str()),

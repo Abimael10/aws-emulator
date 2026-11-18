@@ -211,11 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created_at = ::std::time::SystemTime::now();
 
         // Retire the idempotency records the clock already made due, before anything reads
-        // them: a token past its TTL neither replays nor occupies the map. A profile whose
-        // deletion the clock has already finished goes with them, so a store at its bound is
-        // one really holding that many profiles.
+        // them: a token past its TTL neither replays nor occupies the map.
         store.retire_expired_idempotency_tokens(created_at);
-        store.retire_deleted_provisioning_profiles(created_at);
 
         // A retry with the same `ClientToken` answers with what the first call created,
         // performing no further action — down to the claim certificate and its private key,
@@ -228,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.replayed_resource_id(crate::state::PROVISIONING_PROFILE_RESOURCE_TYPE, token)
         });
         if let Some(created) =
-            replayed.and_then(|id| store.provisioning_profile_in(&region, &id, created_at))
+            replayed.and_then(|id| store.provisioning_profile_in(&region, &id))
         {
             let replay = created_output(created);
             drop(store);
@@ -307,8 +304,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // minted and its record stored inside the call, so the status is terminal and the
             // clock owes it no transition.
             status: crate::state::PROVISIONING_PROFILE_STATUS_CREATED.to_string(),
-            // Nothing has asked for this profile to be deleted.
-            gone_at: None,
             sequence,
         };
 
@@ -322,7 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         store.insert_provisioning_profile(profile);
         let output = store
-            .provisioning_profile_in(&region, &id, created_at)
+            .provisioning_profile_in(&region, &id)
             .map(created_output);
         drop(store);
 

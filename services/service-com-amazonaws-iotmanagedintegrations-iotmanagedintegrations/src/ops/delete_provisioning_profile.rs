@@ -192,38 +192,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        let now = ::std::time::SystemTime::now();
-        // Drop the records whose deletion the clock has already finished, so this call reads a
-        // store holding only profiles that still resolve.
-        store.retire_deleted_provisioning_profiles(now);
 
         // A provisioning profile is regional, as every resource of this service is: only the
         // region that created it resolves — and deletes — it.
         //
-        // The deletion OUTLIVES this call: the profile is marked deleting here and is gone one
-        // span later (`crate::state::PROVISIONING_PROFILE_DELETION_DURATION`), so until then
-        // every reader still resolves it and reports `DELETE_IN_PROGRESS`, and from then on
-        // none does. Repeating the delete of a profile already on its way out is accepted and
-        // moves nothing — the operation is `@idempotent`.
-        let accepted = match store.provisioning_profile_in_mut(&region, &input.identifier, now) {
-            Some(profile) => {
-                profile.begin_deletion(now);
-                true
-            }
-            None => false,
-        };
-        if accepted {
-            // A `ClientToken` whose profile is on its way out must not replay into it: a
-            // create presenting that token again mints a new profile rather than answering a
-            // profile nothing can provision with any more.
-            store.forget_idempotency_tokens_for(
-                crate::state::PROVISIONING_PROFILE_RESOURCE_TYPE,
-                &input.identifier,
-            );
-        }
+        // The removal is performed INSIDE this call: the record is gone when the call answers,
+        // so the next read of that identifier resolves nothing and answers the resource's 404,
+        // and so does the next delete of it. The operation is `@idempotent` in the sense that
+        // matters — repeating it removes nothing a second time and leaves the store exactly as
+        // the first call left it.
+        let removed = store.remove_provisioning_profile_in(&region, &input.identifier);
         drop(store);
 
-        if !accepted {
+        if !removed {
             audit(&akid, &region, "not-found");
             // The reason is the one sentence this resource's 404s carry, read and mutation
             // alike, so a delete of an identifier nothing holds reads exactly the way a get
@@ -236,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        audit(&akid, &region, "deleting");
+        audit(&akid, &region, "deleted");
         Ok(DeleteProvisioningProfileOutput)
     }
 }
