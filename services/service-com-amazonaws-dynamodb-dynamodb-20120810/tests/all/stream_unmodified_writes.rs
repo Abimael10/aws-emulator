@@ -19,24 +19,17 @@
 //! Everything is driven over the wire against DynamoDB and DynamoDB Streams on one engine,
 //! and every verdict is read off the streams surface a change-data-capture consumer reads.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
-use crate::emulator::{call, drain_stream, emulator_with_streams};
+use crate::emulator::{
+    drain_stream, emulator_with_streams, event_names, ok_case, records_of, stored_item,
+    streamed_table,
+};
 
 /// The table every row below writes to, and the attribute it is keyed on.
 const TABLE: &str = "modifications";
 /// See [`TABLE`].
 const KEY: &str = "Pk";
-
-/// How long a poll for the documented `CREATING` -> `ACTIVE` transition may take before this
-/// suite calls it a hang. A ceiling on PATIENCE, generous over the emulator's own span,
-/// because a loaded machine is not a defect.
-const ACTIVE_DEADLINE: Duration = Duration::from_secs(30);
-
-/// How long one look at the table's status waits before looking again.
-const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// One row: the item its key is first given, the write under test, and whether that write
 /// leaves the item different from the one it replaced.
@@ -197,92 +190,6 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// Send one operation that must answer 200, answering its body.
-async fn ok(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    case: &str,
-    operation: &str,
-    body: Value,
-) -> Value {
-    let (status, parsed) = call(router, operation, body).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected {operation} to answer HTTP 200, got {status} with {parsed}"
-    );
-    parsed
-}
-
-/// Create [`TABLE`] with a stream capturing both images, wait until it serves writes, and
-/// answer the ARN of the stream it registered.
-async fn streamed_table(router: &smithy_server_runtime::MultiServiceRouter, case: &str) -> String {
-    let created = ok(
-        router,
-        case,
-        "CreateTable",
-        json!({
-            "TableName": TABLE,
-            "KeySchema": [{ "AttributeName": KEY, "KeyType": "HASH" }],
-            "AttributeDefinitions": [{ "AttributeName": KEY, "AttributeType": "S" }],
-            "BillingMode": "PAY_PER_REQUEST",
-            "StreamSpecification": {
-                "StreamEnabled": true,
-                "StreamViewType": "NEW_AND_OLD_IMAGES",
-            },
-        }),
-    )
-    .await;
-    let stream_arn = created["TableDescription"]["LatestStreamArn"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    assert!(
-        !stream_arn.is_empty(),
-        "case {case:?}: an enabled stream must be reported, got {created}"
-    );
-    let deadline = std::time::Instant::now() + ACTIVE_DEADLINE;
-    loop {
-        let described = ok(router, case, "DescribeTable", json!({ "TableName": TABLE })).await;
-        if described["Table"]["TableStatus"] == json!("ACTIVE") {
-            return stream_arn;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "case {case:?}: {TABLE} never reached ACTIVE, last saw {described}"
-        );
-        tokio::time::sleep(LOOK_AGAIN).await;
-    }
-}
-
-/// The item `GetItem` reports for `id` — the table's own account of what it stores, which is
-/// what a write that modified nothing must have left alone.
-async fn stored(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    case: &str,
-    id: &str,
-) -> Value {
-    let read = ok(
-        router,
-        case,
-        "GetItem",
-        json!({
-            "TableName": TABLE,
-            "Key": { KEY: { "S": id } },
-            "ConsistentRead": true,
-        }),
-    )
-    .await;
-    read["Item"].clone()
-}
-
-/// The records of `id`'s own item, in the order the stream holds them: a drain carries every
-/// row's records, and one row is about one key.
-fn records_of<'feed>(records: &'feed [Value], id: &str) -> Vec<&'feed Value> {
-    records
-        .iter()
-        .filter(|record| record["dynamodb"]["Keys"][KEY]["S"] == json!(id))
-        .collect()
-}
-
 /// RULE: a landed write publishes a stream record only when it left the item different from
 /// the one it replaced — a write storing exactly the values already held, and a delete that
 /// removed nothing, publish none — and one that did change the item publishes exactly one.
@@ -290,23 +197,23 @@ fn records_of<'feed>(records: &'feed [Value], id: &str) -> Vec<&'feed Value> {
 async fn only_a_write_that_modifies_the_item_publishes_a_record() {
     let suite = "writes that modify nothing";
     let router = emulator_with_streams();
-    let stream_arn = streamed_table(&router, suite).await;
+    let stream_arn = streamed_table(&router, suite, TABLE, KEY).await;
 
     for row in rows() {
         let case = row.case;
         // The item the row's write is made against, which is one INSERT on the stream.
-        ok(
+        ok_case(
             &router,
             case,
             "PutItem",
             json!({ "TableName": TABLE, "Item": row.item() }),
         )
         .await;
-        let before = stored(&router, case, row.id).await;
+        let before = stored_item(&router, case, TABLE, KEY, row.id).await;
 
         // The write under test.
-        ok(&router, case, row.operation, row.body()).await;
-        let after = stored(&router, case, row.id).await;
+        ok_case(&router, case, row.operation, row.body()).await;
+        let after = stored_item(&router, case, TABLE, KEY, row.id).await;
         assert_eq!(
             after == before,
             !row.modifies,
@@ -319,7 +226,7 @@ async fn only_a_write_that_modifies_the_item_publishes_a_record() {
         // would still leave the row's expectation unmet.
         let mut changed = row.item();
         changed["marker"] = json!({ "S": "last" });
-        ok(
+        ok_case(
             &router,
             case,
             "PutItem",
@@ -331,11 +238,8 @@ async fn only_a_write_that_modifies_the_item_publishes_a_record() {
     let drained = drain_stream(&router, suite, &stream_arn).await;
     for row in rows() {
         let case = row.case;
-        let mine = records_of(&drained, row.id);
-        let names: Vec<String> = mine
-            .iter()
-            .map(|record| record["eventName"].as_str().unwrap_or_default().to_string())
-            .collect();
+        let mine = records_of(&drained, KEY, row.id);
+        let names = event_names(&mine);
         let mut expected = vec!["INSERT".to_string()];
         if row.modifies {
             expected.push("MODIFY".to_string());
@@ -362,7 +266,7 @@ async fn only_a_write_that_modifies_the_item_publishes_a_record() {
     }
     // A delete of a key that holds no item removed nothing, so that key is on the stream
     // nowhere at all.
-    let never_written = records_of(&drained, "delete-absent-never-written");
+    let never_written = records_of(&drained, KEY, "delete-absent-never-written");
     assert!(
         never_written.is_empty(),
         "case {:?}: a delete that removed nothing publishes no record, got {never_written:?}",

@@ -630,6 +630,133 @@ pub fn event_names(records: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// The records of ONE item's own key, in the order the stream holds them: one drain carries
+/// every key a suite wrote, and a row of a table-driven suite is about one key.
+///
+/// `key` is the table's partition-key attribute and `id` the string value this item is held
+/// under, which is how a record names the item it describes ("The primary key attribute(s)
+/// for the DynamoDB item that was modified", `StreamRecord$Keys`).
+pub fn records_of(records: &[Value], key: &str, id: &str) -> Vec<Value> {
+    records
+        .iter()
+        .filter(|record| record["dynamodb"]["Keys"][key]["S"] == json!(id))
+        .cloned()
+        .collect()
+}
+
+/// Send one operation that must answer 200, answering its body, with `case` naming the row
+/// the call belongs to — [`ok`] for a table-driven suite, whose every panic has to say which
+/// row raised it.
+pub async fn ok_case(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: Value,
+) -> Value {
+    let (status, parsed) = call(router, operation, body).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected {operation} to answer HTTP 200, got {status} with {parsed}"
+    );
+    parsed
+}
+
+/// Create `table` keyed on the string attribute `key` with a stream capturing BOTH images,
+/// wait until it serves writes, and answer the ARN of the stream it registered — the setup
+/// every suite that reads a table's own change feed starts from.
+///
+/// On demand, so nothing here is about provisioned throughput, and the wait is the harness's
+/// own bounded poll for the documented `CREATING` -> `ACTIVE` transition
+/// ([`describe_when_active`]) rather than a span of the caller's choosing.
+pub async fn streamed_table(
+    router: &MultiServiceRouter,
+    case: &str,
+    table: &str,
+    key: &str,
+) -> String {
+    let created = ok_case(
+        router,
+        case,
+        "CreateTable",
+        json!({
+            "TableName": table,
+            "KeySchema": [{"AttributeName": key, "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": key, "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+            "StreamSpecification": {
+                "StreamEnabled": true,
+                "StreamViewType": "NEW_AND_OLD_IMAGES",
+            },
+        }),
+    )
+    .await;
+    let stream_arn = created["TableDescription"]["LatestStreamArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !stream_arn.is_empty(),
+        "case {case:?}: an enabled stream must be reported, got {created}"
+    );
+    describe_when_active(router, case, table).await;
+    stream_arn
+}
+
+/// The item `GetItem` reports for the key `id` of `table` — that table's own account of what
+/// it stores, which is what a write that modified nothing must have left alone.
+///
+/// Read consistently, so what it answers is what the write that just landed left, and with
+/// every set's members in one order ([`with_sorted_sets`]), because a set is unordered
+/// ("Amazon DynamoDB does not preserve the order of the members of a set") and two readings
+/// of one set are therefore compared as sets.
+pub async fn stored_item(
+    router: &MultiServiceRouter,
+    case: &str,
+    table: &str,
+    key: &str,
+    id: &str,
+) -> Value {
+    let read = ok_case(
+        router,
+        case,
+        "GetItem",
+        json!({
+            "TableName": table,
+            "Key": {key: {"S": id}},
+            "ConsistentRead": true,
+        }),
+    )
+    .await;
+    with_sorted_sets(&read["Item"])
+}
+
+/// The same value with every SET's members sorted.
+///
+/// A DynamoDB set is unordered — "Amazon DynamoDB does not preserve the order of the members
+/// of a set" — so a suite that compares a stored set to an expected one compares the MEMBERS,
+/// not the order the wire happened to list them in.
+pub fn with_sorted_sets(value: &Value) -> Value {
+    match value {
+        Value::Object(entries) => Value::Object(
+            entries
+                .iter()
+                .map(|(name, inner)| {
+                    let sorted = if matches!(name.as_str(), "SS" | "NS" | "BS") {
+                        let mut members: Vec<Value> = inner.as_array().cloned().unwrap_or_default();
+                        members.sort_by_key(ToString::to_string);
+                        Value::Array(members)
+                    } else {
+                        with_sorted_sets(inner)
+                    };
+                    (name.clone(), sorted)
+                })
+                .collect(),
+        ),
+        Value::Array(members) => Value::Array(members.iter().map(with_sorted_sets).collect()),
+        other => other.clone(),
+    }
+}
+
 /// The `GlobalSecondaryIndexes` entry of a description by index name, or `Null` when
 /// that description carries no index by that name.
 pub fn index_named(description: &Value, name: &str) -> Value {

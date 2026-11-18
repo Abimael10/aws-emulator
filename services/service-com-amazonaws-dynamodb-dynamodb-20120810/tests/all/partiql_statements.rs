@@ -18,7 +18,7 @@ use service_com_amazonaws_dynamodb_dynamodb_20120810::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::emulator::{call, emulator, error_code, message, ok};
+use crate::emulator::{call, emulator, error_code, message, ok, with_sorted_sets};
 use crate::table_items::create_active_table;
 
 /// Run one statement that must succeed, with the parameters it names (if any).
@@ -44,34 +44,6 @@ fn addressed(answered: &Value) -> Vec<(String, String)> {
             )
         })
         .collect()
-}
-
-/// The same value with every SET's members sorted.
-///
-/// A DynamoDB set is unordered — "Amazon DynamoDB does not preserve the order of the
-/// members of a set" — so a suite that compares a stored set to an expected one
-/// compares the MEMBERS, not the order the wire happened to list them in.
-fn with_sorted_sets(value: &Value) -> Value {
-    match value {
-        Value::Object(entries) => Value::Object(
-            entries
-                .iter()
-                .map(|(name, inner)| {
-                    let sorted = if matches!(name.as_str(), "SS" | "NS" | "BS") {
-                        let mut members: Vec<Value> =
-                            inner.as_array().cloned().unwrap_or_default();
-                        members.sort_by_key(|member| member.to_string());
-                        Value::Array(members)
-                    } else {
-                        with_sorted_sets(inner)
-                    };
-                    (name.clone(), sorted)
-                })
-                .collect(),
-        ),
-        Value::Array(members) => Value::Array(members.iter().map(with_sorted_sets).collect()),
-        other => other.clone(),
-    }
 }
 
 /// One `INSERT` row: the statement, the parameters it names, and the item a later
