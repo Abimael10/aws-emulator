@@ -696,6 +696,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.durable_execution_name.as_deref(),
                 &version,
                 &payload,
+                input.tenant_id.as_deref(),
                 now,
             )?;
             // A repeat that named an execution already started is the SAME invocation,
@@ -749,12 +750,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // this emulator through, built from the callback the framework handed
                     // THIS request and signing as the session of the function's own
                     // execution role — the same seam a synchronous invocation's run gets.
-                    aws: crate::state::function_sdk_access(
+                    aws: crate::state::function_sdk_access_in_vpc(
                         &*self.engine,
                         ctx,
                         &region,
                         &resolved_config.role,
                         &function_name,
+                        &record.vpc_network_interface_ids,
                     ),
                     // Where the run's log is delivered, and what the function's execution
                     // role may do there (`crate::state::execution::log_delivery`).
@@ -837,6 +839,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The package the run reads is the one of the version this invocation resolved to,
         // so a weighted alias runs the code of the version it reports.
         let zip_bytes = record.code_of(&executed_version).zip_bytes.clone();
+        // The interfaces Lambda stood up for the function's `VpcConfig`, which ATTACH the run
+        // to a VPC (`crate::state::vpc_interfaces`): copied out with the rest, because the run
+        // happens with no store guard held.
+        let vpc_network_interface_ids = record.vpc_network_interface_ids.clone();
         let kms_key_arn = resolved_config.kms_key_arn.clone();
         drop(store);
         // Lambda ADMITS the invocation to the function only while the function's own
@@ -908,12 +914,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // emulator through the callback the framework handed THIS request, signing
             // every call the handler makes as the session of the function's own execution
             // role (`crate::state::execution_role_session`).
-            aws: crate::state::function_sdk_access(
+            aws: crate::state::function_sdk_access_in_vpc(
                 &*self.engine,
                 ctx,
                 &region,
                 &resolved_config.role,
                 &function_name,
+                &vpc_network_interface_ids,
             ),
             // Where the run's log is delivered, and what the function's execution role may
             // do there (`crate::state::execution::log_delivery`).
@@ -985,6 +992,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.durable_execution_name.as_deref(),
                     &version,
                     &invocation.payload,
+                    input.tenant_id.as_deref(),
                     now,
                 )?,
             }
@@ -1000,6 +1008,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &state,
                 &function_name,
                 input.durable_execution_name.as_deref(),
+                input.tenant_id.as_deref(),
             );
             return Ok(InvokeOutput {
                 status_code: REQUEST_RESPONSE_STATUS,
@@ -1075,18 +1084,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// error document carries, under the `FunctionError` signal a failed invocation reports. An
 /// execution that has reached neither — one still running, started by an asynchronous
 /// invocation — has produced no answer yet, so there is none to report.
+///
+/// `tenant_id` is the `TenantId` the repeat carried: an execution is one tenant's own work, so
+/// only the tenant that started it is answered from it. A start can reach this at all only
+/// when it de-duplicated onto an execution of the same tenant
+/// ([`crate::state::FunctionRecord::start_durable_execution_for_tenant`]), and the same
+/// reading is made again here, so no answer of one tenant's execution is ever rendered for
+/// another.
 fn deduplicated_answer(
     state: &::engine::ServiceState<crate::state::ComAmazonawsLambdaAwsgirapiserviceState>,
     function: &str,
     name: Option<&str>,
+    tenant_id: Option<&str>,
 ) -> (Vec<u8>, Option<String>) {
     let mut store = state.lock();
-    let Some(execution) = name.and_then(|name| {
-        store
-            .functions
-            .get_mut(function)
-            .and_then(|record| record.durable_executions.get(name))
-    }) else {
+    let Some(execution) = name
+        .and_then(|name| {
+            store
+                .functions
+                .get_mut(function)
+                .and_then(|record| record.durable_executions.get(name))
+        })
+        .filter(|execution| execution.tenant_id.as_deref() == tenant_id)
+    else {
         return (Vec::new(), None);
     };
     if let Some(error) = execution.error.as_ref() {
@@ -1246,6 +1266,7 @@ fn start_durable_execution(
     requested_name: Option<&str>,
     version: &str,
     payload: &[u8],
+    tenant_id: Option<&str>,
     now: ::std::time::SystemTime,
 ) -> Result<StartedDurableExecution, InvokeError> {
     let durable = record
@@ -1263,7 +1284,7 @@ fn start_durable_execution(
     let resolved = record
         .resolved_version(version)
         .unwrap_or_else(|| version.to_string());
-    match record.start_durable_execution(&name, &resolved, payload, now) {
+    match record.start_durable_execution_for_tenant(&name, &resolved, payload, tenant_id, now) {
         crate::state::DurableExecutionStart::Started(arn) => Ok(StartedDurableExecution {
             durable_execution_arn: Some(arn),
             execution_name: Some(name),

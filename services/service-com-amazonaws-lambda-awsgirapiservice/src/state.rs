@@ -411,7 +411,7 @@ pub use recursion::{
 pub mod execution;
 pub use execution::{
     absent_environment_key_refusal, durable_data_key_fault, engine_for, environment_key_fault,
-    function_sdk_access,
+    function_sdk_access, function_sdk_access_in_vpc,
     invocation_trace_context, layer_archives, log_target, mint_request_id,
     report_environment_key_fault, run_invocation, runs_handler, supplied_trace_header, AwsAccess,
     Engine, EnvironmentKeyFault, Invocation, Invoked, LogTarget, Unrunnable,
@@ -1994,6 +1994,15 @@ pub const EVENT_TYPE_EXECUTION_STOPPED: &str = "ExecutionStopped";
 pub struct DurableExecutionRecord {
     /// The execution's name, as the call that started it named it.
     pub name: String,
+    /// The `TenantId` the invocation that started it carried, and `None` for one started by
+    /// an invocation that named no tenant.
+    ///
+    /// An execution is the state of ONE tenant's work: "Lambda returns the existing
+    /// execution instead of creating a duplicate" is an answer only the tenant that started
+    /// it may be given, so a start under a name another tenant holds is refused rather than
+    /// de-duplicated onto that tenant's execution, and nothing of it is reported to anyone
+    /// else ([`FunctionRecord::start_durable_execution_for_tenant`]).
+    pub tenant_id: Option<String>,
     /// The id this emulator minted for the execution, which its ARN carries beside the
     /// name; see [`mint_durable_execution_id`].
     pub execution_id: String,

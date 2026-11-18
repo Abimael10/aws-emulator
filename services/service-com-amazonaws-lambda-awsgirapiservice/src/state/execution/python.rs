@@ -742,6 +742,7 @@ impl Session {
             .clone()?;
         Some(self.sockets.answered(
             access.dialing().as_ref(),
+            access.inside_vpc().as_ref(),
             &access.runtime(),
             verb,
             document,

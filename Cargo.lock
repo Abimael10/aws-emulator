@@ -16098,6 +16098,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "image",
+ "ipnet",
  "libc",
  "md-5 0.10.6",
  "memory-stats",
@@ -16153,6 +16154,7 @@ dependencies = [
  "service-common",
  "sha1 0.10.7",
  "sha2 0.10.9",
+ "simple-dns",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -22200,6 +22202,15 @@ name = "similar"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+
+[[package]]
+name = "simple-dns"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8aea2b78df6bbe38fb98d2c8140ada65fb63a314246a0c38626140dd21c69ff7"
+dependencies = [
+ "bitflags 2.13.2",
+]
 
 [[package]]
 name = "siphasher"

@@ -432,12 +432,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // emulator through, built from the callback the framework handed THIS
                 // request and signing as the session of the function's own execution role
                 // — the same seam a synchronous invocation's run gets.
-                aws: crate::state::function_sdk_access(
+                aws: crate::state::function_sdk_access_in_vpc(
                     &*self.engine,
                     ctx,
                     &region,
                     &resolved_config.role,
                     &function_name,
+                    &record.vpc_network_interface_ids,
                 ),
                 // Where the run's log is delivered, and what the function's execution role
                 // may do there (`crate::state::execution::log_delivery`).

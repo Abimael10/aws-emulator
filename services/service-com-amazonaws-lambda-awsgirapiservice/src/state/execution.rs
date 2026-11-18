@@ -179,7 +179,9 @@ pub mod db_auth_token;
 /// The credential a running handler's own calls are made with: a session of the function's
 /// execution role.
 pub mod execution_role_session;
-pub use execution_role_session::{function_sdk_access, ExecutionRoleSessions};
+pub use execution_role_session::{
+    function_sdk_access, function_sdk_access_in_vpc, ExecutionRoleSessions,
+};
 
 /// The AWS SDK modules a Python handler imports, which that seam is reached through.
 mod aws_sdk_guest;
@@ -250,6 +252,11 @@ use trace_context::report_segments;
 /// The X-Ray daemon a traced invocation reports its own work to, and the datagram surface a
 /// handler reaches it through.
 pub mod xray_daemon;
+
+/// The VPC a function with a `VpcConfig` is ATTACHED to, as the run inside it addresses that
+/// VPC: the private address its traffic leaves from, and the VPC's own DNS resolver.
+pub mod vpc_network;
+pub use vpc_network::VpcAttachment;
 
 /// The engine memory the runs of this process may hold TOGETHER, stated in the MB a
 /// function's `MemorySize` is stated in.

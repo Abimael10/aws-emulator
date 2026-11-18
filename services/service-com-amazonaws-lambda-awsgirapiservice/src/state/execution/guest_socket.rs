@@ -56,6 +56,8 @@ use ::service_common::dialable_data_planes::{DialablePlanes, Dialed};
 use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ::tokio::runtime::Handle;
 
+use super::vpc_network::VpcAttachment;
+
 /// How many connections ONE invocation may hold open at a time.
 ///
 /// A handler opens a session per data plane it talks to, and a few at once is what a client
@@ -74,6 +76,26 @@ const MAX_BYTES_EACH_WAY: usize = 8 * 1024 * 1024;
 
 /// How much ONE read may return, and how much ONE write may carry.
 const MAX_BYTES_PER_CALL: usize = 1024 * 1024;
+
+/// How many DATAGRAMS one invocation may send, across every socket it opened.
+///
+/// A datagram is not a connection — nothing is held open for one — so what has to be bounded
+/// is how many a run may hand over: a client resolves a name and sends a measurement or two,
+/// and a run that asks for more than this is answered as a host out of descriptors answers
+/// one.
+const MAX_DATAGRAMS_PER_RUN: usize = 256;
+
+/// How many bytes ONE datagram may carry: the largest payload an IPv4 UDP datagram can hold
+/// (65535 less the 20-byte IP and 8-byte UDP headers), so a datagram this seam refuses is one
+/// no host could have sent either.
+const MAX_DATAGRAM_BYTES: usize = 65_507;
+
+/// The ports a host LENDS a socket that bound none itself: Linux's own default ephemeral
+/// range (`net.ipv4.ip_local_port_range`, 32768-60999), which is what a connected socket
+/// reports as its own port.
+const EPHEMERAL_PORT_FIRST: u16 = 32768;
+/// See [`EPHEMERAL_PORT_FIRST`].
+const EPHEMERAL_PORT_LAST: u16 = 60999;
 
 /// How long a connect or a read waits when the guest asked for no timeout at all: a socket
 /// call still cannot wait without end, and what is left of the run's deadline bounds it
@@ -128,6 +150,11 @@ struct Open {
     /// How many bytes it has written, and how many it has read.
     written: usize,
     read: usize,
+    /// How many datagrams it has sent.
+    datagrams: usize,
+    /// How many ephemeral ports have been lent to its sockets, which is what the next one is
+    /// counted from.
+    lent_ports: u16,
 }
 
 /// ONE connection the host holds for the guest: the CLIENT end of a pipe whose other end the
@@ -398,12 +425,15 @@ impl Sockets {
     ///
     /// `dialing` is the register of the planes this emulator has opened and the addresses they
     /// answer at; `None` where the engine vends none, and then no address answers at all,
-    /// which is the position every address was in before a service opened a plane. `runtime`
-    /// is the async runtime the plane's own handler runs on, which this blocking call drives
-    /// the connection on.
+    /// which is the position every address was in before a service opened a plane. `inside` is
+    /// the VPC this invocation's function is ATTACHED to ([`super::vpc_network`]), and `None`
+    /// for a function attached to none — which then has no route to a VPC address at all.
+    /// `runtime` is the async runtime the plane's own handler runs on, which this blocking call
+    /// drives the connection on.
     pub fn answered(
         &self,
         dialing: Option<&DialablePlanes>,
+        inside: Option<&VpcAttachment>,
         runtime: &Handle,
         verb: &str,
         document: &str,
@@ -411,7 +441,9 @@ impl Sockets {
     ) -> String {
         let answered = match ::serde_json::from_str::<Value>(document) {
             Ok(asked) => match verb {
-                "connect" => self.connected(dialing, runtime, &asked, within),
+                "connect" => self.connected(dialing, inside, runtime, &asked, within),
+                "route" => self.routed(inside, &asked),
+                "datagram" => self.delivered(inside, &asked),
                 "send" => self.sent(runtime, &asked, within),
                 "recv" => self.received(runtime, &asked, within),
                 "close" => self.closed(&asked),
@@ -445,6 +477,8 @@ impl Sockets {
         held.opened = 0;
         held.written = 0;
         held.read = 0;
+        held.datagrams = 0;
+        held.lent_ports = 0;
     }
 
     /// How many connections are open right now, for the tests of this seam.
@@ -457,6 +491,7 @@ impl Sockets {
     fn connected(
         &self,
         dialing: Option<&DialablePlanes>,
+        inside: Option<&VpcAttachment>,
         runtime: &Handle,
         asked: &Value,
         within: Duration,
@@ -499,6 +534,13 @@ impl Sockets {
                 Err(_elapsed) => Err(Failure::timed_out()),
             }
         })?;
+        // Where the connection LEAVES from, read off the same route a datagram's is
+        // ([`Self::source_toward`]): the private address of the interface the function's VPC
+        // attachment holds for an address of that VPC, and this machine's own interface for a
+        // plane served in this process. A destination the attachment has no source for leaves
+        // the socket bound to nothing, which is what an unbound socket reports. Read BEFORE
+        // the connections are locked, because the route lends a port out of the same state.
+        let source = self.source_toward(inside, &host).ok();
         let mut held = self.locked();
         held.handed += 1;
         held.opened += 1;
@@ -516,7 +558,118 @@ impl Sockets {
             "peerHost": peer_host,
             "peerPort": peer_port,
             "dialed": authority,
+            "sourceHost": source.as_ref().map(|(address, _)| address.clone()),
+            "sourcePort": source.as_ref().map(|(_, port)| *port),
         }))
+    }
+
+    /// The address a datagram or a connection toward the address this call names LEAVES from:
+    /// the route lookup a host performs before it sends one.
+    fn routed(&self, inside: Option<&VpcAttachment>, asked: &Value) -> Result<Value, Failure> {
+        let host = host_of(asked);
+        // A route is looked up toward an address AND a port, as a host's own lookup is: the
+        // port decides nothing about which interface answers, but a call that names none is
+        // not one this seam makes.
+        port_of(asked)?;
+        let (source, source_port) = self.source_toward(inside, &host)?;
+        Ok(json!({ "source": source, "sourcePort": source_port }))
+    }
+
+    /// Deliver ONE datagram to the address it is addressed to, and answer what came back.
+    ///
+    /// The one address of the VPC this emulator answers a datagram at is the VPC's own DNS
+    /// server ([`super::vpc_network`]), which replies to the query a datagram addressed to it
+    /// carries. Every other address of the VPC takes the datagram and answers nothing, as a
+    /// host with nothing bound to that port does — UDP reports nothing back, so the datagram
+    /// is simply lost — and an address the attachment has no route to is answered the way a
+    /// host with no route to it answers one, with nothing sent.
+    ///
+    /// An address of THIS MACHINE is the one case a datagram is REFUSED: the only datagram
+    /// service this emulator runs is the in-process X-Ray daemon, which a handler delivers to
+    /// without reaching this seam at all, so every other port of this machine has nothing
+    /// bound to it — and a datagram to an unbound port of a reachable host is refused, which
+    /// is what the sender reads off the port-unreachable the host answers with.
+    fn delivered(
+        &self,
+        inside: Option<&VpcAttachment>,
+        asked: &Value,
+    ) -> Result<Value, Failure> {
+        let host = host_of(asked);
+        let port = port_of(asked)?;
+        let payload = payload_of(asked)?;
+        if payload.len() > MAX_DATAGRAM_BYTES {
+            return Err(Failure::not_made(format!(
+                "one datagram may carry {MAX_DATAGRAM_BYTES} bytes"
+            )));
+        }
+        // The route first: a datagram toward an address with no route is never handed over.
+        let (source, source_port) = self.source_toward(inside, &host)?;
+        if this_machine(&host) {
+            return Err(Failure::refused());
+        }
+        {
+            let mut held = self.locked();
+            if held.datagrams >= MAX_DATAGRAMS_PER_RUN {
+                return Err(Failure::bounded(format!(
+                    "one invocation may send {MAX_DATAGRAMS_PER_RUN} datagrams"
+                )));
+            }
+            held.datagrams += 1;
+        }
+        let answered = host
+            .parse::<::std::net::Ipv4Addr>()
+            .ok()
+            .zip(inside)
+            .filter(|(destination, inside)| inside.is_resolver(*destination, port))
+            .and_then(|(_destination, inside)| inside.resolved(&payload))
+            .map(|reply| ::base64::engine::general_purpose::STANDARD.encode(reply));
+        Ok(json!({
+            "source": source,
+            "sourcePort": source_port,
+            "data": answered,
+        }))
+    }
+
+    /// The address traffic toward `host`:`port` leaves from, and the ephemeral port the socket
+    /// is lent for it.
+    ///
+    /// This machine's own interface is where every plane this emulator opened and the
+    /// in-process X-Ray daemon are served, so traffic to it leaves from that same interface.
+    /// Everything else is reached through the function's VPC attachment, which has a route to
+    /// the addresses of its own VPC and to nothing else; a value that is a NAME rather than an
+    /// address is answered by what resolves it, which is nothing but this machine's own names.
+    fn source_toward(
+        &self,
+        inside: Option<&VpcAttachment>,
+        host: &str,
+    ) -> Result<(String, u16), Failure> {
+        let named = host.trim_start_matches('[').trim_end_matches(']');
+        let address = match named.parse::<::std::net::IpAddr>() {
+            Ok(address) => address,
+            Err(_name) if ::emulator_server::is_loopback_host(named) => {
+                ::std::net::IpAddr::V4(::std::net::Ipv4Addr::LOCALHOST)
+            }
+            Err(_name) => return Err(Failure::unresolved(host)),
+        };
+        if address.is_loopback() || bound_to(address) {
+            return Ok((address.to_string(), self.lent_port()));
+        }
+        let ::std::net::IpAddr::V4(destination) = address else {
+            return Err(nothing_answers(host));
+        };
+        let source = inside
+            .and_then(|inside| inside.source_toward(destination))
+            .ok_or_else(|| nothing_answers(host))?;
+        Ok((source.to_string(), self.lent_port()))
+    }
+
+    /// The next ephemeral port this invocation's sockets are lent, out of the range a host
+    /// lends from ([`EPHEMERAL_PORT_FIRST`]).
+    fn lent_port(&self) -> u16 {
+        let mut held = self.locked();
+        let lent = held.lent_ports % (EPHEMERAL_PORT_LAST - EPHEMERAL_PORT_FIRST + 1);
+        held.lent_ports = lent.wrapping_add(1);
+        EPHEMERAL_PORT_FIRST + lent
     }
 
     /// Write what the guest handed over, whole.
@@ -671,6 +824,16 @@ fn bound_to(address: ::std::net::IpAddr) -> bool {
         .is_ok_and(|bound| !bound.is_unspecified() && bound == address)
 }
 
+/// Whether `host` names an address of THIS machine: one of its loopback addresses, one of its
+/// loopback names, or the interface the core binds its listeners on.
+fn this_machine(host: &str) -> bool {
+    let named = host.trim_start_matches('[').trim_end_matches(']');
+    match named.parse::<::std::net::IpAddr>() {
+        Ok(address) => address.is_loopback() || bound_to(address),
+        Err(_name) => ::emulator_server::is_loopback_host(named),
+    }
+}
+
 /// The address one connection reports as its peer: the host and port the register holds the
 /// plane under, and the ones the client addressed where that authority spells no port.
 fn peer_of(authority: &str, host: &str, port: u16) -> (String, u16) {
@@ -681,6 +844,16 @@ fn peer_of(authority: &str, host: &str, port: u16) -> (String, u16) {
         ),
         None => (host.to_string(), port),
     }
+}
+
+/// The HOST one call names, as the guest spelled it.
+fn host_of(asked: &Value) -> String {
+    asked
+        .get("host")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// The handle one call names, or the failure a call naming no connection answers.
@@ -949,6 +1122,13 @@ def _stream_connect(sock, address):
     )
     sock._handle = answered["handle"]
     sock._peer = (answered["peerHost"], answered["peerPort"])
+    # The address the connection LEAVES from, as the host's own route lookup answered it: the
+    # private address of the interface the function's VPC attachment holds, or this machine's
+    # own interface for a plane served in this process. A destination there is no source for
+    # leaves the socket bound to nothing.
+    source = answered.get("sourceHost")
+    if source:
+        sock._source = (source, int(answered.get("sourcePort") or 0))
     return None
 
 
@@ -1008,6 +1188,7 @@ def _stream_close(sock):
     handle = sock._handle
     sock._handle = None
     sock._peer = None
+    sock._source = None
     if handle is None:
         return None
     try:
@@ -1200,7 +1381,7 @@ mod tests {
             ("a handle that names no connection", "recv", "{\"handle\":7,\"size\":1}"),
         ] {
             let answered =
-                sockets.answered(None, &runtime, verb, document, Duration::from_secs(1));
+                sockets.answered(None, None, &runtime, verb, document, Duration::from_secs(1));
             assert!(
                 answered.contains("\"error\""),
                 "case {case:?}: expected a reported failure, got {answered}"
@@ -1211,6 +1392,120 @@ mod tests {
             0,
             "expected no connection to have been opened at all"
         );
+    }
+
+    /// One row of the table below: the case, the destination, the source the ROUTE answers,
+    /// the errno that route is refused with, and the errno a DATAGRAM to it is refused with.
+    type RouteRow = (&'static str, &'static str, Option<&'static str>, Option<i64>, i64);
+
+    /// RULE: the route a datagram takes is answered off the function's VPC attachment: this
+    /// machine's own interface is where the planes served in this process are, and a function
+    /// attached to NO VPC has no route to any other address. A datagram handed over for an
+    /// address of this machine is REFUSED — the one datagram service here is the X-Ray daemon,
+    /// which a handler delivers to without reaching this seam — and one with no route is never
+    /// handed over at all.
+    ///
+    /// The rows differ along where the destination sits: this machine, its loopback name, an
+    /// address of another host, and a name nothing resolves.
+    #[tokio::test]
+    async fn the_route_of_a_function_attached_to_no_vpc_reaches_this_machine_alone() {
+        let sockets = Sockets::default();
+        let runtime = Handle::current();
+        // Per row: the source the ROUTE answers, the errno that route is refused with, and
+        // the errno a DATAGRAM to it is refused with.
+        let rows: &[RouteRow] = &[
+            (
+                "this machine",
+                "127.0.0.1",
+                Some("127.0.0.1"),
+                None,
+                i64::from(ECONNREFUSED),
+            ),
+            (
+                "its loopback name",
+                "localhost",
+                Some("127.0.0.1"),
+                None,
+                i64::from(ECONNREFUSED),
+            ),
+            (
+                "an address of another host",
+                "10.0.7.9",
+                None,
+                Some(i64::from(ENETUNREACH)),
+                i64::from(ENETUNREACH),
+            ),
+            (
+                "a name nothing resolves",
+                "broker.example.com",
+                None,
+                Some(i64::from(EAI_NONAME)),
+                i64::from(EAI_NONAME),
+            ),
+        ];
+        for (case, host, expected, route_errno, datagram_errno) in rows {
+            let asked = json!({ "host": host, "port": 53, "data": "" }).to_string();
+            let routed = sockets.answered(
+                None,
+                None,
+                &runtime,
+                "route",
+                &asked,
+                Duration::from_secs(1),
+            );
+            let reported: Value = ::serde_json::from_str(&routed).expect("an answer document");
+            assert_eq!(
+                reported.get("source").and_then(Value::as_str),
+                *expected,
+                "case {case:?} (route): expected the source {expected:?}, got {routed}"
+            );
+            assert_eq!(
+                reported
+                    .get("error")
+                    .and_then(|error| error.get("errno"))
+                    .and_then(Value::as_i64),
+                *route_errno,
+                "case {case:?} (route): expected errno {route_errno:?}, got {routed}"
+            );
+            if expected.is_some() {
+                // The port is one lent out of the ephemeral range, as a host lends one to a
+                // socket that bound none itself.
+                let port = reported
+                    .get("sourcePort")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                assert!(
+                    (u64::from(EPHEMERAL_PORT_FIRST)..=u64::from(EPHEMERAL_PORT_LAST))
+                        .contains(&port),
+                    "case {case:?} (route): expected a lent ephemeral port, got {routed}"
+                );
+            }
+            // No datagram of a function attached to no VPC is delivered anywhere: nothing of
+            // this emulator answers one at this machine, and every other address has no
+            // route.
+            let delivered = sockets.answered(
+                None,
+                None,
+                &runtime,
+                "datagram",
+                &asked,
+                Duration::from_secs(1),
+            );
+            let reported: Value = ::serde_json::from_str(&delivered).expect("an answer document");
+            assert_eq!(
+                reported
+                    .get("error")
+                    .and_then(|error| error.get("errno"))
+                    .and_then(Value::as_i64),
+                Some(*datagram_errno),
+                "case {case:?} (datagram): expected errno {datagram_errno}, got {delivered}"
+            );
+            assert_eq!(
+                reported.get("data").unwrap_or(&Value::Null),
+                &Value::Null,
+                "case {case:?} (datagram): expected no reply to come back, got {delivered}"
+            );
+        }
     }
 
     /// RULE: a connection is opened only to a plane a service RECORDED, and an address no
@@ -1242,6 +1537,7 @@ mod tests {
             let asked = json!({ "host": host, "port": port, "timeout": 1.0 }).to_string();
             let answered = sockets.answered(
                 Some(&planes),
+                None,
                 &runtime,
                 "connect",
                 &asked,

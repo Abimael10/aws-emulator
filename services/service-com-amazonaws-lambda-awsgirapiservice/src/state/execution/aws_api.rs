@@ -1837,6 +1837,11 @@ pub struct AwsAccess {
     /// STREAM SOCKET the handler opens itself ([`super::guest_socket`]). `None` where this
     /// emulator vends no such records, and then no address answers at all.
     dialable: Option<::service_common::dialable_data_planes::DialablePlanes>,
+    /// The VPC the function this invocation runs is ATTACHED to
+    /// ([`super::vpc_network`]): the private address its traffic leaves from and the addresses
+    /// it reaches there. `None` for a function attached to no VPC, which then has no route to
+    /// a VPC address at all.
+    attachment: Option<super::vpc_network::VpcAttachment>,
     /// The base URL this emulator is reached on, which a URL the handler's SDK PRESIGNS has
     /// to lead back to ([`super::presigned_url`]). `None` where the run was given no
     /// endpoint, in which case no URL is signed at all rather than one signed for an address
@@ -1862,6 +1867,7 @@ impl AwsAccess {
             trace_header: None,
             published: None,
             dialable: None,
+            attachment: None,
             endpoint: None,
             client_endpoint: None,
         })
@@ -1925,6 +1931,29 @@ impl AwsAccess {
     #[must_use]
     pub fn dialing(&self) -> Option<::service_common::dialable_data_planes::DialablePlanes> {
         self.dialable.clone()
+    }
+
+    /// The same access, with the function ATTACHED to the VPC `attachment` describes — the
+    /// interfaces Lambda stood up for its `VpcConfig` and the address space they reach
+    /// ([`super::vpc_network`]).
+    ///
+    /// `None` leaves the run attached to no VPC, which is a function whose configuration named
+    /// no subnet: its datagrams then reach only the in-process X-Ray daemon, and an address of
+    /// a VPC is one it has no route to.
+    #[must_use]
+    pub fn attached_in_vpc(
+        mut self,
+        attachment: Option<super::vpc_network::VpcAttachment>,
+    ) -> Self {
+        self.attachment = attachment;
+        self
+    }
+
+    /// The VPC attachment a datagram's route and a connection's source address are read off,
+    /// for that same seam.
+    #[must_use]
+    pub fn inside_vpc(&self) -> Option<super::vpc_network::VpcAttachment> {
+        self.attachment.clone()
     }
 
     /// The async runtime a call of this seam is driven on, for a caller that has to block its

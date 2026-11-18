@@ -443,6 +443,10 @@ impl FunctionRecord {
     /// The execution's settings come from the function's own `DurableConfig`: the key it
     /// encrypts payload data under, and the `ExecutionTimeout` whose due instant is
     /// stored here once rather than recomputed on every read.
+    ///
+    /// Started for NO tenant: the start an invocation carrying a `TenantId` makes is
+    /// [`FunctionRecord::start_durable_execution_for_tenant`], which scopes the whole rule
+    /// above to the tenant that owns the execution.
     pub fn start_durable_execution(
         &mut self,
         name: &str,
@@ -450,7 +454,30 @@ impl FunctionRecord {
         payload: &[u8],
         now: SystemTime,
     ) -> DurableExecutionStart {
+        self.start_durable_execution_for_tenant(name, version, payload, None, now)
+    }
+
+    /// [`FunctionRecord::start_durable_execution`] for the invocation of a TENANT.
+    ///
+    /// An execution is the state of ONE tenant's work, and what a de-duplicated repeat is
+    /// answered with is that execution's own ARN and, later, its own result — so the
+    /// de-duplication above holds only between starts of the SAME tenant. A start under a name
+    /// another tenant already holds is [`DurableExecutionStart::NameAlreadyStarted`]: the name
+    /// is taken within the function, which is the state the modelled
+    /// `DurableExecutionAlreadyStartedException` describes, and nothing of the other tenant's
+    /// execution is reported to this caller.
+    pub fn start_durable_execution_for_tenant(
+        &mut self,
+        name: &str,
+        version: &str,
+        payload: &[u8],
+        tenant_id: Option<&str>,
+        now: SystemTime,
+    ) -> DurableExecutionStart {
         if let Some(held) = self.durable_executions.get(name) {
+            if held.tenant_id.as_deref() != tenant_id {
+                return DurableExecutionStart::NameAlreadyStarted;
+            }
             if held.input_payload == payload {
                 return DurableExecutionStart::AlreadyStarted(self.durable_execution_arn(held));
             }
@@ -469,6 +496,7 @@ impl FunctionRecord {
         let now = crate::state::execution_instant(now);
         let mut execution = DurableExecutionRecord {
             name: name.to_string(),
+            tenant_id: tenant_id.map(str::to_string),
             execution_id: mint_durable_execution_id(),
             version: version.to_string(),
             status: EXECUTION_STATUS_RUNNING.to_string(),

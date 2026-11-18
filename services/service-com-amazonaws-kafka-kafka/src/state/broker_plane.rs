@@ -23,6 +23,15 @@
 //! authenticated with IAM, the policies of the principal that signed it
 //! ([`iam_access`]).
 //!
+//! That same broker answers at BOTH ends of the announced address: the socket the core
+//! accepts a client's connections on, and the connections a client running in THIS process
+//! opens to the address the control plane published
+//! ([`::service_common::dialable_data_planes`]). "Amazon MSK brokers are only accessible from
+//! within the cluster's VPC", so the client that reads a bootstrap string and dials it is
+//! often code this emulator itself runs — the code of a Lambda function attached to that VPC,
+//! which opens no host socket — and an address the control plane publishes has to be one such
+//! a client can reach.
+//!
 //! The log itself is this state's: a produced record is kept here and handed back to a
 //! fetch from the offset it was written at, and a record older than the topic's
 //! `retention.ms` is dropped — the clock owes that removal at the instant the record
@@ -45,6 +54,12 @@ pub mod wire;
 /// its clients reach is one broker to them. It is also the node a group's coordinator is
 /// reported as.
 pub const BROKER_NODE_ID: i32 = 1;
+
+/// The service that opened the endpoint's socket, as the register of the planes this
+/// emulator serves in process names it: this service's own SigV4 signing name
+/// (`sigv4Name` `kafka`, `smithy_query(query="service_info")`), which is what a diagnosis
+/// of a connection to the published address has to say.
+const SIGNING_NAME: &str = "kafka";
 
 /// The most bytes one request frame on a broker connection may carry. Apache Kafka's
 /// own `socket.request.max.bytes` default (100 MiB) is far above what an emulator
@@ -279,6 +294,12 @@ pub struct ClusterEndpoint {
     authority: String,
     /// Held only to keep the port open; the core owns the socket and its lifetime.
     _listener: ::emulator_server::ResourceListener,
+    /// The record that makes the SAME broker reachable at that address by a client
+    /// running in THIS process (`service_common::dialable_data_planes`) — the code of a
+    /// Lambda function attached to the cluster's VPC, which is the one vantage point a
+    /// VPC-only bootstrap address is reachable from. Dropped with the listener, so
+    /// nothing resolves to a port that is closed.
+    _dialable: Option<::service_common::dialable_data_planes::OpenedPlanes>,
 }
 
 /// Written by hand rather than derived: a [`::emulator_server::ResourceListener`] is a
@@ -344,26 +365,45 @@ pub async fn ensure_cluster_endpoint<Eng: Send + Sync + 'static>(
     let listeners = (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()?
         .listeners();
+    // ONE broker per access path, served at BOTH ends of its address: the socket the core
+    // accepts a client's connections on, and the connections an IN-PROCESS client of this
+    // emulator opens to the address `GetBootstrapBrokers` publishes
+    // (`service_common::dialable_data_planes`). A bootstrap address of a cluster in a VPC is
+    // reachable only from inside that VPC, so the client that reads it out of the control
+    // plane and dials it is code this emulator itself runs — a function attached to that VPC
+    // — and both ends are the same broker over the same log.
+    let served = ::std::sync::Arc::new(wire::ClusterBroker::new(
+        cluster_arn.to_string(),
+        region.to_string(),
+        path,
+        state.clone(),
+        // The core's own TLS server, for a client that dialled one of the
+        // encrypted paths. A core that cannot prepare one leaves this `None`, and
+        // such a client is then dropped at its first byte rather than answered in
+        // the clear.
+        listeners.tls_upgrader().ok(),
+        ctx.callback().clone(),
+        // Where a connection's IAM permissions are read from: the stores
+        // themselves, so a policy written after this socket was opened is in force
+        // on the next connection ([`iam_access`]).
+        iam_access::PolicySource::of_engine(engine),
+    ));
     let listener = listeners
-        .tcp_plaintext(wire::ClusterBroker::new(
-            cluster_arn.to_string(),
-            region.to_string(),
-            path,
-            state.clone(),
-            // The core's own TLS server, for a client that dialled one of the
-            // encrypted paths. A core that cannot prepare one leaves this `None`, and
-            // such a client is then dropped at its first byte rather than answered in
-            // the clear.
-            listeners.tls_upgrader().ok(),
-            ctx.callback().clone(),
-            // Where a connection's IAM permissions are read from: the stores
-            // themselves, so a policy written after this socket was opened is in force
-            // on the next connection ([`iam_access`]).
-            iam_access::PolicySource::of_engine(engine),
+        .tcp_plaintext(::service_common::dialable_data_planes::SharedHandler(
+            ::std::sync::Arc::clone(&served),
         ))
         .await
         .ok()?;
     let authority = ::service_common::data_plane_addressing::listener_authority(&listener);
+    // The published address is now recorded as one this emulator SERVES, so an in-process
+    // client dialling it reaches this cluster's own broker instead of being answered as a
+    // client of an address nothing listens at. The plane negotiates its encryption in band
+    // itself ([`wire::ClusterBroker`]), reading byte 0 the way it does on the socket, so the
+    // record carries no upgrader of its own.
+    let dialable = ::service_common::dialable_data_planes::DialablePlanes::of(engine).map(|planes| {
+        let plane = ::service_common::dialable_data_planes::served_in_process(served, None);
+        planes.opening([authority.clone()], SIGNING_NAME, &plane)
+    });
 
     let mut store = state.lock();
     // Another call may have opened one while this was binding; keep the first, so an
@@ -379,6 +419,7 @@ pub async fn ensure_cluster_endpoint<Eng: Send + Sync + 'static>(
     let endpoint = ClusterEndpoint {
         authority: authority.clone(),
         _listener: listener,
+        _dialable: dialable,
     };
     store.cluster_endpoints.insert(key, endpoint);
     ::tracing::info!(

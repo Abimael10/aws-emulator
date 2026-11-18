@@ -138,6 +138,10 @@ fn sessions_state<Eng: Send + Sync + 'static>(
 /// And it carries the base URL this emulator is reached on, because a URL the handler's SDK
 /// PRESIGNS is handed to a later caller: it leads back to this emulator or it leads nowhere
 /// ([`super::presigned_url`]).
+///
+/// What it does NOT carry is a VPC attachment: a runner of another service's work is attached
+/// to no VPC of its own. The seam an invocation of a LAMBDA FUNCTION gets is
+/// [`function_sdk_access_in_vpc`], which is this one with the function's own attachment on it.
 #[must_use]
 pub fn function_sdk_access<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -163,6 +167,31 @@ pub fn function_sdk_access<Eng: Send + Sync + 'static>(
             .dialing_opened_planes(
                 ::service_common::dialable_data_planes::DialablePlanes::of(engine),
             ),
+    )
+}
+
+/// The seam [`function_sdk_access`] builds, for an invocation of a Lambda FUNCTION: the same
+/// access, with the VPC the function is ATTACHED to on it.
+///
+/// `vpc_network_interface_ids` are the interfaces Lambda stood up for the function's
+/// `VpcConfig` ([`crate::state::vpc_interfaces`]), and they are what attaches the run to a
+/// VPC: the seam then carries the private address the run's traffic leaves from and the
+/// address space it reaches there ([`super::vpc_network`]), read out of the same shared
+/// engine's EC2 inventory. A function attached to no VPC names none, and reaches no VPC
+/// address at all.
+#[must_use]
+pub fn function_sdk_access_in_vpc<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    session_name: &str,
+    vpc_network_interface_ids: &[String],
+) -> Option<super::AwsAccess> {
+    Some(
+        function_sdk_access(engine, ctx, region, role_arn, session_name)?.attached_in_vpc(
+            super::vpc_network::attachment_of(engine, region, vpc_network_interface_ids),
+        ),
     )
 }
 

@@ -11,12 +11,13 @@
 //! * [`DATAGRAM_SOURCE`], the sockets of the `socket` module this runtime supplies
 //!   ([`super::guest_http::runtime_stdlib_modules`], which this source is appended to). The
 //!   interpreter a run happens in registers no host socket extension at all
-//!   ([`super::python`]), so every socket of a run is this source's. The one destination a
-//!   DATAGRAM of it reaches is the daemon address this invocation's environment names, and
-//!   every other datagram destination raises the error a host with no route to it answers; a
-//!   STREAM socket's calls are the stream half appended beside this one
-//!   ([`super::guest_socket`]), which connects to the data-plane listeners this emulator has
-//!   opened.
+//!   ([`super::python`]), so every socket of a run is this source's. A DATAGRAM of one reaches
+//!   the daemon address this invocation's environment names, and the addresses of the VPC the
+//!   function is ATTACHED to — the host answers the route each takes and carries it
+//!   ([`super::vpc_network`], [`super::guest_socket`]) — while a destination with no route
+//!   raises the error a host with none answers; a STREAM socket's calls are the stream half
+//!   appended beside this one ([`super::guest_socket`]), which connects to the data-plane
+//!   listeners this emulator has opened.
 //! * the DAEMON itself, in that same source: a datagram is read as the daemon's own framing —
 //!   a header line declaring the format, then one segment document per line — and the documents
 //!   it carries are submitted to X-Ray through `PutTraceSegments`, over the one AWS SDK seam a
@@ -57,18 +58,24 @@ pub const CONTEXT_MISSING_LOG_ERROR: &str = "LOG_ERROR";
 /// The SOCKETS of the `socket` module this runtime supplies, appended to the names, errors
 /// and conversions that module already states
 /// ([`super::guest_http::runtime_stdlib_modules`]) — so there is ONE `socket` a handler can
-/// import. What this adds to it is the socket itself and the daemon a datagram of one
-/// reaches; where a socket is a STREAM socket, its calls are the stream half beside this one
-/// ([`super::guest_socket::STREAM_SOURCE`]).
+/// import. What this adds to it is the socket itself, the daemon a datagram of one reaches and
+/// the route a datagram takes into the VPC the function is attached to
+/// ([`super::vpc_network`]); where a socket is a STREAM socket, its calls are the stream half
+/// beside this one ([`super::guest_socket::STREAM_SOURCE`]).
 pub const DATAGRAM_SOURCE: &str = r#"
 
 # ---------------------------------------------------------------------------
-# The datagram sockets of this runtime, and the X-Ray daemon behind them.
+# The datagram sockets of this runtime, the X-Ray daemon behind them, and the VPC the
+# function is attached to.
 #
 # A datagram addressed to the daemon address the environment names is delivered to the
-# daemon, which submits the segment documents it carries to X-Ray; every other destination
-# has no route, so addressing one raises as it does on a host with none.
+# daemon, which submits the segment documents it carries to X-Ray. Every other datagram is
+# handed to the host, which answers the route it takes: a function attached to a VPC reaches
+# the addresses of that VPC, from the private address of the interface it holds there, and the
+# VPC's own DNS server replies to a query addressed to it. An address with no route is
+# answered the way a host with none answers one.
 
+import base64 as _base64
 import json as _json
 import os as _os
 
@@ -78,12 +85,14 @@ _host = __import__("_lambda_host")
 # version, then one segment document per line.
 _DAEMON_FORMAT = "json"
 
-# ENETUNREACH, as a host with no route to the address answers.
+# The numbers a host answers these failures with, which a program reads off `errno`.
+_EBADF = 9
+_EOPNOTSUPP = 95
 _ENETUNREACH = 101
-_NO_ROUTE = (
-    "a Lambda function in this emulator reaches no host: the only address its "
-    "datagrams reach is the X-Ray daemon named by AWS_XRAY_DAEMON_ADDRESS"
-)
+_ENOTCONN = 107
+
+# What a call that is not a datagram socket's is answered with.
+_NOT_SUPPORTED = "Operation not supported"
 
 
 def _daemon_address():
@@ -96,19 +105,76 @@ def _daemon_region():
     return _os.environ.get("AWS_REGION") or _os.environ.get("AWS_DEFAULT_REGION") or ""
 
 
-def _named(address):
-    """`address` as the `host:port` text the daemon address is written in."""
-    if isinstance(address, (tuple, list)) and len(address) >= 2:
-        return "%s:%s" % (address[0], address[1])
-    if isinstance(address, (bytes, bytearray)):
-        return bytes(address).decode("utf-8", "replace")
-    return str(address)
-
-
 def _datagram_text(data):
     if isinstance(data, (bytes, bytearray, memoryview)):
         return bytes(data).decode("utf-8", "replace")
     return str(data)
+
+
+def _datagram_bytes(data):
+    """The bytes one datagram carries, as a socket takes them."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return bytes(data)
+    if isinstance(data, str):
+        raise TypeError("a bytes-like object is required, not 'str'")
+    return bytes(data)
+
+
+def _datagram_endpoint(address):
+    """The `(host, port)` one datagram is addressed to."""
+    if not isinstance(address, (tuple, list)) or len(address) < 2:
+        raise error("a datagram is addressed to a (host, port) address")
+    host = address[0]
+    if isinstance(host, (bytes, bytearray)):
+        host = bytes(host).decode("utf-8", "replace")
+    return str("" if host is None else host), _stream_port(address[1])
+
+
+def _net_asked(verb, document):
+    """One call on the host's own network seam, with a failure raised as the error a host
+    answers it with."""
+    answered = _json.loads(_host.net(verb, _json.dumps(document)))
+    failed = answered.get("error")
+    if failed:
+        raise _stream_failure(failed)
+    return answered
+
+
+def _datagram_source(sock, host, port):
+    """The address a datagram toward `host`:`port` leaves from.
+
+    The daemon is served in THIS process, on this machine's own loopback interface, so a
+    datagram to the address the environment names it at leaves from that interface; every other
+    destination is the host's own route lookup, which answers the private address of the
+    interface the function's VPC attachment holds — or raises what a host with no route to the
+    address raises.
+    """
+    if sock._closed:
+        raise error(_EBADF, "Bad file descriptor")
+    if "%s:%s" % (host, port) == _daemon_address():
+        return (_LOOPBACK_ADDRESS, 0)
+    answered = _net_asked("route", {"host": host, "port": port})
+    return (answered["source"], int(answered.get("sourcePort") or 0))
+
+
+def _datagram_read(sock, size):
+    """The oldest datagram that has arrived on `sock`, and the address it came from.
+
+    A socket nothing has arrived on waits for one, and a wait of this runtime ends the way a
+    host's own does when nothing comes: with the timeout a socket reports.
+    """
+    if sock._closed:
+        raise error(_EBADF, "Bad file descriptor")
+    if not sock._arrived:
+        raise timeout("timed out")
+    data, peer = sock._arrived.pop(0)
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        raise error("the number of bytes to read is a number") from None
+    if size < 0:
+        raise ValueError("negative buffersize in recv")
+    return (data[:size], peer)
 
 
 def _segment_documents(data):
@@ -157,10 +223,10 @@ def _delivered(data):
 class socket(object):
     """One socket of the invocation.
 
-    A DATAGRAM socket delivers to the daemon, and every other destination has no route. A
-    STREAM socket carries bytes on a connection the host opens for it, to an address this
-    emulator serves a resource's own data plane at: those calls are the stream half of this
-    module, appended below.
+    A DATAGRAM socket delivers to the daemon the environment names and to the VPC the function
+    is attached to, and every other destination has no route. A STREAM socket carries bytes on
+    a connection the host opens for it, to an address this emulator serves a resource's own
+    data plane at: those calls are the stream half of this module, appended below.
     """
 
     def __init__(self, family=AF_INET, type=SOCK_STREAM, proto=0, fileno=None):
@@ -172,6 +238,12 @@ class socket(object):
         self._timeout = None
         # The connection a STREAM socket holds, once it has one. A datagram socket holds none.
         self._handle = None
+        # The address this socket's traffic leaves from, once a route toward a destination has
+        # been resolved; a socket with no route resolved is bound to nothing.
+        self._source = None
+        # The datagrams that have arrived on this socket and have not been read yet, oldest
+        # first, each with the address it came from.
+        self._arrived = []
 
     def __enter__(self):
         return self
@@ -193,6 +265,7 @@ class socket(object):
     def close(self):
         if self._is_stream():
             _stream_close(self)
+        self._arrived = []
         self._closed = True
 
     def detach(self):
@@ -224,28 +297,39 @@ class socket(object):
         return None
 
     def getsockname(self):
-        # A connection of this runtime is served in process, so it is bound to no address of
-        # its own: the same answer an unbound socket gives, which is what this is.
+        """The address this socket's traffic leaves from.
+
+        Once a route toward a destination has been resolved, that is the address the route
+        leaves from — the private address of the interface the function's VPC attachment holds
+        for an address of its VPC, and this machine's own interface for a destination served in
+        this process. A socket with no route resolved is bound to no address of its own, which
+        is the answer an unbound socket gives.
+        """
+        if self._source is not None:
+            return self._source
         return ("0.0.0.0", 0)
 
     def getpeername(self):
         if self._peer is None:
-            raise error(_ENETUNREACH, _NO_ROUTE)
+            raise error(_ENOTCONN, "Transport endpoint is not connected")
         return self._peer
 
     def sendto(self, data, *arguments):
         if not arguments:
             raise TypeError("sendto() takes an address")
         if self._is_stream():
-            raise error(_ENETUNREACH, _NO_ROUTE)
-        self._deliver(data, _named(arguments[-1]))
-        return len(_datagram_text(data).encode("utf-8"))
+            raise error(_EOPNOTSUPP, _NOT_SUPPORTED)
+        return self._deliver(data, arguments[-1])
 
     def connect(self, address):
         if self._is_stream():
             return _stream_connect(self, address)
-        self._reachable(_named(address))
-        self._peer = address
+        host, port = _datagram_endpoint(address)
+        # A datagram socket's `connect` only states where its datagrams go, so the whole of
+        # what it does is the route lookup — which is what tells a caller the address its
+        # traffic toward that destination leaves from.
+        self._source = _datagram_source(self, host, port)
+        self._peer = (host, port)
         return None
 
     def connect_ex(self, address):
@@ -260,9 +344,8 @@ class socket(object):
         if self._is_stream():
             return _stream_send(self, data)
         if self._peer is None:
-            raise error(_ENETUNREACH, _NO_ROUTE)
-        self._deliver(data, _named(self._peer))
-        return len(_datagram_text(data).encode("utf-8"))
+            raise error(_ENOTCONN, "Transport endpoint is not connected")
+        return self._deliver(data, self._peer)
 
     def sendall(self, data, flags=0):
         if self._is_stream():
@@ -276,44 +359,66 @@ class socket(object):
     def recv(self, size, flags=0):
         if self._is_stream():
             return _stream_recv(self, size)
-        raise error(_ENETUNREACH, _NO_ROUTE)
+        return _datagram_read(self, size)[0]
 
     def recv_into(self, buffer, nbytes=None, flags=0):
         if self._is_stream():
             return _stream_recv_into(self, buffer, nbytes)
-        raise error(_ENETUNREACH, _NO_ROUTE)
+        view = memoryview(buffer)
+        size = len(view) if not nbytes else min(int(nbytes), len(view))
+        data = _datagram_read(self, size)[0]
+        view[: len(data)] = data
+        return len(data)
 
     def recvfrom(self, size, flags=0):
         if self._is_stream():
             return (_stream_recv(self, size), self.getpeername())
-        raise error(_ENETUNREACH, _NO_ROUTE)
+        return _datagram_read(self, size)
 
     def listen(self, backlog=0):
-        raise error(_ENETUNREACH, _NO_ROUTE)
+        raise error(_EOPNOTSUPP, _NOT_SUPPORTED)
 
     def accept(self):
-        raise error(_ENETUNREACH, _NO_ROUTE)
+        raise error(_EOPNOTSUPP, _NOT_SUPPORTED)
 
     def makefile(self, *arguments, **keywords):
         if self._is_stream():
             return _stream_makefile(self, *arguments, **keywords)
-        raise error(_ENETUNREACH, _NO_ROUTE)
+        raise error(_EOPNOTSUPP, _NOT_SUPPORTED)
 
     def shutdown(self, how):
         if self._is_stream():
             return _stream_shutdown(self, how)
         return None
 
-    def _reachable(self, named):
-        if self._closed:
-            raise error("the socket is closed")
-        daemon = _daemon_address()
-        if self.type != SOCK_DGRAM or not daemon or named != daemon:
-            raise error(_ENETUNREACH, _NO_ROUTE)
+    def _deliver(self, data, address):
+        """Deliver ONE datagram, and keep whatever came back for a read of this socket.
 
-    def _deliver(self, data, named):
-        self._reachable(named)
-        _delivered(data)
+        The daemon is in this process, so a datagram addressed to it is handed straight to it.
+        Every other datagram goes through the host, which carries it to the address it is
+        addressed to inside the function's own VPC and answers with the reply that address
+        sent, if it sent one — the VPC's own DNS server does, and an address nothing is bound
+        at answers nothing, exactly as UDP reports nothing back.
+        """
+        host, port = _datagram_endpoint(address)
+        payload = _datagram_bytes(data)
+        self._source = _datagram_source(self, host, port)
+        if "%s:%s" % (host, port) == _daemon_address():
+            _delivered(payload)
+            return len(payload)
+        answered = _net_asked(
+            "datagram",
+            {
+                "host": host,
+                "port": port,
+                "data": _base64.b64encode(payload).decode("ascii"),
+                "timeout": _stream_seconds(self._timeout),
+            },
+        )
+        reply = answered.get("data")
+        if reply:
+            self._arrived.append((_base64.b64decode(reply), (host, port)))
+        return len(payload)
 
 
 SocketType = socket

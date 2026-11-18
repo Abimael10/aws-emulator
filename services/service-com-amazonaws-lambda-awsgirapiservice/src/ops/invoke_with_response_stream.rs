@@ -474,12 +474,13 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             // emulator through the callback the framework handed THIS request, signing
             // every call the handler makes as the session of the function's own execution
             // role (`crate::state::execution_role_session`).
-            aws: crate::state::function_sdk_access(
+            aws: crate::state::function_sdk_access_in_vpc(
                 &*self.engine,
                 ctx,
                 &region,
                 &resolved_config.role,
                 &function_name,
+                &record.vpc_network_interface_ids,
             ),
             // Where the run's log is delivered, and what the function's execution role may
             // do there (`crate::state::execution::log_delivery`).

@@ -298,6 +298,16 @@ tokio-rustls = "0.26"
 # the `open` flags the standard library reads off `os` while being imported
 # (`state::execution::host_posix`) — taken from the C headers rather than written out here.
 libc = "0.2"
+# The VPC a function with a `VpcConfig` is attached to, as the run inside it addresses that
+# VPC (`state::execution::vpc_network`): `ipnet` reads the CIDR blocks of the VPC and of the
+# subnets its interfaces sit in, and says whether a destination lies in one, which is what
+# decides the source address a route resolves to; `simple-dns` reads and writes the DNS
+# messages the VPC's own resolver is asked and answers with, so what travels between the
+# handler and that resolver is a real DNS exchange. Both are pure-Rust libraries computing
+# over data in this process: no listener, no engine, no native or build-time code, and
+# between them one dependency of their own (`bitflags`, already in this workspace's lock).
+ipnet = "2"
+simple-dns = "0.13"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
