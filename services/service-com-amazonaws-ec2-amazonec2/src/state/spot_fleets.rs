@@ -300,8 +300,33 @@ pub struct SpotFleetRequestRecord {
     pub view: SpotFleetRequestConfig,
     /// The move the clock owes this fleet, while one is owed.
     pub pending: Option<SpotFleetRequestTransition>,
+    /// The `EventSubType` the move the clock owes RECORDS, when the state word it enters is
+    /// not the sub type AWS publishes for the change — a modification completing is
+    /// `modify_succeeded` while the state it leaves the fleet in is `active`
+    /// ([`EVENT_SUB_TYPE_MODIFY_SUCCEEDED`]). `None` for every move whose sub type IS the
+    /// state word, which is what the `fleetRequestChange` list of
+    /// `EventInformation$EventSubType` names for them.
+    pub pending_event_sub_type: Option<&'static str>,
     /// The Spot Instance requests this fleet placed, in placement order.
     pub placements: Vec<SpotFleetPlacement>,
+    /// The Spot pools this fleet places its Spot capacity in, as the write that stored the
+    /// fleet resolved them from its launch specifications or its launch template
+    /// configurations — with no count of their own, which is a fact of one placement round
+    /// rather than of the pool.
+    ///
+    /// Kept because a fleet whose target capacity is INCREASED places the additional capacity
+    /// in the same pools ("the Spot Fleet launches the additional Spot Instances according to
+    /// the allocation strategy for the Spot Fleet request", `ModifySpotFleetRequest`), so the
+    /// launch a later placement makes is the one the fleet was described with rather than one
+    /// resolved a second way.
+    pub pools: Vec<SpotFleetPoolPlacement>,
+    /// The `SpotInstanceType` every Spot Instance request of this fleet is placed as, out of
+    /// [`SPOT_INSTANCE_TYPES`] — a fact of the fleet's own `Type`, kept so a later placement
+    /// places the same kind of request as the first.
+    pub spot_request_type: &'static str,
+    /// The interruption behaviour every Spot Instance request of this fleet carries, out of
+    /// [`crate::ops::types::INSTANCE_INTERRUPTION_BEHAVIOR_VALUES`], kept for the same reason.
+    pub interruption_behavior: &'static str,
     /// The events this fleet has been through, in the order they were recorded — what
     /// `DescribeSpotFleetRequestHistory` reports. Each event ([`SpotFleetHistoryEvent`]) is
     /// recorded at the instant it happened, by the writer that made it happen, so a report of
@@ -362,9 +387,15 @@ impl SpotFleetRequestRecord {
             self.pending = None;
             // "A change in the status or configuration of the Spot Fleet request" is an event
             // of the fleet's history, recorded at the instant the change FELL DUE rather than
-            // the instant somebody read it — the state changed when the move fell due.
+            // the instant somebody read it — the state changed when the move fell due. The sub
+            // type is the state word for every move that publishes one, and the word carried
+            // beside the move for the one that does not ([`Self::pending_event_sub_type`]).
+            let event_sub_type = self.pending_event_sub_type.take().unwrap_or(to);
             self.history
-                .push(SpotFleetHistoryEvent::fleet_request_change(to, at));
+                .push(SpotFleetHistoryEvent::fleet_request_change(
+                    event_sub_type,
+                    at,
+                ));
         }
         let target = self.target_capacity();
         let on_demand = self
@@ -395,23 +426,32 @@ impl SpotFleetRequestRecord {
 }
 
 /// The capacity one Spot Fleet's `placements` have FULFILLED: the weighted capacity of every
-/// placement whose Spot Instance request has launched its instance.
+/// placement whose Spot Instance request launched an instance the account still RUNS.
 ///
 /// The ONE definition of "`FulfilledCapacity`": "The number of units fulfilled by this
 /// request compared to the set target capacity. You cannot set this value"
 /// (`SpotFleetRequestConfigData$FulfilledCapacity`) — so it is derived from the instances the
 /// fleet's requests actually launched, never taken from a request and never counted for a
 /// request that has launched nothing.
+///
+/// Those instances are exactly the ones the fleet REPORTS ([`spot_fleet_active_instances`]):
+/// an instance that has reached `terminated`, and one the store no longer holds at all,
+/// belongs to no fleet, so it fulfils no capacity either — which is what makes a fleet whose
+/// capacity was terminated report the capacity it is left with rather than the one it once
+/// had.
 pub fn spot_fleet_fulfilled_capacity(
     placements: &[SpotFleetPlacement],
     requests: &BTreeMap<String, SpotInstanceRequestRecord>,
+    instances: &HashMap<String, InstanceRecord>,
 ) -> f64 {
     placements
         .iter()
         .filter(|placement| {
             requests
                 .get(&placement.spot_instance_request_id)
-                .is_some_and(|record| record.view.instance_id.is_some())
+                .and_then(|record| record.view.instance_id.as_deref())
+                .and_then(|instance_id| instances.get(instance_id))
+                .is_some_and(|instance| instance.state != InstanceStateName::Terminated)
         })
         .map(|placement| placement.weighted_capacity)
         // Folded from a POSITIVE zero rather than summed: `Sum` for `f64` folds from a
@@ -748,7 +788,20 @@ impl ComAmazonawsEc2Amazonec2State {
                 pending: Some(SpotFleetRequestTransition::starting_now(
                     SPOT_FLEET_STATE_ACTIVE,
                 )),
+                // `active` IS the `fleetRequestChange` sub type AWS publishes for that move,
+                // so the move carries no sub type of its own.
+                pending_event_sub_type: None,
                 placements,
+                // The pools with no count of their own: how many each placed is a fact of this
+                // placement round, while the pools themselves are where the fleet places
+                // capacity for as long as it holds.
+                pools: spec
+                    .pools
+                    .iter()
+                    .map(|pool| SpotFleetPoolPlacement { count: 0, ..pool.clone() })
+                    .collect(),
+                spot_request_type: spec.spot_request_type,
+                interruption_behavior: spec.interruption_behavior,
                 // The first event of every fleet's history: "`submitted` - the EC2 Fleet or
                 // Spot Fleet request is being evaluated and Amazon EC2 is preparing to launch
                 // the target number of instances" (`EventInformation$EventSubType`), which is
@@ -925,6 +978,9 @@ impl ComAmazonawsEc2Amazonec2State {
         record.pending = Some(SpotFleetRequestTransition::starting_now(
             SPOT_FLEET_STATE_CANCELLED,
         ));
+        // `cancelled` IS the sub type that move records, so a modification's
+        // `modify_succeeded` is not left owed on a fleet that is now being cancelled.
+        record.pending_event_sub_type = None;
         // Read the activity status back through the one derivation of it, so the cancellation
         // reports what a describe in the same instant reports.
         self.materialize_due_spot_fleet_requests(Instant::now());
@@ -954,7 +1010,11 @@ impl ComAmazonawsEc2Amazonec2State {
             .map(|(fleet_id, record)| {
                 (
                     fleet_id.clone(),
-                    spot_fleet_fulfilled_capacity(&record.placements, &self.spot_instance_requests),
+                    spot_fleet_fulfilled_capacity(
+                        &record.placements,
+                        &self.spot_instance_requests,
+                        &self.instances,
+                    ),
                     spot_fleet_has_running_instances(
                         &record.placements,
                         &self.spot_instance_requests,

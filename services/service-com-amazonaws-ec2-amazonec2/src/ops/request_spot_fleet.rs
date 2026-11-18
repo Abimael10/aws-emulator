@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             FLEET_TYPE_MAINTAIN, FLEET_TYPE_REQUEST,
-            INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE, LAUNCH_TEMPLATE_VERSION_DEFAULT,
+            INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE,
             MAX_CLIENT_TOKEN_CHARS, MAX_SPOT_FLEET_POOLS, MAX_SPOT_FLEET_REQUESTS,
             MAX_SPOT_FLEET_SPOT_INSTANCES, MAX_STORED_BYTES, MAX_STORED_INSTANCES,
             MAX_STORED_SPOT_INSTANCE_REQUESTS, RESOURCE_TYPE_SPOT_FLEET_REQUEST,
@@ -159,10 +159,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             SPOT_INSTANCE_TYPE_ONE_TIME, SPOT_INSTANCE_TYPE_PERSISTENT, SpotFleetPoolPlacement,
             SpotFleetRequestSpec, availability_zone_of_region, availability_zones_in_region,
             iam_role_arn_is_well_formed, invalid_subnet_id_not_found, modelled_catalog_word,
-            request_region, require_service_state, require_visible_image,
-            resolve_launch_template_id, resolve_launch_template_version, resource_count_exceeded,
-            spot_fleet_placement_counts, spot_fleet_request_payload_bytes,
-            spot_instance_request_payload_bytes, tags_from_specifications, validate_hourly_price,
+            request_region, require_service_state, require_visible_image, resource_count_exceeded,
+            spot_fleet_placement_counts, spot_fleet_pool_weighted_capacity,
+            spot_fleet_request_payload_bytes, spot_fleet_template_pool_count,
+            spot_fleet_template_pools, spot_instance_request_payload_bytes,
+            tags_from_specifications, validate_hourly_price,
         };
 
         // The Region of the request's SigV4 credential scope: the zone a launch specification
@@ -371,12 +372,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lookup — is bounded here, before any of that work is done.
         let declared_pools = launch_specifications
             .len()
-            .saturating_add(
-                launch_template_configs
-                    .iter()
-                    .map(|entry| entry.overrides.as_ref().map_or(1, Vec::len).max(1))
-                    .fold(0usize, usize::saturating_add),
-            );
+            .saturating_add(spot_fleet_template_pool_count(&launch_template_configs));
         if declared_pools > MAX_SPOT_FLEET_POOLS {
             return Err(Scaffolded::invalid_parameter_value(format!(
                 "The request describes {declared_pools} Spot pools, above the maximum of \
@@ -525,7 +521,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             validate_hourly_price("spotPrice", launch.spot_price.as_deref())?;
             pools.push(SpotFleetPoolPlacement {
                 launch: launch_from_specification(launch),
-                weighted_capacity: weighted_capacity(launch.weighted_capacity)?,
+                weighted_capacity: spot_fleet_pool_weighted_capacity(launch.weighted_capacity)?,
                 // "The maximum price per unit hour that you are willing to pay for a Spot
                 // Instance" of this pool, falling back to the fleet's own maximum.
                 spot_price: launch.spot_price.clone().or_else(|| config.spot_price.clone()),
@@ -534,104 +530,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The launch template and overrides" (`$LaunchTemplateConfigs`): the template holds
-        // the launch parameters, and each override is one Spot pool of the fleet — so a
-        // template the account does not hold, or a version it does not have, is refused with
-        // the launch template API's own error code.
-        for entry in &launch_template_configs {
-            let Some(specification) = entry.launch_template_specification.as_ref() else {
-                return Err(Scaffolded::missing_parameter(
-                    "Each launchTemplateConfig must contain the parameter \
-                     launchTemplateSpecification",
-                ));
-            };
-            let template_id = resolve_launch_template_id(
-                &store,
-                specification.launch_template_id.as_deref(),
-                specification.launch_template_name.as_deref(),
-            )?;
-            let Some(record) = store.launch_templates.get(&template_id) else {
-                return Err(crate::state::invalid_launch_template_id_not_found());
-            };
-            // "The launch template version number, `$Latest`, or `$Default`"
-            // (`FleetLaunchTemplateSpecification$Version`): a configuration that names none
-            // launches the template's default version, which is the version a launch with no
-            // version named gets everywhere in this API.
-            let version = specification
-                .version
-                .as_deref()
-                .unwrap_or(LAUNCH_TEMPLATE_VERSION_DEFAULT);
-            let number = resolve_launch_template_version(record, version)?;
-            let Some(launch_data) = record.versions.get(&number).map(|held| held.data.clone())
-            else {
-                return Err(Scaffolded::internal_error(format!(
-                    "launch template '{template_id}' version '{version}' could not be read back"
-                )));
-            };
-            let Some(image_id) = launch_data.image_id.clone() else {
-                return Err(Scaffolded::missing_parameter(format!(
-                    "Launch template '{template_id}' names no imageId, so the Spot Fleet \
-                     request has no AMI to launch from"
-                )));
-            };
-            require_visible_image(&store, &image_id)?;
-            // A configuration with no overrides is ONE pool: the template as it stands.
-            let overrides: Vec<Option<&LaunchTemplateOverrides>> = match entry.overrides.as_deref()
-            {
-                None | Some([]) => vec![None],
-                Some(entries) => entries.iter().map(Some).collect(),
-            };
-            for over in overrides {
-                // "If you specify `InstanceRequirements`, you can't specify `InstanceType`"
-                // (`LaunchTemplateOverrides$InstanceRequirements`): the two members are two
-                // ways of saying which instance type a pool launches, so an override that
-                // gives both says it twice — refused through the one place that rule lives,
-                // so this operation and `CreateFleet` answer it alike.
-                if over.is_some_and(|over| {
-                    over.instance_type.is_some() && over.instance_requirements.is_some()
-                }) {
-                    return Err(crate::state::instance_requirements_with_instance_type());
-                }
-                // An override that names its pool by instance REQUIREMENTS asks EC2 to
-                // "identify instance types with the provided requirements" and launch from
-                // those (`$InstanceRequirements`), which this slice does not do: nothing here
-                // resolves a requirement set to the instance types that satisfy it. Refused
-                // rather than accepted and dropped, because a pool that launched the
-                // template's own instance type instead would not be the pool the request
-                // described — the answer `CreateFleet` gives for the same override member.
-                if over.is_some_and(|over| over.instance_requirements.is_some()) {
-                    return Err(crate::state::unsupported_operation(
-                        "RequestSpotFleet places the Spot pools the instance type of a launch \
-                         template or of an override names; the override member \
-                         'instanceRequirements' is not one this service resolves instance \
-                         types from",
-                    ));
-                }
-                if let Some(subnet_id) = over.and_then(|over| over.subnet_id.as_deref()) {
-                    if !store.subnets.contains_key(subnet_id) {
-                        return Err(invalid_subnet_id_not_found(subnet_id));
-                    }
-                }
-                if let Some(zone_name) = over.and_then(|over| over.availability_zone.as_deref()) {
-                    availability_zone_of_region(
-                        &zones,
-                        &region,
-                        "availabilityZone",
-                        zone_name,
-                        |zone| zone.zone_name.as_str(),
-                    )?;
-                }
-                let pool_price = over.and_then(|over| over.spot_price.clone());
-                validate_hourly_price("spotPrice", pool_price.as_deref())?;
-                pools.push(SpotFleetPoolPlacement {
-                    launch: launch_from_template(&launch_data, over),
-                    weighted_capacity: weighted_capacity(
-                        over.and_then(|over| over.weighted_capacity),
-                    )?,
-                    spot_price: pool_price.or_else(|| config.spot_price.clone()),
-                    count: 0,
-                });
-            }
-        }
+        // the launch parameters, and each override is one Spot pool of the fleet — resolved
+        // through the ONE resolution of that list ([`crate::state::spot_fleet_template_pools`]),
+        // which `ModifySpotFleetRequest` reads a replacement list through, so a fleet created
+        // with a launch template and one modified onto one place the same pools.
+        pools.extend(spot_fleet_template_pools(
+            &store,
+            &zones,
+            &region,
+            &launch_template_configs,
+            config.spot_price.as_deref(),
+            Self::NAME,
+        )?);
 
         // How many Spot Instances each pool places, bounded by what this store can hold: a
         // fleet whose target capacity needs more instances than that places what it can and
@@ -743,30 +653,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// "The number of units provided by the specified instance type"
-/// (`SpotFleetLaunchSpecification$WeightedCapacity`), defaulted to
-/// [`crate::state::DEFAULT_FLEET_INSTANCE_WEIGHT`] — one unit per instance — when a pool names
-/// none.
-///
-/// A weight of zero or less would make a pool provide nothing however many instances it
-/// launched, so it is refused rather than letting a fleet ask for an unbounded number of
-/// instances.
-fn weighted_capacity<E>(
-    requested: Option<f64>,
-) -> Result<f64, crate::scaffolded::Scaffolded<E>> {
-    let weight = requested.unwrap_or(crate::state::DEFAULT_FLEET_INSTANCE_WEIGHT);
-    if weight.is_finite() && weight > 0.0 {
-        Ok(weight)
-    } else {
-        Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-            format!(
-                "Invalid value '{weight}' for weightedCapacity. \
-                 It must be the number of units one instance provides"
-            ),
-        ))
-    }
-}
-
 /// Refuse a security group a launch specification names that the account holds none of.
 ///
 /// A group is named by id or by name ("the IDs of the security groups" is the supported
@@ -822,81 +708,6 @@ fn launch_from_specification(launch: &SpotFleetLaunchSpecification) -> LaunchSpe
         placement: launch.placement.clone(),
         security_groups: launch.security_groups.clone(),
         block_device_mappings: None,
-        iam_instance_profile: None,
-        network_interfaces: None,
-    }
-}
-
-/// One Spot pool's launch from the launch template version `data` and the `over` that
-/// narrows it, if any.
-///
-/// "The launch template and overrides" (`SpotFleetRequestConfigData$LaunchTemplateConfigs`):
-/// an override names the instance type, the subnet, the Availability Zone and the weighted
-/// capacity of ONE pool, and everything else about the launch comes from the template — so
-/// the pools of one template differ exactly where the overrides say they do.
-fn launch_from_template(
-    data: &RequestLaunchTemplateData,
-    over: Option<&LaunchTemplateOverrides>,
-) -> LaunchSpecification {
-    let zone = over
-        .and_then(|over| over.availability_zone.clone())
-        .or_else(|| {
-            data.placement
-                .as_ref()
-                .and_then(|placement| placement.availability_zone.clone())
-        });
-    let groups: Vec<GroupIdentifier> = data
-        .security_group_ids
-        .iter()
-        .flatten()
-        .map(|group_id| GroupIdentifier {
-            group_id: Some(group_id.clone()),
-            group_name: None,
-        })
-        .chain(
-            data.security_groups
-                .iter()
-                .flatten()
-                .map(|group_name| GroupIdentifier {
-                    group_id: None,
-                    group_name: Some(group_name.clone()),
-                }),
-        )
-        .collect();
-    LaunchSpecification {
-        image_id: data.image_id.clone(),
-        instance_type: over
-            .and_then(|over| over.instance_type.clone())
-            .or_else(|| data.instance_type.clone()),
-        key_name: data.key_name.clone(),
-        subnet_id: over.and_then(|over| over.subnet_id.clone()),
-        user_data: data.user_data.clone(),
-        addressing_type: None,
-        kernel_id: data.kernel_id.clone(),
-        ramdisk_id: data.ram_disk_id.clone(),
-        ebs_optimized: Some(data.ebs_optimized.unwrap_or(false)),
-        monitoring: data.monitoring.as_ref().map(|monitoring| {
-            RunInstancesMonitoringEnabled {
-                enabled: monitoring.enabled.unwrap_or(false),
-            }
-        }),
-        placement: zone.map(|zone| SpotPlacement {
-            availability_zone: Some(zone),
-            group_name: None,
-            tenancy: None,
-            availability_zone_id: None,
-        }),
-        security_groups: Some(groups),
-        // "The block device mapping" (`RequestLaunchTemplateData$BlockDeviceMappings`) a
-        // version carries applies to every launch made from it, so a pool of this template
-        // boots the volume that version describes — read through the one conversion of a
-        // version's entries ([`crate::state::template_block_device_mapping`]).
-        block_device_mappings: data.block_device_mappings.as_ref().map(|mappings| {
-            mappings
-                .iter()
-                .map(crate::state::template_block_device_mapping)
-                .collect()
-        }),
         iam_instance_profile: None,
         network_interfaces: None,
     }

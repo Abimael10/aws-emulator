@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifySpotFleetRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifySpotFleetRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifySpotFleetRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies one modification to a stored Spot Fleet request of type `maintain` —
+//! its size, its On-Demand size, the launch template and overrides it places from, and whether
+//! excess capacity is terminated — placing the additional Spot Instance requests a larger
+//! target capacity takes and giving up the ones a smaller one leaves it holding, then leaving
+//! the fleet in `modifying` until the clock returns it to `active`. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +159,222 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifySpotFleetRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifySpotFleetRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifySpotFleetRequest"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            FLEET_TYPE_MAINTAIN, MAX_SPOT_FLEET_POOLS, MAX_SPOT_FLEET_TARGET_CAPACITY,
+            SpotFleetRequestModification,
+            availability_zones_in_region, modelled_catalog_word, request_region,
+            require_known_spot_fleet_request, require_service_state,
+            require_well_formed_spot_fleet_request_id, missing_required_parameter,
+            spot_fleet_capacity_above_ceiling, spot_fleet_request_not_modifiable,
+            spot_fleet_request_type_not_modifiable, spot_fleet_template_pool_count,
+            spot_fleet_template_pools,
+        };
+
+        // The Region of the request's SigV4 credential scope: the zone a launch template
+        // override names is resolved against that Region's zones, as it is when the fleet is
+        // created.
+        let region = request_region(ctx.parts());
+
+        // "The ID of the Spot Fleet request" (`$SpotFleetRequestId`), a `@required` member the
+        // model marks client-optional — so an absent one reaches this handler as an empty
+        // string rather than being refused at the boundary. Something that is not a Spot Fleet
+        // request id AT ALL is refused before the store is read: there is nothing to look up,
+        // so it is a request that cannot be read rather than a fleet the account does not hold.
+        // The refusal for an absent one is the sentence the BOUNDARY answers for a `@required`
+        // member this surface left out, so the two sides of dispatch cannot word it differently.
+        let fleet_id = input.spot_fleet_request_id.clone();
+        if fleet_id.is_empty() {
+            return Err(missing_required_parameter("SpotFleetRequestId"));
+        }
+        require_well_formed_spot_fleet_request_id(&fleet_id)?;
+
+        // "The size of the fleet" and "the number of On-Demand Instances in the fleet"
+        // (`$TargetCapacity` / `$OnDemandTargetCapacity`): both are plain modelled `Integer`s
+        // with no `@range`, so this handler is the only place their floor can be said — the
+        // same floor the create holds them to — and the only place their CEILING can be said.
+        // The ceiling is asked BEFORE the state lock is taken, because the capacity a request
+        // names is what every placement this call makes is computed from: how much work and
+        // memory one call asks of this store must not be a caller's integer to choose.
+        for (member, capacity) in [
+            ("targetCapacity", input.target_capacity),
+            ("onDemandTargetCapacity", input.on_demand_target_capacity),
+        ] {
+            let Some(capacity) = capacity else {
+                continue;
+            };
+            if capacity < 0 {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{capacity}' for {member}. It must not be negative"
+                )));
+            }
+            if capacity > MAX_SPOT_FLEET_TARGET_CAPACITY {
+                return Err(spot_fleet_capacity_above_ceiling(member, capacity));
+            }
+        }
+
+        // The one member of a modelled catalog this request carries, read out of the GENERATED
+        // `*_VALUES` constant so the store never holds the request's own text. AWS documents no
+        // default for it, so a request that names none leaves the fleet's own policy alone.
+        let excess_capacity_termination_policy = modelled_catalog_word(
+            input.excess_capacity_termination_policy.as_deref(),
+            EXCESS_CAPACITY_TERMINATION_POLICY_VALUES,
+            "excessCapacityTerminationPolicy",
+            None,
+        )?;
+
+        let launch_template_configs = input.launch_template_configs.clone().unwrap_or_default();
+        // A request that changes nothing about the fleet is not a modification: this operation
+        // modifies the fleet's size, its On-Demand size, the launch template and overrides it
+        // launches from, or whether excess capacity is terminated — so one that names none of
+        // them has nothing to apply. `Context` is "Reserved" (`$Context`), so a request that
+        // names only it IS a modification of the stored configuration but is not one the
+        // sentence below offers a caller, which names the four members AWS documents.
+        if input.target_capacity.is_none()
+            && input.on_demand_target_capacity.is_none()
+            && excess_capacity_termination_policy.is_none()
+            && launch_template_configs.is_empty()
+            && input.context.is_none()
+        {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter targetCapacity, \
+                 onDemandTargetCapacity, launchTemplateConfig or \
+                 excessCapacityTerminationPolicy",
+            ));
+        }
+        // The list carries no modelled `@length`, so the number of pools one call makes this
+        // handler resolve — an AMI, a subnet, a security-group and a launch-template lookup
+        // each — is bounded here, before any of that work is done, by the bound the create
+        // holds the same list to.
+        let declared_pools = spot_fleet_template_pool_count(&launch_template_configs);
+        if declared_pools > MAX_SPOT_FLEET_POOLS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request describes {declared_pools} Spot pools, above the maximum of \
+                 {MAX_SPOT_FLEET_POOLS}"
+            )));
+        }
+
+        // Everything the REQUEST can be read for on its own — the id's form, the capacities'
+        // floor and ceiling, the catalog word and the pool count — is answered before the fleet
+        // is resolved, so a request that cannot be read is never answered for the state of a
+        // fleet instead: a call naming both an unknown fleet and a capacity outside the bounds
+        // is refused for the capacity. The ceiling in particular has to precede the state lock,
+        // because it is what keeps the work done under that lock bounded.
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The moves the CLOCK already owed are materialised before any state is read, so the
+        // fleet is modified from the state it is actually in: a `submitted` fleet whose
+        // `active` fell due is modified from `active`, the capacity its requests have fulfilled
+        // by now is the capacity this modification scales from, and a fleet whose cancellation
+        // has completed is seen as `cancelled` rather than modified after the fact.
+        store.materialize_due_transitions();
+
+        // The fleet the modification applies to, refusing a malformed id first and an id this
+        // account holds no fleet for second.
+        let record = require_known_spot_fleet_request(&store, &fleet_id)?;
+        // "You can only modify a Spot Fleet request of type `maintain`"
+        // (`ModifySpotFleetRequest`): a fleet of type `request` "only places the required
+        // requests" (`SpotFleetRequestConfigData$Type`) and holds no capacity to scale, so the
+        // request is refused rather than answered a success that changed nothing.
+        if record.fleet_type() != FLEET_TYPE_MAINTAIN {
+            return Err(spot_fleet_request_type_not_modifiable());
+        }
+        // A fleet that is being cancelled, is cancelled or failed is not one a modification
+        // runs from.
+        if !record.is_modifiable() {
+            return Err(spot_fleet_request_not_modifiable(&fleet_id, record.state()));
+        }
+        let stored_target_capacity = record.config().map_or(0, |config| config.target_capacity);
+        let stored_on_demand_target_capacity = record
+            .config()
+            .and_then(|config| config.on_demand_target_capacity);
+        let stored_spot_price = record
+            .config()
+            .and_then(|config| config.spot_price.clone());
+        let launches_from_specifications = record.config().is_some_and(|config| {
+            config
+                .launch_specifications
+                .as_deref()
+                .is_some_and(|launches| !launches.is_empty())
+        });
+
+        // "Amazon EC2 calculates the difference between the total capacity and On-Demand
+        // capacity, and launches the difference as Spot capacity" (`RequestSpotFleet`), so
+        // On-Demand capacity above the fleet's total would leave a negative Spot capacity to
+        // launch — asked of the capacities the modification LEAVES the fleet with, since either
+        // may come from the request or from the store.
+        let target_capacity = input.target_capacity.unwrap_or(stored_target_capacity);
+        let on_demand_target_capacity = input
+            .on_demand_target_capacity
+            .or(stored_on_demand_target_capacity)
+            .unwrap_or(0);
+        if on_demand_target_capacity > target_capacity {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "onDemandTargetCapacity '{on_demand_target_capacity}' is above the fleet's \
+                 targetCapacity '{target_capacity}'"
+            )));
+        }
+        // An On-Demand Instance is launched by the fleet directly rather than placed through a
+        // Spot Instance request, which this slice does not model — so capacity nothing would
+        // ever launch is REFUSED rather than accepted and left unfulfilled for ever, the answer
+        // `RequestSpotFleet` gives for the same capacity.
+        if on_demand_target_capacity > 0 {
+            return Err(Scaffolded::not_implemented(
+                "ModifySpotFleetRequest with On-Demand target capacity",
+            ));
+        }
+
+        // "The launch template and overrides. You can only use this parameter if you specified
+        // a launch template (`LaunchTemplateConfigs`) in your Spot Fleet request. If you
+        // specified `LaunchSpecifications` in your Spot Fleet request, then omit this
+        // parameter" (`$LaunchTemplateConfigs`): a fleet that describes its launches with its
+        // own specifications has no launch template to re-point, so the member is refused
+        // rather than stored on a fleet nothing would read it from.
+        let pools = if launch_template_configs.is_empty() {
+            None
+        } else {
+            if launches_from_specifications {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "launchTemplateConfigs may be specified only for a Spot Fleet request that \
+                     was created with launchTemplateConfigs",
+                ));
+            }
+            let zones = availability_zones_in_region(&region);
+            Some(spot_fleet_template_pools(
+                &store,
+                &zones,
+                &region,
+                &launch_template_configs,
+                stored_spot_price.as_deref(),
+                Self::NAME,
+            )?)
+        };
+
+        let change = SpotFleetRequestModification {
+            target_capacity: input.target_capacity,
+            on_demand_target_capacity: input.on_demand_target_capacity,
+            excess_capacity_termination_policy,
+            context: input.context.clone(),
+            launch_template_configs: pools
+                .is_some()
+                .then_some(launch_template_configs),
+            pools,
+        };
+        // The modification itself, applied to the fleet just resolved under this same lock.
+        if !store.modify_spot_fleet_request(&fleet_id, &change) {
+            return Err(Scaffolded::internal_error(format!(
+                "the Spot Fleet request '{fleet_id}' could not be modified after it was \
+                 resolved"
+            )));
+        }
+
+        // "If the request succeeds, the response returns `true`. If the request fails, no
+        // response is returned, and instead an error message is returned"
+        // (`ModifySpotFleetRequestResponse$Return`) — the modification was applied to the
+        // stored fleet, which a `DescribeSpotFleetRequests` now reports.
+        Ok(ModifySpotFleetRequestOutput {
+            r#return: Some(true),
+        })
     }
 }

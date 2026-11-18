@@ -2874,6 +2874,19 @@ mod spot_fleets;
 /// re-exported below, so a handler reaches it as `crate::state::SpotFleetHistoryEvent` like any
 /// primitive of this module.
 mod spot_fleet_history;
+/// The Spot POOLS a Spot Fleet request's launch template configurations describe: the one
+/// resolution of a `LaunchTemplateConfig` list into the pools a fleet places capacity in,
+/// read both when a fleet is created and when its configurations are modified — in a file of
+/// its own rather than as more lines beside the fleet record. Everything it declares is
+/// re-exported below, so a handler reaches it as `crate::state::spot_fleet_template_pools`
+/// like any helper of this module.
+mod spot_fleet_pools;
+/// What a MODIFICATION does to a stored Spot Fleet request: the states one runs from, the
+/// capacity the fleet holds toward its target, and the one writer that scales a fleet up and
+/// down — in a file of its own rather than as more lines beside the fleet record. Everything
+/// it declares is re-exported below, so a handler reaches it as
+/// `crate::state::SpotFleetRequestModification` like any primitive of this module.
+mod spot_fleet_modification;
 mod spot_instance_requests;
 mod store_image_tasks_and_route_servers;
 /// Which route tables each route server may install its learned routes into: the
@@ -3060,6 +3073,8 @@ pub use route_server_propagations::*;
 pub use spot_instance_requests::*;
 pub use spot_fleets::*;
 pub use spot_fleet_history::*;
+pub use spot_fleet_modification::*;
+pub use spot_fleet_pools::*;
 pub use nat_gateways_and_vpn_connections::*;
 pub use nat_gateway_metrics::*;
 pub use vpn_connection_creation::*;
