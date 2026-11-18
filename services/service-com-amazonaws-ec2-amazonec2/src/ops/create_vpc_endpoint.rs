@@ -44,6 +44,11 @@
 //! account's own services also owes the `pendingAcceptance` state and a
 //! `VpcEndpointConnection` row, which is that operation's change rather than this one's.
 //!
+//! A repeat of a request under one `ClientToken` is answered with the endpoint that request
+//! already created and creates nothing — asked BEFORE the questions about what the store
+//! already holds, so a retry is never refused for state the first of the two calls wrote
+//! itself (the route a gateway endpoint added to each table it associated).
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -772,21 +777,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !requested_route_tables.is_empty() && endpoint_prefix_list.is_none() {
             return Err(state::invalid_service_name(service_name));
         }
-        // Each named table has to have ROOM for that one route, and must not already route
-        // its destination: "the route identified by <x> already exists" and the per-table
-        // route quota are the table's own bounds, asked here — before anything is written —
-        // so an endpoint is never stored reporting a table it does not actually route to.
-        if let Some(prefix_list_id) = endpoint_prefix_list.as_deref() {
-            for route_table_id in &requested_route_tables {
-                if store.route_table_holds_destination(route_table_id, prefix_list_id) {
-                    return Err(state::route_already_exists(prefix_list_id));
-                }
-                if store.route_count(route_table_id) >= state::MAX_ROUTES_PER_ROUTE_TABLE {
-                    return Err(state::route_limit_exceeded());
-                }
-            }
-        }
-
         // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
         // the request": a repeat of a request this store already served answers with the
         // endpoint it created then, and creates nothing. Compared on what the REQUEST chose
@@ -867,6 +857,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 vpc_endpoint: Some(stored),
                 client_token: input.client_token.clone(),
             });
+        }
+
+        // Each named table has to have ROOM for that one route, and must not already route
+        // its destination: "the route identified by <x> already exists" and the per-table
+        // route quota are the table's own bounds, asked before anything is written — so an
+        // endpoint is never stored reporting a table it does not actually route to.
+        //
+        // Asked AFTER the replay above, because both questions are about what this store
+        // already holds rather than about the request: the route the FIRST of two identical
+        // calls added is exactly what the destination question would find, so asking it first
+        // would refuse the caller's own retry of a request that has already been served — the
+        // one thing a client token exists to prevent.
+        if let Some(prefix_list_id) = endpoint_prefix_list.as_deref() {
+            for route_table_id in &requested_route_tables {
+                if store.route_table_holds_destination(route_table_id, prefix_list_id) {
+                    return Err(state::route_already_exists(prefix_list_id));
+                }
+                if store.route_count(route_table_id) >= state::MAX_ROUTES_PER_ROUTE_TABLE {
+                    return Err(state::route_limit_exceeded());
+                }
+            }
         }
 
         // The private hosted zone this endpoint would associate answers ONE domain inside the
