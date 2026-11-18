@@ -42,6 +42,9 @@
 //! * a member the request did not carry has no value to quote, and the clause states none;
 //! * a URI-LABEL member outside its `@pattern` is stated with no value either, and the
 //!   expression is quoted without the whole-value anchors the model wraps it in;
+//! * a member outside either end of its `@length` is stated with no value either — the
+//!   clause names the bound it broke, not the text that broke it — which the child suite
+//!   [`length_constraint_clauses`] pins over the operations and bounds that rule covers;
 //! * a value outside an enumerated set is quoted beside that set, whose members are listed
 //!   in the order of the hash table the front door holds them in rather than in the model's
 //!   declaration order.
@@ -64,6 +67,14 @@ use service_com_amazonaws_iot_awsiotservice::state::{
 };
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The `@length` class of that same constraint envelope: which half of a clause a bound
+/// states, over the operations, the bindings and both ends of a bound that the rule covers.
+/// The `#[path]` is what keeps it a child of THIS suite rather than a second suite beside
+/// it: this crate's `tests/all.rs` declares the suites directly under `tests/all/`, and a
+/// module of a `#[path]`-declared file resolves next to that file unless it says otherwise.
+#[path = "not_found_wording/length_constraint_clauses.rs"]
+mod length_constraint_clauses;
 
 /// The account id this emulator serves, which the registry families qualify a missing
 /// name with (`engine::emulator_account_id`).

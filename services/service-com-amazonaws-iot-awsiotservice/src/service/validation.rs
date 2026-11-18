@@ -23,6 +23,12 @@
 //!   what this service's recorded refusals of a URI-LABEL member show; whether a `@pattern`
 //!   on a BODY member is stated the same way is a question about this rendering that a
 //!   report of its own carries, and the rendering lives in `service_common` either way;
+//! * a member outside either end of its `@length` is stated with no value as well: the
+//!   clause names the member and the bound it broke, and the text that was too long or too
+//!   short — which is the whole of what the caller sent for that member — is not reflected
+//!   back. A value and a length bound say the same thing twice, and this service's recorded
+//!   refusals of a member that broke its bound AND its expression together state neither
+//!   clause with a value;
 //! * every other class keeps the value the request submitted — a value outside an
 //!   enumerated set is quoted beside the set it had to be in — which is what the framework
 //!   already states.
@@ -81,11 +87,15 @@ fn in_stated_value_set_order(refusal: &Refusal) -> Refusal {
 
 /// Whether the clause for `violation` states no value: the member was ABSENT, so there is
 /// no value to quote; it fell outside its `@pattern`, whose clause names the expression
-/// rather than what was submitted; or it is one this service never discloses.
+/// rather than what was submitted; it fell outside its `@length`, whose clause names the
+/// bound rather than the text that broke it; or it is one this service never discloses.
 fn states_no_value(violation: &Violation) -> bool {
     matches!(
         violation.kind,
-        ViolationKind::MissingRequiredMember | ViolationKind::Pattern(_)
+        ViolationKind::MissingRequiredMember
+            | ViolationKind::Pattern(_)
+            | ViolationKind::MinLength(_)
+            | ViolationKind::MaxLength(_)
     ) || violation.sensitive
 }
 
@@ -103,14 +113,15 @@ mod tests {
         }
     }
 
-    /// RULE: a member the request did not carry and a member outside its `@pattern` are
-    /// each stated with NO value, every other constraint class states the value the
-    /// request submitted, and a `@pattern` is quoted without the anchors a whole-value
-    /// pattern wraps it in.
+    /// RULE: a member the request did not carry, a member outside its `@pattern` and a
+    /// member outside its `@length` are each stated with NO value, every other constraint
+    /// class states the value the request submitted, and a `@pattern` is quoted without
+    /// the anchors a whole-value pattern wraps it in.
     #[test]
     fn an_absent_member_states_no_value_and_every_other_class_states_one() {
         // The rows span the classes the framework reports: an absent member, a value
-        // outside a pattern, one past a length bound and one outside an enumerated set.
+        // outside a pattern, one past each end of a length bound and one outside an
+        // enumerated set.
         let rows = [
             (
                 "a member the request did not carry",
@@ -132,8 +143,14 @@ mod tests {
             (
                 "a member past its length maximum",
                 violation("policyName", ViolationKind::MaxLength(128), Some("pppp")),
-                "1 validation error detected: Value 'pppp' at 'policyName' failed to satisfy \
+                "1 validation error detected: Value at 'policyName' failed to satisfy \
                  constraint: Member must have length less than or equal to 128",
+            ),
+            (
+                "a member short of its length minimum",
+                violation("targetAwsAccount", ViolationKind::MinLength(12), Some("12345")),
+                "1 validation error detected: Value at 'targetAwsAccount' failed to satisfy \
+                 constraint: Member must have length greater than or equal to 12",
             ),
             (
                 "a member outside its value set",

@@ -54,6 +54,12 @@ use x509_cert::Certificate;
 #[path = "device_certificate_issuance/ca_certificate_registry.rs"]
 mod ca_certificate_registry;
 
+/// `DescribeCertificate`'s `transferData` projection: the TRANSFER STATE member of a
+/// described certificate, which this suite's cases read past. Declared the same way, and
+/// for the same reason, as the CA-certificate suite above.
+#[path = "device_certificate_issuance/transfer_state_projection.rs"]
+mod transfer_state_projection;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.
@@ -451,9 +457,10 @@ async fn describe_certificate_reports_the_issued_certificate() {
                 .is_some_and(|id| !id.is_empty()),
             "case {label:?}: the description must report a generationId, got {read:?}"
         );
-        // Nothing has transferred the certificate to another account and no registered
-        // CA signed it, so the members that describe those carry nothing.
-        for absent in ["caCertificateId", "previousOwnedBy", "transferData"] {
+        // No registered CA signed the certificate and no previous account owned it, so
+        // the members that describe those carry nothing. The transfer state is reported
+        // as an EMPTY structure rather than left out — see the child suite below.
+        for absent in ["caCertificateId", "previousOwnedBy"] {
             assert!(
                 read.member(absent).is_none(),
                 "case {label:?}: {absent} must be absent on a freshly issued certificate, \
