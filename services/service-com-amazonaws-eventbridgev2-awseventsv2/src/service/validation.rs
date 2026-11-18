@@ -2,8 +2,8 @@
 
 //! How this service states a request it refuses before a handler runs.
 //!
-//! Two rules live here, and both are INPUT validation: they are decided from the
-//! request alone, ahead of any state this service holds.
+//! One rule lives here, and it is INPUT validation: it is decided from the request
+//! alone, ahead of any state this service holds.
 //!
 //! # The modelled shape a refusal is stated in
 //!
@@ -28,25 +28,20 @@
 //! accepts is delegated, untouched, to the generated operation in the routing table, so
 //! every handler, its state and its 501 are exactly as before.
 //!
-//! # The idempotency token this service requires
-//!
-//! The model tags each create's `ClientToken` `@idempotencyToken` (an SDK fills one in
-//! when the caller omits it) and marks it neither `@required` nor anything else the
-//! boundary walk can enforce, yet the service refuses a create that carries no token at
-//! all — the one requirement here that the model does not express. It is applied to
-//! every operation of this service whose input models such a token, which is each of the
-//! three creates, and to no other: an operation that mints nothing has no token to
-//! require.
+//! "Exactly the model's" is the whole of it: a member the model leaves optional is
+//! optional here, so a create that omits its `@idempotencyToken` `ClientToken` reaches
+//! its handler and mints its resource — without the replay record a token would have
+//! left, which is all its absence costs.
 
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints::Violation;
 use service_common::validation::refusing_violations;
 use service_common::validation_message::aws_validation_refusal;
 use smithy_server_runtime::{
-    BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
-    ServerHttpProtocol, Service,
+    BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, ServerHttpProtocol, Service,
 };
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use crate::ops::types::{InvalidInputException, SCHEMA_INVALID_INPUT_EXCEPTION};
 
@@ -59,12 +54,6 @@ pub const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
 /// The status such a refusal is served on: `InvalidInputException`'s own
 /// `@httpError(400)`.
 pub const INVALID_INPUT_STATUS: u16 = 400;
-
-/// The whole `Message` of the refusal of a create that carries no idempotency token.
-///
-/// FIXED text of that refusal: it names neither the request nor the resource that was
-/// not created, so nothing is interpolated into it.
-pub const CLIENT_TOKEN_REQUIRED_MESSAGE: &str = "ClientToken is required";
 
 /// This service's `InvalidInputException` carrying `message`. The shape models
 /// `Message` alone.
@@ -88,30 +77,19 @@ fn refusal_message(violations: Vec<Violation>) -> Option<String> {
 ///
 /// Holds no operation and no engine: it carries the operation TYPE, which is all the
 /// check needs (the input shape to read the request into and the input `Schema` to
-/// validate it against), plus how that operation reads its idempotency token where it
-/// models one. A request that passes is delegated to the one operation instance the
-/// generated routing table built from the shared engine, so there is no second instance
-/// of any operation and no second store.
+/// validate it against). A request that passes is delegated to the one operation instance
+/// the generated routing table built from the shared engine, so there is no second
+/// instance of any operation and no second store.
 struct ModelledInputRefusal<Op: Operation> {
-    /// Whether the request carries the idempotency token this service requires of the
-    /// operation, for one whose input models a `ClientToken`; `None` for an operation
-    /// that models none and so requires none.
-    carries_client_token: Option<fn(&Op::Input) -> bool>,
+    /// The operation this wrapper stands in front of, carried as a type alone.
+    operation: PhantomData<fn() -> Op>,
 }
 
 impl<Op: Operation> ModelledInputRefusal<Op> {
-    /// The wrapper for an operation that requires no idempotency token.
+    /// The wrapper for one modelled operation.
     const fn new() -> Self {
         Self {
-            carries_client_token: None,
-        }
-    }
-
-    /// The wrapper for an operation whose input models the idempotency token this
-    /// service requires, read by `carries_client_token`.
-    const fn requiring_client_token(carries_client_token: fn(&Op::Input) -> bool) -> Self {
-        Self {
-            carries_client_token: Some(carries_client_token),
+            operation: PhantomData,
         }
     }
 
@@ -126,23 +104,17 @@ impl<Op: Operation> ModelledInputRefusal<Op> {
     /// traits over what was read, and restores each clause's value echo to the bytes the
     /// caller sent. So this front door can find no violation set the framework's own walk
     /// would not, and a long value is quoted as submitted rather than as the elision a
-    /// renderer would otherwise carry. Only the one requirement the model cannot express
-    /// is this service's own.
+    /// renderer would otherwise carry — and it refuses nothing the model accepts.
     fn refusal(
         &self,
         protocol: &dyn ServerHttpProtocol,
         req: &WireRequest,
     ) -> Option<InvalidInputException> {
         let violations = refusing_violations::<Op>(protocol, req);
-        if !violations.is_empty() {
-            return refusal_message(violations).map(invalid_input);
+        if violations.is_empty() {
+            return None;
         }
-        // The one requirement the model cannot express, asked only of an operation whose
-        // input models the token and only once the model's own rules are satisfied.
-        let carries = self.carries_client_token?;
-        let mut deserializer = protocol.deserialize_input(req, Op::INPUT_SCHEMA).ok()?;
-        let input = <Op::Input as DeserializableStruct>::deserialize(&mut *deserializer).ok()?;
-        (!carries(&input)).then(|| invalid_input(CLIENT_TOKEN_REQUIRED_MESSAGE.to_string()))
+        refusal_message(violations).map(invalid_input)
     }
 }
 
@@ -229,8 +201,11 @@ pub(super) fn refusal_table<Eng: Send + Sync + 'static>(
             })+
         };
     }
-    // Every operation whose input models no idempotency token.
+    // Every operation the model declares, each served through the same front door.
     register!(
+        create_event_bus::CreateEventBus,
+        create_event_source::CreateEventSource,
+        create_subscriber::CreateSubscriber,
         delete_event_bus::DeleteEventBus,
         delete_event_source::DeleteEventSource,
         delete_resource_policy::DeleteResourcePolicy,
@@ -253,31 +228,6 @@ pub(super) fn refusal_table<Eng: Send + Sync + 'static>(
         update_event_bus::UpdateEventBus,
         update_event_source::UpdateEventSource,
         update_subscriber::UpdateSubscriber,
-    );
-    // The three creates, each of which requires the idempotency token its input models.
-    refusals.insert(
-        <crate::ops::create_event_bus::CreateEventBus<Eng> as Operation>::NAME,
-        Box::new(ModelledInputRefusal::<
-            crate::ops::create_event_bus::CreateEventBus<Eng>,
-        >::requiring_client_token(|input| {
-            input.client_token.is_some()
-        })) as Box<dyn ErasedOperation>,
-    );
-    refusals.insert(
-        <crate::ops::create_event_source::CreateEventSource<Eng> as Operation>::NAME,
-        Box::new(ModelledInputRefusal::<
-            crate::ops::create_event_source::CreateEventSource<Eng>,
-        >::requiring_client_token(|input| {
-            input.client_token.is_some()
-        })) as Box<dyn ErasedOperation>,
-    );
-    refusals.insert(
-        <crate::ops::create_subscriber::CreateSubscriber<Eng> as Operation>::NAME,
-        Box::new(ModelledInputRefusal::<
-            crate::ops::create_subscriber::CreateSubscriber<Eng>,
-        >::requiring_client_token(|input| {
-            input.client_token.is_some()
-        })) as Box<dyn ErasedOperation>,
     );
     refusals
 }

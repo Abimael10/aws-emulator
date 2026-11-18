@@ -15,9 +15,10 @@
 //! No operation of this service answers the framework's synthetic `ValidationException`,
 //! which its model does not declare at all.
 //!
-//! RULE 2 — a create requires the idempotency token its input models: a request carrying
-//! no `ClientToken` is refused with the same error shape and the fixed text of that
-//! refusal, for every operation of this service whose input models such a token.
+//! RULE 2 — the idempotency token a create models is OPTIONAL: a request that omits
+//! `ClientToken` is served and mints its resource, for every operation of this service
+//! whose input models such a token. Its absence costs only the replay record, so a
+//! repeat of a tokenless create is the name collision rather than an idempotent replay.
 //!
 //! RULE 3 — `DescribeEventBus` resolves the whole `EventBusArn` it is given, identifier
 //! segment included: an ARN carrying an identifier this service never minted addresses no
@@ -44,12 +45,15 @@ use eventsv2::ops::create_event_bus::CreateEventBus;
 use eventsv2::ops::create_event_source::CreateEventSource;
 use eventsv2::ops::create_subscriber::CreateSubscriber;
 use eventsv2::ops::describe_event_bus::DescribeEventBus;
+use eventsv2::ops::describe_event_source::DescribeEventSource;
+use eventsv2::ops::describe_subscriber::DescribeSubscriber;
 use eventsv2::ops::delete_event_bus::DeleteEventBus;
 use eventsv2::ops::put_events::PutEvents;
 use eventsv2::ops::types::{
     AwsServiceEventsSourceConfiguration, CreateEventBusInput, CreateEventSourceInput,
-    CreateSubscriberInput, DeleteEventBusInput, DescribeEventBusInput, EventSourceConfiguration,
-    InvokeConfiguration, PutEventsInput, PutEventsRequestEntry,
+    CreateSubscriberInput, DeleteEventBusInput, DescribeEventBusInput, DescribeEventSourceInput,
+    DescribeSubscriberInput, EventSourceConfiguration, InvokeConfiguration, PutEventsInput,
+    PutEventsRequestEntry, StorageConfiguration,
 };
 
 /// The region every request below is signed for, which the minted ARNs carry.
@@ -69,8 +73,10 @@ const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 /// service's model does not declare: no answer below may name it.
 const UNMODELLED_REFUSAL: &str = "ValidationException";
 
-/// The whole `Message` of a create carrying no idempotency token.
-const CLIENT_TOKEN_REQUIRED: &str = "ClientToken is required";
+/// The error shape a create of a name already taken answers with, and the whole
+/// `Message` of that class.
+const RESOURCE_ALREADY_EXISTS_EXCEPTION: &str = "ResourceAlreadyExistsException";
+const RESOURCE_ALREADY_EXISTS: &str = eventsv2::state::RESOURCE_ALREADY_EXISTS_MESSAGE;
 
 /// The whole `Message` of a refusal of a value that addresses no resource of this
 /// service.
@@ -93,6 +99,16 @@ const CLIENT_TOKEN_MAX: usize = 64;
 /// `ClientToken`'s modelled `@pattern`, quoted the same way.
 /// Source: `smithy_query(query="shape", shape="ClientToken")`.
 const CLIENT_TOKEN_PATTERN: &str = r"[\u0021-\u007E]+";
+
+/// `RetentionPeriodInDays`' modelled `@range`, which a storage configuration a request
+/// names must sit inside and the effective retention period of a bus therefore does too.
+/// Source: `smithy_query(query="shape", shape="RetentionPeriodInDays")`.
+const RETENTION_MIN: i32 = 1;
+const RETENTION_MAX: i32 = 365;
+
+/// The retention period a bus created without a storage configuration holds, which every
+/// read of it reports.
+const DEFAULT_RETENTION: i32 = eventsv2::state::DEFAULT_RETENTION_PERIOD_IN_DAYS;
 
 /// `EventBusArn`'s modelled `@pattern`, quoted the same way.
 /// Source: `smithy_query(query="operation", operation="DescribeEventBus")`.
@@ -370,8 +386,8 @@ fn unminted_arn(region: &str, name: &str, bus_id: &str) -> String {
     format!("arn:aws:events:{region}:{ACCOUNT}:event-busv2/{name}/{bus_id}")
 }
 
-/// A `CreateEventBusInput` naming `name`, with the idempotency token this service
-/// requires.
+/// A `CreateEventBusInput` naming `name`, with `client_token` as the caller supplied it:
+/// the model leaves the token optional, so `None` is a request a caller really makes.
 fn create_bus(name: &str, client_token: Option<&str>) -> CreateEventBusInput {
     CreateEventBusInput {
         name: name.to_string(),
@@ -631,84 +647,262 @@ async fn every_modelled_operation_states_its_refusal_in_the_modelled_shape() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE 2: a create requires the idempotency token its input models
+// RULE 2: the idempotency token a create models is OPTIONAL
 // ---------------------------------------------------------------------------
 
-/// RULE 2 over every operation of this service that mints a resource under an idempotency
-/// token: the create is refused without one and served with one.
+/// RULE 2 on the create whose whole output the model states: a request that omits
+/// `ClientToken` is served, and what it reports is the resource the store now holds —
+/// over rows varying the name grammar and the storage configuration, so no part of the
+/// answer is keyed to one request shape.
 #[tokio::test]
-async fn every_create_requires_the_idempotency_token_its_input_models() {
+async fn a_bus_create_omitting_its_idempotency_token_mints_the_bus_it_reports() {
     let wire = Wire::new();
-    let bus = wire.active_bus("the host bus", "token-rule-bus").await;
 
-    // (case, operation, the request with no token, the same request with one)
-    let rows: Vec<(&str, &str, Vec<u8>, Vec<u8>)> = vec![
+    // (case, the bus name, the RetentionPeriodInDays the request names)
+    // The retention rows are the published bounds of `RetentionPeriodInDays`
+    // (`@range` 1..365) plus a request naming no storage configuration at all.
+    // Source: `smithy_query(query="shape", shape="StorageConfiguration")`.
+    let rows = [
+        ("naming only the required member", "tokenless-bus", None),
+        ("the shortest name the grammar admits", "A", None),
         (
-            "CreateEventBus",
-            CreateEventBus::<InMemoryEngine>::NAME,
-            encoded::<CreateEventBus<InMemoryEngine>>(&create_bus("tokenless-bus", None)),
-            encoded::<CreateEventBus<InMemoryEngine>>(&create_bus(
-                "tokenless-bus",
-                Some("a-bus-token"),
-            )),
+            "every punctuation character the name admits",
+            "A.b-c_9",
+            None,
         ),
+        ("the retention floor", "tokenless-floor", Some(RETENTION_MIN)),
         (
-            "CreateEventSource",
-            CreateEventSource::<InMemoryEngine>::NAME,
-            encoded::<CreateEventSource<InMemoryEngine>>(&create_source(
-                "tokenless-source",
-                &bus,
-                None,
-            )),
-            encoded::<CreateEventSource<InMemoryEngine>>(&create_source(
-                "tokenless-source",
-                &bus,
-                Some("a-source-token"),
-            )),
-        ),
-        (
-            "CreateSubscriber",
-            CreateSubscriber::<InMemoryEngine>::NAME,
-            encoded::<CreateSubscriber<InMemoryEngine>>(&create_subscriber(
-                "tokenless-subscriber",
-                &bus,
-                None,
-            )),
-            encoded::<CreateSubscriber<InMemoryEngine>>(&create_subscriber(
-                "tokenless-subscriber",
-                &bus,
-                Some("a-subscriber-token"),
-            )),
+            "the retention ceiling",
+            "tokenless-ceiling",
+            Some(RETENTION_MAX),
         ),
     ];
 
-    for (case, operation, tokenless, tokened) in rows {
-        let (status, body) = wire.send(operation, tokenless).await;
+    let mut minted: Vec<String> = Vec::new();
+    for (case, name, retention) in rows {
+        let created = wire
+            .ok::<CreateEventBus<InMemoryEngine>>(
+                case,
+                &CreateEventBusInput {
+                    name: name.to_string(),
+                    storage_configuration: retention.map(|days| StorageConfiguration {
+                        retention_period_in_days: Some(days),
+                    }),
+                    client_token: None,
+                    ..Default::default()
+                },
+            )
+            .await;
+
         assert_eq!(
-            status, 400,
-            "case {case:?}: a create carrying no ClientToken must answer 400, got {status} \
-             with {:?}",
-            rendered(&body)
+            created.name.as_deref(),
+            Some(name),
+            "case {case:?}: expected the requested name {name:?}, got {:?}",
+            created.name
         );
-        let (code, message) = refusal(case, &body);
-        assert_eq!(
-            code, INVALID_INPUT_EXCEPTION,
-            "case {case:?}: expected {INVALID_INPUT_EXCEPTION}, got {code:?} with {message:?}"
+        let arn = created.event_bus_arn.clone().unwrap_or_else(|| {
+            panic!("case {case:?}: expected a minted EventBusArn, got {created:?}")
+        });
+        let prefix = format!("arn:aws:events:{REGION}:{ACCOUNT}:event-busv2/{name}/");
+        assert!(
+            arn.starts_with(&prefix) && arn.len() == prefix.len() + BUS_ID_LEN,
+            "case {case:?}: expected an ARN {prefix}<{BUS_ID_LEN} characters>, got {arn:?}"
         );
         assert_eq!(
-            message, CLIENT_TOKEN_REQUIRED,
-            "case {case:?}: expected {CLIENT_TOKEN_REQUIRED:?}, got {message:?}"
+            created.state.as_deref(),
+            Some("CREATING"),
+            "case {case:?}: expected the bus reported CREATING, got {:?}",
+            created.state
+        );
+        assert!(
+            created.creation_time.is_some(),
+            "case {case:?}: expected a CreationTime, got {created:?}"
+        );
+        let storage = created.storage_configuration.clone().unwrap_or_else(|| {
+            panic!("case {case:?}: expected a StorageConfiguration, got {created:?}")
+        });
+        // The effective retention period: what the request named, or the service default
+        // when it named none.
+        let effective = retention.unwrap_or(DEFAULT_RETENTION);
+        assert_eq!(
+            storage.retention_period_in_days,
+            Some(effective),
+            "case {case:?}: expected RetentionPeriodInDays {effective}, got {:?}",
+            storage.retention_period_in_days
+        );
+        assert!(
+            (RETENTION_MIN..=RETENTION_MAX).contains(&effective),
+            "case {case:?}: the effective retention period must sit inside the modelled \
+             range {RETENTION_MIN}..={RETENTION_MAX}, got {effective}"
+        );
+        assert!(
+            storage.retention_window_start_time.is_some(),
+            "case {case:?}: expected a RetentionWindowStartTime, got {storage:?}"
         );
 
-        // The same request, with the token, is served.
-        let (status, body) = wire.send(operation, tokened).await;
+        // The bus the create reported is the bus the store holds: read it back under the
+        // ARN it minted.
+        let read = wire
+            .ok::<DescribeEventBus<InMemoryEngine>>(
+                case,
+                &DescribeEventBusInput {
+                    event_bus_arn: arn.clone(),
+                },
+            )
+            .await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: the same create carrying a ClientToken must be served, got {status} \
-             with {:?}",
-            rendered(&body)
+            read.name.as_deref(),
+            Some(name),
+            "case {case:?}: the stored bus must carry the requested name, got {:?}",
+            read.name
         );
+        assert_eq!(
+            read.storage_configuration
+                .as_ref()
+                .and_then(|storage| storage.retention_period_in_days),
+            Some(effective),
+            "case {case:?}: the stored bus must carry the effective retention period, got \
+             {:?}",
+            read.storage_configuration
+        );
+        minted.push(arn);
     }
+
+    // No token is no replay record, so every row minted a bus of its own.
+    let mut distinct = minted.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        minted.len(),
+        "each tokenless create must mint its own bus, got {minted:?}"
+    );
+}
+
+/// RULE 2 on the two remaining creates, which model the same optional token: each is
+/// served without one and the resource it minted reads back through its own Describe.
+#[tokio::test]
+async fn an_event_source_and_a_subscriber_are_created_without_an_idempotency_token() {
+    let wire = Wire::new();
+    let bus = wire.active_bus("the host bus", "token-rule-bus").await;
+
+    let case = "CreateEventSource with no ClientToken";
+    let source = wire
+        .ok::<CreateEventSource<InMemoryEngine>>(
+            case,
+            &create_source("tokenless-source", &bus, None),
+        )
+        .await;
+    let source_arn = source.event_source_arn.clone().unwrap_or_else(|| {
+        panic!("case {case:?}: expected a minted EventSourceArn, got {source:?}")
+    });
+    let read = wire
+        .ok::<DescribeEventSource<InMemoryEngine>>(
+            case,
+            &DescribeEventSourceInput {
+                event_source_arn: source_arn.clone(),
+            },
+        )
+        .await;
+    assert_eq!(
+        read.event_bus_arn.as_deref(),
+        Some(bus.as_str()),
+        "case {case:?}: the stored source must sit on the bus the request named, got {:?}",
+        read.event_bus_arn
+    );
+    assert_eq!(
+        read.name.as_deref(),
+        Some("tokenless-source"),
+        "case {case:?}: the stored source must carry the requested name, got {:?}",
+        read.name
+    );
+
+    let case = "CreateSubscriber with no ClientToken";
+    let subscriber = wire
+        .ok::<CreateSubscriber<InMemoryEngine>>(
+            case,
+            &create_subscriber("tokenless-subscriber", &bus, None),
+        )
+        .await;
+    let subscriber_arn = subscriber.subscriber_arn.clone().unwrap_or_else(|| {
+        panic!("case {case:?}: expected a minted SubscriberArn, got {subscriber:?}")
+    });
+    let read = wire
+        .ok::<DescribeSubscriber<InMemoryEngine>>(
+            case,
+            &DescribeSubscriberInput {
+                subscriber_arn: subscriber_arn.clone(),
+            },
+        )
+        .await;
+    assert_eq!(
+        read.event_bus_arn.as_deref(),
+        Some(bus.as_str()),
+        "case {case:?}: the stored subscriber must sit on the bus the request named, got {:?}",
+        read.event_bus_arn
+    );
+    assert_eq!(
+        read.name.as_deref(),
+        Some("tokenless-subscriber"),
+        "case {case:?}: the stored subscriber must carry the requested name, got {:?}",
+        read.name
+    );
+}
+
+/// What the absent token COSTS, which is the whole of its absence: a create carrying no
+/// token leaves no replay record, so a second create of the same name is the name
+/// collision — while two creates carrying one and the same token are the one resource
+/// that token minted.
+#[tokio::test]
+async fn a_tokenless_create_is_not_idempotent_and_a_tokened_one_still_is() {
+    let wire = Wire::new();
+
+    let case = "a repeated tokenless create";
+    let first = wire
+        .ok::<CreateEventBus<InMemoryEngine>>(case, &create_bus("repeated-tokenless", None))
+        .await;
+    let (status, body) = wire
+        .call::<CreateEventBus<InMemoryEngine>>(&create_bus("repeated-tokenless", None))
+        .await;
+    assert_eq!(
+        status, 409,
+        "case {case:?}: a second create of the same name must collide, got {status} with {:?}",
+        rendered(&body)
+    );
+    let (code, message) = refusal(case, &body);
+    assert_eq!(
+        code, RESOURCE_ALREADY_EXISTS_EXCEPTION,
+        "case {case:?}: expected {RESOURCE_ALREADY_EXISTS_EXCEPTION}, got {code:?} with \
+         {message:?}"
+    );
+    assert_eq!(
+        message, RESOURCE_ALREADY_EXISTS,
+        "case {case:?}: expected {RESOURCE_ALREADY_EXISTS:?}, got {message:?}"
+    );
+
+    let case = "a repeated create carrying one token";
+    let replayed = wire
+        .ok::<CreateEventBus<InMemoryEngine>>(
+            case,
+            &create_bus("repeated-tokened", Some("one-and-the-same-token")),
+        )
+        .await;
+    let again = wire
+        .ok::<CreateEventBus<InMemoryEngine>>(
+            case,
+            &create_bus("repeated-tokened", Some("one-and-the-same-token")),
+        )
+        .await;
+    assert_eq!(
+        again.event_bus_arn, replayed.event_bus_arn,
+        "case {case:?}: the retry must replay the bus the token minted, got {:?} after {:?}",
+        again.event_bus_arn, replayed.event_bus_arn
+    );
+    assert_ne!(
+        first.event_bus_arn, replayed.event_bus_arn,
+        "case {case:?}: the tokened create must mint a bus of its own, got {:?}",
+        replayed.event_bus_arn
+    );
 }
 
 // ---------------------------------------------------------------------------
