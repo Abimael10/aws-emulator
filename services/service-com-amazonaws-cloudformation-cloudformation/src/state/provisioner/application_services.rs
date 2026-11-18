@@ -584,6 +584,9 @@ pub(super) async fn create_pipeline(
         declaration.insert("artifactStores".to_string(), rewritten);
     }
     let mut request = Map::new();
+    // Every value the declaration states for a member CodePipeline models as TEXT is handed
+    // over as that text, whichever scalar spelling the template chose for it.
+    action_values_as_text(&mut declaration);
     request.insert("pipeline".to_string(), Value::Object(declaration));
     let tags = tags_of(&resource.properties, propagated);
     if !tags.is_empty() {
@@ -602,6 +605,48 @@ pub(super) async fn create_pipeline(
         Ok(_) => Ok(Created::default()),
         Err(refusal) if refusal.code == PIPELINE_NAME_IN_USE => Ok(Created::default()),
         Err(refusal) => Err(refusal),
+    }
+}
+
+/// Every value an action's declaration states for a member CodePipeline models as TEXT, as
+/// that text.
+///
+/// `ActionConfigurationMap` is a map of string to string and every member of `ActionTypeId`
+/// (`category`, `owner`, `provider`, `version`) is a string, while a template may spell such
+/// a value as a BARE scalar (`PollForSourceChanges: false`, `Version: 1`) — a spelling
+/// CloudFormation accepts and hands the owning API as that scalar's own single text
+/// ([`scalar_text`]). So the declaration carries the text for those members rather than the
+/// JSON type the author happened to write, which the service that owns the pipeline models no
+/// member as and would refuse the whole create for.
+///
+/// A composite value is left as it stands: it is no scalar, so it has no text, and what the
+/// owning service makes of it is its own to report.
+fn action_values_as_text(declaration: &mut Map<String, Value>) {
+    /// The members of an action declaration whose every value the model states as text.
+    const TEXTUAL_MEMBERS: [&str; 2] = ["configuration", "actionTypeId"];
+
+    let Some(stages) = declaration.get_mut("stages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for stage in stages {
+        let Some(actions) = stage.get_mut("actions").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for action in actions {
+            for member in TEXTUAL_MEMBERS {
+                let Some(values) = action.get_mut(member).and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                for value in values.values_mut() {
+                    if value.is_string() {
+                        continue;
+                    }
+                    if let Some(text) = scalar_text(value) {
+                        *value = Value::String(text);
+                    }
+                }
+            }
+        }
     }
 }
 

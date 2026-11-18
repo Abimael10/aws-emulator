@@ -35,7 +35,12 @@
 //!   `Unsupported property [<member>]` the stage reports
 //!   ([`declared_properties::unsupported_property_reason`]);
 //! * a property whose contract publishes the values it admits, carrying a value that is not
-//!   one of them, over the rows this emulator holds ([`CONSTRAINED_PROPERTIES`]).
+//!   one of them, over the rows this emulator holds ([`CONSTRAINED_PROPERTIES`]);
+//! * a property whose contract publishes the PATTERN its values match, carrying a value
+//!   outside it, over the rows this emulator holds
+//!   ([`patterned_properties::PATTERNED_PROPERTIES`]), which is the
+//!   `Property value [<value>] does not match pattern: <pattern>` the stage reports
+//!   ([`patterned_properties::pattern_failure_reason`]).
 //!
 //! A resource is judged in that order, because a property that is not there has no value to
 //! hold to a set and a member the type does not have has no set to hold one to, and the
@@ -96,6 +101,10 @@ use super::StoredResource;
 /// Which properties a type HAS at all, which is the other question its schema makes
 /// decidable here.
 pub mod declared_properties;
+
+/// Which SPELLINGS a property admits, which is the other question its schema makes decidable
+/// about a value.
+pub mod patterned_properties;
 
 /// One property whose admitted values its type's contract publishes.
 #[derive(Debug, Clone, Copy)]
@@ -391,13 +400,16 @@ const PROPERTIES_SECTION: &str = "Properties";
 /// every property the type REQUIRES (a property that is not there has no value to hold to a
 /// set), then that every member it does carry is one the type HAS
 /// ([`declared_properties`]), then the `oneOf` over those members, and last each value
-/// against the set its property publishes.
+/// against what its property states about a value — the set it publishes, and then the
+/// pattern it admits ([`patterned_properties`]), since a value outside a published set is
+/// not one of its values whatever it is spelled like.
 pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
     declared.iter().find_map(|resource| {
         missing_required_property(resource)
             .or_else(|| declared_properties::undeclared_property(resource))
             .or_else(|| matched_several_subschemas(resource))
             .or_else(|| inadmissible_value(resource))
+            .or_else(|| patterned_properties::value_outside_its_pattern(resource))
     })
 }
 
