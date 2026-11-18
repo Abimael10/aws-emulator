@@ -190,6 +190,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Signer is regional: this read resolves a profile of the region whose
         // endpoint the request was signed for, and nothing of any other region.
         let region = crate::state::request_region(ctx.parts());
+
+        // IAM decides the call before this service looks at what the request
+        // names: the action is `signer:GetSigningProfile` and the resource is the
+        // signing profile the request addresses, whether or not this endpoint
+        // holds one of that name.
+        crate::authorize!(
+            GetSigningProfileErrorModeled,
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::profile_arn(&input.profile_name, &region)
+        )?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetSigningProfileErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {

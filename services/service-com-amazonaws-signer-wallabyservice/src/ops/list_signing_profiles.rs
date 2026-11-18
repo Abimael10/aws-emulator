@@ -182,6 +182,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Signer is regional: a list reports the profiles of the region whose
         // endpoint was addressed, and none of any other region's.
         let region = crate::state::request_region(ctx.parts());
+
+        // IAM decides the call before this service reads anything: the action is
+        // `signer:ListSigningProfiles`, and the listing addresses no resource of
+        // this service — it reports the account's own profiles — so it is judged
+        // against the all-resources form IAM writes for such an action.
+        crate::authorize!(
+            ListSigningProfilesErrorModeled,
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::state::authorization::ANY_RESOURCE
+        )?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListSigningProfilesErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {

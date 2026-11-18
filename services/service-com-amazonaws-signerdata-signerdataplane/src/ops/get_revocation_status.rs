@@ -78,6 +78,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The ONE gate that decides whether the caller of a request may perform an AWS Signer
+/// action, and the ONE wording of a refusal of one: AWS Signer's control plane owns it
+/// (`services/service-com-amazonaws-signer-wallabyservice`, `state::authorization`) and
+/// this endpoint decides its own call with it. The two endpoints are two views of one API
+/// publishing one IAM action namespace (`signer`), so a second reading of the caller's
+/// identity-based policies here could come to answer differently from that one.
+use ::service_com_amazonaws_signer_wallabyservice::state::authorization as signer_authorization;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -147,8 +155,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A revocation check is a security decision, so IAM decides the call
+        // before this endpoint reads its registry: the action is
+        // `signer:GetRevocationStatus` — this endpoint publishes AWS Signer's own
+        // IAM action namespace (`smithy_query(query="service_info")` reads
+        // `arnNamespace: signer`) — and the resource is the signing profile the
+        // request's `profileVersionArn` belongs to, since a profile VERSION is not
+        // a resource IAM addresses on its own. A value that is no version ARN of
+        // Signer addresses no profile, so it is judged against the all-resources
+        // form IAM writes for an action that names none.
+        //
+        // Decided by the SAME gate the control plane decides its calls with
+        // ([`signer_authorization`]): the two endpoints are two views of one API
+        // under one action namespace, so a second reading of the caller's policies
+        // here could come to answer differently from that one.
+        let authorized_resource =
+            signer_authorization::profile_of_version_arn(&input.profile_version_arn)
+                .unwrap_or_else(|| signer_authorization::ANY_RESOURCE.to_string());
+        if let Some(message) = signer_authorization::authorization_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &authorized_resource,
+        ) {
+            return Err(GetRevocationStatusErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                    code: Some(signer_authorization::ERROR_CODE_ACCESS_DENIED.to_string()),
+                },
+            )
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| server_error(crate::state::NO_STORE))?;
 

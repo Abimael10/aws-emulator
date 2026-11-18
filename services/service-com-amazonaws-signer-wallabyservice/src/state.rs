@@ -727,6 +727,11 @@ pub mod payload_signing;
 /// terminal status that work gives it.
 pub mod code_signing;
 
+/// Whether IAM lets the caller of a request perform the action it asks for, and
+/// how a refusal of one is worded — the gate every operation whose model declares
+/// `AccessDeniedException` runs before it reads or writes anything.
+pub mod authorization;
+
 /// Per-service state for com-amazonaws-signer-wallabyservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSignerWallabyserviceState {

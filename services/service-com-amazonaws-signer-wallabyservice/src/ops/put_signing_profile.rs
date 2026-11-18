@@ -204,6 +204,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 
+        // IAM decides the call before this service looks at what the request
+        // names: the action is `signer:PutSigningProfile` and the resource is the
+        // signing profile the request addresses, whether or not this endpoint
+        // holds one of that name yet.
+        crate::authorize!(
+            PutSigningProfileErrorModeled,
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::profile_arn(&input.profile_name, &region)
+        )?;
+
         // A profile is a template bound to one of the signing platforms the
         // service publishes, and the platform is what supplies the signing
         // configuration a later job runs under — so the entry is looked up in the

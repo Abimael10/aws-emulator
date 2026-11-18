@@ -12,6 +12,12 @@ engine = { workspace = true }
 # every form the wire names an instant in (`query_timestamps`), which
 # `GetRevocationStatus`' `signatureTimestamp` needs — see `src/service.rs`.
 service-common = { path = "../common" }
+# AWS Signer's CONTROL plane, for the ONE authorization gate both views of this API
+# decide a call with (`state::authorization`): the two endpoints publish the same
+# `signer` IAM action namespace and the same `GetRevocationStatus`, so a caller's
+# identity-based policy has to decide this endpoint's call exactly as it decides the
+# control plane's — one rule, one home, rather than a second copy here.
+service-com-amazonaws-signer-wallabyservice = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

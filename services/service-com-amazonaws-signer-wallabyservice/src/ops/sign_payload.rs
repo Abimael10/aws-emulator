@@ -191,6 +191,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides the call before this service looks at anything the request
+        // carries: the action is `signer:SignPayload` and the resource is the
+        // signing profile the request addresses, whether or not this endpoint
+        // holds one of that name.
+        crate::authorize!(
+            SignPayloadErrorModeled,
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::profile_arn(
+                &input.profile_name,
+                &crate::state::request_region(ctx.parts()),
+            )
+        )?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_service_error(
                 "the signer job store is unavailable".to_string(),

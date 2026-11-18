@@ -169,7 +169,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A platform is a published fact about the service, not a stored
         // resource: this call reads the catalog and writes nothing, so a later
         // reader of any platform sees exactly what this one saw.
-        let _ = (ctx, &self.engine);
+        //
+        // IAM still decides the call: the action is `signer:ListSigningPlatforms`,
+        // and a platform is no resource an IAM policy addresses, so it is judged
+        // against the all-resources form IAM writes for such an action.
+        crate::authorize!(
+            ListSigningPlatformsErrorModeled,
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::state::authorization::ANY_RESOURCE
+        )?;
 
         // How many platforms this page carries: the `maxResults` the request
         // named, or this operation's page limit when it named none — the one

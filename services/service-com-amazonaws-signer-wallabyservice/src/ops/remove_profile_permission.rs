@@ -188,6 +188,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Signer is regional: the removal lands on the policy of the profile held
         // by the region whose endpoint it was signed for.
         let region = crate::state::request_region(ctx.parts());
+
+        // IAM decides the call before this service looks at what the request
+        // names: the action is `signer:RemoveProfilePermission` and the resource
+        // is the signing profile the request addresses, whether or not this
+        // endpoint holds one of that name.
+        crate::authorize!(
+            RemoveProfilePermissionErrorModeled,
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::profile_arn(&input.profile_name, &region)
+        )?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 RemoveProfilePermissionErrorModeled::InternalServiceErrorException(

@@ -18,6 +18,13 @@
 //! signature, and of nothing else — so no stored record can make one of the
 //! request's certificate hashes revoked, and none is reported.
 //!
+//! A revocation check is a security decision, so IAM decides the call before
+//! anything is read: the action is `signer:GetRevocationStatus` and the resource
+//! is the signing profile the request's `profileVersionArn` belongs to (see
+//! [`crate::state::authorization`]), and a caller whose identity-based policies
+//! refuse it is answered the modelled `AccessDeniedException` rather than a
+//! revocation list.
+//!
 //! `certificateHashes` is `@required` and bound to the query string, where a list
 //! carrying no entries and an absent one are the same request, so a request that
 //! supplies nothing for it is refused the way this service words that refusal
@@ -182,6 +189,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names are the ones held by the region whose endpoint it was signed for,
         // and no other region's.
         let region = crate::state::request_region(ctx.parts());
+
+        // IAM decides the call before this service looks at what the request
+        // names: the action is `signer:GetRevocationStatus`, and the resource is
+        // the signing profile the request's `profileVersionArn` belongs to — a
+        // profile VERSION is not a resource IAM addresses on its own. A value
+        // that is no version ARN of this service addresses no profile, so it is
+        // judged against the all-resources form and then refused for the value
+        // it carried below.
+        let authorized_resource = crate::state::authorization::profile_of_version_arn(
+            &input.profile_version_arn,
+        )
+        .unwrap_or_else(|| crate::state::authorization::ANY_RESOURCE.to_string());
+        crate::authorize!(
+            GetRevocationStatusErrorModeled,
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &authorized_resource
+        )?;
 
         // Every value this route's published contract CONSTRAINS is refused for
         // the constraint it violated before anything it might name is resolved,

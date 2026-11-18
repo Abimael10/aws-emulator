@@ -241,6 +241,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Signer is regional: the grant is written on the profile held by the
         // region whose endpoint it was signed for, and on no other region's.
         let region = crate::state::request_region(ctx.parts());
+
+        // IAM decides the call before this service looks at what the request
+        // names: the action is `signer:AddProfilePermission` and the resource is
+        // the signing profile the request addresses, whether or not this
+        // endpoint holds one of that name.
+        crate::authorize!(
+            AddProfilePermissionErrorModeled,
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::profile_arn(&input.profile_name, &region)
+        )?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 AddProfilePermissionErrorModeled::InternalServiceErrorException(

@@ -216,6 +216,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Signer is regional: the revocation lands on the job held by the region
         // whose endpoint it was signed for, and on no other region's.
         let region = crate::state::request_region(ctx.parts());
+
+        // IAM decides the call before this service looks at what the request
+        // names: the action is `signer:RevokeSignature` and the resource is the
+        // signing job the request addresses, whether or not this endpoint holds
+        // one of that id.
+        crate::authorize!(
+            RevokeSignatureErrorModeled,
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::job_arn(&input.job_id, &region)
+        )?;
+
         let mut store = state.lock();
 
         // The job is resolved with any completion the clock already owed it
