@@ -1215,7 +1215,19 @@ async fn seeding_a_group_from_a_snapshot_is_refused_by_whether_that_snapshot_exi
         "the source cluster must be created, got {}",
         cluster.body
     );
-    std::thread::sleep(PAST_TRANSITION);
+    // `CreateSnapshot` takes a snapshot of an AVAILABLE cluster, so this waits for
+    // that CONDITION rather than for a span: the handlers never sleep, and only the
+    // clock carries the cluster there.
+    poll_until(
+        &emulator,
+        REGION,
+        "seed-source",
+        "the source cluster reaching available",
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", "seed-source")]),
+        |reply| reply.text("CacheCluster/CacheClusterStatus") == Some("available"),
+    )
+    .await;
     let snapshot = emulator
         .call(
             "CreateSnapshot",
@@ -1230,24 +1242,43 @@ async fn seeding_a_group_from_a_snapshot_is_refused_by_whether_that_snapshot_exi
         "the snapshot must be taken, got {}",
         snapshot.body
     );
+    // And a restore source is a snapshot the clock has made `available`, which is
+    // the condition a client's own wait is written against.
+    poll_until(
+        &emulator,
+        REGION,
+        "seed-snap",
+        "the snapshot reaching available",
+        "DescribeSnapshots",
+        &params(&[("SnapshotName", "seed-snap")]),
+        |reply| reply.text("Snapshot/SnapshotStatus") == Some("available"),
+    )
+    .await;
 
-    // A name this account never took is the modelled bad value; the stored one
-    // is a restore nobody has written yet, so it answers the scaffold's 501
-    // rather than a group whose data was never loaded. The axis is exactly that:
-    // whether the named snapshot exists.
-    for (case, name, status, code) in [
+    // A name this account never took is the modelled bad value; a snapshot the
+    // store DOES hold is a restore source, whichever case it is named in ("this
+    // parameter is stored as a lowercase string"). The axis is exactly that:
+    // whether the named snapshot exists. What the restored group then SERVES is
+    // the data the snapshot captured, which the data-consequence suite asserts
+    // over the group's own endpoint.
+    for (case, id, name, status, code) in [
         (
             "a snapshot this account never took",
+            "seeded-rg-missing",
             "no-such-snap",
             400,
             "InvalidParameterValue",
         ),
-        ("a snapshot the store holds", "seed-snap", 501, "NotImplemented"),
-        // "This parameter is stored as a lowercase string": the same snapshot,
-        // named in another case, resolves to the same record.
-        ("the same snapshot in mixed case", "Seed-Snap", 501, "NotImplemented"),
+        ("a snapshot the store holds", "seeded-rg", "seed-snap", 200, ""),
+        (
+            "the same snapshot in mixed case",
+            "seeded-rg-mixed",
+            "Seed-Snap",
+            200,
+            "",
+        ),
     ] {
-        let reply = create_group(&emulator, "seeded-rg", &[("SnapshotName", name)]).await;
+        let reply = create_group(&emulator, id, &[("SnapshotName", name)]).await;
         assert_eq!(
             reply.status, status,
             "case {case:?}: expected HTTP {status}, got {} {}",
@@ -1256,17 +1287,25 @@ async fn seeding_a_group_from_a_snapshot_is_refused_by_whether_that_snapshot_exi
         assert_eq!(
             reply.error_code(),
             code,
-            "case {case:?}: expected error code {code}, got {}",
+            "case {case:?}: expected error code {code:?}, got {}",
             reply.body
         );
-        let described = describe_group(&emulator, "seeded-rg").await;
-        assert_eq!(
-            (described.status, described.error_code()),
-            (404, "ReplicationGroupNotFoundFault"),
-            "case {case:?}: a refused create must persist no group, got {} {}",
-            described.status,
-            described.body
-        );
+        let described = describe_group(&emulator, id).await;
+        if status == 200 {
+            assert_eq!(
+                described.status, 200,
+                "case {case:?}: an accepted create must persist the group, got {} {}",
+                described.status, described.body
+            );
+        } else {
+            assert_eq!(
+                (described.status, described.error_code()),
+                (404, "ReplicationGroupNotFoundFault"),
+                "case {case:?}: a refused create must persist no group, got {} {}",
+                described.status,
+                described.body
+            );
+        }
     }
 }
 

@@ -2182,6 +2182,10 @@ pub struct NewSnapshot {
     /// The VPC of the source cluster's subnet group, resolved by the caller
     /// (which holds the store) rather than guessed here.
     pub vpc_id: Option<String>,
+    /// The source cache's data set, captured at this instant
+    /// ([`captured_cache_cluster_data`]) — the copy [`SnapshotRecord::data`]
+    /// holds.
+    pub data: SharedKeyspace,
     pub tags: Vec<(String, String)>,
     pub now: SystemTime,
 }

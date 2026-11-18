@@ -10,6 +10,11 @@
 //!   taken, so a cache created from that snapshot's ARN starts with exactly the keys the
 //!   snapshot captured, the snapshot reports the size of that data set, and the snapshot
 //!   outlives both the cache it was taken of and every cache restored from it;
+//! * the same holds for the snapshot of a CACHE CLUSTER: a create that names one as its
+//!   restore source — `CreateCacheCluster$SnapshotName` or
+//!   `CreateReplicationGroup$SnapshotName` — is accepted whenever this account holds a
+//!   snapshot of that name and the new cache serves the keys that snapshot captured, while
+//!   only a name no snapshot of this account has is refused `InvalidParameterValue`;
 //! * the members of a replication group hold ONE data set, so adding a replica and moving
 //!   the primary role between members changes WHICH address the group publishes for the
 //!   writer and changes nothing a client can read there.
@@ -596,5 +601,423 @@ async fn a_scaled_shard_moves_its_primary_role_and_keeps_the_data_written_before
         accepted,
         Resp::Status("OK".to_string()),
         "the member the primary role moved to must take writes, got {accepted:?}"
+    );
+}
+
+/// Read one cache cluster back once the clock has made it `available` and its node is
+/// provisioned, so the endpoint it publishes is there to be read.
+async fn cluster_available(emulator: &Emulator, id: &str) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        id,
+        "the cluster reaching available with its node provisioned",
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", id), ("ShowCacheNodeInfo", "true")]),
+        |reply| reply.text("CacheCluster/CacheClusterStatus") == Some("available"),
+    )
+    .await
+}
+
+/// Create one cache cluster, wait until the clock has made it `available`, and answer the
+/// endpoint it publishes for its one node: `(address, port)`.
+///
+/// `extra` carries whatever the row adds beside the identity — the `SnapshotName` a restore
+/// names, for the rows that restore one.
+async fn cache_cluster(emulator: &Emulator, id: &str, extra: &[(&str, &str)]) -> (String, String) {
+    let mut pairs = params(&[
+        ("CacheClusterId", id),
+        ("Engine", "redis"),
+        ("CacheNodeType", "cache.t3.micro"),
+        ("NumCacheNodes", "1"),
+    ]);
+    pairs.extend(params(extra));
+    let created = emulator.call("CreateCacheCluster", &pairs).await;
+    assert_eq!(
+        created.status, 200,
+        "case {id}: CreateCacheCluster{extra:?} must answer 200, got {} {}",
+        created.status, created.body
+    );
+    // A created cluster is not ready: the create's own answer reports the work it started.
+    assert_eq!(
+        created.text("CacheCluster/CacheClusterStatus"),
+        Some("creating"),
+        "case {id}: the create's own answer must report the provisioning it started, got {}",
+        created.body
+    );
+    let described = cluster_available(emulator, id).await;
+    endpoint_of(
+        &described,
+        "CacheNodes/CacheNode/Endpoint/Address",
+        "CacheNodes/CacheNode/Endpoint/Port",
+        id,
+    )
+}
+
+/// Take one snapshot named `name` of the cache cluster `cluster` and wait until the clock
+/// has made it `available` — the state a client's own `_wait_snapshot_available` waits for
+/// before naming it as a restore source.
+async fn cluster_snapshot(emulator: &Emulator, name: &str, cluster: &str) {
+    cluster_available(emulator, cluster).await;
+    let created = emulator
+        .call(
+            "CreateSnapshot",
+            &params(&[("SnapshotName", name), ("CacheClusterId", cluster)]),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case {name}: CreateSnapshot of {cluster} must answer 200, got {} {}",
+        created.status, created.body
+    );
+    snapshot_available(emulator, name).await;
+}
+
+/// Read one cache-cluster snapshot back once the clock has made it `available`, whether it
+/// was `creating` or `restoring` before.
+async fn snapshot_available(emulator: &Emulator, name: &str) -> Reply {
+    poll_until(
+        emulator,
+        REGION,
+        name,
+        "the snapshot reaching available",
+        "DescribeSnapshots",
+        &params(&[("SnapshotName", name)]),
+        |reply| reply.text("Snapshot/SnapshotStatus") == Some("available"),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_cache_cluster_restored_from_a_snapshot_holds_the_data_set_it_captured() {
+    let emulator = Emulator::new();
+    let rows = written();
+    let late_key = "after-the-snapshot";
+
+    // The source cluster, and the data a client puts in it over the wire its published
+    // endpoint answers on.
+    let (address, port) = cache_cluster(&emulator, "snap-origin", &[]).await;
+    let mut origin = open("snap-origin", &address, &port).await;
+    write_all("snap-origin", &mut origin, &rows).await;
+
+    // A snapshot of a cluster nothing was written to is the counter-row: a cluster restored
+    // from it holds nothing.
+    cache_cluster(&emulator, "snap-untouched", &[]).await;
+    cluster_snapshot(&emulator, "snap-of-nothing", "snap-untouched").await;
+
+    // The first snapshot: taken with the table's keys in the cluster and nothing else.
+    cluster_snapshot(&emulator, "snap-early", "snap-origin").await;
+    // One more key, and a second snapshot. The LATE key pins each snapshot to an INSTANT: it
+    // is in the second snapshot's data set and not in the first's.
+    let late = command("snap-origin", &mut origin, &["SET", late_key, "late"]).await;
+    assert_eq!(
+        late,
+        Resp::Status("OK".to_string()),
+        "the source cluster must take a key written after its first snapshot, got {late:?}"
+    );
+    cluster_snapshot(&emulator, "snap-late", "snap-origin").await;
+    // And a COPY of the first snapshot, which carries what the source snapshot captured.
+    let copied = emulator
+        .call(
+            "CopySnapshot",
+            &params(&[
+                ("SourceSnapshotName", "snap-early"),
+                ("TargetSnapshotName", "snap-copy"),
+            ]),
+        )
+        .await;
+    assert_eq!(
+        copied.status, 200,
+        "CopySnapshot must answer 200, got {} {}",
+        copied.status, copied.body
+    );
+    snapshot_available(&emulator, "snap-copy").await;
+
+    // The axis: WHICH snapshot the restore names, how it spells the name, and whether the
+    // snapshot captured anything. Each row's cluster is created from nothing but that name,
+    // so what it answers is what the snapshot captured.
+    let keys: Vec<&str> = rows.iter().map(|row| row.key).collect();
+    let cases: [(&str, &str, bool, bool); 6] = [
+        // The recorded row: one snapshot, one restore.
+        ("restored-early", "snap-early", true, false),
+        // The same snapshot restored a second time: restoring does not consume one.
+        ("restored-early-again", "snap-early", true, false),
+        // "This parameter is stored as a lowercase string": the same snapshot named in
+        // another case is the same record.
+        ("restored-mixed-case", "SNAP-EARLY", true, false),
+        // The later snapshot, which carries the key the earlier one does not.
+        ("restored-late", "snap-late", true, true),
+        // A copy of a snapshot is a restore source of its own.
+        ("restored-from-a-copy", "snap-copy", true, false),
+        // A snapshot of a cluster that held nothing restores a cluster that holds nothing.
+        ("restored-from-nothing", "snap-of-nothing", false, false),
+    ];
+    for (id, snapshot_name, holds_the_table, holds_the_late_key) in cases {
+        let (address, port) = cache_cluster(&emulator, id, &[("SnapshotName", snapshot_name)]).await;
+        let mut session = open(id, &address, &port).await;
+        if holds_the_table {
+            let absent: &[&str] = if holds_the_late_key { &[] } else { &[late_key] };
+            assert_reads_back(id, &mut session, &rows, absent).await;
+            if holds_the_late_key {
+                let reply = command(id, &mut session, &["GET", late_key]).await;
+                assert_eq!(
+                    reply,
+                    Resp::Bulk("late".to_string()),
+                    "case {id}: the key written before this snapshot must be restored, got \
+                     {reply:?}"
+                );
+            }
+        } else {
+            let mut none_of_them: Vec<&str> = keys.clone();
+            none_of_them.push(late_key);
+            assert_reads_back(id, &mut session, &[], &none_of_them).await;
+        }
+        // The restored cluster's data set is its OWN: what it writes reaches neither the
+        // snapshot it came from nor the cluster that snapshot was taken of.
+        let own = format!("written-in-{id}");
+        command(id, &mut session, &["SET", &own, "mine"]).await;
+        let from_origin = command("snap-origin", &mut origin, &["GET", &own]).await;
+        assert_eq!(
+            from_origin,
+            Resp::Nil,
+            "case {id}: a key written in the restored cluster must not appear in the source \
+             cluster, got {from_origin:?}"
+        );
+        // The snapshot is a restore source again once the restore it fed has settled: the
+        // clock carries it back from `restoring` to `available`.
+        let settled = snapshot_available(&emulator, snapshot_name).await;
+        assert_eq!(
+            settled.text("Snapshot/SnapshotName"),
+            Some(snapshot_name.to_ascii_lowercase().as_str()),
+            "case {id}: the snapshot must still be there under its stored name, got {}",
+            settled.body
+        );
+    }
+
+    // The snapshot outlives the cluster it was taken of: the source is deleted, stops
+    // resolving, and a cluster restored from its snapshot afterwards still holds the data.
+    let deleted = emulator
+        .call(
+            "DeleteCacheCluster",
+            &params(&[("CacheClusterId", "snap-origin")]),
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "the source cluster must be deletable, got {} {}",
+        deleted.status, deleted.body
+    );
+    let gone = poll_until(
+        &emulator,
+        REGION,
+        "snap-origin",
+        "the deleted cluster ceasing to resolve",
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", "snap-origin")]),
+        |reply| reply.status == 404,
+    )
+    .await;
+    assert_eq!(
+        gone.error_code(),
+        "CacheClusterNotFound",
+        "a deleted cluster must stop resolving, got {} {}",
+        gone.status,
+        gone.body
+    );
+    let (address, port) =
+        cache_cluster(&emulator, "restored-after-delete", &[("SnapshotName", "snap-early")]).await;
+    let mut after_delete = open("restored-after-delete", &address, &port).await;
+    assert_reads_back(
+        "restored-after-delete",
+        &mut after_delete,
+        &rows,
+        &[late_key],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_replication_group_restored_from_a_snapshot_holds_the_data_set_it_captured() {
+    let emulator = Emulator::new();
+    let rows = written();
+
+    // The source cluster and its snapshot, taken with the table's keys in it.
+    let (address, port) = cache_cluster(&emulator, "rg-snap-origin", &[]).await;
+    let mut origin = open("rg-snap-origin", &address, &port).await;
+    write_all("rg-snap-origin", &mut origin, &rows).await;
+    cluster_snapshot(&emulator, "rg-seed-snap", "rg-snap-origin").await;
+
+    // The axis: how many members the restored group holds, since every member of a group
+    // reads and writes the one data set the snapshot seeded.
+    for (id, members) in [("restored-rg-single", 1usize), ("restored-rg-pair", 2usize)] {
+        let created = emulator
+            .call(
+                "CreateReplicationGroup",
+                &params(&[
+                    ("ReplicationGroupId", id),
+                    ("ReplicationGroupDescription", "a group restored from a snapshot"),
+                    ("Engine", "redis"),
+                    ("CacheNodeType", "cache.t3.micro"),
+                    ("NumCacheClusters", &members.to_string()),
+                    ("SnapshotName", "rg-seed-snap"),
+                ]),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {id}: a create restoring from a stored snapshot must answer 200, got {} {}",
+            created.status, created.body
+        );
+        let described = group_available_with(&emulator, id, members).await;
+        let (address, port) = endpoint_of(
+            &described,
+            "PrimaryEndpoint/Address",
+            "PrimaryEndpoint/Port",
+            "the restored group's primary endpoint",
+        );
+        let mut session = open(id, &address, &port).await;
+        assert_reads_back(id, &mut session, &rows, &["never-written"]).await;
+    }
+
+    // The snapshot is still there, and still a restore source: the restores did not consume
+    // it.
+    snapshot_available(&emulator, "rg-seed-snap").await;
+}
+
+#[tokio::test]
+async fn a_cache_cluster_restore_naming_a_snapshot_this_account_does_not_hold_is_refused() {
+    let emulator = Emulator::new();
+    // One snapshot really does exist, so each row below is refused for naming NO snapshot
+    // rather than because this account has none at all.
+    cache_cluster(&emulator, "refusal-origin", &[]).await;
+    cluster_snapshot(&emulator, "the-one-there-is", "refusal-origin").await;
+    // And one that was taken and then deleted: a name whose snapshot is gone names none.
+    cluster_snapshot(&emulator, "the-one-that-went", "refusal-origin").await;
+    let removed = emulator
+        .call(
+            "DeleteSnapshot",
+            &params(&[("SnapshotName", "the-one-that-went")]),
+        )
+        .await;
+    assert_eq!(
+        removed.status, 200,
+        "setup: the snapshot must be deletable, got {} {}",
+        removed.status, removed.body
+    );
+    poll_until(
+        &emulator,
+        REGION,
+        "the-one-that-went",
+        "the deleted snapshot ceasing to resolve",
+        "DescribeSnapshots",
+        &params(&[("SnapshotName", "the-one-that-went")]),
+        |reply| reply.all("Snapshot/SnapshotName").is_empty(),
+    )
+    .await;
+
+    // The axis: HOW the name fails to name a stored snapshot — a name nobody took, a prefix
+    // of one that is held, a name whose snapshot was deleted, and a name that is no snapshot
+    // name at all.
+    let cases: [(&str, &str); 4] = [
+        ("a snapshot nobody took", "never-taken-at-all"),
+        ("a prefix of the one there is", "the-one"),
+        ("a snapshot that was deleted", "the-one-that-went"),
+        ("a value that is no snapshot name", "not a snapshot name"),
+    ];
+    for (case, snapshot_name) in cases {
+        let refused = emulator
+            .call(
+                "CreateCacheCluster",
+                &params(&[
+                    ("CacheClusterId", "refused-restore"),
+                    ("Engine", "redis"),
+                    ("CacheNodeType", "cache.t3.micro"),
+                    ("SnapshotName", snapshot_name),
+                ]),
+            )
+            .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected 400, got {} {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "InvalidParameterValue",
+            "case {case:?}: expected InvalidParameterValue, got {} {}",
+            refused.error_code(),
+            refused.body
+        );
+        // Nothing was created: the refused id still resolves to no cluster.
+        let described = emulator
+            .call(
+                "DescribeCacheClusters",
+                &params(&[("CacheClusterId", "refused-restore")]),
+            )
+            .await;
+        assert_eq!(
+            described.status, 404,
+            "case {case:?}: a refused create must store no cluster, got {} {}",
+            described.status, described.body
+        );
+        // And the same name is refused by the other create that takes one.
+        let group_refused = emulator
+            .call(
+                "CreateReplicationGroup",
+                &params(&[
+                    ("ReplicationGroupId", "refused-restore-rg"),
+                    ("ReplicationGroupDescription", "a group that is never created"),
+                    ("Engine", "redis"),
+                    ("CacheNodeType", "cache.t3.micro"),
+                    ("SnapshotName", snapshot_name),
+                ]),
+            )
+            .await;
+        assert_eq!(
+            (group_refused.status, group_refused.error_code()),
+            (400, "InvalidParameterValue"),
+            "case {case:?}: CreateReplicationGroup must refuse the same name, got {} {}",
+            group_refused.status,
+            group_refused.body
+        );
+    }
+
+    // The engine rule: `SnapshotName` "is only valid if the Engine parameter is redis", so a
+    // Memcached cluster naming the snapshot that IS held is the modelled combination refusal
+    // rather than a restore.
+    let memcached = emulator
+        .call(
+            "CreateCacheCluster",
+            &params(&[
+                ("CacheClusterId", "refused-memcached-restore"),
+                ("Engine", "memcached"),
+                ("CacheNodeType", "cache.t3.micro"),
+                ("SnapshotName", "the-one-there-is"),
+            ]),
+        )
+        .await;
+    assert_eq!(
+        (memcached.status, memcached.error_code()),
+        (400, "InvalidParameterCombination"),
+        "case \"a memcached cluster naming a snapshot\": expected 400 \
+         InvalidParameterCombination, got {} {}",
+        memcached.status,
+        memcached.body
+    );
+
+    // The snapshot that IS held is still a restore source after every refusal above: the
+    // refusals are about the name, not about restoring.
+    let (address, port) = cache_cluster(
+        &emulator,
+        "restored-after-the-refusals",
+        &[("SnapshotName", "the-one-there-is")],
+    )
+    .await;
+    let mut session = open("restored-after-the-refusals", &address, &port).await;
+    assert_eq!(
+        command("restored-after-the-refusals", &mut session, &["PING"]).await,
+        Resp::Status("PONG".to_string()),
+        "the cluster restored from the snapshot this account holds must answer on its \
+         published endpoint"
     );
 }

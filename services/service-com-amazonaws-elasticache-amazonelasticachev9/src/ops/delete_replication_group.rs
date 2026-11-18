@@ -532,6 +532,21 @@ fn final_snapshot_of(
             source: crate::state::SNAPSHOT_SOURCE_MANUAL.to_string(),
             kms_key_id,
             vpc_id,
+            // The DATA SET the snapshot captures: what the group holds at this
+            // instant, read off the keyspace its members share — so a cache
+            // created from this snapshot later answers what the group held when
+            // it was deleted. A group with no shard to copy carries no data, and
+            // `from_replication_group` answers `None` for one anyway.
+            data: shards
+                .first()
+                .map(|(_, primary)| {
+                    crate::state::captured_cache_cluster_data(
+                        store,
+                        &primary.cache_cluster_id,
+                        now,
+                    )
+                })
+                .unwrap_or_else(crate::state::empty_keyspace),
             // This request carries no tags of its own.
             tags: Vec::new(),
             now,

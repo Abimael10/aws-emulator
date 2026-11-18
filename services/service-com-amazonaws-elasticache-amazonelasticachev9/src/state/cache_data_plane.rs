@@ -210,6 +210,45 @@ pub fn captured_serverless_cache_data(
     }
 }
 
+/// The data set the cache cluster `cache_cluster_id` holds at `now`, as a snapshot of it —
+/// [`captured_serverless_cache_data`] for the other kind of cache a snapshot is taken of.
+///
+/// WHICH socket's keyspace that is follows the cluster's own record: a member of a
+/// replication group reads and writes the GROUP's keyspace, so a snapshot taken from such a
+/// member captures what the group holds, and a standalone cluster's own. A cluster this
+/// emulator serves no data plane for (one running Memcached, or one created on an engine
+/// that vends no listeners) holds an empty one, which is the data set it can report.
+///
+/// The LIVE keyspace is only read here; the COPY is what the snapshot keeps, so taking one
+/// changes nothing a client of the source cluster sees.
+pub fn captured_cache_cluster_data(
+    store: &super::ComAmazonawsElasticacheAmazonelasticachev9State,
+    cache_cluster_id: &str,
+    now: SystemTime,
+) -> SharedKeyspace {
+    let identity = store
+        .cache_clusters
+        .get(cache_cluster_id)
+        .map(|cluster| match cluster.replication_group_id.as_deref() {
+            Some(group) => CacheIdentity::ReplicationGroupMember {
+                replication_group_id: group.to_string(),
+                cache_cluster_id: cache_cluster_id.to_string(),
+            },
+            None => CacheIdentity::CacheCluster {
+                cache_cluster_id: cache_cluster_id.to_string(),
+            },
+        });
+    match identity.and_then(|identity| store.cache_data_planes.get(&identity)) {
+        Some(plane) => copied_keyspace(plane.keyspace(), now),
+        None => Arc::new(Mutex::new(Keyspace::default())),
+    }
+}
+
+/// An empty data set, for a caller that holds no cache to capture one from.
+pub fn empty_keyspace() -> SharedKeyspace {
+    Arc::new(Mutex::new(Keyspace::default()))
+}
+
 /// The key one cache's data plane is held under.
 fn data_plane_key(identity: &CacheIdentity) -> String {
     match identity {
@@ -768,6 +807,22 @@ pub async fn serve_replication_group<Eng: Send + Sync + 'static>(
     state: &::engine::ServiceState<super::ComAmazonawsElasticacheAmazonelasticachev9State>,
     replication_group_id: &str,
 ) {
+    serve_replication_group_holding(engine, state, replication_group_id, None).await
+}
+
+/// [`serve_replication_group`] for a group that starts from a data set it was given:
+/// `restored` is what the group's keyspace holds before any client writes to it, and `None`
+/// starts it empty.
+///
+/// The one caller that hands a keyspace in is a create that RESTORES the group from a
+/// snapshot: the group's members all read and write that one keyspace, so the data the
+/// snapshot captured is what a client's first read at the group's primary endpoint answers.
+pub async fn serve_replication_group_holding<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    state: &::engine::ServiceState<super::ComAmazonawsElasticacheAmazonelasticachev9State>,
+    replication_group_id: &str,
+    restored: Option<SharedKeyspace>,
+) {
     // One pass per member, and never more: the loop below takes the next member that has
     // no socket, and a member it could not open one for ends it — so it runs at most as
     // many times as the group has members, which the group's own quota bounds.
@@ -783,7 +838,9 @@ pub async fn serve_replication_group<Eng: Send + Sync + 'static>(
             let members = group.member_clusters();
             // The keyspace the group already serves, if any of its members is already
             // open: every member of a group reads and writes the one keyspace, which is
-            // what makes a replica answer what the primary wrote.
+            // what makes a replica answer what the primary wrote. The FIRST member opened
+            // takes the data set this call was given, so a restored group is served what
+            // its snapshot captured.
             let keyspace = members
                 .iter()
                 .map(|member| CacheIdentity::ReplicationGroupMember {
@@ -791,7 +848,8 @@ pub async fn serve_replication_group<Eng: Send + Sync + 'static>(
                     cache_cluster_id: member.clone(),
                 })
                 .find_map(|identity| store.cache_data_planes.get(&identity))
-                .map(|plane| Arc::clone(plane.keyspace()));
+                .map(|plane| Arc::clone(plane.keyspace()))
+                .or_else(|| restored.as_ref().map(Arc::clone));
             let next = members
                 .iter()
                 .map(|member| CacheIdentity::ReplicationGroupMember {

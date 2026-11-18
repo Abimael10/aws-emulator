@@ -446,19 +446,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A cluster can only be seeded from a snapshot that exists, and none
-        // can: `CreateSnapshot` / `CopySnapshot` are scaffolded 501s, and an
-        // `SnapshotArns` entry would have to be read out of Amazon S3, which
-        // this emulator does not reach.
-        if let Some(name) = input.snapshot_name.as_deref() {
-            return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
-                InvalidParameterValueException {
-                    message: Some(format!(
-                        "Invalid value {name} for SnapshotName: no such snapshot exists."
-                    )),
-                },
-            )
-            .into());
+        // "The name of a Valkey or Redis OSS snapshot from which to restore data
+        // into the new node group (shard) … This parameter is only valid if the
+        // Engine parameter is redis": a Memcached cluster has no snapshot to be
+        // seeded from, so naming one is a combination this engine cannot take.
+        // WHICH snapshot the name resolves to is read out of the store below,
+        // under the one lock this create takes.
+        if input.snapshot_name.is_some() && engine == "memcached" {
+            return Err(
+                CreateCacheClusterErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "SnapshotName is only valid for a cluster running valkey or redis, \
+                             not for {engine}."
+                        )),
+                    },
+                )
+                .into(),
+            );
         }
         if let Some(arn) = input.snapshot_arns.as_deref().unwrap_or_default().first() {
             return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
@@ -588,7 +593,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything this create writes happens under ONE lock, and the socket the
         // cluster is served on is opened after it: opening one is async, and no
         // await may happen while the store is held.
-        let (cache_cluster_id, cache_cluster) = {
+        let (cache_cluster_id, cache_cluster, restored) = {
         let mut store = state.lock();
 
         // The parameter group the cluster joins has to be one this account
@@ -891,6 +896,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             (None, None) => vec![crate::state::availability_zone(&region, 0)],
         };
+        // The DATA SET the new cluster starts with: the keyspace the snapshot
+        // `SnapshotName` names captured, so a client's first read on the restored
+        // cluster answers what the source cache held when the snapshot was taken.
+        // The snapshot is resolved against the snapshots this account HOLDS —
+        // whichever operation stored one — and only a name no snapshot of this
+        // account has is the modelled bad value; the copy is the snapshot's own
+        // copy copied again (`crate::state::copied_keyspace`), so the new
+        // cluster's writes do not reach the snapshot and a second restore from the
+        // same snapshot starts from the same data. Resolved after every refusal
+        // above, so a request that is refused restores nothing and leaves the
+        // snapshot as it was.
+        let restored = match input.snapshot_name.as_deref() {
+            Some(name) => {
+                let key = name.to_ascii_lowercase();
+                let Some(snapshot) = store.settled_snapshot_mut(&key, now) else {
+                    return Err(
+                        CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(format!(
+                                    "Invalid value {name} for SnapshotName: no such snapshot \
+                                     exists."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                let captured = crate::state::copied_keyspace(&snapshot.data, now);
+                // "The snapshot status changes to restoring while the new node
+                // group (shard) is being created": the restore is observable on
+                // the SOURCE as well, and the clock carries the snapshot back to
+                // `available` over the same span the new cluster takes.
+                snapshot.begin_restore(now);
+                Some(captured)
+            }
+            None => None,
+        };
+
         let new = crate::state::NewCluster {
             cache_cluster_id,
             port: input.port.unwrap_or_else(|| crate::state::default_port(&engine)),
@@ -958,15 +1001,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // provisioning this call starts, which the clock raises when the cluster
         // reaches `available` (see `crate::state::insert_cluster`).
         store.record_cluster_event(&cache_cluster_id, None, "Cache cluster created", now);
-        (cache_cluster_id, cache_cluster)
+        (cache_cluster_id, cache_cluster, restored)
         };
         // The cluster's own data plane: the address `DescribeCacheClusters`
         // publishes for it has to be one a client can reach, so the socket is
         // opened here and its address written onto the record
         // (`crate::state::serve_cache_cluster`). The answer above reports no
         // endpoint — a cluster still `creating` has no provisioned node to report
-        // one for — so the address is published before any reader can see one.
-        crate::state::serve_cache_cluster(&*self.engine, &state, &cache_cluster_id).await;
+        // one for — so the address is published before any reader can see one. A
+        // cluster restored from a snapshot is served the data set that snapshot
+        // captured, so its node answers the keys the source held.
+        crate::state::serve_cache_cluster_holding(
+            &*self.engine,
+            &state,
+            &cache_cluster_id,
+            restored,
+        )
+        .await;
         // The cluster's presence in the account's VPC: a node of a cluster placed
         // in a cache subnet group holds a requester-managed network interface in
         // one of that group's subnets, which is an Amazon VPC record, so it is

@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// The `Snapshot$SnapshotStatus` of a snapshot a cache is being created from:
+/// "The snapshot status changes to `restoring` while the new node group (shard)
+/// is being created" (`CreateCacheClusterMessage$SnapshotName`). One of that
+/// member's own values (`creating | available | restoring | copying |
+/// deleting`); the other two this slice reports are [`STATUS_CREATING`] and
+/// [`STATUS_AVAILABLE`].
+pub const SNAPSHOT_STATUS_RESTORING: &str = "restoring";
+
 /// One snapshot, as this emulator persists it: the source cluster's
 /// configuration as it stood when the snapshot was taken, plus the snapshot's
 /// own identity and status.
@@ -66,6 +74,16 @@ pub struct SnapshotRecord {
     pub snapshot_window: Option<String>,
     pub kms_key_id: Option<String>,
     pub arn: String,
+    /// The source cache's DATA SET as it stood when the snapshot was taken —
+    /// what makes a snapshot "a copy of an entire cluster as of the time when the
+    /// snapshot was taken" rather than a note that one was taken.
+    ///
+    /// It is this snapshot's OWN copy ([`copied_keyspace`]), so a later write to
+    /// the source cache does not reach it and deleting that cache cannot take it
+    /// away — which is what lets a cache cluster or a replication group created
+    /// from this snapshot answer what was stored before it was taken. A snapshot
+    /// of a cache this emulator serves no data plane for holds an empty one.
+    pub data: SharedKeyspace,
     pub node_snapshots: Vec<NodeSnapshotRecord>,
     /// The tags `CreateSnapshot` was given. The ONE copy of this snapshot's tags:
     /// `ListTagsForResource` reports it and `AddTagsToResource` /
@@ -127,6 +145,7 @@ impl SnapshotRecord {
             snapshot_retention_limit: cluster.snapshot_retention_limit,
             snapshot_window: cluster.snapshot_window.clone(),
             kms_key_id: new.kms_key_id,
+            data: new.data,
             tags: new.tags,
         }
     }
@@ -212,6 +231,11 @@ impl SnapshotRecord {
             // `Tags` are "a list of tags to be added to this resource" — the
             // copy's own, not the source's.
             tags: new.tags,
+            // The copy holds the data set the SOURCE captured, as a copy of its
+            // own: two snapshots are two resources, so a cache restored from
+            // either reads the same keys and neither snapshot's data is shared
+            // with the other.
+            data: copied_keyspace(&self.data, new.now),
             ..self.clone()
         }
     }
@@ -232,6 +256,27 @@ impl SnapshotRecord {
         self.status = pending.status.clone();
         self.pending_status = None;
         Some(settled)
+    }
+
+    /// Put this snapshot into [`SNAPSHOT_STATUS_RESTORING`] while a cache is being
+    /// created from it, and let the clock owe it [`STATUS_AVAILABLE`] again
+    /// [`SNAPSHOT_TRANSITION`] later.
+    ///
+    /// `CreateCacheCluster$SnapshotName` documents exactly this: "The snapshot
+    /// status changes to `restoring` while the new node group (shard) is being
+    /// created" — so the restore is observable on the SOURCE too, and the snapshot
+    /// is a restore source again once the clock has carried it back. A snapshot a
+    /// `DeleteSnapshot` has already begun removing keeps the status and the
+    /// removal it was given: a resource that is going away is owed nothing else.
+    pub fn begin_restore(&mut self, now: SystemTime) {
+        if self.pending_removal.is_some() {
+            return;
+        }
+        self.status = SNAPSHOT_STATUS_RESTORING.to_string();
+        self.pending_status = Some(PendingTransition {
+            due: now + SNAPSHOT_TRANSITION,
+            status: STATUS_AVAILABLE.to_string(),
+        });
     }
 
     /// Put this snapshot into [`STATUS_DELETING`] and let the clock owe its

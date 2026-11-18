@@ -311,6 +311,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The DATA SET this snapshot captures: a copy of what the source cluster
+        // holds at this instant (`crate::state::captured_cache_cluster_data`),
+        // taken before the source record is read so no borrow of it is held while
+        // the store is asked which socket serves it. The live keyspace is only
+        // READ, so taking a snapshot changes nothing a client of the source sees,
+        // and a request refused below stores neither the copy nor anything else.
+        let data = crate::state::captured_cache_cluster_data(&store, &cache_cluster_id, now);
+
         let Some(cluster) = store.settled_cluster_mut(&cache_cluster_id, now) else {
             return Err(CreateSnapshotErrorModeled::CacheClusterNotFoundFault(
                 CacheClusterNotFoundFault {
@@ -383,6 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Resolved below: the VPC is the source cluster's subnet
                 // group's, which is another record of this store.
                 vpc_id: None,
+                data,
                 tags,
                 now,
             },

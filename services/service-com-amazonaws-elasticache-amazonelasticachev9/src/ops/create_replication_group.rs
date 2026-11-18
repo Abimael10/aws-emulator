@@ -805,7 +805,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything this create writes happens under ONE lock, and the sockets the
         // group's members are served on are opened after it: opening one is async,
         // and no await may happen while the store is held.
-        let replication_group = {
+        let (replication_group, restored) = {
         let mut store = state.lock();
         // Whether the primary cluster below is `available` depends on the status
         // change the clock may already owe it, so that is materialised first.
@@ -895,20 +895,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
         // Seeding the group from a stored snapshot ("The name of a snapshot from
-        // which to restore data into the new replication group"): a name this
-        // account never took is the modelled bad value, and a snapshot that DOES
-        // exist is a restore nobody has written yet, so it answers the scaffold's
-        // 501 rather than a group whose data was never loaded.
-        if let Some(name) = input.snapshot_name.as_deref() {
-            if !store.snapshots.contains_key(&name.to_ascii_lowercase()) {
-                return Err(invalid_value(format!(
-                    "Invalid value {name} for SnapshotName: no such snapshot exists."
-                )));
+        // which to restore data into the new replication group"): the name is
+        // resolved against the snapshots this account HOLDS, whichever operation
+        // stored one, and a name this account never took is the modelled bad
+        // value. The data set itself is read off the snapshot below, once every
+        // other refusal has passed, so a refused create restores nothing.
+        let restore_from = match input.snapshot_name.as_deref() {
+            Some(name) => {
+                let key = name.to_ascii_lowercase();
+                if !store.snapshots.contains_key(&key) {
+                    return Err(invalid_value(format!(
+                        "Invalid value {name} for SnapshotName: no such snapshot exists."
+                    )));
+                }
+                Some(key)
             }
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CreateReplicationGroup seeded from a snapshot",
-            ));
-        }
+            None => None,
+        };
 
         // The cluster the request named as the group's primary: it "must already
         // exist and have a status of available", and it becomes the group's
@@ -1346,6 +1349,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         };
 
+        // The DATA SET the group starts with: the keyspace the snapshot
+        // `SnapshotName` named captured, copied again out of the snapshot's own
+        // copy (`crate::state::copied_keyspace`) so the group's writes do not
+        // reach the snapshot and a second restore starts from the same data. Read
+        // here, after every refusal above, and the snapshot reads `restoring`
+        // until the clock carries it back to `available`.
+        let restored = restore_from.and_then(|key| {
+            store.settled_snapshot_mut(&key, now).map(|snapshot| {
+                let captured = crate::state::copied_keyspace(&snapshot.data, now);
+                snapshot.begin_restore(now);
+                captured
+            })
+        });
+
         // A created group is NOT ready: it answers `creating`, and the clock
         // owes it `available` once the transition span has passed. The response
         // is read back out of the store, so it reports what was persisted.
@@ -1372,13 +1389,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "Replication group created",
             now,
         );
-        replication_group
+        (replication_group, restored)
         };
         // The group's own data plane: one socket per MEMBER over the one keyspace
         // the group holds, so the primary and reader endpoints the group publishes
         // are addresses a client can reach and a replica answers what the primary
-        // wrote (`crate::state::serve_replication_group`).
-        crate::state::serve_replication_group(&*self.engine, &state, &replication_group_id).await;
+        // wrote (`crate::state::serve_replication_group`). A group restored from a
+        // snapshot is served the data set that snapshot captured, so a client's
+        // first read at its primary endpoint answers what the source held.
+        crate::state::serve_replication_group_holding(
+            &*self.engine,
+            &state,
+            &replication_group_id,
+            restored,
+        )
+        .await;
         // Every member cluster's node holds a requester-managed network interface
         // in a subnet of the group's cache subnet group — the same presence a
         // standalone cluster's node has, placed by the same pass
