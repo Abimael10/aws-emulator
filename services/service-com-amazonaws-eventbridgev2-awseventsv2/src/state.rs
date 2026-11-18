@@ -125,6 +125,34 @@ pub const MAX_STORED_EVENTS_PER_BUS: usize = 10_000;
 /// collision must word it the same way.
 pub const RESOURCE_ALREADY_EXISTS_MESSAGE: &str = "Resource already exists";
 
+/// The whole `Message` of the `InvalidInputException` a create of this service
+/// answers a request that states no idempotency token.
+///
+/// Every create of this service takes a `ClientToken` and REQUIRES one: recorded
+/// answers of this service refuse a create whose request carries none with
+/// `InvalidInputException` (HTTP 400) and this sentence, before it looks up any
+/// resource the request names. The model tags the member `@idempotencyToken`
+/// rather than `@required` — an SDK fills one in when a caller omits it — so the
+/// requirement lives here, with the service's other fixed refusal texts.
+///
+/// FIXED text of that error class: it names the member the request has to carry
+/// and nothing of the request or of the store.
+pub const CLIENT_TOKEN_REQUIRED_MESSAGE: &str = "ClientToken is required";
+
+/// Whether a create's `ClientToken` states an idempotency token at all.
+///
+/// PRESENCE is the whole of it: `ClientToken`'s own modelled `@length 1..64` and
+/// `@pattern ^[\u{0021}-\u{007E}]+$` are what refuse a token that is empty or
+/// blank, in the constraint envelope that states which rule it broke, before this
+/// is reached.
+///
+/// One predicate for every create, so the three of them cannot drift apart over
+/// what counts as a token ([`CLIENT_TOKEN_REQUIRED_MESSAGE`] is the refusal they
+/// share).
+pub fn client_token_missing(client_token: Option<&str>) -> bool {
+    client_token.is_none()
+}
+
 /// The whole `Message` of the `ResourceNotFoundException` answered for a value
 /// that addresses no resource of this service at all.
 ///

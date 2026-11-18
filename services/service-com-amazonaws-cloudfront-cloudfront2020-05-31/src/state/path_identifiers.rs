@@ -11,13 +11,11 @@
 //!
 //! * the FORM — how much of the way CloudFront writes that kind's identifiers a route reads of
 //!   the value, which is a property of the value alone. The two field-level encryption records
-//!   read their identifier against their OWN namespace, so a value outside it is an identifier
-//!   those routes cannot read ([`super::unresolved_field_level_encryption_config`]); the
-//!   origin access control reads only the ALPHABET CloudFront issues an identifier in
-//!   ([`is_entity_identifier`]), its recorded refusals answering the absent control for a value
-//!   of that alphabet whatever letter it opens with and however wide it is; the distribution
-//!   reads the whole form its ids are minted in ([`super::is_distribution_id`] and its
-//!   neighbours);
+//!   and the origin access control read only the ALPHABET CloudFront issues an identifier in
+//!   ([`is_entity_identifier`]), their recorded refusals answering the absent record for a
+//!   value of that alphabet whatever letter it opens with and however wide it is
+//!   ([`super::unresolved_field_level_encryption_config`]); the distribution reads the whole
+//!   form its ids are minted in ([`super::is_distribution_id`] and its neighbours);
 //! * which KIND an identifier belongs to, for the family CloudFront draws from ONE form. A
 //!   distribution, a streaming distribution, an origin access identity and an origin access
 //!   control all carry an `E` followed by an identifier body of the same width and alphabet,

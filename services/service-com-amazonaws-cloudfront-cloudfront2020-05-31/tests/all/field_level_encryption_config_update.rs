@@ -971,9 +971,10 @@ async fn an_update_whose_mapping_list_passes_its_bound_is_refused() {
 
 /// An id no stored configuration holds is `NoSuchFieldLevelEncryptionConfig` (HTTP 404) whatever
 /// shape the id takes and whatever the `If-Match` header carries, and the refused update creates
-/// nothing under it. The MESSAGE follows the id's SHAPE, judged before the store is consulted:
-/// an id outside the shape a configuration id takes is the identifier the service cannot read,
-/// a well-formed one the store holds nothing for is the absent configuration.
+/// nothing under it. The MESSAGE follows the id's ALPHABET, judged before the store is consulted:
+/// a value outside the alphabet CloudFront issues its identifiers in is the identifier the
+/// service cannot read, and every value of that alphabet the store holds nothing for is the
+/// absent configuration.
 #[tokio::test]
 async fn an_id_no_configuration_holds_is_refused() {
     let router = emulator();
@@ -1012,7 +1013,7 @@ async fn an_id_no_configuration_holds_is_refused() {
         (
             "a profile id where a configuration id belongs",
             profile.clone(),
-            UNREADABLE_ID_MESSAGE,
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
         ),
         (
             "a token of no configuration id's shape",

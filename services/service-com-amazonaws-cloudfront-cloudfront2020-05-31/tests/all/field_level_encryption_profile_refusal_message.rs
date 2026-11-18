@@ -198,7 +198,7 @@ fn assert_refusal(answer: &Answer, case: &str, status: u16, code: &str, message:
 
 /// Every path that reports a field-level encryption profile id as naming nothing answers
 /// `NoSuchFieldLevelEncryptionProfile`, with the absent-profile wire sentence where the id is
-/// one of the profile namespace and the unreadable-identifier sentence where it is not — while
+/// of the identifier alphabet and the unreadable-identifier sentence where it is not — while
 /// an id that travels in a submitted DOCUMENT as a mapping's `ProfileId` addresses nothing, so
 /// it reports the absent profile whatever shape it takes.
 #[tokio::test]
@@ -339,10 +339,11 @@ async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
 }
 
 /// A READ of a profile answers its one not-found code for every `Id` it cannot resolve, and
-/// the identifier's own NAMESPACE decides the sentence: a well-formed profile id nothing
-/// answers to reports the profile that is ABSENT, while a minted id of ANOTHER resource kind of
-/// this service, a value of no minted id's alphabet or width, a name and a caller reference are
-/// each the identifier reported UNREADABLE.
+/// the identifier's ALPHABET decides the sentence: every value of the alphabet CloudFront
+/// issues its identifiers in that nothing answers to reports the profile that is ABSENT — a
+/// minted id of ANOTHER resource kind of this service included, since which kind an identifier
+/// was issued for is a property of the store — while a value outside that alphabet, a
+/// lower-cased id, a UUID, a word or a caller reference, is the identifier reported UNREADABLE.
 ///
 /// The rows span the shapes an `Id` takes outside a profile id's: the namespaces of this
 /// service a profile id's is disjoint from, taking two of them from ids this emulator really
@@ -368,17 +369,17 @@ async fn a_profile_read_answers_one_sentence_for_every_id_it_cannot_resolve() {
         (
             "the sibling configuration's own id",
             config_id.clone(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a public key id this service minted",
             key.clone(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a distribution id's namespace",
             "E1234567890ABC".to_string(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a UUID, the namespace the policy kinds are keyed by",

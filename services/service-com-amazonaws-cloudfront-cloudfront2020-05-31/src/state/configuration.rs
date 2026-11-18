@@ -3376,36 +3376,25 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
 /// The modelled `NoSuchFieldLevelEncryptionProfile` (HTTP 404) an operation ADDRESSED by a
 /// field-level encryption profile `Id` in its path answers an `Id` it cannot resolve.
 ///
-/// The SAME split [`unresolved_public_key_id`] makes for another resource of this service,
-/// over this kind's own predicate ([`is_field_level_encryption_profile_id`]): these operations
-/// model this one not-found code, so one code and one status cover two conditions and the
-/// MESSAGE is what tells them apart, decided from the value alone and therefore before the
-/// store is consulted. Only a value written the way CloudFront writes a profile identifier —
-/// the profile namespace letter followed by an identifier body of the width it issues one at —
-/// is an identifier the service READS, so the store holding no profile under it is the
-/// absent-profile sentence; every other value — another resource kind's identifier, this
-/// namespace at a width CloudFront issues none at, a lower-cased identifier, a UUID, a caller
-/// reference, a word — is the identifier the service reports it cannot read
-/// ([`id_format_invalid_message`]).
+/// These operations model this one not-found code and no argument error, so one code and one
+/// status cover two conditions and the MESSAGE is what tells them apart, decided from the value
+/// alone and therefore before the store is consulted. The FORM this route reads of the value is
+/// the identifier ALPHABET CloudFront issues its identifiers in ([`is_entity_identifier`]): the
+/// `Id` member is a plain `string` in the model — no `@pattern`, no `@length` — so neither the
+/// namespace letter nor the width this emulator happens to MINT is a constraint a request may be
+/// refused on, and the recorded refusals of this surface answer the absent-record sentence for a
+/// value of that alphabet whatever letter it opens with and however wide it is. A value outside
+/// the alphabet was never an identifier this service issued, and is the identifier it reports it
+/// cannot read ([`id_format_invalid_message`]).
 ///
 /// Only an identifier that ADDRESSES the operation is judged this way: a profile id borne by a
 /// submitted CONFIGURATION (a query-arg or content-type mapping's `ProfileId`) addresses
 /// nothing, so it is resolved against the store alone and reports the absent profile whatever
 /// its shape ([`no_such_field_level_encryption_profile`]).
-///
-/// The WIDTH is part of the namespace here, and that is recorded rather than assumed: these
-/// routes' recorded refusals answer the unreadable-identifier sentence for a value that is not
-/// in the form this surface's identifiers take and the absent-record sentence for one that is,
-/// so the form the records are issued in — the namespace letter and the body width — is what
-/// the sentence turns on. That is why this surface reads more of the value than the routes
-/// whose kind is told apart by the store instead
-/// ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`] reads
-/// the alphabet alone), and the same principle is what [`unresolved_public_key_id`] applies to
-/// the public keys.
 pub fn unresolved_field_level_encryption_profile(
     id: &str,
 ) -> crate::ops::types::NoSuchFieldLevelEncryptionProfile {
-    if is_field_level_encryption_profile_id(id) {
+    if is_entity_identifier(id) {
         no_such_field_level_encryption_profile()
     } else {
         crate::ops::types::NoSuchFieldLevelEncryptionProfile {
@@ -3499,14 +3488,14 @@ pub const MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT: usize = MAX_ORIGIN_ACCESS_I
 /// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) for a configuration id the
 /// store does not hold.
 ///
-/// ONE sentence for the whole condition, whatever shape the id takes — the SAME rule
-/// [`no_such_field_level_encryption_profile`] keeps for the other field-level encryption
-/// resource: these operations model this one not-found code and no argument error
+/// ONE sentence for the whole condition, whatever namespace letter and width the id carries —
+/// the SAME rule [`no_such_field_level_encryption_profile`] keeps for the other field-level
+/// encryption resource: these operations model this one not-found code and no argument error
 /// (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` reports
 /// `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`), and the recorded answers of
-/// this surface report every id the account holds no configuration under as the configuration
-/// that is absent. So an operation ADDRESSED by a configuration `Id` answers one it cannot
-/// resolve with this.
+/// this surface report every id of the identifier alphabet the account holds no configuration
+/// under as the configuration that is absent
+/// ([`unresolved_field_level_encryption_config`]).
 ///
 /// The sentence states a property of the store rather than of the request — the id names no
 /// configuration — so nothing from the request belongs in the text and every refusal of this
@@ -3528,12 +3517,12 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE: &str =
 
 /// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) an operation ADDRESSED by a
 /// field-level encryption configuration `Id` in its path answers an `Id` it cannot resolve —
-/// the split [`unresolved_field_level_encryption_profile`] makes, over this kind's own
-/// predicate ([`is_field_level_encryption_config_id`]).
+/// the split [`unresolved_field_level_encryption_profile`] makes for the other field-level
+/// encryption record, over the same identifier ALPHABET ([`is_entity_identifier`]).
 pub fn unresolved_field_level_encryption_config(
     id: &str,
 ) -> crate::ops::types::NoSuchFieldLevelEncryptionConfig {
-    if is_field_level_encryption_config_id(id) {
+    if is_entity_identifier(id) {
         no_such_field_level_encryption_config()
     } else {
         crate::ops::types::NoSuchFieldLevelEncryptionConfig {

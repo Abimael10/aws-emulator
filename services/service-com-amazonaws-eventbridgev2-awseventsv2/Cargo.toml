@@ -46,6 +46,9 @@ service-common = { path = "../common" }
 aws-sdk-sqs = { version = "1", default-features = false }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so a new suite is picked up by
+# being added rather than by editing a list.
+automod = { workspace = true }
 # Amazon SQS, mounted beside this service on one engine in the delivery suite,
 # because a delivery is asserted where a client sees it: on the queue the
 # subscriber's target names.

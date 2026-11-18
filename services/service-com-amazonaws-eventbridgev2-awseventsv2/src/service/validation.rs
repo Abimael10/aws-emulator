@@ -28,13 +28,16 @@
 //! accepts is delegated, untouched, to the generated operation in the routing table, so
 //! every handler, its state and its 501 are exactly as before.
 //!
-//! "Exactly the model's" is the whole of it: a member the model leaves optional is
-//! optional here, so a create that omits its `@idempotencyToken` `ClientToken` reaches
-//! its handler and mints its resource — without the replay record a token would have
-//! left, which is all its absence costs.
+//! The model's rules are almost the whole of it: a member the model leaves optional is
+//! optional here too. The one rule this service adds is its own, and is about the request
+//! alone, which is why it lives here rather than in the handlers it would otherwise be
+//! repeated in — a CREATE of this service requires the `@idempotencyToken` `ClientToken`
+//! the model leaves optional, and is refused with [`CLIENT_TOKEN_REQUIRED`] when the
+//! request states none.
 
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints::Violation;
+use aws_smithy_schema_server::DeserializableStruct;
 use service_common::validation::refusing_violations;
 use service_common::validation_message::aws_validation_refusal;
 use smithy_server_runtime::{
@@ -55,6 +58,12 @@ pub const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
 /// `@httpError(400)`.
 pub const INVALID_INPUT_STATUS: u16 = 400;
 
+/// The whole `Message` a create of this service is refused with when the request states no
+/// idempotency token: the service's own requirement, named once here and read through
+/// [`crate::state::CLIENT_TOKEN_REQUIRED_MESSAGE`], which is where this service's fixed
+/// refusal texts live.
+pub const CLIENT_TOKEN_REQUIRED: &str = crate::state::CLIENT_TOKEN_REQUIRED_MESSAGE;
+
 /// This service's `InvalidInputException` carrying `message`. The shape models
 /// `Message` alone.
 fn invalid_input(message: String) -> InvalidInputException {
@@ -71,6 +80,14 @@ fn refusal_message(violations: Vec<Violation>) -> Option<String> {
     aws_validation_refusal(&Refusal::Invalid(violations)).map(|refused| refused.message)
 }
 
+/// How one operation's input states the idempotency token a create of this service requires,
+/// read off the input the protocol's own deserializer built from the request.
+///
+/// A function per operation rather than one over every input shape, because the member lives
+/// on each create's own input type: the wrapper is generic over the operation, so the reader
+/// is the one thing about that type this check cannot name itself.
+type ClientTokenReader<Op> = fn(&<Op as Operation>::Input) -> Option<&str>;
+
 /// One modelled operation, wrapped so a request refused before its handler runs is
 /// stated in this service's own `InvalidInputException` rather than in the framework's
 /// synthetic envelope.
@@ -83,6 +100,9 @@ fn refusal_message(violations: Vec<Violation>) -> Option<String> {
 struct ModelledInputRefusal<Op: Operation> {
     /// The operation this wrapper stands in front of, carried as a type alone.
     operation: PhantomData<fn() -> Op>,
+    /// How to read this operation's `ClientToken`, for a create that requires one, and
+    /// `None` for every operation that states no such requirement.
+    client_token: Option<ClientTokenReader<Op>>,
 }
 
 impl<Op: Operation> ModelledInputRefusal<Op> {
@@ -90,6 +110,16 @@ impl<Op: Operation> ModelledInputRefusal<Op> {
     const fn new() -> Self {
         Self {
             operation: PhantomData,
+            client_token: None,
+        }
+    }
+
+    /// The wrapper for a CREATE of this service, which requires the idempotency token
+    /// `client_token` reads off its input ([`CLIENT_TOKEN_REQUIRED`]).
+    const fn requiring_client_token(client_token: ClientTokenReader<Op>) -> Self {
+        Self {
+            operation: PhantomData,
+            client_token: Some(client_token),
         }
     }
 
@@ -112,9 +142,32 @@ impl<Op: Operation> ModelledInputRefusal<Op> {
     ) -> Option<InvalidInputException> {
         let violations = refusing_violations::<Op>(protocol, req);
         if violations.is_empty() {
-            return None;
+            // The model accepted the request; this service's own requirement on a
+            // create's idempotency token is what is left to state.
+            return self.missing_client_token(protocol, req);
         }
         refusal_message(violations).map(invalid_input)
+    }
+
+    /// This service's refusal of a CREATE that states no idempotency token, or `None` when
+    /// the operation requires none, the request carries one, or the request cannot be read
+    /// into the operation's input at all — in which case the framework's own walk over the
+    /// same bytes is what answers it.
+    ///
+    /// The token is read off the input the PROTOCOL's deserializer builds, so a member the
+    /// request really carried is seen however the protocol writes it, and the check is made
+    /// on exactly the value the handler behind this door would have been handed.
+    fn missing_client_token(
+        &self,
+        protocol: &dyn ServerHttpProtocol,
+        req: &WireRequest,
+    ) -> Option<InvalidInputException> {
+        let read_token = self.client_token?;
+        let mut deserializer = protocol.deserialize_input(req, Op::INPUT_SCHEMA).ok()?;
+        let input = <Op::Input as DeserializableStruct>::deserialize(&mut *deserializer).ok()?;
+        drop(deserializer);
+        crate::state::client_token_missing(read_token(&input))
+            .then(|| invalid_input(CLIENT_TOKEN_REQUIRED.to_string()))
     }
 }
 
@@ -201,11 +254,28 @@ pub(super) fn refusal_table<Eng: Send + Sync + 'static>(
             })+
         };
     }
-    // Every operation the model declares, each served through the same front door.
-    register!(
+    // The CREATES, which require the idempotency token the model leaves optional: each
+    // states where its own input carries it.
+    macro_rules! register_create {
+        ($($module:ident :: $operation:ident),+ $(,)?) => {
+            $({
+                refusals.insert(
+                    <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                    Box::new(ModelledInputRefusal::<
+                        crate::ops::$module::$operation<Eng>,
+                    >::requiring_client_token(|input| input.client_token.as_deref()))
+                        as Box<dyn ErasedOperation>,
+                );
+            })+
+        };
+    }
+    register_create!(
         create_event_bus::CreateEventBus,
         create_event_source::CreateEventSource,
         create_subscriber::CreateSubscriber,
+    );
+    // Every other operation the model declares, each served through the same front door.
+    register!(
         delete_event_bus::DeleteEventBus,
         delete_event_source::DeleteEventSource,
         delete_resource_policy::DeleteResourcePolicy,
