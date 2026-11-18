@@ -28,6 +28,10 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Reads the HTTP-date an `If-Modified-Since` carries, so a conditional viewer request is judged
+# by the crate that owns the three formats HTTP defines for that field rather than by scanning
+# text (`service::edge::conditional`).
+httpdate = "1"
 # `iam_authorization`: the ONE evaluation of the resource policy an origin states its grant
 # to the CloudFront service principal in; `in_process_sigv4`: the ONE signature an
 # in-process call to another emulated service carries; `s3_bucket_name`: whether a host

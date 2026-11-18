@@ -52,14 +52,24 @@
 //!    names or, where that path is the distribution's ROOT, the one its `DefaultRootObject`
 //!    names ([`origin_object_path`]), and as the distribution's own origin access control
 //!    says that origin is to be addressed (see below);
-//! 9. a viewer that asked for part of the object is answered that part of it and no more:
+//! 9. a viewer that already holds a copy of the object is told so rather than sent it again:
+//!    the edge judges the `If-None-Match` and `If-Modified-Since` it sent against the
+//!    validators of the representation it is about to serve, and answers `304` carrying none of
+//!    its bytes when that copy is the current one ([`conditional`]);
+//! 10. a viewer that asked for part of the object is answered that part of it and no more:
 //!    the edge evaluates the `Range` it sent against the representation it is about to serve,
 //!    whether the cache held it or the origin has just produced it, so a satisfiable window is
 //!    answered `206` with those bytes alone and a range that selects nothing is refused `416`
 //!    carrying none of them ([`byte_range`]). The origin is therefore always asked for the
-//!    COMPLETE representation ([`HEADERS_NEVER_FORWARDED`] holds the viewer's `Range`), so one
-//!    viewer's window is never what the cache ends up holding for the object;
-//! 10. and whatever the answer turns out to be — the origin's, the cache's, or a page
+//!    COMPLETE representation ([`HEADERS_NEVER_FORWARDED`] holds the viewer's `Range` and its
+//!    conditional headers), so one viewer's window is never what the cache ends up holding for
+//!    the object;
+//! 11. an answer that is an ERROR is replaced by the one the distribution's
+//!    `CustomErrorResponses` states for that status, where it states one: the viewer receives
+//!    the configured `ResponseCode` and the page `ResponsePagePath` names, and the error itself
+//!    is held for `ErrorCachingMinTTL` rather than for the behaviour's own TTL
+//!    ([`custom_errors`]);
+//! 12. and whatever the answer turns out to be — the origin's, the cache's, or a page
 //!    CloudFront generated itself — the header groups of the behaviour's
 //!    `ResponseHeadersPolicyId` are applied to it: the CORS headers for a viewer whose
 //!    `Origin` the policy grants, the security and custom headers it configures, and the
@@ -150,10 +160,16 @@ pub mod access_logs;
 pub mod byte_range;
 /// The content encodings the edge compresses an answer with, and the bytes they produce.
 pub mod compression;
+/// WHETHER a viewer that already holds a copy of the object is answered the object again, or
+/// told that the copy it holds is still current.
+pub mod conditional;
 /// CONTINUOUS DEPLOYMENT: which of a continuous deployment's two distributions — the primary
 /// the viewer addressed or the staging distribution its policy routes to — serves one viewer
 /// request.
 pub mod continuous_deployment;
+/// The CUSTOM ERROR RESPONSES the distribution states: what a viewer receives when the answer
+/// the edge reached for its request is an error, and how long that error is held.
+pub mod custom_errors;
 /// WHICH headers, cookies and query strings the behaviour's policies key on and forward.
 pub mod forwarding;
 /// The CLOUDFRONT FUNCTION the matched behaviour associates, run on the viewer event it
@@ -185,8 +201,9 @@ use super::edge_metrics;
 use super::origin_access::{self, OriginAccess};
 use compression::Encoding;
 use crate::ops::types::{
-    AllowedMethods, CacheBehavior, DefaultCacheBehavior, ForwardedValues, FunctionAssociations,
-    LambdaFunctionAssociations, Origin, ResponseHeadersPolicyConfig, TrustedKeyGroups,
+    AllowedMethods, CacheBehavior, CustomErrorResponse, DefaultCacheBehavior, ForwardedValues,
+    FunctionAssociations, LambdaFunctionAssociations, Origin, ResponseHeadersPolicyConfig,
+    TrustedKeyGroups,
 };
 use crate::state::{
     managed_cache_policy, matches_path_pattern, same_domain, CachedEdgeResponse,
@@ -358,14 +375,20 @@ const METHOD_NOT_ALLOWED_DETAIL: &str =
 ///
 /// The viewer's `Range` is here for a third reason: the edge evaluates a byte range ITSELF,
 /// against the whole representation it holds ([`byte_range`]), so the origin is asked for that
-/// whole representation and every window of it can be served from one cached object.
-const HEADERS_NEVER_FORWARDED: [&str; 13] = [
+/// whole representation and every window of it can be served from one cached object. The
+/// viewer's CONDITIONAL headers are here for that same reason: the edge judges them itself,
+/// against the representation it is about to serve ([`conditional`]), so one viewer's
+/// revalidation never becomes what the cache holds for the object and every later viewer —
+/// conditional or not — is answered from the one entry.
+const HEADERS_NEVER_FORWARDED: [&str; 15] = [
     "authorization",
     "connection",
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
     byte_range::RANGE,
+    conditional::IF_NONE_MATCH,
+    conditional::IF_MODIFIED_SINCE,
     "te",
     "trailer",
     "transfer-encoding",
@@ -1141,13 +1164,21 @@ struct OriginFetch {
     encode: Option<Encoding>,
     /// The viewer path, which an invalidation is matched against.
     viewer_path: String,
+    /// `DistributionConfig$CustomErrorResponses`, which decide how long an answer that is an
+    /// ERROR is held: `ErrorCachingMinTTL` rather than the behaviour's own TTL
+    /// ([`custom_errors::caching_ttl`]).
+    custom_error_responses: Vec<CustomErrorResponse>,
 }
 
 /// Where a cacheable answer is held, and for how long.
 #[derive(Debug)]
 struct CacheDirective {
     key: String,
-    ttl: Duration,
+    /// How long an answer the edge MAY cache is held, from the behaviour's cache policy, or
+    /// `None` for a policy that holds no such answer at all — which still leaves an ERROR the
+    /// distribution's custom error responses name to be held for its own span
+    /// ([`custom_errors::caching_ttl`]).
+    ttl: Option<Duration>,
 }
 
 /// Serve one viewer request addressed to a distribution's edge.
@@ -1363,7 +1394,12 @@ pub async fn serve<Eng: Send + Sync + 'static>(
                 None,
             ),
             Plan::Hit { answer, encode } => (
-                served_origin_answer(&answer, encode, CACHE_HIT, &cf_id),
+                served_origin_answer(
+                    &answer,
+                    encode,
+                    cache_outcome(answer.status, CACHE_HIT),
+                    &cf_id,
+                ),
                 edge_metrics::ServedFrom::EdgeCache,
                 None,
             ),
@@ -1381,6 +1417,18 @@ pub async fn serve<Eng: Send + Sync + 'static>(
             }
         },
     };
+    // The viewer's CONDITIONAL headers, judged by the edge over the representation it is about
+    // to serve — the entry its cache held, or the answer the origin has just produced: a viewer
+    // whose copy is still the current one is told so and sent none of the object's bytes
+    // ([`conditional`]). Judged BEFORE the range, which a viewer holding the current copy has no
+    // need of, and only on an answer that IS the object, so a page CloudFront generated itself
+    // is left as it is.
+    if matches!(
+        served_from,
+        edge_metrics::ServedFrom::Origin | edge_metrics::ServedFrom::EdgeCache
+    ) {
+        conditional::apply(req, &method, now, &mut response);
+    }
     // The viewer's byte RANGE, evaluated by the edge over the representation it is about to
     // serve — the entry its cache held, or the answer the origin has just produced: the window
     // the viewer selected is answered with those bytes alone, and a range that selects none of
@@ -1392,6 +1440,38 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         edge_metrics::ServedFrom::Origin | edge_metrics::ServedFrom::EdgeCache
     ) {
         byte_range::apply(req.headers().get(byte_range::RANGE), &method, &mut response);
+    }
+    // The CUSTOM ERROR RESPONSE the distribution states for the status this answer carries,
+    // where it states one: the viewer receives the configured `ResponseCode` and the page
+    // `ResponsePagePath` names instead of the error ([`custom_errors`]). Applied to an answer
+    // the edge reached on an ORIGIN's behalf — the origin's own, or the same answer out of the
+    // cache — because the status it is keyed on is the origin's; a page CloudFront generated
+    // itself for a request it never passed to an origin is its own refusal of this viewer.
+    if let Some(served) = served_for.as_ref().filter(|_| {
+        matches!(
+            served_from,
+            edge_metrics::ServedFrom::Origin | edge_metrics::ServedFrom::EdgeCache
+        )
+    }) {
+        if let Some(configured) =
+            custom_errors::configured(&served.custom_error_responses, response.status().as_u16())
+        {
+            custom_errors::apply(
+                engine,
+                ctx,
+                &custom_errors::Serving {
+                    req,
+                    cf_id: &cf_id,
+                    viewer_path: &served.viewer_path,
+                    now,
+                    received,
+                    staging: staging.as_deref(),
+                },
+                &configured,
+                &mut response,
+            )
+            .await;
+        }
     }
     // The header groups of the response headers policy the matched behaviour attaches, put on
     // the answer CloudFront is about to serve — whoever produced it, since the policy is the
@@ -1696,6 +1776,11 @@ struct ServedFor {
     /// behaviour that attaches none. The policy's own `Server-Timing` sampling is counted
     /// against the RECORD it names, so the id travels beside the configuration read off it.
     response_headers_policy_id: String,
+    /// `DistributionConfig$CustomErrorResponses` as the stored configuration lists them: what
+    /// the viewer receives when the answer the edge reached is an error ([`custom_errors`]).
+    /// Stated on the DISTRIBUTION rather than on a behaviour, so it covers every behaviour's
+    /// answers.
+    custom_error_responses: Vec<CustomErrorResponse>,
 }
 
 /// The distribution one viewer request resolved to and the FUNCTIONS its matched cache
@@ -1944,6 +2029,7 @@ fn plan_request(
             .response_headers_policy_id
             .clone()
             .unwrap_or_default(),
+        custom_error_responses: custom_errors::of_config(&resolved.distribution.config),
     };
     let plan = plan_resolved(store, &addressed, &resolved, req, cf_id, now, behavior);
     (Some(served_for), plan)
@@ -2069,11 +2155,15 @@ fn plan_resolved(
         &viewer_path,
         &keyed_values(&keyed, &accept_encoding, addressed.query, req, &generated),
     );
-    // "The HTTP methods for which CloudFront caches responses": a cacheable method under
-    // a caching cache policy may be answered from the cache; everything else goes to the
-    // origin every time.
-    let cacheable = behavior.caches(&method).then_some(ttl).flatten();
-    if cacheable.is_some() {
+    // "The HTTP methods for which CloudFront caches responses": an answer to a cacheable
+    // method may come out of the edge cache and may be held in it, and everything else goes to
+    // the origin every time. WHETHER one is held, and for how long, is decided where the answer
+    // is: the cache policy's TTL for an answer the edge may cache, and `ErrorCachingMinTTL` for
+    // an ERROR the distribution's custom error responses name ([`custom_errors`]) — which a
+    // policy holding nothing does not take away, so a cacheable method still reads the one
+    // place such an error is held.
+    let cacheable = behavior.caches(&method);
+    if cacheable {
         if let Some(entry) = resolved.distribution.cached_edge_response(&cache_key, now) {
             return Plan::Hit {
                 answer: OriginAnswer {
@@ -2162,12 +2252,13 @@ fn plan_resolved(
         access,
         headers,
         read_timeout: origin_read_timeout(origin),
-        cache: cacheable.map(|ttl| CacheDirective {
+        cache: cacheable.then_some(CacheDirective {
             key: cache_key,
             ttl,
         }),
         encode,
         viewer_path,
+        custom_error_responses: custom_errors::of_config(&resolved.distribution.config),
     };
     Plan::Fetch(Box::new(fetch))
 }
@@ -2754,13 +2845,20 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
         headers,
     };
     if let Some(directive) = fetch.cache {
-        // The status the edge may hold at all; the size bound the entry has to stay within is
-        // [`cache`]'s own, stated where the bytes are held.
-        if is_cacheable_status(status) {
+        // How long this answer is held: the behaviour's own TTL for an answer the edge may
+        // cache at all, and `ErrorCachingMinTTL` for one the distribution's custom error
+        // responses name — which is what holds an ERROR no cache policy would hold
+        // ([`custom_errors`]).
+        let ttl = custom_errors::caching_ttl(&fetch.custom_error_responses, status)
+            .or_else(|| directive.ttl.filter(|_| is_cacheable_status(status)));
+        // The size bound the entry has to stay within is [`cache`]'s own, stated where the
+        // bytes are held.
+        if let Some(ttl) = ttl {
             cache(
                 engine,
                 &fetch.distribution_id,
-                directive,
+                &directive.key,
+                ttl,
                 &fetch.viewer_path,
                 &answer,
             );
@@ -2769,11 +2867,7 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
     // The origin answered, so the answer is the origin's — a MISS, since this request is
     // what went to the origin. An origin answer that is itself an error is reported as
     // one CloudFront did not produce from its cache either.
-    let x_cache = if is_cacheable_status(status) || status < 400 {
-        CACHE_MISS
-    } else {
-        CACHE_ERROR
-    };
+    let x_cache = cache_outcome(status, CACHE_MISS);
     Fetched {
         response: served_origin_answer(&answer, fetch.encode, x_cache, cf_id),
         origin_latency: Some(origin_latency),
@@ -2825,6 +2919,20 @@ fn is_transport_refusal(body: &[u8]) -> bool {
 /// MISS. This emulator's own bound, not CloudFront's.
 const MAX_CACHED_BODY_BYTES: usize = 1024 * 1024;
 
+/// What [`X_CACHE`] reports for an answer the edge serves on an ORIGIN's behalf: the outcome
+/// `produced` names — the origin produced this answer, or the cache held it — for an answer that
+/// IS the object, and [`CACHE_ERROR`] for one that is an ERROR, which is what CloudFront reports
+/// for an answer no object came out of however it reached it. The same reading on both paths, so
+/// an error the distribution's configuration holds in the cache ([`custom_errors`]) does not read
+/// as a hit the second time a viewer earns it.
+fn cache_outcome(status: u16, produced: &'static str) -> &'static str {
+    if is_cacheable_status(status) || status < 400 {
+        produced
+    } else {
+        CACHE_ERROR
+    }
+}
+
 /// Whether a status the origin answered is one the edge may hold in its cache.///
 /// "CloudFront caches ... responses with the following status codes: 200, 203, 204, 206,
 /// 300, 301, 302, 303, 304, 307, 308, 404, 405, 410, 414, and 501" — the successful,
@@ -2850,7 +2958,8 @@ fn is_cacheable_status(status: u16) -> bool {
 fn cache<Eng: Send + Sync + 'static>(
     engine: &Eng,
     distribution_id: &str,
-    directive: CacheDirective,
+    key: &str,
+    ttl: Duration,
     viewer_path: &str,
     answer: &OriginAnswer,
 ) {
@@ -2870,10 +2979,10 @@ fn cache<Eng: Send + Sync + 'static>(
     // The expiry is computed BEFORE the store is locked and without arithmetic that can
     // fail: a TTL the clock cannot reach holds the entry for the longest span the clamp
     // admits rather than making the instant uncomputable.
-    let Some(expires_at) = now.checked_add(directive.ttl) else {
+    let Some(expires_at) = now.checked_add(ttl) else {
         ::tracing::warn!(
             distribution = %distribution_id,
-            ttl_seconds = directive.ttl.as_secs(),
+            ttl_seconds = ttl.as_secs(),
             "this cache behavior's TTL runs past the clock, so the answer is served to \
              this viewer and not held"
         );
@@ -2884,7 +2993,7 @@ fn cache<Eng: Send + Sync + 'static>(
         return;
     };
     distribution.store_edge_response(
-        directive.key,
+        key.to_string(),
         CachedEdgeResponse {
             status: answer.status,
             body: answer.body.clone(),
