@@ -9,7 +9,9 @@
 //! description, `Source`, data type, allowed values, modifiability and change type come
 //! from the one catalog every parameter view in this service renders from. The group is
 //! resolved out of the store, so a name this account holds no group for is refused with
-//! the modelled `ParameterGroupNotFoundFault` rather than answered with the catalog.
+//! the modelled `ParameterGroupNotFoundFault` — naming the group the request asked for
+//! ([`crate::state::parameter_group_not_found_for_parameters`]) — rather than answered
+//! with the catalog.
 //! This operation writes nothing, so a later caller sees exactly what this one saw.
 //!
 //! `Source` selects the parameters defined that way — the vocabulary `Parameter$Source`
@@ -198,7 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // parameter group for resolves to nothing and is refused.
         let Some(group) = store.parameter_groups.get(&input.parameter_group_name) else {
             return Err(DescribeParametersErrorModeled::ParameterGroupNotFoundFault(
-                crate::state::parameter_group_not_found(),
+                crate::state::parameter_group_not_found_for_parameters(
+                    &input.parameter_group_name,
+                ),
             )
             .into());
         };

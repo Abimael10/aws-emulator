@@ -377,8 +377,10 @@ async fn a_not_found_fault_names_the_resource_its_template_names() {
         );
     }
 
-    // The parameter-group templates: a path that ADDRESSES the group names none, and a
-    // cluster that REFERENCES one names the group it could not be given.
+    // The parameter-group templates: the path that names groups as a FILTER and the one
+    // that REMOVES a group name none, the read of one group's parameters names the group
+    // it was asked for, and a cluster that REFERENCES one names the group it could not be
+    // given.
     for asked in ["absent-group", "ABSENT-GROUP"] {
         for (operation, request) in [
             (
@@ -387,10 +389,6 @@ async fn a_not_found_fault_names_the_resource_its_template_names() {
             ),
             (
                 "DeleteParameterGroup",
-                json!({ "ParameterGroupName": asked }),
-            ),
-            (
-                "DescribeParameters",
                 json!({ "ParameterGroupName": asked }),
             ),
         ] {
@@ -407,6 +405,24 @@ async fn a_not_found_fault_names_the_resource_its_template_names() {
                  got {body:?}"
             );
         }
+
+        let (status, body) = call(
+            &router,
+            "DescribeParameters",
+            json!({ "ParameterGroupName": asked }),
+        )
+        .await;
+        assert_eq!(
+            status, CLIENT_FAULT_STATUS,
+            "case DescribeParameters {asked:?}: expected {CLIENT_FAULT_STATUS}, \
+             got {status} {body:?}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("CacheParameterGroupnot found: {asked}"),
+            "case DescribeParameters {asked:?}: the fault must name the group asked for, \
+             got {body:?}"
+        );
 
         let mut request = create_cluster_body(&format!("pg-{}", asked.to_lowercase()), 1);
         request["ParameterGroupName"] = json!(asked);

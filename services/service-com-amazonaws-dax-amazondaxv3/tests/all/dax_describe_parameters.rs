@@ -27,6 +27,12 @@ const REGION: &str = "us-west-2";
 /// per-shape `@httpError` being inert on an RPC protocol.
 const CLIENT_FAULT_STATUS: u16 = 400;
 
+/// The fixed text of the not-found template the read of a group's parameters answers with
+/// (`CacheParameterGroup` followed by `not found: `, DAX's own wording). Written out here
+/// rather than taken from the service, so the wording itself is pinned and not merely
+/// echoed back; the only variable part is the requested `ParameterGroupName`.
+const ADDRESSED_NOT_FOUND: &str = "CacheParameterGroupnot found: ";
+
 /// Names spanning the class a create accepts (the name is read as a parameter-group
 /// identifier, and the model constrains `ParameterGroupName` to no pattern or length): a
 /// short name, a hyphenated one, one of letters and digits, and one with mixed case and a
@@ -279,6 +285,141 @@ async fn an_unmodified_group_reports_the_system_defined_parameters() {
 }
 
 // ---------------------------------------------------------------------------
+// Rule: the value each parameter reports is the one THAT group stores, so a read issued
+// after a change to a group's parameters reports the values that change persisted, while
+// every other member of the parameter keeps the catalog entry's rendering and every other
+// group keeps its own values.
+// Source: `DescribeParameters` ("the detailed parameter list for a particular parameter
+// group") with `UpdateParameterGroup` ("Modifies the parameters of a parameter group").
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_read_reports_the_values_the_group_stores_not_the_catalog() {
+    let router = emulator();
+    for name in CREATED_GROUPS {
+        create_group(&router, name).await;
+    }
+
+    // Rows: each parameter the catalog publishes changed on its own, both of them in one
+    // change, and a change back to the catalog's own value — the values spanning the
+    // published range rather than repeating one cited number.
+    let mut cases: Vec<(String, Vec<(&str, String)>)> = Vec::new();
+    for definition in state::DEFAULT_PARAMETERS {
+        for value in ["0", "1", "75000", definition.default_value] {
+            cases.push((
+                format!("{} = {value}", definition.name),
+                vec![(definition.name, value.to_string())],
+            ));
+        }
+    }
+    cases.push((
+        "every published parameter at once".to_string(),
+        state::DEFAULT_PARAMETERS
+            .iter()
+            .enumerate()
+            .map(|(index, definition)| (definition.name, format!("{}", 10_000 + index * 13_000)))
+            .collect(),
+    ));
+
+    for (index, (case, pairs)) in cases.iter().enumerate() {
+        // A group per row, so each row starts from the values a group that has never been
+        // changed holds; the untouched group beside it is read at the end of the row.
+        let group = format!("read-back-{index:03}");
+        create_group(&router, &group).await;
+        let (status, updated) = call(
+            &router,
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": group,
+                "ParameterNameValues": pairs
+                    .iter()
+                    .map(|(name, value)| json!({
+                        "ParameterName": name,
+                        "ParameterValue": value,
+                    }))
+                    .collect::<Vec<Value>>(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected the change accepted, got {status} {updated:?}"
+        );
+
+        let (status, body) = call(
+            &router,
+            "DescribeParameters",
+            json!({ "ParameterGroupName": group }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case}: got {status} {body:?}");
+        let reported = by_name(&body);
+
+        for definition in state::DEFAULT_PARAMETERS {
+            let expected = pairs
+                .iter()
+                .find(|(name, _)| *name == definition.name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| definition.default_value.to_string());
+            let parameter = reported
+                .get(definition.name)
+                .unwrap_or_else(|| panic!("case {case}: expected it reported, got {body:?}"));
+            assert_eq!(
+                parameter["ParameterValue"],
+                json!(expected),
+                "case {case}: expected {} to report the value the group stores \
+                 ({expected:?}), got {parameter:?}",
+                definition.name
+            );
+            // Only the value is the group's; every other member is the catalog entry's.
+            assert_eq!(
+                parameter["Description"],
+                json!(definition.description),
+                "case {case}: expected the catalog description, got {parameter:?}"
+            );
+            assert_eq!(
+                parameter["Source"],
+                json!(definition.source),
+                "case {case}: expected the catalog Source, got {parameter:?}"
+            );
+            assert_eq!(
+                parameter["DataType"],
+                json!(definition.data_type),
+                "case {case}: expected the catalog DataType, got {parameter:?}"
+            );
+            assert_eq!(
+                parameter["AllowedValues"],
+                json!(definition.allowed_values),
+                "case {case}: expected the catalog AllowedValues, got {parameter:?}"
+            );
+        }
+
+        // A group nothing changed still reports the system-defined values, so the change
+        // above reached one group's own stored values and not the catalog behind them.
+        let (status, untouched) = call(
+            &router,
+            "DescribeParameters",
+            json!({ "ParameterGroupName": CREATED_GROUPS[0] }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case}: got {status} {untouched:?}");
+        for definition in state::DEFAULT_PARAMETERS {
+            let parameter = by_name(&untouched)
+                .get(definition.name)
+                .cloned()
+                .unwrap_or(Value::Null);
+            assert_eq!(
+                parameter["ParameterValue"],
+                json!(definition.default_value),
+                "case {case}: an unchanged group keeps the system-defined value of {}, \
+                 got {parameter:?}",
+                definition.name
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Rule: `Source` selects the parameters defined that way — "How the parameter is
 // defined. For example, system denotes a system-defined parameter."
 // (`DescribeParametersRequest$Source` / `Parameter$Source`) — so a value no parameter is
@@ -364,8 +505,8 @@ async fn a_group_that_does_not_exist_is_refused() {
         );
         assert_eq!(
             body["message"],
-            json!(state::parameter_group_not_found_message()),
-            "case {name:?}: expected the fault's own template, got {body:?}"
+            json!(format!("{ADDRESSED_NOT_FOUND}{name}")),
+            "case {name:?}: expected the fault to name the group asked for, got {body:?}"
         );
     }
 
@@ -391,6 +532,94 @@ async fn a_group_that_does_not_exist_is_refused() {
         error_code(&body),
         "ParameterGroupNotFoundFault",
         "case deleted group: expected ParameterGroupNotFoundFault, got {body:?}"
+    );
+    assert_eq!(
+        body["message"],
+        json!(format!("{ADDRESSED_NOT_FOUND}{}", CREATED_GROUPS[0])),
+        "case deleted group: expected the fault to name the group asked for, got {body:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rule: when the parameter group whose parameters this read was asked for cannot be
+// resolved, the fault's message carries the `ParameterGroupName` the request sent,
+// verbatim, so the caller is told WHICH group was missing. The template's fixed text is
+// written out here rather than taken from the service, so the wording itself is pinned
+// and not merely echoed back; the only variable part is the requested name. The other
+// paths that raise this fault keep each their own recorded wording — the group list
+// (`DescribeParameterGroups`) and the removal (`DeleteParameterGroup`) name no
+// identifier, a cluster that references a group names it — which
+// `dax_client_fault_wire_status.rs` pins side by side.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_not_found_fault_names_the_group_the_request_addressed() {
+    let router = emulator();
+    create_group(&router, CREATED_GROUPS[0]).await;
+
+    // Rows spanning the names a request may ask for: one letter, a hyphenated name, one
+    // carrying digits, a mixed-case one, a long one, one differing from a stored group by
+    // a single character, one differing from it only in case, the empty name the model's
+    // `@required` admits, a dotted name shaped like the group this service provides, and
+    // one carrying a character no parameter-group identifier may hold. None of them names
+    // a group this account holds.
+    let absent = [
+        "a",
+        "no-such-group",
+        "group9",
+        "NoSuchGroup",
+        "a-rather-long-but-valid-parameter-group-name-0123456789",
+        "p",
+        "PG",
+        "",
+        "default.no-such-family",
+        "under_score",
+    ];
+
+    for name in absent {
+        let (status, body) = call(
+            &router,
+            "DescribeParameters",
+            json!({ "ParameterGroupName": name }),
+        )
+        .await;
+        assert_eq!(
+            status, CLIENT_FAULT_STATUS,
+            "case {name:?}: expected a refusal, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ParameterGroupNotFoundFault",
+            "case {name:?}: expected ParameterGroupNotFoundFault, got {body:?}"
+        );
+        let expected = format!("{ADDRESSED_NOT_FOUND}{name}");
+        assert_eq!(
+            body["message"],
+            json!(expected),
+            "case {name:?}: expected the message {expected:?}, got {body:?}"
+        );
+    }
+
+    // Every refusal above wrote nothing: the one stored group is still readable, with the
+    // parameters it was created holding.
+    let (status, body) = call(
+        &router,
+        "DescribeParameters",
+        json!({ "ParameterGroupName": CREATED_GROUPS[0] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the stored group must still be readable, got {status} {body:?}"
+    );
+    let expected_names: Vec<String> = state::default_parameter_names()
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    assert_eq!(
+        reported_names(&body),
+        expected_names,
+        "the stored group must still report every parameter it holds, got {body:?}"
     );
 }
 

@@ -10,7 +10,8 @@
 //! included — is refused with `InvalidParameterValueException` carrying that rule, and
 //! "You cannot delete a parameter group if it is associated with any DAX clusters"
 //! (`InvalidParameterGroupStateFault`). An unknown name answers
-//! `ParameterGroupNotFoundFault`.
+//! `ParameterGroupNotFoundFault`, whose template on this path names no identifier
+//! ([`crate::state::parameter_group_not_found`]).
 //!
 //! Before it reads the clusters it settles the cluster status moves the CLOCK has
 //! already made due (`crate::state::ComAmazonawsDaxAmazondaxv3State::settle_due`), so a

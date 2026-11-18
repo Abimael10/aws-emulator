@@ -1030,11 +1030,24 @@ pub fn max_results_out_of_range_message() -> String {
     )
 }
 
-/// The message `ParameterGroupNotFoundFault` carries on a path that READS or REMOVES a
-/// parameter group the request addresses by name: one fixed template, naming no
-/// identifier.
+/// The message `ParameterGroupNotFoundFault` carries on the paths that name parameter
+/// groups as a FILTER over the groups they report (`DescribeParameterGroups`'s
+/// `ParameterGroupNames`) and that REMOVE one (`DeleteParameterGroup`): one fixed
+/// template, naming no identifier. DAX words this fault per PATH, and each wording in
+/// this module is the one that path's own recorded answer carries.
 pub fn parameter_group_not_found_message() -> String {
     "Parameter Group not found.".to_string()
+}
+
+/// The message `ParameterGroupNotFoundFault` carries when the parameter group whose
+/// PARAMETERS a read was asked for (`DescribeParameters`) is not one this store holds:
+/// the fixed text `CacheParameterGroupnot found: ` (DAX's own wording, with no space
+/// between `CacheParameterGroup` and `not`, naming the parameter-group member of the
+/// parameter-group API this service's control plane shares) followed by the
+/// `ParameterGroupName` the request asked for, verbatim, so the caller is told WHICH
+/// group could not be resolved.
+pub fn parameter_group_not_found_for_parameters_message(name: &str) -> String {
+    format!("CacheParameterGroupnot found: {name}")
 }
 
 /// The message a request that CREATES or CHANGES a parameter group is refused with when
@@ -1240,11 +1253,22 @@ pub fn events_beyond_retention() -> InvalidParameterCombinationException {
     }
 }
 
-/// `ParameterGroupNotFoundFault` for a parameter group this store does not hold, on a
-/// path that ADDRESSES that group, carrying [`parameter_group_not_found_message`].
+/// `ParameterGroupNotFoundFault` for a parameter group this store does not hold, on the
+/// paths that name groups as a FILTER over what they report and that REMOVE one, carrying
+/// [`parameter_group_not_found_message`].
 pub fn parameter_group_not_found() -> ParameterGroupNotFoundFault {
     ParameterGroupNotFoundFault {
         message: Some(parameter_group_not_found_message()),
+    }
+}
+
+/// `ParameterGroupNotFoundFault` for a read of the PARAMETERS of a parameter group this
+/// store does not hold, carrying [`parameter_group_not_found_for_parameters_message`] for
+/// the name the request asked for. The single site that path raises this fault from, so
+/// it reads the same whether the group was never created or has been removed.
+pub fn parameter_group_not_found_for_parameters(name: &str) -> ParameterGroupNotFoundFault {
+    ParameterGroupNotFoundFault {
+        message: Some(parameter_group_not_found_for_parameters_message(name)),
     }
 }
 
