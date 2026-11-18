@@ -22,8 +22,8 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::ops::types::ConnectorDetail;
 use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::state::{
-    encode_cursor, service_state, CONNECTOR_TYPE_CUSTOM, DEFAULT_CONNECTOR_PAGE_SIZE, FLOW_CURSOR,
-    SCHEDULE_FREQUENCIES, VENDED_CONNECTORS,
+    connector_type_of_published_token, encode_cursor, service_state, CONNECTOR_TYPE_CUSTOM,
+    DEFAULT_CONNECTOR_PAGE_SIZE, FLOW_CURSOR, SCHEDULE_FREQUENCIES, VENDED_CONNECTORS,
 };
 
 use super::flow_lifecycle::{appflow, appflow_with_engine, call, Answer};
@@ -344,11 +344,16 @@ async fn a_destination_a_source_offers_can_itself_be_a_destination() {
         offered.iter().any(|offered| offered == CONNECTOR_TYPE_CUSTOM),
         "a flow can write to a registered connector, but the offered destinations are {offered:?}"
     );
-    let offered_types: Vec<&str> = offered
+    // A destination reaches the wire under the token AppFlow publishes it as, which is not
+    // always its `ConnectorType`, so a token read out of the answer is resolved back to the
+    // type a request names that connector by before asking about it.
+    let mut offered_types: Vec<&str> = offered
         .iter()
+        .map(|offered| connector_type_of_published_token(offered))
         .filter(|offered| *offered != CONNECTOR_TYPE_CUSTOM)
-        .map(String::as_str)
         .collect();
+    offered_types.sort_unstable();
+    offered_types.dedup();
     let answer = describe(&router, &offered_types).await;
     assert!(
         answer.is_ok(),

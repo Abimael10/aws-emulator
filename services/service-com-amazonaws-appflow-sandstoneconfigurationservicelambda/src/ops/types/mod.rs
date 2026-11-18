@@ -15,6 +15,10 @@
 //! ambiguous inside `ops` (`E0659`).
 
 pub mod cancel_flow_executions_types;
+// The connector configuration AppFlow reports, whose wire form carries a member the on-disk
+// model does not declare — so its schema and codec are written out rather than derived. See
+// that module's own note.
+pub mod connector_configuration_wire;
 pub mod create_connector_profile_types;
 pub mod create_flow_types;
 pub mod delete_connector_profile_types;
@@ -47,6 +51,8 @@ pub mod update_flow_types;
 
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use cancel_flow_executions_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use connector_configuration_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_connector_profile_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

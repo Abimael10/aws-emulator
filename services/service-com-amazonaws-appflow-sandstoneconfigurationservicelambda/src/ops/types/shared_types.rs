@@ -903,38 +903,9 @@ pub struct ConnectorServerException {
     pub message: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appflow#ConnectorConfiguration")]
-#[derive(Debug, Clone, Default)]
-pub struct ConnectorConfiguration {
-    pub can_use_as_source: bool,
-    pub can_use_as_destination: bool,
-    pub supported_destination_connectors: Option<Vec<String>>,
-    pub supported_scheduling_frequencies: Option<Vec<String>>,
-    pub is_private_link_enabled: bool,
-    pub is_private_link_endpoint_url_required: bool,
-    pub supported_trigger_types: Option<Vec<String>>,
-    pub connector_metadata: Option<ConnectorMetadata>,
-    pub connector_type: Option<String>,
-    pub connector_label: Option<String>,
-    pub connector_description: Option<String>,
-    pub connector_owner: Option<String>,
-    pub connector_name: Option<String>,
-    pub connector_version: Option<String>,
-    pub connector_arn: Option<String>,
-    pub connector_modes: Option<Vec<String>>,
-    pub authentication_config: Option<AuthenticationConfig>,
-    pub connector_runtime_settings: Option<Vec<ConnectorRuntimeSetting>>,
-    pub supported_api_versions: Option<Vec<String>>,
-    pub supported_operators: Option<Vec<String>>,
-    pub supported_write_operations: Option<Vec<String>>,
-    pub connector_provisioning_type: Option<String>,
-    pub connector_provisioning_config: Option<ConnectorProvisioningConfig>,
-    pub logo_url: Option<String>,
-    pub registered_at: Option<::aws_smithy_types::DateTime>,
-    pub registered_by: Option<String>,
-    pub supported_data_transfer_types: Option<Vec<String>>,
-    pub supported_data_transfer_apis: Option<Vec<DataTransferApi>>,
-}
+// `ConnectorConfiguration` is NOT declared here: AppFlow reports a member the on-disk model
+// does not declare, which the derive cannot express, so its schema and codec are written out
+// in `super::connector_configuration_wire`.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.appflow#ConnectorMetadata")]
 #[derive(Debug, Clone, Default)]

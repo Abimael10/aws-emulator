@@ -1428,21 +1428,55 @@ pub fn vended_connector(connector_type: &str) -> Option<&'static VendedConnector
         .find(|connector| connector.connector_type == connector_type)
 }
 
-/// Every connector type a flow can transfer data TO, in the order AppFlow reports them.
+/// Each connector AppFlow publishes in a LIST of connectors under a token that is not the
+/// `ConnectorType` the model spells: the modelled type, and the token AppFlow emits for it.
 ///
-/// The MEMBERS are the connector types a flow may name as its destination: every entry
-/// of [`VENDED_CONNECTORS`] whose own record says a flow can write to it, plus
-/// [`CONNECTOR_TYPE_CUSTOM`] — a flow can write to a connector an account registered
-/// just as it can to one AppFlow vends, and that type is the one `ConnectorType` the
-/// vended catalog has no entry for. [`destination_catalog_agrees`] is what keeps the two
-/// from drifting: a connector is listed here exactly when its own entry says it can be a
-/// destination.
+/// A published list of connector types (`supportedDestinationConnectors`) carries AppFlow's
+/// own token for each connector, and for nearly every connector that token IS its
+/// `ConnectorType` (`smithy_query(query="shape", shape="ConnectorType")`). Recorded behaviour
+/// for the one that differs: AppFlow publishes the Amazon Lookout for Metrics connector under
+/// the service's own name for it rather than under the modelled value, so a client reading a
+/// published list sees a token the modelled enum does not carry — and AppFlow's token is the
+/// one a membership test has to compare against.
+pub const PUBLISHED_CONNECTOR_TOKENS: [(&str, &str); 1] = [("LookoutMetrics", "Locke")];
+
+/// The token AppFlow publishes `connector_type` under in a list of connectors: the type
+/// itself for every connector [`PUBLISHED_CONNECTOR_TOKENS`] does not name.
+pub fn published_connector_token(connector_type: &str) -> &str {
+    PUBLISHED_CONNECTOR_TOKENS
+        .iter()
+        .find(|(modelled, _)| *modelled == connector_type)
+        .map_or(connector_type, |(_, token)| *token)
+}
+
+/// The `ConnectorType` of the connector AppFlow publishes under `token`: the token itself for
+/// every connector published under its own type.
 ///
-/// The ORDER is the one AppFlow itself reports this list in, which is neither the order
-/// the model declares `ConnectorType` in nor alphabetical; the values are the modelled
-/// `ConnectorType` enum (`smithy_query(query="shape", shape="ConnectorTypeList")` — a
-/// list over `ConnectorType`), so a destination a caller discovers here is a value
+/// The inverse of [`published_connector_token`], so a token read out of a published list
+/// names the connector a request can then ask about.
+pub fn connector_type_of_published_token(token: &str) -> &str {
+    PUBLISHED_CONNECTOR_TOKENS
+        .iter()
+        .find(|(_, published)| *published == token)
+        .map_or(token, |(modelled, _)| *modelled)
+}
+
+/// The destinations AppFlow PUBLISHES for a connector a flow can read from, in the order it
+/// publishes them — the answer `supportedDestinationConnectors` carries.
+///
+/// This is AppFlow's OWN published list, element for element and in AppFlow's order, and NOT
+/// a projection of which entries of [`VENDED_CONNECTORS`] a flow can write to: what a flow
+/// may name as its destination and what AppFlow publishes for discovery are two separate
+/// statements about a service, so a connector a flow can write to need not be published here
+/// (the event bus is not), and AppFlow publishes the custom-connector type both among the
+/// connectors it vends and as this list's last entry. [`destination_catalog_agrees`] keeps
+/// the two from drifting in the direction a caller depends on: every type published here is
+/// one whose own record says a flow can write to it, so a destination discovered here is one
 /// `CreateFlow` accepts for `destinationConnectorType`.
+///
+/// The entries are `ConnectorType` values; each reaches the wire under the token AppFlow
+/// publishes it as ([`published_connector_token`], applied by
+/// [`destination_connector_types`]).
 pub const DESTINATION_CONNECTORS: [&str; 13] = [
     "Salesforce",
     "Snowflake",
@@ -1456,35 +1490,33 @@ pub const DESTINATION_CONNECTORS: [&str; 13] = [
     CONNECTOR_TYPE_CUSTOM,
     "Upsolver",
     "SAPOData",
-    "EventBridge",
+    CONNECTOR_TYPE_CUSTOM,
 ];
 
-/// `true` when [`DESTINATION_CONNECTORS`] lists exactly the connector types a flow can
-/// write to: every vended connector whose entry says it can be a destination, none that
-/// says it cannot, and the custom-connector type.
+/// `true` when every destination [`DESTINATION_CONNECTORS`] publishes names a connector a
+/// flow can really write to: an entry of [`VENDED_CONNECTORS`] whose own record says so, or
+/// [`CONNECTOR_TYPE_CUSTOM`] — a flow can write to a connector an account registered just as
+/// it can to one AppFlow vends, and that type is the one `ConnectorType` the vended catalog
+/// has no entry for.
 ///
-/// The two are stated separately — one entry per connector, one ordered list for the
-/// answer — so this is what proves they agree; `tests/all/connector_configuration.rs`
-/// asserts it.
+/// The published list and the per-connector records are stated separately — one entry per
+/// connector, one ordered list for the answer — so this is what proves discovery cannot name
+/// a destination the service itself would refuse;
+/// `tests/all/connector_configuration.rs` asserts it.
 pub fn destination_catalog_agrees() -> bool {
-    let listed = |connector_type: &str| DESTINATION_CONNECTORS.contains(&connector_type);
-    DESTINATION_CONNECTORS.len()
-        == VENDED_CONNECTORS
-            .iter()
-            .filter(|connector| connector.can_use_as_destination)
-            .count()
-            + 1
-        && listed(CONNECTOR_TYPE_CUSTOM)
-        && VENDED_CONNECTORS
-            .iter()
-            .all(|connector| listed(connector.connector_type) == connector.can_use_as_destination)
+    DESTINATION_CONNECTORS.iter().all(|connector_type| {
+        *connector_type == CONNECTOR_TYPE_CUSTOM
+            || vended_connector(connector_type)
+                .is_some_and(|connector| connector.can_use_as_destination)
+    })
 }
 
-/// Every connector type a flow can transfer data TO, as the wire reports it.
+/// The destinations a source offers, as the wire reports them: AppFlow's published list, each
+/// entry under the token AppFlow publishes that connector as.
 pub fn destination_connector_types() -> Vec<String> {
     DESTINATION_CONNECTORS
         .iter()
-        .map(|connector_type| (*connector_type).to_string())
+        .map(|connector_type| published_connector_token(connector_type).to_string())
         .collect()
 }
 
@@ -1590,6 +1622,28 @@ fn capability_configuration(
     }
 }
 
+/// Everything a configuration DERIVES from the rest of itself, filled in once the record the
+/// configuration was projected from has stated its own members.
+///
+/// `isSupportedApiVersionsRequired` is the one such member: whether the caller must pin one
+/// of the connector's API versions when it builds a connector profile or a flow follows from
+/// the API versions the connector publishes (`supportedApiVersions`, "A list of API versions
+/// that are supported by the connector") — a caller has to name one exactly when the
+/// connector publishes any, and a connector that publishes none takes no API version at all.
+/// Reported for every connector, like the other configuration flags, so a client never has to
+/// tell `false` from "not reported".
+///
+/// Both projections ([`VendedConnector::to_connector_configuration`] and
+/// [`registered_connector_configuration`]) end here, so neither can answer the flag
+/// differently from the API versions it publishes beside it.
+fn with_derived_members(mut configuration: ConnectorConfiguration) -> ConnectorConfiguration {
+    configuration.is_supported_api_versions_required = configuration
+        .supported_api_versions
+        .as_ref()
+        .is_some_and(|versions| !versions.is_empty());
+    configuration
+}
+
 /// The wire `ConnectorConfiguration` for a connector a caller REGISTERED, built from the
 /// registration the store holds.
 ///
@@ -1615,7 +1669,7 @@ pub fn registered_connector_configuration(
     let can_use_as_source = declares(CONNECTOR_MODE_SOURCE);
     let can_use_as_destination = declares(CONNECTOR_MODE_DESTINATION);
 
-    ConnectorConfiguration {
+    with_derived_members(ConnectorConfiguration {
         connector_type: detail.connector_type.clone(),
         connector_label: detail.connector_label.clone(),
         connector_name: detail.connector_name.clone(),
@@ -1652,7 +1706,7 @@ pub fn registered_connector_configuration(
             false,
             false,
         )
-    }
+    })
 }
 
 impl VendedConnector {
@@ -1668,7 +1722,7 @@ impl VendedConnector {
     /// `supportedDataTransferTypes`): those belong to a connector a caller registered
     /// ([`registered_connector_configuration`]).
     pub fn to_connector_configuration(&self) -> ConnectorConfiguration {
-        ConnectorConfiguration {
+        with_derived_members(ConnectorConfiguration {
             connector_type: Some(self.connector_type.to_string()),
             connector_description: Some(self.description.to_string()),
             connector_metadata: connector_metadata(self.connector_type),
@@ -1678,6 +1732,6 @@ impl VendedConnector {
                 self.supports_event_trigger,
                 self.is_private_link_enabled,
             )
-        }
+        })
     }
 }

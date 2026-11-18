@@ -29,8 +29,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::ops::types::ConnectorDetail;
 use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::state::{
-    destination_catalog_agrees, service_state, CONNECTOR_MODE_DESTINATION, CONNECTOR_MODE_SOURCE,
-    CONNECTOR_TYPE_CUSTOM, DESTINATION_CONNECTORS, VENDED_CONNECTORS,
+    connector_type_of_published_token, destination_catalog_agrees, destination_connector_types,
+    published_connector_token, service_state, CONNECTOR_MODE_DESTINATION, CONNECTOR_MODE_SOURCE,
+    CONNECTOR_TYPE_CUSTOM, DESTINATION_CONNECTORS, PUBLISHED_CONNECTOR_TOKENS, VENDED_CONNECTORS,
 };
 
 use super::flow_lifecycle::{appflow, appflow_with_engine, call};
@@ -39,6 +40,12 @@ use super::flow_lifecycle::{appflow, appflow_with_engine, call};
 /// (`smithy_query(query="operation", operation="DescribeConnector")`: POST
 /// `/describe-connector`).
 const DESCRIBE_CONNECTOR: &str = "/describe-connector";
+
+/// `DescribeConnectors`' HTTP binding
+/// (`smithy_query(query="operation", operation="DescribeConnectors")`: POST
+/// `/describe-connectors`), which projects the same `ConnectorConfiguration` shape into
+/// `connectorConfigurations`.
+const DESCRIBE_CONNECTORS: &str = "/describe-connectors";
 
 /// Every value of the model's `ConnectorType` enum
 /// (`smithy_query(query="shape", shape="ConnectorType")`), which is what
@@ -339,17 +346,17 @@ async fn the_destinations_a_source_offers_are_the_connectors_a_flow_can_write_to
     let router = appflow();
 
     // The ordered list the answer carries and the per-connector records it has to agree
-    // with are stated separately, so first: they agree.
+    // with are stated separately, so first: every destination published is one a flow can
+    // really write to.
     assert!(
         destination_catalog_agrees(),
-        "the destinations offered {DESTINATION_CONNECTORS:?} do not match the connectors \
-         whose own record says a flow can write to them"
+        "the destinations offered {DESTINATION_CONNECTORS:?} name a connector whose own record \
+         says a flow cannot write to it"
     );
 
-    let expected: Vec<String> = DESTINATION_CONNECTORS
-        .iter()
-        .map(|connector_type| (*connector_type).to_string())
-        .collect();
+    // A destination reaches the wire under the token AppFlow publishes that connector as,
+    // which is not always the `ConnectorType` the model spells.
+    let expected: Vec<String> = destination_connector_types();
     assert!(
         expected.len() <= MAX_CONNECTOR_LIST,
         "ConnectorTypeList holds at most {MAX_CONNECTOR_LIST} entries, got {}",
@@ -360,10 +367,12 @@ async fn the_destinations_a_source_offers_are_the_connectors_a_flow_can_write_to
         expected.iter().any(|offered| offered == CONNECTOR_TYPE_CUSTOM),
         "expected the custom-connector type among the destinations, got {expected:?}"
     );
+    // Every published token names a connector a request can ask about: resolved back
+    // through AppFlow's own token table, each one is a `ConnectorType` the model declares.
     for offered in &expected {
         assert!(
-            CONNECTOR_TYPES.contains(&offered.as_str()),
-            "expected every offered destination to be a ConnectorType the model declares, \
+            CONNECTOR_TYPES.contains(&connector_type_of_published_token(offered)),
+            "expected every offered destination to name a ConnectorType the model declares, \
              got {offered:?}"
         );
     }
@@ -385,6 +394,7 @@ async fn the_destinations_a_source_offers_are_the_connectors_a_flow_can_write_to
     // cannot name a connector the service would refuse as a destination.
     for offered in expected
         .iter()
+        .map(|offered| connector_type_of_published_token(offered))
         .filter(|offered| *offered != CONNECTOR_TYPE_CUSTOM)
     {
         let reported = describe(&router, offered).await;
@@ -392,6 +402,207 @@ async fn the_destinations_a_source_offers_are_the_connectors_a_flow_can_write_to
             reported.get("canUseAsDestination").and_then(Value::as_bool),
             Some(true),
             "case {offered}: offered as a destination, but its own configuration is {reported:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_published_destination_carries_the_token_appflow_emits_for_that_connector() {
+    let router = appflow();
+
+    // The token AppFlow publishes a connector under is its `ConnectorType` for all but the
+    // connectors `PUBLISHED_CONNECTOR_TOKENS` names, and the published list is spelled with
+    // those tokens — so a client comparing a published token against AppFlow's spelling
+    // finds it, and the modelled spelling of a renamed connector is NOT in the list.
+    for (modelled, token) in PUBLISHED_CONNECTOR_TOKENS {
+        assert_ne!(
+            modelled, token,
+            "case {modelled}: a connector published under its own type needs no entry here"
+        );
+        assert_eq!(
+            published_connector_token(modelled),
+            token,
+            "case {modelled}: expected the published token {token:?}, got {:?}",
+            published_connector_token(modelled)
+        );
+        assert_eq!(
+            connector_type_of_published_token(token),
+            modelled,
+            "case {token}: expected it to resolve back to {modelled:?}, got {:?}",
+            connector_type_of_published_token(token)
+        );
+    }
+
+    // A table spanning both classes: a connector published under its own type, and one
+    // published under AppFlow's own token for it. The published list names the first by its
+    // type, the second only by its token.
+    let published = destination_connector_types();
+    let cases: &[(&str, bool)] = &[
+        // Destination-capable types published under their own `ConnectorType`.
+        ("S3", true),
+        ("Snowflake", true),
+        ("CustomerProfiles", true),
+        (CONNECTOR_TYPE_CUSTOM, true),
+        // A connector AppFlow publishes under its own token: the modelled spelling is
+        // absent from the published list, the token is there.
+        ("LookoutMetrics", false),
+        // A type that is not published as a destination at all.
+        ("Salesforce", true),
+        ("Amplitude", false),
+    ];
+    for (connector_type, published_under_its_type) in cases {
+        let token = published_connector_token(connector_type);
+        assert_eq!(
+            published.contains(&(*connector_type).to_string()),
+            *published_under_its_type,
+            "case {connector_type}: published list {published:?}"
+        );
+        if *published_under_its_type {
+            assert_eq!(
+                token, *connector_type,
+                "case {connector_type}: a connector published by its type keeps its spelling, \
+                 got {token:?}"
+            );
+        }
+    }
+    let renamed: Vec<&str> = PUBLISHED_CONNECTOR_TOKENS
+        .iter()
+        .map(|(_, token)| *token)
+        .collect();
+    for token in &renamed {
+        assert!(
+            published.contains(&(*token).to_string()),
+            "case {token}: expected AppFlow's own token among the published destinations, \
+             got {published:?}"
+        );
+    }
+
+    // Both reading paths project the same `ConnectorConfiguration`, so both publish the
+    // same tokens in the same order — `DescribeConnector` for one connector,
+    // `DescribeConnectors` for the catalog.
+    let sources: Vec<&str> = VENDED_CONNECTORS
+        .iter()
+        .filter(|connector| connector.can_use_as_source)
+        .map(|connector| connector.connector_type)
+        .collect();
+    for case in &sources {
+        let reported = describe(&router, case).await;
+        assert_eq!(
+            list(&reported, "supportedDestinationConnectors"),
+            published,
+            "case {case}: DescribeConnector published {:?}",
+            list(&reported, "supportedDestinationConnectors")
+        );
+    }
+    let answer = call(
+        &router,
+        DESCRIBE_CONNECTORS,
+        &json!({ "connectorTypes": sources }),
+    )
+    .await;
+    assert!(
+        answer.is_ok(),
+        "case {sources:?}: expected HTTP 200, got {answer:?}"
+    );
+    for case in &sources {
+        let reported = answer
+            .get("connectorConfigurations")
+            .get(case)
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            list(&reported, "supportedDestinationConnectors"),
+            published,
+            "case {case}: DescribeConnectors published {:?}",
+            list(&reported, "supportedDestinationConnectors")
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_configuration_reports_whether_an_api_version_must_be_pinned() {
+    let (router, engine) = appflow_with_engine();
+
+    // One registration per connection-mode class, so the flag is asserted for a connector
+    // a flow reads from, one it writes to, and one it does both with.
+    let registrations: &[(&str, &[&str])] = &[
+        ("AcmeSource", &[CONNECTOR_MODE_SOURCE]),
+        ("AcmeSink", &[CONNECTOR_MODE_DESTINATION]),
+        (
+            "Acme.Both-1",
+            &[CONNECTOR_MODE_SOURCE, CONNECTOR_MODE_DESTINATION],
+        ),
+    ];
+    {
+        let state = service_state(&*engine).expect("the AppFlow store is on this engine");
+        let mut store = state.lock();
+        for (label, modes) in registrations {
+            store.registered_connectors.insert(
+                label.to_string(),
+                ConnectorDetail {
+                    connector_label: Some((*label).to_string()),
+                    connector_type: Some(CONNECTOR_TYPE_CUSTOM.to_string()),
+                    connector_modes: Some(modes.iter().map(|mode| (*mode).to_string()).collect()),
+                    ..ConnectorDetail::default()
+                },
+            );
+        }
+    }
+
+    // The flag is served for every connector, whatever its capabilities, and it says what
+    // the configuration's own API versions say: a caller must pin one exactly when the
+    // connector publishes any.
+    let mut cases: Vec<(String, Value)> = Vec::new();
+    for connector in VENDED_CONNECTORS.iter() {
+        cases.push((
+            connector.connector_type.to_string(),
+            describe(&router, connector.connector_type).await,
+        ));
+    }
+    for (label, _) in registrations {
+        let answer = call(
+            &router,
+            DESCRIBE_CONNECTOR,
+            &json!({ "connectorType": CONNECTOR_TYPE_CUSTOM, "connectorLabel": label }),
+        )
+        .await;
+        assert!(
+            answer.is_ok(),
+            "case {label}: expected HTTP 200, got {answer:?}"
+        );
+        cases.push((
+            (*label).to_string(),
+            answer.get("connectorConfiguration").clone(),
+        ));
+    }
+    // The same projection through the catalog listing, so the member is not served by one
+    // reading path only. A page wide enough to carry the whole catalog, so every connector
+    // is asserted here too.
+    let answer = call(&router, DESCRIBE_CONNECTORS, &json!({ "maxResults": 100 })).await;
+    assert!(answer.is_ok(), "expected HTTP 200, got {answer:?}");
+    let configurations = answer.get("connectorConfigurations").clone();
+    for connector in VENDED_CONNECTORS.iter() {
+        cases.push((
+            format!("DescribeConnectors/{}", connector.connector_type),
+            configurations
+                .get(connector.connector_type)
+                .cloned()
+                .unwrap_or(Value::Null),
+        ));
+    }
+
+    for (case, reported) in &cases {
+        let flag = reported
+            .get("isSupportedApiVersionsRequired")
+            .and_then(Value::as_bool);
+        let publishes_api_versions = !list(reported, "supportedApiVersions").is_empty();
+        assert_eq!(
+            flag,
+            Some(publishes_api_versions),
+            "case {case}: supportedApiVersions is {:?}, so expected \
+             isSupportedApiVersionsRequired {publishes_api_versions}, got {:?}",
+            reported.get("supportedApiVersions"),
+            reported.get("isSupportedApiVersionsRequired")
         );
     }
 }
