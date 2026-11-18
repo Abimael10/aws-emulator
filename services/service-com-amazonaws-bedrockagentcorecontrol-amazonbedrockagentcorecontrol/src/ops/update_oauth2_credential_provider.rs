@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let store = state.lock();
             if !store.oauth2_credential_providers.contains_key(&input.name) {
-                return Err(provider_not_found(&input.name).into());
+                return Err(provider_not_found().into());
             }
         }
 
@@ -240,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = store
             .oauth2_credential_providers
             .get_mut(&input.name)
-            .ok_or_else(|| provider_not_found(&input.name))?;
+            .ok_or_else(provider_not_found)?;
 
         record.apply_update(
             input.credential_provider_vendor,
@@ -254,12 +254,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The refusal of an update whose `name` resolves to no provider of this
-/// account, worded as every other credential-provider route words it: the
-/// provider is addressed by name, so the refusal echoes the name the request
-/// addressed it by.
-fn provider_not_found(name: &str) -> UpdateOauth2CredentialProviderErrorModeled {
+/// account, in the OAuth2 credential-provider family's own fixed wording
+/// ([`crate::state::oauth2_credential_provider_not_found`]), which states
+/// neither the provider kind nor the name the request addressed.
+fn provider_not_found() -> UpdateOauth2CredentialProviderErrorModeled {
     UpdateOauth2CredentialProviderErrorModeled::ResourceNotFoundException(
-        crate::state::oauth2_credential_provider_not_found(name),
+        crate::state::oauth2_credential_provider_not_found(),
     )
 }
 

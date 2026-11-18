@@ -64,15 +64,23 @@ pub fn oauth2_credential_provider_arn(region: &str, token_vault_id: &str, name: 
 }
 
 /// How this service words an OAuth2 credential provider no name of this account
-/// resolves to: the resource type and the name the request addressed it by, on
-/// the same rule as [`api_key_credential_provider_not_found`] — the
-/// credential-provider routes address a provider by `name`, so the refusal
-/// echoes it.
-pub fn oauth2_credential_provider_not_found(name: &str) -> ResourceNotFoundException {
+/// resolves to: ENTIRELY FIXED text, naming neither the kind of credential
+/// provider asked for nor the name the request addressed it by.
+///
+/// Each credential-provider family words its own refusal — the sentence belongs
+/// to the route that answers it, not to a template shared across the families —
+/// so this one is not derived from [`api_key_credential_provider_not_found`],
+/// which does state the name its request carried. Saying nothing about the name
+/// is also what keeps a read of one family from reporting whether ANOTHER
+/// family holds that name: every absent name gets one answer.
+pub fn oauth2_credential_provider_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Oauth2CredentialProvider not found for {name}")),
+        message: Some(OAUTH2_CREDENTIAL_PROVIDER_NOT_FOUND_MESSAGE.to_string()),
     }
 }
+
+/// The whole of the sentence [`oauth2_credential_provider_not_found`] carries.
+pub const OAUTH2_CREDENTIAL_PROVIDER_NOT_FOUND_MESSAGE: &str = "CredentialProvider not found";
 
 /// How many OAuth2 credential providers this emulator will hold.
 ///
@@ -265,14 +273,22 @@ pub fn oauth2_configuration_mismatch(vendor: &str) -> ValidationException {
     }
 }
 
-/// The modelled `@pattern` of `Oauth2Discovery$discoveryUrl`
-/// (`smithy_query shape=Oauth2Discovery`), which a discovery URL has to satisfy
-/// and which the refusal of one that does not states verbatim.
+/// The `@pattern` of `Oauth2Discovery$discoveryUrl`, which a discovery URL has
+/// to satisfy and which the refusal of one that does not states verbatim.
+///
+/// The expression is the one the SERVICE enforces, which is not the one the
+/// model shipped in this repo spells: `Oauth2Discovery.discoveryUrl` ->
+/// `DiscoveryUrlType` (`smithy_query shape=Oauth2Discovery`) still carries the
+/// older `^.+/\.well-known/(openid-configuration|oauth-authorization-server)$`,
+/// while the service both quotes and enforces the one below — the issuer and
+/// any trailing path segment made of characters a URL may carry before its
+/// query or fragment begins, and the metadata document allowed a path segment
+/// after it rather than having to end the URL.
 pub const DISCOVERY_URL_PATTERN: &str =
-    r"^.+/\.well-known/(openid-configuration|oauth-authorization-server)$";
+    r"^[^\s?#]+/\.well-known/(openid-configuration|oauth-authorization-server)(/[^\s?#]+)?$";
 
 /// The two documents an authorization server's metadata is published as, which
-/// are the only endings [`DISCOVERY_URL_PATTERN`] admits.
+/// are the only ones [`DISCOVERY_URL_PATTERN`] admits.
 const DISCOVERY_DOCUMENT_SUFFIXES: [&str; 2] = [
     "/.well-known/openid-configuration",
     "/.well-known/oauth-authorization-server",
@@ -290,19 +306,51 @@ pub fn discovery_url_for_issuer(issuer: &str) -> String {
     )
 }
 
-/// Whether `url` satisfies [`DISCOVERY_URL_PATTERN`]: it ends in one of the two
-/// published metadata documents, with at least one character of issuer before
-/// it and no line break anywhere in that issuer — the pattern is anchored at
-/// both ends and its `.` does not match a line terminator, so this is the whole
-/// of it.
+/// Whether `url` satisfies [`DISCOVERY_URL_PATTERN`]: one of the two published
+/// metadata documents, preceded by at least one character of issuer and
+/// followed by nothing or by one more path segment, with every character of the
+/// issuer and of that segment one [`discovery_url_segment_is_admitted`] allows.
 ///
-/// Anchored at both ends means a value carrying anything AFTER the metadata
-/// document does not satisfy it. The check runs the model's pattern as the model
-/// states it, so what this emulator refuses is what its own model declares.
+/// The check runs the expression the refusal QUOTES, so the set this emulator
+/// accepts is the set it advertises.
+///
+/// LINEAR IN THE LENGTH OF A CALLER-SUPPLIED VALUE, which is what makes it safe
+/// to run on a request: the character class is settled in ONE pass over the
+/// whole value, and each candidate position of the document then costs a
+/// constant check, so the work is the length of the URL plus the number of
+/// candidate positions — never the product of the two. Nothing re-scans a
+/// prefix or a remainder per candidate.
 pub fn discovery_url_satisfies_pattern(url: &str) -> bool {
+    // Both variable parts of the expression are drawn from `[^\s?#]`, and the
+    // fixed middle carries none of those characters either, so one disallowed
+    // character ANYWHERE in the value refuses it whatever the rest looks like.
+    if !discovery_url_segment_is_admitted(url) {
+        return false;
+    }
     DISCOVERY_DOCUMENT_SUFFIXES.iter().any(|suffix| {
-        url.strip_suffix(suffix)
-            .is_some_and(|issuer| !issuer.is_empty() && !issuer.contains(['\n', '\r']))
+        // The document can occur more than once in one URL, and the expression
+        // is satisfied if ANY occurrence leaves an issuer before it and an
+        // admitted remainder after it, exactly as a regular-expression match
+        // would be. With the character class already settled, each occurrence
+        // asks only where it sits and what the next character is.
+        url.match_indices(suffix).any(|(at, _)| {
+            let trailing = &url[at + suffix.len()..];
+            at > 0
+                && (trailing.is_empty()
+                    || trailing
+                        .strip_prefix('/')
+                        .is_some_and(|segment| !segment.is_empty()))
+        })
+    })
+}
+
+/// Whether every character of `segment` is one `[^\s?#]` admits: anything but
+/// whitespace, which no URL carries unescaped, and the two delimiters that end
+/// a URL's path — `?` opening the query and `#` opening the fragment, neither of
+/// which is part of the discovery endpoint itself.
+fn discovery_url_segment_is_admitted(segment: &str) -> bool {
+    !segment.contains(|character: char| {
+        character.is_whitespace() || character == '?' || character == '#'
     })
 }
 

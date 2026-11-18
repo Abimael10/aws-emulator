@@ -10,7 +10,9 @@
 
 use super::*;
 
-use crate::ops::types::{CreatePaymentManagerOutput, GetPaymentManagerOutput};
+use crate::ops::types::{
+    CreatePaymentManagerOutput, GetPaymentManagerOutput, UpdatePaymentManagerOutput,
+};
 
 /// The modelled not-found error for a payment manager this account does not hold.
 ///
@@ -47,7 +49,30 @@ pub fn payment_manager_arn(region: &str, payment_manager_id: &str) -> String {
 /// shape=PaymentManagerStatus`); the failure statuses belong to a provisioning that
 /// failed, which nothing here makes happen.
 pub const PAYMENT_MANAGER_STATUS_CREATING: &str = "CREATING";
+pub const PAYMENT_MANAGER_STATUS_UPDATING: &str = "UPDATING";
 pub const PAYMENT_MANAGER_STATUS_READY: &str = "READY";
+
+/// The modelled conflict for a write asked of a payment manager that is not
+/// settled: a create or an update of its own is still under way, so this one
+/// collides with it.
+///
+/// The text around the three values is fixed; `accountId` is the single account
+/// this emulator serves, `managerId` the id the request's path carried, and
+/// `version` the version of the manager the refused writer raced against —
+/// [`PaymentManagerRecord::version_at`], which is the version visible while the
+/// write already in flight has not settled.
+pub fn payment_manager_update_conflict(
+    payment_manager_id: &str,
+    version: u64,
+) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Conflict while updating payment manager: accountId={}, managerId={payment_manager_id}, \
+             version={version}",
+            ::engine::emulator_account_id()
+        )),
+    }
+}
 
 /// How long a freshly created payment manager stays `CREATING` before the clock owes
 /// it `READY`.
@@ -102,6 +127,12 @@ pub struct PaymentManagerRecord {
     pub transient_status: String,
     /// The status it reports from then on.
     pub settled_status: String,
+    /// The version the manager is at until [`Self::settles_at`] — the version a
+    /// writer racing the write already in flight read.
+    pub transient_version: u64,
+    /// The version it is at from then on: one more per write that has been
+    /// applied to it.
+    pub settled_version: u64,
     /// When the clock owes the move from one to the other. Stored, never slept on: a
     /// read materialises the transition the clock already made due.
     pub settles_at: SystemTime,
@@ -116,6 +147,79 @@ impl PaymentManagerRecord {
             &self.transient_status
         } else {
             &self.settled_status
+        }
+    }
+
+    /// The version at `now`, on the same rule as [`Self::status_at`]: the version the
+    /// write in flight started from until the clock owes its completion, and the one
+    /// that write produced from then on.
+    ///
+    /// No response member carries it — `PaymentManagerStatus` is what a caller sees of
+    /// the manager's progress — so it exists to tell a writer refused for a collision
+    /// WHICH version of the manager it raced against.
+    pub fn version_at(&self, now: SystemTime) -> u64 {
+        if now < self.settles_at {
+            self.transient_version
+        } else {
+            self.settled_version
+        }
+    }
+
+    /// Apply one update's PATCH to the manager: "This operation uses PATCH semantics,
+    /// so you only need to specify the fields you want to change"
+    /// (`smithy_query doc shape=UpdatePaymentManager`) — a member the request carried
+    /// replaces the stored one, and a member it omitted leaves the stored one alone.
+    ///
+    /// The write is not instantaneous: the manager moves to `UPDATING` and the clock
+    /// owes it `READY` again, exactly as a create's does, and the version it is at
+    /// rises with the write rather than when this call returns.
+    pub fn apply_update(
+        &mut self,
+        description: Option<String>,
+        authorizer_type: Option<String>,
+        authorizer_configuration: Option<AuthorizerConfiguration>,
+        role_arn: Option<String>,
+        kms_key_arn: Option<String>,
+        now: SystemTime,
+    ) {
+        if description.is_some() {
+            self.description = description;
+        }
+        if let Some(authorizer_type) = authorizer_type {
+            self.authorizer_type = authorizer_type;
+        }
+        if authorizer_configuration.is_some() {
+            self.authorizer_configuration = authorizer_configuration;
+        }
+        if let Some(role_arn) = role_arn {
+            self.role_arn = role_arn;
+        }
+        if kms_key_arn.is_some() {
+            self.kms_key_arn = kms_key_arn;
+        }
+        self.updated_at = now;
+        self.transient_version = self.version_at(now);
+        self.settled_version = self.transient_version.saturating_add(1);
+        self.transient_status = PAYMENT_MANAGER_STATUS_UPDATING.to_string();
+        self.settled_status = PAYMENT_MANAGER_STATUS_READY.to_string();
+        self.settles_at = now + PAYMENT_MANAGER_SETTLE_DELAY;
+    }
+
+    /// This payment manager as `UpdatePaymentManager`'s response envelope: every
+    /// member `UpdatePaymentManagerResponse` declares, read off the record the update
+    /// just wrote. That response declares neither the description nor the tags nor the
+    /// authorizer configuration, so those are reported by a read of the manager.
+    pub fn update_output(&self, now: SystemTime) -> UpdatePaymentManagerOutput {
+        UpdatePaymentManagerOutput {
+            payment_manager_arn: self.payment_manager_arn.clone(),
+            payment_manager_id: self.payment_manager_id.clone(),
+            name: self.name.clone(),
+            authorizer_type: self.authorizer_type.clone(),
+            role_arn: self.role_arn.clone(),
+            workload_identity_details: self.workload_identity_details.clone(),
+            last_updated_at: timestamp(self.updated_at),
+            status: self.status_at(now).to_string(),
+            kms_key_arn: self.kms_key_arn.clone(),
         }
     }
 

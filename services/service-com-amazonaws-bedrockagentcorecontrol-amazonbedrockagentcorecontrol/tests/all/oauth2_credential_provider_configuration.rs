@@ -31,19 +31,23 @@ use service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol:
 /// The region every request in this suite signs for.
 const REGION: &str = "eu-west-1";
 
-/// The modelled `@pattern` of `Oauth2Discovery$discoveryUrl`, as the MODEL spells it
-/// (`smithy_query(query="shape", shape="Oauth2Discovery")`) — anchors included, because
-/// that is what the check runs against.
-const MODELLED_DISCOVERY_URL_PATTERN: &str =
-    r"^.+/\.well-known/(openid-configuration|oauth-authorization-server)$";
+/// The `@pattern` the SERVICE enforces on `Oauth2Discovery$discoveryUrl`, anchored as a
+/// total match, because that is what the check runs against. It is NOT the expression the
+/// model shipped in this repo spells (`smithy_query(query="shape",
+/// shape="Oauth2Discovery")` still carries the older
+/// `^.+/\.well-known/(openid-configuration|oauth-authorization-server)$`): the service
+/// admits a path segment after the metadata document and refuses whitespace, a query
+/// string and a fragment anywhere in the value.
+const ENFORCED_DISCOVERY_URL_PATTERN: &str =
+    r"^[^\s?#]+/\.well-known/(openid-configuration|oauth-authorization-server)(/[^\s?#]+)?$";
 
-/// The same expression as this service's refusal QUOTES it: without the `^` / `$` pair the
-/// model spells it with, which is rule 3 of this crate's constraint-message wording
+/// The same expression as this service's refusal QUOTES it: without the `^` / `$` pair,
+/// which is rule 3 of this crate's constraint-message wording
 /// (`src/service/validation.rs`) — the advertised constraint is the character grammar a
-/// value must satisfy, not the model's way of making the match total. Written out rather
-/// than computed, so the expectation pins the words a caller reads.
+/// value must satisfy, not the way of making the match total. Written out rather than
+/// computed, so the expectation pins the words a caller reads.
 const QUOTED_DISCOVERY_URL_PATTERN: &str =
-    r".+/\.well-known/(openid-configuration|oauth-authorization-server)";
+    r"[^\s?#]+/\.well-known/(openid-configuration|oauth-authorization-server)(/[^\s?#]+)?";
 
 /// The two documents that pattern admits, which are the published locations of an
 /// authorization server's metadata (OpenID Connect Discovery 1.0 and RFC 8414).
@@ -233,25 +237,27 @@ async fn a_vendor_and_a_configuration_that_disagree_are_refused() {
     }
 }
 
-/// A `discoveryUrl` outside its modelled pattern is refused in this service's
+/// A `discoveryUrl` outside the pattern this service enforces is refused in its
 /// constraint-violation wording, which names the member path and the pattern; one that
 /// satisfies the pattern is served and reported back.
 ///
 /// The refused rows drive each way the pattern can fail — no well-known path at all, the
-/// path without the metadata document, a document the pattern does not admit, the
-/// metadata document with nothing before it, and a trailing path segment the pattern's
-/// anchored ending does not allow. The served rows drive each document the pattern names.
+/// path without the metadata document, a document the pattern does not admit, the metadata
+/// document with nothing before it, and each delimiter the character class excludes (a
+/// query string, a fragment, whitespace), before the document and after it. The served
+/// rows drive each document the pattern names, an issuer under a path of its own, and the
+/// trailing path segment the pattern admits after the document.
 #[tokio::test]
 async fn a_discovery_url_outside_its_pattern_is_refused_and_one_inside_it_is_served() {
     let emulator = Emulator::new();
     let member_path =
         "oauth2ProviderConfigInput.customOauth2ProviderConfig.oauthDiscovery.discoveryUrl";
-    // The quoted expression is the modelled one with the anchoring pair dropped, and
+    // The quoted expression is the enforced one with the anchoring pair dropped, and
     // nothing else: rule 3 changes how the pattern READS, never which values it admits.
     assert_eq!(
         format!("^{QUOTED_DISCOVERY_URL_PATTERN}$"),
-        MODELLED_DISCOVERY_URL_PATTERN,
-        "the quoted expression is the modelled one without its anchors, got \
+        ENFORCED_DISCOVERY_URL_PATTERN,
+        "the quoted expression is the enforced one without its anchors, got \
          {QUOTED_DISCOVERY_URL_PATTERN}"
     );
     // Rule 5: the `/identities` family states the member and the requirement alone, so the
@@ -262,7 +268,7 @@ async fn a_discovery_url_outside_its_pattern_is_refused_and_one_inside_it_is_ser
     );
 
     // (case, provider name, the URL the request carries)
-    let refused: [(&str, &str, String); 5] = [
+    let refused: [(&str, &str, String); 9] = [
         (
             "no well-known path at all",
             "custom-no-well-known",
@@ -284,9 +290,34 @@ async fn a_discovery_url_outside_its_pattern_is_refused_and_one_inside_it_is_ser
             OPENID_CONFIGURATION.to_string(),
         ),
         (
-            "the metadata document followed by another path segment",
-            "custom-trailing-segment",
-            format!("https://example.com{OPENID_CONFIGURATION}/v2"),
+            "the metadata document carrying a query string",
+            "custom-query-string",
+            format!("https://example.com{OPENID_CONFIGURATION}?tenant=t1"),
+        ),
+        (
+            "the metadata document carrying a fragment",
+            "custom-fragment",
+            format!("https://example.com{OPENID_CONFIGURATION}#top"),
+        ),
+        (
+            "whitespace inside the issuer",
+            "custom-spaced-issuer",
+            format!("https://exa mple.com{OPENID_CONFIGURATION}"),
+        ),
+        (
+            "whitespace inside the trailing segment",
+            "custom-spaced-segment",
+            format!("https://example.com{OPENID_CONFIGURATION}/v 2"),
+        ),
+        (
+            // The document can occur many times over; one disallowed character
+            // anywhere still refuses the value, whichever occurrence is considered.
+            "the document repeated, with a query string at the end",
+            "custom-repeated-query",
+            format!(
+                "https://example.com{OPENID_CONFIGURATION}{OPENID_CONFIGURATION}\
+                 {OPENID_CONFIGURATION}?tenant=t1"
+            ),
         ),
     ];
     for (case, provider, url) in refused {
@@ -316,7 +347,7 @@ async fn a_discovery_url_outside_its_pattern_is_refused_and_one_inside_it_is_ser
     }
 
     // (case, provider name, the URL the request carries)
-    let served: [(&str, &str, String); 3] = [
+    let served: [(&str, &str, String); 6] = [
         (
             "the OpenID Connect discovery document",
             "custom-openid",
@@ -331,6 +362,23 @@ async fn a_discovery_url_outside_its_pattern_is_refused_and_one_inside_it_is_ser
             "the metadata document under a path of its own",
             "custom-nested-issuer",
             format!("https://example.com/tenants/t1{OPENID_CONFIGURATION}"),
+        ),
+        (
+            "the metadata document followed by one path segment",
+            "custom-trailing-segment",
+            format!("https://example.com{OPENID_CONFIGURATION}/v2"),
+        ),
+        (
+            "the metadata document followed by a deeper path",
+            "custom-trailing-path",
+            format!("https://example.com{OAUTH_AUTHORIZATION_SERVER}/tenants/t1"),
+        ),
+        (
+            // The trailing segment may itself look like the document, so a value
+            // carrying it twice satisfies the expression on its first occurrence.
+            "the metadata document carrying itself as the trailing path",
+            "custom-repeated-document",
+            format!("https://example.com{OPENID_CONFIGURATION}{OPENID_CONFIGURATION}"),
         ),
     ];
 

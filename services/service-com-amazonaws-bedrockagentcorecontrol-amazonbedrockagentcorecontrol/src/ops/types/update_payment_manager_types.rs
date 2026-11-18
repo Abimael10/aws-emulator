@@ -23,7 +23,15 @@ pub struct UpdatePaymentManagerInput {
     pub kms_key_arn: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#UpdatePaymentManagerResponse")]
+/// `UpdatePaymentManagerResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `lastUpdatedAt` targets `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="UpdatePaymentManager")`), and the derive
+/// does not put that trait on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct UpdatePaymentManagerOutput {
     pub payment_manager_arn: String,
@@ -36,4 +44,42 @@ pub struct UpdatePaymentManagerOutput {
     pub status: String,
     pub kms_key_arn: Option<String>,
 }
+
+agentcore_schema_and_codec!(
+    UpdatePaymentManagerOutput,
+    UPDATE_PAYMENT_MANAGER_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#UpdatePaymentManagerResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "UpdatePaymentManagerResponse",
+    (
+        M_PAYMENT_MANAGER_ARN,
+        payment_manager_arn,
+        "paymentManagerArn",
+        0,
+        req,
+        string
+    ),
+    (
+        M_PAYMENT_MANAGER_ID,
+        payment_manager_id,
+        "paymentManagerId",
+        1,
+        req,
+        string
+    ),
+    (M_NAME, name, "name", 2, req, string),
+    (M_AUTHORIZER_TYPE, authorizer_type, "authorizerType", 3, req, string),
+    (M_ROLE_ARN, role_arn, "roleArn", 4, req, string),
+    (
+        M_WORKLOAD_IDENTITY_DETAILS,
+        workload_identity_details,
+        "workloadIdentityDetails",
+        5,
+        opt,
+        struct_of(WorkloadIdentityDetails)
+    ),
+    (M_LAST_UPDATED_AT, last_updated_at, "lastUpdatedAt", 6, req, date_time),
+    (M_STATUS, status, "status", 7, req, string),
+    (M_KMS_KEY_ARN, kms_key_arn, "kmsKeyArn", 8, opt, string),
+);
 

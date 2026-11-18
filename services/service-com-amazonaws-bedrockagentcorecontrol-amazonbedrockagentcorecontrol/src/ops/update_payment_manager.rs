@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePaymentManager
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePaymentManager`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePaymentManager::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +188,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePaymentManager` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePaymentManagerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePaymentManager"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdatePaymentManagerErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the payment manager store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the manager
+        // as that token's update left it, rather than applying the change a second
+        // time: "If this token matches a previous request, the service ignores the
+        // request, but doesn't return an error."
+        if let Some(payment_manager_id) =
+            store.replayed_payment_manager_result(Self::NAME, input.client_token.as_deref())
+        {
+            // `replayed_payment_manager_result` answers only for a manager the store
+            // still holds, so this lookup cannot miss.
+            if let Some(record) = store.payment_managers.get(&payment_manager_id) {
+                return Ok(record.update_output(now));
+            }
+        }
+
+        // "Updates an existing payment manager", addressed by the `paymentManagerId`
+        // the path carries, so an id this account holds no manager under is the
+        // modelled 404 rather than a manager an update minted.
+        let record = store
+            .payment_managers
+            .get(&input.payment_manager_id)
+            .ok_or_else(|| {
+                UpdatePaymentManagerErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_manager_not_found(&input.payment_manager_id),
+                )
+            })?;
+
+        // One write at a time: a manager whose own create or update has not settled
+        // yet is still being written, so a second writer collides with the first and
+        // is refused the modelled 409 naming the version it raced against. The
+        // refusal is decided BEFORE anything is written, so a refused writer changes
+        // nothing and the manager settles carrying the values the writer that won
+        // submitted.
+        if record.status_at(now) != crate::state::PAYMENT_MANAGER_STATUS_READY {
+            let version = record.version_at(now);
+            return Err(UpdatePaymentManagerErrorModeled::ConflictException(
+                crate::state::payment_manager_update_conflict(&input.payment_manager_id, version),
+            )
+            .into());
+        }
+
+        // The same prose rule the create enforces — "If you specify CUSTOM_JWT as the
+        // authorizerType, you must provide an authorizerConfiguration" — read against
+        // what the manager WOULD carry once this PATCH is applied: an update that
+        // switches the authorizer type to `CUSTOM_JWT` has to supply a configuration
+        // unless the manager already holds one, while one that re-states the type the
+        // manager already runs under keeps the configuration it already has.
+        let authorizer_type = input
+            .authorizer_type
+            .as_deref()
+            .unwrap_or(record.authorizer_type.as_str());
+        let holds_configuration =
+            input.authorizer_configuration.is_some() || record.authorizer_configuration.is_some();
+        if authorizer_type == crate::state::AUTHORIZER_TYPE_CUSTOM_JWT && !holds_configuration {
+            return Err(UpdatePaymentManagerErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    crate::state::AUTHORIZER_CONFIGURATION_MEMBER,
+                    &format!(
+                        "is required when authorizerType is {}",
+                        crate::state::AUTHORIZER_TYPE_CUSTOM_JWT
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // The checks above read the stored manager and this handler holds the store's
+        // lock across both, so the manager the write applies to is the one they read.
+        let record = store
+            .payment_managers
+            .get_mut(&input.payment_manager_id)
+            .ok_or_else(|| {
+                UpdatePaymentManagerErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_manager_not_found(&input.payment_manager_id),
+                )
+            })?;
+        record.apply_update(
+            input.description,
+            input.authorizer_type,
+            input.authorizer_configuration,
+            input.role_arn,
+            input.kms_key_arn,
+            now,
+        );
+        let output = record.update_output(now);
+
+        store.remember_payment_manager_client_token(
+            Self::NAME,
+            input.client_token,
+            &input.payment_manager_id,
+        );
+
+        Ok(output)
     }
 }

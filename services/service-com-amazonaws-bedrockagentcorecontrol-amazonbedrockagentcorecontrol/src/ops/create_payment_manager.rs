@@ -282,6 +282,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // owed by the clock, not by this call.
             transient_status: crate::state::PAYMENT_MANAGER_STATUS_CREATING.to_string(),
             settled_status: crate::state::PAYMENT_MANAGER_STATUS_READY.to_string(),
+            // The create is the manager's first version, and it is the version a
+            // writer sees whether or not the move to READY is owed yet: nothing has
+            // raced it.
+            transient_version: 1,
+            settled_version: 1,
             settles_at: now + crate::state::PAYMENT_MANAGER_SETTLE_DELAY,
         };
         let output = record.create_output(now);

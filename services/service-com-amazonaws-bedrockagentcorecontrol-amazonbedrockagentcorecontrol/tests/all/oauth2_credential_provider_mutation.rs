@@ -563,7 +563,10 @@ async fn an_update_of_a_name_no_provider_resolves_to_is_refused() {
         );
         assert_eq!(
             refused["message"].as_str().unwrap_or_default(),
-            format!("Oauth2CredentialProvider not found for {name}"),
+            // The OAuth2 credential-provider family's own fixed sentence: it names
+            // neither the provider kind nor the name the request addressed
+            // (`tests/all/credential_provider_type_isolation.rs`).
+            "CredentialProvider not found",
             "case {case:?}: unexpected refusal message, got {refused}"
         );
 
@@ -684,8 +687,10 @@ async fn an_update_with_a_discovery_url_outside_its_pattern_is_refused() {
         .await;
 
     // Each way the pattern can fail: no well-known path, a document it does not admit, no
-    // issuer before the document, and a segment after it (the pattern is anchored).
-    let rows: [(&str, String); 4] = [
+    // issuer before the document, and the delimiters that end a URL's path — the query and
+    // the fragment — which the character class the issuer and any trailing segment are
+    // drawn from excludes.
+    let rows: [(&str, String); 5] = [
         (
             "no well-known path at all",
             "https://second.example.com/oauth".to_string(),
@@ -699,8 +704,12 @@ async fn an_update_with_a_discovery_url_outside_its_pattern_is_refused() {
             OPENID_CONFIGURATION.to_string(),
         ),
         (
-            "the metadata document followed by another segment",
-            format!("https://second.example.com{OPENID_CONFIGURATION}/v2"),
+            "the metadata document carrying a query string",
+            format!("https://second.example.com{OPENID_CONFIGURATION}?tenant=t1"),
+        ),
+        (
+            "the metadata document carrying a fragment",
+            format!("https://second.example.com{OPENID_CONFIGURATION}#section"),
         ),
     ];
 

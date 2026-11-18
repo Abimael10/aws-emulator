@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.name)
             .ok_or_else(|| {
                 GetOauth2CredentialProviderErrorModeled::ResourceNotFoundException(
-                    crate::state::oauth2_credential_provider_not_found(&input.name),
+                    crate::state::oauth2_credential_provider_not_found(),
                 )
             })?;
 
