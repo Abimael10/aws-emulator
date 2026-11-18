@@ -77,6 +77,7 @@ const MUST_REACH: &[&str] = &[
     "sfn",
     "sns",
     "sqs",
+    "ssm",
     "xray",
 ];
 
@@ -136,6 +137,11 @@ fn rows() -> Vec<Row> {
         Row {
             case: "a multi-word SDK id hyphenated, for another service",
             token: "cloudwatch-logs",
+            reachable: true,
+        },
+        Row {
+            case: "the configuration store an event-driven function maintains a value in",
+            token: "ssm",
             reachable: true,
         },
         Row {
