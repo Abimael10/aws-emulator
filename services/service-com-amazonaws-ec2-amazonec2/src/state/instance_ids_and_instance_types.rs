@@ -2762,6 +2762,13 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
     let secondary_network = facts
         .and_then(|facts| facts.secondary_network_supported)
         .unwrap_or(nitro_clock);
+    // "Indicates whether NitroTPM is supported" (`InstanceTypeInfo$NitroTpmSupport`): the
+    // published answer where the catalog holds the type's row, else the virtual device the Nitro
+    // hypervisor presents to the guest, which a bare metal instance has no hypervisor for. Read
+    // once, because it is also what says whether there is a `NitroTpmInfo` to report at all.
+    let nitro_tpm = facts
+        .and_then(|facts| facts.nitro_tpm_supported)
+        .unwrap_or(nitro && !record.bare_metal);
     let supported_or_not = |supported: bool| {
         if supported { "supported" } else { "unsupported" }.to_string()
     };
@@ -3043,9 +3050,11 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
         )),
         // NitroTPM is a virtual device the Nitro hypervisor presents to the guest, so a
         // bare metal instance — which has no hypervisor under it, and reports none
-        // ([`InstanceTypeInfo$Hypervisor`] above) — does not have one.
-        nitro_tpm_support: Some(supported_or_not(nitro && !record.bare_metal)),
-        nitro_tpm_info: (nitro && !record.bare_metal).then(|| NitroTpmInfo {
+        // ([`InstanceTypeInfo$Hypervisor`] above) — does not have one, and neither does a type
+        // whose own hardware the published list of the types offered NitroTPM leaves out, which
+        // the catalog holds per type.
+        nitro_tpm_support: Some(supported_or_not(nitro_tpm)),
+        nitro_tpm_info: nitro_tpm.then(|| NitroTpmInfo {
             supported_versions: Some(vec![NITRO_TPM_VERSION.to_string()]),
         }),
         media_accelerator_info: None,

@@ -1337,17 +1337,18 @@ pub fn instance_type_is_modelled(instance_type: &str) -> bool {
 ///
 /// Source: "Encryption in transit" in the Amazon EC2 User Guide, which names them one by
 /// one beside the generations that all encrypt — C5a, C5ad, C5n, D3, D3en, G4 (the NVIDIA
-/// `g4dn` and the AMD `g4ad`), I3en, I4i, Im4gn, Is4gen, M5dn, M5n, M5zn, P3dn, P4d, R5dn,
-/// R5n, X2idn, X2iedn and X2iezn. The high-memory U family that page names as `U-*` is on
-/// the same list and is answered by [`HIGH_MEMORY_ROOT`] instead, because its names carry a
+/// `g4dn` and the AMD `g4ad`), I3en, I4g, I4i, Im4gn, Is4gen, M5dn, M5n, M5zn, P3dn, P4d,
+/// R5dn, R5n, X2idn, X2iedn and X2iezn. The high-memory U family that page names as `U-*` is
+/// on the same list and is answered by [`HIGH_MEMORY_ROOT`] instead, because its names carry a
 /// memory size where every entry here carries a generation.
 ///
 /// FAMILIES, not sizes: every size of a family carries the same network adapter, so an
 /// entry is compared against [`instance_family_of`] rather than against a whole instance
 /// type.
-pub const ENCRYPTING_INSTANCE_FAMILIES: [&str; 21] = [
-    "c5a", "c5ad", "c5n", "d3", "d3en", "g4ad", "g4dn", "i3en", "i4i", "im4gn", "is4gen",
-    "m5dn", "m5n", "m5zn", "p3dn", "p4d", "r5dn", "r5n", "x2idn", "x2iedn", "x2iezn",
+pub const ENCRYPTING_INSTANCE_FAMILIES: [&str; 22] = [
+    "c5a", "c5ad", "c5n", "d3", "d3en", "g4ad", "g4dn", "i3en", "i4g", "i4i", "im4gn",
+    "is4gen", "m5dn", "m5n", "m5zn", "p3dn", "p4d", "r5dn", "r5n", "x2idn", "x2iedn",
+    "x2iezn",
 ];
 
 /// The family root of the high-memory instance types — the `U-*` of the same published
