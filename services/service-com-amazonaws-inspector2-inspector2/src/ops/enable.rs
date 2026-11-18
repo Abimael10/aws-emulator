@@ -2,7 +2,9 @@
 
 //! @op Enable
 //! IMPLEMENTED: records per-account Amazon Inspector enablement in this service's
-//! shared state and renders the requested accounts back from what it stored.
+//! shared state — including, for each scan type it switches on for the first time, the
+//! instant that scan type's free trial began — and renders the requested accounts back
+//! from what it stored.
 //!
 //! ## Shape of an operation
 //!
@@ -225,6 +227,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         resource_type.clone(),
                         crate::state::STATUS_ENABLED.to_string(),
                     );
+                    // Switching a scan type on for the first time is what starts that scan
+                    // type's free trial for the account, which is the window
+                    // `BatchGetFreeTrialInfo` reports. A scan type whose trial already began
+                    // keeps its original window, so turning it off and on again neither
+                    // restarts the trial nor hands out a second one.
+                    enablement.begin_free_trial(resource_type, now);
                 }
                 // A scan type this call did not name keeps whatever it had, and a type
                 // never enabled at all is recorded as off rather than left absent.

@@ -8,7 +8,9 @@
 //! * `accounts` — per-account Amazon Inspector enablement, written by `Enable` and read
 //!   back by `BatchGetAccountStatus`, plus that account's EC2 deep inspection
 //!   configuration, written by `UpdateEc2DeepInspectionConfiguration` and read back by
-//!   `GetEc2DeepInspectionConfiguration`.
+//!   `GetEc2DeepInspectionConfiguration`, and the instant each of its scan types' free
+//!   trial began, written where that scan type is switched on and read back by
+//!   `BatchGetFreeTrialInfo`.
 //! * `filters` — the suppression/other findings filters, keyed by their own ARN so a
 //!   record and its ARN can never diverge. `BTreeMap` iteration is stable, which is what
 //!   makes a `ListFilters` page token meaningful across calls.
@@ -82,14 +84,32 @@ pub const STATUS_DISABLED: &str = "DISABLED";
 
 /// The `ErrorCode` token a per-account entry carries when the calling account is not
 /// allowed to act on, or read, the account that entry names.
-/// Source: `smithy_query(query="shape", shape="ErrorCode")` — `ACCESS_DENIED` is one of
-/// its tokens, and `FailedAccount$errorCode` targets it.
+/// Source: `smithy_query(query="shape", shape="ErrorCode,FreeTrialInfoErrorCode")` —
+/// `ACCESS_DENIED` is a token of both, and `FailedAccount$errorCode` and
+/// `FreeTrialInfoError$code` target them, so every per-account entry of this service names
+/// that failure with one token.
 pub const ERROR_CODE_ACCESS_DENIED: &str = "ACCESS_DENIED";
 
 /// How this service words an [`ERROR_CODE_ACCESS_DENIED`] per-account entry: the calling
 /// account has no access to the account the entry names. The entry's only variable part is
 /// its `accountId`, so the message itself carries no value from the request.
 pub const NO_ACCOUNT_ACCESS_MESSAGE: &str = "Invoking account does not have access to this account";
+
+/// The `FreeTrialStatus` token of a scan type whose free trial window is still open.
+/// Source: `smithy_query(query="shape", shape="FreeTrialStatus")` — `ACTIVE | INACTIVE`.
+pub const FREE_TRIAL_ACTIVE: &str = "ACTIVE";
+
+/// The `FreeTrialStatus` token of a scan type whose free trial window has closed.
+/// Source: `smithy_query(query="shape", shape="FreeTrialStatus")`.
+pub const FREE_TRIAL_INACTIVE: &str = "INACTIVE";
+
+/// How long one scan type's Amazon Inspector free trial runs for an account.
+///
+/// Amazon Inspector documents the length of this trial — the Amazon Inspector User Guide's
+/// free-trial section (`docs.aws.amazon.com/inspector/latest/user/free-trial.html`) states
+/// that an account activating Amazon Inspector gets a 15-day free trial of each scan type —
+/// so the window is 15 days wide rather than a span this emulator chose.
+pub const FREE_TRIAL_DURATION: Duration = Duration::from_secs(15 * 24 * 60 * 60);
 
 /// The `Ec2DeepInspectionStatus` token of an account deep inspection is running for.
 /// Source: `smithy_query(query="shape", shape="Ec2DeepInspectionStatus")` —
@@ -320,6 +340,29 @@ impl Ec2DeepInspection {
     }
 }
 
+/// One scan type's Amazon Inspector free trial window for one account: when it began and
+/// when it ends, [`FREE_TRIAL_DURATION`] later.
+#[derive(Debug, Clone, Copy)]
+pub struct FreeTrialWindow {
+    /// The instant the trial began — the first time the scan type's scanning was switched
+    /// on for the account.
+    pub start: SystemTime,
+    /// The instant the trial ends, [`FREE_TRIAL_DURATION`] after it began.
+    pub end: SystemTime,
+}
+
+impl FreeTrialWindow {
+    /// The `FreeTrialStatus` this window reports at `now`: [`FREE_TRIAL_ACTIVE`] while the
+    /// window is still open, and [`FREE_TRIAL_INACTIVE`] from the instant it closes.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.end {
+            FREE_TRIAL_ACTIVE
+        } else {
+            FREE_TRIAL_INACTIVE
+        }
+    }
+}
+
 /// Amazon Inspector enablement for one account.
 #[derive(Debug, Clone, Default)]
 pub struct AccountEnablement {
@@ -332,6 +375,20 @@ pub struct AccountEnablement {
     pub resource_status: BTreeMap<String, String>,
     /// When the account was first enabled.
     pub enabled_at: Option<SystemTime>,
+    /// The instant each `ResourceScanType`'s Amazon Inspector free trial began for this
+    /// account — the first time that scan type's scanning was switched on — keyed by the
+    /// scan type. A scan type absent here has never been switched on, so its trial has not
+    /// begun and there is no window to report for it, which is a different answer from a
+    /// window that has closed.
+    ///
+    /// BOUNDED without a cap of its own: a key is only ever one of the five modelled
+    /// `ResourceScanType` tokens, and a token outside that enum is refused at the request
+    /// boundary, so this map holds at most five entries however many requests arrive.
+    ///
+    /// An entry is written once and never rewritten or removed: the trial is the account's
+    /// one 15-day window for that scan type, so turning the scan type off and on again
+    /// neither restarts it nor hands out a second one.
+    pub trial_starts: BTreeMap<String, SystemTime>,
     /// `Enable` idempotency tokens already honoured for this account, so a retry of the
     /// same request is a replay rather than a second write. A BOUNDED queue, oldest
     /// first: at most [`MAX_CLIENT_TOKENS_PER_ACCOUNT`] are kept, so caller-chosen
@@ -391,6 +448,11 @@ impl AccountEnablement {
     /// `Status` follows the scan types: it stays [`STATUS_ENABLED`] while any scan type is
     /// still on, and becomes [`STATUS_DISABLED`] once none is, because turning off every
     /// scan type in an account turns Amazon Inspector itself off for it.
+    ///
+    /// A free trial window already begun ([`Self::trial_starts`]) is left exactly as it
+    /// was: the trial is a span of the account's calendar rather than a span of scanning,
+    /// so it keeps running while the scan type is off and does not start over when the
+    /// scan type comes back on.
     pub fn disable(&mut self, resource_types: &[String]) {
         for resource_type in resource_types {
             self.resource_status
@@ -408,6 +470,26 @@ impl AccountEnablement {
             self.enabled_at = None;
             self.client_tokens.clear();
         }
+    }
+
+    /// Begin this account's free trial of `resource_type` at `now`, if it has not begun
+    /// already. Called where a scan type's scanning is switched on; a scan type whose
+    /// trial already began keeps its original window.
+    pub fn begin_free_trial(&mut self, resource_type: &str, now: SystemTime) {
+        self.trial_starts
+            .entry(resource_type.to_string())
+            .or_insert(now);
+    }
+
+    /// This account's free trial window for `resource_type`, or `None` while that scan
+    /// type's trial has not begun.
+    pub fn free_trial(&self, resource_type: &str) -> Option<FreeTrialWindow> {
+        self.trial_starts
+            .get(resource_type)
+            .map(|start| FreeTrialWindow {
+                start: *start,
+                end: *start + FREE_TRIAL_DURATION,
+            })
     }
 
     /// Whether this account was already enabled under `token`.

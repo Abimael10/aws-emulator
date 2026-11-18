@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetFreeTrialInfo
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetFreeTrialInfo`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetFreeTrialInfo::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports, for each requested account the calling account may read, the
+//! Amazon Inspector free trial window of every scan type whose scanning that account has
+//! switched on, and reports every other requested account in `failedAccounts` with
+//! `ACCESS_DENIED`. A reporting operation: it reads the shared state and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +108,14 @@ impl From<BatchGetFreeTrialInfoErrorModeled> for BatchGetFreeTrialInfoError {
     }
 }
 
+/// The `CloudProvider` token of a free trial of a `ResourceScanType` scan, whose resources
+/// are Amazon Web Services resources. The `VM`, `CONTAINER_IMAGE` and
+/// `SERVERLESS_FUNCTION` free trial types cover resources another cloud provider's
+/// connector brings in, so they belong to no scan type this service enables.
+/// Source: `smithy_query(query="shape", shape="CloudProvider,FreeTrialType")` —
+/// `AWS | AZURE | NOT_APPLICABLE`.
+const CLOUD_PROVIDER_AWS: &str = "AWS";
+
 /// The `BatchGetFreeTrialInfo` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,18 +152,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetFreeTrialInfo` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetFreeTrialInfoErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetFreeTrialInfo"))
+        let _ = ctx;
+        // A free trial window is recorded state, so a call that cannot reach this
+        // service's store has to fail rather than report a trial it never read.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetFreeTrialInfoErrorModeled::InternalServerException(InternalServerException {
+                message: "Amazon Inspector account state is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // `accountIds` is required and `@length 1..100`, and `MeteringAccountId` is
+        // `@pattern [0-9]{12}`, so the request boundary has already refused an empty list,
+        // one past a hundred ids and a malformed id: at most a hundred twelve-digit ids
+        // reach this handler. The list is NOT `@uniqueItems`, so an id named twice is
+        // collected once — a repeated id names one account, reported once, at the position
+        // it was first named.
+        // Source: `smithy_query(query="shape", shape="MeteringAccountIdList,MeteringAccountId")`.
+        let mut requested: Vec<String> = Vec::with_capacity(input.account_ids.len());
+        let mut seen: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
+        for account_id in input.account_ids {
+            if seen.insert(account_id.clone()) {
+                requested.push(account_id);
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let caller = ::engine::emulator_account_id();
+        let guard = state.lock();
+        let mut accounts = Vec::with_capacity(requested.len());
+        let mut failed_accounts = Vec::new();
+        for account_id in requested {
+            // An account outside what the caller administers is not the caller's to read,
+            // and the per-entry failure list is where that is reported: the request as a
+            // whole still succeeds, and the entry carries no trial window at all, so no
+            // free trial is ever reported for an account the caller may not see.
+            if !guard.administers_account(caller, &account_id) {
+                failed_accounts.push(FreeTrialInfoError {
+                    account_id,
+                    code: crate::state::ERROR_CODE_ACCESS_DENIED.to_string(),
+                    message: crate::state::NO_ACCOUNT_ACCESS_MESSAGE.to_string(),
+                });
+                continue;
+            }
+
+            // An account this service holds no record for has switched no scan type on, so
+            // no trial of its has begun, and it reports what an account Amazon Inspector
+            // was never enabled for reports: no trial window at all.
+            let enablement = guard.accounts.get(&account_id).cloned().unwrap_or_default();
+            let free_trial_info = crate::state::RESOURCE_SCAN_TYPES
+                .iter()
+                .filter_map(|resource_type| {
+                    // A scan type whose trial has not begun has no start and no end to
+                    // report, so it is left out of the list rather than reported with
+                    // invented instants.
+                    let window = enablement.free_trial(resource_type)?;
+                    Some(FreeTrialInfo {
+                        r#type: (*resource_type).to_string(),
+                        start: crate::state::timestamp(window.start),
+                        end: crate::state::timestamp(window.end),
+                        status: window.status(now).to_string(),
+                        cloud_provider: Some(CLOUD_PROVIDER_AWS.to_string()),
+                    })
+                })
+                .collect();
+            accounts.push(FreeTrialAccountInfo {
+                account_id,
+                free_trial_info,
+            });
+        }
+
+        Ok(BatchGetFreeTrialInfoOutput {
+            accounts,
+            failed_accounts,
+        })
     }
 }
