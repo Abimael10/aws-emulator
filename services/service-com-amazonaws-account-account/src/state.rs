@@ -436,6 +436,64 @@ pub const ENABLED_BY_DEFAULT_REGION_STATUS: &str = "ENABLED_BY_DEFAULT";
 /// `ENABLING` and then `ENABLED`.
 pub const DISABLED_REGION_STATUS: &str = "DISABLED";
 
+/// The Regions of the commercial (`aws`) partition Amazon Web Services turns on
+/// for every account, which therefore need no opt-in at all.
+///
+/// SOURCE: the "Regions that are enabled by default" table of the Amazon Web
+/// Services Account Management Reference Guide, "Specify which Amazon Web
+/// Services Regions your account can use" — the guide this API's Region-opt
+/// operations document themselves against.
+///
+/// The ENABLED set is the written list and the opt-in set is its COMPLEMENT over
+/// the published Region catalog ([`REGION_CATALOG`]), rather than the other way
+/// round, because that is the direction AWS's rule runs: a Region launched after
+/// the guide's cut-off is disabled until the account opts in, so a Region the
+/// catalog gains later is an opt-in Region without this list being touched.
+pub const REGIONS_ENABLED_BY_DEFAULT: [&str; 17] = [
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ca-central-1",
+    "eu-central-1",
+    "eu-north-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "sa-east-1",
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "us-west-2",
+];
+
+/// The Region-code prefixes of the partitions this API does NOT report Regions
+/// of: the China partition, GovCloud and the isolated partitions, whose Region
+/// codes all name their partition in their leading groups.
+///
+/// An account lives in exactly one partition and reaches only that partition's
+/// Regions, and this emulator serves the commercial one — the partition its
+/// endpoints and its signing scope name — so a Region of any other partition
+/// carries no opt status for this account at all.
+///
+/// The two isolated-partition prefixes deliberately end WITHOUT the hyphen: the
+/// codes they have to catch spell the partition letter inside that group
+/// (`us-iso-east-1`, `us-isob-east-1`, `us-isof-south-1`, `eu-isoe-west-1`), so
+/// completing them to `us-iso-` would readmit every `us-isob`/`us-isof` Region as
+/// a commercial one.
+const NON_COMMERCIAL_REGION_PREFIXES: [&str; 4] = ["cn-", "eu-iso", "us-gov-", "us-iso"];
+
+/// Whether `region_name` is a Region of the commercial partition — the partition
+/// whose Region codes name no partition at all
+/// ([`NON_COMMERCIAL_REGION_PREFIXES`]).
+fn is_commercial_region(region_name: &str) -> bool {
+    !NON_COMMERCIAL_REGION_PREFIXES
+        .iter()
+        .any(|prefix| region_name.starts_with(prefix))
+}
+
 /// Every Region of the commercial (`aws`) partition this emulator reports, with
 /// the `RegionOptStatus` an account that has neither enabled nor disabled it
 /// reports for that Region.
@@ -443,54 +501,45 @@ pub const DISABLED_REGION_STATUS: &str = "DISABLED";
 /// MEMBERSHIP is service data, not a modelled list: `RegionName` is a free
 /// string constrained only to `@length(min: 1, max: 50)`
 /// (`smithy_query(query="shape",shape="RegionName")`), so there is no modelled
-/// list to project. SOURCE: the AWS General Reference's Region table
-/// ("Regions, Availability Zones, and Local Zones") together with the opt-in
-/// Regions the Account Management guide lists under "Specify which AWS Regions
-/// your account can use" — the Regions a new account must enable before use. A
-/// Region AWS turns on by default is `ENABLED_BY_DEFAULT` here; an opt-in Region
-/// is `DISABLED` until `EnableRegion` says otherwise.
+/// list to project. It is DERIVED from the catalog of Regions this emulator
+/// publishes (`emulator_telemetry::policy::KNOWN_REGIONS`, "every AWS region the
+/// wire may carry", already sorted), narrowed to the commercial partition
+/// ([`is_commercial_region`]) — the same source the Region catalog of the service
+/// that publishes each Region's opt-in status derives from — rather than from a
+/// second hand-written membership list that would drift from it. A Region the
+/// emulator publishes but this catalog omitted would carry no opt status for the
+/// account, and every endpoint gated on that status would serve a Region the
+/// account cannot use.
 ///
-/// Regions of the GovCloud and China partitions are deliberately absent: this
-/// emulator serves the commercial partition, which is the partition its
-/// endpoints and its signing scope name.
+/// The status is the catalog's DEFAULT, before any opt call: a Region of
+/// [`REGIONS_ENABLED_BY_DEFAULT`] is `ENABLED_BY_DEFAULT`, and every other Region
+/// of the partition requires an opt-in, so it is `DISABLED` until `EnableRegion`
+/// says otherwise.
 ///
-/// Kept SORTED by Region code and free of duplicates: `ListRegions` reports it in
-/// this order and pages through it by Region code, so a resume point is a
-/// position in this sequence.
-pub const REGION_CATALOG: &[(&str, &str)] = &[
-    ("af-south-1", DISABLED_REGION_STATUS),
-    ("ap-east-1", DISABLED_REGION_STATUS),
-    ("ap-northeast-1", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("ap-northeast-2", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("ap-northeast-3", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("ap-south-1", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("ap-south-2", DISABLED_REGION_STATUS),
-    ("ap-southeast-1", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("ap-southeast-2", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("ap-southeast-3", DISABLED_REGION_STATUS),
-    ("ap-southeast-4", DISABLED_REGION_STATUS),
-    ("ap-southeast-5", DISABLED_REGION_STATUS),
-    ("ap-southeast-7", DISABLED_REGION_STATUS),
-    ("ca-central-1", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("ca-west-1", DISABLED_REGION_STATUS),
-    ("eu-central-1", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("eu-central-2", DISABLED_REGION_STATUS),
-    ("eu-north-1", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("eu-south-1", DISABLED_REGION_STATUS),
-    ("eu-south-2", DISABLED_REGION_STATUS),
-    ("eu-west-1", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("eu-west-2", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("eu-west-3", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("il-central-1", DISABLED_REGION_STATUS),
-    ("me-central-1", DISABLED_REGION_STATUS),
-    ("me-south-1", DISABLED_REGION_STATUS),
-    ("mx-central-1", DISABLED_REGION_STATUS),
-    ("sa-east-1", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("us-east-1", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("us-east-2", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("us-west-1", ENABLED_BY_DEFAULT_REGION_STATUS),
-    ("us-west-2", ENABLED_BY_DEFAULT_REGION_STATUS),
-];
+/// SORTED by Region code and free of duplicates: `ListRegions` reports it in this
+/// order and pages through it by Region code, so a resume point is a position in
+/// this sequence, and [`catalog_region_status`] finds a Region by binary search.
+/// The order is established HERE rather than assumed of the source catalog, so a
+/// source that ever carried an out-of-order entry cannot turn that lookup into a
+/// silent miss.
+pub static REGION_CATALOG: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
+    let mut catalog: Vec<(&'static str, &'static str)> = ::emulator_telemetry::policy::KNOWN_REGIONS
+        .iter()
+        .copied()
+        .filter(|region| is_commercial_region(region))
+        .map(|region| {
+            let status = if REGIONS_ENABLED_BY_DEFAULT.contains(&region) {
+                ENABLED_BY_DEFAULT_REGION_STATUS
+            } else {
+                DISABLED_REGION_STATUS
+            };
+            (region, status)
+        })
+        .collect();
+    catalog.sort_unstable();
+    catalog.dedup();
+    catalog
+});
 
 /// The status [`REGION_CATALOG`] gives `region_name` before any account-specific
 /// opt-in is recorded, or `None` for a Region code the catalog does not hold.
