@@ -487,14 +487,17 @@ pub(super) fn handler_error_code(code: &str) -> &'static str {
 /// provider that names the resource in its own report of a refusal — a bucket whose name is
 /// already taken ([`s3_bucket::handler_message`]) — states it from here, so the event says
 /// WHICH resource the refusal was about.
+///
+/// A type CloudFormation provisions ITSELF has no provider answer to quote, and its failure is
+/// therefore reported in CloudFormation's own words with no envelope around them
+/// ([`own_failure_reason`]).
 pub(in crate::state) fn handler_failure_reason(owner: Option<Owner>, refusal: &Refusal, identifier: &str) -> String {
-    // A service that worded no message at all still named the error, and the code is then
-    // all there is to report.
-    let message = if refusal.message.is_empty() {
-        refusal.code.as_str()
-    } else {
-        refusal.message.as_str()
-    };
+    // A type CloudFormation provisions itself: no provider answered for the resource, so there
+    // is nothing to quote and the refusal stands as it reads.
+    if owner.is_some_and(|owner| !owner.reported_by_a_resource_provider()) {
+        return own_failure_reason(refusal);
+    }
+    let message = stated_message(refusal);
     let class = match owner {
         Some(owner) => owner.handler_error_class(&refusal.code, handler_error_code(&refusal.code)),
         None => handler_error_code(&refusal.code),
@@ -513,6 +516,35 @@ pub(in crate::state) fn handler_failure_reason(owner: Option<Owner>, refusal: &R
          HandlerErrorCode: {class})",
         crate::state::new_request_id(),
     )
+}
+
+/// What a refusal STATES: the message it worded, or — for a service that worded none at all
+/// but still named the error — the code it named, which is then all there is to report.
+fn stated_message(refusal: &Refusal) -> &str {
+    if refusal.message.is_empty() {
+        refusal.code.as_str()
+    } else {
+        refusal.message.as_str()
+    }
+}
+
+/// The `ResourceStatusReason` the event for a failed resource of a type CLOUDFORMATION
+/// PROVISIONS ITSELF carries: the refusal exactly as it stands.
+///
+/// The envelope [`handler_failure_reason`] builds is CloudFormation QUOTING a resource
+/// provider — the registry extension of the service that owns the type, whose answer
+/// CloudFormation reports beside the token of the resource request it answered and the class
+/// that answer falls in. A type CloudFormation deploys itself has no such provider: a nested
+/// stack is created by CloudFormation's own `CreateStack` ([`nested_stack`]), so what fails
+/// that resource is CloudFormation's own account of why the stack was not created and is
+/// reported as it reads — with no quoting, no request token and no handler class, none of
+/// which any provider supplied.
+///
+/// Only [`handler_failure_reason`] decides this, from the type whose resource failed
+/// ([`Owner::reported_by_a_resource_provider`]), so the question is asked once wherever a
+/// refusal is recorded.
+fn own_failure_reason(refusal: &Refusal) -> String {
+    stated_message(refusal).to_string()
 }
 
 /// CLOUDFORMATION's own reason for a create the owning service refused because the name is

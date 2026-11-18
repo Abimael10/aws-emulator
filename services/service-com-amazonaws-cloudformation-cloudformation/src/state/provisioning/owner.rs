@@ -1372,8 +1372,10 @@ impl Owner {
             Self::Ec2VpcNetwork(_) | Self::Ec2Instance => message.to_string(),
             // Amazon Cognito Identity's and Amazon Cognito user pools' do the same.
             Self::CognitoIdentityPool(_) | Self::CognitoUserPool(_) => message.to_string(),
-            // The nested-stack provider reports what CloudFormation answered as it came: the
-            // child's own refusal, which is the account of why the stack was not created.
+            // A nested stack is provisioned by CloudFormation itself rather than by a provider
+            // of another service ([`Self::reported_by_a_resource_provider`]), so there is no
+            // provider wording to add: what CloudFormation answered about the child is the
+            // account of why the stack was not created, and it stands as it came.
             Self::NestedStack => message.to_string(),
             // AWS Secrets Manager's and AWS Step Functions' do the same.
             Self::SecretsManagerRotationSchedule
@@ -1399,6 +1401,20 @@ impl Owner {
             // And so does Amazon Athena's.
             Self::Athena(_) => message.to_string(),
         }
+    }
+
+    /// Whether a failure of a resource of this type is a RESOURCE PROVIDER's answer — the
+    /// registry extension of the service that owns the type, which CloudFormation asks to
+    /// create, update and delete it and whose refusal it then quotes
+    /// ([`super::handler_failure_reason`]).
+    ///
+    /// A type CloudFormation deploys ITSELF is provisioned by no such provider: a nested stack
+    /// is created by CloudFormation's own `CreateStack` ([`nested_stack`]), so what fails its
+    /// resource is CloudFormation's own account of why the stack was not created and is
+    /// reported in those words ([`super::own_failure_reason`]) rather than attributed to a
+    /// provider that answered nothing.
+    pub(super) fn reported_by_a_resource_provider(self) -> bool {
+        !matches!(self, Self::NestedStack)
     }
 
     /// Which `HandlerErrorCode` class this type's provider puts a refusal carrying `code`
