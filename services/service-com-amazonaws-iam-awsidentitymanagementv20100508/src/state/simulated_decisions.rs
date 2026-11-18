@@ -138,9 +138,23 @@ const RESOURCE_POLICY_SOURCE: &str = "Resource Policy";
 /// as an input"): the input member it arrived in, of which there is exactly one.
 const RESOURCE_POLICY_ID: &str = "ResourcePolicy";
 
+/// How the cross-account decision detail names the permissions boundary's own contribution
+/// ("the decision for each policy type (identity-based policy, resource-based policy, and
+/// permissions boundary)"), beside [`IDENTITY_POLICY_SOURCE`] and
+/// [`RESOURCE_POLICY_SOURCE`], which name the other two policy types a simulation decides
+/// from.
+const BOUNDARY_POLICY_SOURCE: &str = "Permissions Boundary";
+
 /// How a `MatchedStatements` entry identifies a document the request supplied in
 /// `PolicyInputList`: that member and the document's position in it, counted from one.
 pub const SUPPLIED_POLICY_ID: &str = "PolicyInputList";
+
+/// What a simulation answers for an entry of `ActionNames` that does not name BOTH a service
+/// and an action ("each operation must include the service identifier, such as
+/// iam:CreateUser"): the one fixed sentence IAM words that refusal in, which names neither
+/// the member nor the value the request supplied — the value it was handed is precisely one
+/// with no names in it to report.
+pub const ACTION_MISSING_NAMES: &str = "The action is invalid since it is missing names";
 
 /// The simulation scenarios `ResourceHandlingOption` names, each with the resources the
 /// request must define to run it.
@@ -320,16 +334,15 @@ pub fn request_defect(request: &SimulationInput<'_>) -> Option<String> {
 
     // "Each operation must include the service identifier, such as iam:CreateUser": an
     // action name with no service prefix names no action, so nothing can be decided
-    // about it.
-    if let Some(action) = request
+    // about it. The refusal is the one fixed sentence IAM words it in
+    // ([`ACTION_MISSING_NAMES`]), which echoes nothing: the value it was handed carries no
+    // names to report.
+    if request
         .action_names
         .iter()
-        .find(|action| !names_a_service_action(action))
+        .any(|action| !names_a_service_action(action))
     {
-        return Some(format!(
-            "Invalid Action name: {action} must name a service and an action, as in \
-             iam:CreateUser"
-        ));
+        return Some(ACTION_MISSING_NAMES.to_string());
     }
 
     // "A list of ARNs of Amazon Web Services resources to include in the simulation …
@@ -545,6 +558,19 @@ struct Decided {
     /// Whether the service control policies in force allowed this pair, when the request
     /// named any level of a hierarchy at all.
     allowed_by_organizations: Option<bool>,
+    /// The keys the pair's decision needed a value for that the documents in force on the
+    /// PRINCIPAL reference — its own result's list less the ones only the resource-based
+    /// policy tests, which is what the ACTION's own result is folded from
+    /// ([`evaluate_page`]): "each resource in the simulation is treated as if it had this
+    /// policy attached" (`ResourcePolicy`), so a key only that policy tests was needed to
+    /// decide about a RESOURCE and is reported by that resource's own result.
+    identity_missing_context_keys: Vec<String>,
+    /// Whether the action can be performed on this resource AT ALL
+    /// ([`super::action_resource_types::applies_to_resource`]): a pair naming a resource the
+    /// action is not published to take is a request that action could not have been made
+    /// as, so it is reported on its own — as nothing permitted — without being part of what
+    /// the ACTION's own result says about the action's resource type.
+    applies: bool,
 }
 
 /// What the documents in force decide about each action of ONE page, over every resource
@@ -569,23 +595,32 @@ pub async fn evaluate_page(
     // over the finished page, so the request is refused at the entry that reaches the bound
     // and nothing is retained for a page that cannot be answered.
     let mut reported_statements = 0usize;
+    // Whether the simulation is about NAMED resources: a request that named concrete resource
+    // ARNs asks what the documents decide about those resources, while one that named none —
+    // or named the wildcard explicitly — asks about "* (all resources)". Two members of the
+    // action's own result are answered by which of the two it is: the resource that result is
+    // about, and whether the per-policy-type detail is reported at all (see below).
+    let simulates_named_resources = resources
+        .iter()
+        .any(|resource| resource != ANY_RESOURCE);
     for action in actions {
         let mut per_resource: Vec<ResourceSpecificResult> = Vec::new();
+        // Whether the action can be performed on each of those resources at all, one entry
+        // per entry of `per_resource` ([`Decided::applies`]).
+        let mut applicable: Vec<bool> = Vec::new();
         // The hierarchy allowed the ACTION only where it allowed it on every resource
         // the request asked about, the way the permissions boundary's detail beside it is
         // aggregated ([`boundary_detail`]).
         let mut allowed_by_organizations: Option<bool> = None;
         // "A list of context keys that are required by the included input policies but
-        // that were not provided by one of the input parameters": the keys the DECISION
-        // needed a value for and the request carried none, which each resource's own
-        // result already reports for its own pair ([`decide`]) — a pair reaches the
-        // statements its action and resource match, so two pairs can need different keys.
-        // The action's own result reports the union of its resources', the way it reports
-        // the union of their matched statements; the per-resource lists are reported only
-        // where the response carries the per-resource results at all. "This list is used
-        // when the resource in a simulation is '*' … if you include a list of resources,
-        // then any missing context values are instead included under the
-        // ResourceSpecificResults section."
+        // that were not provided by one of the input parameters … in the top-level result,
+        // this field contains the deduplicated set of missing context values across all
+        // requested resources": the keys the DECISION needed a value for, folded over the
+        // resources the action was decided about — the ones the documents in force on the
+        // PRINCIPAL needed, since a key only the resource-based policy tests was needed to
+        // decide about a resource and is reported by that resource's own result
+        // ([`Decided::identity_missing_context_keys`]). The per-resource lists are reported
+        // only where the response carries the per-resource results at all.
         //
         // Folded as each pair is decided rather than over the finished page, so the bound
         // below is reached — and the request refused — at the pair that reaches it,
@@ -603,21 +638,20 @@ pub async fn evaluate_page(
                 allowed_by_organizations =
                     Some(allowed && allowed_by_organizations.unwrap_or(true));
             }
-            fold_keys_into(
-                &mut missing,
-                decided
-                    .result
-                    .missing_context_values
-                    .iter()
-                    .flatten()
-                    .cloned(),
-            );
+            fold_keys_into(&mut missing, decided.identity_missing_context_keys);
             // The list is reported on every result the page carries, so its length is a
             // factor of the response's size: past the bound the request is refused rather
             // than answered with a report nothing bounds. Truncating the list instead
             // would be worse — a short list would read as "these are the only keys
             // missing".
-            if missing.len() > MAX_SIMULATED_CONTEXT_KEYS {
+            let reported_keys = missing.len().max(
+                decided
+                    .result
+                    .missing_context_values
+                    .as_ref()
+                    .map_or(0, Vec::len),
+            );
+            if reported_keys > MAX_SIMULATED_CONTEXT_KEYS {
                 return Err(format!(
                     "Invalid value for PolicyInputList: the policies in force test more \
                      than {MAX_SIMULATED_CONTEXT_KEYS} context keys the request supplied \
@@ -634,6 +668,7 @@ pub async fn evaluate_page(
                 return Err(too_many_reported_statements());
             }
             per_resource.push(decided.result);
+            applicable.push(decided.applies);
             decided_pairs += 1;
             // The evaluation is synchronous work inside an async handler, so it hands the
             // executor back periodically: one simulation never holds a worker for its
@@ -648,7 +683,31 @@ pub async fn evaluate_page(
                 result.missing_context_values = None;
             }
         }
-        let first = per_resource.first().cloned().unwrap_or_default();
+        // What the ACTION's own result is aggregated from: the pairs whose resource the
+        // action can be performed on. A named resource the action is not published to take is
+        // a request that action could not have been made as, reported as such in its own
+        // entry ([`decide`]) — it is not a resource the action was withheld on, so it does
+        // not make what the action's own result says about the action's resource type more
+        // restrictive. Nothing to aggregate is nothing stated about the action.
+        let aggregated: Vec<&ResourceSpecificResult> = per_resource
+            .iter()
+            .zip(&applicable)
+            .filter_map(|(result, applies)| applies.then_some(result))
+            .collect();
+        let decision = most_restrictive(&aggregated);
+        // "This parameter is populated for only cross-account simulations. It contains a
+        // brief summary of how each policy type contributes to the final evaluation
+        // decision. In the top-level result, this map reports the most restrictive decision
+        // per policy type across all requested resources. If the simulation evaluates
+        // policies within the same account and includes a resource ARN, then the parameter
+        // is present but the response is empty. If the simulation evaluates policies within
+        // the same account and specifies all resources (*), then the parameter is not
+        // returned" (`EvaluationResult$EvalDecisionDetails`).
+        let decision_details = if simulated.cross_account {
+            Some(most_restrictive_per_policy_type(&aggregated))
+        } else {
+            simulates_named_resources.then(::std::collections::HashMap::new)
+        };
         // "In the top-level result, this field contains the union of matched statements
         // across all requested resources" — so the statements the action's own result
         // reports are every resource's, each named once. The union counts against what the
@@ -677,8 +736,23 @@ pub async fn evaluate_page(
         }
         results.push(EvaluationResult {
             eval_action_name: action.clone(),
-            eval_resource_name: Some(first.eval_resource_name.clone()),
-            eval_decision: most_restrictive(&per_resource),
+            // What the ACTION's own result is ABOUT, which is what the resources the request
+            // named leave it to be: a request that named ONE resource asks what the documents
+            // decide about that resource, so the aggregate is about it and names it; a
+            // request that named several has no one resource for its aggregate to be about,
+            // so the result names the action's resource type instead — "the ARN template for
+            // the simulated resource type … or `*` if no ARN format is defined for the
+            // action. This is not a specific customer-provided resource ARN. To find the
+            // decision for a specific resource, use `ResourceSpecificResults`"
+            // (`EvaluationResult$EvalResourceName`), which is where each of those resources
+            // is named with its own decision; and a request that named none is about
+            // "* (all resources)", which is what it reports.
+            eval_resource_name: Some(match (simulates_named_resources, resources) {
+                (false, _) => ANY_RESOURCE.to_string(),
+                (true, [resource]) => resource.clone(),
+                (true, _) => super::action_resource_types::resource_arn_template(action),
+            }),
+            eval_decision: decision,
             // "In the top-level result, this field contains the deduplicated set of
             // missing context values across all requested resources": the member is what
             // the result reports about the keys the decision needed, so it is REPORTED
@@ -701,13 +775,39 @@ pub async fn evaluate_page(
             organizations_decision_detail: Some(OrganizationsDecisionDetail {
                 allowed_by_organizations: allowed_by_organizations.unwrap_or(true),
             }),
-            // `EvalDecisionDetails` is for a decision reported per policy TYPE, which
-            // nothing here reports: the decision's sources are already named by the
-            // details beside it and by the statements it reports.
-            eval_decision_details: None,
+            eval_decision_details: decision_details,
         });
     }
     Ok(results)
+}
+
+/// What each policy TYPE said about the ACTION, from what it said about each of the
+/// resources the action's own result is aggregated from: "in the top-level result, this map
+/// reports the most restrictive decision per policy type across all requested resources"
+/// (`EvaluationResult$EvalDecisionDetails`), which is the order [`most_restrictive`]
+/// aggregates the decision beside it by ([`restrictiveness`]).
+///
+/// A policy type no pair reported is absent, the way it is absent from a pair's own detail:
+/// a type that took no part in the simulation said nothing about the action.
+fn most_restrictive_per_policy_type(
+    per_resource: &[&ResourceSpecificResult],
+) -> ::std::collections::HashMap<String, String> {
+    let mut folded: ::std::collections::HashMap<String, String> =
+        ::std::collections::HashMap::new();
+    let details = per_resource
+        .iter()
+        .filter_map(|result| result.eval_decision_details.as_ref());
+    for detail in details {
+        for (policy_type, decision) in detail {
+            match folded.get(policy_type) {
+                Some(held) if restrictiveness(held) >= restrictiveness(decision) => {}
+                _ => {
+                    folded.insert(policy_type.clone(), decision.clone());
+                }
+            }
+        }
+    }
+    folded
 }
 
 /// What the documents in force decide about one `(action, resource)` pair, and which
@@ -755,6 +855,9 @@ fn decide(
                 eval_resource_decision: DECISION_IMPLICIT_DENY.to_string(),
                 missing_context_values: None,
                 matched_statements: Some(Vec::new()),
+                // No document was read for this pair, so no policy type contributed a
+                // decision to report per type — the detail says nothing where nothing was
+                // evaluated.
                 eval_decision_details: None,
                 permissions_boundary_decision_detail: (!simulated.boundary.is_empty()).then_some(
                     PermissionsBoundaryDecisionDetail {
@@ -763,6 +866,10 @@ fn decide(
                 ),
             },
             allowed_by_organizations: (!simulated.organization_levels.is_empty()).then_some(false),
+            // No document was read for this pair, so no condition in one was reached for a
+            // value to have been missing.
+            identity_missing_context_keys: Vec::new(),
+            applies: false,
         };
     }
     let granting = iam::Request::new(action, resource, simulated.granting_principals)
@@ -869,35 +976,62 @@ fn decide(
         }
     }
 
+    // The keys THIS pair's decision needed a value for and the request supplied none: every
+    // document that took part in it is asked, since a condition in any of them is one the
+    // simulation needed the value for. Each answer is already bounded by the evaluation
+    // (`service_common::iam_authorization::MAX_REQUIRED_CONTEXT_KEYS`), and the list kept
+    // per pair stops one key past the bound this report is answered under and holds no name
+    // longer than one ([`MAX_CONTEXT_KEY_NAME_CHARACTERS`]) — so the page's retention is its
+    // pairs times two constants of this module rather than times what the documents carry;
+    // [`evaluate_page`] refuses past the first of them.
+    //
+    // The keys the PRINCIPAL's own documents needed are kept apart from the ones only the
+    // resource-based policy did, because the two are reported in different places
+    // ([`Decided::identity_missing_context_keys`]).
+    let identity_missing_context_keys = folded_keys(
+        identity
+            .required_context_keys
+            .iter()
+            .chain(&from_boundary.required_context_keys)
+            .chain(&from_organizations.required_context_keys)
+            .take(MAX_SIMULATED_CONTEXT_KEYS + 1)
+            .cloned(),
+    );
+    let missing_context_values = folded_keys(
+        identity_missing_context_keys
+            .iter()
+            .chain(&from_resource.required_context_keys)
+            .take(MAX_SIMULATED_CONTEXT_KEYS + 1)
+            .cloned(),
+    );
+
     Decided {
         result: ResourceSpecificResult {
             eval_resource_name: resource.to_string(),
             eval_resource_decision: decision.to_string(),
-            // The keys THIS pair's decision needed a value for and the request supplied
-            // none: every document that took part in it is asked, since a condition in any
-            // of them is one the simulation needed the value for. Each answer is already
-            // bounded by the evaluation
-            // (`service_common::iam_authorization::MAX_REQUIRED_CONTEXT_KEYS`), and the
-            // list kept per pair stops one key past the bound this report is answered
-            // under and holds no name longer than one
-            // ([`MAX_CONTEXT_KEY_NAME_CHARACTERS`]) — so the page's retention is its pairs
-            // times two constants of this module rather than times what the documents
-            // carry; [`evaluate_page`] refuses past the first of them.
-            missing_context_values: {
-                let missing = folded_keys(
-                    identity
-                        .required_context_keys
-                        .iter()
-                        .chain(&from_resource.required_context_keys)
-                        .chain(&from_boundary.required_context_keys)
-                        .chain(&from_organizations.required_context_keys)
-                        .take(MAX_SIMULATED_CONTEXT_KEYS + 1)
-                        .cloned(),
-                );
-                (!missing.is_empty()).then_some(missing)
-            },
+            // "A list of context keys that are required by the included input policies but
+            // that were not provided by one of the input parameters … this list is used when
+            // a list of ARNs is included in the ResourceArns parameter instead of '*'"
+            // (`ResourceSpecificResult$MissingContextValues`): what the decision about THIS
+            // resource needed, which includes the keys the resource-based policy tests —
+            // "each resource in the simulation is treated as if it had this policy attached"
+            // (`ResourcePolicy`), so those keys were needed to decide about a resource and
+            // are reported by the resource's own result.
+            missing_context_values: (!missing_context_values.is_empty())
+                .then_some(missing_context_values),
             matched_statements: Some(matched.into_entries()),
-            eval_decision_details: None,
+            // "Additional details about the results of the evaluation decision on a single
+            // resource. This parameter is returned only for cross-account simulations"
+            // (`ResourceSpecificResult$EvalDecisionDetails`): within one account an allow
+            // from either side grants, so there is no per-type decision to explain; across
+            // accounts both sides have to allow, which is what the detail reports.
+            eval_decision_details: simulated.cross_account.then(|| {
+                decision_per_policy_type(
+                    identity.decision,
+                    simulated.resource_policy.map(|_| from_resource.decision),
+                    (!no_boundary).then_some(from_boundary.decision),
+                )
+            }),
             permissions_boundary_decision_detail: (!no_boundary).then_some(
                 PermissionsBoundaryDecisionDetail {
                     allowed_by_permissions_boundary: allowed_by_boundary,
@@ -905,6 +1039,48 @@ fn decide(
             ),
         },
         allowed_by_organizations: (!no_organization).then_some(allowed_by_organizations),
+        identity_missing_context_keys,
+        applies: true,
+    }
+}
+
+/// What each policy TYPE that took part in one pair's decision said about it, as the
+/// cross-account detail reports it: "a brief summary of how each policy type contributes to
+/// the final evaluation decision" (`EvaluationResult$EvalDecisionDetails`), over the policy
+/// types the operations take — the identity-based policies, the resource-based policy the
+/// request supplied and the permissions boundary in force.
+///
+/// A type that took no part in the simulation is not reported: the resource-based policy
+/// where the request supplied none, and the boundary where none is simulated, said nothing
+/// about the request rather than withholding it.
+fn decision_per_policy_type(
+    identity: iam::Decision,
+    from_resource: Option<iam::Decision>,
+    from_boundary: Option<iam::Decision>,
+) -> ::std::collections::HashMap<String, String> {
+    [
+        Some((IDENTITY_POLICY_SOURCE, identity)),
+        from_resource.map(|decision| (RESOURCE_POLICY_SOURCE, decision)),
+        from_boundary.map(|decision| (BOUNDARY_POLICY_SOURCE, decision)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|(policy_type, decision)| {
+        (policy_type.to_string(), decision_alone(decision).to_string())
+    })
+    .collect()
+}
+
+/// What ONE side's outcome is as a `PolicyEvaluationDecisionType` value: a statement that
+/// denied is the explicit deny, one that allowed the allow, and a side that stated nothing
+/// about the request the implicit deny — the same three values the decision the pair is
+/// reported with takes ([`super::authorization::decision_name`], which answers what the two
+/// sides TOGETHER decided).
+fn decision_alone(decision: iam::Decision) -> &'static str {
+    match decision {
+        iam::Decision::Denied => DECISION_EXPLICIT_DENY,
+        iam::Decision::Allowed => DECISION_ALLOWED,
+        iam::Decision::NotStated => DECISION_IMPLICIT_DENY,
     }
 }
 
@@ -998,8 +1174,8 @@ fn fold_keys_into<I: IntoIterator<Item = String>>(
     }
 }
 
-/// The decision the ACTION's own result reports, from the decisions its resources were
-/// each decided.
+/// The decision the ACTION's own result reports, from the decisions the resources it is
+/// aggregated from were each decided.
 ///
 /// "The top-level `EvalDecision` reflects the most restrictive decision across all
 /// resources (for example, if any resource produces `explicitDeny`, the top-level
@@ -1011,15 +1187,15 @@ fn fold_keys_into<I: IntoIterator<Item = String>>(
 ///
 /// The order is IAM's own: an explicit deny is the most restrictive outcome, then the
 /// implicit deny, then the allow ([`restrictiveness`]).
-fn most_restrictive(per_resource: &[ResourceSpecificResult]) -> String {
+fn most_restrictive(per_resource: &[&ResourceSpecificResult]) -> String {
     per_resource
         .iter()
         .map(|result| result.eval_resource_decision.as_str())
         .max_by_key(|decision| restrictiveness(decision))
         // Nothing to aggregate is nothing stated about the request, which is the implicit
-        // deny; a page always decides at least one resource, so this is the value of a
-        // decision no resource was asked for rather than a fallback the response is built
-        // from.
+        // deny: a page always decides at least one resource, and a page every resource of
+        // which is one the action cannot be performed on is a page nothing stated anything
+        // about.
         .unwrap_or(DECISION_IMPLICIT_DENY)
         .to_string()
 }

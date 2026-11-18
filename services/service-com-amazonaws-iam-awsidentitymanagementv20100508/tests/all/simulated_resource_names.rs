@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How a simulation refuses a `ResourceArns` entry that names no resource.
+//! How a simulation refuses a `ResourceArns` entry that names no resource, and an
+//! `ActionNames` entry that names no action.
 //!
-//! The rule under test: an entry of `ResourceArns` that is neither an Amazon Resource Name
-//! nor the wildcard the member defaults to names no resource a statement's `Resource`
+//! The first rule under test: an entry of `ResourceArns` that is neither an Amazon Resource
+//! Name nor the wildcard the member defaults to names no resource a statement's `Resource`
 //! element could be decided against, so the request is refused `InvalidInput` (HTTP 400)
 //! with the message naming every such entry, in the order the request carries them. "A list
 //! of ARNs of Amazon Web Services resources to include in the simulation. If this parameter
 //! is not provided, then the value defaults to * (all resources)"
 //! (`SimulateCustomPolicyRequest$ResourceArns`).
+//!
+//! The second: an entry of `ActionNames` that does not name BOTH a service and an action
+//! names no action either — "each operation is evaluated for each resource. Each operation
+//! must include the service identifier, such as iam:CreateUser" (`ActionNames`) — and is
+//! refused under the same code with the one fixed sentence IAM words that refusal in, which
+//! echoes nothing of the request.
 //!
 //! The suite is a TABLE whose rows differ along what the rule generalises over: how the
 //! entry fails to be an ARN (no `arn` prefix, too few fields, an empty partition or
@@ -46,10 +53,25 @@ async fn simulate(
     principal_arn: &str,
     resources: &[&str],
 ) -> (u16, String) {
-    let mut owned: Vec<(String, String)> = vec![
-        ("PolicyInputList.member.1".to_string(), DOCUMENT.to_string()),
-        ("ActionNames.member.1".to_string(), ACTION.to_string()),
-    ];
+    simulate_actions(router, operation, principal_arn, &[ACTION], resources).await
+}
+
+/// One call of `operation` asking about `actions` over `resources`.
+async fn simulate_actions(
+    router: &MultiServiceRouter,
+    operation: &str,
+    principal_arn: &str,
+    actions: &[&str],
+    resources: &[&str],
+) -> (u16, String) {
+    let mut owned: Vec<(String, String)> =
+        vec![("PolicyInputList.member.1".to_string(), DOCUMENT.to_string())];
+    for (position, action) in (1..).zip(actions) {
+        owned.push((
+            format!("ActionNames.member.{position}"),
+            (*action).to_string(),
+        ));
+    }
     for (position, resource) in (1..).zip(resources) {
         owned.push((
             format!("ResourceArns.member.{position}"),
@@ -194,6 +216,89 @@ const SERVED_CASES: &[(&str, &[&str])] = &[
         &[BUCKET, "arn:aws:dynamodb:us-east-1:000000000000:table/orders"],
     ),
 ];
+
+/// What a simulation answers for an entry of `ActionNames` that names no action, written out
+/// here rather than taken from the implementation's constant: what this suite pins is the
+/// SENTENCE IAM answers, so a reworded constant has to fail here rather than agree with
+/// itself.
+const ACTION_MISSING_NAMES: &str = "The action is invalid since it is missing names";
+
+/// RULE: an entry of `ActionNames` that does not name both a service and an action is
+/// refused `InvalidInput` with that one sentence, which echoes nothing of the request —
+/// whichever simulation operation took the list, and wherever in the list the entry sits.
+#[tokio::test]
+async fn an_action_naming_no_service_and_action_is_refused() {
+    let router = router();
+    let principal = "action-names-principal";
+    create_user(&router, "the named principal", principal, &[]).await;
+    let principal_arn = user_arn(principal);
+
+    // The rows differ along the way the value fails to name both halves — a separator that
+    // is not the one an action name uses, no separator at all, each half left empty — and
+    // along where in the list it sits.
+    let rows: &[(&str, &[&str])] = &[
+        ("a dot where the separator belongs", &["s3.ListBucket"]),
+        ("no separator at all", &["ListBucket"]),
+        ("an empty service", &[":ListBucket"]),
+        ("an empty action", &["s3:"]),
+        ("the second of two entries", &[ACTION, "s3.ListBucket"]),
+        ("the first of two entries", &["s3.ListBucket", ACTION]),
+    ];
+
+    for operation in OPERATIONS {
+        for (case, actions) in rows {
+            let (status, body) =
+                simulate_actions(&router, operation, &principal_arn, actions, &[]).await;
+            let code = error_code(&body);
+            assert_eq!(
+                (status, code.as_str()),
+                (400, INVALID_INPUT),
+                "case {operation:?}/{case:?}: expected HTTP 400 {INVALID_INPUT}, got {status} \
+                 {code}: {body}"
+            );
+            let message = element(&body, "Message");
+            assert_eq!(
+                message, ACTION_MISSING_NAMES,
+                "case {operation:?}/{case:?}: expected the message \
+                 {ACTION_MISSING_NAMES:?}, got {message:?}: {body}"
+            );
+            for named in *actions {
+                assert!(
+                    !message.contains(named),
+                    "case {operation:?}/{case:?}: the refusal must echo nothing of the \
+                     request, got {message:?}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: an action name that DOES name a service and an action is not refused on this ground
+/// at all, whatever the casing or the service — it is simulated and reported back.
+#[tokio::test]
+async fn an_action_naming_both_halves_is_simulated() {
+    let router = router();
+    let principal = "action-names-served";
+    create_user(&router, "the named principal", principal, &[]).await;
+    let principal_arn = user_arn(principal);
+
+    for operation in OPERATIONS {
+        for action in [ACTION, "iam:ListUsers", "S3:ListBucket", "a:b"] {
+            let (status, body) =
+                simulate_actions(&router, operation, &principal_arn, &[action], &[]).await;
+            assert_eq!(
+                status, 200,
+                "case {operation:?}/{action:?}: expected 200, got {status}: {body}"
+            );
+            assert_eq!(
+                element(&body, "EvalActionName"),
+                action,
+                "case {operation:?}/{action:?}: expected the action to be reported back: \
+                 {body}"
+            );
+        }
+    }
+}
 
 /// RULE: a list whose every entry names a resource is not refused on this ground at all —
 /// an ARN of any service, with or without a Region and an account, and the wildcard the

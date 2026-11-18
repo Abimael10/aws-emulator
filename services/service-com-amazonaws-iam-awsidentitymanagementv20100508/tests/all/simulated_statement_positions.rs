@@ -11,9 +11,13 @@
 //!    from: `StartPosition` is "the row and column of the beginning of the Statement in an
 //!    IAM policy" and `EndPosition` "the row and column of the end of a Statement in an IAM
 //!    policy" (`Statement$StartPosition` / `$EndPosition`, each a `Position` of `Line` and
-//!    `Column`) — so the statement begins at the row and column of its first character and
-//!    ends at those one character past its last, counted from one, and two statements of
-//!    ONE document are told apart by them.
+//!    `Column`) — so the statement ends at the row and column one character past its last
+//!    and begins where the statement before it ended, the first statement of a document at
+//!    its own first character, all counted from one, and two statements of ONE document are
+//!    told apart by them. The spans of one document therefore TILE it: the separator written
+//!    between two statements belongs to the span of the one that follows it, so how a
+//!    document spaces its separators does not move a statement's beginning relative to the
+//!    statement before it.
 //! 2. `MissingContextValues` is "a list of context keys that are required by the included
 //!    input policies but that were not provided by one of the input parameters", which "in
 //!    the top-level result … contains the deduplicated set of missing context values across
@@ -67,13 +71,20 @@ const MINIFIED: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow"
 /// position in it: the statement opens at the 41st character and ends at the 104th.
 const SPACED: &str = r#"{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "iam:ListUsers", "Resource": "*"}]}"#;
 
-/// Two statements, of which the SECOND is about the simulated action: it opens at the 97th
-/// character and ends at the 155th, where the first opens at the 38th.
+/// Two statements, of which the SECOND is about the simulated action: the first opens at the
+/// 38th character and ends at the 96th, where the second's span begins; the second closes at
+/// the 154th character, so it ends at the 155th.
 const SECOND_STATEMENT: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:ListRoles","Resource":"*"},{"Effect":"Allow","Action":"iam:ListUsers","Resource":"*"}]}"#;
 
+/// The same two statements written with a space after the separator between them, which
+/// moves the second statement's own `{` by one character but not the position its span
+/// begins at: the first still ends at the 96th character and the second's span still begins
+/// there, two characters before its `{`, and it ends at the 156th.
+const SECOND_STATEMENT_SPACED: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:ListRoles","Resource":"*"}, {"Effect":"Allow","Action":"iam:ListUsers","Resource":"*"}]}"#;
+
 /// An `Allow` of the action followed by a `Deny` of it: the explicit deny is what
-/// determines the decision, so the entry locates the SECOND statement, which opens at the
-/// 97th character and ends at the 154th.
+/// determines the decision, so the entry locates the SECOND statement, whose span begins at
+/// the 96th character — where the first statement ended — and ends at the 154th.
 const ALLOW_THEN_DENY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:ListUsers","Resource":"*"},{"Effect":"Deny","Action":"iam:ListUsers","Resource":"*"}]}"#;
 
 /// `Statement` stated as the single statement an object carries rather than as a list: it
@@ -122,14 +133,21 @@ const LOCATED: &[Located] = &[
         case: "the second of two statements",
         document: SECOND_STATEMENT,
         decision: ALLOWED,
-        start: (1, 97),
+        start: (1, 96),
         end: (1, 155),
+    },
+    Located {
+        case: "the second of two statements written with a space after the separator",
+        document: SECOND_STATEMENT_SPACED,
+        decision: ALLOWED,
+        start: (1, 96),
+        end: (1, 156),
     },
     Located {
         case: "the deny that overrides an allow before it",
         document: ALLOW_THEN_DENY,
         decision: EXPLICIT_DENY,
-        start: (1, 97),
+        start: (1, 96),
         end: (1, 154),
     },
     Located {
@@ -525,4 +543,73 @@ fn reports_no_missing_key(body: &str) -> bool {
     let present = body.contains("<MissingContextValues></MissingContextValues>")
         || body.contains("<MissingContextValues/>");
     present && missing_keys(body).is_empty()
+}
+
+/// What a document states before its first statement, and the statement the rows below
+/// state several of, which allows the action they simulate.
+const STATEMENT_PREFIX: &str = r#"{"Version":"2012-10-17","Statement":["#;
+const ONE_STATEMENT: &str = r#"{"Effect":"Allow","Action":"iam:ListUsers","Resource":"*"}"#;
+
+/// A document stating `count` identical allowing statements separated by `separator`, with
+/// the column its first statement's own `{` is at.
+fn separated_statements(count: usize, separator: &str) -> (String, i32) {
+    let statements = vec![ONE_STATEMENT; count];
+    let document = format!("{STATEMENT_PREFIX}{}]}}", statements.join(separator));
+    let opens_at = i32::try_from(STATEMENT_PREFIX.len() + 1).expect("the prefix is short");
+    (document, opens_at)
+}
+
+/// RULE 1 as the INVARIANT it is: the spans of one document TILE it — each statement ends
+/// one character past its own last and begins where the statement before it ended — so how
+/// widely the document spaces the separator between two statements moves a statement's own
+/// `{` but not the position its span begins at.
+#[tokio::test]
+async fn each_statement_begins_where_the_statement_before_it_ended() {
+    let statement_characters =
+        i32::try_from(ONE_STATEMENT.len()).expect("one statement is short");
+    let router = router();
+    let principal = "located-tiled";
+    create_user(&router, "the simulated principal", principal, &[]).await;
+    let arn = user_arn(principal);
+
+    // The rows differ along what the rule generalises over: how widely the document spaces
+    // the separator between two statements, and how many statements it states.
+    for separator in [",", ", ", ",   "] {
+        for count in [1usize, 2, 4] {
+            let case = format!("{count} statements separated by {separator:?}");
+            let (document, opens_at) = separated_statements(count, separator);
+            for operation in OPERATIONS {
+                let (status, body) =
+                    simulate(&router, operation, &arn, &document, LIST_USERS, &[]).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}/{operation}: expected 200, got {status}: {body}"
+                );
+                // Derived from the rule rather than listed per row: each statement ends
+                // `ONE_STATEMENT`'s length past its own `{`, the next one opens a separator
+                // later, and a statement begins where the one before it ended.
+                let mut expected: Vec<((i32, i32), (i32, i32))> = Vec::new();
+                let mut opens = opens_at;
+                let mut ended: Option<i32> = None;
+                for _ in 0..count {
+                    let ends = opens + statement_characters;
+                    expected.push(((1, ended.unwrap_or(opens)), (1, ends)));
+                    ended = Some(ends);
+                    opens = ends + i32::try_from(separator.len()).expect("a short separator");
+                }
+                let starts = positions(&body, "StartPosition");
+                let ends = positions(&body, "EndPosition");
+                let located: Vec<((i32, i32), (i32, i32))> =
+                    starts.into_iter().zip(ends).collect();
+                // Every statement allows the simulated action, so the action's own result
+                // names all of them — and the request names no resource, so there is no
+                // per-resource result repeating them.
+                assert_eq!(
+                    located, expected,
+                    "case {case:?}/{operation}: expected the statements located at \
+                     {expected:?}, got {located:?}: {body}"
+                );
+            }
+        }
+    }
 }

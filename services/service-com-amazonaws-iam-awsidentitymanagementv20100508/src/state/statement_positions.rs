@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! WHERE each statement of a policy document sits in the text that document was read
-//! from: the row and column it BEGINS at, which are those of its first character, and the
-//! row and column it ENDS at, which are those one character past its last — so a statement
-//! occupies the columns from the one up to, and not including, the other.
+//! from: the row and column it BEGINS at and the row and column it ENDS at, which are those
+//! one character past its last — so a statement occupies the columns from the one up to, and
+//! not including, the other.
+//!
+//! The spans of the statements of ONE document are CONTIGUOUS: a statement begins where the
+//! statement before it ended, so the separator between two statements belongs to the span of
+//! the one that follows it, and the FIRST statement of a document begins at its own first
+//! character. That is what makes the span of a statement independent of how the document is
+//! written: a document laid out `},{` and one laid out `}, {` both report the statement
+//! after the separator as beginning where the one before it ended, and no position of the
+//! document is attributed to no statement.
 //!
 //! A simulation reports the statements that determined its decision
 //! (`EvaluationResult$MatchedStatements`), and each entry of that report locates the
@@ -65,7 +73,8 @@ const MAX_LOCATED_STATEMENTS: usize = 10_000;
 /// Where ONE statement begins and ends in the document it was read from.
 #[derive(Debug, Clone)]
 pub struct StatementSpan {
-    /// The row and column the statement BEGINS at: those of its first character.
+    /// The row and column the statement BEGINS at: where the statement before it ended, or
+    /// those of its own first character when it is the first statement of the document.
     pub start: Position,
     /// The row and column the statement ENDS at: those one character past its last, so a
     /// statement occupies the columns from [`Self::start`] up to but not including this
@@ -76,14 +85,34 @@ pub struct StatementSpan {
 /// Where each statement of `document` sits in it, in document order — so the entry at
 /// index `n` is the span of the statement the evaluation counts as `n`.
 ///
+/// The spans TILE the statement list: the statement at index `n` begins where the statement
+/// at `n - 1` ended, which is one character past that statement's last, and the statement at
+/// index `0` begins at its own first character. So the separator a document puts between two
+/// statements — a comma, and whatever space is written around it — is part of the span of
+/// the statement that follows it, and how the document is laid out around a statement does
+/// not change where that statement is reported to begin relative to the one before it.
+///
 /// Empty for a document that locates nothing: one this cannot read as JSON, one whose
 /// top-level value is not an object, and one whose `Statement` element is neither an array
 /// nor an object — all of which the evaluation reads as stating no statement either.
 pub fn statement_spans(document: &str) -> Vec<StatementSpan> {
     let ranges = statement_byte_ranges(document);
+    // The byte range of each statement, with its start moved back to where the statement
+    // before it ended: the statements' spans then tile the list, leaving no position of the
+    // document attributed to no statement.
+    let tiled: Vec<(usize, usize)> = ranges
+        .iter()
+        .enumerate()
+        .map(|(at, (start, end))| {
+            match at.checked_sub(1).and_then(|before| ranges.get(before)) {
+                Some((_, ended)) => (*ended, *end),
+                None => (*start, *end),
+            }
+        })
+        .collect();
     // The ranges are in document order and do not overlap, so the offsets they are made of
     // ascend — which is what lets one walk of the text resolve all of them.
-    let wanted: Vec<usize> = ranges
+    let wanted: Vec<usize> = tiled
         .iter()
         .flat_map(|(start, end)| [*start, *end])
         .collect();
@@ -157,8 +186,9 @@ fn byte_range(value: &JsonValue<'_>) -> (usize, usize) {
     (range.start, range.end)
 }
 
-/// The row and column of each byte offset of `offsets`, which ASCEND, in one walk of
-/// `document`.
+/// The row and column of each byte offset of `offsets`, which ASCEND — two offsets may be
+/// the same one, where a statement begins where the statement before it ended — in one walk
+/// of `document`.
 ///
 /// The row is counted from one at the document's first line and the column from one at each
 /// line's first character, which is how a `Position` of a policy document's text reads
@@ -214,8 +244,9 @@ mod tests {
             .collect()
     }
 
-    /// RULE: each statement BEGINS at the row and column of its first character and ENDS
-    /// at those one character past its last, both counted from one.
+    /// RULE: each statement ENDS at the row and column one character past its last and
+    /// BEGINS where the statement before it ended, both counted from one — the first
+    /// statement of a document at its own first character.
     #[test]
     fn a_statement_is_located_from_its_first_character_to_past_its_last() {
         // (case, the document, the span of each of its statements)
@@ -235,7 +266,15 @@ mod tests {
             (
                 "two statements on one line",
                 r#"{"Statement":[{"Effect":"Allow"},{"Effect":"Deny"}]}"#,
-                &[(1, 15, 1, 33), (1, 34, 1, 51)],
+                // The second begins where the first ended, at the `,` between them.
+                &[(1, 15, 1, 33), (1, 33, 1, 51)],
+            ),
+            (
+                "two statements written with a space after the separator",
+                r#"{"Statement":[{"Effect":"Allow"}, {"Effect":"Deny"}]}"#,
+                // The second still begins where the first ended, two characters before its
+                // own `{`: the separator and the space after it are part of its span.
+                &[(1, 15, 1, 33), (1, 33, 1, 52)],
             ),
             (
                 "a statement spanning several lines",
@@ -262,7 +301,7 @@ mod tests {
             (
                 "a repeated statement element, of which the last is read",
                 r#"{"Statement":[{"Effect":"Allow"}],"Statement":[{"Effect":"Deny"},{"Effect":"Allow"}]}"#,
-                &[(1, 48, 1, 65), (1, 66, 1, 84)],
+                &[(1, 48, 1, 65), (1, 65, 1, 84)],
             ),
             (
                 "a statement the document ends with",

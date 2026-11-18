@@ -213,8 +213,11 @@ async fn an_action_with_no_resource_type_is_decided_only_on_the_wildcard() {
 }
 
 /// RULE: the pairs of ONE request are decided independently, so a request naming several
-/// resources reports the wildcard-only action's decision per resource, and the action's own
-/// decision is the most restrictive of them.
+/// resources reports the wildcard-only action's decision per resource, while the action's
+/// own decision is the most restrictive of the resources the action can be performed on at
+/// all — a resource it cannot be performed on is a request that action could not have been
+/// made as, reported as such in its own entry and not part of what the action's own result
+/// says about the action's resource type.
 #[tokio::test]
 async fn each_named_resource_of_one_request_is_decided_on_its_own() {
     let router = router();
@@ -248,14 +251,17 @@ async fn each_named_resource_of_one_request_is_decided_on_its_own() {
         ],
         "expected one decision per (action, resource) pair, in request order: {body}"
     );
+    // The mint cannot be performed on the repository at all, so that pair is not one of the
+    // resources its own result is aggregated from: what is left is the wildcard, which the
+    // grant covers.
     assert_eq!(
         crate::policy_simulation::reported(&body),
         vec![
-            ("ecr:GetAuthorizationToken".to_string(), IMPLICIT_DENY.to_string()),
+            ("ecr:GetAuthorizationToken".to_string(), ALLOWED.to_string()),
             ("ecr:BatchGetImage".to_string(), ALLOWED.to_string()),
         ],
-        "expected each action's own decision to be the most restrictive of its \
-         resources': {body}"
+        "expected each action's own decision to be the most restrictive of the resources it \
+         can be performed on: {body}"
     );
 }
 

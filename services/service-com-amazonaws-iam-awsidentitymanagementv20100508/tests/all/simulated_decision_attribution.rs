@@ -24,6 +24,11 @@
 //!    detail beside it aggregated the same way — while each resource keeps its own
 //!    decision in `ResourceSpecificResults`.
 //!
+//! Three more rules, about WHAT each part of that report is and which detail it carries,
+//! are stated where they are tested further down: the resource the action's own result is
+//! about, the resources an action is decided on at all, and the two details a cross-account
+//! simulation reports.
+//!
 //! `tests/all/simulated_resource_policy.rs` is the sibling suite that spans the
 //! principal element's forms with a user's inline policy as the only identity source;
 //! the rows here differ along the axes it holds fixed — WHERE the deciding identity
@@ -41,7 +46,7 @@ use crate::simulated_resource_policy::{
     attribution, inline_policy_id, parts, user_inline_policy_id, IDENTITY_POLICY, RESOURCE_POLICY,
     RESOURCE_POLICY_ID,
 };
-use crate::user_lifecycle::{call, element, elements, router};
+use crate::user_lifecycle::{account_id, call, element, elements, router};
 
 /// How a `MatchedStatements` entry identifies the FIRST document a request supplied in
 /// `PolicyInputList`: that member and the document's position in it, counted from one.
@@ -475,8 +480,11 @@ async fn the_actions_result_reports_the_most_restrictive_resource_decision() {
         );
         // Each of those entries is a different statement, which is what the span it
         // carries says: two entries of one document are told apart by where they are in it.
-        let spans = elements(top, "Column");
-        let distinct: std::collections::BTreeSet<&String> = spans.iter().collect();
+        // The spans of one document TILE it — a statement begins where the statement before
+        // it ended — so what has to differ is the SPAN, not every number in it.
+        let columns = elements(top, "Column");
+        let spans: Vec<&[String]> = columns.chunks(2).collect();
+        let distinct: std::collections::BTreeSet<&[String]> = spans.iter().copied().collect();
         assert_eq!(
             distinct.len(),
             spans.len(),
@@ -673,5 +681,428 @@ async fn expect_ok(
     assert_eq!(
         status, 200,
         "case {case:?}: {operation} must succeed, got {status}: {body}"
+    );
+}
+
+// RULE 3, 4 and 5 below are about WHAT a result is and which part of the report carries
+// which detail, which is the same projection rules 1 and 2 above are about:
+//
+// 3. the action's own result is ABOUT the action and the resource the simulation was about
+//    — "the ARN template for the simulated resource type (for example,
+//    `arn:${Partition}:s3:::${BucketName}/${KeyName}`), or `*` if no ARN format is defined
+//    for the action. This is not a specific customer-provided resource ARN"
+//    (`EvaluationResult$EvalResourceName`) where the request named several resources, the
+//    one resource it named where it named one, and `*` where it named none — while each
+//    `ResourceSpecificResults` entry names its own resource;
+// 4. an action is decided only on the resources it can be PERFORMED on: a named resource of
+//    another service than the one the action acts on is a request that action could not have
+//    been made as, reported `implicitDeny` in its own entry and not part of the action's own
+//    aggregate;
+// 5. `EvalDecisionDetails` is the CROSS-ACCOUNT detail: "this parameter is populated for
+//    only cross-account simulations … if the simulation evaluates policies within the same
+//    account and includes a resource ARN, then the parameter is present but the response is
+//    empty. If the simulation evaluates policies within the same account and specifies all
+//    resources (`*`), then the parameter is not returned"
+//    (`EvaluationResult$EvalDecisionDetails`), and `MissingContextValues` reports a key
+//    where the document that needed it is in force: the documents on the PRINCIPAL by the
+//    action's own result, and a key only the resource-based policy tests by the result of
+//    the resource that policy is treated as attached to.
+
+/// Resources the rows of those three suites are about: two of one service, one of another,
+/// and a role, so what a result names cannot be keyed to one ARN form.
+const OTHER_OBJECT_ARN: &str = "arn:aws:s3:::quarterly-reports/2026/q2.csv";
+const TASK_DEFINITION_ARN: &str = "arn:aws:ecs:us-west-2:000000000000:task-definition/reports:1";
+const OTHER_TASK_DEFINITION_ARN: &str =
+    "arn:aws:ecs:us-west-2:000000000000:task-definition/reports:2";
+const LOG_STREAM_ARN: &str = "arn:aws:logs:us-west-2:000000000000:log-group:app:log-stream:one";
+const OTHER_LOG_STREAM_ARN: &str =
+    "arn:aws:logs:us-west-2:000000000000:log-group:app:log-stream:two";
+
+/// One grant covering every action those rows ask about, written on `*` so no row's decision
+/// turns on how the statement is scoped: what the rows differ along is the RESOURCE the
+/// request names, not what the document says about it.
+const ALLOW_EVERY_PROJECTED_ACTION: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:ListAllMyBuckets","ecs:RunTask","iam:PassRole","logs:PutLogEvents"],"Resource":"*"}]}"#;
+
+/// The text of each `EvaluationResults` member of a response, in report order: each result
+/// opens with the action it is about, and what follows it up to the next one — the members
+/// of that result and its `ResourceSpecificResults` — belongs to it.
+fn projected_results(body: &str) -> Vec<&str> {
+    const OPENS: &str = "<EvalActionName>";
+    let within = body
+        .split_once("<EvaluationResults>")
+        .map_or(body, |(_, rest)| rest);
+    let within = within
+        .split_once("</EvaluationResults>")
+        .map_or(within, |(part, _)| part);
+    let mut found: Vec<&str> = Vec::new();
+    let mut rest = within;
+    while let Some(at) = rest.find(OPENS) {
+        let from = &rest[at..];
+        let ends = from[OPENS.len()..]
+            .find(OPENS)
+            .map_or(from.len(), |next| next + OPENS.len());
+        found.push(&from[..ends]);
+        rest = &from[ends..];
+    }
+    found
+}
+
+/// The text of a result's `EvalDecisionDetails` element, or `None` when the result carries
+/// none: the query protocol writes a present-and-empty map either as an element with nothing
+/// between its tags or as a self-closed one.
+fn decision_details(part: &str) -> Option<String> {
+    if part.contains("<EvalDecisionDetails/>") {
+        return Some(String::new());
+    }
+    let (_, rest) = part.split_once("<EvalDecisionDetails>")?;
+    let (within, _) = rest.split_once("</EvalDecisionDetails>")?;
+    Some(within.to_string())
+}
+
+/// The keys one part of a report names under `MissingContextValues`, in report order.
+fn missing_keys(part: &str) -> Vec<String> {
+    const OPEN: &str = "<MissingContextValues>";
+    const CLOSE: &str = "</MissingContextValues>";
+    let mut found = Vec::new();
+    let mut rest = part;
+    while let Some(start) = rest.find(OPEN) {
+        let text = &rest[start + OPEN.len()..];
+        let end = text
+            .find(CLOSE)
+            .unwrap_or_else(|| panic!("{OPEN} is never closed in {part}"));
+        found.extend(elements(&text[..end], "member"));
+        rest = &text[end + CLOSE.len()..];
+    }
+    found
+}
+
+/// One row of the resource-name table.
+struct Named {
+    case: &'static str,
+    action: &'static str,
+    /// The resources the request names, if any.
+    resources: &'static [&'static str],
+    /// What the ACTION's own result must name as the resource it is about.
+    expected: &'static str,
+}
+
+/// Rows spanning how many resources one request names, the service they belong to, and
+/// whether the action is published with a resource type at all.
+///
+/// The templates are the ARN formats those services publish their resources under
+/// (`crate::state::action_resource_types`'s catalog, read from the Service Authorization
+/// Reference), and `*` is what an action published with no resource type has no ARN format
+/// for.
+const NAMED: &[Named] = &[
+    Named {
+        case: "a request naming no resource",
+        action: "s3:GetObject",
+        resources: &[],
+        expected: "*",
+    },
+    Named {
+        case: "a request naming the wildcard resource",
+        action: "s3:GetObject",
+        resources: &["*"],
+        expected: "*",
+    },
+    Named {
+        case: "a request naming one object",
+        action: "s3:GetObject",
+        resources: &[OBJECT_ARN],
+        expected: OBJECT_ARN,
+    },
+    Named {
+        case: "a request naming two objects",
+        action: "s3:GetObject",
+        resources: &[OBJECT_ARN, OTHER_OBJECT_ARN],
+        expected: "arn:aws:s3:::${BucketName}/${KeyName}",
+    },
+    Named {
+        case: "a request naming two resources of a regional service",
+        action: "ecs:RunTask",
+        resources: &[TASK_DEFINITION_ARN, OTHER_TASK_DEFINITION_ARN],
+        expected: "arn:aws:ecs:${Region}:${Account}:${ResourceType}/${ResourcePath}",
+    },
+    Named {
+        case: "a request naming two resources of another regional service",
+        action: "logs:PutLogEvents",
+        resources: &[LOG_STREAM_ARN, OTHER_LOG_STREAM_ARN],
+        expected: "arn:aws:logs:${Region}:${Account}:${ResourceType}/${ResourcePath}",
+    },
+    Named {
+        case: "a request naming two resources for an action with no resource type",
+        action: "s3:ListAllMyBuckets",
+        resources: &[OBJECT_ARN, OTHER_OBJECT_ARN],
+        expected: "*",
+    },
+];
+
+/// RULE 3: the action's own result names the resource the simulation was about — the one
+/// resource a request named, the ARN template of the action's resource type where it named
+/// several, and the wildcard where it named none — while each per-resource result names its
+/// own resource.
+#[tokio::test]
+async fn the_actions_result_names_the_resource_the_simulation_is_about() {
+    let router = router();
+    let user_name = "projected-names";
+    let arn = create_user(&router, "named resources", user_name).await;
+    put_policy(
+        &router,
+        "named resources",
+        "PutUserPolicy",
+        &[("UserName", user_name)],
+        "allow-the-asked-actions",
+        ALLOW_EVERY_PROJECTED_ACTION,
+    )
+    .await;
+
+    for case in NAMED {
+        let (status, body) = simulate(&router, &arn, &[case.action], case.resources, &[]).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected 200, got {status}: {body}",
+            case.case
+        );
+        let reported = projected_results(&body);
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {:?}: expected one result for one action, got {body}",
+            case.case
+        );
+        let (own, per_resource) = parts(reported[0]);
+        let named = element(own, "EvalResourceName");
+        assert_eq!(
+            named, case.expected,
+            "case {:?}: expected the action's result to be about {:?}, got {named:?}: {body}",
+            case.case, case.expected
+        );
+        // Each resource the request named keeps its own ARN in its own result: "the name of
+        // the simulated resource, in Amazon Resource Name (ARN) format"
+        // (`ResourceSpecificResult$EvalResourceName`).
+        let per_resource_names = elements(per_resource, "EvalResourceName");
+        let expected_names: Vec<String> = case
+            .resources
+            .iter()
+            .map(|resource| (*resource).to_string())
+            .collect();
+        assert_eq!(
+            per_resource_names, expected_names,
+            "case {:?}: expected each resource to name itself {expected_names:?}, got \
+             {per_resource_names:?}: {body}",
+            case.case
+        );
+    }
+}
+
+/// RULE 4: a named resource the action cannot be performed on is reported `implicitDeny` in
+/// its own entry and is not part of what the action's own result says — so two actions of
+/// two services asked about one resource of each are each decided on the resource that is
+/// theirs.
+#[tokio::test]
+async fn an_action_is_decided_only_on_the_resources_it_can_be_performed_on() {
+    let router = router();
+    let user_name = "projected-services";
+    let arn = create_user(&router, "resources of two services", user_name).await;
+    put_policy(
+        &router,
+        "resources of two services",
+        "PutUserPolicy",
+        &[("UserName", user_name)],
+        "allow-the-asked-actions",
+        ALLOW_EVERY_PROJECTED_ACTION,
+    )
+    .await;
+    let role = format!("arn:aws:iam::{}:role/task-execution", account_id());
+    let (status, body) = simulate(
+        &router,
+        &arn,
+        &["ecs:RunTask", "iam:PassRole"],
+        &[TASK_DEFINITION_ARN, &role],
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "expected 200, got {status}: {body}");
+    let reported = projected_results(&body);
+    assert_eq!(
+        reported.len(),
+        2,
+        "expected one result per action, got {body}"
+    );
+
+    // (the action, the decision each resource reaches in request order, the action's own
+    // decision, the resource type its result is about): the task definition is a resource of
+    // the task run alone and the role one of the role handover alone, while the grant covers
+    // every resource — so what differs between the two results is which of the two named
+    // resources the action can be performed on.
+    let expected: [(&str, [&str; 2], &str, &str); 2] = [
+        (
+            "ecs:RunTask",
+            [ALLOWED, IMPLICIT_DENY],
+            ALLOWED,
+            "arn:aws:ecs:${Region}:${Account}:${ResourceType}/${ResourcePath}",
+        ),
+        (
+            "iam:PassRole",
+            [IMPLICIT_DENY, ALLOWED],
+            ALLOWED,
+            "arn:aws:iam::${Account}:${ResourceType}/${ResourceName}",
+        ),
+    ];
+    for (at, (action, per_resource_decisions, decision, about)) in expected.iter().enumerate() {
+        let (own, per_resource) = parts(reported[at]);
+        assert_eq!(
+            element(own, "EvalActionName"),
+            *action,
+            "case {action:?}: expected the results in request order, got {body}"
+        );
+        assert_eq!(
+            element(own, "EvalDecision"),
+            *decision,
+            "case {action:?}: expected the action's own decision to be {decision}, got {body}"
+        );
+        assert_eq!(
+            element(own, "EvalResourceName"),
+            *about,
+            "case {action:?}: expected the action's result to be about {about}, got {body}"
+        );
+        let decisions = elements(per_resource, "EvalResourceDecision");
+        let expected_decisions: Vec<String> = per_resource_decisions
+            .iter()
+            .map(|decision| (*decision).to_string())
+            .collect();
+        assert_eq!(
+            decisions, expected_decisions,
+            "case {action:?}: expected each resource to be decided on its own \
+             {expected_decisions:?}, got {decisions:?}: {body}"
+        );
+    }
+}
+
+/// An identity policy whose grant is guarded by a condition over a key no request below
+/// supplies: the key the PRINCIPAL's own documents needed.
+const GUARDED_BY_A_TAG: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*","Condition":{"StringEquals":{"aws:PrincipalTag/team":"core"}}}]}"#;
+
+/// The key `GUARDED_BY_A_TAG` tests, and the one the resource-based policy below tests.
+const TAG_KEY: &str = "aws:PrincipalTag/team";
+const TRANSPORT_KEY: &str = "aws:SecureTransport";
+
+/// RULE 5, first half: the key a document in force on the PRINCIPAL needed is reported by
+/// the action's own result, and a key only the resource-based policy tests by the result of
+/// the resource that policy is treated as attached to.
+#[tokio::test]
+async fn a_key_is_reported_where_the_document_that_needed_it_is_in_force() {
+    let router = router();
+    let user_name = "projected-keys";
+    let arn = create_user(&router, "keys by document", user_name).await;
+    put_policy(
+        &router,
+        "keys by document",
+        "PutUserPolicy",
+        &[("UserName", user_name)],
+        "guarded",
+        GUARDED_BY_A_TAG,
+    )
+    .await;
+    let resource_policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{arn}"}},"Action":"s3:GetObject","Resource":"{OBJECT_ARN}","Condition":{{"Bool":{{"aws:SecureTransport":"true"}}}}}}]}}"#
+    );
+    let extra = vec![("ResourcePolicy".to_string(), resource_policy)];
+    let (status, body) = simulate(&router, &arn, &["s3:GetObject"], &[OBJECT_ARN], &extra).await;
+    assert_eq!(status, 200, "expected 200, got {status}: {body}");
+    let reported = projected_results(&body);
+    assert_eq!(reported.len(), 1, "expected one result, got {body}");
+    let (own, per_resource) = parts(reported[0]);
+    assert_eq!(
+        missing_keys(own),
+        vec![TAG_KEY.to_string()],
+        "expected the action's own result to report the key its own documents needed: {body}"
+    );
+    let mut expected = vec![TAG_KEY.to_string(), TRANSPORT_KEY.to_string()];
+    expected.sort();
+    let mut reported_per_resource = missing_keys(per_resource);
+    reported_per_resource.sort();
+    assert_eq!(
+        reported_per_resource, expected,
+        "expected the resource's own result to report the keys both the principal's \
+         documents and the policy attached to it needed: {body}"
+    );
+    // Neither condition can hold without a value, so nothing granted the request: the
+    // report above is of a decision and not of a list the response carries regardless.
+    assert_eq!(
+        element(own, "EvalDecision"),
+        IMPLICIT_DENY,
+        "expected the unsatisfiable conditions to leave nothing granting: {body}"
+    );
+}
+
+/// RULE 5, second half: `EvalDecisionDetails` is present and empty for a same-account
+/// simulation that names a resource, absent for one about all resources, and carries a
+/// decision per policy type for a cross-account one.
+#[tokio::test]
+async fn the_decision_detail_reports_what_each_policy_type_said_across_accounts() {
+    let router = router();
+    let user_name = "projected-detail";
+    let arn = create_user(&router, "decision detail", user_name).await;
+    put_policy(
+        &router,
+        "decision detail",
+        "PutUserPolicy",
+        &[("UserName", user_name)],
+        "allow-the-asked-actions",
+        ALLOW_EVERY_PROJECTED_ACTION,
+    )
+    .await;
+
+    // Same account, one named resource: the member is present and carries nothing.
+    let (status, body) = simulate(&router, &arn, &["s3:GetObject"], &[OBJECT_ARN], &[]).await;
+    assert_eq!(status, 200, "expected 200, got {status}: {body}");
+    assert_eq!(
+        decision_details(projected_results(&body)[0]),
+        Some(String::new()),
+        "expected a same-account simulation naming a resource to report the detail empty: \
+         {body}"
+    );
+
+    // Same account, no resource named: the member is not returned at all.
+    let (status, body) = simulate(&router, &arn, &["s3:GetObject"], &[], &[]).await;
+    assert_eq!(status, 200, "expected 200, got {status}: {body}");
+    assert_eq!(
+        decision_details(projected_results(&body)[0]),
+        None,
+        "expected a simulation about all resources to report no detail: {body}"
+    );
+
+    // Another account's resource, with the policy attached to it: both sides have to allow,
+    // so the detail says what each policy type decided.
+    let another_account = "210987654321";
+    let other_object = format!("arn:aws:s3:::{another_account}-reports/q1.csv");
+    let resource_policy = allow_principal(&arn, "s3:GetObject", &other_object);
+    let extra = vec![
+        ("ResourcePolicy".to_string(), resource_policy),
+        ("ResourceOwner".to_string(), another_account.to_string()),
+    ];
+    let (status, body) =
+        simulate(&router, &arn, &["s3:GetObject"], &[&other_object], &extra).await;
+    assert_eq!(status, 200, "expected 200, got {status}: {body}");
+    let detail = decision_details(projected_results(&body)[0])
+        .unwrap_or_else(|| panic!("a cross-account simulation must report the detail: {body}"));
+    for policy_type in [IDENTITY_POLICY, RESOURCE_POLICY] {
+        assert!(
+            detail.contains(policy_type),
+            "expected the cross-account detail to report {policy_type:?}, got {detail:?}: \
+             {body}"
+        );
+    }
+    assert!(
+        detail.contains(ALLOWED),
+        "expected the cross-account detail to report what each side decided, got \
+         {detail:?}: {body}"
+    );
+    assert_eq!(
+        element(projected_results(&body)[0], "EvalDecision"),
+        ALLOWED,
+        "expected both sides allowing to grant the cross-account request: {body}"
     );
 }
