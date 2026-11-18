@@ -13,6 +13,10 @@
 //!    `KeyIdentifier` resolving through it) and every later `DeleteAlias` sees a name
 //!    that no longer exists, and the name is free for a new `CreateAlias`. The key the
 //!    alias named is untouched.
+//! 3. A registry entry is held under the exact alias name and is removed whatever
+//!    binding it currently holds — a live key, no key at all, or a key whose deletion
+//!    is already scheduled — and removing one name removes no other name the registry
+//!    holds, however close to it.
 //!
 //! A name the registry does not hold is refused with `ResourceNotFoundException`,
 //! whose `ResourceId` is the alias name the request asked for — the identifier that
@@ -26,6 +30,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::alias_binding_lifecycle::alias_of;
 use crate::key_lifecycle::{call, error_code, ok_call, router, string};
 
 /// A `CreateKey` body for one symmetric data-encryption key: the attribute set this
@@ -219,6 +224,157 @@ async fn a_name_the_registry_never_held_is_refused_by_both_readers_and_the_delet
                 &name,
             );
         }
+    }
+}
+
+/// RULE: the registry entry is removed whatever binding it holds, and the key the
+/// entry named keeps the record it had — "Deletes the alias, but doesn't affect the
+/// underlying key".
+///
+/// The rows differ along the binding the entry holds when the delete arrives: a key
+/// that is live, no key at all (`UpdateAlias` naming none removes the binding and
+/// leaves the alias in the registry), and a key whose deletion is already scheduled.
+/// None of them is the binding the issue cited; the rule is the same for each.
+#[tokio::test]
+async fn deleting_an_alias_removes_its_entry_whatever_binding_it_holds() {
+    let router = router();
+    for (index, binding) in ["a live key", "no key", "a key scheduled for deletion"]
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("alias/binding-{index}");
+        let case = format!("bound to {binding}: {name}");
+        let key_arn = fresh_key_arn(&router).await;
+        ok_call(
+            &router,
+            "CreateAlias",
+            &json!({"AliasName": name, "KeyArn": key_arn}),
+        )
+        .await;
+        // The `KeyState` the key record must still report after the alias is deleted:
+        // the state the setup below left it in.
+        let key_state = match binding {
+            "no key" => {
+                ok_call(&router, "UpdateAlias", &json!({"AliasName": name})).await;
+                "CREATE_COMPLETE"
+            }
+            "a key scheduled for deletion" => {
+                ok_call(&router, "DeleteKey", &json!({"KeyIdentifier": key_arn})).await;
+                "DELETE_PENDING"
+            }
+            _ => "CREATE_COMPLETE",
+        };
+
+        // Whatever it binds, the registry holds the name before the delete.
+        let live = ok_call(&router, "GetAlias", &json!({"AliasName": name})).await;
+        assert_eq!(
+            string(&alias_of(&case, &live), "AliasName"),
+            name,
+            "case {case}: the registry must hold the name before it is deleted"
+        );
+
+        let deleted = ok_call(&router, "DeleteAlias", &json!({"AliasName": name})).await;
+        assert!(
+            deleted.is_null() || deleted.as_object().is_some_and(|body| body.is_empty()),
+            "case {case}: DeleteAlias answers an empty output, got {deleted}"
+        );
+
+        // The entry is gone: no reader resolves the name, and deleting it again finds
+        // nothing to delete.
+        let (status, parsed) = call(&router, "GetAlias", &json!({"AliasName": name})).await;
+        assert_unknown_alias_refusal(&format!("{case}, read after delete"), status, &parsed, &name);
+        assert!(
+            !listed_alias_names(&router).await.contains(&name),
+            "case {case}: a deleted alias must not be listed"
+        );
+        let (status, parsed) = call(&router, "DeleteAlias", &json!({"AliasName": name})).await;
+        assert_unknown_alias_refusal(&format!("{case}, second delete"), status, &parsed, &name);
+
+        // And the key the entry named is exactly as the setup left it.
+        let read = ok_call(&router, "GetKey", &json!({"KeyIdentifier": key_arn})).await;
+        let key = read
+            .get("Key")
+            .unwrap_or_else(|| panic!("case {case}: GetKey answered no Key: {read}"));
+        assert_eq!(
+            (string(key, "KeyArn"), string(key, "KeyState")),
+            (key_arn.as_str(), key_state),
+            "case {case}: DeleteAlias must leave the key record untouched, got {key}"
+        );
+    }
+}
+
+/// Alias names that resemble `alias/neighbour` without being it: the same name in
+/// another letter case, with one more character, with one fewer, and a name nested
+/// under it.
+///
+/// Source: `smithy_query(query="operation",operation="DeleteAlias")` — `AliasName`
+/// carries `pattern ^alias/[a-zA-Z0-9/_-]+$`, which admits both letter cases, `/`, `_`
+/// and `-`, so each of these is a name of its own.
+fn neighbouring_alias_names() -> Vec<String> {
+    vec![
+        "alias/neighbour".to_string(),
+        "alias/Neighbour".to_string(),
+        "alias/NEIGHBOUR".to_string(),
+        "alias/neighbour1".to_string(),
+        "alias/neighbou".to_string(),
+        "alias/neighbour/child".to_string(),
+        "alias/neighbour-2".to_string(),
+        "alias/neighbour_2".to_string(),
+    ]
+}
+
+/// RULE: an entry is held under the exact alias name, so a delete removes that one
+/// name and leaves every other name the registry holds — including the names that
+/// differ from it only in letter case or by a single character.
+#[tokio::test]
+async fn deleting_a_name_leaves_every_other_name_the_registry_holds() {
+    let router = router();
+    let key_arn = fresh_key_arn(&router).await;
+    let names = neighbouring_alias_names();
+    for name in &names {
+        ok_call(
+            &router,
+            "CreateAlias",
+            &json!({"AliasName": name, "KeyArn": key_arn}),
+        )
+        .await;
+    }
+
+    // Each row deletes one name and puts it back, so every name is the deleted one
+    // once while the rest of the registry stands.
+    for target in &names {
+        let case = format!("deleted {target}");
+        ok_call(&router, "DeleteAlias", &json!({"AliasName": target})).await;
+
+        let listed = listed_alias_names(&router).await;
+        for name in &names {
+            if name == target {
+                let (status, parsed) = call(&router, "GetAlias", &json!({"AliasName": name})).await;
+                assert_unknown_alias_refusal(&case, status, &parsed, name);
+                assert!(
+                    !listed.contains(name),
+                    "case {case}: the deleted name must not be listed, got {listed:?}"
+                );
+            } else {
+                let read = ok_call(&router, "GetAlias", &json!({"AliasName": name})).await;
+                assert_eq!(
+                    string(&alias_of(&case, &read), "KeyArn"),
+                    key_arn,
+                    "case {case}: {name} must still be bound to the key it was created with"
+                );
+                assert!(
+                    listed.contains(name),
+                    "case {case}: {name} must still be listed, got {listed:?}"
+                );
+            }
+        }
+
+        ok_call(
+            &router,
+            "CreateAlias",
+            &json!({"AliasName": target, "KeyArn": key_arn}),
+        )
+        .await;
     }
 }
 

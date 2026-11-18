@@ -45,7 +45,7 @@ async fn fresh_key_arn(router: &MultiServiceRouter) -> String {
 }
 
 /// The `Alias` an answer carries.
-fn alias_of(case: &str, answered: &Value) -> Value {
+pub(crate) fn alias_of(case: &str, answered: &Value) -> Value {
     answered
         .get("Alias")
         .unwrap_or_else(|| panic!("case {case}: no Alias in {answered}"))
