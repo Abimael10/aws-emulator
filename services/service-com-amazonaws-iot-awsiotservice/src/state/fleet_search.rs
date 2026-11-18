@@ -28,7 +28,7 @@
 //! off the async worker and with no lock held, so neither the runtime nor the store is
 //! held for its duration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::fleet_query::{tokenize, Token};
 
@@ -340,6 +340,28 @@ pub fn terms_buckets(
     });
     ranked.truncate(max_buckets);
     ranked
+}
+
+/// How many DISTINCT values `field` holds across `documents` — the count of unique
+/// values of one field over the documents a query selected.
+///
+/// Counted over the VALUES themselves, so two documents holding the same value count
+/// once and a document holding several values for one field (the groups a thing belongs
+/// to) contributes each of them — the same reading of a multi-valued field
+/// [`terms_buckets`] gives one bucket per value. A document that carries no value for
+/// the field contributes nothing, so a field nothing selected carries has a cardinality
+/// of zero.
+///
+/// CPU-BOUND, like [`documents_matching`] whose answer it counts: a caller runs it off
+/// the async worker and with no store lock held.
+pub fn distinct_value_count(documents: &[IndexedDocument], field: &str) -> usize {
+    let mut distinct: BTreeSet<&str> = BTreeSet::new();
+    for document in documents {
+        for value in document.get(field).into_iter().flatten() {
+            distinct.insert(value.as_str());
+        }
+    }
+    distinct.len()
 }
 
 /// The arithmetic summary of the numbers one field holds across the documents a query

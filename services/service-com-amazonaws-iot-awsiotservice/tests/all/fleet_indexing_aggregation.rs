@@ -27,7 +27,10 @@
 //! * `GetStatistics` summarises one field of the things a query selects: the COUNT of
 //!   the selected things that carry a valid value for the aggregation field, plus the
 //!   arithmetic summary of those values where the index carries the field as a NUMBER
-//!   and nothing more where it does not.
+//!   and nothing more where it does not;
+//! * `GetCardinality` counts the DISTINCT values one field holds across the things a
+//!   query selects, so a repeated value counts once and a request naming no field counts
+//!   the selected records themselves.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -1231,6 +1234,319 @@ async fn statistics_over_an_absent_index_or_an_unindexed_field_are_refused() {
     ];
     for (label, request, expected) in &rows {
         let refused = emulator.statistics(request).await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case {label}: expected 400, got {} body {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            &refused.error_code(),
+            expected,
+            "case {label}: expected {expected}, got {}",
+            refused.text()
+        );
+    }
+}
+
+/// A managed field the index carries as a FLAG, so a case can show which field types a
+/// count of distinct VALUES is asked of. `Boolean` is one of the modelled `FieldType`
+/// values (`smithy_query(query="shape",shape="FieldType")`).
+const BOOLEAN_MANAGED_FIELD: &str = "connectivity.connected";
+
+impl Emulator {
+    async fn cardinality(&self, body: &Value) -> Reply {
+        self.dispatch("POST", "/indices/cardinality", Some(body))
+            .await
+    }
+}
+
+impl Reply {
+    /// The `cardinality` a `GetCardinality` answer carries.
+    fn cardinality(&self) -> Value {
+        self.json()["cardinality"].clone()
+    }
+}
+
+/// RULE: `GetCardinality` counts the DISTINCT values one field holds across the things a
+/// query selects — repeated values count once, a thing carrying no value for the field
+/// contributes none, and a request naming no field counts the selected records
+/// themselves.
+#[tokio::test]
+async fn cardinality_counts_the_distinct_values_of_the_things_the_query_selects() {
+    let emulator = Emulator::with_numeric_custom_field("cardinality").await;
+    for thing_type_name in ["sensor", "gateway"] {
+        emulator.create_thing_type("cardinality", thing_type_name).await;
+    }
+    // Six things whose attribute values REPEAT: every figure asserted below is a property
+    // of THIS registry, and the repeats are what separate a count of distinct values from
+    // a count of the things that carry one.
+    for (thing_name, thing_type_name, attributes) in [
+        (
+            "sensor-1",
+            Some("sensor"),
+            vec![("zone", "north"), (NUMERIC_ATTRIBUTE, "10")],
+        ),
+        (
+            "sensor-2",
+            Some("sensor"),
+            vec![("zone", "north"), (NUMERIC_ATTRIBUTE, "10")],
+        ),
+        (
+            "sensor-3",
+            Some("sensor"),
+            vec![("zone", "south"), (NUMERIC_ATTRIBUTE, "30")],
+        ),
+        (
+            "gateway-1",
+            Some("gateway"),
+            vec![("zone", "south"), (NUMERIC_ATTRIBUTE, "40")],
+        ),
+        ("gateway-2", Some("gateway"), vec![]),
+        ("spare-1", None, vec![]),
+    ] {
+        emulator
+            .create_thing("cardinality", thing_name, thing_type_name, &attributes)
+            .await;
+    }
+
+    /// One request and the number of distinct values this registry answers it with.
+    struct Case {
+        label: &'static str,
+        query: &'static str,
+        /// The `aggregationField`, or `None` for a request that names none.
+        field: Option<&'static str>,
+        cardinality: i64,
+    }
+    // The rows differ along what the rule generalises over: which field is counted (a text
+    // custom field, a numeric custom field, a text MANAGED field, an identity field, a
+    // numeric managed field, and no field at all), which things the query selects (all of
+    // them, a name wildcard, an attribute value, exactly one, and none), and how many
+    // values the selection holds (repeats, one, none).
+    let cases = vec![
+        Case {
+            label: "a text custom field whose values repeat",
+            query: "thingName:*",
+            field: Some(DECLARED_ATTRIBUTE_FIELD),
+            // north, north, south, south.
+            cardinality: 2,
+        },
+        Case {
+            label: "a numeric custom field whose values repeat",
+            query: "thingName:*",
+            field: Some(NUMERIC_ATTRIBUTE_FIELD),
+            // 10, 10, 30, 40.
+            cardinality: 3,
+        },
+        Case {
+            label: "a text MANAGED field over every thing",
+            query: "thingName:*",
+            field: Some("registry.thingTypeName"),
+            // sensor on three things, gateway on two, and one thing with no type at all.
+            cardinality: 2,
+        },
+        Case {
+            label: "an identity field, which every thing carries its own value of",
+            query: "thingName:*",
+            field: Some("thingName"),
+            cardinality: 6,
+        },
+        Case {
+            label: "a numeric MANAGED field every thing holds the same value of",
+            query: "thingName:*",
+            field: Some("registry.version"),
+            // A create leaves every thing at registry version 1.
+            cardinality: 1,
+        },
+        Case {
+            label: "a numeric custom field over the things one name wildcard selects",
+            query: "thingName:sensor-*",
+            field: Some(NUMERIC_ATTRIBUTE_FIELD),
+            // 10, 10, 30.
+            cardinality: 2,
+        },
+        Case {
+            label: "an identity field over the things one attribute value selects",
+            query: "attributes.zone:south",
+            field: Some("thingName"),
+            cardinality: 2,
+        },
+        Case {
+            label: "a field the one selected thing carries no value for",
+            query: "thingName:spare-1",
+            field: Some(NUMERIC_ATTRIBUTE_FIELD),
+            cardinality: 0,
+        },
+        Case {
+            label: "a query that selects no thing",
+            query: "thingName:absent-*",
+            field: Some("thingName"),
+            cardinality: 0,
+        },
+        Case {
+            label: "a request naming no aggregation field",
+            query: "thingName:*",
+            field: None,
+            cardinality: 6,
+        },
+        Case {
+            label: "a request naming no aggregation field over a narrower query",
+            query: "attributes.zone:north",
+            field: None,
+            cardinality: 2,
+        },
+    ];
+
+    for case in &cases {
+        let mut request = json!({ "queryString": case.query });
+        if let Some(field) = case.field {
+            request["aggregationField"] = json!(field);
+        }
+        let answer = emulator.cardinality(&request).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {}: expected 200, got {} body {}",
+            case.label,
+            answer.status,
+            answer.text()
+        );
+        assert_eq!(
+            answer.cardinality(),
+            json!(case.cardinality),
+            "case {}: expected cardinality {}, got {}",
+            case.label,
+            case.cardinality,
+            answer.text()
+        );
+    }
+
+    // The count is read out of the REGISTRY, so a thing carrying a value the registry did
+    // not hold before raises it — which is what makes the figures above computed over the
+    // account's own records rather than fixed.
+    emulator
+        .create_thing("cardinality", "sensor-4", Some("sensor"), &[("zone", "west")])
+        .await;
+    let after = emulator
+        .cardinality(&json!({
+            "queryString": "thingName:*",
+            "aggregationField": DECLARED_ATTRIBUTE_FIELD,
+        }))
+        .await;
+    assert_eq!(
+        after.cardinality(),
+        json!(3),
+        "case a thing carrying a new value of the counted field: expected cardinality 3, got {}",
+        after.text()
+    );
+}
+
+/// RULE: the count is read out of the INDEX and over a field whose values it can be asked
+/// of, so the index's own state and the request's field decide the refusal — and the same
+/// request is answered once the index is ACTIVE.
+#[tokio::test]
+async fn cardinality_over_an_absent_index_or_an_uncountable_field_is_refused() {
+    let request = json!({
+        "queryString": "thingName:*",
+        "aggregationField": "thingName",
+    });
+
+    // No indexing configured at all: there is no index to count values out of.
+    let emulator = Emulator::new();
+    let refused = emulator.cardinality(&request).await;
+    assert_eq!(
+        refused.status,
+        404,
+        "case thing indexing OFF: expected 404, got {} body {}",
+        refused.status,
+        refused.text()
+    );
+    assert_eq!(
+        refused.error_code(),
+        "ResourceNotFoundException",
+        "case thing indexing OFF: got {}",
+        refused.text()
+    );
+
+    // Turned on, the index exists but is still building until the clock makes it active.
+    emulator
+        .enable_thing_index("cardinality while building")
+        .await;
+    emulator.hold_index_build();
+    let building = emulator.cardinality(&request).await;
+    assert_eq!(
+        building.status,
+        400,
+        "case the index still building: expected 400, got {} body {}",
+        building.status,
+        building.text()
+    );
+    assert_eq!(
+        building.error_code(),
+        "IndexNotReadyException",
+        "case the index still building: got {}",
+        building.text()
+    );
+
+    // Once the build the clock owed is due, the same request is answered — over an empty
+    // registry, which is a count of zero rather than a refusal.
+    emulator.finish_index_build();
+    let answered = emulator.cardinality(&request).await;
+    assert_eq!(
+        answered.status,
+        200,
+        "case the index ACTIVE: expected 200, got {} body {}",
+        answered.status,
+        answered.text()
+    );
+    assert_eq!(
+        answered.cardinality(),
+        json!(0),
+        "case the index ACTIVE over an empty registry: expected cardinality 0, got {}",
+        answered.text()
+    );
+
+    // Each remaining row is one rule the request broke: a name that is no fleet index of
+    // this service, a field the index does not carry, a field whose type is a flag rather
+    // than values a cardinality is asked of, and a string that is not a query.
+    let rows = vec![
+        (
+            "an index name this service does not serve",
+            json!({
+                "indexName": "AWS_Nothing",
+                "queryString": "thingName:*",
+                "aggregationField": "thingName",
+            }),
+            "InvalidRequestException",
+        ),
+        (
+            "a field the index does not carry",
+            json!({
+                "queryString": "thingName:*",
+                "aggregationField": UNDECLARED_ATTRIBUTE_FIELD,
+            }),
+            "InvalidRequestException",
+        ),
+        (
+            "a field the index carries as a flag",
+            json!({
+                "queryString": "thingName:*",
+                "aggregationField": BOOLEAN_MANAGED_FIELD,
+            }),
+            "InvalidRequestException",
+        ),
+        (
+            "a query string that is not a query",
+            json!({
+                "queryString": "thingName:(",
+                "aggregationField": "thingName",
+            }),
+            "InvalidQueryException",
+        ),
+    ];
+    for (label, request, expected) in &rows {
+        let refused = emulator.cardinality(request).await;
         assert_eq!(
             refused.status,
             400,

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCardinality
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCardinality`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCardinality::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +147,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCardinality` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCardinalityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCardinalityErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // A name outside the set of indexes this service recognises is a request it
+        // cannot act on at all, which is a different refusal from an index the account
+        // does not have: the modelled `InvalidRequestException` ahead of any lookup.
+        // "The name of the index to search" defaults to the thing index, as it does for
+        // every other aggregation this service serves.
+        let index_name = input
+            .index_name
+            .clone()
+            .unwrap_or_else(|| crate::state::THING_INDEX_NAME.to_string());
+        if !crate::state::FLEET_INDEX_NAMES.contains(&index_name.as_str()) {
+            return Err(
+                GetCardinalityErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: Some(crate::state::unrecognized_index_name_message(&index_name)),
+                })
+                .into(),
+            );
+        }
+
+        // The unique values counted are those of the documents a QUERY selects, so a
+        // string that is not a query is refused with the modelled
+        // `InvalidQueryException` ("The query is invalid", HTTP 400) — the same reading of
+        // a `queryString` every operation that takes one shares.
+        if let Err(rejection) = crate::state::validate_query_string(&input.query_string) {
+            return Err(
+                GetCardinalityErrorModeled::InvalidQueryException(InvalidQueryException {
+                    message: Some(rejection.message()),
+                })
+                .into(),
+            );
+        }
+
+        // The index's own state, whether it carries the field at all and the documents it
+        // holds are read under ONE lock, and the guard is released before anything is
+        // matched: the scan below is CPU-bound work whose size the request chooses, so it
+        // must not hold the store every other caller reads.
+        let documents = {
+            let store = state.lock();
+
+            // The index the count is read from decides whether the request can be answered
+            // at all: an account whose configuration has no such index has nothing to
+            // aggregate (the modelled `ResourceNotFoundException`, HTTP 404), and one whose
+            // index is still being built has the index but not yet its contents (the
+            // modelled `IndexNotReadyException`, HTTP 400).
+            match store.fleet_index_availability(&index_name, now) {
+                crate::state::FleetIndexAvailability::Missing => {
+                    return Err(GetCardinalityErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(
+                                crate::state::missing_fleet_index_for_aggregation_message(
+                                    &index_name,
+                                ),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::FleetIndexAvailability::Building => {
+                    return Err(GetCardinalityErrorModeled::IndexNotReadyException(
+                        IndexNotReadyException {
+                            message: Some(crate::state::index_not_ready_message(
+                                &index_name,
+                                store.fleet_index_status(&index_name, now),
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::FleetIndexAvailability::Ready => {}
+            }
+
+            // A field whose unique values are counted has to be one the index carries, and
+            // of a type whose values a cardinality is asked of: that is the same rule — in
+            // the same wording — every other aggregation reads its field under, so the
+            // operations cannot drift.
+            if let Some(aggregation_field) = input.aggregation_field.as_deref() {
+                if let Err(rejection) = store.validate_aggregation_field(
+                    &index_name,
+                    aggregation_field,
+                    &AggregationType {
+                        name: crate::state::fleet_metrics::AGGREGATION_CARDINALITY_NAME.to_string(),
+                        values: None,
+                    },
+                ) {
+                    return Err(GetCardinalityErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(rejection.message()),
+                        },
+                    )
+                    .into());
+                }
+            }
+
+            store.indexed_documents(&index_name)
+        };
+
+        // The answer is COMPUTED over the account's own records: the query selects the
+        // documents of the index ([`crate::state::documents_matching`]) and the count is
+        // of the DISTINCT values they hold for one field
+        // ([`crate::state::distinct_value_count`]).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCardinality"))
+        // Matching every document against the query is CPU-bound work whose size the
+        // request chooses, so it runs on the blocking pool: `spawn_blocking(..).await` is
+        // a real await point, so one aggregation cannot starve the worker that serves
+        // every other request, and the scan's own budget bounds what it may cost at all.
+        let query_string = input.query_string.clone();
+        let aggregation_field = input.aggregation_field.clone();
+        let scanned = ::tokio::task::spawn_blocking(move || {
+            let selected = crate::state::documents_matching(documents, &query_string)?;
+            let cardinality = match aggregation_field.as_deref() {
+                Some(aggregation_field) => {
+                    crate::state::distinct_value_count(&selected, aggregation_field)
+                }
+                // A request naming no field asks about the selected RECORDS rather than
+                // about the values of one field of them, and each document of an index is
+                // one record of the account's registry, so the unique values they amount
+                // to are the records themselves.
+                None => selected.len(),
+            };
+            Ok::<usize, crate::state::ScanRefusal>(cardinality)
+        })
+        .await;
+        let cardinality = match scanned {
+            Ok(Ok(cardinality)) => cardinality,
+            // A request that would cost more than this emulator evaluates for one
+            // aggregation is refused with the modelled `InvalidRequestException` naming
+            // the bound it exceeded, rather than answered from a partial scan.
+            Ok(Err(refusal)) => {
+                return Err(
+                    GetCardinalityErrorModeled::InvalidRequestException(InvalidRequestException {
+                        message: Some(refusal.message()),
+                    })
+                    .into(),
+                );
+            }
+            // A panic or a cancellation on the pool says nothing about the request, so it
+            // is reported as the server fault it is rather than as a count of zero.
+            Err(error) => {
+                ::tracing::error!(
+                    operation = Self::NAME,
+                    error = %error,
+                    "the cardinality aggregation did not complete"
+                );
+                return Err(GetCardinalityErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the cardinality could not be computed".to_string()),
+                    },
+                )
+                .into());
+            }
+        };
+
+        Ok(GetCardinalityOutput {
+            cardinality: i32::try_from(cardinality).unwrap_or(i32::MAX),
+        })
     }
 }
