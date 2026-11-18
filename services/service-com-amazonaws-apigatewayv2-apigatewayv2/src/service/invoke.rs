@@ -863,12 +863,16 @@ static INTEGRATIONS_IN_FLIGHT: ::std::sync::atomic::AtomicUsize =
 /// One of the [`MAX_INTEGRATIONS_IN_FLIGHT`] integrations this seam performs at once, given
 /// back when it is dropped — on every path, including one a performed integration panicked
 /// on.
-struct IntegrationPermit;
+///
+/// `pub(crate)` because the WEBSOCKET data plane serves its own connection request from the
+/// same synchronous seam (`crate::service::websocket::serve`), and the two share ONE count: a
+/// chain that comes back round through either is cut at the same number of laps.
+pub(crate) struct IntegrationPermit;
 
 impl IntegrationPermit {
     /// One permit, or `None` when this seam already has as many integrations in flight as it
     /// performs at once.
-    fn claim() -> Option<Self> {
+    pub(crate) fn claim() -> Option<Self> {
         let mut held = INTEGRATIONS_IN_FLIGHT.load(::std::sync::atomic::Ordering::Relaxed);
         loop {
             if held >= MAX_INTEGRATIONS_IN_FLIGHT {
@@ -911,12 +915,15 @@ fn request_head(req: &RtRequest) -> Option<http::request::Parts> {
 /// The runtime an integration can be performed on from a SYNCHRONOUS seam, or `None` when
 /// this process is not on one.
 ///
+/// `pub(crate)` for the WEBSOCKET data plane's own use of this seam; see
+/// [`IntegrationPermit`].
+///
 /// It is the MULTI-THREAD runtime the emulator boots. A current-thread runtime is driven by
 /// the one thread now inside the seam, which is therefore driving nothing while it waits: a
 /// task spawned on it could not be polled and its timers would not advance, so an integration
 /// is not performed from there at all rather than waited on. This is also what keeps
 /// [`awaited`]'s `block_in_place` from the one runtime that refuses it.
-fn drivable_runtime() -> Option<::tokio::runtime::Handle> {
+pub(crate) fn drivable_runtime() -> Option<::tokio::runtime::Handle> {
     let handle = ::tokio::runtime::Handle::try_current().ok()?;
     (handle.runtime_flavor() == ::tokio::runtime::RuntimeFlavor::MultiThread).then_some(handle)
 }
@@ -931,7 +938,10 @@ fn drivable_runtime() -> Option<::tokio::runtime::Handle> {
 /// ([`dispatch`]) is on the runtime's own timer, and the task stays cancellable.
 /// `block_in_place` hands this worker's queue to a replacement thread while it waits, so the
 /// runtime keeps serving every other request.
-fn awaited<Answered: Send + 'static>(
+///
+/// `pub(crate)` for the WEBSOCKET data plane's own use of this seam; see
+/// [`IntegrationPermit`].
+pub(crate) fn awaited<Answered: Send + 'static>(
     handle: &::tokio::runtime::Handle,
     work: impl ::std::future::Future<Output = Answered> + Send + 'static,
 ) -> Option<Box<Answered>> {

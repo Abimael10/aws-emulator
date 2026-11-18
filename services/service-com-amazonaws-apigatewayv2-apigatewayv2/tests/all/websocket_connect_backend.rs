@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The DATA MAPPING a WEBSOCKET route's integration applies to the call it fronts, and the
-//! one route of a WEBSOCKET api that may DECLARE request parameters at all.
+//! The DATA MAPPING a WEBSOCKET route's integration applies to the call it fronts, the one
+//! route of a WEBSOCKET api that may DECLARE request parameters at all, and WHAT DECIDES the
+//! connection request the `$connect` route serves.
 //!
-//! The rule both tables below are slices of: **a WEBSOCKET route's integration passes the
-//! call to its backend as its `RequestParameters` map it — each
+//! The rule the first two tables below are slices of: **a WEBSOCKET route's integration passes
+//! the call to its backend as its `RequestParameters` map it — each
 //! `integration.request.{location}.{name}` key carrying either a request parameter of the
 //! call, written `route.request.{location}.{name}` or `method.request.{location}.{name}`, or
 //! a static value "enclosed within single quotes" — so the function reads the destination
@@ -12,6 +13,19 @@
 //! nothing at all; and a ROUTE may DECLARE `Route$RequestParameters` only on `$connect`, the
 //! route that serves the connection request, every other route of such an api being refused
 //! `400` `BadRequestException`.**
+//!
+//! The rule the LAST table is a slice of: **a WEBSOCKET connection request is admitted or
+//! refused by the REPLY the `$connect` route's integration produced, so a route that fronts a
+//! BACKEND is refused only by the status that backend answered — and with the body it
+//! answered — while the gateway's own `500` `{"message":"Internal server error"}` is owed
+//! exactly to a `$connect` route that can serve the connection request no reply at all: one
+//! targeting no integration of the api, and one bound to a `MOCK`, which reaches no backend
+//! and so gives the connection request no decision. An api with no `$connect` route has
+//! nothing to refuse the connection.** `MOCK` is "for integrating the route or method request
+//! with API Gateway as a 'loopback' endpoint without invoking any backend" and `AWS_PROXY` is
+//! "for integrating the route or method request with a Lambda function or other AWS service
+//! action" (`smithy_query(query="shape", shape="Integration")`, member `IntegrationType`),
+//! which is why the two answer a connection request differently.
 //!
 //! Nothing in the first table is a value this emulator fills in: the mapping is asserted
 //! through the DECISION of a function that ran, which is why AWS Lambda is mounted beside
@@ -21,15 +35,15 @@
 //!
 //! The rest of the WebSocket lifecycle — the event each call is stated in, the routes a frame
 //! is dispatched to, the `$disconnect` call and the `REQUEST` authorizer in front of
-//! `$connect` — is `websocket_lambda_routes.rs`'s, and the handshake's own statuses are
-//! `websocket_transport_data_plane.rs`'s; neither is restated here.
+//! `$connect` — is `websocket_lambda_routes.rs`'s, and the handshake's own statuses over the
+//! api's announced socket are `websocket_transport_data_plane.rs`'s; neither is restated here.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::api_lifecycle::{as_str, call_in_region, emulator, error_code};
 use crate::http_api_backend_dispatch::{emulator_with_lambda, given_function};
-use crate::websocket_handshake_data_plane::CLIENT_KEY;
+use crate::websocket_handshake_data_plane::{message, send, Answer, CLIENT_KEY};
 use crate::websocket_transport_data_plane::{dial_loopback, ClientSocket};
 
 /// The Region every request below is signed for — the one the Lambda harness creates its
@@ -509,5 +523,361 @@ async fn a_patch_that_leaves_request_parameters_off_the_connection_requests_rout
             CONNECT_ONLY_MESSAGE,
             "case {case:?}: expected the refusal's own sentence, got {body}"
         );
+    }
+}
+
+/// The status and sentence a gateway answers for a connection request its api's own
+/// configuration can serve no reply for.
+const UNPLACEABLE: u16 = 500;
+const UNPLACEABLE_MESSAGE: &str = "Internal server error";
+
+/// The status an ADMITTED connection request earns at this emulator's own SERVICE endpoint,
+/// and the error code it carries: that endpoint serves one BUFFERED request per call and so
+/// switches no connection to the WebSocket protocol — the api's own announced socket is where
+/// the `101` is answered (`websocket_transport_data_plane.rs`, and the first table above).
+/// What the last table asserts is that an admitted connection request reaches THIS refusal
+/// instead of the [`UNPLACEABLE`] a configuration that cannot be served earns.
+const NOT_IMPLEMENTED: u16 = 501;
+const NOT_IMPLEMENTED_CODE: &str = "NotImplemented";
+
+/// What a row's `$connect` route fronts.
+#[derive(Debug, Clone, Copy)]
+enum Connect {
+    /// No `$connect` route at all.
+    Absent,
+    /// A `MOCK` integration carrying the documented request template, which renders the
+    /// `2xx` a loopback integration answers from its own records, and the `$default`
+    /// integration response that status selects.
+    Mock,
+    /// An `AWS_PROXY` integration whose function answers this `statusCode` and this `body`
+    /// (an empty body being a reply that carries none).
+    Proxy(u16, &'static str),
+}
+
+/// What the handshake to the deployed stage is answered with.
+#[derive(Debug, Clone, Copy)]
+enum Expected {
+    /// ADMITTED: nothing of the api refuses the connection request, so the handshake reaches
+    /// the capability refusal the service endpoint ends in.
+    Admitted,
+    /// Refused with the gateway's own `500` and its sentence.
+    Unplaceable,
+    /// Refused with the status the `$connect` function answered and the body it answered.
+    FromTheFunction(u16, &'static str),
+}
+
+/// One row of the connection-request table: what the `$connect` route fronts, and what a
+/// handshake to the deployed stage is then answered with.
+struct AdmissionRow {
+    case: &'static str,
+    connect: Connect,
+    expected: Expected,
+}
+
+/// The rows differ along what the `$connect` route fronts — nothing at all, a `MOCK` loopback
+/// whose template renders a `2xx`, a function that admits, a function that refuses — and
+/// along the status and body that function answers: a `2xx`, a `4xx` the client is refused
+/// with, and a `5xx`, each of which the gateway relays rather than replacing with one of its
+/// own. The recorded case is the `MOCK` row and the `(200, "")` row, which is the same api's
+/// `$connect` route re-pointed onto a Lambda.
+///
+/// The other configuration the rule refuses — a `$connect` route that targets no integration
+/// at all — is not a row, because no caller can deploy one: `CreateDeployment` refuses it with
+/// `crate::state::route_key::undefined_route_target_message`, which `route_key_grammar.rs`
+/// holds.
+const ADMISSION_ROWS: &[AdmissionRow] = &[
+    AdmissionRow {
+        case: "no $connect route at all: nothing refuses the connection",
+        connect: Connect::Absent,
+        expected: Expected::Admitted,
+    },
+    AdmissionRow {
+        case: "a $connect route bound to a MOCK loopback that renders a 2xx",
+        connect: Connect::Mock,
+        expected: Expected::Unplaceable,
+    },
+    AdmissionRow {
+        case: "a $connect route whose function admits the client",
+        connect: Connect::Proxy(200, ""),
+        expected: Expected::Admitted,
+    },
+    AdmissionRow {
+        case: "a $connect route whose function admits the client with a body",
+        connect: Connect::Proxy(201, "welcome"),
+        expected: Expected::Admitted,
+    },
+    AdmissionRow {
+        case: "a $connect route whose function refuses the client",
+        connect: Connect::Proxy(403, "denied"),
+        expected: Expected::FromTheFunction(403, "denied"),
+    },
+    AdmissionRow {
+        case: "a $connect route whose function answers an unauthorized status",
+        connect: Connect::Proxy(401, ""),
+        expected: Expected::FromTheFunction(401, ""),
+    },
+    AdmissionRow {
+        case: "a $connect route whose function answers a status of its own upstream",
+        connect: Connect::Proxy(502, "upstream"),
+        expected: Expected::FromTheFunction(502, "upstream"),
+    },
+];
+
+/// A `$connect` handler that answers one proxy reply, whatever event it is handed.
+fn answering_handler(status: u16, body: &str) -> String {
+    let reply = if body.is_empty() {
+        format!("{{'statusCode': {status}}}")
+    } else {
+        format!("{{'statusCode': {status}, 'body': '{body}'}}")
+    };
+    format!("def lambda_handler(event, context):\n    return {reply}\n")
+}
+
+/// An api created, routed and deployed to one stage, with the two addresses a case needs.
+struct DeployedConnect {
+    /// The api's own `execute-api` host — the addressing `Api$ApiEndpoint` documents, and the
+    /// one this emulator's front door claims.
+    endpoint_host: String,
+    /// The `ApiEndpoint` the api reported: the socket its data plane is really served on,
+    /// which the capability refusal names.
+    announced: String,
+}
+
+/// Create a WEBSOCKET api whose `$connect` route fronts `connect`, release a deployment to one
+/// stage, and answer how a handshake addresses it.
+async fn deploy_connect(
+    emulator: &MultiServiceRouter,
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    case: &str,
+    connect: Connect,
+) -> DeployedConnect {
+    let api = created(
+        emulator,
+        case,
+        "/v2/apis",
+        websocket_api("connect-admission"),
+        "CreateApi",
+    )
+    .await;
+    let api_id = as_str(&api, "apiId");
+    let announced = as_str(&api, "apiEndpoint");
+    // `Some(id)` is a `$connect` route targeting that integration; `None` is no such route at
+    // all.
+    let target: Option<String> = match connect {
+        Connect::Absent => None,
+        Connect::Mock => {
+            let integration = created(
+                emulator,
+                case,
+                &format!("/v2/apis/{api_id}/integrations"),
+                json!({
+                    "integrationType": "MOCK",
+                    "requestTemplates": { "$default": "{\"statusCode\": 200}" }
+                }),
+                "CreateIntegration",
+            )
+            .await;
+            let integration_id = as_str(&integration, "integrationId");
+            created(
+                emulator,
+                case,
+                &format!("/v2/apis/{api_id}/integrations/{integration_id}/integrationresponses"),
+                json!({ "integrationResponseKey": "$default" }),
+                "CreateIntegrationResponse",
+            )
+            .await;
+            Some(integration_id)
+        }
+        Connect::Proxy(status, body) => {
+            let function = given_function(
+                emulator,
+                engine,
+                case,
+                &format!("connect-answering-{status}"),
+                &answering_handler(status, body),
+            )
+            .await;
+            let integration = created(
+                emulator,
+                case,
+                &format!("/v2/apis/{api_id}/integrations"),
+                json!({ "integrationType": "AWS_PROXY", "integrationUri": function }),
+                "CreateIntegration",
+            )
+            .await;
+            Some(as_str(&integration, "integrationId"))
+        }
+    };
+    if let Some(integration_id) = target {
+        created(
+            emulator,
+            case,
+            &format!("/v2/apis/{api_id}/routes"),
+            json!({
+                "routeKey": "$connect",
+                "target": format!("integrations/{integration_id}")
+            }),
+            "CreateRoute",
+        )
+        .await;
+    }
+    created(
+        emulator,
+        case,
+        &format!("/v2/apis/{api_id}/stages"),
+        json!({ "stageName": STAGE }),
+        "CreateStage",
+    )
+    .await;
+    created(
+        emulator,
+        case,
+        &format!("/v2/apis/{api_id}/deployments"),
+        json!({ "stageName": STAGE }),
+        "CreateDeployment",
+    )
+    .await;
+    // What the stage serves is the configuration its deployment froze, so the release is read
+    // back off the stage rather than assumed.
+    let (status, stage) = control(
+        emulator,
+        "GET",
+        &format!("/v2/apis/{api_id}/stages/{STAGE}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: GetStage must answer 200, got {status} {stage}"
+    );
+    assert!(
+        !as_str(&stage, "deploymentId").is_empty(),
+        "case {case:?}: the stage must carry the released deployment, got {stage}"
+    );
+    DeployedConnect {
+        endpoint_host: format!("{api_id}.execute-api.{REGION}.amazonaws.com"),
+        announced,
+    }
+}
+
+/// Send the RFC 6455 opening handshake to the deployed stage at the api's own `execute-api`
+/// host, with `fields` added to the three fields of §4.1 — the browser-set ones a seam is
+/// reached through among them.
+async fn endpoint_handshake(
+    emulator: &MultiServiceRouter,
+    deployed: &DeployedConnect,
+    fields: &[(&str, &str)],
+) -> Answer {
+    let mut sent: Vec<(&str, &str)> = vec![
+        ("connection", "Upgrade"),
+        ("upgrade", "websocket"),
+        ("sec-websocket-key", CLIENT_KEY),
+        ("sec-websocket-version", "13"),
+    ];
+    sent.extend_from_slice(fields);
+    send(
+        emulator,
+        &deployed.endpoint_host,
+        "GET",
+        &format!("/{STAGE}"),
+        &sent,
+    )
+    .await
+}
+
+/// Assert `answer` is what `expected` says, naming the seam the handshake was answered from.
+fn assert_connection_answer(
+    case: &str,
+    seam: &str,
+    deployed: &DeployedConnect,
+    expected: Expected,
+    answer: &Answer,
+) {
+    assert_ne!(
+        answer.status, SWITCHING_PROTOCOLS,
+        "case {case:?} ({seam}): a 101 would promise a socket the service endpoint cannot \
+         carry, got {}",
+        answer.summary()
+    );
+    match expected {
+        Expected::Admitted => {
+            assert_eq!(
+                answer.status, NOT_IMPLEMENTED,
+                "case {case:?} ({seam}): nothing of this api refuses the connection request, \
+                 so the handshake must reach the capability refusal and not a {UNPLACEABLE}, \
+                 got {}",
+                answer.summary()
+            );
+            assert_eq!(
+                answer.error_type.as_deref(),
+                Some(NOT_IMPLEMENTED_CODE),
+                "case {case:?} ({seam}): expected the capability refusal's own code, got {}",
+                answer.summary()
+            );
+            assert!(
+                message(answer).contains(&deployed.announced),
+                "case {case:?} ({seam}): the refusal must name the address this api IS reached \
+                 at ({:?}), got {}",
+                deployed.announced,
+                answer.summary()
+            );
+        }
+        Expected::Unplaceable => {
+            assert_eq!(
+                answer.status, UNPLACEABLE,
+                "case {case:?} ({seam}): a $connect route that can serve the connection \
+                 request no reply at all is the gateway's own {UNPLACEABLE}, got {}",
+                answer.summary()
+            );
+            assert_eq!(
+                message(answer),
+                UNPLACEABLE_MESSAGE,
+                "case {case:?} ({seam}): expected the gateway's own sentence, got {}",
+                answer.summary()
+            );
+        }
+        Expected::FromTheFunction(status, body) => {
+            assert_eq!(
+                answer.status, status,
+                "case {case:?} ({seam}): expected the status the $connect function answered, \
+                 got {}",
+                answer.summary()
+            );
+            assert_eq!(
+                answer.text, body,
+                "case {case:?} ({seam}): expected the body the $connect function answered, \
+                 got {:?}",
+                answer.text
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_request_is_answered_by_its_integrations_reply_and_only_a_route_with_none_is_the_gateways_500(
+) {
+    // The two seams this emulator's own service endpoint answers a handshake from. The second
+    // is reached because the front door reads those browser-set fields as cross-site and so
+    // names the request no operation of this service, leaving it to the routing-error seam —
+    // which carries no transport of its own and performs the connection request over the one
+    // this service remembered. The decision is the api's and its backend's, so both seams must
+    // answer one status.
+    let seams: &[(&str, &[(&str, &str)])] = &[
+        ("the handshake the router names an operation", &[]),
+        (
+            "the handshake the front door reads as cross-site",
+            &[
+                ("origin", "https://another.example"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+        ),
+    ];
+    for row in ADMISSION_ROWS {
+        let (emulator, engine) = emulator_with_lambda();
+        let deployed = deploy_connect(&emulator, &engine, row.case, row.connect).await;
+        for (seam, fields) in seams {
+            let answer = endpoint_handshake(&emulator, &deployed, fields).await;
+            assert_connection_answer(row.case, seam, &deployed, row.expected, &answer);
+        }
     }
 }

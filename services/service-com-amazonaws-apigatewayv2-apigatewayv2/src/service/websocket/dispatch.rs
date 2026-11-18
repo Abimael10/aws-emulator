@@ -7,7 +7,7 @@
 //! is decided here from the configuration the stage's deployment froze:
 //!
 //! * the CONNECTION REQUEST, the opening handshake itself, served by the `$connect` route
-//!   when the api has one ([`connection_request`]);
+//!   when the api has one ([`admission`]);
 //! * each MESSAGE the client then sends, served by the route the api's
 //!   `RouteSelectionExpression` selects ([`message_route`]).
 //!
@@ -181,15 +181,41 @@ pub fn targeted_integration<'d>(
     deployed.integrations.get(integration_id)
 }
 
-/// What the CONNECTION REQUEST is answered with, from the configuration the stage deployed,
-/// WITHOUT reaching a backend.
+/// What the CONNECTION REQUEST is answered with as far as the configuration the stage
+/// deployed DECIDES IT, WITHOUT reaching a backend — see [`admission`].
+///
+/// Three answers rather than two, because the reading of a configuration and the answer to a
+/// handshake are not the same question: a route that fronts a BACKEND is neither admitted nor
+/// refused by the records, and a caller that reads one as a refusal gives the gateway's
+/// configuration-fault status to a configuration API Gateway serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// ADMITTED by the configuration itself: the deployment holds no `$connect` route, so
+    /// there is nothing to refuse the connection.
+    Admitted,
+    /// REFUSED by the configuration itself: the `$connect` route's integration can produce no
+    /// reply for the connection request at all — it targets no integration of this api, or it
+    /// is a `MOCK` that answers from its own records and reaches no backend — so the
+    /// handshake fails whatever a backend would have said. The string says which, for this
+    /// emulator's own log.
+    Refused(String),
+    /// UNDECIDED by the configuration: the `$connect` route fronts a BACKEND, and the
+    /// connection is admitted or refused by the status that backend answers, which no reading
+    /// of the records can give. The caller that holds an in-process transport obtains it
+    /// ([`super::integration::perform`]).
+    BackendDecides,
+}
+
+/// What the configuration the stage deployed says about the CONNECTION REQUEST, without
+/// reaching a backend.
 ///
 /// The handshake completes only when the route that serves the connection request produced a
 /// SUCCESSFUL reply: the `$connect` route's integration is called before the socket exists,
 /// and its reply is what admits the connection. So:
 ///
 /// * an api with NO `$connect` route admits the connection — there is no route to refuse it;
-/// * a `$connect` route whose integration replies with a `2xx` status admits it;
+/// * a `$connect` route whose integration replies with a `2xx` status admits it
+///   ([`is_success_status`], applied to the reply the backend gave);
 /// * a `$connect` route whose integration produces no reply, or a reply outside `2xx`, fails
 ///   the handshake.
 ///
@@ -198,23 +224,28 @@ pub fn targeted_integration<'d>(
 /// precisely a call whose answer the backend has to give (which is why `$connect` is the
 /// route an authorizer and a handler admit or refuse a client at). A `$connect` route bound
 /// to one therefore fails the handshake, which is the recorded behaviour of API Gateway for
-/// that configuration — the client reads `500` and no connection is established.
+/// that configuration — the client reads `500` and no connection is established. So does a
+/// route that targets no integration at all: there is nothing to serve the connection
+/// request with.
 ///
-/// A `$connect` route fronting a BACKEND is decided by that backend's own reply, which this
-/// reading cannot obtain: a caller with no in-process transport reads `Unserved` for it,
-/// while the api's own socket performs the integration ([`super::integration`]) and is
-/// admitted by the status the function answered.
-pub fn connection_request(deployed: &DeployedConfiguration) -> Result<Option<Reply>, Unserved> {
+/// Every OTHER integration type fronts a backend, and what that backend answered is the whole
+/// decision: this reading reports [`Admission::BackendDecides`] rather than a refusal, so the
+/// gateway's `500` — the answer a configuration that cannot be served earns — is never given
+/// to a configuration whose only unknown is a reply nobody has asked the backend for yet.
+pub fn admission(deployed: &DeployedConfiguration) -> Admission {
     let Some(route) = deployed_route(deployed, CONNECT_ROUTE_KEY) else {
-        return Ok(None);
+        return Admission::Admitted;
     };
-    if targeted_integration(deployed, route)
-        .is_some_and(|integration| integration.integration_type == MOCK_INTEGRATION_TYPE)
-    {
-        return Err(no_connection_decision());
+    let Some(integration) = targeted_integration(deployed, route) else {
+        return Admission::Refused(format!(
+            "the {CONNECT_ROUTE_KEY} route targets no integration of this api, so nothing \
+             serves the connection request"
+        ));
+    };
+    if integration.integration_type != MOCK_INTEGRATION_TYPE {
+        return Admission::BackendDecides;
     }
-    let reply = integration_reply(deployed, route, None)?;
-    Ok(Some(reply))
+    Admission::Refused(no_connection_decision_reason())
 }
 
 /// Why a `MOCK` integration gives the CONNECTION REQUEST no decision at all.
@@ -229,10 +260,17 @@ pub fn connection_request(deployed: &DeployedConfiguration) -> Result<Option<Rep
 /// Stated here, as the one owner of the rule, because both the reading of the records and
 /// the performing of the integration apply it ([`super::integration::perform`]).
 pub fn no_connection_decision() -> Unserved {
-    Unserved::Unperformable(format!(
+    Unserved::Unperformable(no_connection_decision_reason())
+}
+
+/// The sentence [`no_connection_decision`] carries, which is also the reason an
+/// [`Admission::Refused`] read off the records alone carries for that configuration: one
+/// owner, so the reading of a `MOCK`-bound `$connect` and the performing of it cannot drift.
+pub fn no_connection_decision_reason() -> String {
+    format!(
         "a {MOCK_INTEGRATION_TYPE} integration answers from the integration's own records \
          and reaches no backend, so it gives the connection request no decision"
-    ))
+    )
 }
 
 /// Whether a status a reply carries is a SUCCESS — the `2xx` class, which is what admits a
@@ -326,31 +364,6 @@ impl<'c> TemplateCall<'c> {
             body,
         }
     }
-}
-
-/// The reply `route`'s integration produces for this call WITHOUT reaching a backend; see
-/// the module docs for the rule a `MOCK` integration's follows.
-///
-/// Every other integration type is answered by a backend, which this reading does not call:
-/// it is reported as unperformable, and the caller that HAS the in-process transport
-/// performs it instead ([`super::integration`]).
-fn integration_reply(
-    deployed: &DeployedConfiguration,
-    route: &Route,
-    call: Option<TemplateCall<'_>>,
-) -> Result<Reply, Unserved> {
-    let integration = targeted_integration(deployed, route).ok_or(Unserved::NoIntegration)?;
-    if integration.integration_type != MOCK_INTEGRATION_TYPE {
-        // Every other integration type REACHES a backend — a function to invoke, an HTTP
-        // endpoint to call, an AWS service action to perform — which is not this reading's
-        // to decide: it says so rather than answering as if the backend had replied.
-        return Err(Unserved::Unperformable(format!(
-            "an integration of type {} is performed by its backend, which this reading of \
-             the api's records does not call",
-            integration.integration_type
-        )));
-    }
-    mock_reply(integration, call)
 }
 
 /// The reply a `MOCK` integration computes for this call, from the integration's own
