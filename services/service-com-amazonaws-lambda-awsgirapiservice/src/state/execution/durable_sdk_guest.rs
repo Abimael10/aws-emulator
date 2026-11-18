@@ -24,7 +24,12 @@
 //!   other way a handler spends time it is spent inside the invocation: the wait is the
 //!   standard library's own sleep, which this runtime hands the guest already clamped to what
 //!   the run has left ([`super::python`]), so a wait the function's own `Timeout` cuts off
-//!   ends the run as any other unfinished handler's does.
+//!   ends the run as any other unfinished handler's does. A wait is CHECKPOINTED like every
+//!   other operation of the model: the wait that BEGAN before the span is waited and the one
+//!   that ELAPSED after it, and the one that was CANCELLED for a wait something cut off, each
+//!   through the one host function that records a checkpoint
+//!   ([`super::super::durable_steps`]), so the execution's history carries the wait where the
+//!   handler took it.
 //! * `context.step(work, …)` RUNS one STEP of the execution and answers what its work
 //!   returned. `@durable_step` marks a callable as one such unit, and CALLING the marked
 //!   callable NAMES that step rather than running it — `context.step(charge(order))` is how a
@@ -47,11 +52,9 @@
 //!   `from_days`) and the readings it gives back.
 //!
 //! What it does NOT do: the CALLBACK operations of the model
-//! (`context.wait_for_callback`), which mint a callback id a client then signals, and the
-//! checkpointing of a WAIT, which this runtime spends inside the invocation rather than as an
-//! operation a client can observe. A handler reaching for a callback is answered the attribute
-//! error of a name this runtime does not supply, rather than a callback id nothing can be
-//! signalled through.
+//! (`context.wait_for_callback`), which mint a callback id a client then signals. A handler
+//! reaching for a callback is answered the attribute error of a name this runtime does not
+//! supply, rather than a callback id nothing can be signalled through.
 
 use super::package::PackageModule;
 
@@ -414,7 +417,8 @@ class DurableContext:
 
     def __init__(self, context):
         self._context = context
-        self._operations = 0
+        self._steps = 0
+        self._waits = 0
 
     def __getattr__(self, name):
         return getattr(self._context, name)
@@ -428,10 +432,40 @@ class DurableContext:
         return self._context
 
     def wait(self, duration, name=None, **options):
-        """Wait for `duration` before the handler continues."""
+        """Wait for `duration` before the handler continues.
+
+        The wait is one OPERATION of this execution, so it is checkpointed as one: the wait
+        that began, then the wait that elapsed — or the wait that was CANCELLED, for one
+        something cut off before its span was up, carrying the error that cut it off.
+        """
         seconds = _seconds_of(duration)
-        if seconds > 0:
-            time.sleep(seconds)
+        if seconds < 0:
+            seconds = 0.0
+        self._waits += 1
+        identifier = "wait-%d" % self._waits
+        self._checkpoint(
+            "START", identifier, name, 1, operation="WAIT", wait_seconds=seconds
+        )
+        try:
+            if seconds > 0:
+                time.sleep(seconds)
+        except BaseException as error:
+            self._checkpoint(
+                "CANCEL",
+                identifier,
+                name,
+                1,
+                operation="WAIT",
+                wait_seconds=seconds,
+                error={
+                    "errorType": type(error).__name__,
+                    "errorMessage": str(error),
+                },
+            )
+            raise
+        self._checkpoint(
+            "SUCCEED", identifier, name, 1, operation="WAIT", wait_seconds=seconds
+        )
 
     def step(self, work, *args, **kwargs):
         """Run one STEP of this execution and answer what its work returned.
@@ -487,8 +521,8 @@ class DurableContext:
             )
         strategy = _retry_strategy_of(config)
         attempts = _max_attempts_of(strategy)
-        self._operations += 1
-        identifier = "step-%d" % self._operations
+        self._steps += 1
+        identifier = "step-%d" % self._steps
         self._checkpoint("START", identifier, name, 1)
         attempt = 1
         # Every attempt, and every interval between two of them, is spent INSIDE the
@@ -535,14 +569,21 @@ class DurableContext:
         payload=None,
         error=None,
         next_attempt_delay=None,
+        operation="STEP",
+        wait_seconds=None,
     ):
-        """Record one thing that happened to a step on the execution this run belongs to."""
+        """Record one thing that happened to an operation of the execution this run belongs
+        to."""
         record = {
-            "type": "STEP",
+            "type": operation,
             "action": action,
             "id": identifier,
             "attempt": attempt,
         }
+        if wait_seconds is not None:
+            # `WaitOptions$WaitSeconds` and `WaitStartedDetails$Duration` are whole numbers
+            # of seconds, so a span named finer than that is reported as the nearest second.
+            record["waitSeconds"] = int(wait_seconds + 0.5)
         if name is not None:
             record["name"] = str(name)
         if payload is not None:

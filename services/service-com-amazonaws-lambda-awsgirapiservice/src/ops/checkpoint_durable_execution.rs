@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CheckpointDurableExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CheckpointDurableExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CheckpointDurableExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Saves the progress of ONE durable execution: the updates the checkpoint carries become
+//! the history events they are, the token it carried is consumed and the token the next
+//! checkpoint must carry is answered. A checkpoint carrying a token that is not the
+//! execution's current one is refused and changes nothing, and nothing is recorded that the
+//! request did not carry.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +176,357 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CheckpointDurableExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CheckpointDurableExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CheckpointDurableExecution"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CheckpointDurableExecutionErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+
+        // The updates this checkpoint carries, BOUNDED before anything else is done: the
+        // model puts no length on `OperationUpdates`, so the count is the caller's, and the
+        // work of applying a checkpoint is one append per update. A request carrying more
+        // than one checkpoint may carry is refused here, before any state is read or
+        // written.
+        let updates = input.updates.as_deref().unwrap_or_default();
+        if updates.len() > crate::state::durable_steps::MAX_CHECKPOINT_UPDATES {
+            return Err(invalid_parameter(format!(
+                "One checkpoint may carry at most {} updates, and this request carried {}.",
+                crate::state::durable_steps::MAX_CHECKPOINT_UPDATES,
+                updates.len()
+            )));
+        }
+
+        // An update CARRIES the execution's data — the payload a successful operation
+        // produced, the error a failed one did — so storing it encrypts that data under the
+        // key the function's `DurableConfig` names, which is why this operation binds the
+        // four KMS failures at 502. The key is asked about at the point of use, with no store
+        // guard held (see [`crate::state::durable_data_key_fault`]).
+        let data_key = {
+            let mut store = state.lock();
+            crate::state::resolve_durable_execution(
+                &mut store,
+                &input.durable_execution_arn,
+                &region,
+                now,
+            )
+            .ok()
+            .and_then(|(record, name)| {
+                record
+                    .durable_executions
+                    .get(&name)
+                    .and_then(|execution| execution.kms_key_arn.clone())
+            })
+        };
+        if let Some(fault) =
+            crate::state::durable_data_key_fault(ctx.callback(), &region, data_key.as_deref())
+                .await
+        {
+            return Err(kms_refusal(fault));
+        }
+
+        // Every update read as the checkpoint of an operation it is, BEFORE anything is
+        // applied: "updates are applied atomically as part of the checkpoint operation", so a
+        // checkpoint carrying an update this emulator cannot apply applies none of them.
+        let mut planned = Vec::with_capacity(updates.len());
+        for update in updates {
+            planned.push(planned_update(update)?);
+        }
+
+        // An update that reports the EXECUTION's own outcome CLOSES the history, and a closed
+        // history takes no further event, so nothing a checkpoint carries after it could be
+        // recorded: such an update is the last one a checkpoint may carry, and a batch that
+        // carries anything after it is refused rather than applied in part.
+        let settles = planned
+            .iter()
+            .position(|update| matches!(update, PlannedUpdate::Settles(_)));
+        if settles.is_some_and(|position| position + 1 != planned.len()) {
+            return Err(invalid_parameter(
+                "A checkpoint update that reports the execution's own outcome closes the \
+                 execution's history, so it is the last update one checkpoint may carry."
+                    .to_string(),
+            ));
+        }
+
+        let mut store = state.lock();
+
+        // The execution is addressed by the ARN `Invoke` answered, which carries the
+        // function, the version and the execution's name and id; resolving it is also what
+        // brings the record up to whatever the clock already made due, so a checkpoint
+        // reaching an execution whose `ExecutionTimeout` has fallen due is one of a closed
+        // history. This operation models no `ResourceNotFoundException`, so an ARN that
+        // addresses no execution of this emulator is refused as the parameter value it is.
+        let (record, name) = crate::state::resolve_durable_execution(
+            &mut store,
+            &input.durable_execution_arn,
+            &region,
+            now,
+        )
+        .map_err(|failure| {
+            invalid_parameter(match failure {
+                crate::state::ResolveFailure::Malformed(message)
+                | crate::state::ResolveFailure::NotFound(message) => message,
+            })
+        })?;
+        let Some(execution) = record.durable_executions.get_mut(&name) else {
+            return Err(invalid_parameter(
+                crate::state::durable_execution_not_found_message(&input.durable_execution_arn),
+            ));
+        };
+
+        // A DUPLICATE of a checkpoint already answered is answered the same thing and applies
+        // nothing a second time: that is what the idempotency token is for ("Lambda uses this
+        // token to detect and handle duplicate requests within a 15-minute window").
+        if let Some(client_token) = input.client_token.as_deref() {
+            if let Some(answered) = execution.answered_checkpoint(client_token, now) {
+                return Ok(answered_state(answered));
+            }
+        }
+
+        // "A unique token that identifies the current checkpoint state. […] Each checkpoint
+        // operation consumes this token and returns a new one." A token that is not the
+        // current one identifies no state to apply this checkpoint to, so the request is
+        // refused and the history is left exactly as it was.
+        if !execution.checkpoint_token_is_current(&input.checkpoint_token) {
+            return Err(invalid_parameter(
+                crate::state::INVALID_CHECKPOINT_TOKEN_MESSAGE.to_string(),
+            ));
+        }
+
+        // A checkpoint whose events this execution's history has no ROOM for is refused
+        // rather than applied in part: "updates are applied atomically as part of the
+        // checkpoint operation", so a checkpoint whose updates could not all be recorded must
+        // not be answered as one that was. The room is what the appender will take
+        // (`durable_steps::MAX_STEP_EVENTS`, the events one history may be grown by).
+        let recordable = planned
+            .iter()
+            .filter(|update| {
+                matches!(update, PlannedUpdate::Recorded(checkpoint)
+                    if checkpoint.event_type().is_some())
+            })
+            .count();
+        let recorded = execution.history.len();
+        let room = crate::state::durable_steps::MAX_STEP_EVENTS.saturating_sub(recorded);
+        if recordable > room {
+            return Err(invalid_parameter(format!(
+                "This execution's history holds {recorded} of the {} events one may record, \
+                 so it has no room for the {recordable} event(s) this checkpoint records.",
+                crate::state::durable_steps::MAX_STEP_EVENTS
+            )));
+        }
+
+        // Which attempt of its operation a checkpoint is of is the execution's own record:
+        // `RetryDetails$CurrentAttempt` is "the current attempt number for this operation", so
+        // it is the one after every attempt of that operation that has already failed. The
+        // failures are counted ONCE here, in a single pass over the history, and kept up to
+        // date as this checkpoint's own failures are appended — so applying a checkpoint costs
+        // one append per update rather than a walk of the history per update.
+        let mut failed_attempts: ::std::collections::BTreeMap<String, i32> =
+            ::std::collections::BTreeMap::new();
+        for recorded in &execution.history {
+            if recorded.event_type.as_deref()
+                == Some(crate::state::durable_steps::EVENT_TYPE_STEP_FAILED)
+            {
+                if let Some(id) = recorded.id.clone() {
+                    *failed_attempts.entry(id).or_default() += 1;
+                }
+            }
+        }
+
+        // The updates, applied in the order the request carried them: each one appends the
+        // history event it is, by the same appender the run's own checkpoints go through, and
+        // an update of the EXECUTION itself settles the execution on what it reports.
+        for update in &planned {
+            match update {
+                PlannedUpdate::Recorded(checkpoint) => {
+                    let mut checkpoint = checkpoint.clone();
+                    checkpoint.attempt = checkpoint
+                        .id
+                        .as_deref()
+                        .and_then(|id| failed_attempts.get(id).copied())
+                        .unwrap_or_default()
+                        .saturating_add(1);
+                    let appended = crate::state::durable_steps::append_checkpoint(
+                        execution,
+                        &checkpoint,
+                        now,
+                    );
+                    if appended
+                        && checkpoint.event_type()
+                            == Some(crate::state::durable_steps::EVENT_TYPE_STEP_FAILED)
+                    {
+                        if let Some(id) = checkpoint.id {
+                            *failed_attempts.entry(id).or_default() += 1;
+                        }
+                    }
+                }
+                PlannedUpdate::Settles(outcome) => execution.settle(outcome, now),
+                PlannedUpdate::Nothing => (),
+            }
+        }
+
+        // The token this checkpoint consumed is replaced by the one the next checkpoint must
+        // carry; an execution these updates CLOSED takes no further checkpoint, so it is
+        // answered none.
+        let checkpoint_token = execution.take_current_checkpoint_token();
+        if let Some(client_token) = input.client_token.as_deref() {
+            execution.remember_checkpoint(client_token, checkpoint_token.clone(), now);
+        }
+        Ok(answered_state(checkpoint_token))
     }
+}
+
+/// What ONE update of a checkpoint does to the execution.
+enum PlannedUpdate {
+    /// It is one operation of the execution, recorded as the history event it is
+    /// ([`crate::state::durable_steps::append_checkpoint`]).
+    Recorded(crate::state::durable_steps::Checkpoint),
+    /// It is the outcome of the EXECUTION itself, which settles the execution on it
+    /// ([`crate::state::DurableExecutionRecord::settle`]).
+    Settles(crate::state::DurableOutcome),
+    /// It changes nothing about the execution: the execution has already started, so an
+    /// update that reports it starting reports what the history already carries.
+    Nothing,
+}
+
+/// `update` read as what it does to the execution, or the refusal for one this emulator keeps
+/// no operations of.
+///
+/// The model's `OperationType` covers six kinds of operation, and this emulator's durable
+/// executions hold four of them: the execution itself, the contexts, the steps and the waits
+/// a durable handler runs. A callback and a chained invocation are operations it does not
+/// keep — the operations that mint a callback id for a client to signal and start another
+/// execution — so a checkpoint of one is refused rather than recorded as an event for work
+/// nothing performed.
+fn planned_update(
+    update: &OperationUpdate,
+) -> Result<PlannedUpdate, CheckpointDurableExecutionError> {
+    use crate::state::durable_steps::{
+        Checkpoint, CONTEXT_TYPE, EXECUTION_TYPE, FAIL_ACTION, START_ACTION, STEP_TYPE,
+        SUCCEED_ACTION, WAIT_TYPE,
+    };
+    match update.r#type.as_str() {
+        EXECUTION_TYPE => Ok(PlannedUpdate::Settles(match update.action.as_str() {
+            // "The payload for successful operations": what the execution itself produced,
+            // which is the result a read of it reports.
+            SUCCEED_ACTION => crate::state::DurableOutcome::Succeeded(update.payload.clone()),
+            // "The error information for failed operations", and the error object of a
+            // failure that carried none.
+            FAIL_ACTION => {
+                crate::state::DurableOutcome::Failed(update.error.clone().unwrap_or_default())
+            }
+            // The execution has already started by the time any checkpoint of it arrives, and
+            // its `ExecutionStarted` event is what the history opens with, so a checkpoint
+            // reporting that start changes nothing.
+            START_ACTION => return Ok(PlannedUpdate::Nothing),
+            // No other action on the EXECUTION itself is one this emulator moves it by: a
+            // caller's `StopDurableExecution` and the `ExecutionTimeout` the clock owes are
+            // what end an execution, and nothing retries one, so the action is refused
+            // rather than answered as applied.
+            action => {
+                return Err(invalid_parameter(format!(
+                    "A checkpoint update that takes the action {action} on the EXECUTION \
+                     itself is not supported by this emulator, which ends a durable \
+                     execution through StopDurableExecution or its ExecutionTimeout."
+                )))
+            }
+        })),
+        operation @ (CONTEXT_TYPE | STEP_TYPE | WAIT_TYPE) => {
+            Ok(PlannedUpdate::Recorded(Checkpoint {
+                operation: operation.to_string(),
+                action: update.action.clone(),
+                id: Some(update.id.clone()),
+                name: update.name.clone(),
+                // Which attempt of the operation this checkpoint is of is counted off the
+                // execution's history where it is applied.
+                attempt: 1,
+                next_attempt_delay_seconds: update
+                    .step_options
+                    .as_ref()
+                    .and_then(|options| options.next_attempt_delay_seconds),
+                payload: update.payload.clone(),
+                error: update.error.clone(),
+                wait_seconds: update
+                    .wait_options
+                    .as_ref()
+                    .and_then(|options| options.wait_seconds),
+            }))
+        }
+        operation => Err(invalid_parameter(format!(
+            "Checkpoint updates of operation type {operation} are not supported by this \
+             emulator, which keeps the EXECUTION, CONTEXT, STEP and WAIT operations of a \
+             durable execution."
+        ))),
+    }
+}
+
+/// The answer a checkpoint is given: the token the next one must carry, and the execution
+/// state this one updated.
+///
+/// `NewExecutionState` is "operations that have been updated since the last checkpoint, such
+/// as completed asynchronous work like timers or callbacks". This emulator runs a durable
+/// handler's waits inside the invocation and keeps no callbacks, so no operation of an
+/// execution completes between two checkpoints without a checkpoint of its own: nothing is
+/// reported as updated, and no further page of them is announced.
+fn answered_state(checkpoint_token: Option<String>) -> CheckpointDurableExecutionOutput {
+    CheckpointDurableExecutionOutput {
+        checkpoint_token,
+        new_execution_state: CheckpointUpdatedExecutionState {
+            operations: Some(Vec::new()),
+            next_marker: None,
+        },
+    }
+}
+
+/// How a key that cannot decrypt a durable execution's data refuses this WRITE: the modelled
+/// 502 for the fault the key service reported, carrying that fault's own sentence.
+fn kms_refusal(fault: crate::state::EnvironmentKeyFault) -> CheckpointDurableExecutionError {
+    match fault {
+        crate::state::EnvironmentKeyFault::Disabled(message) => {
+            CheckpointDurableExecutionErrorModeled::KMSDisabledException(KMSDisabledException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::InvalidState(message) => {
+            CheckpointDurableExecutionErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    r#type: None,
+                    message: Some(message),
+                },
+            )
+        }
+        crate::state::EnvironmentKeyFault::NotFound(message) => {
+            CheckpointDurableExecutionErrorModeled::KMSNotFoundException(KMSNotFoundException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
+        crate::state::EnvironmentKeyFault::AccessDenied(message) => {
+            CheckpointDurableExecutionErrorModeled::KMSAccessDeniedException(
+                KMSAccessDeniedException {
+                    r#type: None,
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> CheckpointDurableExecutionError {
+    CheckpointDurableExecutionErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }

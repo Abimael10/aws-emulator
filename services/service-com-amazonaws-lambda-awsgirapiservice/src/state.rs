@@ -195,7 +195,8 @@ use crate::ops::types::{
     AccountLimit, AccountUsage, AliasRoutingConfiguration, AllowedPublishers, CapacityProvider,
     CapacityProviderConfig, CapacityProviderPermissionsConfig, CapacityProviderScalingConfig,
     CapacityProviderTelemetryConfig, CapacityProviderVpcConfig, CodeSigningConfig,
-    CodeSigningPolicies, Cors, CreateFunctionOutput, DeadLetterConfig, DurableConfig, Environment,
+    CodeSigningPolicies, ContextFailedDetails, ContextStartedDetails, ContextSucceededDetails,
+    Cors, CreateFunctionOutput, DeadLetterConfig, DurableConfig, Environment,
     EphemeralStorage, ErrorObject, Event, EventError, EventInput, EventResult,
     ExecutionFailedDetails, ExecutionStoppedDetails, ExecutionSucceededDetails,
     ExecutionTimedOutDetails, FileSystemConfig, FunctionScalingConfig,
@@ -203,7 +204,8 @@ use crate::ops::types::{
     ImageConfig, InstanceRequirements, LayerVersionContentOutput, LayerVersionsListItem,
     LoggingConfig, PropagateTags, ProvisionedConcurrencyConfigListItem, ResolvedS3Object,
     RetryDetails, SelfManagedEventSource, StepFailedDetails, StepStartedDetails,
-    StepSucceededDetails, TenancyConfig, VpcConfig,
+    StepSucceededDetails, TenancyConfig, VpcConfig, WaitCancelledDetails, WaitStartedDetails,
+    WaitSucceededDetails,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -450,11 +452,20 @@ pub use invocation_logs::{
 /// module.
 pub mod durable_run;
 
-/// The step CHECKPOINTS the run of a durable function writes into the execution's history
-/// live in [`durable_steps`], beside the run that writes them: the journal a run reports each
-/// step through, and the history events it appends.
+/// The CHECKPOINTS the run of a durable function writes into the execution's history live in
+/// [`durable_steps`], beside the run that writes them: the journal a run reports each
+/// operation through, and the history events it appends.
 pub mod durable_steps;
 pub use durable_steps::DurableStepJournal;
+
+/// The CHECKPOINT TOKEN one durable execution's next checkpoint must carry lives in
+/// [`durable_checkpoint`], beside the execution it belongs to: what a `CheckpointDurableExecution`
+/// call is validated against, the token it rotates to, and the duplicate request its client
+/// token identifies.
+pub mod durable_checkpoint;
+pub use durable_checkpoint::{
+    mint_checkpoint_token, AnsweredCheckpoint, INVALID_CHECKPOINT_TOKEN_MESSAGE,
+};
 
 /// The EventBridge events a durable execution's status changes OWE the account's default
 /// event bus live in [`durable_events`], beside the record whose statuses they report: one
@@ -2056,7 +2067,7 @@ pub struct DurableExecutionRecord {
     ///
     /// The log is APPEND-ONLY and it is the only record of what happened: an event is
     /// appended by the call that made it happen (the start, and the stop), by the RUN of the
-    /// execution as it takes each step ([`durable_steps`]), or by the clock
+    /// execution as it takes each operation ([`durable_steps`]), or by the clock
     /// transition that fell due ([`DurableExecutionRecord::materialize`]), so nothing
     /// reading the history ever invents an event. `EventId` is "the unique identifier for
     /// this event. Event IDs increment sequentially", which is the position in this
@@ -2065,9 +2076,23 @@ pub struct DurableExecutionRecord {
     /// It is bounded by what can append to it: one event for the start, one for the
     /// TERMINAL transition — the timeout the clock owes, or the stop a caller makes —
     /// which can happen only once, because neither moves an execution that has already
-    /// ended, and the step checkpoints of its run, which stop at
+    /// ended, and the checkpoints of its run, which stop at
     /// [`durable_steps::MAX_STEP_EVENTS`].
     pub history: Vec<Event>,
+    /// The CHECKPOINT TOKEN this execution's next checkpoint must carry: "a unique token
+    /// that identifies the current checkpoint state […] Each checkpoint operation consumes
+    /// this token and returns a new one."
+    ///
+    /// Minted when the execution starts and rotated by every checkpoint that is applied
+    /// ([`durable_checkpoint`]), so a token a checkpoint already consumed is no longer the
+    /// current one — which is what makes the history append-only rather than a log two
+    /// out-of-order checkpoints can rewrite.
+    pub checkpoint_token: String,
+    /// The last checkpoint a `ClientToken` identified, and the token it was answered:
+    /// "an optional idempotency token to ensure that duplicate checkpoint requests are
+    /// handled correctly. If provided, Lambda uses this token to detect and handle duplicate
+    /// requests within a 15-minute window."
+    pub answered_checkpoint: Option<AnsweredCheckpoint>,
 }
 
 impl DurableExecutionRecord {

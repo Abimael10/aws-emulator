@@ -577,6 +577,13 @@ impl FunctionRecord {
                 // than at a panic.
                 .and_then(|seconds| now.checked_add(Duration::from_secs(seconds))),
             history: Vec::new(),
+            // The token the execution's FIRST checkpoint must carry: "a unique token that
+            // identifies the current checkpoint state", which the Lambda runtime driving the
+            // execution is handed and every later checkpoint rotates
+            // ([`crate::state::durable_checkpoint`]).
+            checkpoint_token: crate::state::mint_checkpoint_token(),
+            // Nothing has been checkpointed yet, so no duplicate request can be identified.
+            answered_checkpoint: None,
         };
         // The history opens with the event the start itself is: "The input payload
         // provided for the durable execution" and "the maximum amount of time that the
