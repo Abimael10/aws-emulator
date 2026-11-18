@@ -559,10 +559,23 @@ async fn a_served_application_name_runs_the_whole_chain() {
             );
         }
         for stamp in ["createdAt", "updatedAt"] {
+            // A date-time STRING: this model's one timestamp shape declares
+            // `@timestampFormat("date-time")` (`crate::date_time_members_wire_form` pins
+            // that wire form).
+            let reported = authorization_member(&created, stamp);
+            let text = reported.as_str().unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected a date-time in appAuthorization.{stamp}, got {}",
+                    created.body
+                )
+            });
             assert!(
-                authorization_member(&created, stamp).is_number(),
-                "case {case:?}: expected a timestamp in appAuthorization.{stamp}, got {}",
-                created.body
+                ::aws_smithy_types::DateTime::from_str(
+                    text,
+                    ::aws_smithy_types::date_time::Format::DateTime
+                )
+                .is_ok(),
+                "case {case:?}: expected appAuthorization.{stamp} as a date-time, got {text:?}"
             );
         }
         let arn = authorization_member(&created, "appAuthorizationArn")

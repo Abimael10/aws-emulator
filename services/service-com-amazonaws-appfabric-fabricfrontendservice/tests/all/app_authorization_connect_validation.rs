@@ -223,12 +223,19 @@ fn status_of(body: &Value, resource: &str) -> String {
         .to_string()
 }
 
-/// A timestamp member of a record, as epoch seconds.
+/// The instant a timestamp member of a record reports, read from the RFC 3339 date-time
+/// STRING this model's `@timestampFormat("date-time")` timestamp shape is carried as
+/// (`crate::date_time_members_wire_form` pins that wire form).
 fn stamp(record: &Value, name: &str, case: &str) -> f64 {
-    record
+    let text = record
         .get(name)
-        .and_then(Value::as_f64)
-        .unwrap_or_else(|| panic!("case {case:?}: expected the timestamp {name} in {record}"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: expected the date-time {name} in {record}"));
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: expected {name} as a date-time, got {text:?}: {error}")
+        })
+        .as_secs_f64()
 }
 
 /// A string member of a JSON object, or `""`.

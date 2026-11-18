@@ -93,15 +93,23 @@ fn as_identifier(arn: &str, by_arn: bool) -> String {
     }
 }
 
-/// The `updatedAt` `GetIngestion` reports for one stored ingestion, as the epoch
-/// seconds the wire carries.
+/// The instant `GetIngestion` reports as the `updatedAt` of one stored ingestion, read from
+/// the RFC 3339 date-time STRING this model's `@timestampFormat("date-time")` timestamp
+/// shape is carried as (`crate::date_time_members_wire_form` pins that wire form).
 async fn ingestion_updated_at(emulator: &Emulator, bundle: &str, ingestion: &str) -> f64 {
     let read = emulator.get_ingestion(bundle, ingestion).await;
-    read.body
+    let text = read
+        .body
         .get("ingestion")
         .and_then(|ingestion| ingestion.get("updatedAt"))
-        .and_then(Value::as_f64)
-        .unwrap_or_else(|| panic!("expected ingestion.updatedAt in {}", read.body))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected a date-time ingestion.updatedAt in {}", read.body))
+        .to_string();
+    ::aws_smithy_types::DateTime::from_str(&text, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| {
+            panic!("expected ingestion.updatedAt as a date-time, got {text:?}: {error}")
+        })
+        .as_secs_f64()
 }
 
 /// RULE: an ingestion that loses a destination association while it is `enabled`

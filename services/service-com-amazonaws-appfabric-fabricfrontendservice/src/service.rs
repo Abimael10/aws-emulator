@@ -35,6 +35,13 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, is one this service also takes: it serves the
+//! model's own `restJson1` codec with every timestamp carried in the `date-time` form this
+//! model's one timestamp shape declares, rather than in the protocol's default
+//! epoch-seconds form. That correction is the shared one
+//! (`service_common::date_time_json`), which every service of this class takes, so two of
+//! them cannot answer one instant differently.
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
@@ -125,6 +132,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// States a refused request of ANY of this service's operations in the modelled
     /// `ValidationException`; see [`request_validation`].
     request_validation: request_validation::RequestValidation,
+    /// This service's wire codec, built ONCE here because [`Service::override_protocol`]
+    /// hands back a borrow of it.
+    protocol: ::service_common::date_time_json::DateTimeRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -135,6 +145,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             request_validation: request_validation::RequestValidation::new::<Eng>(),
+            protocol: ::service_common::date_time_json::DateTimeRestJson::new(),
         }
     }
 }
@@ -243,5 +254,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // This model declares ONE timestamp shape, `com.amazonaws.appfabric#DateTime`, and
+        // it carries `@timestampFormat("date-time")` (`smithy_query(query="shape",
+        // shape="DateTime")`), so every timestamp member of every shape of this service is a
+        // date-time one: an RFC 3339 string rather than the protocol's default epoch-seconds
+        // number. The generated member schemas drop that format and the shared codec
+        // supplies it, never overriding a member that declares one. Borrowed from the field
+        // built in `new`, never constructed per request.
+        Some(&self.protocol)
     }
 }

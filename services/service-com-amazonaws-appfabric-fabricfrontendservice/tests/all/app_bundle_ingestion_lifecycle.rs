@@ -927,13 +927,24 @@ async fn an_ingestion_belongs_only_to_its_own_bundle() {
             "case {app:?}: wrong ingestionType in {ingestion}"
         );
         for stamp in ["createdAt", "updatedAt"] {
-            let seconds = ingestion
+            // A date-time STRING: this model's one timestamp shape declares
+            // `@timestampFormat("date-time")` (`crate::date_time_members_wire_form` pins
+            // that wire form).
+            let text = ingestion
                 .get(stamp)
-                .and_then(Value::as_f64)
-                .unwrap_or_else(|| panic!("case {app:?}: no numeric {stamp} in {ingestion}"));
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("case {app:?}: no date-time {stamp} in {ingestion}"));
+            let seconds = ::aws_smithy_types::DateTime::from_str(
+                text,
+                ::aws_smithy_types::date_time::Format::DateTime,
+            )
+            .unwrap_or_else(|error| {
+                panic!("case {app:?}: {stamp} must be a date-time, got {text:?}: {error}")
+            })
+            .as_secs_f64();
             assert!(
                 seconds > 1.0e9,
-                "case {app:?}: {stamp} must be a real epoch timestamp, got {seconds}"
+                "case {app:?}: {stamp} must be a real instant, got {text:?}"
             );
         }
 
