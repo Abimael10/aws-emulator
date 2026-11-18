@@ -109,9 +109,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The `ByMessageCategory` value that stands for every message category ("The the
-/// value ANY returns count of all message categories"), so it filters nothing out.
-const MESSAGE_CATEGORY_WILDCARD: &str = "*";
+/// The `ByMessageCategory` value THIS operation's member documentation names as
+/// standing for every message category ("The the value ANY returns count of all
+/// message categories" —
+/// `smithy_query(query="doc",shape="ListCopyJobsInput",member="ByMessageCategory")`),
+/// so it filters nothing out. `ListBackupJobs` documents the same wildcard as `*`
+/// instead, which is why each listing honours the spelling its OWN member documents
+/// rather than a spelling shared between them.
+const MESSAGE_CATEGORY_ANY: &str = "ANY";
 
 /// The `ByMessageCategory` value that aggregates every message category at once
 /// ("AGGREGATE_ALL aggregates job counts for all message categories and returns the
@@ -311,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ListCopyJobs<Eng>
                         // the two values the model documents as standing for
                         // every category filter nothing out.
                         && input.by_message_category.as_deref().is_none_or(|category| {
-                            category == MESSAGE_CATEGORY_WILDCARD
+                            category == MESSAGE_CATEGORY_ANY
                                 || category == MESSAGE_CATEGORY_AGGREGATE_ALL
                         })
                 })

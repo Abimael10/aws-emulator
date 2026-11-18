@@ -116,9 +116,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The `ByMessageCategory` value the model documents as the wildcard over every
-/// message category ("The wildcard (*) returns count of all message
-/// categories"), so it filters nothing out.
+/// The `ByMessageCategory` value THIS operation's member documentation names as
+/// the wildcard over every message category ("The wildcard (*) returns count of
+/// all message categories" —
+/// `smithy_query(query="doc",shape="ListBackupJobsInput",member="ByMessageCategory")`),
+/// so it filters nothing out. `ListCopyJobs` documents the same wildcard as `ANY`
+/// instead, which is why each listing honours the spelling its OWN member
+/// documents rather than a spelling shared between them.
 const MESSAGE_CATEGORY_WILDCARD: &str = "*";
 
 /// The `ByMessageCategory` value that stands for every message category at
