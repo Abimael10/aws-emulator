@@ -13,6 +13,16 @@ Issue-Commit: 029c732db8092362c2d6a7aa89bcc4c3ae279d73
 ## Operation
 ListPermissionVersions
 
+## Status note
+`ListPermissionVersions` has since been implemented, as part of the fix for
+`20261103T040218Z-ram-createpermissionversion-stub`: that issue's recorded unit reads a
+permission's versions back after the version write it is about, so the reader it needs
+was written there (state-backed page over the versions a permission carries) and this
+file's `//! SCAFFOLDED, NOT IMPLEMENTED:` census line is gone. This record is left open
+because its own recorded unit,
+`ram.permission-version-lifecycle-and-default-propagation`, covers more of the version
+lifecycle than that one read: whatever it still fails on is the work left here.
+
 ## Description
 `ListPermissionVersions` is an unmodified scaffold stub, so it answers HTTP 501 and persists nothing. Implement it in `services/service-com-amazonaws-ram-amazonresourcesharing/src/ops/list_permission_versions.rs`: replace the `Err(crate::scaffolded::Scaffolded::not_implemented(..))` with a real handler that reads and writes the service's state, then DELETE that file's `//! SCAFFOLDED, NOT IMPLEMENTED:` header line.
 

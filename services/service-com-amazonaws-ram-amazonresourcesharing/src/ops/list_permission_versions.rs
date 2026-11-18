@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPermissionVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPermissionVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the versions of one managed permission held in [`crate::state`], a page at
+//! a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPermissionVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Lists the available versions of the specified RAM permission": every version ever
+//! written for the permission the request names, in version order, each as the summary
+//! a listing reports ([`crate::state::PermissionRecord::summary`]), with
+//! `defaultVersion` set on the one a read that names no version answers with. A
+//! permission `DeletePermission` has deleted still carries its versions, in the status
+//! that delete left them in, so a caller polling the delete can watch it complete.
 //!
 //! ## Shape of an operation
 //!
@@ -177,20 +177,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPermissionVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPermissionVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPermissionVersions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPermissionVersionsErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the managed permission store is unavailable".to_string(),
+            })
+        })?;
+
+        // The model constrains the ARN member not at all, so the rule is applied here,
+        // rendered as the modelled error RAM words that refusal with.
+        if let Some(why) =
+            crate::state::permission_arn_rejection("permissionArn", &input.permission_arn)
+        {
+            return Err(ListPermissionVersionsErrorModeled::MalformedArnException(
+                MalformedArnException { message: why },
+            )
+            .into());
+        }
+
+        let page_size = crate::state::page_size(input.max_results);
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_permission_version_cursor(token).ok_or_else(|| {
+                    ListPermissionVersionsErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: "nextToken is not a pagination token issued by \
+                                      ListPermissionVersions"
+                                .to_string(),
+                        },
+                    )
+                })?,
+            ),
+        };
+
+        let mut store = state.lock();
+        // A permission whose delete has fallen due is DELETED whether or not anybody
+        // asked, so this read materialises that owed move before reporting: the only
+        // write it performs.
+        let now = store.tick();
+        store.settle_due_permissions(now);
+        let permission = store.permission(&input.permission_arn).ok_or_else(|| {
+            ListPermissionVersionsErrorModeled::UnknownResourceException(UnknownResourceException {
+                message: crate::state::unknown_permission_message(&input.permission_arn),
+            })
+        })?;
+
+        let mut permissions = Vec::with_capacity(page_size.min(permission.versions.len()));
+        let mut next_token = None;
+        // The versions are keyed by number, so a token naming one starts this page at
+        // the first version at or after it.
+        for (number, version) in permission.versions.range(start.unwrap_or(i32::MIN)..) {
+            // The first version that does not fit becomes the next page's start, and
+            // only then is a `nextToken` emitted: the last page carries none.
+            if permissions.len() == page_size {
+                next_token = Some(crate::state::encode_permission_version_cursor(*number));
+                break;
+            }
+            permissions.push(permission.summary(version));
+        }
+
+        Ok(ListPermissionVersionsOutput {
+            permissions: Some(permissions),
+            next_token,
+        })
     }
 }

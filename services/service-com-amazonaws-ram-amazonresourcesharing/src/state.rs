@@ -26,10 +26,12 @@
 mod aws_managed_permissions;
 mod permission_attachments;
 mod permission_deletion;
+mod policy_actions;
 
 pub use aws_managed_permissions::*;
 pub use permission_attachments::*;
 pub use permission_deletion::*;
+pub use policy_actions::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2417,7 +2419,9 @@ pub enum PolicyTemplateRejection {
 /// JSON, not a JSON object, or carrying an element that is not of the type a policy
 /// statement's element takes — is one refusal class with one fixed message
 /// ([`invalid_policy_format`]); a statement that reads but breaks one of the rules
-/// above is reported with the rule it broke.
+/// above is reported with the rule it broke — an action the resource type does not
+/// support ([`action_supported_for_resource_type`]) with
+/// [`action_not_allowed_message`].
 pub fn policy_template_rejection(
     resource_type: &str,
     template: &str,
@@ -2470,27 +2474,17 @@ pub fn policy_template_rejection(
             return invalid_policy_format();
         }
     }
-    // An action is supported by a resource type only if it belongs to the service
-    // that owns that resource type, so an action of any other service namespace is
-    // one this permission's resource type does not support — what the template says
-    // is then not a policy this permission may carry.
-    let service = resource_type_service(resource_type)?;
-    for action in actions {
-        let Some((namespace, operation)) = action.split_once(':') else {
-            return Some(PolicyTemplateRejection::InvalidPolicy(format!(
-                "policyTemplate {POLICY_TEMPLATE_ACTION_ELEMENT} '{}' is not an action of the \
-                 form <service-code>:<action>",
-                truncate(action)
-            )));
-        };
-        if operation.is_empty() || !namespace.eq_ignore_ascii_case(service) {
-            return Some(PolicyTemplateRejection::InvalidPolicy(format!(
-                "policyTemplate {POLICY_TEMPLATE_ACTION_ELEMENT} '{}' is not an action supported \
-                 by resource type '{}'",
-                truncate(action),
-                truncate(resource_type)
-            )));
-        }
+    // "The list must contain only actions that are supported by the specified resource
+    // type": an action the resource type does not support makes what the template says
+    // a policy this permission may not carry
+    // ([`action_supported_for_resource_type`]).
+    if actions
+        .iter()
+        .any(|action| !action_supported_for_resource_type(resource_type, action))
+    {
+        return Some(PolicyTemplateRejection::InvalidPolicy(
+            action_not_allowed_message(&truncate(resource_type)),
+        ));
     }
     None
 }
@@ -2605,6 +2599,28 @@ pub fn decode_invitation_cursor(token: &str) -> Option<String> {
 /// this service issued — the `InvalidNextTokenException` case.
 pub fn decode_permission_cursor(token: &str) -> Option<String> {
     decode_cursor(token).filter(|arn| is_permission_arn(arn))
+}
+
+/// A `nextToken` naming the permission version the next page starts at.
+///
+/// A read that pages over the versions of ONE permission pages over version numbers
+/// rather than over ARNs, so the value a token carries is the number itself, encoded
+/// the way every other cursor of this service is.
+pub fn encode_permission_version_cursor(version: i32) -> String {
+    hex::encode(version.to_string())
+}
+
+/// The permission version a `nextToken` names, or `None` when the token is not one this
+/// service issued — the `InvalidNextTokenException` case.
+///
+/// A token this service issued names a version a permission could carry, so the test is
+/// on the FORM of the value, as every other decoder's is: a version number at or above
+/// the first one ([`FIRST_PERMISSION_VERSION`]), whether or not any permission still
+/// carries that one.
+pub fn decode_permission_version_cursor(token: &str) -> Option<i32> {
+    decode_cursor(token)
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|version| *version >= FIRST_PERMISSION_VERSION)
 }
 
 /// A `nextToken` naming the resource type the next page of the catalog starts at.

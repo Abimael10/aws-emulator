@@ -14,6 +14,11 @@
 //!   sentence that interpolates nothing from the request. The template's own rules
 //!   (`CreatePermission$policyTemplate`: an `Effect` of `ALLOW`, actions the resource
 //!   type supports) are the same error class, reported with the rule that was broken.
+//! * A template whose `Action` element names an action the permission's resource type
+//!   does not support is refused, by every operation that takes one, as
+//!   `InvalidPolicyException` with HTTP 400 and one sentence whose only variable part
+//!   is that resource type; a template naming only actions it supports is stored and
+//!   reads back.
 //!
 //! So the rows vary along what the rules generalise over:
 //!
@@ -26,9 +31,17 @@
 //!   scalar, a JSON array, a missing `Effect`, an `Effect` of every other JSON type, a
 //!   missing `Action`, an `Action` of a type that names no action, a list with an entry
 //!   that is not a name, an empty list, and a `Condition` that is not an object;
-//! * WHICH operation takes the template — the create and the version create.
+//! * WHICH operation takes the template — the create and the version create;
+//! * WHY an action is not supported for the resource type it was named for: it controls
+//!   a resource of that very type (created, deleted, updated, put over, named in the
+//!   singular or the plural), it belongs to another service's namespace, or it names no
+//!   namespace at all — against actions of the same services that ARE supported, over
+//!   several resource types of the catalog.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_ram_amazonresourcesharing::state::{
+    resource_type_entry_of, AWS_MANAGED_PERMISSIONS,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 // Every suite in this crate calls the service the one way: through `tests/all/harness.rs`.
@@ -427,6 +440,394 @@ async fn a_readable_statement_that_breaks_a_template_rule_says_which_rule() {
         assert!(
             !message.is_empty(),
             "case {case:?}: the refusal must say which rule was broken, got {refused:?}"
+        );
+    }
+}
+
+/// The sentence a refusal of an action the resource type does not support carries:
+/// fixed text and one variable part, the resource type the permission applies to.
+fn action_not_allowed(resource_type: &str) -> String {
+    format!(
+        "InvalidPolicy: Input policy containing action that is not allowed for resource type \
+         {resource_type}"
+    )
+}
+
+/// A template allowing exactly `action`, which is either one action name or a list of
+/// them — both forms `CreatePermission$policyTemplate` admits for the `Action` element.
+fn template_allowing(action: &Value) -> String {
+    json!({"Effect": "ALLOW", "Action": action}).to_string()
+}
+
+/// One row of the supported-action tables: the resource type a permission applies to,
+/// and the `Action` element a write for it carries.
+///
+/// A row's actions are read against the resource type's own resource code, so a row may
+/// name an action of that form (`<Verb><ResourceCode>`) whichever service owns the type.
+struct ActionCase {
+    case: &'static str,
+    resource_type: &'static str,
+    action: Value,
+}
+
+/// Rows whose `Action` names something the resource type does not support.
+fn unsupported_action_cases() -> Vec<ActionCase> {
+    vec![
+        ActionCase {
+            case: "a delete of a resource of the shared type",
+            resource_type: "codebuild:Project",
+            action: json!(["codebuild:DeleteProject"]),
+        },
+        ActionCase {
+            case: "an update of a resource of the shared type",
+            resource_type: "ssm-incidents:ResponsePlan",
+            action: json!(["ssm-incidents:UpdateResponsePlan"]),
+        },
+        ActionCase {
+            case: "a create of a resource of the shared type",
+            resource_type: "resource-groups:Group",
+            action: json!(["resource-groups:CreateGroup"]),
+        },
+        ActionCase {
+            case: "a put over a resource of the shared type",
+            resource_type: "glue:Catalog",
+            action: json!(["glue:PutCatalog"]),
+        },
+        ActionCase {
+            case: "a modify of a resource of the shared type",
+            resource_type: "rds:Cluster",
+            action: json!(["rds:ModifyCluster"]),
+        },
+        ActionCase {
+            case: "a delete naming the shared type in the plural",
+            resource_type: "codebuild:ReportGroup",
+            action: json!(["codebuild:DeleteReportGroups"]),
+        },
+        ActionCase {
+            case: "a delete of the shared type cased differently",
+            resource_type: "cloudtrail:EventDataStore",
+            action: json!(["cloudtrail:deleteeventdatastore"]),
+        },
+        ActionCase {
+            case: "one action the type supports beside one it does not",
+            resource_type: "codebuild:Project",
+            action: json!(["codebuild:BatchGetProjects", "codebuild:DeleteProject"]),
+        },
+        ActionCase {
+            case: "a delete of the shared type named as a bare string",
+            resource_type: "network-firewall:FirewallPolicy",
+            action: json!("network-firewall:DeleteFirewallPolicy"),
+        },
+        ActionCase {
+            case: "an action of another service's namespace",
+            resource_type: "codebuild:Project",
+            action: json!(["s3:GetObject"]),
+        },
+        ActionCase {
+            case: "an action of another service's namespace, cased differently",
+            resource_type: "codebuild:Project",
+            action: json!(["IAM:PassRole"]),
+        },
+        ActionCase {
+            case: "an action naming no namespace at all",
+            resource_type: "codebuild:Project",
+            action: json!("*"),
+        },
+    ]
+}
+
+/// Rows whose `Action` names only actions the resource type does support.
+fn supported_action_cases() -> Vec<ActionCase> {
+    vec![
+        ActionCase {
+            case: "a read of the shared resource",
+            resource_type: "glue:Table",
+            action: json!(["glue:GetTable"]),
+        },
+        ActionCase {
+            case: "a write of a resource BESIDE the shared one",
+            resource_type: "glue:Database",
+            action: json!(["glue:CreateTable", "glue:DeleteTable", "glue:UpdateTable"]),
+        },
+        ActionCase {
+            case: "a create whose object merely starts with the shared type's code",
+            resource_type: "vpc-lattice:ServiceNetwork",
+            action: json!(["vpc-lattice:CreateServiceNetworkVpcAssociation"]),
+        },
+        ActionCase {
+            case: "a use of the shared resource",
+            resource_type: "codebuild:Project",
+            action: json!(["codebuild:StartBuild"]),
+        },
+        ActionCase {
+            case: "an association with the shared resource",
+            resource_type: "route53resolver:ResolverRule",
+            action: json!([
+                "route53resolver:AssociateResolverRule",
+                "route53resolver:DisassociateResolverRule",
+            ]),
+        },
+        ActionCase {
+            case: "a prefixed wildcard, which names no single action",
+            resource_type: "imagebuilder:Image",
+            action: json!(["imagebuilder:Get*"]),
+        },
+        ActionCase {
+            case: "a whole-namespace wildcard",
+            resource_type: "appmesh:Mesh",
+            action: json!(["appmesh:*"]),
+        },
+        ActionCase {
+            case: "one action named as a bare string",
+            resource_type: "outposts:Site",
+            action: json!("outposts:GetSite"),
+        },
+    ]
+}
+
+/// A permission of `resource_type` to write new versions of, created with a template
+/// the type supports: a wildcard over its own service's namespace.
+async fn version_subject(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    resource_type: &str,
+) -> String {
+    let service = resource_type
+        .split(':')
+        .next()
+        .expect("every resource type names a service code");
+    let (status, created) = create_permission(
+        router,
+        &json!({
+            "name": name,
+            "resourceType": resource_type,
+            "policyTemplate": template_allowing(&json!([format!("{service}:*")])),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the subject create expected 200, got {status} with {created:?}"
+    );
+    created_arn(case, &created)
+}
+
+/// The `permission` member of a read or a write, and one of its members as a string.
+fn member(case: &str, body: &Value, name: &str) -> String {
+    body.get("permission")
+        .and_then(|permission| permission.get(name))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: no permission {name}, got {body:?}"))
+        .to_string()
+}
+
+async fn get_permission(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        "/getpermission",
+        Some(&json!({"permissionArn": arn})),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_action_the_resource_type_does_not_support_is_refused_by_both_writes() {
+    let router = emulator();
+    for (index, ActionCase { case, resource_type, action }) in
+        unsupported_action_cases().into_iter().enumerate()
+    {
+        let expected = action_not_allowed(resource_type);
+        let template = template_allowing(&action);
+
+        let (status, refused) = create_permission(
+            &router,
+            &json!({
+                "name": format!("Unsupported{index}"),
+                "resourceType": resource_type,
+                "policyTemplate": template,
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&refused)),
+            (400, "InvalidPolicyException".to_string()),
+            "case {case:?}: CreatePermission expected 400 InvalidPolicyException, got {status} \
+             with {refused:?}"
+        );
+        assert_eq!(
+            error_message(&refused),
+            expected,
+            "case {case:?}: CreatePermission expected the message {expected:?}, got {refused:?}"
+        );
+        // Nothing was stored: the name is still free, so the version subject below can
+        // be created under its own name without clashing with a refused create.
+        let (status, missing) = get_permission(
+            &router,
+            &format!("arn:aws:ram:{REGION}:{ACCOUNT}:permission/Unsupported{index}"),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&missing)),
+            (400, "UnknownResourceException".to_string()),
+            "case {case:?}: a refused create must store nothing, got {status} with {missing:?}"
+        );
+
+        let subject = version_subject(
+            &router,
+            case,
+            &format!("UnsupportedSubject{index}"),
+            resource_type,
+        )
+        .await;
+        let (status, refused) = create_permission_version(
+            &router,
+            &json!({"permissionArn": subject, "policyTemplate": template}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&refused)),
+            (400, "InvalidPolicyException".to_string()),
+            "case {case:?}: CreatePermissionVersion expected 400 InvalidPolicyException, got \
+             {status} with {refused:?}"
+        );
+        assert_eq!(
+            error_message(&refused),
+            expected,
+            "case {case:?}: CreatePermissionVersion expected the message {expected:?}, got \
+             {refused:?}"
+        );
+        // The refused version create wrote nothing: the subject still carries the one
+        // version its create wrote, and that version is still the default.
+        let (status, read) = get_permission(&router, &subject).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reading the subject back expected 200, got {status} with {read:?}"
+        );
+        assert_eq!(
+            member(case, &read, "version"),
+            "1",
+            "case {case:?}: a refused version create must write no version, got {read:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_action_the_resource_type_supports_is_stored_by_both_writes() {
+    let router = emulator();
+    for (index, ActionCase { case, resource_type, action }) in
+        supported_action_cases().into_iter().enumerate()
+    {
+        let template = template_allowing(&action);
+
+        let (status, created) = create_permission(
+            &router,
+            &json!({
+                "name": format!("Supported{index}"),
+                "resourceType": resource_type,
+                "policyTemplate": template,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreatePermission expected 200, got {status} with {created:?}"
+        );
+        // The create reports a summary, which carries no policy document, so what was
+        // stored is read back through `GetPermission`, which reports the detail.
+        let stored = created_arn(case, &created);
+        let (status, read) = get_permission(&router, &stored).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reading the create back expected 200, got {status} with {read:?}"
+        );
+        assert_eq!(
+            member(case, &read, "permission"),
+            template,
+            "case {case:?}: the create stored another document, got {read:?}"
+        );
+
+        // The same template as a new version of a permission of that type, read back
+        // through `GetPermission`: the version the write reported is the default one.
+        let subject = version_subject(
+            &router,
+            case,
+            &format!("SupportedSubject{index}"),
+            resource_type,
+        )
+        .await;
+        let (status, written) = create_permission_version(
+            &router,
+            &json!({"permissionArn": subject, "policyTemplate": template}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreatePermissionVersion expected 200, got {status} with {written:?}"
+        );
+        assert_eq!(
+            member(case, &written, "version"),
+            "2",
+            "case {case:?}: the version create reported another version, got {written:?}"
+        );
+
+        let (status, read) = get_permission(&router, &subject).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reading the version back expected 200, got {status} with {read:?}"
+        );
+        assert_eq!(
+            (
+                member(case, &read, "version"),
+                member(case, &read, "permission"),
+            ),
+            ("2".to_string(), template),
+            "case {case:?}: the default version must be the one just written, got {read:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_action_a_published_permission_grants_is_supported_for_its_resource_type() {
+    let router = emulator();
+    // The invariant over the WHOLE published catalog rather than over the rows above:
+    // the actions the permissions this service publishes for a resource type grant are
+    // actions that type supports, so a customer managed permission may grant them too.
+    // Resource types that take no customer managed permission are refused earlier, on
+    // the resource type itself, so only the types that take one are driven here.
+    for (index, entry) in AWS_MANAGED_PERMISSIONS.iter().enumerate() {
+        let case = entry.name;
+        if !resource_type_entry_of(entry.resource_type)
+            .is_some_and(|known| known.customer_managed_permissions)
+        {
+            continue;
+        }
+        let template = template_allowing(&json!(entry.actions));
+        let (status, created) = create_permission(
+            &router,
+            &json!({
+                "name": format!("Published{index}"),
+                "resourceType": entry.resource_type,
+                "policyTemplate": template,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a template granting what {:?} grants expected 200, got {status} with \
+             {created:?}",
+            entry.resource_type
+        );
+        let (status, read) = get_permission(&router, &created_arn(case, &created)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reading the create back expected 200, got {status} with {read:?}"
+        );
+        assert_eq!(
+            member(case, &read, "permission"),
+            template,
+            "case {case:?}: the create stored another document, got {read:?}"
         );
     }
 }

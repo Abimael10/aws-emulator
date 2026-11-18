@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for `ListPermissions`.
+//! End-to-end HTTP tests for `ListPermissions` and `ListPermissionVersions`.
 //!
 //! The rule the rows below pin: a list of managed permissions reports every permission
 //! the store holds that the Region the request was signed for sees — the customer
@@ -12,19 +12,27 @@
 //! `resourceType` is named, the ones applying to that type matched without regard to
 //! case or to the separators inside the resource code.
 //!
+//! A list of the versions of ONE permission pins the same rule over that permission's
+//! versions: every version ever written for it, once each, in version order, with the
+//! default flag on the version a read naming none answers with, paged the same way; a
+//! request naming no permission this store holds is refused with the modelled error
+//! that words that refusal.
+//!
 //! So the rows vary along what the rule generalises over: the filter takes each of its
 //! modelled values and none at all; the resource type takes a type with two permissions,
 //! one with a single permission, a hyphenated service code, two spellings of one type,
 //! a shareable type no permission applies to and a type nothing shares; the page size
-//! takes both published bounds, values between them and one past each; and a permission
-//! is read from the Region that created it and from another one.
+//! takes both published bounds, values between them and one past each; a permission
+//! is read from the Region that created it and from another one; and a permission's
+//! version count runs from the first version up to the published maximum of 5, over a
+//! customer managed permission and over the catalog Amazon Web Services publishes.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ram_amazonresourcesharing::state::{
-    aws_managed_permission_arn, encode_arn_cursor, permission_arn, resource_type_matches,
-    AWS_MANAGED_PERMISSIONS, FIRST_PERMISSION_VERSION, PERMISSION_FEATURE_SET_STANDARD,
-    PERMISSION_STATUS_ATTACHABLE, PERMISSION_TYPE_AWS_MANAGED, PERMISSION_TYPE_CUSTOMER_MANAGED,
-    RESOURCE_TYPES,
+    aws_managed_permission_arn, encode_arn_cursor, encode_permission_version_cursor,
+    permission_arn, resource_type_matches, AWS_MANAGED_PERMISSIONS, FIRST_PERMISSION_VERSION,
+    PERMISSION_FEATURE_SET_STANDARD, PERMISSION_STATUS_ATTACHABLE, PERMISSION_TYPE_AWS_MANAGED,
+    PERMISSION_TYPE_CUSTOMER_MANAGED, RESOURCE_TYPES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -590,4 +598,293 @@ async fn a_list_reports_the_same_permissions_to_a_later_caller() {
         before, after,
         "case \"repeat read\": listing changed what a read of one permission reports, got {after:?}"
     );
+}
+
+async fn list_permission_versions(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/listpermissionversions", Some(body)).await
+}
+
+/// The version numbers a list of versions reported, in the order it reported them.
+fn versions_of(case: &str, body: &Value) -> Vec<String> {
+    permissions_of(case, body)
+        .iter()
+        .map(|permission| field(case, permission, "version"))
+        .collect()
+}
+
+/// A list of versions that must succeed.
+async fn list_versions_ok(router: &MultiServiceRouter, case: &str, body: &Value) -> Value {
+    let (status, reported) = list_permission_versions(router, body).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with {reported:?}"
+    );
+    reported
+}
+
+/// Write `count` further versions of the permission at `arn`, each with its own
+/// template, and answer the version numbers the permission then carries.
+async fn add_versions(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+    actions: &[&str],
+) -> Vec<String> {
+    for action in actions {
+        let (status, written) = create_permission_version(
+            router,
+            &json!({
+                "permissionArn": arn,
+                "policyTemplate": json!({"Effect": "ALLOW", "Action": [action]}).to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: writing the version granting {action:?} expected 200, got {status} \
+             with {written:?}"
+        );
+    }
+    (FIRST_PERMISSION_VERSION..=FIRST_PERMISSION_VERSION + actions.len() as i32)
+        .map(|version| version.to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn every_version_a_permission_carries_is_listed_in_version_order() {
+    let router = emulator();
+    // The rule over a VARYING number of versions: a permission at its first version,
+    // and one at each further version up to the published maximum of 5, each reported
+    // once, in version order, with the default flag on the version a read that names
+    // none answers with.
+    let later_actions = [
+        "codebuild:StartBuild",
+        "codebuild:ListBuildsForProject",
+        "codebuild:BatchGetBuilds",
+        "codebuild:ListProjects",
+    ];
+    for count in 0..=later_actions.len() {
+        let case = format!("{} version(s) beyond the first", count);
+        let name = format!("VersionsListed{count}");
+        let arn = create_ok(
+            &router,
+            &name,
+            "codebuild:Project",
+            "codebuild:BatchGetProjects",
+        )
+        .await;
+        let expected = add_versions(&router, &case, &arn, &later_actions[..count]).await;
+
+        let reported = list_versions_ok(&router, &case, &json!({"permissionArn": arn})).await;
+        assert_eq!(
+            versions_of(&case, &reported),
+            expected,
+            "case {case:?}: expected every version in version order, got {reported:?}"
+        );
+        assert_eq!(
+            token_of(&reported),
+            None,
+            "case {case:?}: one page holds every version, so it carries no nextToken, got \
+             {reported:?}"
+        );
+        for permission in permissions_of(&case, &reported) {
+            let version = field(&case, &permission, "version");
+            assert_eq!(
+                (
+                    field(&case, &permission, "arn"),
+                    field(&case, &permission, "name"),
+                    field(&case, &permission, "resourceType"),
+                    field(&case, &permission, "permissionType"),
+                    field(&case, &permission, "featureSet"),
+                    field(&case, &permission, "status"),
+                ),
+                (
+                    arn.clone(),
+                    name.clone(),
+                    "codebuild:Project".to_string(),
+                    PERMISSION_TYPE_CUSTOMER_MANAGED.to_string(),
+                    PERMISSION_FEATURE_SET_STANDARD.to_string(),
+                    PERMISSION_STATUS_ATTACHABLE.to_string(),
+                ),
+                "case {case:?}: version {version} reported another permission, got {permission:?}"
+            );
+            assert_eq!(
+                flag(&case, &permission, "defaultVersion"),
+                version == *expected.last().expect("a permission carries a version"),
+                "case {case:?}: only the latest version is the default one, got {permission:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_page_of_versions_runs_to_max_results_and_its_token_resumes_after_it() {
+    let router = emulator();
+    let arn = create_ok(
+        &router,
+        "VersionPagingPermission",
+        "glue:Database",
+        "glue:GetDatabase",
+    )
+    .await;
+    let all = add_versions(
+        &router,
+        "setup",
+        &arn,
+        &["glue:GetTable", "glue:GetTables", "glue:GetPartitions"],
+    )
+    .await;
+
+    // The published bounds of `maxResults` (1..500) and sizes between them: every
+    // version comes back once, in one order, however it is cut into pages.
+    for size in [1usize, 2, all.len(), 500] {
+        let case = format!("maxResults {size}");
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let mut body = json!({"permissionArn": arn.clone(), "maxResults": size});
+            if let Some(resume) = &token {
+                body["nextToken"] = json!(resume);
+            }
+            let reported = list_versions_ok(&router, &case, &body).await;
+            let page = versions_of(&case, &reported);
+            assert!(
+                page.len() <= size,
+                "case {case:?}: a page reported {} versions, more than the {size} asked for",
+                page.len()
+            );
+            seen.extend(page);
+            token = token_of(&reported);
+            pages += 1;
+            assert!(
+                pages <= all.len() + 1,
+                "case {case:?}: paging did not finish after {pages} pages, got {seen:?}"
+            );
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen, all,
+            "case {case:?}: paging reported every version exactly once, in version order"
+        );
+    }
+
+    // One past each published bound is refused by the modelled range, not clamped.
+    for size in [0, 501] {
+        let case = format!("maxResults {size}");
+        let (status, refused) = list_permission_versions(
+            &router,
+            &json!({"permissionArn": arn.clone(), "maxResults": size}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a page size outside 1..500 is refused, got {status} with {refused:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_versions_of_an_aws_managed_permission_are_the_one_it_publishes() {
+    let router = emulator();
+    // The catalog is read the same way a created permission is, from every Region: an
+    // AWS managed permission is published at one version, which is its default.
+    for entry in AWS_MANAGED_PERMISSIONS.iter().take(3) {
+        let case = entry.name;
+        let arn = aws_managed_permission_arn(entry.name);
+        let reported = list_versions_ok(&router, case, &json!({"permissionArn": arn.clone()})).await;
+        assert_eq!(
+            versions_of(case, &reported),
+            vec![FIRST_PERMISSION_VERSION.to_string()],
+            "case {case:?}: expected the one published version, got {reported:?}"
+        );
+        let permission = permissions_of(case, &reported)
+            .first()
+            .cloned()
+            .expect("the page reported the published version");
+        assert_eq!(
+            (
+                field(case, &permission, "arn"),
+                field(case, &permission, "permissionType"),
+                flag(case, &permission, "defaultVersion"),
+                flag(case, &permission, "isResourceTypeDefault"),
+            ),
+            (
+                arn,
+                PERMISSION_TYPE_AWS_MANAGED.to_string(),
+                true,
+                entry.is_resource_type_default,
+            ),
+            "case {case:?}: the published version reported something else, got {permission:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_list_of_versions_refuses_a_request_that_names_no_permission() {
+    let router = emulator();
+    let arn = create_ok(
+        &router,
+        "VersionRefusalPermission",
+        "outposts:Site",
+        "outposts:GetSite",
+    )
+    .await;
+
+    // WHY a request names no versions to list: the ARN is not a managed permission ARN
+    // at all, it is one nothing was stored under, or the token does not name where a
+    // page of versions resumes.
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "a value that is not an ARN",
+            json!({"permissionArn": "permission/Nope"}),
+            "MalformedArnException",
+        ),
+        (
+            "an ARN of another resource of this service",
+            json!({
+                "permissionArn":
+                    format!("arn:aws:ram:{REGION}:{ACCOUNT}:resource-share/11111111-2222-3333-4444-555555555555"),
+            }),
+            "MalformedArnException",
+        ),
+        (
+            "a permission ARN nothing was stored under",
+            json!({"permissionArn": permission_arn(REGION, "NeverCreated")}),
+            "UnknownResourceException",
+        ),
+        (
+            "a nextToken this read did not issue",
+            json!({"permissionArn": arn.clone(), "nextToken": "not-a-token"}),
+            "InvalidNextTokenException",
+        ),
+        (
+            "an empty nextToken",
+            json!({"permissionArn": arn.clone(), "nextToken": ""}),
+            "InvalidNextTokenException",
+        ),
+        (
+            "a nextToken naming an ARN rather than a version",
+            json!({"permissionArn": arn.clone(), "nextToken": encode_arn_cursor(&arn)}),
+            "InvalidNextTokenException",
+        ),
+        (
+            "a nextToken naming a version below the first one",
+            json!({
+                "permissionArn": arn.clone(),
+                "nextToken": encode_permission_version_cursor(FIRST_PERMISSION_VERSION - 1),
+            }),
+            "InvalidNextTokenException",
+        ),
+    ];
+    for (case, body, code) in cases {
+        let (status, refused) = list_permission_versions(&router, &body).await;
+        assert_eq!(
+            (status, error_code(&refused)),
+            (400, code.to_string()),
+            "case {case:?}: expected 400 {code}, got {status} with {refused:?}"
+        );
+    }
 }
