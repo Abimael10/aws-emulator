@@ -68,6 +68,10 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Recomputes the CRC32 of the bytes Amazon S3 served, so the execution suite can assert
+# the checksum a read of the result object reports really describes that object rather
+# than only being present.
+crc32fast = "1"
 # The AWS SDK for IAM, used by the test harness to CREATE the execution roles a hybrid job
 # names, over the same in-process callback `CreateJob` resolves them through.
 aws-sdk-iam = { version = "1", default-features = false }

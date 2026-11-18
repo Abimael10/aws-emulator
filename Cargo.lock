@@ -11016,6 +11016,7 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
+ "crc32fast",
  "hex",
  "http",
  "oq3_parser",

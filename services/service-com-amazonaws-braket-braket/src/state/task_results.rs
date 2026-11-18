@@ -13,6 +13,11 @@
 //!   as completed ([`write_result_document`]), so a task this service reports as
 //!   `COMPLETED` is one whose results a client can actually read.
 //!
+//! The object that write stores is read back exactly as the write declared it, which is why
+//! the write declares no media type (Amazon S3 records its own default for an object with
+//! no stated type) and declares the integrity checksum an upload carries
+//! ([`RESULTS_CHECKSUM_ALGORITHM`]).
+//!
 //! Amazon S3 is reached the way the framework documents a handler reaching another
 //! emulated service ([`smithy_server_runtime::OperationContext::callback`]), through the
 //! tree's one construction of that client (`service_common::s3_client`), so nothing here
@@ -40,8 +45,19 @@ const SIMULATOR_METADATA_SCHEMA: &str = "braket.task_result.simulator_metadata";
 /// The version every one of those schemas is published at.
 const SCHEMA_VERSION: &str = "1";
 
-/// The media type of the result object.
-const RESULTS_CONTENT_TYPE: &str = "application/json";
+/// The integrity checksum the write of a result document declares, which is what a later
+/// read of the object reports beside it (`GetObjectOutput$ChecksumCRC32`, with the
+/// `ChecksumType` `FULL_OBJECT` a one-shot write stores).
+///
+/// A service writes into a caller's bucket through an AWS SDK, and an SDK computes a CRC32
+/// checksum for every upload it makes unless the caller asks for another algorithm (the
+/// default request checksum calculation of every current SDK), so the object a finished
+/// task leaves behind carries that checksum and a reader can verify the document it got is
+/// the one that was stored. Named here rather than left to the transport: the in-process
+/// hop every emulated service shares computes a checksum only where one is asked for
+/// (`service_common::s3_client`), so this is the SERVICE stating what its write carries.
+const RESULTS_CHECKSUM_ALGORITHM: ::aws_sdk_s3::types::ChecksumAlgorithm =
+    ::aws_sdk_s3::types::ChecksumAlgorithm::Crc32;
 
 /// How Amazon Braket refuses a create whose `outputS3Bucket` it cannot resolve for the
 /// caller: the fixed sentence pointing at the developer guide, interpolating nothing from
@@ -97,6 +113,12 @@ pub async fn output_bucket_is_absent(
 /// Write `document` as the object `key` of `bucket`, and report whether the write was
 /// made.
 ///
+/// The write declares NO media type: Amazon S3 records the type an upload declared and
+/// reports exactly that on every later read, and a write that declares none is recorded
+/// under the store's own default for an object with no stated type — which is what a read
+/// of a finished task's result object reports. It declares the integrity checksum the
+/// upload carries ([`RESULTS_CHECKSUM_ALGORITHM`]), so that read reports that checksum too.
+///
 /// Call it with NO guard of this service's store held: it awaits.
 pub async fn write_result_document(
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -110,7 +132,7 @@ pub async fn write_result_document(
         .put_object()
         .bucket(bucket)
         .key(key)
-        .content_type(RESULTS_CONTENT_TYPE)
+        .checksum_algorithm(RESULTS_CHECKSUM_ALGORITHM)
         .body(::aws_sdk_s3::primitives::ByteStream::from(body.into_bytes()))
         .send()
         .await;

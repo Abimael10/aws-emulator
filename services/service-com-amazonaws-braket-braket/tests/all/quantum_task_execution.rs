@@ -17,6 +17,11 @@
 //! the member of the request that is out of range. The recorded Bell circuit at 100 shots
 //! is ONE row of the first table.
 //!
+//! The last suite pins the OBJECT rather than the document: Amazon S3 serves a stored
+//! object as the write that stored it declared it, so a read of a result object reports
+//! the store's own default media type (the write declares none) and the CRC32 whole-object
+//! checksum that write carries.
+//!
 //! Everything goes over HTTP through the production router, with Amazon S3 — the owner of
 //! the output location — mounted beside this service on the same engine, so a result
 //! object exists here only because S3 answered for it.
@@ -645,5 +650,181 @@ async fn a_well_formed_arn_no_task_is_held_for_is_a_missing_resource() {
                 reply.message()
             );
         }
+    }
+}
+
+/// Amazon S3 reports a stored object exactly as the write that stored it declared it, so a
+/// read of a finished task's result object reports the store's own default media type —
+/// the Braket write declares none — and the CRC32 whole-object checksum that write
+/// carries, beside the standard metadata of any stored object.
+///
+/// The rows differ along the run that produced the document, and so along its size and its
+/// bytes: the properties a read reports are the write's, not the document's. The recorded
+/// deterministic circuit at 10 shots is ONE row.
+#[tokio::test]
+async fn a_result_object_is_read_back_with_the_properties_its_write_stored() {
+    let (braket, s3) = Braket::with_s3();
+    create_bucket(&s3).await;
+
+    // (case, source, shots)
+    let cases: Vec<(&str, &str, i64)> = vec![
+        (
+            // The recorded run of this fixture: an X on the first of two measured qubits.
+            "the recorded deterministic circuit at 10 shots",
+            "OPENQASM 3.0; bit[2] b; qubit[2] q; x q[0]; b[0] = measure q[0]; \
+             b[1] = measure q[1];",
+            10,
+        ),
+        (
+            "a one-qubit circuit at a single shot",
+            "OPENQASM 3.0; qubit[1] q; x q[0];",
+            1,
+        ),
+        (
+            // Many more shots over more qubits: a document some hundreds of rows long.
+            "a three-qubit circuit at 250 shots",
+            "OPENQASM 3.0; qubit[3] q; h q[0]; cnot q[0], q[1]; cnot q[1], q[2];",
+            250,
+        ),
+    ];
+
+    for (index, (case, source, shots)) in cases.iter().enumerate() {
+        let created = braket
+            .create_task(create_body(
+                &format!("object-token-{index}"),
+                SV1,
+                *shots,
+                BUCKET,
+                &openqasm_action(source),
+            ))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: expected 200, got {} {}",
+            created.status, created.body
+        );
+        let arn = created.str_member("quantumTaskArn");
+        let task = poll_until_terminal(&braket, &arn).await;
+        assert_eq!(
+            member(&task, "status"),
+            "COMPLETED",
+            "case {case}: expected COMPLETED, got {task}"
+        );
+        let key = format!("{}/{RESULTS_OBJECT}", member(&task, "outputS3Directory"));
+
+        let object = s3
+            .get_object()
+            .bucket(BUCKET)
+            .key(&key)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case}: expected the object at {key}, got {error:?}")
+            });
+        let content_type = object.content_type().map(ToString::to_string);
+        let checksum = object.checksum_crc32().map(ToString::to_string);
+        let checksum_type = object
+            .checksum_type()
+            .map(|value| value.as_str().to_string());
+        let accept_ranges = object.accept_ranges().map(ToString::to_string);
+        let etag = object.e_tag().map(ToString::to_string);
+        let last_modified = object.last_modified().copied();
+        let encryption = object
+            .server_side_encryption()
+            .map(|value| value.as_str().to_string());
+        let bytes = object
+            .body
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("case {case}: the object's body reads, got {error:?}"))
+            .into_bytes();
+
+        assert_eq!(
+            content_type.as_deref(),
+            // The store's own default for an object stored with no stated media type,
+            // named where Amazon S3 holds it rather than copied as a value.
+            Some(::service_com_amazonaws_s3_amazons3::state::DEFAULT_CONTENT_TYPE),
+            "case {case}: expected the store's default media type, got {content_type:?}"
+        );
+        // The CRC32 of the bytes the read served, Base64 encoded the way every `Checksum*`
+        // member carries a checksum.
+        let mut digest = ::crc32fast::Hasher::new();
+        digest.update(&bytes);
+        let expected = ::aws_smithy_types::base64::encode(digest.finalize().to_be_bytes());
+        assert_eq!(
+            checksum.as_deref(),
+            Some(expected.as_str()),
+            "case {case}: expected the CRC32 of the {} bytes served ({expected}), got \
+             {checksum:?}",
+            bytes.len()
+        );
+        assert_eq!(
+            checksum_type.as_deref(),
+            Some("FULL_OBJECT"),
+            "case {case}: expected a whole-object checksum, got {checksum_type:?}"
+        );
+        assert_eq!(
+            accept_ranges.as_deref(),
+            Some("bytes"),
+            "case {case}: expected ranged reads to be offered, got {accept_ranges:?}"
+        );
+        assert!(
+            etag.as_deref().is_some_and(|tag| !tag.is_empty()),
+            "case {case}: expected an entity tag, got {etag:?}"
+        );
+        assert!(
+            last_modified.is_some(),
+            "case {case}: expected a last-modified instant, got {last_modified:?}"
+        );
+        assert!(
+            encryption.is_some(),
+            "case {case}: expected the stored encryption to be reported, got {encryption:?}"
+        );
+
+        // The document itself is the run's, and it is the whole of the object: one
+        // measurement row per shot, read off the bytes the checksum above describes.
+        let document: Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("case {case}: the result object is JSON: {error}"));
+        assert_eq!(
+            document["braketSchemaHeader"]["name"].as_str(),
+            Some(RESULT_SCHEMA),
+            "case {case}: expected the gate-model result schema, got {document}"
+        );
+        assert_eq!(
+            document["measurements"].as_array().map(Vec::len),
+            Some(usize::try_from(*shots).expect("a shot count fits a usize")),
+            "case {case}: expected one measurement row per shot, got {}",
+            document["measurements"]
+        );
+
+        // A HEAD of the same key reports the same stored properties: both readers answer
+        // about one object. The checksum is asked for explicitly, which is what a HEAD has
+        // to do to be told it ("to retrieve the checksum, this parameter must be enabled").
+        let head = s3
+            .head_object()
+            .bucket(BUCKET)
+            .key(&key)
+            .checksum_mode(::aws_sdk_s3::types::ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("case {case}: expected a HEAD of {key}, got {error:?}"));
+        assert_eq!(
+            head.content_type().map(ToString::to_string),
+            content_type,
+            "case {case}: expected the HEAD to report the stored media type, got {:?}",
+            head.content_type()
+        );
+        assert_eq!(
+            head.checksum_crc32().map(ToString::to_string),
+            checksum,
+            "case {case}: expected the HEAD to report the stored checksum, got {:?}",
+            head.checksum_crc32()
+        );
+        assert_eq!(
+            head.e_tag().map(ToString::to_string),
+            etag,
+            "case {case}: expected the HEAD to report the stored entity tag, got {:?}",
+            head.e_tag()
+        );
     }
 }
