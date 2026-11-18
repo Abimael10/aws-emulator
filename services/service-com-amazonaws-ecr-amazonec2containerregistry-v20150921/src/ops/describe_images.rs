@@ -264,12 +264,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let repo = &*repo;
 
         // Each requested identifier must name a stored image; the whole call is refused
-        // when one does not. The resolution lives on `Repo`, so every operation that
-        // takes an `imageId` refuses the same identifier the same way.
-        let mut wanted = ::std::collections::BTreeSet::new();
-        for id in &requested {
-            wanted.insert(repo.resolve_image(id).map_err(fault_error)?.digest.clone());
-        }
+        // when one does not, about the entry the registry resolves first
+        // ([`crate::state::Repo::resolve_image_digests`]). The resolution lives on `Repo`,
+        // so every operation that takes an `imageId` refuses the same identifier the same
+        // way.
+        let wanted = repo.resolve_image_digests(&requested).map_err(fault_error)?;
 
         // Keyed — and so ordered and paged — by ascending push instant
         // ([`crate::state::ImageRecord::push_order_key`]): the image pushed first is

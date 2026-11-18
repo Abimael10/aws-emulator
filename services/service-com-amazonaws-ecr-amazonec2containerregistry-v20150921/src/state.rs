@@ -2397,6 +2397,40 @@ impl Repo {
         }
     }
 
+    /// Every image a LIST of `imageIds` entries names, as the digests they resolve to, or
+    /// the [`Fault`] the first entry that resolves to nothing reports.
+    ///
+    /// The entries are resolved in the order the REGISTRY resolves them, which is not
+    /// necessarily the order the request lists them in: an entry carrying an
+    /// `imageDigest` addresses a manifest by its content and is resolved against the
+    /// image store directly, while a tag-only entry has first to be read through the tag
+    /// index, so every digest-addressed entry is resolved before any tag-only one. A call
+    /// naming both an unstored digest and a tag nothing carries is therefore refused
+    /// about the DIGEST, and a tag-only entry is stated only once every digest-addressed
+    /// entry resolved — exactly as the recorded AWS refusals for such a call read. Two
+    /// entries of the same kind keep the request's order between them, so the entry
+    /// stated is the first of its kind that names nothing.
+    ///
+    /// Each entry is resolved by [`Self::resolve_image`], so one entry is refused here
+    /// exactly as it is where an operation takes a single identifier.
+    pub fn resolve_image_digests(
+        &self,
+        ids: &[ImageIdentifier],
+    ) -> Result<BTreeSet<String>, Fault> {
+        // The request's order is kept WITHIN each of the two kinds, which is what reading
+        // the list twice — the digest-addressed entries, then the tag-only ones — states
+        // directly.
+        let order = ids
+            .iter()
+            .filter(|id| id.image_digest.is_some())
+            .chain(ids.iter().filter(|id| id.image_digest.is_none()));
+        let mut digests = BTreeSet::new();
+        for id in order {
+            digests.insert(self.resolve_image(id)?.digest.clone());
+        }
+        Ok(digests)
+    }
+
     /// The stored image an [`ImageIdentifier`] names, FOR MUTATION, or the [`Fault`] it
     /// resolves to.
     ///

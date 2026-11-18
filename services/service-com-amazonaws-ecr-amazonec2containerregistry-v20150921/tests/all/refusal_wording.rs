@@ -25,9 +25,11 @@
 //! 6. a replication destination that IS the source registry states the constraint, with
 //!    no value from the request.
 //!
-//! Class 2 is carried by three suites: the frame itself, the `imageId` echo in a repository
-//! holding no image, and the same echo in one holding stored, tagged images, where an
-//! identifier read off the store would differ from the request's entry.
+//! Class 2 is carried by four suites: the frame itself, the `imageId` echo in a repository
+//! holding no image, the same echo in one holding stored, tagged images, where an
+//! identifier read off the store would differ from the request's entry, and — for the one
+//! operation whose parameter is a LIST of identifiers — which entry of such a list a
+//! refusal states.
 //!
 //! Each suite is a TABLE whose rows differ along what its rule generalises over — the
 //! verdict and the operation, the kind of resource and how it was addressed, the shape of
@@ -764,6 +766,171 @@ async fn the_echoed_identifier_resolves_once_an_image_carries_it() {
         )
         .await;
     }
+}
+
+/// Which entry a refusal states when a request names SEVERAL identifiers and more than one
+/// of them names no stored image: the one the registry RESOLVES first. An entry carrying an
+/// `imageDigest` addresses a manifest by its content and is resolved against the stored
+/// images directly, while a tag-only entry has first to be read through the tag index, so
+/// every digest-addressed entry is resolved before any tag-only one — a call naming both an
+/// unstored digest and a tag nothing carries is refused about the DIGEST, and a tag-only
+/// entry is stated only once every digest-addressed entry resolved. Two entries of the same
+/// kind keep the request's order between them.
+///
+/// `DescribeImages` is the operation whose parameter is a LIST of identifiers
+/// (`imageIds`), so it is where the order between entries is observable at all; the
+/// operations taking a single `imageId` are covered by the suites above.
+///
+/// The rows differ along what the rule generalises over: where the digest-addressed entry
+/// sits in the list, how many entries the list carries, how many of them resolve, which
+/// members each entry carries, and whether the repository holds images at all. The reported
+/// instance is the first row — a tag-only entry sent before a digest nothing was pushed
+/// under. The admitted side closes the table: a list every entry of which resolves reports
+/// every image it named.
+#[tokio::test]
+async fn an_image_refusal_states_the_entry_the_registry_resolves_first() {
+    let router = emulator();
+    let empty = "resolution-order-empty";
+    given_repository(&router, "the empty repository", empty).await;
+    let populated = "resolution-order-populated";
+    given_repository(&router, "the populated repository", populated).await;
+    let live =
+        given_tagged_image(&router, "the first stored image", populated, "live", "live").await;
+    let other =
+        given_tagged_image(&router, "the second stored image", populated, "other", "other").await;
+
+    // (case, repository, the imageIds list sent, the digest the refusal must state, the
+    // tag it must state)
+    let rows: Vec<(&str, &str, Value, String, String)> = vec![
+        (
+            // The reported instance.
+            "a tag-only entry sent before a digest nothing was pushed under",
+            empty,
+            json!([{"imageTag": "latest"}, {"imageDigest": UNSTORED_DIGEST}]),
+            UNSTORED_DIGEST.to_string(),
+            UNSET_MEMBER.to_string(),
+        ),
+        (
+            "the same two entries in the other order",
+            empty,
+            json!([{"imageDigest": UNSTORED_DIGEST}, {"imageTag": "latest"}]),
+            UNSTORED_DIGEST.to_string(),
+            UNSET_MEMBER.to_string(),
+        ),
+        (
+            "two tag-only entries, neither of which resolves",
+            empty,
+            json!([{"imageTag": "first-absent"}, {"imageTag": "second-absent"}]),
+            UNSET_MEMBER.to_string(),
+            "first-absent".to_string(),
+        ),
+        (
+            "two digest-addressed entries, neither of which resolves",
+            empty,
+            json!([{"imageDigest": OTHER_UNSTORED_DIGEST}, {"imageDigest": UNSTORED_DIGEST}]),
+            OTHER_UNSTORED_DIGEST.to_string(),
+            UNSET_MEMBER.to_string(),
+        ),
+        (
+            "a tag-only entry sent before an entry carrying both members",
+            empty,
+            json!([
+                {"imageTag": "latest"},
+                {"imageDigest": UNSTORED_DIGEST, "imageTag": "absent"},
+            ]),
+            UNSTORED_DIGEST.to_string(),
+            "absent".to_string(),
+        ),
+        (
+            "two tag-only entries sent before a digest-addressed one",
+            empty,
+            json!([
+                {"imageTag": "latest"},
+                {"imageTag": "absent"},
+                {"imageDigest": UNSTORED_DIGEST},
+            ]),
+            UNSTORED_DIGEST.to_string(),
+            UNSET_MEMBER.to_string(),
+        ),
+        (
+            "a tag that resolves beside a tag nothing carries",
+            populated,
+            json!([{"imageTag": "live"}, {"imageTag": "absent"}]),
+            UNSET_MEMBER.to_string(),
+            "absent".to_string(),
+        ),
+        (
+            "a stored digest, an unstored digest and a tag nothing carries",
+            populated,
+            json!([
+                {"imageDigest": live.clone()},
+                {"imageDigest": UNSTORED_DIGEST},
+                {"imageTag": "absent"},
+            ]),
+            UNSTORED_DIGEST.to_string(),
+            UNSET_MEMBER.to_string(),
+        ),
+        (
+            "a tag nothing carries beside an entry both of whose members resolve",
+            populated,
+            json!([{"imageTag": "absent"}, {"imageDigest": other.clone(), "imageTag": "other"}]),
+            UNSET_MEMBER.to_string(),
+            "absent".to_string(),
+        ),
+        (
+            "a tag nothing carries beside a stored digest carrying another image's tag",
+            populated,
+            json!([{"imageTag": "absent"}, {"imageDigest": live.clone(), "imageTag": "other"}]),
+            live.clone(),
+            "other".to_string(),
+        ),
+    ];
+
+    for (case, repository, ids, digest, tag) in rows {
+        let expected = not_within_sentence(
+            &format!("image with imageId {{imageDigest:'{digest}', imageTag:'{tag}'}}"),
+            repository,
+        );
+        assert_refusal(
+            &router,
+            case,
+            "DescribeImages",
+            &json!({"repositoryName": repository, "imageIds": ids}),
+            "ImageNotFoundException",
+            &expected,
+        )
+        .await;
+    }
+
+    // The admitted side: a list whose every entry resolves — one entry by tag, one by
+    // digest — reports both images it named, so the resolution order refuses nothing a
+    // request really addressed.
+    let case = "a list every entry of which resolves";
+    let answer = ok(
+        &router,
+        case,
+        "DescribeImages",
+        &json!({
+            "repositoryName": populated,
+            "imageIds": [{"imageTag": "live"}, {"imageDigest": other.clone()}],
+        }),
+    )
+    .await;
+    let mut reported: Vec<String> = answer["imageDetails"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected an imageDetails list, got {answer:?}");
+        })
+        .iter()
+        .filter_map(|detail| detail["imageDigest"].as_str().map(str::to_string))
+        .collect();
+    reported.sort();
+    let mut expected = vec![live.clone(), other.clone()];
+    expected.sort();
+    assert_eq!(
+        reported, expected,
+        "case {case:?}: expected the images {expected:?} to be reported, got {answer:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
