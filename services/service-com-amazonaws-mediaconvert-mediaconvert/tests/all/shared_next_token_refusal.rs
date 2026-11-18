@@ -25,7 +25,9 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_mediaconvert_mediaconvert::state::encode_cursor;
-use service_com_amazonaws_mediaconvert_mediaconvert::EmulatedService;
+use service_com_amazonaws_mediaconvert_mediaconvert::{
+    ComAmazonawsMediaconvertMediaconvertState, EmulatedService,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every case signs for.
@@ -163,6 +165,15 @@ struct Emulator {
 impl Emulator {
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        // The Job engine version catalogue is behind the account's version selection
+        // capability, which is granted out of band: this account is granted it so the
+        // `ListVersions` row below is about the token and not about the capability
+        // (`tests/all/fixed_refusal_sentences.rs` owns the refusal an account without it
+        // earns).
+        engine
+            .state::<ComAmazonawsMediaconvertMediaconvertState>()
+            .lock()
+            .set_version_selection_access(true);
         let mut router = MultiServiceRouter::new();
         // The signature itself is the transport's business, not this suite's; the
         // Authorization header is still present because routing and the ARN region read

@@ -10,6 +10,12 @@
 //! service's version listing owns; a version whose expiration date has passed is no
 //! longer available, so it is left out.
 //!
+//! Reading that catalogue at all takes the account's Job engine version selection
+//! capability, which is granted out of band ([`crate::state::version_selection`]): an
+//! account that does not have it is answered the modelled `ForbiddenException` with that
+//! module's fixed sentence, ahead of the token decode and the catalogue read, so a client
+//! probing for the capability is told what the account really has.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -166,7 +172,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A `nextToken` is decoded BEFORE the store is touched: a token this service never
+        // Job engine version selection is an account CAPABILITY, granted out of band: an
+        // account that does not have it may not read the version catalogue, which is what
+        // a client's feature detection calls this door for. Decided FIRST — ahead of the
+        // token decode and the catalogue read — so the answer is the same whatever else
+        // the request carries, exactly as the capability itself is.
+        if !state.lock().version_selection_access() {
+            return Err(ListVersionsErrorModeled::ForbiddenException(
+                ForbiddenException {
+                    message: Some(
+                        crate::state::VERSION_SELECTION_FORBIDDEN_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A `nextToken` is decoded BEFORE the catalogue is read: a token this service never
         // issued is a bad request, as it is for every other paged listing in this crate —
         // the rule and its sentence live in the state module, and only the modelled error
         // it is answered as is this operation's.

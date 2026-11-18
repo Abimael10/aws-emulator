@@ -10,16 +10,20 @@
 //! `AssociateCertificate` added it to), and the account no longer has that certificate
 //! associated afterwards.
 //!
-//! Two refusals go with it, both the model's own:
+//! The refusal that goes with it is the model's own: an `Arn` that is not an ACM
+//! certificate ARN is a problem in the REQUEST — the member is documented as "the ARN of
+//! the ACM certificate that you want to disassociate from your MediaConvert resource" —
+//! so it is `BadRequestException` (400), exactly as a value that is not the ARN this
+//! crate's other ARN-taking door expects is.
 //!
-//! * an `Arn` that is not an ACM certificate ARN is a problem in the REQUEST — the member
-//!   is documented as "the ARN of the ACM certificate that you want to disassociate from
-//!   your MediaConvert resource" — so it is `BadRequestException` (400), exactly as a
-//!   value that is not the ARN this crate's other ARN-taking door expects is;
-//! * an ACM certificate ARN the account has NOT associated addresses no association, so
-//!   there is nothing to remove: `NotFoundException` (404), the answer this service gives
-//!   wherever a request addresses something the store does not hold, worded by the one
-//!   [`crate::state::not_found_message`] every such refusal uses.
+//! A request naming an ACM certificate ARN the account has NOT associated asks for the
+//! state the account is ALREADY in — that certificate is not associated — so it removes
+//! nothing and answers the same empty 202 the removal of a held association does, as this
+//! service's recorded behaviour for this door does: a certificate the account never had
+//! associated (one `AssociateCertificate` itself refused, say) is disassociated with the
+//! success status rather than a lookup refusal. That makes the pair symmetric: the repeat
+//! of an association adds nothing and answers its 201, and the repeat of a removal takes
+//! nothing away and answers its 202.
 //!
 //! ## Shape of an operation
 //!
@@ -195,17 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The store owns both the removal and the answer to "was that certificate
-        // associated at all", under one borrow, so the decision and the state it was read
-        // from cannot disagree.
-        if !state.lock().disassociate_certificate(&input.arn) {
-            return Err(DisassociateCertificateErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::not_found_message("arn")),
-                },
-            )
-            .into());
-        }
+        // The store owns the removal, which reports whether the account had that
+        // certificate associated at all — a fact the ANSWER does not depend on, because a
+        // request for the state the account is already in is the same success. Removing an
+        // association the account does not hold leaves the set exactly as it was.
+        state.lock().disassociate_certificate(&input.arn);
 
         Ok(DisassociateCertificateOutput {})
     }

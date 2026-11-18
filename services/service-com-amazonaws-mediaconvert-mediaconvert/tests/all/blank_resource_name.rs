@@ -516,7 +516,7 @@ async fn a_reference_carrying_no_characters_is_refused_by_the_share_and_tagging_
         // `SupportCaseId` is well-formed here, and blank in the second row, so neither
         // refusal depends on the other member's value.
         for (row, support_case_id) in [
-            ("a well-formed support case", "case-42"),
+            ("a well-formed support case", "420000000000042"),
             ("a blank support case too", blank.value),
         ] {
             let refused = share_request(&emulator, blank.value, support_case_id).await;
@@ -575,7 +575,7 @@ async fn a_reference_carrying_no_characters_is_refused_by_the_share_and_tagging_
     // The boundary of the same rule on these doors: a reference that carries characters is
     // served. The share is recorded against the job the request named, and the tagging
     // doors reach the queue the ARN names.
-    let accepted = share_request(&emulator, &job_id, "case-42").await;
+    let accepted = share_request(&emulator, &job_id, "420000000000042").await;
     assert_eq!(
         accepted.status, 202,
         "case \"a job id that carries characters\": expected HTTP 202, got {} with body {}",
@@ -583,7 +583,7 @@ async fn a_reference_carrying_no_characters_is_refused_by_the_share_and_tagging_
     );
     let read = emulator.get_job(&job_id).await;
     assert!(
-        read.string("/job/lastShareDetails").contains("case-42"),
+        read.string("/job/lastShareDetails").contains("420000000000042"),
         "case \"a job id that carries characters\": the share must be recorded against the \
          job, got body {}",
         read.body

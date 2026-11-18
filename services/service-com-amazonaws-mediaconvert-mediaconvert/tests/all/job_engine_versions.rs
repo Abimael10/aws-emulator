@@ -14,6 +14,11 @@
 //! Cases that are about the catalogue's CONTENT seed their records straight into the
 //! store, because only a seeded record can carry a release or expiry instant a case
 //! chose. Nothing here reaches past HTTP except that seeding and the store snapshot.
+//!
+//! Reading the catalogue at all takes the account's Job engine version selection
+//! capability, which is granted out of band, so every case here runs on an account that
+//! HAS it ([`granted`]); what an account WITHOUT it is answered is the business of
+//! `tests/all/fixed_refusal_sentences.rs`.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,6 +41,24 @@ pub(crate) async fn list_versions(emulator: &Emulator, query: &str) -> Reply {
         format!("/2017-08-29/versions?{query}")
     };
     emulator.send_in(REGION, "GET", &uri, None).await
+}
+
+/// Grant this account access to Job engine version selection, the way the out-of-band
+/// grant records it — the capability the version catalogue is behind.
+pub(crate) fn grant_version_selection(emulator: &Emulator) {
+    emulator
+        .engine
+        .state::<ComAmazonawsMediaconvertMediaconvertState>()
+        .lock()
+        .set_version_selection_access(true);
+}
+
+/// An emulator whose account has been granted Job engine version selection: what every
+/// case in this suite runs against, because the listing is behind that capability.
+pub(crate) fn granted() -> Emulator {
+    let emulator = Emulator::new();
+    grant_version_selection(&emulator);
+    emulator
 }
 
 /// `(version, expirationDate)` of every entry in `versions`, in the order returned.
@@ -148,7 +171,7 @@ fn entry(label: &str, ago: Duration, expires_in: Duration, expired: bool) -> Job
 /// record.
 #[tokio::test]
 async fn the_listing_projects_the_seeded_catalogue_in_release_order() {
-    let emulator = Emulator::new();
+    let emulator = granted();
     let stored = stored_catalogue(&emulator);
     assert_eq!(
         stored.len(),
@@ -239,7 +262,7 @@ async fn a_version_label_is_the_calendar_date_of_its_release() {
     ];
 
     for (released_at_secs, expected) in cases {
-        let emulator = Emulator::new();
+        let emulator = granted();
         let released_at = UNIX_EPOCH + Duration::from_secs(released_at_secs);
         let record = JobEngineVersionRecord::released(released_at);
         assert_eq!(
@@ -269,7 +292,7 @@ async fn a_version_label_is_the_calendar_date_of_its_release() {
 /// expiry is the longest span the catalogue uses.
 #[tokio::test]
 async fn an_expired_version_is_no_longer_available() {
-    let emulator = Emulator::new();
+    let emulator = granted();
     let cases: [(&str, Duration, bool); 6] = [
         // (label, how far from now the expiry falls, whether it already passed)
         ("2019-01-01", Duration::from_secs(1), true),
@@ -310,7 +333,7 @@ async fn an_expired_version_is_no_longer_available() {
 
     // An account whose every version has expired has nothing available to report — an
     // empty list, never a fabricated entry.
-    let all_expired = Emulator::new();
+    let all_expired = granted();
     seed_catalogue(
         &all_expired,
         cases
@@ -340,7 +363,7 @@ async fn an_expired_version_is_no_longer_available() {
 /// and 20, and sizes in between) over more versions than one page holds.
 #[tokio::test]
 async fn paging_walks_every_version_exactly_once() {
-    let emulator = Emulator::new();
+    let emulator = granted();
     // 25 versions: more than the 20 a single page holds, so the default page size is
     // exercised too. Released a day apart, oldest first, each still available.
     let seeded = 25_usize;
@@ -431,7 +454,7 @@ async fn paging_walks_every_version_exactly_once() {
 /// one step past either is refused before the handler runs.
 #[tokio::test]
 async fn max_results_is_held_to_the_range_the_model_declares() {
-    let emulator = Emulator::new();
+    let emulator = granted();
 
     for accepted in ["maxResults=1", "maxResults=20"] {
         let reply = list_versions(&emulator, accepted).await;
@@ -455,7 +478,7 @@ async fn max_results_is_held_to_the_range_the_model_declares() {
 /// first page. The table spans the ways a token can be wrong.
 #[tokio::test]
 async fn a_next_token_this_service_did_not_issue_is_a_bad_request() {
-    let emulator = Emulator::new();
+    let emulator = granted();
 
     let cases = [
         // Not hex at all.
@@ -488,7 +511,7 @@ async fn a_next_token_this_service_did_not_issue_is_a_bad_request() {
 /// whatever paging it is called.
 #[tokio::test]
 async fn listing_changes_nothing_a_later_caller_sees() {
-    let emulator = Emulator::new();
+    let emulator = granted();
     let before = stored_catalogue(&emulator);
 
     let queries = ["", "maxResults=1", "maxResults=2", "maxResults=20"];

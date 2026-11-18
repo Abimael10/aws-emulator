@@ -63,7 +63,9 @@
 //! * `job_engine_versions` is NOT caller-driven at all: the account's Job engine version
 //!   catalogue is seeded once, at state construction, with exactly
 //!   [`JOB_ENGINE_VERSION_COUNT`] records, and no request path adds, removes or rewrites
-//!   one — so what `ListVersions` reports is stable across reads.
+//!   one — so what `ListVersions` reports is stable across reads. Whether the account may
+//!   read that catalogue AT ALL is the capability `version_selection_access` (see
+//!   [`VERSION_SELECTION_FORBIDDEN_MESSAGE`]), which is not caller-driven either.
 //! * `ListJobs` orders the jobs, over at most `MAX_JOBS` records, and returns at most
 //!   one page of twenty, through [`page_of_jobs`]. `SearchJobs` goes through the same
 //!   function, over the same bounded record set, with the input-file test
@@ -110,14 +112,20 @@ use crate::ops::types::{
     OutputGroup, OutputGroupSettings, Policy, Preset, PresetSettings, Queue, QueueTransition,
     ReservationPlan, ReservationPlanSettings, Timing, VideoCodecSettings, VideoDescription,
 };
+mod acm_certificates;
 mod job_clock;
 mod job_events;
+mod resource_id_format;
 mod system_catalog;
 mod paging;
+mod version_selection;
+pub use acm_certificates::*;
 pub use job_clock::*;
 pub use job_events::*;
 pub use paging::*;
+pub use resource_id_format::*;
 use system_catalog::*;
+pub use version_selection::*;
 
 /// The built-in queue a job with no `Queue` member is sent to.
 ///
@@ -3754,6 +3762,11 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     /// The running pump's task handle, kept so the pump it replaces is aborted rather than
     /// merely forgotten.
     clock_pump: Option<::tokio::task::JoinHandle<()>>,
+    /// Whether this account has access to Job engine version selection — the capability
+    /// `ListVersions` is gated on (`state::version_selection`). Not caller-driven: the
+    /// grant is made out of band, so no request path writes it and it moves only through
+    /// [`Self::set_version_selection_access`].
+    version_selection_access: bool,
 }
 
 impl Default for ComAmazonawsMediaconvertMediaconvertState {
@@ -3834,6 +3847,11 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
             clock_pump_running: false,
             clock_pump_generation: 0,
             clock_pump: None,
+            // An account nobody has been granted Job engine version selection for does
+            // not have it: the grant is made out of band and no call of this API carries
+            // one, so a fresh account comes up without the capability and the door onto
+            // the catalogue refuses it.
+            version_selection_access: false,
         }
     }
 }
@@ -4598,8 +4616,9 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// `DisassociateCertificate` "removes an association between the Amazon Resource Name
     /// (ARN) of an AWS Certificate Manager (ACM) certificate and an AWS Elemental
     /// MediaConvert resource": the association is what the request addresses, so an ARN
-    /// this set does not hold addresses nothing to remove — `false`, which the handler
-    /// answers with the modelled `NotFoundException`.
+    /// this set does not hold leaves the set exactly as it was — `false`, which the door
+    /// answers with the same success as a removal that removed something, because the
+    /// request asks for the state the account is already in.
     pub fn disassociate_certificate(&mut self, arn: &str) -> bool {
         self.certificates.remove(arn)
     }

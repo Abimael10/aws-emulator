@@ -101,9 +101,9 @@ async fn send_reference(
                 .send(
                     "POST",
                     "/2017-08-29/resourceShares",
-                    // The support case is valid in every row, so the only thing wrong with
-                    // a refused one is the job reference itself.
-                    Some(json!({ "jobId": reference, "supportCaseId": "case-4412" })),
+                    // The support case is of the form the member takes in every row, so
+                    // the only thing wrong with a refused one is the job reference itself.
+                    Some(json!({ "jobId": reference, "supportCaseId": "441200000004412" })),
                 )
                 .await
         }

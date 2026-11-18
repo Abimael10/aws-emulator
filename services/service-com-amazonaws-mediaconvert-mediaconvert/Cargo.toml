@@ -35,6 +35,18 @@ service-common = { path = "../common" }
 # statuses (`state::job_events`). Only the generated client is needed — the emulator
 # supplies the transport, so the SDK's own HTTPS stack is left out.
 aws-sdk-eventbridge = { version = "1", default-features = false }
+# The AWS SDK for Certificate Manager, driven over the same in-process callback: the
+# certificate `AssociateCertificate` names is that service's resource, so the handler
+# resolves it against the service that OWNS it (`src/state/acm_certificates.rs`) rather
+# than assuming a well-formed ARN names one. Only the generated client is needed — the
+# emulator supplies the transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-acm = { version = "1", default-features = false, features = [
+    # As for the S3 client below: `BehaviorVersion::latest()` is gated behind the first
+    # feature and the callback transport is driven on the Tokio runtime, so a
+    # `cargo build -p` of this crate alone resolves both.
+    "behavior-version-latest",
+    "rt-tokio",
+] }
 # The AWS SDK for S3, driven over the in-process callback
 # (`OperationContext::callback`): `CreateJob` probes each of a job's
 # `Settings.Inputs[].FileInput` S3 locations with `HeadObject` before the job is
@@ -75,6 +87,10 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # operation reads the media file the request addresses out of S3 over the in-process
 # callback, so without an S3 holding the object there is nothing for it to read.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# Certificate Manager is mounted beside MediaConvert on one engine in the certificate
+# tests: `AssociateCertificate` resolves the ARN it is given against the service that owns
+# the certificate, so without an ACM holding one there is nothing for it to resolve.
+service-com-amazonaws-acm-certificatemanager = { workspace = true }
 
 [lints]
 workspace = true

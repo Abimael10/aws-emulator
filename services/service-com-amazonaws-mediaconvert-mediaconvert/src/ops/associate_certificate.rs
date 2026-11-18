@@ -11,10 +11,14 @@
 //! An `Arn` the account ALREADY has associated is the state the request asks for, so the
 //! repeat adds nothing and answers the same 201 the first association did — as this
 //! service's recorded behaviour for a repeated create does (see
-//! [`crate::state::CreateOutcome`]). The two refusals are the model's own: an `Arn` that is
-//! not an ACM certificate ARN is `BadRequestException` (400), and an association that
-//! would carry the account past [`crate::state::MAX_CERTIFICATES`] certificates is the
-//! quota error, `ServiceQuotaExceededException` (402).
+//! [`crate::state::CreateOutcome`]). The refusals are the model's own: an `Arn` that is
+//! not an ACM certificate ARN is `BadRequestException` (400); an `Arn` that is one but
+//! names no certificate the account holds is `NotFoundException` (404), because the
+//! certificate is Certificate Manager's resource and this service asks that service
+//! whether it has one ([`crate::state::acm_certificate_is_absent`]) rather than assuming
+//! a well-formed ARN names one; and an association that would carry the account past
+//! [`crate::state::MAX_CERTIFICATES`] certificates is the quota error,
+//! `ServiceQuotaExceededException` (402).
 //!
 //! ## Shape of an operation
 //!
@@ -155,10 +159,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing in this operation depends on the request's region: the account's
-        // certificate set is keyed by the ARN the caller sent, and the response carries no
-        // members at all.
-        let _ = ctx;
+        // The account's certificate set is keyed by the ARN the caller sent and the
+        // response carries no members at all, so the request's region matters only to the
+        // read below: a certificate ARN that states no region of its own is resolved in
+        // the region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AssociateCertificateErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -185,6 +190,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(AssociateCertificateErrorModeled::BadRequestException(
                 BadRequestException {
                     message: Some(crate::state::certificate_arn_message(&input.arn)),
+                },
+            )
+            .into());
+        }
+
+        // "The ARN of the ACM certificate that you want to associate with your
+        // MediaConvert resource": the certificate itself is Certificate Manager's
+        // resource, so whether the account holds one under this ARN is asked of the
+        // service that OWNS it rather than assumed from the ARN's form. An ARN that names
+        // no certificate addresses nothing to associate, which is the lookup refusal every
+        // reference in this service that resolves to nothing gets, naming the member the
+        // lookup read. Asked with no lock held, and before the insert, so nothing is
+        // stored for a certificate that does not exist.
+        if crate::state::acm_certificate_is_absent(ctx, &region, &input.arn).await {
+            return Err(AssociateCertificateErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::not_found_message("arn")),
                 },
             )
             .into());

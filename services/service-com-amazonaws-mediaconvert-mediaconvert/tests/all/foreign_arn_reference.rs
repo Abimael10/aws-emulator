@@ -350,7 +350,9 @@ async fn a_job_and_template_reference_resolve_only_this_services_arn() {
                 .send(
                     "POST",
                     "/2017-08-29/resourceShares",
-                    Some(json!({ "jobId": value, "supportCaseId": "case-404" })),
+                    // The support case is of the form the member takes in every row, so
+                    // the only thing wrong with a refused one is the job reference.
+                    Some(json!({ "jobId": value, "supportCaseId": "404000000000404" })),
                 )
                 .await,
         );
@@ -395,11 +397,11 @@ async fn a_job_and_template_reference_resolve_only_this_services_arn() {
     }
 
     for (form, reference, support_case_id) in [
-        ("the job's id", job_id.clone(), "case-by-id"),
+        ("the job's id", job_id.clone(), "111000000000111"),
         (
             "the job's own ARN",
             arn(&format!("jobs/{job_id}")),
-            "case-by-arn",
+            "222000000000222",
         ),
     ] {
         let shared = emulator

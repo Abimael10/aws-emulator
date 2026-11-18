@@ -23,6 +23,15 @@
 //! MediaConvert resource ARN at all is a problem in the REQUEST
 //! (`BadRequestException`, HTTP 400), worded once for all three of them.
 //!
+//! One door that takes an `arn` is NOT among the rows: `DisassociateCertificate` removes
+//! an association, and a request naming an association the account does not hold asks for
+//! the state the account is already in rather than addressing a resource that is missing,
+//! so it answers its own success status — `tests/all/certificate_association.rs` owns that
+//! pair. The certificate door that DOES resolve a resource is
+//! `AssociateCertificate`, which resolves the certificate against the service that owns
+//! it and words its refusal with this very sentence (the same suite's
+//! `an_arn_that_names_no_certificate_the_account_holds_is_the_modelled_not_found`).
+//!
 //! What a resolved reference reads back as is the business of the suites that own each
 //! operation; this one is only about the refusal they all share.
 
@@ -266,7 +275,9 @@ async fn every_door_words_a_reference_that_resolves_to_nothing_alike() {
                     "/2017-08-29/resourceShares",
                     Some(json!({
                         "jobId": ABSENT_JOB_ID,
-                        "supportCaseId": "case-00000001"
+                        // Of the form the service enforces for the member, so this row is
+                        // about the job reference and not about the support case.
+                        "supportCaseId": "100000000000001"
                     })),
                 )
                 .await,
@@ -302,23 +313,6 @@ async fn every_door_words_a_reference_that_resolves_to_nothing_alike() {
                     "queue": "absent-queue",
                     "settings": crate::job_template_crud::settings(1, 1)
                 }))
-                .await,
-        ),
-        (
-            "DisassociateCertificate for an association the account does not hold",
-            "arn",
-            emulator
-                .send(
-                    "DELETE",
-                    &format!(
-                        "/2017-08-29/certificates/{}",
-                        encode_label(
-                            "arn:aws:acm:us-west-2:123456789012:certificate/\
-                             0d1e2f30-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
-                        )
-                    ),
-                    None,
-                )
                 .await,
         ),
     ];

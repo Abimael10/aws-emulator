@@ -2,6 +2,15 @@
 
 //! @op CreateResourceShare
 //!
+//! "Create a new resource share request for MediaConvert resources with AWS Support":
+//! records, on the job the request names, the share attempt
+//! ([`crate::state::ShareAttempt`]) the job then reports as its most recent one, which
+//! the clock completes. The refusals are the model's own: a required member that carries
+//! no characters names nothing, a `SupportCaseId` that is not of the form AWS Support
+//! case identifiers take ([`crate::state::SUPPORT_CASE_ID_FORMAT`]) identifies no case,
+//! and both are `BadRequestException` (400); a `JobId` that resolves to no stored job is
+//! `NotFoundException` (404).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -181,6 +190,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          to share your job's resources with."
                             .to_string(),
                     ),
+                },
+            )
+            .into());
+        }
+
+        // "AWS Support case identifier": the case is a resource of AWS Support, addressed
+        // by the resource id that system publishes, so a value of another form identifies
+        // no case there and the share has nothing to be made with. The form and its one
+        // refusal live in the state module
+        // ([`crate::state::SUPPORT_CASE_ID_FORMAT`]), so this door and anything else that
+        // reads such a member cannot disagree about it; the refusal names the member in
+        // its wire spelling and the form it takes, never the value this one request sent.
+        // Tested before the job is resolved, because it is a problem in the request rather
+        // than a lookup.
+        if !crate::state::is_support_case_id(&input.support_case_id) {
+            return Err(CreateResourceShareErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_resource_id_message(
+                        "supportCaseId",
+                        crate::state::SUPPORT_CASE_ID_FORMAT,
+                    )),
                 },
             )
             .into());

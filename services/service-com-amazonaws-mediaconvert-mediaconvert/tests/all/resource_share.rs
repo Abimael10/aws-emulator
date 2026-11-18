@@ -16,11 +16,15 @@
 //! is `NOT_SHARED` with no details, a reference that resolves to no stored job is the
 //! modelled `NotFoundException`, a repeat against the same support case changes nothing,
 //! and a request naming another support case records a new attempt that supersedes the
-//! one before it — the job reports "the most recent share attempt".
+//! one before it — the job reports "the most recent share attempt". A `SupportCaseId`
+//! that is not of the form AWS Support case identifiers take identifies no case, so it is
+//! the modelled `BadRequestException` naming the member and that form, and records
+//! nothing.
 //!
 //! A case that asserts the NON-TERMINAL status pins the completion span to
 //! [`HELD_IN_INITIATED`] and a case that asserts the COMPLETION pins it to
-//! [`SHORT_SHARE`], so no assertion here races the machine in either direction.
+//! [`SHORT_SHARE`] and then looks for the status it waits on ([`share_view_at`]), so no
+//! assertion here races the machine in either direction.
 
 use std::time::Duration;
 
@@ -33,12 +37,16 @@ use service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMed
 
 use super::job_lifecycle::{arn, settings, Emulator, Reply, ROLE};
 
-/// A completion span short enough that a case waiting past it costs almost no wall-clock
-/// time. Only a case that asserts the COMPLETED attempt pins it.
+/// A completion span short enough that a case waiting for the completion costs almost no
+/// wall-clock time. Only a case that asserts the COMPLETED attempt pins it.
 const SHORT_SHARE: Duration = Duration::from_millis(20);
 
-/// Comfortably past [`SHORT_SHARE`], so a case that waits always observes the completion.
-const PAST_THE_SHARE: Duration = Duration::from_millis(150);
+/// How long a case waits for the CLOCK to complete a share attempt before it gives up.
+///
+/// Generous: a deadline for a machine under load, not a span anything is expected to take
+/// (the span a case pins is [`SHORT_SHARE`]). What a case waits for is the CONDITION — the
+/// status the job reports — never a fixed time.
+const SHARE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Longer than any case takes to run, so a share attempt stays `INITIATED` for the whole
 /// of a case that is about the non-terminal status.
@@ -118,6 +126,35 @@ async fn share_view(emulator: &Emulator, id: &str) -> (String, Value) {
     )
 }
 
+/// The `ShareStatus` and `LastShareDetails` a `GetJob` reports for `id` once the status is
+/// `expected`, looking again until it is or [`SHARE_DEADLINE`] passes.
+///
+/// The CONDITION, not a duration: the completion of an attempt is the clock's business (it
+/// is owed the pinned span after the call that started it), so a case that needs the
+/// completed attempt polls the job the way a client does rather than waiting a fixed time
+/// and hoping. A status that is already `expected` returns on the first look, so a case
+/// about the non-terminal status pays nothing for it.
+async fn share_view_at(
+    emulator: &Emulator,
+    case: &str,
+    id: &str,
+    expected: &str,
+) -> (String, Value) {
+    let started = ::std::time::Instant::now();
+    loop {
+        let (status, details) = share_view(emulator, id).await;
+        if status == expected {
+            return (status, details);
+        }
+        assert!(
+            started.elapsed() < SHARE_DEADLINE,
+            "case {case:?}: the clock never moved the share of job {id} to {expected}, it \
+             reports {status:?} with details {details}"
+        );
+        ::tokio::task::yield_now().await;
+    }
+}
+
 /// What `LastShareDetails` must read for an attempt against `support_case_id` in
 /// `status`, built through the emulator's OWN rendering of a stored attempt, so the
 /// expectation is not a second hand-written format. One case below pins that rendering
@@ -155,34 +192,38 @@ fn by_arn(id: &str) -> String {
 }
 
 /// The rows every reference-and-case table below spans: both forms `JobId` accepts,
-/// crossed with support case identifiers that differ in form and length — a bare case
-/// number, a prefixed one, one carrying a space and a long one.
+/// crossed with support case identifiers of the form the service enforces for
+/// `SupportCaseId` — 15 decimal digits, the form
+/// `state::SUPPORT_CASE_ID_FORMAT` states — differing along what remains free in it: a
+/// leading-zero id, a trailing-zero one, one digit repeated, the lowest and the highest
+/// id the form admits. (What a value of ANOTHER form earns is
+/// `a_support_case_id_of_another_form_is_refused` below.)
 fn share_rows() -> [ShareRow; 5] {
     [
         ShareRow {
-            case: "job id, bare case number",
+            case: "job id, an id padded with leading zeros",
             reference: by_id,
-            support_case_id: "1234567890",
+            support_case_id: "000000000042424",
         },
         ShareRow {
-            case: "job ARN, bare case number",
+            case: "job ARN, an id ending in zeros",
             reference: by_arn,
-            support_case_id: "9876543210",
+            support_case_id: "987654321000000",
         },
         ShareRow {
-            case: "job id, prefixed case id",
+            case: "job id, one digit repeated",
             reference: by_id,
-            support_case_id: "case-00042",
+            support_case_id: "777777777777777",
         },
         ShareRow {
-            case: "job ARN, case id carrying a space",
+            case: "job ARN, the lowest id the form admits",
             reference: by_arn,
-            support_case_id: "Case 42",
+            support_case_id: "000000000000000",
         },
         ShareRow {
-            case: "job id, long case id",
+            case: "job id, the highest id the form admits",
             reference: by_id,
-            support_case_id: "support-case-0123456789012345678901234567890123456789",
+            support_case_id: "999999999999999",
         },
     ]
 }
@@ -271,8 +312,7 @@ async fn a_recorded_share_completes_when_the_clock_makes_it_due() {
             row.case, shared.status, shared.body
         );
 
-        tokio::time::sleep(PAST_THE_SHARE).await;
-        let (status, details) = share_view(&emulator, &id).await;
+        let (status, details) = share_view_at(&emulator, row.case, &id, SHARE_STATUS_SHARED).await;
         assert_eq!(
             status, SHARE_STATUS_SHARED,
             "case {:?}: past the completion instant the share must report \
@@ -296,7 +336,7 @@ async fn a_recorded_share_completes_when_the_clock_makes_it_due() {
 async fn the_share_details_name_the_support_case_and_the_status() {
     let held = emulator_with_share_span(HELD_IN_INITIATED);
     let held_job = fixture_job(&held, "s3://example-bucket/in/c.mp4").await;
-    let shared = create_resource_share(&held, &held_job, "case-12345").await;
+    let shared = create_resource_share(&held, &held_job, "123456789012345").await;
     assert_eq!(
         shared.status, 202,
         "the share must answer HTTP 202, got {} with body {}",
@@ -305,24 +345,24 @@ async fn the_share_details_name_the_support_case_and_the_status() {
     let (_, details) = share_view(&held, &held_job).await;
     assert_eq!(
         details,
-        json!("supportCaseId=case-12345, shareStatus=INITIATED"),
+        json!("supportCaseId=123456789012345, shareStatus=INITIATED"),
         "case \"in flight\": expected the rendered details of the recorded attempt, got \
          {details}"
     );
 
     let completing = emulator_with_share_span(SHORT_SHARE);
     let completing_job = fixture_job(&completing, "s3://example-bucket/in/c.mp4").await;
-    let shared = create_resource_share(&completing, &completing_job, "case-12345").await;
+    let shared = create_resource_share(&completing, &completing_job, "123456789012345").await;
     assert_eq!(
         shared.status, 202,
         "the share must answer HTTP 202, got {} with body {}",
         shared.status, shared.body
     );
-    tokio::time::sleep(PAST_THE_SHARE).await;
-    let (_, details) = share_view(&completing, &completing_job).await;
+    let (_, details) =
+        share_view_at(&completing, "completed", &completing_job, SHARE_STATUS_SHARED).await;
     assert_eq!(
         details,
-        json!("supportCaseId=case-12345, shareStatus=SHARED"),
+        json!("supportCaseId=123456789012345, shareStatus=SHARED"),
         "case \"completed\": expected the rendered details of the completed attempt, got \
          {details}"
     );
@@ -335,34 +375,33 @@ async fn the_share_details_name_the_support_case_and_the_status() {
 /// after it completed.
 #[tokio::test]
 async fn a_repeat_for_the_same_support_case_changes_nothing() {
-    for (case, span, wait, expected_status) in [
+    for (case, span, expected_status) in [
         (
             "repeat while the attempt is in flight",
             HELD_IN_INITIATED,
-            Duration::ZERO,
             SHARE_STATUS_INITIATED,
         ),
         (
             "repeat after the attempt completed",
             SHORT_SHARE,
-            PAST_THE_SHARE,
             SHARE_STATUS_SHARED,
         ),
     ] {
         let emulator = emulator_with_share_span(span);
         let id = fixture_job(&emulator, "s3://example-bucket/in/d.mp4").await;
-        let first = create_resource_share(&emulator, &id, "case-77").await;
+        let first = create_resource_share(&emulator, &id, "000000000000077").await;
         assert_eq!(
             first.status, 202,
             "case {case:?}: the first share must answer HTTP 202, got {} with body {}",
             first.status, first.body
         );
-        tokio::time::sleep(wait).await;
-        let before = share_view(&emulator, &id).await;
+        // The row's own condition: the attempt is still in flight, or the clock has
+        // completed it. Looked for, never waited out.
+        let before = share_view_at(&emulator, case, &id, expected_status).await;
 
         // The repeat names the job the other way round, so the idempotent repeat is not a
         // property of the reference form either.
-        let repeat = create_resource_share(&emulator, &by_arn(&id), "case-77").await;
+        let repeat = create_resource_share(&emulator, &by_arn(&id), "000000000000077").await;
         assert_eq!(
             repeat.status, 202,
             "case {case:?}: the repeat must answer HTTP 202, got {} with body {}",
@@ -390,24 +429,31 @@ async fn a_repeat_for_the_same_support_case_changes_nothing() {
 /// clock had already completed.
 #[tokio::test]
 async fn another_support_case_supersedes_the_previous_attempt() {
-    for (case, span, wait) in [
-        ("supersede an attempt in flight", HELD_IN_INITIATED, Duration::ZERO),
-        ("supersede a completed attempt", SHORT_SHARE, PAST_THE_SHARE),
+    for (case, span, completed_first) in [
+        ("supersede an attempt in flight", HELD_IN_INITIATED, false),
+        ("supersede a completed attempt", SHORT_SHARE, true),
     ] {
         let emulator = emulator_with_share_span(span);
         let id = fixture_job(&emulator, "s3://example-bucket/in/e.mp4").await;
-        let first = create_resource_share(&emulator, &id, "case-first").await;
+        let first = create_resource_share(&emulator, &id, "111111111111111").await;
         assert_eq!(
             first.status, 202,
             "case {case:?}: the first share must answer HTTP 202, got {} with body {}",
             first.status, first.body
         );
-        tokio::time::sleep(wait).await;
+        if completed_first {
+            // The row's own condition: the attempt this one supersedes has completed.
+            // Looked for, never waited out — and the attempts that follow are then held in
+            // flight, so what is asserted below is the superseding and not how fast the
+            // machine ran.
+            share_view_at(&emulator, case, &id, SHARE_STATUS_SHARED).await;
+            pin_share_span(&emulator, HELD_IN_INITIATED);
+        }
 
         // Each later case supersedes the one before it, named either way round.
         for (step, (reference, support_case_id)) in [
-            (by_id(&id), "case-second"),
-            (by_arn(&id), "case-third"),
+            (by_id(&id), "222222222222222"),
+            (by_arn(&id), "333333333333333"),
         ]
         .into_iter()
         .enumerate()
@@ -441,7 +487,7 @@ async fn another_support_case_supersedes_the_previous_attempt() {
 async fn the_attempt_that_completes_is_the_most_recent_one() {
     let emulator = emulator_with_share_span(SHORT_SHARE);
     let id = fixture_job(&emulator, "s3://example-bucket/in/f.mp4").await;
-    for support_case_id in ["case-one", "case-two", "case-three"] {
+    for support_case_id in ["100000000000001", "200000000000002", "300000000000003"] {
         let shared = create_resource_share(&emulator, &id, support_case_id).await;
         assert_eq!(
             shared.status, 202,
@@ -450,15 +496,20 @@ async fn the_attempt_that_completes_is_the_most_recent_one() {
         );
     }
 
-    tokio::time::sleep(PAST_THE_SHARE).await;
-    let (status, details) = share_view(&emulator, &id).await;
+    let (status, details) = share_view_at(
+        &emulator,
+        "the most recent attempt",
+        &id,
+        SHARE_STATUS_SHARED,
+    )
+    .await;
     assert_eq!(
         status, SHARE_STATUS_SHARED,
         "the surviving attempt must complete to {SHARE_STATUS_SHARED}, got {status:?}"
     );
     assert_eq!(
         details,
-        expected_details("case-three", SHARE_STATUS_SHARED),
+        expected_details("300000000000003", SHARE_STATUS_SHARED),
         "the completed attempt must be the most recent one, got {details}"
     );
 }
@@ -490,7 +541,7 @@ async fn sharing_a_job_that_is_not_stored_is_the_modelled_not_found() {
             format!("  {stored}  "),
         ),
     ] {
-        let reply = create_resource_share(&emulator, &reference, "case-404").await;
+        let reply = create_resource_share(&emulator, &reference, "404000000000404").await;
         assert_eq!(
             reply.status, 404,
             "case {case:?}: expected HTTP 404, got {} with body {}",
@@ -573,7 +624,7 @@ async fn a_support_case_id_that_names_no_case_is_refused() {
 
     // A real case id against the same job still works, so the refusals above blocked the
     // request and not the job.
-    let accepted = create_resource_share(&emulator, &id, "case-ok").await;
+    let accepted = create_resource_share(&emulator, &id, "123456789012345").await;
     assert_eq!(
         accepted.status, 202,
         "a well-formed share must still be accepted: got {} with body {}",
@@ -584,4 +635,98 @@ async fn a_support_case_id_that_names_no_case_is_refused() {
         status, SHARE_STATUS_INITIATED,
         "the accepted share must move the job to {SHARE_STATUS_INITIATED}, got {status:?}"
     );
+}
+
+/// The sentence MediaConvert answers a `SupportCaseId` that is not of the form the service
+/// enforces for it, spelled out here rather than imported from the crate so a wrong
+/// constant in the implementation cannot make this case pass.
+const INVALID_SUPPORT_CASE: &str = "You specified an invalid value for supportCaseId. The \
+     resource ID must match the format '^\\d{15}$'.";
+
+/// A `SupportCaseId` of ANOTHER FORM identifies no AWS Support case, so it is the modelled
+/// `BadRequestException` naming the member and the form — and nothing is recorded against
+/// the job.
+///
+/// "AWS Support case identifier": the identifier of a resource of another system, which
+/// that system publishes in one form — 15 decimal digits, the form MediaConvert states in
+/// this very refusal. The refused rows span the ways a value can fail to be one: one digit
+/// short and one digit long (the boundary either side of the form), far shorter and far
+/// longer, a prefixed id, a separator, a space, a sign, a letter, a decimal point and
+/// digits that are not ASCII. The accepted rows are the edges of the form itself.
+#[tokio::test]
+async fn a_support_case_id_of_another_form_is_refused() {
+    let emulator = emulator_with_share_span(HELD_IN_INITIATED);
+    let id = fixture_job(&emulator, "s3://example-bucket/in/i.mp4").await;
+
+    for (case, value) in [
+        ("one digit short of the form", "12345678901234"),
+        ("one digit past the form", "1234567890123456"),
+        ("a single digit", "7"),
+        ("far longer than the form", "12345678901234567890123456789012345"),
+        ("a prefixed case id", "case-123456789012345"),
+        ("a separator among the digits", "12345-678901234"),
+        ("a space among the digits", "12345678 901234"),
+        ("a signed id", "+12345678901234"),
+        ("a letter among the digits", "12345678901234a"),
+        ("a decimal point", "1234567890123.5"),
+        ("digits that are not ASCII", "１２３４５６７８９０１２３４５"),
+    ] {
+        let refused = create_resource_share(&emulator, &id, value).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400, got {} with body {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_type.as_deref(),
+            Some("BadRequestException"),
+            "case {case:?}: expected BadRequestException, got {:?} with body {}",
+            refused.error_type,
+            refused.body
+        );
+        assert_eq!(
+            refused.string("/message"),
+            INVALID_SUPPORT_CASE,
+            "case {case:?}: expected the refusal to name the member and the form, got {}",
+            refused.body
+        );
+
+        let (status, details) = share_view(&emulator, &id).await;
+        assert_eq!(
+            status, SHARE_STATUS_NOT_SHARED,
+            "case {case:?}: a refused share must leave the job \
+             {SHARE_STATUS_NOT_SHARED}, got {status:?}"
+        );
+        assert_eq!(
+            details,
+            Value::Null,
+            "case {case:?}: a refused share must record no details, got {details}"
+        );
+    }
+
+    // The other side of the rule: a value OF the form is accepted and recorded, at each
+    // edge of the form and in between.
+    for (case, value) in [
+        ("the lowest id the form admits", "000000000000000"),
+        ("an ordinary case number", "472819003651884"),
+        ("the highest id the form admits", "999999999999999"),
+    ] {
+        let accepted = create_resource_share(&emulator, &id, value).await;
+        assert_eq!(
+            accepted.status, 202,
+            "case {case:?}: expected HTTP 202, got {} with body {}",
+            accepted.status, accepted.body
+        );
+        let (status, details) = share_view(&emulator, &id).await;
+        assert_eq!(
+            status, SHARE_STATUS_INITIATED,
+            "case {case:?}: an accepted share must move the job to \
+             {SHARE_STATUS_INITIATED}, got {status:?}"
+        );
+        assert_eq!(
+            details,
+            expected_details(value, SHARE_STATUS_INITIATED),
+            "case {case:?}: expected the details of the attempt just recorded, got {details}"
+        );
+    }
 }

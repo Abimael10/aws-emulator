@@ -30,7 +30,7 @@ use service_com_amazonaws_mediaconvert_mediaconvert::state::{
 };
 use service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState;
 
-use super::job_engine_versions::{labels, list_versions};
+use super::job_engine_versions::{granted, labels, list_versions};
 use super::job_lifecycle::{settings as job_settings, Emulator, ROLE};
 
 /// The label of the catalogue entry every case needs to be EXPIRED.
@@ -109,7 +109,9 @@ struct Row {
 /// well-formed future date.
 #[tokio::test]
 async fn a_requested_job_engine_version_is_resolved_against_the_accounts_catalogue() {
-    let emulator = Emulator::new();
+    // The table reads the account's published labels through `ListVersions`, which is
+    // behind the account's version selection capability, so this account is granted it.
+    let emulator = granted();
     seed_version(&emulator, EXPIRED_VERSION, true);
 
     // The labels this account publishes, read through `ListVersions` itself — the
