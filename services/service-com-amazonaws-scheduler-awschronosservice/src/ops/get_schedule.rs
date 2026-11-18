@@ -187,8 +187,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
         let group_name = crate::state::effective_group_name(input.group_name.as_deref());
+        // AWS decides authorization at the IAM layer, ahead of the service looking at
+        // what the request asks for: this read is served only where the calling
+        // principal's own policies allow it `scheduler:GetSchedule` on the schedule the
+        // request addresses (`crate::state::caller_authorization`). It is charged before
+        // the store is read, so a refused caller learns nothing about what the account
+        // holds.
+        if let Some(message) = crate::state::caller_denial(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::schedule_arn(
+                &crate::state::request_region(ctx.parts()),
+                &group_name,
+                &input.name,
+            ),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(message));
+        }
         let mut store = state.lock();
         // Materialise any group deletion the clock has already made due, so a
         // schedule that went with a deleted group is not reported as live.

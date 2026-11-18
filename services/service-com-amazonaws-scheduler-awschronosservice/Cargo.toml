@@ -72,6 +72,9 @@ service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The one integration-test target is rooted at tests/all/main.rs, which declares one module
+# per suite file under tests/all/ rather than listing them by hand.
+automod = { workspace = true }
 sha2 = { workspace = true }
 # The services a schedule's target lives in are mounted beside this one on a
 # single engine in the invocation suite, because an invocation is asserted where a

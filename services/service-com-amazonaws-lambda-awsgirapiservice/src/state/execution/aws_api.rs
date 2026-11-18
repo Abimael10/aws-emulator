@@ -323,6 +323,28 @@ pub const APIS: &[Api] = &[
         protocol: Protocol::RestJson(&PIPES),
         answer_model: Some(&PIPES_ANSWERS),
     },
+    // `services/service-com-amazonaws-scheduler-awschronosservice/smithy-model/
+    // com-amazonaws-scheduler-awschronosservice.json`: restJson1, sigv4Name `scheduler`,
+    // endpointPrefix `scheduler`, sdkId `Scheduler`. Its requests are bound per operation out
+    // of that same model ([`SCHEDULER`]).
+    //
+    // A SCHEDULE is on both sides of a function: EventBridge Scheduler is one of the things
+    // that invokes a function at all, and a handler that writes, reads and deletes the
+    // schedules a workload runs on is the other half — `CreateSchedule` for the work a handler
+    // defers to a future instant, `GetSchedule`/`ListSchedules` to report what is pending,
+    // `DeleteSchedule` to stand it down, and `CreateScheduleGroup` for the group they live in.
+    // A handler that cannot reach this service can neither defer work nor report on it, and
+    // the two faults an operator has to tell apart — a missing GROUP
+    // (`ResourceNotFoundException`) and a missing GRANT (`AccessDeniedException`) — are this
+    // service's own answers, observable from inside a function only once the call is made.
+    Api {
+        sdk_token: "scheduler",
+        signing_name: "scheduler",
+        endpoint_prefix: "scheduler",
+        model: Some(SCHEDULER_MODEL),
+        protocol: Protocol::RestJson(&SCHEDULER),
+        answer_model: Some(&SCHEDULER_ANSWERS),
+    },
     // `services/service-com-amazonaws-dynamodb-dynamodb-20120810/smithy-model/
     // com-amazonaws-dynamodb-dynamodb-20120810.json`: awsJson1_0, sigv4Name `dynamodb`,
     // endpointPrefix `dynamodb`, sdkId `DynamoDB`, service shape `DynamoDB_20120810`.
@@ -1284,6 +1306,10 @@ pub(super) const TRANSFER_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-transfer-transferservice/smithy-model/\
      com-amazonaws-transfer-transferservice.json"
 );
+pub(super) const SCHEDULER_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-scheduler-awschronosservice/smithy-model/\
+     com-amazonaws-scheduler-awschronosservice.json"
+);
 /// THIS service's own model, read the same way as every other entry's: a call a handler makes
 /// to Lambda is bound by the model this crate is generated from, so the surface a running
 /// function reaches is the surface this emulator serves.
@@ -1456,6 +1482,10 @@ static S3VECTORS_ANSWERS: super::blob_members::ServiceModel = super::blob_member
     source: S3VECTORS_MODEL,
     plan: ::std::sync::OnceLock::new(),
 };
+static SCHEDULER_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: SCHEDULER_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
 
 /// The Bedrock Agent runtime plane's own model, which a call to it is bound by — embedded
 /// exactly as [`APIGATEWAY`] is, and for the same reason: the wire facts of each operation are
@@ -1581,6 +1611,15 @@ static IOT_DATA: super::rest_json::RestApi = super::rest_json::RestApi {
 static S3VECTORS: super::rest_json::RestApi = super::rest_json::RestApi {
     model: S3VECTORS_MODEL,
     namespace: "com.amazonaws.s3vectors",
+    parsed: ::std::sync::OnceLock::new(),
+};
+
+/// EventBridge Scheduler's own model, which a call to it is bound by — embedded exactly as the
+/// models above are and for the same reason: the wire facts of each of its operations are that
+/// model's, so this seam states none of them.
+static SCHEDULER: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: SCHEDULER_MODEL,
+    namespace: "com.amazonaws.scheduler",
     parsed: ::std::sync::OnceLock::new(),
 };
 

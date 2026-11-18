@@ -40,6 +40,13 @@
 //! into `service-common` would make every service depending on that crate link the IAM
 //! service crate.
 //!
+//! All three pieces above are the ONE reading of a request's caller this crate has
+//! ([`super::caller_identity`]), shared with the gate that decides the request's own action
+//! ([`super::caller_authorization`]), so two gates handed the same credential blame the same
+//! principal; this module adds only WHICH action and WHICH resource the pass is judged on,
+//! and the condition key the pass itself fixes. What a decision does not bound is stated
+//! there, and holds for the pass too:
+//!
 //! ## What this gate does not bound
 //!
 //! Nothing is refused on evidence this emulator does not have:
@@ -61,7 +68,9 @@
 //! BEFORE the role is resolved against IAM
 //! ([`super::execution_role_violation`]) and before anything is written.
 
-use ::service_common::iam_authorization::{self as iam, Decision};
+use ::service_common::iam_authorization as iam;
+
+use super::caller_identity::{identity_denial, request_caller};
 
 /// The IAM action a request that hands this service a role performs: "To pass a role to
 /// an AWS service, a user must have permissions to pass the role to the service".
@@ -92,46 +101,13 @@ pub fn pass_role_denial<Eng: Send + Sync + 'static>(
 ) -> Option<String> {
     let caller = request_caller(engine, ctx);
     let context = pass_context();
-    let request = iam::Request::new(PASS_ROLE_ACTION, role_arn, &caller.principals)
-        .with_context(&context);
-    let stated = iam::identity_decision(&caller.documents, &request);
-    // The decision is taken FIRST, so an explicit `Deny` in a document that CAN be read
-    // refuses the call whatever else the principal carries — including a grant this
-    // emulator cannot read, which only lifts the DEFAULT deny.
-    if stated == Decision::Denied {
-        return Some(iam::not_authorized_by_identity_policy(
-            &caller.arn,
-            PASS_ROLE_ACTION,
-            role_arn,
-            iam::IDENTITY_POLICY_EXPLICIT_DENY,
-        ));
-    }
-    let granted = iam::is_allowed(stated, Decision::NotStated) || caller.identity_is_unbounded();
-    if !granted {
-        return Some(iam::not_authorized_by_identity_policy(
-            &caller.arn,
-            PASS_ROLE_ACTION,
-            role_arn,
-            &iam::no_identity_policy_allows(PASS_ROLE_ACTION),
-        ));
-    }
-    // "A permissions boundary sets the maximum permissions that an identity-based policy
-    // can grant": a pass the boundary does not also allow is not a permission the
-    // principal has. The account's own credential carries none.
-    let boundary = caller.boundary.as_ref()?;
-    let reason = match iam::identity_decision(::std::slice::from_ref(boundary), &request) {
-        Decision::Allowed => return None,
-        // An explicit deny is a fact about the boundary document, so the refusal names
-        // it; a boundary that merely states nothing withheld the grant.
-        Decision::Denied => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
-        Decision::NotStated => iam::no_permissions_boundary_allows(PASS_ROLE_ACTION),
-    };
-    Some(iam::not_authorized_by_identity_policy(
-        &caller.arn,
+    identity_denial(
+        &caller,
         PASS_ROLE_ACTION,
         role_arn,
-        &reason,
-    ))
+        &iam::Request::new(PASS_ROLE_ACTION, role_arn, &caller.principals)
+            .with_context(&context),
+    )
 }
 
 /// The condition context this pass carries: the SERVICE the role is being passed to
@@ -146,121 +122,10 @@ fn pass_context() -> [(String, String); 1] {
     )]
 }
 
-/// The principal a request speaks for, and everything a decision about it is made from.
-#[derive(Debug, Clone, Default)]
-struct Caller {
-    /// The principal's ARN, as `sts:GetCallerIdentity` reports it — what a refusal names.
-    arn: String,
-    /// Every spelling of the principal a policy may name it by: the ARN STS reports, and
-    /// the ARN of the IAM role behind an assumed-role session.
-    principals: Vec<String>,
-    /// The identity-based policy documents in force on the principal.
-    documents: Vec<String>,
-    /// The permissions boundary in force on the principal, when it carries one whose
-    /// document this emulator holds.
-    boundary: Option<String>,
-    /// Set when this request presents the account's own published credential, which holds
-    /// no IAM policies (see the module docs).
-    account_credential: bool,
-    /// Set when the principal has a policy attached whose document the IAM store does not
-    /// hold — an AWS-managed policy (see the module docs).
-    unreadable_attachment: bool,
-}
-
-impl Caller {
-    /// Whether nothing the identity-based decision found can refuse this caller once no
-    /// readable document DENIES the pass: the account's own credential, which holds no IAM
-    /// policies, or a principal carrying a grant this emulator cannot read.
-    fn identity_is_unbounded(&self) -> bool {
-        self.account_credential || self.unreadable_attachment
-    }
-}
-
-/// Who this request speaks for, resolved from the access key id it signed with.
-///
-/// Which principal an access key id speaks for is a question about the account's
-/// IDENTITIES, and the IAM store of the same shared engine answers both halves of it: a
-/// long-term key through the registry `iam:CreateAccessKey` wrote, and a TEMPORARY
-/// credential of a role session through the record the minting operation left there — so
-/// no other service's store is consulted here. A key the account holds no live record for
-/// is the account's OWN published credential; whether a credential verifies at all is the
-/// emulator's authentication layer's decision, taken before any handler runs.
-fn request_caller<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-) -> Caller {
-    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
-    let Some(iam) = super::iam_state(engine) else {
-        // No IAM store on this engine: the account holds no identity for the key to
-        // speak for, so the request is the account's own.
-        return account_caller();
-    };
-    let store = iam.lock();
-    let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
-    // A temporary credential of a role session: the principal is the SESSION, and the
-    // policies in force are the ROLE's ("the temporary security credentials … have the
-    // permissions of the role", `AssumeRole`). The role's own ARN is also a spelling a
-    // policy names the caller by, so a statement about the role decides the session.
-    if let Some(session) = store.role_session(&access_key_id, now) {
-        let role_arn = session.role_arn.clone();
-        let mut caller = named_caller(&session.session_arn);
-        if !caller.principals.contains(&role_arn) {
-            caller.principals.push(role_arn.clone());
-        }
-        read_policies_of(&store, &role_arn, &mut caller);
-        return caller;
-    }
-    // A long-term access key speaks for the IAM user that holds it, which is the identity
-    // `sts:GetCallerIdentity` reports for it.
-    let user_arn = store
-        .access_keys
-        .get(&access_key_id)
-        .and_then(|record| store.users.get(&record.user_key))
-        .map(|user| user.arn.clone());
-    match user_arn {
-        Some(user_arn) => {
-            let mut caller = named_caller(&user_arn);
-            read_policies_of(&store, &user_arn, &mut caller);
-            caller
-        }
-        None => account_caller(),
-    }
-}
-
-/// The caller a request presenting the account's own published credential speaks for: the
-/// principal `sts:GetCallerIdentity` reports for it, read from the shared definition so
-/// this service refuses in the name of the same principal every other service names.
-fn account_caller() -> Caller {
-    Caller {
-        account_credential: true,
-        ..named_caller(&::service_common::caller_principal::ambient_user_arn())
-    }
-}
-
-/// The caller `arn` names, with no documents read yet.
-fn named_caller(arn: &str) -> Caller {
-    Caller {
-        arn: arn.to_string(),
-        principals: vec![arn.to_string()],
-        ..Caller::default()
-    }
-}
-
-/// Read what the IAM identity `identity_arn` names may do onto `caller`, through IAM's own
-/// accessors: the documents in force on it, whether it carries an attachment whose document
-/// this emulator cannot read, and the permissions boundary that caps it.
-fn read_policies_of(store: &super::IamState, identity_arn: &str, caller: &mut Caller) {
-    if let Some(policies) = store.principal_policies(identity_arn) {
-        caller.documents = policies.documents;
-        // An attachment the collection resolved no document for is an entry of AWS's own
-        // catalog this emulator does not carry: a grant it cannot read.
-        caller.unreadable_attachment = !policies.uncarried.is_empty();
-    }
-    caller.boundary = store.permissions_boundary_document(identity_arn);
-}
-
 #[cfg(test)]
 mod tests {
+    use ::service_common::iam_authorization::Decision;
+
     use super::*;
 
     /// RULE: the refusal names the principal, the `iam:PassRole` action, the ROLE the

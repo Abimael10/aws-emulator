@@ -156,6 +156,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // AWS decides authorization at the IAM layer, ahead of the service looking at
+        // what the request asks for: the write goes ahead only where the calling
+        // principal's own policies allow it `scheduler:TagResource` on the resource the
+        // request addresses, which is the ARN it carries
+        // (`crate::state::caller_authorization`). It is charged before anything is
+        // validated, resolved or written, so a refused caller changes nothing and learns
+        // nothing about what the account holds.
+        if let Some(message) =
+            crate::state::caller_denial(&*self.engine, ctx, Self::NAME, &input.resource_arn)
+        {
+            return Err(crate::scaffolded::Scaffolded::access_denied(message));
+        }
+
         // Request validation comes before the resource lookup, so a reserved key
         // is refused the same way whether or not the ARN names a live group. The
         // refusal is about the reserved namespace, not about this request, so its

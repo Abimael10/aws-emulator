@@ -23,16 +23,22 @@
 //!
 //! Whether the CALLER may hand this service the execution role its request names at
 //! all — the `iam:PassRole` every operation that carries a `Target.RoleArn` charges
-//! against the calling principal's own policies — is [`pass_role`].
+//! against the calling principal's own policies — is [`pass_role`]. Whether the caller may
+//! make the request AT ALL — the `scheduler:<OperationName>` IAM charges every request
+//! against those same policies — is [`caller_authorization`], and the one reading of the
+//! principal both stand on is [`caller_identity`].
 
 mod dead_letter;
 mod occurrence;
 mod schedule_definition;
 mod universal_target;
 
+pub mod caller_authorization;
+pub mod caller_identity;
 pub mod invocation;
 pub mod pass_role;
 
+pub use caller_authorization::{caller_denial, ANY_RESOURCE};
 pub use invocation::{drive_invocation_clock, Invocations};
 pub use occurrence::Occurrences;
 pub use schedule_definition::*;

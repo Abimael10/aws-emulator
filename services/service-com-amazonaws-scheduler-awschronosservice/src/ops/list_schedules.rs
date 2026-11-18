@@ -160,7 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        // AWS decides authorization at the IAM layer, ahead of the service looking at
+        // what the request asks for: this listing is served only where the calling
+        // principal's own policies allow it `scheduler:ListSchedules`
+        // (`crate::state::caller_authorization`). A listing is about the ACCOUNT rather
+        // than about one schedule, so the resource it is judged on is the one IAM writes
+        // for a request that addresses no single resource of its own.
+        if let Some(message) =
+            crate::state::caller_denial(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
+        {
+            return Err(crate::scaffolded::Scaffolded::access_denied(message));
+        }
 
         // A page token is only ever one this service minted; anything else is a
         // bad request, not an empty page.

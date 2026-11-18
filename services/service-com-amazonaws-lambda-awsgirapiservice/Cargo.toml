@@ -435,6 +435,12 @@ service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice 
 # that service's own authorization, and the document it stored is read back through its own
 # data plane.
 service-com-amazonaws-opensearch-amazonopensearchservice = { workspace = true }
+# The SCHEDULES a handler's own EventBridge Scheduler calls write, read and delete, mounted
+# beside lambda on ONE engine: the group and schedule a handler created are asserted where a
+# client reads them — through that service's own GetSchedule, ListSchedules and
+# GetScheduleGroup — and the role policies that decide those calls are written with IAM's own
+# operations.
+service-com-amazonaws-scheduler-awschronosservice = { workspace = true }
 
 [lints]
 workspace = true

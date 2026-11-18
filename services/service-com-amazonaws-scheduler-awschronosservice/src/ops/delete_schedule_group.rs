@@ -162,7 +162,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ClientToken` is the client's retry marker; deleting a group is
         // idempotent here by STATE rather than by token — a group already being
         // deleted keeps the due instant its first delete set.
-        let _ = (&input.client_token, ctx);
+        let _ = &input.client_token;
+
+        // AWS decides authorization at the IAM layer, ahead of the service looking at
+        // what the request asks for: the delete goes ahead only where the calling
+        // principal's own policies allow it `scheduler:DeleteScheduleGroup` on the group
+        // the request addresses (`crate::state::caller_authorization`). It is charged
+        // before anything is validated or removed, so a refused caller changes nothing and
+        // learns nothing about what the account holds.
+        if let Some(message) = crate::state::caller_denial(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::schedule_group_arn(
+                &crate::state::request_region(ctx.parts()),
+                &input.name,
+            ),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(message));
+        }
 
         // The reserved built-in group is refused on the REQUEST, before the
         // store is consulted: the name can never be deleted, whatever the

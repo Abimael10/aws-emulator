@@ -157,6 +157,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // AWS decides authorization at the IAM layer, ahead of the service looking at
+        // what the request asks for: the create goes ahead only where the calling
+        // principal's own policies allow it `scheduler:CreateScheduleGroup` on the group
+        // the request addresses (`crate::state::caller_authorization`). It is charged
+        // before anything is validated or persisted, so a refused caller writes nothing
+        // and learns nothing about what the account holds.
+        if let Some(message) = crate::state::caller_denial(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::schedule_group_arn(&region, &input.name),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(message));
+        }
+
         // The reserved name is a refusal about the REQUEST, so it is answered
         // before the store is consulted at all: a client must be able to tell a
         // permanently invalid name from a collision it could resolve.
@@ -169,7 +187,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle(now);

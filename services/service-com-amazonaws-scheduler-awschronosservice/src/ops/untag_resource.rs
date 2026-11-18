@@ -151,6 +151,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // AWS decides authorization at the IAM layer, ahead of the service looking at
+        // what the request asks for: the removal goes ahead only where the calling
+        // principal's own policies allow it `scheduler:UntagResource` on the resource the
+        // request addresses, which is the ARN it carries
+        // (`crate::state::caller_authorization`). It is charged before anything is
+        // validated, resolved or removed, so a refused caller changes nothing and learns
+        // nothing about what the account holds.
+        if let Some(message) =
+            crate::state::caller_denial(&*self.engine, ctx, Self::NAME, &input.resource_arn)
+        {
+            return Err(crate::scaffolded::Scaffolded::access_denied(message));
+        }
+
         // A reserved key cannot be removed any more than it can be set: the keys
         // in that namespace are the service's own, so a request naming one is
         // refused as a modification of system tags before the resource is looked
