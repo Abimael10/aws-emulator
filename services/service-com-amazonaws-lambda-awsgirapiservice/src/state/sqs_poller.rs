@@ -39,6 +39,15 @@
 //!   ([`super::event_source_authorization`]): the messages stay where they are until the
 //!   grant is in place, which is the same question the call that WIRED the pair together was
 //!   refused for.
+//! * OPEN. A message of a queue encrypted with a CUSTOMER MANAGED KMS key is sealed under a
+//!   data key only KMS can open, and the pass is the consumer asking for it — as the
+//!   function's execution role — so a key that does not let that role perform the
+//!   `kms:Decrypt` a hand-over performs stops the hand-over of the batch it took
+//!   ([`undecryptable_queue`]): nothing is handed to the function and nothing is deleted, so
+//!   the messages are the queue's own, hidden for the hold their delivery took and handed
+//!   over again when it lapses — the delivery attempt counting against the queue's
+//!   `RedrivePolicy` like every other — until the decrypt is granted, which the pass after it
+//!   decides afresh.
 //! * FILTER. `FilterCriteria` is "an object that defines the filter criteria that determine
 //!   whether Lambda should process an event", so a polled message that matches none of the
 //!   mapping's patterns is not handed to the function. On a QUEUE source such a message is
@@ -606,6 +615,21 @@ async fn poll_mapping_due<Eng: Send + Sync + 'static>(
                 continue;
             }
         };
+        // The bodies of a batch out of a queue encrypted with a CUSTOMER MANAGED KMS key are
+        // sealed under a data key only KMS can open, and this pass is the consumer asking for
+        // it — as the function's execution role. So a key that does not let that role decrypt
+        // stops the hand-over HERE, with the batch already taken: nothing is handed to the
+        // function and nothing is deleted, and the messages the pass took are the queue's own,
+        // hidden for the hold their delivery took and handed over again when it lapses — until
+        // the decrypt is granted, which the pass after it decides afresh
+        // ([`undecryptable_queue`]).
+        if let Some(detail) = undecryptable_queue(engine, &target) {
+            note_undecryptable(session, &target, &detail);
+            // The batch this pass took is let go rather than kept for a later pass, for the
+            // reason a withheld read lets one go: its receipt handles lapse with the hold.
+            session.gathering.remove(&target.uuid);
+            continue;
+        }
         // What the filter admits of each batch, decided before any of them is handed over: a
         // message the filter rejected is removed from the queue, because nothing else would
         // and the mapping would otherwise be handed it again at every poll.
@@ -842,6 +866,68 @@ fn withheld_queue_read(
         &target.queue_arn,
         now,
     )
+}
+
+/// Why the batch this pass took out of `target`'s queue cannot be DECRYPTED for the function's
+/// execution role — the key the queue names is gone, unusable, or does not let that role
+/// perform the `kms:Decrypt` a hand-over of an encrypted message performs — or `None` when it
+/// can be, which includes a queue on the Amazon SQS owned key, a mapping whose function this
+/// store holds no execution role for, and every case that shows nothing about the key.
+///
+/// The decision is Amazon SQS's own
+/// ([`sqs::state::encryption::authorize_queue_key_as_role`]), the one this emulator makes for
+/// every consumer of an encrypted queue, so a pass may open a queue's messages exactly when a
+/// client's receive under the same role may: the key's state, the key's own policy, the
+/// documents in force on the role and the grants issued to it — and nothing of this service's
+/// own.
+///
+/// A READ: it decides, and takes nothing out of the queue and puts nothing back. The batch
+/// the pass already took stays where every undelivered batch stays — in the queue, hidden for
+/// the hold its delivery took — which is what a refused hand-over leaves behind.
+fn undecryptable_queue<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    target: &PollTarget,
+) -> Option<String> {
+    let role_arn = target.role_arn.as_deref()?;
+    let refusal = sqs::state::encryption::authorize_queue_key_as_role(
+        engine,
+        &target.region,
+        &target.queue_arn,
+        role_arn,
+        sqs::state::encryption::DECRYPT_ACTION,
+    )
+    .err()?;
+    Some(format!(
+        "the messages of {} are encrypted with the queue's KMS key, which cannot be used to \
+         decrypt them for {role_arn}: {}",
+        target.queue_arn,
+        refusal.message()
+    ))
+}
+
+/// Report that a mapping could not have the key of its queue opened for its function's
+/// execution role, at most once every [`FAILURE_LOG_INTERVAL`] passes so one such mapping
+/// cannot fill the log.
+///
+/// Nothing is recorded on the mapping: no batch reached the function, so there is no
+/// processing attempt whose result to report — exactly as for a pass whose reads are withheld
+/// ([`note_unpollable`]).
+fn note_undecryptable(session: &mut PollSession, target: &PollTarget, detail: &str) {
+    let passes = session
+        .failures
+        .entry(target.uuid.clone())
+        .and_modify(|passes| *passes = passes.saturating_add(1))
+        .or_insert(1);
+    if *passes == 1 || passes.is_multiple_of(FAILURE_LOG_INTERVAL) {
+        ::tracing::warn!(
+            mapping = %target.uuid,
+            attempt = *passes,
+            detail = %detail,
+            "an event source mapping could not have the key of its queue opened for its \
+             function's execution role; the batch it took is handed to nobody and deleted by \
+             nobody, and the queue hands it over again when the hold on it lapses"
+        );
+    }
 }
 
 /// Report that a mapping's execution role may not read its queue, at most once every

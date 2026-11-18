@@ -63,6 +63,15 @@
 //! failed with, so each message is KMS's own sentence with the metadata block an AWS error
 //! carries — see [`relayed`].
 //!
+//! # A consumer that is not a request's caller
+//!
+//! A queue is also consumed by a POLLER another service runs over it as an IAM ROLE (a
+//! Lambda event source mapping's), which presents no credential of its own, so there is no
+//! request caller to resolve. The question is the same one and
+//! [`authorize_queue_key_as_role`] asks it of the key for that role — through KMS's OWN
+//! authorizer, which is how every service in this tree that uses a key AS a role decides it,
+//! so such a consumer is also permitted by a GRANT issued to the role on the key.
+//!
 //! When no KMS service is mounted beside this one the lookup answers nothing about the
 //! key, and the call proceeds: a condition nobody attributed to the key never refuses a
 //! send or a receive.
@@ -254,6 +263,22 @@ pub enum KeyRefusal {
     AccessDenied(String),
 }
 
+impl KeyRefusal {
+    /// The sentence KMS refused the call with, which every reader of a refusal reports:
+    /// the operation that relays it as its own modelled error, and the consumer that
+    /// records why a poll of an encrypted queue took nothing out of it.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotFound(message)
+            | Self::Disabled(message)
+            | Self::InvalidState(message)
+            | Self::InvalidKeyUsage(message)
+            | Self::AccessDenied(message) => message,
+        }
+    }
+}
+
 /// The service name KMS's own error metadata carries.
 const KMS_SERVICE_NAME: &str = "AWSKMS";
 
@@ -334,6 +359,161 @@ pub fn authorize_queue_key<Eng: Send + Sync + 'static>(
     }))
 }
 
+/// The SAME question as [`authorize_queue_key`], for a consumer that reads a queue ACTING
+/// AS an IAM role rather than on a credential of its own — a poller another service runs as
+/// a function's execution role — asked about the queue by its ARN, which is what such a
+/// caller holds.
+///
+/// A queue encrypted with a customer managed key is read through that key whoever the
+/// consumer is, so the same two things decide it: the key has to be usable at all, and the
+/// authorities in force have to let that principal use it. For a role the decision is KMS's
+/// OWN ([`kms_store::authorization::authorize_use`], taken for the role as the principal),
+/// which is how every service in this tree that uses a key AS a role decides it: the key's
+/// own policy and the role's identity-based documents — either of which can grant the use,
+/// while an explicit deny in either refuses it — and the GRANTS issued to that role on the
+/// key, which are permission of their own. The use arrives THROUGH this service, which is
+/// what a key policy scoped by `kms:ViaService` is written against, and carries the queue's
+/// own encryption context.
+///
+/// `Ok(None)` for an ARN that addresses no queue of this store and for a queue on the Amazon
+/// SQS owned key, neither of which needs anything of KMS, and for every case that shows
+/// nothing about the key: no KMS store beside this service, and an Amazon Web Services
+/// managed key, whose policy AWS manages for the service that owns it.
+///
+/// A READ of the stores: it decides, and takes nothing out of the queue — which is what lets
+/// the consumer leave the messages where they are when the key is refused. Call it with no
+/// store of this service locked.
+pub fn authorize_queue_key_as_role<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    queue_arn: &str,
+    role_arn: &str,
+    action: &str,
+) -> Result<Option<QueueKey>, KeyRefusal> {
+    let Some(store) = crate::state::service_state(engine) else {
+        return Ok(None);
+    };
+    // The lock is released before KMS or IAM is consulted: nothing of this service's state
+    // is read or written while the decision is being made.
+    let configured = {
+        let state = store.lock();
+        state
+            .queue_by_arn(queue_arn)
+            .and_then(|queue| queue.master_key_id().map(str::to_string))
+    };
+    let Some(master_key_id) = configured else {
+        return Ok(None);
+    };
+    let Some(kms) = kms_store::service_state(engine) else {
+        // Visible to an operator, for the reason [`authorize_master_key`] states it.
+        ::tracing::warn!(
+            master_key_id,
+            action,
+            "no KMS service is mounted beside Amazon SQS; the queue's key is accepted"
+        );
+        return Ok(Some(QueueKey {
+            queue_arn: queue_arn.to_string(),
+            key_arn: master_key_id,
+        }));
+    };
+    // The role's own documents are read BEFORE the KMS store is locked, so the IAM store is
+    // never reached while another service's guard is held.
+    let caller = kms_store::authorization::role_caller(engine, role_arn);
+    // The entry every call on this queue's key carries, which is what an authority scoped
+    // to one queue's context is claimed for that queue and for no other.
+    let context: HashMap<String, String> = [(
+        super::data_keys::QUEUE_ENCRYPTION_CONTEXT_NAME.to_string(),
+        queue_arn.to_string(),
+    )]
+    .into_iter()
+    .collect();
+    let kms = kms.lock();
+    let kms_store::KeyRef::Found(found) = kms.resolve(region, &master_key_id) else {
+        // Every other reading of the queue's `KmsMasterKeyId` is the one
+        // [`authorize_master_key`] takes of it: an identifier KMS cannot resolve names no
+        // key that could open anything.
+        return Err(KeyRefusal::NotFound(relayed(
+            &kms_store::key_not_found_message(region, &master_key_id),
+            "NotFoundException",
+        )));
+    };
+    let key = KeySnapshot::of(found);
+    if let Some(refusal) = unusable(&key) {
+        return Err(refusal);
+    }
+    // An Amazon Web Services managed key's policy is managed by AWS for the service that
+    // owns the alias, so no identity needs a grant of its own on it.
+    if key.aws_managed {
+        return Ok(Some(QueueKey {
+            queue_arn: queue_arn.to_string(),
+            key_arn: key.arn,
+        }));
+    }
+    match kms_store::authorization::authorize_use(
+        &caller,
+        &kms,
+        region,
+        found,
+        kms_store::authorization::RequestedUse::through_service(
+            action.strip_prefix("kms:").unwrap_or(action),
+            &via_service(region),
+        ),
+        Some(&context),
+        None,
+    ) {
+        Ok(()) => Ok(Some(QueueKey {
+            queue_arn: queue_arn.to_string(),
+            key_arn: key.arn,
+        })),
+        Err(why) => Err(KeyRefusal::AccessDenied(relayed(
+            &why,
+            "AccessDeniedException",
+        ))),
+    }
+}
+
+/// The value of the `kms:ViaService` condition key for a use of a key this service makes on
+/// a caller's behalf: this service's own regional endpoint name.
+fn via_service(region: &str) -> String {
+    format!("{}.{region}.amazonaws.com", crate::state::ARN_SERVICE)
+}
+
+/// Why the key cannot be used in a cryptographic operation AT ALL, whoever asks — it is
+/// disabled, it is in a state no such operation can use, or it is not a key a data key can
+/// be sealed under — or `None` when it can.
+///
+/// The one reading of those conditions, so a call made on a request's own credential and one
+/// made acting as a role are refused the same key for the same reason.
+fn unusable(key: &KeySnapshot) -> Option<KeyRefusal> {
+    if key.state == kms_store::KEY_STATE_DISABLED {
+        return Some(KeyRefusal::Disabled(relayed(
+            &key.state_message,
+            "DisabledException",
+        )));
+    }
+    if !key.usable {
+        return Some(KeyRefusal::InvalidState(relayed(
+            &key.state_message,
+            "KMSInvalidStateException",
+        )));
+    }
+    // "For encrypting, decrypting, re-encrypting, and generating data keys, the KeyUsage
+    // must be ENCRYPT_DECRYPT", and a data key is generated under a symmetric encryption
+    // key, so a key that is neither cannot seal this queue's messages.
+    if !key.encrypt_decrypt {
+        return Some(KeyRefusal::InvalidKeyUsage(relayed(
+            &format!(
+                "{} cannot be used to encrypt or decrypt a message; its KeyUsage must be \
+                 {} and its key spec a symmetric encryption spec.",
+                key.arn,
+                kms_store::KEY_USAGE_ENCRYPT_DECRYPT
+            ),
+            "InvalidKeyUsageException",
+        )));
+    }
+    None
+}
+
 /// Whether the queue's customer master key may be used for `action` on behalf of this
 /// request's caller, which is what a send (generating a data key) and a receive
 /// (decrypting one) each need before they touch the message plane.
@@ -410,31 +590,10 @@ pub fn authorize_master_key<Eng: Send + Sync + 'static>(
         }
     };
 
-    if key.state == kms_store::KEY_STATE_DISABLED {
-        return Err(KeyRefusal::Disabled(relayed(
-            &key.state_message,
-            "DisabledException",
-        )));
-    }
-    if !key.usable {
-        return Err(KeyRefusal::InvalidState(relayed(
-            &key.state_message,
-            "KMSInvalidStateException",
-        )));
-    }
-    // "For encrypting, decrypting, re-encrypting, and generating data keys, the KeyUsage
-    // must be ENCRYPT_DECRYPT", and a data key is generated under a symmetric encryption
-    // key, so a key that is neither cannot seal this queue's messages.
-    if !key.encrypt_decrypt {
-        return Err(KeyRefusal::InvalidKeyUsage(relayed(
-            &format!(
-                "{} cannot be used to encrypt or decrypt a message; its KeyUsage must be \
-                 {} and its key spec a symmetric encryption spec.",
-                key.arn,
-                kms_store::KEY_USAGE_ENCRYPT_DECRYPT
-            ),
-            "InvalidKeyUsageException",
-        )));
+    // Whether the key can be used in a cryptographic operation at all, which is the same
+    // question for every caller ([`unusable`]).
+    if let Some(refusal) = unusable(&key) {
+        return Err(refusal);
     }
     // An Amazon Web Services managed key's policy is managed by AWS for the service that
     // owns the alias, so the caller needs no grant of its own on it.
@@ -446,7 +605,7 @@ pub fn authorize_master_key<Eng: Send + Sync + 'static>(
     let context = [
         (
             VIA_SERVICE_CONDITION_KEY.to_string(),
-            format!("{}.{region}.amazonaws.com", crate::state::ARN_SERVICE),
+            via_service(region),
         ),
         (
             CALLER_ACCOUNT_CONDITION_KEY.to_string(),
