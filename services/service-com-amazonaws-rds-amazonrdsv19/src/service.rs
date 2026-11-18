@@ -58,6 +58,13 @@
 //! which the framework's error renderers omit. Everything else about those paths —
 //! status, `<Type>`, `<Code>`, `<Message>` — stays with the framework.
 //!
+//! That same wrapper is also where the AUTHORIZATION decision AWS takes in front of a
+//! service is taken ([`authorization`]): whether the caller may perform the action at all is
+//! a fact of the credential the request presented rather than of the input any one operation
+//! reads, so it is decided once for every request this front door serves, ahead of the
+//! handler, and a request the IAM policies in force do not permit is refused HTTP 403
+//! `AccessDenied` without reading or changing anything.
+//!
 //! That same wrapper is where this front door's AUDIT leg hangs: it serves each request
 //! through the operation wrapped in the shared management-event recorder
 //! ([`management_events`]), so every call this service serves is recorded in the account's
@@ -75,6 +82,7 @@
 //! three control planes, which is why their models share its endpoint prefix.
 
 pub mod api_version;
+pub mod authorization;
 pub mod management_events;
 pub mod query_error_envelope;
 pub mod unresolved_reference;

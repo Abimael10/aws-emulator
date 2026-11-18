@@ -119,6 +119,12 @@ pub fn with_request_id(mut resp: RtResponse) -> RtResponse {
 /// [`crate::service::unresolved_reference`]). Every other request is served exactly as
 /// before.
 ///
+/// And it is where the AUTHORIZATION gate runs
+/// ([`crate::service::authorization::refusal`]), ahead of the operation: whether the caller
+/// may perform the action at all is a fact of the credential the request presented, not of
+/// the input the operation reads, so it is decided once here for every request this service
+/// serves. The engine it holds is what that gate reads the IAM and STS stores through.
+///
 /// And it is where the events a served call RECORDED are published onto the account's
 /// default event bus ([`crate::state::bus_events`]): every request of this front door passes
 /// through here, so the publication is made once, from outside the handler that recorded the
@@ -162,6 +168,15 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for RequestIdEnvelopeOperation<
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            // IAM's decision, taken in front of everything else: a caller the policies in
+            // force do not permit to perform the action is refused 403 before any handler
+            // reaches the store, so the call reads nothing and changes nothing. The refusal
+            // already carries the envelope's `<RequestId>`.
+            if let Some(resp) =
+                crate::service::authorization::refusal(&*self.engine, svc, req, ctx)
+            {
+                return resp;
+            }
             if let Some(resp) = crate::service::unresolved_reference::refuse_absent_db_cluster(
                 &*self.engine,
                 svc,

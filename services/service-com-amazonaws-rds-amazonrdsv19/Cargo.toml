@@ -120,6 +120,13 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # engine (`src/state/data_plane/engine_s3_role.rs`), so a session is judged by the very
 # policies that service's `PutRolePolicy` wrote.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The same store answers the other half of the AUTHORIZATION gate in front of every
+# operation (`src/service/authorization.rs`): which identity-based policy documents are in
+# force on the principal a request speaks for. WHO that principal is comes from the token
+# service's own session registry on the same engine, which is the record
+# `sts:GetCallerIdentity` answers from — so a call a role session makes is judged on the
+# policies in force on that role, exactly as the service that minted the session reports it.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # Every lifecycle change this service records is also published onto the account's DEFAULT
 # EventBridge bus as an `aws.rds` event, the way Amazon RDS publishes one with no opt-in:
 # this is the EventBridge client that publication goes out over the in-process callback with
