@@ -19,16 +19,20 @@
 //! The class the rule generalises over is the endpoint the call arrived on crossed with the
 //! repository name and the operation reporting it, so the rows span the endpoint forms a
 //! caller reaches this emulator by — the registry host ECR publishes (a host in AWS's own
-//! zone, which this emulator does not answer on), the emulator's own socket, a loopback name
-//! with a port, an endpoint carried only on the request URI, this service's control-plane
-//! endpoint host (which names a service, so no registry client can use it) and a `Host` that
-//! is no endpoint at all — crossed with the repository-name forms `RepositoryName`'s pattern
-//! allows. No row is the recorded request; the recorded case is one name at one endpoint.
+//! zone, which this emulator does not answer on), another partition's registry host and this
+//! service's dual-stack endpoint host (two more zones AWS publishes its own endpoints in),
+//! the emulator's own socket, a loopback name with a port, an endpoint carried only on the
+//! request URI, this service's control-plane endpoint host (which names a service, so no
+//! registry client can use it) and a `Host` that is no endpoint at all — crossed with the
+//! repository-name forms `RepositoryName`'s pattern allows. No row is the recorded request;
+//! the recorded case is one name at one endpoint.
 //!
 //! The last test follows the reported URI the way a container client does: it pulls the
 //! manifest at the very address the `repositoryUri` named, with the credential
 //! `GetAuthorizationToken` issued, so the URI is proved to address the repository in this
-//! registry rather than merely to carry the right shape.
+//! registry rather than merely to carry the right shape, and the one after it requires every
+//! address this service reports to be dialable — and never a name in a zone AWS publishes its
+//! own endpoints in — whatever zone the call arrived from.
 
 use std::sync::Arc;
 
@@ -103,8 +107,30 @@ fn endpoints() -> Vec<Endpoint> {
             uri_authority: None,
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
         },
+        Endpoint {
+            case: "a registry host in the China partition's zone",
+            host: Some(format!("{REGISTRY_ID}.dkr.ecr.cn-north-1.amazonaws.com.cn")),
+            uri_authority: None,
+            // Another zone AWS publishes its own endpoints in, and so another host this
+            // emulator does not answer on.
+            announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
+        },
+        Endpoint {
+            case: "this service's dual-stack endpoint host",
+            host: Some(format!("api.ecr.{REGION}.api.aws")),
+            uri_authority: None,
+            announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
+        },
     ]
 }
+
+/// The DNS suffixes AWS publishes its own endpoints under, spelled out here rather than
+/// imported so that a reported address slipping into one of them fails this suite.
+///
+/// Source: `service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`, the tree's one
+/// list of them, which this service's reading of the endpoint it may report is written on.
+const AWS_ENDPOINT_DNS_SUFFIXES: [&str; 4] =
+    [".amazonaws.com", ".amazonaws.com.cn", ".api.aws", ".on.aws"];
 
 /// The media type a Docker v2 manifest is pushed and served under.
 const DOCKER_V2_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
@@ -450,6 +476,72 @@ async fn a_pull_at_the_reported_repository_uri_reaches_this_registry() {
             body, manifest,
             "case {case:?}: expected the pushed manifest from the reported URI, got \
              {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_reported_address_names_a_zone_aws_publishes_its_own_endpoints_in() {
+    // The half of the rule that cannot be read off one value: WHEREVER the call came from —
+    // a host under any of the zones AWS publishes its own endpoints in included — both
+    // reported addresses are the endpoint this emulator answered that caller at, and a
+    // client that dials what it was handed reaches this registry's Docker Registry v2
+    // endpoint with the credential it was issued. A name under one of those zones resolves
+    // nowhere near this process, so reporting one would send the next client out of the
+    // emulated environment entirely.
+    for endpoint in endpoints() {
+        let router = emulator();
+        let case = endpoint.case;
+        let name = "dialled/at-the-reported-address";
+
+        let created = call_at(
+            &router,
+            &endpoint,
+            "CreateRepository",
+            &json!({"repositoryName": name}),
+        )
+        .await;
+        let reported = text(case, &created, "/repository/repositoryUri");
+        let issued = call_at(&router, &endpoint, "GetAuthorizationToken", &json!({})).await;
+        let proxy_endpoint = text(case, &issued, "/authorizationData/0/proxyEndpoint");
+        let token = text(case, &issued, "/authorizationData/0/authorizationToken");
+
+        // Both reported values, split into the address a client dials.
+        let push_authority = reported
+            .split_once('/')
+            .map(|(authority, _)| authority.to_string())
+            .unwrap_or_else(|| panic!("case {case:?}: {reported:?} names no repository path"));
+        let login_authority = proxy_endpoint
+            .strip_prefix("https://")
+            .unwrap_or_else(|| panic!("case {case:?}: {proxy_endpoint:?} is no https URL"))
+            .to_string();
+        for (member, authority) in [
+            ("repositoryUri", &push_authority),
+            ("proxyEndpoint", &login_authority),
+        ] {
+            assert_eq!(
+                *authority, endpoint.announced_endpoint,
+                "case {case:?}: expected {member} to carry the endpoint this emulator \
+                 answered this caller at, got {authority:?}"
+            );
+            for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
+                assert!(
+                    !authority.to_ascii_lowercase().contains(suffix),
+                    "case {case:?}: {member} carries {authority:?}, a name under {suffix:?} \
+                     — a zone AWS publishes its own endpoints in, which this emulator does \
+                     not answer in"
+                );
+            }
+        }
+
+        // What the address is FOR: dialled as it was handed over, with the credential this
+        // call issued, it is this registry's own v2 endpoint that answers.
+        let (status, answered) =
+            registry_get(&router, &login_authority, "/v2/", &token, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the registry API must answer at the reported address \
+             {proxy_endpoint:?}, got HTTP {status} with {answered:?}"
         );
     }
 }

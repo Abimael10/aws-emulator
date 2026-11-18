@@ -490,6 +490,12 @@ async fn a_stack_publishes_the_repository_values_amazon_ecr_itself_reports() {
              {held_uri:?}",
             row.case
         );
+        assert_eq!(
+            held["registryId"].as_str(),
+            Some(ACCOUNT),
+            "case {:?}: expected the owning account beside the URI, got {reported}",
+            row.case
+        );
 
         // Every value the stack published for that attribute is the value the create
         // answered, however the output composed it: the stand-in CloudFormation computed

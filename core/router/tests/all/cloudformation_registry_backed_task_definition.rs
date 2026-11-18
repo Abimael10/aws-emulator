@@ -585,8 +585,8 @@ async fn a_stacks_registry_and_its_task_definition_exist_in_the_services_that_ow
             );
         }
 
-        // The URI Amazon ECR publishes for the repository: the registry host of the account
-        // and Region that holds it, followed by the repository's own name, so a client
+        // The URI Amazon ECR publishes for the repository: the endpoint this emulator
+        // answers the registry API at, followed by the repository's own name, so a client
         // composes a tag or a digest on what it was handed. The stack publishes one for the
         // repository it created too, and the two must agree.
         let published_uri = held["repositoryUri"].as_str().unwrap_or_default().to_string();

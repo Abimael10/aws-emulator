@@ -226,9 +226,12 @@ pub fn parse_reference(image: &str) -> Option<RegistryReference> {
 /// The form is the one the Amazon ECR User Guide gives for a pull:
 /// `<account>.dkr.ecr.<region>.amazonaws.com/<repository>[:<tag>|@<digest>]`, so the account,
 /// the Region and the repository are read out of the reference itself
-/// ([`registry_host_parts`] for the host, which reads the address this registry ANNOUNCES
-/// for one of its own repositories as well as the host AWS publishes, because both name the
-/// same registry). A reference naming no tag and no digest asks for [`DEFAULT_IMAGE_TAG`].
+/// ([`registry_host_parts`] for the host). A reference carrying the ADDRESS this registry
+/// announced instead (`super::registry_address`) names no Region of its own — one endpoint
+/// serves every Region's registry — so a caller that holds one brings it into this form for
+/// the Region it is resolving in before asking (the compute services'
+/// `reference_into_this_registry`). A reference naming no tag and no digest asks for
+/// [`DEFAULT_IMAGE_TAG`].
 #[must_use]
 pub fn parse_registry_reference(image: &str) -> Option<(String, RegistryReference)> {
     let (host, path) = image.trim().split_once('/')?;
@@ -276,7 +279,7 @@ fn reference_into(region: String, path: &str) -> Option<RegistryReference> {
 
 /// The Region the registry host `host` names, when `host` is THIS registry's host: this
 /// account's id, the two fixed labels, one Region label and the zone the registry is served
-/// in — AWS's own partition suffix, or the zone this emulator announces its registries in.
+/// in — AWS's own partition suffix, or a name an operator points a client at.
 ///
 /// The host layout itself is read by the one walk of it this service states
 /// ([`registry_host_parts`]); what this adds is that the account has to be the account this

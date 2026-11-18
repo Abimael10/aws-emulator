@@ -2843,9 +2843,9 @@ pub fn upstream_registry_for_url(url: &str) -> Option<&'static str> {
 /// what this adds is the SUFFIX — the host has to be served under the Region's own partition
 /// suffix, which is what makes a URL name a registry AWS publishes rather than one some
 /// other registry is served at, and what the `upstreamRegistryUrl` resolution above asks
-/// ([`is_ecr_registry_host`]). An address this emulator ANNOUNCES is a registry host of this
-/// service's own, in the zone this emulator answers in, and is read by
-/// [`registry_host_parts`] instead.
+/// ([`is_ecr_registry_host`]). The address this registry ANNOUNCES for a client to dial is
+/// an endpoint of this emulator rather than a registry host at all
+/// (`state::registry_address`), so it names no upstream registry here.
 pub fn ecr_registry_host_parts(host: &str) -> Option<(&str, &str)> {
     let parts = registry_host_parts(host)?;
     // The suffix is the one the Region's own partition publishes, which is what makes this
@@ -4697,7 +4697,7 @@ mod layer_download;
 /// `crate::state::…` like every other part of this store.
 mod repository_name;
 pub use repository_name::*;
-/// The endpoint a registry address this service announces names, and the repository URI
+/// The endpoint this service ANNOUNCES its registry at, and the repository URI
 /// and `docker login` URL built on it, in `state/registry_address.rs`. Declared and
 /// re-exported here, so a handler reaches it as `crate::state::…` like every other part
 /// of this store.

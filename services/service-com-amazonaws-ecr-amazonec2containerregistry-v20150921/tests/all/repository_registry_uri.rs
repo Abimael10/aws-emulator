@@ -489,9 +489,11 @@ async fn a_name_one_registry_holds_is_free_in_another_and_both_stay_readable() {
 async fn a_pull_with_each_regions_credential_reaches_that_regions_own_image() {
     // What telling the two apart is FOR: with one name in two registries, the reported URI
     // is followed the way a container client follows it — split at the first '/', dialled,
-    // and pulled from with the credential that Region's token carries — and answers the
-    // manifest THAT Region's repository holds. The two manifests differ, so a pull that
-    // reached the other registry answers the wrong document rather than nothing.
+    // and pulled from with the credential that Region's `docker login` token carries — and
+    // answers the manifest THAT Region's repository holds. One address serves both, so it is
+    // the credential that says which registry the pull addresses; the two manifests differ,
+    // so a pull that reached the other registry answers the wrong document rather than
+    // nothing.
     for pair in REGION_PAIRS {
         let router = emulator();
         let case = format!("{}, repository {}", pair.case, pair.name);
