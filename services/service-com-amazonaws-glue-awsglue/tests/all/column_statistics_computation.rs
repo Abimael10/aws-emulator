@@ -13,14 +13,17 @@
 //! says, and aggregates each covered column into the `ColumnStatisticsData` member its
 //! declared `Column$Type` maps to — so the figures reported for a column are the
 //! statistics of the cells that column holds (its nulls, its distinct values, its extremes
-//! and its lengths). Such a run settles `SUCCEEDED` carrying NO `ErrorMessage`, and the
+//! and its lengths), and each entry reports that column's type as the name of the
+//! statistics category its figures were computed under rather than the alias the table
+//! declares. Such a run settles `SUCCEEDED` carrying NO `ErrorMessage`, and the
 //! statistics it generated become readable through `GetColumnStatisticsForTable` with an
 //! empty `Errors`. The modelled failure status is reserved for a run that could not read
 //! the data, and such a run generates no statistics at all.
 //!
 //! The recorded case — a 20-row comma-separated object behind a table of an `int` and a
 //! `string` column — is ONE row of the table below; the rows differ along the declared
-//! column types (every `ColumnStatisticsType` a type maps to), the number of objects under
+//! column types (every `ColumnStatisticsType` a type maps to, and every Hive alias that
+//! maps to one), the number of objects under
 //! the location, the field delimiter, the null marker, whether a header line is skipped,
 //! whether the rows are delimited text or one JSON document per line, and whether the
 //! layout quotes its fields.
@@ -520,6 +523,163 @@ async fn a_finished_run_reports_the_statistics_of_the_data_behind_the_table() {
             ],
         },
         ComputationCase {
+            case: "every declared alias of a category reports that category's own name",
+            name: "type_aliases",
+            // One column per Hive alias `Column$Type` can carry that has statistics, so the
+            // reported type of each is the name of the category it maps to rather than the
+            // alias. Source: the declarations `ColumnStatisticsType` covers
+            // (`smithy_query shape=ColumnStatisticsType`, `smithy_query
+            // shape=ColumnStatisticsData`).
+            columns: &[
+                ("tiny", "tinyint"),
+                ("small", "smallint"),
+                ("whole", "int"),
+                ("big", "bigint"),
+                ("flt", "float"),
+                ("dbl", "double"),
+                ("price", "decimal(12,3)"),
+                ("chars", "char(5)"),
+                ("vchars", "varchar(10)"),
+                ("text", "string"),
+                ("day", "date"),
+                ("stamp", "timestamp"),
+                ("flag", "boolean"),
+                ("blob", "binary"),
+            ],
+            parameters: json!({ "field.delim": "," }),
+            descriptor: json!({}),
+            objects: &[(
+                "rows",
+                "1,2,3,5,1.5,2.5,9.125,abcde,hello,world,2026-01-02,2026-01-02T03:04:05,true,QUJD\n\
+                 1,2,4,5,1.5,3.5,9.125,abcde,hello,world,2026-01-02,2026-01-02T03:04:05,false,QUJD\n",
+            )],
+            expected: &[
+                ExpectedColumn {
+                    column: "tiny",
+                    statistics_type: "LONG",
+                    numbers: &[
+                        ("NumberOfNulls", 0.0),
+                        ("NumberOfDistinctValues", 1.0),
+                        ("MinimumValue", 1.0),
+                        ("MaximumValue", 1.0),
+                    ],
+                },
+                ExpectedColumn {
+                    column: "small",
+                    statistics_type: "LONG",
+                    numbers: &[
+                        ("NumberOfNulls", 0.0),
+                        ("NumberOfDistinctValues", 1.0),
+                        ("MinimumValue", 2.0),
+                        ("MaximumValue", 2.0),
+                    ],
+                },
+                ExpectedColumn {
+                    column: "whole",
+                    statistics_type: "LONG",
+                    numbers: &[
+                        ("NumberOfNulls", 0.0),
+                        ("NumberOfDistinctValues", 2.0),
+                        ("MinimumValue", 3.0),
+                        ("MaximumValue", 4.0),
+                    ],
+                },
+                ExpectedColumn {
+                    column: "big",
+                    statistics_type: "LONG",
+                    numbers: &[
+                        ("NumberOfNulls", 0.0),
+                        ("NumberOfDistinctValues", 1.0),
+                        ("MinimumValue", 5.0),
+                        ("MaximumValue", 5.0),
+                    ],
+                },
+                ExpectedColumn {
+                    column: "flt",
+                    statistics_type: "DOUBLE",
+                    numbers: &[
+                        ("NumberOfNulls", 0.0),
+                        ("NumberOfDistinctValues", 1.0),
+                        ("MinimumValue", 1.5),
+                        ("MaximumValue", 1.5),
+                    ],
+                },
+                ExpectedColumn {
+                    column: "dbl",
+                    statistics_type: "DOUBLE",
+                    numbers: &[
+                        ("NumberOfNulls", 0.0),
+                        ("NumberOfDistinctValues", 2.0),
+                        ("MinimumValue", 2.5),
+                        ("MaximumValue", 3.5),
+                    ],
+                },
+                ExpectedColumn {
+                    column: "price",
+                    statistics_type: "DECIMAL",
+                    numbers: &[("NumberOfNulls", 0.0), ("NumberOfDistinctValues", 1.0)],
+                },
+                ExpectedColumn {
+                    column: "chars",
+                    statistics_type: "STRING",
+                    numbers: &[
+                        ("NumberOfNulls", 0.0),
+                        ("NumberOfDistinctValues", 1.0),
+                        ("MaximumLength", 5.0),
+                        ("AverageLength", 5.0),
+                    ],
+                },
+                ExpectedColumn {
+                    column: "vchars",
+                    statistics_type: "STRING",
+                    numbers: &[
+                        ("NumberOfNulls", 0.0),
+                        ("NumberOfDistinctValues", 1.0),
+                        ("MaximumLength", 5.0),
+                        ("AverageLength", 5.0),
+                    ],
+                },
+                ExpectedColumn {
+                    column: "text",
+                    statistics_type: "STRING",
+                    numbers: &[
+                        ("NumberOfNulls", 0.0),
+                        ("NumberOfDistinctValues", 1.0),
+                        ("MaximumLength", 5.0),
+                        ("AverageLength", 5.0),
+                    ],
+                },
+                ExpectedColumn {
+                    column: "day",
+                    statistics_type: "DATE",
+                    numbers: &[("NumberOfNulls", 0.0), ("NumberOfDistinctValues", 1.0)],
+                },
+                ExpectedColumn {
+                    column: "stamp",
+                    statistics_type: "DATE",
+                    numbers: &[("NumberOfNulls", 0.0), ("NumberOfDistinctValues", 1.0)],
+                },
+                ExpectedColumn {
+                    column: "flag",
+                    statistics_type: "BOOLEAN",
+                    numbers: &[
+                        ("NumberOfTrues", 1.0),
+                        ("NumberOfFalses", 1.0),
+                        ("NumberOfNulls", 0.0),
+                    ],
+                },
+                ExpectedColumn {
+                    column: "blob",
+                    statistics_type: "BINARY",
+                    numbers: &[
+                        ("NumberOfNulls", 0.0),
+                        ("MaximumLength", 3.0),
+                        ("AverageLength", 3.0),
+                    ],
+                },
+            ],
+        },
+        ComputationCase {
             case: "one JSON document per line, whose members are the columns",
             name: "json_lines",
             columns: &[("id", "int"), ("name", "string")],
@@ -683,10 +843,16 @@ async fn a_finished_run_reports_the_statistics_of_the_data_behind_the_table() {
                 .find(|(name, _)| name == column)
                 .map(|(_, declared)| *declared)
                 .unwrap_or_default();
+            // A GENERATED entry reports the column's type as the name of the statistics
+            // category its figures were computed under, in lower case — not the alias the
+            // table declares, so every declaration that maps to one category reports the
+            // one name that category is generated under.
+            let generated_type = statistics_type.to_ascii_lowercase();
             assert_eq!(
                 entry.get("ColumnType").and_then(Value::as_str),
-                Some(declared),
-                "case {case:?}: column {column:?} reports the type the table declares, got {entry}"
+                Some(generated_type.as_str()),
+                "case {case:?}: column {column:?}, declared {declared:?}, reports the statistics \
+                 category its figures were computed under, got {entry}"
             );
             assert!(
                 number(entry, "AnalyzedTime") > 0.0,

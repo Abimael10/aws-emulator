@@ -13,6 +13,12 @@
 //! table's data — whatever layout the objects behind it are in — aggregates a column the
 //! same way.
 //!
+//! A GENERATED entry reports that same category as the column's type: the statistics a run
+//! computes are typed by the category their figures belong to, in the lower case a type
+//! name is written in, so a column declared under any of the aliases that map to one
+//! category reports the one name that category is generated under — not the alias the
+//! catalog happens to declare.
+//!
 //! Nothing here reads anything: it is handed the cells
 //! ([`super::column_statistics_source`] is what reads them) and answers the figures they
 //! add up to. A cell the column's type cannot hold is a NULL, which is how a Hive-style
@@ -132,7 +138,9 @@ pub struct ComputedColumnStatistics {
     /// "Name of column which statistics belong to", exactly as the stored table declares
     /// it.
     pub column_name: String,
-    /// "The data type of the column", exactly as the stored table declares it.
+    /// "The data type of the column", named as a GENERATED entry names it: the statistics
+    /// category the figures were computed under, in the lower case a type name is written
+    /// in (see [`ColumnStatisticsAccumulator::for_column`]).
     pub column_type: String,
     /// The figures the column's values add up to, under the
     /// `ColumnStatisticsData$Type` its declared type maps to.
@@ -157,8 +165,9 @@ impl ComputedColumnStatistics {
 pub struct ColumnStatisticsAccumulator {
     /// The column's declared name, carried into the statistics it produces.
     name: String,
-    /// The column's declared type, carried into the statistics it produces.
-    declared_type: String,
+    /// The type the statistics it produces report: the statistics category the figures are
+    /// computed under, NOT the catalog's declaration (see [`Self::for_column`]).
+    reported_type: String,
     /// The figures so far, in the shape the column's type is reported under.
     values: ColumnValues,
 }
@@ -166,8 +175,17 @@ pub struct ColumnStatisticsAccumulator {
 impl ColumnStatisticsAccumulator {
     /// An accumulator for a column of this declared type, or `None` when the type has no
     /// column-level statistics at all ([`column_statistics_type_of`]).
+    ///
+    /// The statistics it produces report the column's type as the name of the category
+    /// they were computed under — the `ColumnStatisticsType` the declared type maps to,
+    /// written in lower case — so a column of ANY integral declaration reports the one
+    /// name the integer-data statistics are generated under, and both halves of the entry
+    /// agree on what the figures are. (Statistics a caller SUBMITS are a different matter:
+    /// `UpdateColumnStatisticsForTable` stores the `ColumnType` stated for them and reads
+    /// it back unchanged.)
     pub fn for_column(name: &str, declared_type: &str) -> Option<Self> {
-        let values = match column_statistics_type_of(declared_type)? {
+        let statistics_type = column_statistics_type_of(declared_type)?;
+        let values = match statistics_type {
             COLUMN_STATISTICS_TYPE_BOOLEAN => ColumnValues::Boolean {
                 nulls: 0,
                 trues: 0,
@@ -214,7 +232,7 @@ impl ColumnStatisticsAccumulator {
         };
         Some(Self {
             name: name.to_string(),
-            declared_type: declared_type.to_string(),
+            reported_type: statistics_type.to_ascii_lowercase(),
             values,
         })
     }
@@ -229,7 +247,7 @@ impl ColumnStatisticsAccumulator {
     pub fn finish(self) -> ComputedColumnStatistics {
         ComputedColumnStatistics {
             column_name: self.name,
-            column_type: self.declared_type,
+            column_type: self.reported_type,
             statistics_data: self.values.to_statistics_data(),
         }
     }
