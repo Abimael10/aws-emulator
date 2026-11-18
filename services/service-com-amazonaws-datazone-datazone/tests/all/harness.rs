@@ -309,6 +309,33 @@ impl Emulator {
         }
     }
 
+    /// Look again until `GetListing` reports `listing` in `status`, or a generous deadline
+    /// passes. Waits for the CONDITION the clock owes — the publish a change set started —
+    /// never for a fixed time, and answers the listing as it then stands.
+    pub(crate) async fn await_listing_status(
+        &self,
+        domain: &str,
+        listing: &str,
+        status: &str,
+    ) -> Answer {
+        let started = Instant::now();
+        loop {
+            let answer = self
+                .call("GET", &format!("/v2/domains/{domain}/listings/{listing}"), None)
+                .await;
+            if answer.status == 200 && answer.s("status") == status {
+                return answer;
+            }
+            assert!(
+                started.elapsed() < LIFECYCLE_DEADLINE,
+                "listing {listing:?} never reached {status:?}: last answer {} {:?}",
+                answer.status,
+                answer.body
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// Create a project in a settled domain — the precondition every asset case needs.
     pub(crate) async fn project(&self, domain_id: &str, name: &str) -> String {
         let created = self

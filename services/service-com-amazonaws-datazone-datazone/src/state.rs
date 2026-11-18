@@ -792,6 +792,42 @@ impl Listing {
             .values()
             .find(|revision| revision.client_token.as_deref() == Some(token))
     }
+
+    /// Finish the publish this listing owed the clock, as of the instant `due_at` it was
+    /// due at: the listing enters the catalog, and the catalog's own record of the
+    /// published entity is recorded as its next revision.
+    ///
+    /// A publish records TWO revisions of a listing — recorded behaviour: the change set
+    /// that starts it records the snapshot it was asked to publish and answers with that
+    /// revision, and the catalog records the entity again when the publish lands, so a
+    /// listing read once its publish has completed reports one revision more than the
+    /// change set reported. The second revision is the SAME snapshot (the entity as the
+    /// change set found it; a listing is a record of the entity at a given time), minus
+    /// the change set's `clientToken`, which stays on the revision that call answered
+    /// with so a replay of it is still answered with that revision.
+    ///
+    /// Bounded by [`MAX_LISTING_REVISIONS`], like the change set's own record: at the
+    /// bound the listing still enters the catalog, keeping the revisions it has.
+    pub fn complete_publish(&mut self, due_at: i64) {
+        self.status = LISTING_STATUS_ACTIVE.to_string();
+        self.status_due_ms = None;
+        let published = self.latest_revision().cloned();
+        let Some(published) = published.filter(|_| self.revisions.len() < MAX_LISTING_REVISIONS)
+        else {
+            return;
+        };
+        let revision = self.next_revision_number();
+        self.revisions.insert(
+            revision,
+            ListingRevision {
+                revision,
+                created_at_ms: due_at,
+                client_token: None,
+                ..published
+            },
+        );
+        self.updated_at_ms = due_at;
+    }
 }
 
 /// One recorded revision of a listing: the published entity as it was when the PUBLISH
@@ -818,9 +854,17 @@ pub struct ListingRevision {
     /// When the published ENTITY was created, which is what a listing item's
     /// `createdAt` reports (smithy_query shape="AssetListing" member="createdAt").
     pub entity_created_at_ms: i64,
-    /// The entity's metadata forms as the modelled `Forms` string, built by
-    /// [`listing_forms`]. `None` when the entity has no form attached.
-    pub forms: Option<String>,
+    /// The entity's metadata forms AS THEY WERE when this revision was recorded: the
+    /// snapshot every form member of a listing item is projected from — the modelled
+    /// `Forms` string by [`listing_forms`] and the per-form metadata by
+    /// [`form_metadata`]. Empty when the entity had no form attached.
+    pub forms: Vec<StoredForm>,
+    /// The glossary terms attached to the published entity, resolved against the
+    /// domain's stored terms when this revision was recorded
+    /// ([`listing_glossary_terms`]). Empty exactly when the entity had none this store
+    /// holds a term for, which is what lets a listing item report an empty list rather
+    /// than nothing at all.
+    pub glossary_terms: Vec<ListingGlossaryTerm>,
     /// The caller and instant of the change set that recorded this revision.
     pub created_by: String,
     pub created_at_ms: i64,
@@ -865,6 +909,89 @@ pub fn listing_forms(forms: &[StoredForm]) -> Option<String> {
     serde_json::to_string(&serde_json::Value::Object(rendered)).ok()
 }
 
+/// Whether a metadata form is shown collapsed, as a [`form_output`] reports it.
+///
+/// No request member carries a rendering configuration — a `FormInput` is
+/// `formName`/`typeIdentifier`/`typeRevision`/`content` (smithy_query shape="FormInput")
+/// — so every form this store holds is rendered the one way, expanded.
+pub const FORM_RENDERED_COLLAPSED: bool = false;
+
+/// One stored metadata form as the modelled `FormOutput`, shared by every operation that
+/// reports an entity's forms so no two of them can drift apart.
+///
+/// `renderingConfig` is reported on EVERY form output — recorded behaviour, carrying the
+/// one value this store has for it ([`FORM_RENDERED_COLLAPSED`]) — so a client that
+/// renders metadata forms can always read whether a form is collapsed instead of finding
+/// nothing there.
+pub fn form_output(form: &StoredForm) -> crate::ops::types::FormOutput {
+    crate::ops::types::FormOutput {
+        form_name: form.form_name.clone(),
+        type_name: form.type_name.clone(),
+        type_revision: form.type_revision.clone(),
+        content: form.content.clone(),
+        rendering_config: Some(crate::ops::types::FormRenderingConfig {
+            collapse: Some(FORM_RENDERED_COLLAPSED),
+        }),
+    }
+}
+
+/// [`form_output`] without the form's CONTENT: the metadata of one form — which form it
+/// is, of which form type at which revision, and how it renders.
+///
+/// What a published entity's `assetFormsMetadata` reports, where the content of the same
+/// forms is already reported once, as the `forms` string [`listing_forms`] renders.
+pub fn form_metadata(form: &StoredForm) -> crate::ops::types::FormOutput {
+    crate::ops::types::FormOutput {
+        content: None,
+        ..form_output(form)
+    }
+}
+
+/// One glossary term a listing recorded: the term's reportable detail, snapshotted when
+/// the change set that published the entity ran.
+///
+/// A `DetailedGlossaryTerm` is a term's NAME and short description rather than its id
+/// (smithy_query shape="DetailedGlossaryTerm"), and both belong to the term's own stored
+/// record, so they are resolved once — at publish — and kept, because a listing is the
+/// published entity AS IT WAS.
+#[derive(Debug, Clone)]
+pub struct ListingGlossaryTerm {
+    pub name: String,
+    pub short_description: Option<String>,
+}
+
+/// The glossary terms a listing records for an entity whose revision attached
+/// `term_ids`, resolved against the terms `domain` stores now.
+///
+/// An asset attaches terms BY ID (`GlossaryTerms` is a list of `GlossaryTermId`), and a
+/// listing reports each term's name and short description, so an id this domain holds no
+/// term for carries nothing to report and is left out: what the listing records is the
+/// terms it could resolve, in the order the entity attached them.
+pub fn listing_glossary_terms(domain: &Domain, term_ids: &[String]) -> Vec<ListingGlossaryTerm> {
+    term_ids
+        .iter()
+        .filter_map(|id| domain.glossary_terms.get(id))
+        .map(|term| ListingGlossaryTerm {
+            name: term.name.clone(),
+            short_description: term.short_description.clone(),
+        })
+        .collect()
+}
+
+/// The terms a listing recorded as the modelled `DetailedGlossaryTerms` list, in the
+/// order the published entity attached them.
+pub fn detailed_glossary_terms(
+    terms: &[ListingGlossaryTerm],
+) -> Vec<crate::ops::types::DetailedGlossaryTerm> {
+    terms
+        .iter()
+        .map(|term| crate::ops::types::DetailedGlossaryTerm {
+            name: Some(term.name.clone()),
+            short_description: term.short_description.clone(),
+        })
+        .collect()
+}
+
 /// A recorded revision as the modelled `ListingItem` union (smithy_query
 /// shape="ListingItem"), shared by every operation that reports a listing's item so the
 /// forms cannot drift apart.
@@ -874,13 +1001,12 @@ pub fn listing_forms(forms: &[StoredForm]) -> Option<String> {
 /// own vocabulary (`assetId`/`assetRevision` against
 /// `dataProductId`/`dataProductRevision`).
 ///
-/// `glossaryTerms` is a `DetailedGlossaryTerms` — each term's NAME and short
-/// description, not its id (smithy_query shape="DetailedGlossaryTerm") — and a
-/// [`ListingRevision`] records no glossary term ids at all: a listing is the published
-/// entity AS IT WAS, so the terms would have to be snapshotted by the change set that
-/// published it, which records none. There is therefore nothing for this rendering to
-/// resolve against the domain's stored terms, and the member is left absent rather than
-/// filled with a term the listing never recorded.
+/// Every LIST member of an asset listing is reported as a list, empty where the
+/// published entity has nothing of that kind — recorded behaviour, and what lets a
+/// catalog consumer iterate zero times instead of finding nothing there. The forms are
+/// reported twice over, as the `forms` string [`listing_forms`] renders and as one
+/// `assetFormsMetadata` entry per form ([`form_metadata`]); the glossary terms are the
+/// ones the change set resolved ([`listing_glossary_terms`]).
 pub fn listing_item(
     listing: &Listing,
     revision: &ListingRevision,
@@ -892,8 +1018,8 @@ pub fn listing_item(
             data_product_id: Some(listing.entity_id.clone()),
             data_product_revision: Some(revision.entity_revision.clone()),
             created_at: Some(date_time(revision.entity_created_at_ms)),
-            forms: revision.forms.clone(),
-            glossary_terms: None,
+            forms: listing_forms(&revision.forms),
+            glossary_terms: Some(detailed_glossary_terms(&revision.glossary_terms)),
             owning_project_id: Some(revision.owning_project_id.clone()),
             // The assets of a data product listing come from the data product's own
             // record, which no store holds yet.
@@ -905,14 +1031,16 @@ pub fn listing_item(
         asset_revision: Some(revision.entity_revision.clone()),
         asset_type: Some(revision.entity_type_name.clone()),
         created_at: Some(date_time(revision.entity_created_at_ms)),
-        forms: revision.forms.clone(),
+        forms: listing_forms(&revision.forms),
+        asset_forms_metadata: Some(revision.forms.iter().map(form_metadata).collect()),
         // Time series data points are imported by `PostTimeSeriesDataPoints`, which is
-        // still a scaffold, so no published entity has any.
-        latest_time_series_data_point_forms: None,
-        glossary_terms: None,
+        // still a scaffold, so no published entity has any — an empty list, not a
+        // missing one.
+        latest_time_series_data_point_forms: Some(Vec::new()),
+        glossary_terms: Some(detailed_glossary_terms(&revision.glossary_terms)),
         // Governed glossary terms are attached by `AssociateGovernedTerms`, which is
         // still a scaffold, so no published entity carries any.
-        governed_glossary_terms: None,
+        governed_glossary_terms: Some(Vec::new()),
         owning_project_id: Some(revision.owning_project_id.clone()),
     })
 }
@@ -2813,13 +2941,14 @@ impl ComAmazonawsDatazoneDatazoneState {
             }
         }
         // The publish a `CreateListingChangeSet` started has finished: the listing is
-        // in the catalog. Bounded by MAX_DOMAINS * MAX_LISTINGS_PER_DOMAIN, and run
-        // after the domain pass so a domain that has just disappeared is not walked.
+        // in the catalog, and the catalog's own record of the published entity is the
+        // next revision of it ([`Listing::complete_publish`]). Bounded by
+        // MAX_DOMAINS * MAX_LISTINGS_PER_DOMAIN, and run after the domain pass so a
+        // domain that has just disappeared is not walked.
         for domain in self.domains.values_mut() {
             for listing in domain.listings.values_mut() {
-                if listing.status_due_ms.is_some_and(|due| due <= now) {
-                    listing.status = LISTING_STATUS_ACTIVE.to_string();
-                    listing.status_due_ms = None;
+                if let Some(due_at) = listing.status_due_ms.filter(|due| *due <= now) {
+                    listing.complete_publish(due_at);
                 }
             }
         }

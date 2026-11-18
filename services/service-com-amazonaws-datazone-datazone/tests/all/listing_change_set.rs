@@ -15,7 +15,10 @@
 //!    that same listing, and each recorded revision is a snapshot of the entity as it
 //!    was when the change set ran (`GetListing` reports it back).
 //! 2. Publishing is a step the service reports as in-progress: the listing is `CREATING`
-//!    when the change set answers and `ACTIVE` once the clock makes the publish due.
+//!    when the change set answers and `ACTIVE` once the clock makes the publish due, and
+//!    the publish that lands records the catalog's own copy of the entity as the next
+//!    revision — so a landed publish leaves the listing one revision past what the
+//!    change set answered with.
 //! 3. An UNPUBLISH change set takes the record out of the catalog — the listing becomes
 //!    `INACTIVE`, keeping the revisions it had — and publishing again puts it back.
 //! 4. The preconditions are refused with the operation's own modelled errors: a missing
@@ -23,8 +26,12 @@
 //!    with `ResourceNotFoundException`; an unsettled domain with `ConflictException`.
 //! 5. A repeated `clientToken` applies ONE change set, and a read changes nothing a
 //!    later caller sees.
+//! 6. A published asset's listing item reports the asset's metadata forms twice over —
+//!    their content as the `forms` string and one `assetFormsMetadata` entry per form —
+//!    and every other list member of the item as a list, empty where the published asset
+//!    has nothing of that kind.
 
-use crate::harness::{Emulator, SETTLED};
+use crate::harness::Emulator;
 use serde_json::{json, Value};
 
 /// `ListingId`'s modelled pattern, `^[a-zA-Z0-9_-]{1,36}$` (smithy_query
@@ -301,11 +308,13 @@ async fn publishing_an_entity_records_a_listing_get_listing_reports_back() {
             case.label,
             item.get("forms")
         );
-        // A term's own record is a resource this emulator does not store, so the
-        // detailed terms a listing would carry are absent rather than invented.
-        assert!(
-            item.get("glossaryTerms").is_none(),
-            "case {:?}: expected no glossaryTerms on the item, got {item:?}",
+        // Every LIST member of the item is reported as a list: the published assets
+        // here attach no term this domain holds a record for, so the terms are an
+        // empty list rather than nothing at all.
+        assert_eq!(
+            item.get("glossaryTerms"),
+            Some(&json!([])),
+            "case {:?}: expected an empty glossaryTerms list on the item, got {item:?}",
             case.label
         );
         published.push((case.label, asset_id, listing_id));
@@ -313,20 +322,31 @@ async fn publishing_an_entity_records_a_listing_get_listing_reports_back() {
 
     // Rule 2: the publish the clock owed is due, so every listing is now in the
     // catalog — and the asset's own reader agrees about which listing it has.
-    tokio::time::sleep(SETTLED).await;
     for (label, asset_id, listing_id) in &published {
-        let active = dz
+        let active = dz.await_listing_status(&domain, listing_id, "ACTIVE").await;
+        // Rule 1: completing the publish records the catalog's own copy of the
+        // published entity, so a listing read once its publish has landed reports one
+        // revision more than the change set that started it reported.
+        assert_eq!(
+            active.s("listingRevision"),
+            "2",
+            "case {label:?}: the revision a completed first publish leaves, got {:?}",
+            active.body
+        );
+        let pinned = dz
             .call(
                 "GET",
-                &format!("/v2/domains/{domain}/listings/{listing_id}"),
+                &format!("/v2/domains/{domain}/listings/{listing_id}?listingRevision=1"),
                 None,
             )
             .await;
         assert_eq!(
-            active.s("status"),
-            "ACTIVE",
-            "case {label:?}: once the publish is due, got {:?}",
-            active.body
+            (pinned.status, pinned.s("listingRevision").as_str()),
+            (200, "1"),
+            "case {label:?}: the revision the change set recorded is still addressable, \
+             got {} {:?}",
+            pinned.status,
+            pinned.body
         );
         let asset = dz
             .call(
@@ -357,7 +377,8 @@ async fn republishing_records_the_next_revision_and_unpublishing_deactivates_the
     let change_sets_uri = format!("/v2/domains/{domain}/listings/change-set");
 
     // The rule generalises over HOW MANY times an entity is published: each change set
-    // records the next revision of the one listing that entity has.
+    // records the next revision of the one listing that entity has, and the publish it
+    // starts records the catalog's own copy of the entity as the revision after that.
     for publishes in [1_u32, 2, 5] {
         let asset = dz
             .call(
@@ -383,6 +404,8 @@ async fn republishing_records_the_next_revision_and_unpublishing_deactivates_the
         });
 
         let mut listing_id = String::new();
+        // How many revisions the listing holds once the round's publish has landed.
+        let mut recorded = 0_u32;
         for round in 1..=publishes {
             let answer = dz
                 .call("POST", &change_sets_uri, Some(publish.clone()))
@@ -394,7 +417,7 @@ async fn republishing_records_the_next_revision_and_unpublishing_deactivates_the
             );
             assert_eq!(
                 answer.s("listingRevision"),
-                round.to_string(),
+                (recorded + 1).to_string(),
                 "case {publishes} publishes, round {round}: the next revision, got {:?}",
                 answer.body
             );
@@ -407,6 +430,17 @@ async fn republishing_records_the_next_revision_and_unpublishing_deactivates_the
                 "case {publishes} publishes, round {round}: one entity has ONE listing, got {:?}",
                 answer.body
             );
+            // Waiting for the publish to LAND keeps the revision the next round starts
+            // from a fact about the store rather than about how fast the host is.
+            let landed = dz.await_listing_status(&domain, &listing_id, "ACTIVE").await;
+            recorded += 2;
+            assert_eq!(
+                landed.s("listingRevision"),
+                recorded.to_string(),
+                "case {publishes} publishes, round {round}: the revision a landed \
+                 publish leaves, got {:?}",
+                landed.body
+            );
         }
         let listing_uri = format!("/v2/domains/{domain}/listings/{listing_id}");
 
@@ -414,11 +448,11 @@ async fn republishing_records_the_next_revision_and_unpublishing_deactivates_the
         let latest = dz.call("GET", &listing_uri, None).await;
         assert_eq!(
             latest.s("listingRevision"),
-            publishes.to_string(),
+            recorded.to_string(),
             "case {publishes} publishes: the default revision is the newest, got {:?}",
             latest.body
         );
-        for round in 1..=publishes {
+        for round in 1..=recorded {
             let pinned = dz
                 .call("GET", &format!("{listing_uri}?listingRevision={round}"), None)
                 .await;
@@ -435,7 +469,7 @@ async fn republishing_records_the_next_revision_and_unpublishing_deactivates_the
             );
         }
         // A revision the listing does not have names no stored resource.
-        for absent in [(publishes + 1).to_string(), "01".to_string(), "x".to_string()] {
+        for absent in [(recorded + 1).to_string(), "01".to_string(), "x".to_string()] {
             let missing = dz
                 .call(
                     "GET",
@@ -484,7 +518,7 @@ async fn republishing_records_the_next_revision_and_unpublishing_deactivates_the
         );
         assert_eq!(
             unpublished.s("listingRevision"),
-            publishes.to_string(),
+            recorded.to_string(),
             "case {publishes} publishes: an unpublish records no revision, got {:?}",
             unpublished.body
         );
@@ -497,7 +531,7 @@ async fn republishing_records_the_next_revision_and_unpublishing_deactivates_the
         );
         assert_eq!(
             inactive.s("listingRevision"),
-            publishes.to_string(),
+            recorded.to_string(),
             "case {publishes} publishes: the revisions survive the unpublish, got {:?}",
             inactive.body
         );
@@ -512,7 +546,7 @@ async fn republishing_records_the_next_revision_and_unpublishing_deactivates_the
         );
         assert_eq!(
             again.s("listingRevision"),
-            publishes.to_string(),
+            recorded.to_string(),
             "case {publishes} publishes: a repeated unpublish records nothing, got {:?}",
             again.body
         );
@@ -522,7 +556,7 @@ async fn republishing_records_the_next_revision_and_unpublishing_deactivates_the
         let back = dz.call("POST", &change_sets_uri, Some(publish)).await;
         assert_eq!(
             back.s("listingRevision"),
-            (publishes + 1).to_string(),
+            (recorded + 1).to_string(),
             "case {publishes} publishes: a re-publish records the next revision, got {:?}",
             back.body
         );
@@ -532,12 +566,11 @@ async fn republishing_records_the_next_revision_and_unpublishing_deactivates_the
             "case {publishes} publishes: a re-publish starts the publish again, got {:?}",
             back.body
         );
-        tokio::time::sleep(SETTLED).await;
-        let active = dz.call("GET", &listing_uri, None).await;
+        let active = dz.await_listing_status(&domain, &listing_id, "ACTIVE").await;
         assert_eq!(
-            active.s("status"),
-            "ACTIVE",
-            "case {publishes} publishes: once the re-publish is due, got {:?}",
+            active.s("listingRevision"),
+            (recorded + 2).to_string(),
+            "case {publishes} publishes: the revision the landed re-publish leaves, got {:?}",
             active.body
         );
     }
@@ -736,20 +769,37 @@ async fn a_repeated_client_token_applies_one_change_set() {
             "case {token:?}: a replay records no second revision, got {:?}",
             replay.body
         );
-        // The store itself is the evidence: the listing is still at the revision the
-        // first change set recorded.
-        let listing = dz
+        // The store itself is the evidence: the replay recorded nothing, so once the
+        // publish has landed the listing holds exactly the revision the first change
+        // set recorded and the catalog's copy of it, and no more.
+        let landed = dz
+            .await_listing_status(&domain, &first.s("listingId"), "ACTIVE")
+            .await;
+        let recorded: u32 = first
+            .s("listingRevision")
+            .parse()
+            .expect("the change set reports a revision number");
+        assert_eq!(
+            landed.s("listingRevision"),
+            (recorded + 1).to_string(),
+            "case {token:?}: the stored listing after the replay, got {:?}",
+            landed.body
+        );
+        let beyond = dz
             .call(
                 "GET",
-                &format!("/v2/domains/{domain}/listings/{}", first.s("listingId")),
+                &format!(
+                    "/v2/domains/{domain}/listings/{}?listingRevision={}",
+                    first.s("listingId"),
+                    recorded + 2
+                ),
                 None,
             )
             .await;
         assert_eq!(
-            listing.s("listingRevision"),
-            first.s("listingRevision"),
-            "case {token:?}: the stored listing after the replay, got {:?}",
-            listing.body
+            beyond.status, 404,
+            "case {token:?}: a replay must record no further revision, got {} {:?}",
+            beyond.status, beyond.body
         );
 
         // The same token against a DIFFERENT change set is not a replay of this one.
@@ -777,9 +827,222 @@ async fn a_repeated_client_token_applies_one_change_set() {
         );
         assert_eq!(
             unpublish_replay.s("listingRevision"),
-            first.s("listingRevision"),
+            (recorded + 1).to_string(),
             "case {token:?}: a replayed unpublish records nothing, got {:?}",
             unpublish_replay.body
         );
+    }
+}
+
+/// One published asset whose listing item is read back: how many metadata forms it
+/// carries, and whether the glossary terms it attaches are terms the domain holds.
+struct ItemCase {
+    label: &'static str,
+    /// `(formName, form type name)` for each metadata form the asset attaches.
+    forms: Vec<(&'static str, &'static str)>,
+    /// How many of the domain's stored glossary terms the asset attaches.
+    stored_terms: usize,
+    /// Term ids the domain holds no term for, attached beside them.
+    unknown_terms: Vec<&'static str>,
+}
+
+fn item_cases() -> Vec<ItemCase> {
+    vec![
+        ItemCase {
+            label: "no form and no term",
+            forms: Vec::new(),
+            stored_terms: 0,
+            unknown_terms: Vec::new(),
+        },
+        ItemCase {
+            label: "one form, one stored term",
+            forms: vec![("OrdersForm", "OrdersFormType")],
+            stored_terms: 1,
+            unknown_terms: Vec::new(),
+        },
+        ItemCase {
+            label: "three forms, two stored terms beside an id nothing created",
+            forms: vec![
+                ("OrdersForm", "OrdersFormType"),
+                ("_private", "RetentionFormType"),
+                ("Ownership", "amazon.datazone.OwnershipFormType"),
+            ],
+            stored_terms: 2,
+            unknown_terms: vec!["term0000000000000009"],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_published_listing_item_reports_the_asset_s_form_metadata_and_its_empty_lists() {
+    let dz = Emulator::new();
+    let domain = dz.available_domain("listing-item-domain").await;
+    let project = dz.project(&domain, "listing item owner").await;
+
+    // Two glossary terms of this domain, so a published asset can attach terms the
+    // store really holds — the only terms a listing can report a name for.
+    let glossary = dz
+        .call(
+            "POST",
+            &format!("/v2/domains/{domain}/glossaries"),
+            Some(json!({ "name": "catalog terms", "owningProjectIdentifier": project })),
+        )
+        .await;
+    assert_eq!(
+        glossary.status, 201,
+        "creating the glossary: got {} {:?}",
+        glossary.status, glossary.body
+    );
+    let mut terms: Vec<(String, String)> = Vec::new();
+    for name in ["orders", "retention"] {
+        let term = dz
+            .call(
+                "POST",
+                &format!("/v2/domains/{domain}/glossary-terms"),
+                Some(json!({
+                    "glossaryIdentifier": glossary.s("id"),
+                    "name": name,
+                    "shortDescription": format!("what {name} means"),
+                })),
+            )
+            .await;
+        assert_eq!(
+            term.status, 201,
+            "creating the term {name:?}: got {} {:?}",
+            term.status, term.body
+        );
+        terms.push((term.s("id"), name.to_string()));
+    }
+
+    for case in item_cases() {
+        // Each form names a form type of this domain at its stored revision, so the
+        // metadata the listing reports is the asset's own, not the request's echo.
+        for (_, type_name) in &case.forms {
+            if type_name.starts_with("amazon.datazone.") {
+                continue;
+            }
+            let created = dz
+                .call(
+                    "POST",
+                    &format!("/v2/domains/{domain}/form-types"),
+                    Some(json!({
+                        "name": type_name,
+                        "model": { "smithy": "structure F { v: String }" },
+                        "owningProjectIdentifier": project,
+                    })),
+                )
+                .await;
+            assert!(
+                created.status == 201 || created.status == 409,
+                "case {:?}: creating the form type {type_name:?}: got {} {:?}",
+                case.label,
+                created.status,
+                created.body
+            );
+        }
+        let forms_input: Vec<Value> = case
+            .forms
+            .iter()
+            .map(|(form_name, type_name)| {
+                json!({
+                    "formName": form_name,
+                    "typeIdentifier": type_name,
+                    "typeRevision": "1",
+                    "content": format!("{{\"v\":\"{form_name}\"}}"),
+                })
+            })
+            .collect();
+        let attached: Vec<String> = terms
+            .iter()
+            .take(case.stored_terms)
+            .map(|(id, _)| id.clone())
+            .chain(case.unknown_terms.iter().map(|id| id.to_string()))
+            .collect();
+        let mut body = json!({
+            "name": format!("item asset: {}", case.label),
+            "typeIdentifier": "amazon.datazone.RelationalTable",
+            "owningProjectIdentifier": project,
+            "formsInput": forms_input,
+        });
+        if !attached.is_empty() {
+            body["glossaryTerms"] = json!(attached);
+        }
+        let asset = dz
+            .call("POST", &format!("/v2/domains/{domain}/assets"), Some(body))
+            .await;
+        assert_eq!(
+            asset.status, 201,
+            "case {:?}: creating the asset: got {} {:?}",
+            case.label, asset.status, asset.body
+        );
+
+        let published = dz
+            .call(
+                "POST",
+                &format!("/v2/domains/{domain}/listings/change-set"),
+                Some(json!({
+                    "entityIdentifier": asset.s("id"),
+                    "entityType": "ASSET",
+                    "action": "PUBLISH",
+                })),
+            )
+            .await;
+        assert_eq!(
+            published.status, 200,
+            "case {:?}: publishing: got {} {:?}",
+            case.label, published.status, published.body
+        );
+        let listing_id = published.s("listingId");
+        let read = dz.await_listing_status(&domain, &listing_id, "ACTIVE").await;
+        let item = read
+            .body
+            .get("item")
+            .and_then(|item| item.get("assetListing"))
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        // One `assetFormsMetadata` entry per metadata form the published asset carries,
+        // each naming the form, its type and that type's revision and how it renders,
+        // and carrying no content (the content is the item's `forms` string).
+        let expected_metadata: Vec<Value> = case
+            .forms
+            .iter()
+            .map(|(form_name, type_name)| {
+                json!({
+                    "formName": form_name,
+                    "typeName": type_name,
+                    "typeRevision": "1",
+                    "renderingConfig": { "collapse": false },
+                })
+            })
+            .collect();
+        assert_eq!(
+            item.get("assetFormsMetadata"),
+            Some(&json!(expected_metadata)),
+            "case {:?}: the published asset's form metadata, got {item:?}",
+            case.label
+        );
+
+        // Every other list member is a list too: the terms the asset attached that this
+        // domain holds a record for, and empty lists for the kinds it has none of.
+        let expected_terms: Vec<Value> = terms
+            .iter()
+            .take(case.stored_terms)
+            .map(|(_, name)| json!({ "name": name, "shortDescription": format!("what {name} means") }))
+            .collect();
+        assert_eq!(
+            item.get("glossaryTerms"),
+            Some(&json!(expected_terms)),
+            "case {:?}: the terms the listing recorded, got {item:?}",
+            case.label
+        );
+        for empty in ["governedGlossaryTerms", "latestTimeSeriesDataPointForms"] {
+            assert_eq!(
+                item.get(empty),
+                Some(&json!([])),
+                "case {:?}: {empty} must be an empty list, got {item:?}",
+                case.label
+            );
+        }
     }
 }

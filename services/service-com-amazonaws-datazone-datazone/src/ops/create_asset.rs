@@ -22,6 +22,10 @@
 //! revision to check against, so there the request's own value (or the first revision)
 //! stands. The asset itself is real state.
 //!
+//! The forms this call reports are projected by [`crate::state::form_output`], so every
+//! form output carries how the form renders; `readOnlyFormsOutput` is reported as a list
+//! — empty for an asset with no read-only form.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -484,17 +488,13 @@ fn asset_output(
         forms_output: revision
             .forms
             .iter()
-            .map(|form| FormOutput {
-                form_name: form.form_name.clone(),
-                type_name: form.type_name.clone(),
-                type_revision: form.type_revision.clone(),
-                content: form.content.clone(),
-            })
+            .map(crate::state::form_output)
             .collect(),
         // Read-only forms come from the asset type's own definition, and an asset
         // type's form entry carries no read-only flag (`FormEntryOutput` is
-        // `typeName`/`typeRevision`/`required`), so no stored type marks one.
-        read_only_forms_output: None,
+        // `typeName`/`typeRevision`/`required`), so no stored type marks one — an EMPTY
+        // list, which is how the member is reported, rather than a missing one.
+        read_only_forms_output: Some(Vec::new()),
         // Time series data points are imported by `PostTimeSeriesDataPoints`, so a
         // freshly created asset has none.
         latest_time_series_data_point_forms_output: None,

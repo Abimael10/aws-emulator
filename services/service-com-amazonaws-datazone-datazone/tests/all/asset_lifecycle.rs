@@ -22,6 +22,8 @@
 //!    name twice with `ValidationException`.
 //! 5. A repeated `clientToken` returns the asset the first call created instead of a
 //!    second one, and a read changes nothing a later caller sees.
+//! 6. Every metadata form an asset operation reports carries how the form renders, and
+//!    the read-only forms are reported as a list — empty for an asset that has none.
 
 use crate::harness::{Emulator, SETTLED};
 use serde_json::{json, Value};
@@ -780,5 +782,136 @@ async fn a_repeated_client_token_returns_the_first_asset() {
             first.s("id"),
             "case {token:?}: a different clientToken must create a different asset"
         );
+    }
+}
+
+/// One asset whose metadata forms are read back from every operation that reports them.
+/// The rows differ along how many forms the asset carries and along each form's shape:
+/// whether it names a form type, a type revision, or content at all.
+struct FormReportCase {
+    label: &'static str,
+    /// The `formsInput` entries, as the request lists them.
+    forms: Value,
+    /// How many form outputs the responses must carry.
+    count: usize,
+}
+
+fn form_report_cases() -> Vec<FormReportCase> {
+    vec![
+        FormReportCase {
+            label: "an asset carrying no form",
+            forms: json!([]),
+            count: 0,
+        },
+        FormReportCase {
+            label: "one form naming a type and JSON content",
+            forms: json!([{
+                "formName": "RelationalTableForm",
+                "typeIdentifier": "amazon.datazone.RelationalTableFormType",
+                "content": "{\"columns\":[]}",
+            }]),
+            count: 1,
+        },
+        FormReportCase {
+            label: "three forms: a pinned type revision, a form with no type, a form with no content",
+            forms: json!([
+                {
+                    "formName": "Pinned",
+                    "typeIdentifier": "amazon.datazone.RelationalTableFormType",
+                    "typeRevision": "3",
+                    "content": "{}",
+                },
+                { "formName": "_untyped", "content": "not json" },
+                { "formName": "NoContent", "typeIdentifier": "CustomOwnership" },
+            ]),
+            count: 3,
+        },
+    ]
+}
+
+/// Assert the rule on one answer: every entry of `formsOutput` carries the rendering
+/// configuration, and `readOnlyFormsOutput` is a list — empty for an asset that has no
+/// read-only form, never a missing member.
+fn assert_form_members(body: &Value, count: usize, case: &str, operation: &str) {
+    let forms = body
+        .get("formsOutput")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        forms.len(),
+        count,
+        "case {case:?} ({operation}): expected {count} form outputs, got {:?}",
+        body.get("formsOutput")
+    );
+    for form in &forms {
+        assert_eq!(
+            form.get("renderingConfig"),
+            Some(&json!({ "collapse": false })),
+            "case {case:?} ({operation}): every form output carries how it renders, got {form:?}"
+        );
+    }
+    assert_eq!(
+        body.get("readOnlyFormsOutput"),
+        Some(&json!([])),
+        "case {case:?} ({operation}): readOnlyFormsOutput must be an empty list, got {:?}",
+        body.get("readOnlyFormsOutput")
+    );
+}
+
+#[tokio::test]
+async fn every_reported_form_carries_its_rendering_config_beside_an_empty_read_only_list() {
+    let dz = Emulator::new();
+    let domain = dz.available_domain("form-member-domain").await;
+    let project = dz.project(&domain, "form member owner").await;
+    let assets_uri = format!("/v2/domains/{domain}/assets");
+
+    for case in form_report_cases() {
+        let created = dz
+            .call(
+                "POST",
+                &assets_uri,
+                Some(json!({
+                    "name": format!("form-member asset: {}", case.label),
+                    "typeIdentifier": "amazon.datazone.RelationalTable",
+                    "owningProjectIdentifier": project,
+                    "formsInput": case.forms,
+                })),
+            )
+            .await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: CreateAsset expected 201, got {} {:?}",
+            case.label, created.status, created.body
+        );
+        assert_form_members(&created.body, case.count, case.label, "CreateAsset");
+
+        let id = created.s("id");
+        let read = dz.call("GET", &format!("{assets_uri}/{id}"), None).await;
+        assert_eq!(
+            read.status, 200,
+            "case {:?}: GetAsset expected 200, got {} {:?}",
+            case.label, read.status, read.body
+        );
+        assert_form_members(&read.body, case.count, case.label, "GetAsset");
+
+        // The same rule holds for the next revision of the same asset, which reports
+        // the forms it carries through the same projection.
+        let revised = dz
+            .call(
+                "POST",
+                &format!("{assets_uri}/{id}/revisions"),
+                Some(json!({
+                    "name": format!("form-member asset revised: {}", case.label),
+                    "formsInput": case.forms,
+                })),
+            )
+            .await;
+        assert_eq!(
+            revised.status, 200,
+            "case {:?}: CreateAssetRevision expected 200, got {} {:?}",
+            case.label, revised.status, revised.body
+        );
+        assert_form_members(&revised.body, case.count, case.label, "CreateAssetRevision");
     }
 }

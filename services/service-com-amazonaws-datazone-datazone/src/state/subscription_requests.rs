@@ -325,18 +325,8 @@ pub fn subscription_request_view(
         decision_comment: request.decision_comment.clone(),
         existing_subscription_id: request.existing_subscription_id.clone(),
         metadata_forms: (!request.metadata_forms.is_empty())
-            .then(|| request.metadata_forms.iter().map(form_output).collect()),
+            .then(|| request.metadata_forms.iter().map(super::form_output).collect()),
     })
-}
-
-/// One stored metadata form as the modelled `FormOutput`.
-fn form_output(form: &StoredForm) -> FormOutput {
-    FormOutput {
-        form_name: form.form_name.clone(),
-        type_name: form.type_name.clone(),
-        type_revision: form.type_revision.clone(),
-        content: form.content.clone(),
-    }
 }
 
 /// A recorded principal as the modelled `SubscribedPrincipal` union.
@@ -426,8 +416,11 @@ fn subscribed_listing(
 /// entry naming it, each reported only for the asset it names, so a scope asked for on
 /// one asset is never reported against another.
 ///
-/// `glossaryTerms` is absent for the reason it is absent from [`super::listing_item`]: a
-/// listing revision records no glossary term, so there is nothing to resolve.
+/// `glossaryTerms` is the terms the listing revision recorded, resolved when the entity
+/// was published ([`super::listing_glossary_terms`]): the same snapshot
+/// [`super::listing_item`] reports, so the two readers cannot disagree about a published
+/// entity's terms. It is left absent where the revision recorded none, since nothing in
+/// the recordings shows this shape reporting an empty list.
 fn subscribed_listing_item(
     domain: &Domain,
     request: &SubscriptionRequest,
@@ -450,8 +443,9 @@ fn subscribed_listing_item(
         entity_id: Some(listing.entity_id.clone()),
         entity_revision: Some(revision.entity_revision.clone()),
         entity_type: Some(revision.entity_type_name.clone()),
-        forms: revision.forms.clone(),
-        glossary_terms: None,
+        forms: super::listing_forms(&revision.forms),
+        glossary_terms: (!revision.glossary_terms.is_empty())
+            .then(|| super::detailed_glossary_terms(&revision.glossary_terms)),
         asset_scope: request
             .asset_scopes
             .iter()

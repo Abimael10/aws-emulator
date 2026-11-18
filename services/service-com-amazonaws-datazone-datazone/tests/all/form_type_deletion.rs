@@ -724,3 +724,174 @@ async fn a_form_type_in_a_domain_being_deleted_is_already_gone() {
         );
     }
 }
+
+/// One teardown of the custom-asset publish flow: how many metadata forms of the form
+/// type the asset carried, and whether the asset was published to the catalog before it
+/// was torn down. The rule generalises over both, so a row differs only along them.
+struct TeardownCase {
+    label: &'static str,
+    forms: usize,
+    published: bool,
+}
+
+fn teardown_cases() -> Vec<TeardownCase> {
+    vec![
+        TeardownCase {
+            label: "one form, never published",
+            forms: 1,
+            published: false,
+        },
+        TeardownCase {
+            label: "one form, published to the catalog",
+            forms: 1,
+            published: true,
+        },
+        TeardownCase {
+            label: "three forms of the same form type, published",
+            forms: 3,
+            published: true,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_form_type_whose_referencing_asset_and_asset_type_are_gone_is_deleted() {
+    let dz = Emulator::new();
+    let domain = dz.available_domain("teardown-domain").await;
+    let project = dz.project(&domain, "teardown owner").await;
+
+    for case in teardown_cases() {
+        let form_type = format!("TeardownForm{}", case.forms);
+        let asset_type = format!("TeardownType{}", case.forms);
+        form_type_with_revisions(&dz, &domain, &project, &form_type, 1).await;
+
+        // An asset type that binds a metadata form of the form type, and an asset of
+        // that type carrying forms of it: the two references the flow leaves behind.
+        let mut type_forms = Map::new();
+        for index in 0..case.forms {
+            type_forms.insert(
+                format!("form{index}"),
+                json!({ "typeIdentifier": form_type, "typeRevision": "1" }),
+            );
+        }
+        let created_type = dz
+            .call(
+                "POST",
+                &format!("/v2/domains/{domain}/asset-types"),
+                Some(json!({
+                    "name": asset_type,
+                    "owningProjectIdentifier": project,
+                    "formsInput": Value::Object(type_forms),
+                })),
+            )
+            .await;
+        assert_eq!(
+            created_type.status, 201,
+            "case {:?}: CreateAssetType expected 201, got {} {:?}",
+            case.label, created_type.status, created_type.body
+        );
+        let asset_forms: Vec<Value> = (0..case.forms)
+            .map(|index| {
+                json!({
+                    "formName": format!("form{index}"),
+                    "typeIdentifier": form_type,
+                    "typeRevision": "1",
+                    "content": "{}",
+                })
+            })
+            .collect();
+        let asset = dz
+            .call(
+                "POST",
+                &format!("/v2/domains/{domain}/assets"),
+                Some(json!({
+                    "name": format!("teardown asset {}", case.label),
+                    "typeIdentifier": asset_type,
+                    "owningProjectIdentifier": project,
+                    "formsInput": asset_forms,
+                })),
+            )
+            .await;
+        assert_eq!(
+            asset.status, 201,
+            "case {:?}: CreateAsset expected 201, got {} {:?}",
+            case.label, asset.status, asset.body
+        );
+        let asset_id = asset.s("id");
+        if case.published {
+            let published = dz
+                .call(
+                    "POST",
+                    &format!("/v2/domains/{domain}/listings/change-set"),
+                    Some(json!({
+                        "entityIdentifier": asset_id,
+                        "entityType": "ASSET",
+                        "action": "PUBLISH",
+                    })),
+                )
+                .await;
+            assert_eq!(
+                published.status, 200,
+                "case {:?}: publishing expected 200, got {} {:?}",
+                case.label, published.status, published.body
+            );
+        }
+
+        // While either reference stands, the delete is refused — the rule rule 2 states.
+        let uri = format!("/v2/domains/{domain}/form-types/{form_type}");
+        let refused = dz.call("DELETE", &uri, None).await;
+        assert_eq!(
+            (refused.status, refused.error_code.as_str()),
+            (409, "ConflictException"),
+            "case {:?}: a form type in use is refused, got {} {:?}",
+            case.label,
+            refused.status,
+            refused.body
+        );
+
+        // The teardown the flow ends with: the asset, then the asset type that
+        // referenced the form type.
+        let asset_deleted = dz
+            .call(
+                "DELETE",
+                &format!("/v2/domains/{domain}/assets/{asset_id}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            asset_deleted.status, 204,
+            "case {:?}: DeleteAsset expected 204, got {} {:?}",
+            case.label, asset_deleted.status, asset_deleted.body
+        );
+        let type_deleted = dz
+            .call(
+                "DELETE",
+                &format!("/v2/domains/{domain}/asset-types/{asset_type}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            type_deleted.status, 204,
+            "case {:?}: DeleteAssetType expected 204, got {} {:?}",
+            case.label, type_deleted.status, type_deleted.body
+        );
+
+        // Nothing references the form type any more, so the delete that ends the flow
+        // succeeds.
+        let deleted = dz.call("DELETE", &uri, None).await;
+        assert_eq!(
+            (deleted.status, deleted.error_code.as_str()),
+            (204, ""),
+            "case {:?}: a form type whose users are gone is deleted, got {} {:?}",
+            case.label,
+            deleted.status,
+            deleted.body
+        );
+        let read_back = dz.call("GET", &uri, None).await;
+        assert_eq!(
+            read_back.status, 404,
+            "case {:?}: the deleted form type stops being readable, got {} {:?}",
+            case.label, read_back.status, read_back.body
+        );
+    }
+}

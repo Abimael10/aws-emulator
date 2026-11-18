@@ -12,9 +12,11 @@
 //! * PUBLISH records a REVISION of the entity's listing — a snapshot of the entity as
 //!   it is at this instant — minting the listing at [`crate::state::FIRST_REVISION`]
 //!   the first time the entity is published and recording the next revision every
-//!   later time. The listing is `CREATING` until the clock makes its publish due, and
-//!   `ACTIVE` afterwards
-//!   ([`crate::state::ComAmazonawsDatazoneDatazoneState::settle_clock`]).
+//!   later time; that is the revision this call answers with. The listing is `CREATING`
+//!   until the clock makes its publish due, and `ACTIVE` afterwards, when the catalog's
+//!   own copy of the published entity is recorded as the next revision again
+//!   ([`crate::state::Listing::complete_publish`]) — so a landed publish leaves the
+//!   listing one revision past what this call reported.
 //! * UNPUBLISH takes the record out of the catalog: the listing becomes `INACTIVE` and
 //!   keeps the revisions it has, because nothing about the entity was recorded. An
 //!   entity with no listing has nothing to unpublish, which is a 404.
@@ -182,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_principal, listing_forms, listing_name, now_ms, Listing, ListingRevision,
+            caller_principal, listing_glossary_terms, listing_name, now_ms, Listing, ListingRevision,
             ResourceKind, CHANGE_ACTION_PUBLISH, CHANGE_ACTION_UNPUBLISH, DOMAIN_STATUS_AVAILABLE,
             ENTITY_TYPE_ASSET, ENTITY_TYPE_DATA_PRODUCT, LIFECYCLE_SETTLE_MS,
             LISTING_STATUS_CREATING, LISTING_STATUS_INACTIVE, MAX_LISTINGS_PER_DOMAIN,
@@ -313,7 +315,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .first_revision()
                 .unwrap_or(entity_revision)
                 .created_at_ms,
-            forms: listing_forms(&entity_revision.forms),
+            // The entity's forms and glossary terms AS THEY ARE NOW: a listing is a
+            // record of the entity at a given time, so what this change set records is
+            // snapshotted here rather than resolved on every later read.
+            forms: entity_revision.forms.clone(),
+            glossary_terms: listing_glossary_terms(domain, &entity_revision.glossary_terms),
             created_by: caller_principal(ctx),
             created_at_ms: now,
             client_token: input.client_token.clone(),

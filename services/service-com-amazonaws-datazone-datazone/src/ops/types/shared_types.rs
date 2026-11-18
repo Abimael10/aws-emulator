@@ -205,6 +205,20 @@ pub struct FormOutput {
     pub type_name: Option<String>,
     pub type_revision: Option<String>,
     pub content: Option<String>,
+    /// How the form is rendered, reported on every form output — see
+    /// [`crate::state::form_output`], which projects it from the stored form.
+    pub rendering_config: Option<FormRenderingConfig>,
+}
+
+/// How a metadata form is rendered, as a [`FormOutput`] reports it.
+///
+/// The service reports the member on every metadata form it answers with; no request
+/// member carries one, so its value is the service's own default
+/// ([`crate::state::FORM_RENDERED_COLLAPSED`]).
+#[smithy_macros::smithy(shape = "com.amazonaws.datazone#FormRenderingConfig")]
+#[derive(Debug, Clone, Default)]
+pub struct FormRenderingConfig {
+    pub collapse: Option<bool>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.datazone#ServiceQuotaExceededException")]
