@@ -339,6 +339,28 @@ pub const MEMORY_RECORD_NOT_FOUND_MESSAGE: &str = "The memory record was not fou
 /// the two constants are what keeps them apart service-wide.
 pub const MEMORY_RECORD_CONTAINER_NOT_FOUND_MESSAGE: &str = "MemoryItem does not exist";
 
+/// The branch an event created without a `branch` belongs to.
+///
+/// Branches "allow for organizing events into different conversation threads or paths"
+/// (source: smithy_query query="shape" shape="Branch"), and every event in a session
+/// sits on one of them: a request that names no branch appends to the session's default
+/// thread, which AgentCore Memory names `main` — the name the service itself reports in
+/// `Event$branch` for an event created with no `branch`, and the name a `BranchFilter`
+/// selects those events by. The model fixes no default for the member, so this is the
+/// service's own name for that thread rather than anything the request carries.
+/// `Event$branch` is therefore reported for every stored event: the default thread by
+/// this name, with no `rootEventId`, because nothing forked it.
+pub const DEFAULT_BRANCH_NAME: &str = "main";
+
+/// The [`DEFAULT_BRANCH_NAME`] branch, as an event created without a `branch` is stored
+/// on and reported on.
+pub fn default_branch() -> Branch {
+    Branch {
+        name: DEFAULT_BRANCH_NAME.to_string(),
+        root_event_id: None,
+    }
+}
+
 /// The `memoryStrategyId` reported for a record whose creating request named no
 /// strategy.
 ///
@@ -1464,7 +1486,10 @@ pub struct StoredEvent {
     pub session_id: String,
     pub event_timestamp: ::aws_smithy_types::DateTime,
     pub payload: Vec<PayloadType>,
-    pub branch: Option<Branch>,
+    /// The conversation thread this event sits on: the branch the creating request
+    /// named, or [`default_branch`] when it named none. Every event belongs to one, so
+    /// this is not optional.
+    pub branch: Branch,
     pub metadata: Option<HashMap<String, MetadataValue>>,
     /// The `extractionMode` the creating request carried, kept as sent. `SKIP` excludes
     /// the event from long-term memory extraction, so its messages compose no unit of
@@ -1495,7 +1520,7 @@ impl StoredEvent {
             } else {
                 Vec::new()
             },
-            branch: self.branch.clone(),
+            branch: Some(self.branch.clone()),
             metadata: self.metadata.clone(),
         }
     }
@@ -1510,10 +1535,10 @@ impl StoredEvent {
         )
     }
 
-    /// The name of the branch this event is on, or `None` for the trunk (an event
-    /// created without a `branch`).
-    pub fn branch_name(&self) -> Option<&str> {
-        self.branch.as_ref().map(|branch| branch.name.as_str())
+    /// The name of the branch this event is on — [`DEFAULT_BRANCH_NAME`] for an event
+    /// created without a `branch`.
+    pub fn branch_name(&self) -> &str {
+        self.branch.name.as_str()
     }
 }
 

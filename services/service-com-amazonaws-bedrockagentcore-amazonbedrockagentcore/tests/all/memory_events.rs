@@ -190,6 +190,12 @@ fn conversational(role: &str, text: &str) -> Value {
     json!({"conversational": {"role": role, "content": {"text": text}}})
 }
 
+/// The `Branch` an event created without one belongs to: the session's default
+/// conversation thread, which carries no `rootEventId` because nothing forked it.
+fn default_branch() -> Value {
+    json!({"name": "main"})
+}
+
 fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
 }
@@ -284,7 +290,7 @@ async fn a_created_event_round_trips_through_get_event() {
         assert_eq!(
             event["branch"],
             if branch.is_null() {
-                Value::Null
+                default_branch()
             } else {
                 branch.clone()
             },
@@ -1353,6 +1359,231 @@ async fn the_store_evicts_its_least_recently_written_records() {
             status, expected,
             "case {case:?}: expected HTTP {expected} after {} events in one session, got {status} with {body:?}",
             ids.len()
+        );
+    }
+}
+
+/// Every stored event belongs to a conversation thread, and that thread is reported on
+/// every read of it: the `Branch` the creating request named, or the session's default
+/// thread when it named none, comes back on `CreateEvent`, on `GetEvent` and on each
+/// event `ListEvents` reports — with the payloads and without them.
+#[tokio::test]
+async fn every_event_reports_the_branch_it_was_created_on() {
+    let router = emulator();
+
+    // The event a rooted branch forks from. It names no branch, so it is on the default
+    // thread, and its `eventId` is what the rooted row below points `rootEventId` at.
+    let (status, root) = create_event(
+        &router,
+        MEMORY,
+        json!({
+            "actorId": "actor-1",
+            "sessionId": "branch-root",
+            "eventTimestamp": 1_700_000_000,
+            "payload": [conversational("USER", "root")],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "the fork point: expected HTTP 201, got {status} with {root:?}"
+    );
+    let root_id = root["event"]["eventId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // Rows differ along the branch the request carries: none at all, the default thread
+    // named by the client, another thread, the shortest and the longest name admitted,
+    // a name using every character class the pattern allows, and a branch that names the
+    // event it forked from. `Branch$name` is required, @length(1..100) and
+    // @pattern ^[a-zA-Z0-9][a-zA-Z0-9-_]*$, and `Branch$rootEventId` is optional
+    // (source: smithy_query query="shape" shape="Branch").
+    let longest = format!("b{}", "x".repeat(99));
+    let cases: Vec<(&str, Value)> = vec![
+        ("no-branch", Value::Null),
+        ("default-thread-named-by-the-client", json!({"name": "main"})),
+        ("another-thread", json!({"name": "alternate"})),
+        ("shortest-name", json!({"name": "a"})),
+        ("longest-name", json!({"name": longest})),
+        ("every-character-class", json!({"name": "A1-thread_2"})),
+        (
+            "rooted-at-an-earlier-event",
+            json!({"name": "forked", "rootEventId": root_id}),
+        ),
+    ];
+
+    for (case, branch) in cases {
+        // One session per row, so `ListEvents` for it reports exactly this row's event.
+        let session = format!("branch-case-{case}");
+        let mut request = json!({
+            "actorId": "actor-1",
+            "sessionId": &session,
+            "eventTimestamp": 1_700_000_500,
+            "payload": [conversational("USER", case)],
+        });
+        if !branch.is_null() {
+            request["branch"] = branch.clone();
+        }
+        // A request that names no branch is on the default thread; one that names a
+        // branch is on exactly the branch it named.
+        let expected = if branch.is_null() {
+            default_branch()
+        } else {
+            branch.clone()
+        };
+
+        let (status, created) = create_event(&router, MEMORY, request).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected HTTP 201 from CreateEvent, got {status} with {created:?}"
+        );
+        assert_eq!(
+            created["event"]["branch"], expected,
+            "case {case:?}: expected CreateEvent to report branch {expected}, got {:?}",
+            created["event"]["branch"]
+        );
+
+        let event_id = created["event"]["eventId"].as_str().unwrap_or_default();
+        let (status, fetched) = get_event(&router, MEMORY, "actor-1", &session, event_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from GetEvent, got {status} with {fetched:?}"
+        );
+        assert_eq!(
+            fetched["event"]["branch"], expected,
+            "case {case:?}: expected GetEvent to report branch {expected}, got {:?}",
+            fetched["event"]["branch"]
+        );
+
+        // `includePayloads` drops the payloads from a listing, not the branch.
+        for payloads in [true, false] {
+            let (status, page) = list_events(
+                &router,
+                MEMORY,
+                "actor-1",
+                &session,
+                json!({"includePayloads": payloads}),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} with includePayloads={payloads}: expected HTTP 200, got {status} with {page:?}"
+            );
+            assert_eq!(
+                page["events"][0]["branch"], expected,
+                "case {case:?} with includePayloads={payloads}: expected ListEvents to report \
+                 branch {expected}, got {:?}",
+                page["events"][0]["branch"]
+            );
+        }
+    }
+}
+
+/// A `BranchFilter` naming the default thread keeps exactly the events created without
+/// a `branch`, and the parent walk of a branch forked from one of them reaches it.
+#[tokio::test]
+async fn a_branch_filter_selects_the_default_thread() {
+    let router = emulator();
+    const SESSION: &str = "threads";
+
+    // (the payload text that identifies the event, the branch its request carries). The
+    // `rootEventId` of `side` is filled in with the default-thread event's id.
+    let mut ids: Vec<(&str, String)> = Vec::new();
+    for (case, branch) in [
+        ("on-the-default-thread", Value::Null),
+        ("forked-from-the-default-thread", json!({"name": "side"})),
+        ("forked-from-nothing", json!({"name": "loose"})),
+    ] {
+        let mut request = json!({
+            "actorId": "actor-1",
+            "sessionId": SESSION,
+            "eventTimestamp": 1_700_000_000,
+            "payload": [conversational("USER", case)],
+        });
+        if !branch.is_null() {
+            let mut branch = branch;
+            if branch["name"] == json!("side") {
+                branch["rootEventId"] = json!(ids[0].1);
+            }
+            request["branch"] = branch;
+        }
+        let (status, created) = create_event(&router, MEMORY, request).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected HTTP 201, got {status} with {created:?}"
+        );
+        ids.push((
+            case,
+            created["event"]["eventId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        ));
+    }
+
+    // Rows: the branch asked for, whether the parents are asked for, and the events the
+    // filter must keep. `BranchFilter$includeParentBranches` defaults to true (source:
+    // smithy_query query="shape" shape="BranchFilter").
+    let cases: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "default-thread-alone",
+            json!({"name": "main", "includeParentBranches": false}),
+            vec!["on-the-default-thread"],
+        ),
+        (
+            "default-thread-with-parents-it-has-none",
+            json!({"name": "main"}),
+            vec!["on-the-default-thread"],
+        ),
+        (
+            "fork-alone",
+            json!({"name": "side", "includeParentBranches": false}),
+            vec!["forked-from-the-default-thread"],
+        ),
+        (
+            "fork-with-its-parent-thread",
+            json!({"name": "side", "includeParentBranches": true}),
+            vec!["on-the-default-thread", "forked-from-the-default-thread"],
+        ),
+        (
+            "branch-that-forked-from-nothing",
+            json!({"name": "loose"}),
+            vec!["forked-from-nothing"],
+        ),
+    ];
+
+    for (case, filter, expected) in cases {
+        let (status, page) = list_events(
+            &router,
+            MEMORY,
+            "actor-1",
+            SESSION,
+            json!({"filter": {"branch": filter}}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {page:?}"
+        );
+        let mut seen: Vec<String> = page["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|event| {
+                event["payload"][0]["conversational"]["content"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        seen.sort();
+        let mut want: Vec<String> = expected.iter().map(|s| (*s).to_string()).collect();
+        want.sort();
+        assert_eq!(
+            seen, want,
+            "case {case:?}: expected the filter to keep {want:?}, got {seen:?}"
         );
     }
 }

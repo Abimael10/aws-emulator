@@ -122,13 +122,13 @@ const PAGE_KIND: &str = "events";
 /// inherited from the validator.
 const MAX_FILTER_EXPRESSIONS: usize = 5;
 
-/// The branch names a `BranchFilter` keeps, and whether it keeps the trunk.
+/// The branch names a `BranchFilter` keeps.
 ///
 /// `name` is the branch asked for. `includeParentBranches` (default true) widens that
 /// to the branches the named one descends from: a branch records the `rootEventId` it
 /// forked from, so the branch of that event is the named branch's parent, and the walk
-/// continues until it reaches the trunk (events stored without a `branch`) or a branch
-/// whose root is not in this session.
+/// continues until it reaches a branch that forked from nothing (the session's default
+/// thread) or one whose root is not in this session.
 ///
 /// The session's events are indexed ONCE up front, so the walk costs one hop per
 /// distinct branch name rather than a rescan per hop, and the `names` set makes a
@@ -136,21 +136,18 @@ const MAX_FILTER_EXPRESSIONS: usize = 5;
 fn branch_scope<'a>(
     events: &'a VecDeque<StoredEvent>,
     filter: &'a BranchFilter,
-) -> (HashSet<&'a str>, bool) {
+) -> HashSet<&'a str> {
     // branch name -> the event id it forked from, and event id -> its branch name.
     let mut forked_from: HashMap<&str, Option<&str>> = HashMap::new();
-    let mut branch_of: HashMap<&str, Option<&str>> = HashMap::new();
+    let mut branch_of: HashMap<&str, &str> = HashMap::new();
     for event in events {
         branch_of.insert(event.event_id.as_str(), event.branch_name());
-        if let Some(branch) = event.branch.as_ref() {
-            forked_from
-                .entry(branch.name.as_str())
-                .or_insert(branch.root_event_id.as_deref());
-        }
+        forked_from
+            .entry(event.branch.name.as_str())
+            .or_insert(event.branch.root_event_id.as_deref());
     }
 
     let mut names: HashSet<&str> = HashSet::new();
-    let mut include_trunk = false;
     let mut name: &str = filter.name.as_str();
     loop {
         // A branch already in the set closes a cycle; stop rather than walk it again.
@@ -163,24 +160,15 @@ fn branch_scope<'a>(
         match branch_of.get(root) {
             // The fork point is not in this session, so its branch is unknown.
             None => break,
-            // The fork point is on the trunk, so the trunk is a parent.
-            Some(None) => {
-                include_trunk = true;
-                break;
-            }
-            Some(Some(parent)) => name = parent,
+            Some(parent) => name = parent,
         }
     }
-    (names, include_trunk)
+    names
 }
 
 /// Whether `event` is on one of the branches `scope` keeps.
-fn on_branch(event: &StoredEvent, scope: &(HashSet<&str>, bool)) -> bool {
-    let (names, include_trunk) = scope;
-    match event.branch_name() {
-        Some(name) => names.contains(name),
-        None => *include_trunk,
-    }
+fn on_branch(event: &StoredEvent, scope: &HashSet<&str>) -> bool {
+    scope.contains(event.branch_name())
 }
 
 /// Refuse an `eventMetadata` expression the model admits but that cannot be evaluated:

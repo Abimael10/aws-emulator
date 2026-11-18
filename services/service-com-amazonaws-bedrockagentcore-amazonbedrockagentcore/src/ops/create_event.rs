@@ -289,7 +289,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             session_id,
             event_timestamp: input.event_timestamp,
             payload: input.payload,
-            branch: input.branch,
+            // Every event sits on a conversation thread: the branch the request named,
+            // or the session's default thread when it named none.
+            branch: input.branch.unwrap_or_else(crate::state::default_branch),
             metadata: input.metadata,
             extraction_mode: input.extraction_mode,
             seq,
