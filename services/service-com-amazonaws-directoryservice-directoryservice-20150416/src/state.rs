@@ -131,7 +131,7 @@ pub use ec2_network_interfaces::{
 pub use ec2_security_groups::{
     placement_vpc_id, provision_controllers_group, release_controllers_group,
 };
-pub use ec2_subnets::{resolve_subnet_networks, vpc_absence};
+pub use ec2_subnets::{resolve_subnet_networks, vpc_absence, SubnetResolution};
 pub use event_topics::{
     EventTopicRegistration, SnsTopics, TOPIC_STATUS_REGISTERED, TOPIC_STATUS_TOPIC_NOT_FOUND,
 };
@@ -329,7 +329,7 @@ pub const REQUIRED_SUBNETS: usize = 2;
 /// The most `SubnetIds` entries a placement may name.
 ///
 /// NOT an AWS quota: a resource guard, and the one that makes resolving a placement's zones
-/// against the service that owns subnets ([`subnet_zones::single_zone_defect`]) cost ONE hop
+/// against the service that owns subnets ([`subnet_zones::placement_defect`]) cost ONE hop
 /// whatever the request body carries — the work of that hop is (identifiers asked x subnets
 /// the account stores), so the identifiers have to be bounded here, BEFORE any of them is
 /// resolved, rather than per hop. Deliberately well above any servable placement — a
@@ -352,7 +352,7 @@ pub const MAX_PLACEMENT_SUBNETS: usize = 16;
 ///
 /// Whether two DIFFERENT subnets are in two different zones is a fact about the account's
 /// NETWORK rather than about the request, so it is not decided here: it is decided against
-/// what the service that owns subnets answers ([`subnet_zones::single_zone_defect`] over
+/// what the service that owns subnets answers ([`subnet_zones::placement_defect`] over
 /// [`resolve_subnet_networks`], which every placement runs after this check), and refused as
 /// the resource-semantics failure it is. This one is refused with [`INVALID_SUBNET_IDS`], the
 /// sentence Directory Service states the request-level half of the rule in.
@@ -400,7 +400,7 @@ pub const INVALID_SUBNET_IDS: &str =
 /// the account, so every caller that names a VPC that is not there reads the same sentence —
 /// the wording a recorded refusal of a create against an absent VPC carries.
 /// [`refusal`] appends the request id, once. It is the resource-semantics failure class
-/// (`ClientException`), the class [`subnet_zones::single_zone_defect`] is refused in, and not
+/// (`ClientException`), the class [`subnet_zones::placement_defect`] is refused in, and not
 /// the validation refusal a malformed identifier gets: the identifier is well formed and the
 /// resource it names does not exist.
 pub const INVALID_VPC_ID: &str = "Invalid VPC ID.";

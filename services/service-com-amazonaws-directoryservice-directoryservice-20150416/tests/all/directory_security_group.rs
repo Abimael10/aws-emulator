@@ -9,7 +9,8 @@
 //! domain controller security group identifier for the directory") for a directory whose
 //! servers this service runs, `DirectoryConnectSettingsDescription$SecurityGroupId` ("the
 //! security group identifier for the AD Connector directory") for an AD Connector — while a
-//! directory whose placement resolved to nothing reports no group at all.
+//! create whose placement the owner of subnets holds nothing for is refused and is given no
+//! group at all.
 //!
 //! The rows differ along what the rule generalises over: the directory type and therefore the
 //! placement member the group is reported in (Managed Microsoft AD, Simple AD, AD Connector),
@@ -34,6 +35,8 @@ use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 use crate::ad_connector::connect_directory;
 use crate::directory_dns_addresses::{ec2_client, network, AccountSubnet, ABSENT_SUBNET};
+// The account's own security-group listing, read through the sibling suite's one reader of it.
+use crate::directory_network_release::groups_held_by_ec2;
 use crate::directory_lifecycle::{
     create_directory, describe_one, ok, string, PASSWORD, STAGE_ACTIVE,
 };
@@ -430,13 +433,19 @@ async fn deleting_a_directory_releases_the_security_group_ec2_held_for_its_serve
     }
 }
 
-/// RULE: nothing is invented for a placement the account does not have — a directory whose
-/// subnets the owner of subnets reports nothing for has no VPC to be given a group in, so it
-/// reports no `SecurityGroupId` rather than an id naming no group anywhere.
+/// RULE: nothing is provisioned for a placement the account does not have — a create naming an
+/// identifier the owner of subnets reports nothing for is refused before any network is asked
+/// for, so no group is minted anywhere and the account's own groups are left exactly as they
+/// were.
+///
+/// The rows differ in how little of the placement the account holds: neither identifier, in
+/// either order.
 #[tokio::test]
-async fn a_directory_whose_placement_does_not_resolve_reports_no_security_group() {
+async fn a_create_whose_placement_does_not_resolve_is_given_no_security_group() {
     let network = network().await;
     let router = &network.router;
+    let ec2 = ec2_client(&EmbeddedEmulator::from_router(router.clone()));
+    let before = groups_held_by_ec2(&ec2, "before any refused create").await;
 
     // The rows differ in how little of the placement resolves: none of it, and a pair the
     // modelled pattern admits that EC2 mints no subnet for either way.
@@ -452,26 +461,30 @@ async fn a_directory_whose_placement_does_not_resolve_reports_no_security_group(
     ];
 
     for (index, (case, ids)) in rows.iter().enumerate() {
-        // The VPC is one the account really holds, so the create is accepted on its placement
-        // and the only thing that resolves to nothing is the subnets.
+        // The VPC is one the account really holds, so the only thing the owner of subnets
+        // reports nothing for is the subnets.
         let body = json!({
             "Name": format!("nosg{index}.example.com"),
             "Password": PASSWORD,
             "VpcSettings": { "VpcId": network.vpc, "SubnetIds": ids }
         });
-        let answer = ok(router, "CreateMicrosoftAD", body, case).await;
-        let directory_id = string(&answer, "DirectoryId", case);
-
-        let described = describe_one(router, &directory_id, case).await;
+        let (status, parsed) =
+            crate::directory_lifecycle::call(router, "CreateMicrosoftAD", body).await;
         assert_eq!(
-            described["VpcSettings"]["SubnetIds"],
-            json!(ids),
-            "case {case:?}: expected the requested SubnetIds to be echoed, got {described}"
+            status, 400,
+            "case {case:?}: expected a placement the account has no subnet for to be refused, \
+             got {status} with {parsed}"
         );
-        assert!(
-            described["VpcSettings"]["SecurityGroupId"].is_null(),
-            "case {case:?}: expected no SecurityGroupId for a placement that resolves to \
-             nothing, got {described}"
+        assert_eq!(
+            parsed["__type"],
+            json!("ClientException"),
+            "case {case:?}: expected the resource-semantics refusal, got {parsed}"
+        );
+        assert_eq!(
+            groups_held_by_ec2(&ec2, case).await,
+            before,
+            "case {case:?}: expected a refused create to ask the owner of security groups for \
+             nothing"
         );
     }
 }

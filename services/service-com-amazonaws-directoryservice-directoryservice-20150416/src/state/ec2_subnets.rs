@@ -129,9 +129,31 @@ pub async fn vpc_absence(
     }
 }
 
+/// What the owner of subnets ANSWERED about the subnets a placement named.
+///
+/// Two different things, kept apart because a placement decision turns on which one it is:
+///
+/// * `networks` is the network of every named subnet EC2 reported, keyed by identifier — an
+///   identifier the account holds no subnet for is simply absent from it;
+/// * `answered` says whether EC2 answered the question AT ALL, so an identifier missing from
+///   `networks` is a subnet the account does not hold rather than a question nobody could put.
+///
+/// Without the second member the two are indistinguishable (both are an absent entry), and a
+/// placement rule decided over `networks` alone can only treat an identifier the account does
+/// not hold as undecided — which is how a pick naming no network of the account gets served.
+#[derive(Debug, Clone, Default)]
+pub struct SubnetResolution {
+    /// The network of every named subnet the account HAS, as EC2 reports it.
+    pub networks: BTreeMap<String, SubnetNetwork>,
+    /// Whether the owner of subnets answered the hop at all.
+    pub answered: bool,
+}
+
 /// The network of every subnet of `subnet_ids` the account has in `region`, keyed by
 /// identifier, as EC2 reports it — an identifier it holds no subnet for is simply absent
-/// from the map, and so is every identifier when the hop could not be made at all.
+/// from the map — together with whether EC2 ANSWERED at all
+/// ([`SubnetResolution::answered`]), which is what tells an identifier the account does not
+/// hold apart from a hop that could not be made.
 ///
 /// Called by a create BEFORE it takes this service's store, so no guard is held across the
 /// hop. ONE hop of at most [`SUBNET_IDS_PER_HOP`] identifiers, whatever the request body
@@ -140,11 +162,11 @@ pub async fn resolve_subnet_networks(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     subnet_ids: &[String],
-) -> BTreeMap<String, SubnetNetwork> {
-    let mut resolved: BTreeMap<String, SubnetNetwork> = BTreeMap::new();
+) -> SubnetResolution {
+    let mut resolution = SubnetResolution::default();
     let Some(client) = ec2(ctx, region) else {
         ::tracing::warn!("the request names no Region label, so EC2 cannot be asked");
-        return resolved;
+        return resolution;
     };
     // Asked for once each, and at most a hop's worth: an identifier the settings block
     // repeats costs no second value in the filter, and a block longer than one hop is
@@ -164,11 +186,14 @@ pub async fn resolve_subnet_networks(
         .build();
     match client.describe_subnets().filters(by_id).send().await {
         Ok(output) => {
+            // EC2 answered: from here on an identifier missing from the map is one the
+            // account holds no subnet for, which is a fact about the REQUEST.
+            resolution.answered = true;
             for subnet in output.subnets() {
                 let Some(subnet_id) = subnet.subnet_id() else {
                     continue;
                 };
-                resolved.insert(
+                resolution.networks.insert(
                     subnet_id.to_string(),
                     SubnetNetwork {
                         subnet_id: subnet_id.to_string(),
@@ -189,5 +214,5 @@ pub async fn resolve_subnet_networks(
             );
         }
     }
-    resolved
+    resolution
 }

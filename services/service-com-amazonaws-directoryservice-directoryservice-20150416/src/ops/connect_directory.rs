@@ -229,25 +229,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
             );
         }
-        let subnet_networks = crate::state::resolve_subnet_networks(
+        let resolved_subnets = crate::state::resolve_subnet_networks(
             ctx,
             &region,
             &input.connect_settings.subnet_ids,
         )
         .await;
-        // WHICH VPC the connector's servers end up on is the VPC of those subnets, as their
-        // owner reports it — the network the security group this create provisions for them
-        // has to be in. Read before the placement is moved into the record below.
-        let placement_vpc = crate::state::placement_vpc_id(&subnet_networks);
 
         // The subnets have to be subnets OF the VPC the placement names, and two DIFFERENT
         // subnets still have to be in two different zones — which only that service can
-        // answer: a pick EC2 reports in another VPC or in ONE zone is refused as the
-        // resource-semantics failure it is (`ClientException`), a different class to the
-        // validation refusal a MALFORMED subnet id gets — and nothing is refused where EC2
-        // could not be asked.
+        // answer: a pick the owner of subnets does not report as two subnets of that VPC in
+        // two zones — one it reports in another VPC, in ONE zone, or holds no subnet for at
+        // all — is refused as the resource-semantics failure it is (`ClientException`), a
+        // different class to the validation refusal a MALFORMED subnet id gets — and nothing
+        // is refused where EC2 could not be asked.
         if let Some(defect) = crate::state::placement_defect(
-            &subnet_networks,
+            &resolved_subnets,
             &input.connect_settings.subnet_ids,
             &input.connect_settings.vpc_id,
         ) {
@@ -256,6 +253,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
             );
         }
+        // WHICH VPC the connector's servers end up on is the VPC of those subnets, as their
+        // owner reports it — the network the security group this create provisions for them
+        // has to be in. Read before the placement is moved into the record below.
+        let subnet_networks = resolved_subnets.networks;
+        let placement_vpc = crate::state::placement_vpc_id(&subnet_networks);
 
         // Nothing caller-sized reaches the store unchecked: the tag list is bounded
         // before the store lock is taken at all. `ConnectDirectory` models no

@@ -11,19 +11,22 @@
 //!
 //! The rule under test: `DirectoryVpcSettings` names ONE VPC — "the identifier of the VPC in
 //! which to create the directory" — and its `SubnetIds` are "the identifiers of the subnets
-//! for the directory servers", which are subnets OF that VPC. A placement naming a subnet the
-//! owner of subnets reports in another VPC therefore asks for servers in a network the
-//! directory is not being created in, and is refused with the resource-semantics failure
-//! class — `ClientException`, HTTP 400, with this service's placement sentence and the call's
-//! own request id — before anything is stored. A subnet EC2 reports nothing for leaves its
-//! membership unknown and refuses nothing, which is the same reading every other half of the
-//! placement rule takes.
+//! for the directory servers", which are subnets OF that VPC. So a servable placement is one
+//! the owner of subnets HAS a subnet for, for every identifier it names, in the VPC the request
+//! names: a placement naming an identifier that owner holds no subnet for, or a subnet it
+//! reports in another VPC, asks for servers on a network the directory is not being created on
+//! and is refused with the resource-semantics failure class — `ClientException`, HTTP 400, with
+//! the sentence of its own refusal (the invalid-subnets opener alone for an identifier the
+//! account has no subnet for, the opener plus the ownership rule for a subnet of another VPC)
+//! and the call's own request id — before anything is stored.
 //!
 //! It is asserted over a TABLE rather than one call, along what the rule generalises over:
 //! every operation that names a VPC for a placement (both creates that make a directory, the
-//! create that connects one, and the add that replicates one into another Region), and the
-//! position the foreign subnet takes in the list — with the same operations on subnets OF the
-//! named VPC as the positive control.
+//! create that connects one, and the add that replicates one into another Region), WHY the
+//! named subnets are not subnets of that VPC (the owner reports one of them in another VPC,
+//! or holds no subnet for it at all), the position that subnet takes in the list, and the form
+//! the identifier of a subnet the account does not hold takes — with the same operations on
+//! subnets OF the named VPC as the positive control.
 //!
 //! The other two halves of the same placement rule are asserted here over the same real
 //! network:
@@ -51,13 +54,19 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
-use crate::directory_dns_addresses::{ec2_client, network};
+use crate::directory_dns_addresses::{ec2_client, network, ABSENT_SUBNET};
 use crate::directory_lifecycle::{call, describe_one, ok, string, PASSWORD, REGION};
 
 /// The sentence Directory Service refuses a placement whose subnets are not all in the VPC it
 /// names with: fixed text, naming neither the subnets nor either VPC.
 const SUBNETS_OUTSIDE_THE_VPC: &str =
     "Invalid subnet ID(s). Both subnets must belong to the specified VPC.";
+
+/// The sentence Directory Service refuses a placement naming an identifier the account has no
+/// subnet for with: the invalid-subnets opener ALONE, with no rule about a VPC or a zone a
+/// subnet that is not there could satisfy — the shape the sibling refusal of a VPC the account
+/// does not have ("Invalid VPC ID.") takes.
+const UNHELD_SUBNET_IDS: &str = "Invalid subnet ID(s).";
 
 /// What this service's refusal envelope appends to every diagnostic it words.
 const REQUEST_ID_SEPARATOR: &str = " : RequestId: ";
@@ -115,18 +124,19 @@ fn placement_rows() -> Vec<PlacementCase> {
     ]
 }
 
-/// Assert `operation` with `body` is refused with the modelled `ClientException` and the
-/// placement sentence, whose only variable part is the call's own request id.
-async fn refused_as_outside_the_vpc(
+/// Assert `operation` with `body` is refused with the modelled `ClientException` and
+/// `sentence`, whose only variable part is the call's own request id.
+async fn refused_as_unservable_placement(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
+    sentence: &str,
     case: &str,
 ) {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 400,
-        "case {case:?}: expected {operation} to refuse the foreign subnet, got {status} with \
+        "case {case:?}: expected {operation} to refuse the placement, got {status} with \
          {parsed}"
     );
     assert_eq!(
@@ -138,7 +148,7 @@ async fn refused_as_outside_the_vpc(
     let stated = parsed["Message"].as_str().unwrap_or_default();
     assert_eq!(
         stated,
-        format!("{SUBNETS_OUTSIDE_THE_VPC}{REQUEST_ID_SEPARATOR}{reported}"),
+        format!("{sentence}{REQUEST_ID_SEPARATOR}{reported}"),
         "case {case:?}: expected the placement sentence, got {parsed}"
     );
 }
@@ -189,8 +199,14 @@ async fn a_placement_naming_a_subnet_of_another_vpc_is_refused() {
     for row in placement_rows() {
         for (pick, subnets) in &picks {
             let case = format!("{}: {pick}", row.case);
-            refused_as_outside_the_vpc(router, row.operation, (row.body)(&network.vpc, subnets), &case)
-                .await;
+            refused_as_unservable_placement(
+                router,
+                row.operation,
+                (row.body)(&network.vpc, subnets),
+                SUBNETS_OUTSIDE_THE_VPC,
+                &case,
+            )
+            .await;
         }
     }
     assert_eq!(
@@ -244,7 +260,7 @@ async fn a_replica_naming_a_subnet_of_another_vpc_is_refused() {
     .await;
     let directory_id = string(&answer, "DirectoryId", case);
 
-    refused_as_outside_the_vpc(
+    refused_as_unservable_placement(
         router,
         "AddRegion",
         json!({
@@ -255,6 +271,7 @@ async fn a_replica_naming_a_subnet_of_another_vpc_is_refused() {
                 "SubnetIds": [&network.client[0].id, &network.default[1].id]
             }
         }),
+        SUBNETS_OUTSIDE_THE_VPC,
         case,
     )
     .await;
@@ -836,4 +853,166 @@ fn vpc_of(
         .find(|subnet| subnet.id == subnet_id)
         .map(|subnet| subnet.vpc.clone())
         .unwrap_or_else(|| panic!("case {case:?}: the account must hold the subnet {subnet_id}"))
+}
+
+/// Well-formed `SubnetId`s the account has NO subnet for, as `(id, form)`.
+///
+/// Both forms the modelled pattern admits — `^(subnet-[0-9a-f]{8}|subnet-[0-9a-f]{17})$`,
+/// `smithy_query(query="shape",shape="SubnetId")` — with different digits, so no row below can
+/// pass by being refused for the SHAPE of its identifier instead of for the network it names.
+/// One of them is the identifier the sibling suites use for a subnet EC2 mints nothing for.
+const ABSENT_SUBNETS: [(&str, &str); 3] = [
+    ("subnet-0a1b2c3d", "the eight-digit form"),
+    ("subnet-00000000000000000", "a seventeen-digit id of all zeros"),
+    (ABSENT_SUBNET, "a seventeen-digit id of mixed digits"),
+];
+
+/// Assert the OWNER of subnets really holds no subnet for `subnet_id`, so a row that names it
+/// is refused for the network it names and not because this suite says so.
+async fn the_account_holds_no_subnet(router: &MultiServiceRouter, subnet_id: &str, case: &str) {
+    let ec2 = ec2_client(&EmbeddedEmulator::from_router(router.clone()));
+    let reported: Vec<String> = ec2
+        .describe_subnets()
+        .filters(
+            ::aws_sdk_ec2::types::Filter::builder()
+                .name("subnet-id")
+                .values(subnet_id)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: EC2 must answer DescribeSubnets: {error:?}"))
+        .subnets()
+        .iter()
+        .filter_map(|subnet| subnet.subnet_id().map(str::to_string))
+        .collect();
+    assert!(
+        reported.is_empty(),
+        "case {case:?}: the account must hold no subnet for {subnet_id}, EC2 reports {reported:?}"
+    );
+}
+
+/// RULE: a placement is servable only where the owner of subnets HAS a subnet for every
+/// identifier it names — so one naming a well-formed identifier that owner holds no subnet for
+/// names a network that does not exist, and is refused in the resource-semantics class with the
+/// invalid-subnets opener alone, no rule about a VPC or a zone the missing subnet could satisfy.
+/// Nothing is stored, and no directory is minted.
+///
+/// The rows differ along what the rule generalises over: the operation that places the
+/// servers, the form of the identifier the account has no subnet for, where in the list it
+/// sits, and whether the rest of the list is a subnet of the named VPC or absent too.
+#[tokio::test]
+async fn a_placement_naming_a_subnet_the_account_does_not_have_is_refused() {
+    let network = network().await;
+    let router = &network.router;
+    let held = network.client[0].id.clone();
+
+    // (case, the subnets the placement names)
+    let mut picks: Vec<(String, Vec<String>)> = Vec::new();
+    for (absent, form) in ABSENT_SUBNETS {
+        the_account_holds_no_subnet(router, absent, form).await;
+        picks.push((
+            format!("{form}, named second beside a subnet of the VPC"),
+            vec![held.clone(), absent.to_string()],
+        ));
+        picks.push((
+            format!("{form}, named first beside a subnet of the VPC"),
+            vec![absent.to_string(), held.clone()],
+        ));
+    }
+    picks.push((
+        "two identifiers the account has no subnet for".to_string(),
+        vec![
+            ABSENT_SUBNETS[0].0.to_string(),
+            ABSENT_SUBNETS[1].0.to_string(),
+        ],
+    ));
+
+    let before = stored_count(router, "before any refused placement").await;
+    for row in placement_rows() {
+        for (pick, subnets) in &picks {
+            let case = format!("{}: {pick}", row.case);
+            refused_as_unservable_placement(
+                router,
+                row.operation,
+                (row.body)(&network.vpc, subnets),
+                UNHELD_SUBNET_IDS,
+                &case,
+            )
+            .await;
+        }
+    }
+    assert_eq!(
+        stored_count(router, "after every refused placement").await,
+        before,
+        "expected a refused placement to store nothing"
+    );
+}
+
+/// RULE: the add that replicates a directory into another Region resolves the same way — a
+/// replica placed in an identifier the account has no subnet for is refused in the same class,
+/// with the same sentence, and the directory keeps the one Region it was created in.
+#[tokio::test]
+async fn a_replica_naming_a_subnet_the_account_does_not_have_is_refused() {
+    let network = network().await;
+    let router = &network.router;
+    let case = "a replica of a Managed Microsoft AD directory";
+
+    let answer = ok(
+        router,
+        "CreateMicrosoftAD",
+        json!({
+            "Name": "membership-unheld.example.com",
+            "Password": PASSWORD,
+            "Edition": "Enterprise",
+            "VpcSettings": {
+                "VpcId": &network.vpc,
+                "SubnetIds": [&network.client[0].id, &network.client[1].id]
+            }
+        }),
+        case,
+    )
+    .await;
+    let directory_id = string(&answer, "DirectoryId", case);
+
+    for (absent, form) in ABSENT_SUBNETS {
+        refused_as_unservable_placement(
+            router,
+            "AddRegion",
+            json!({
+                "DirectoryId": &directory_id,
+                "RegionName": REGION,
+                "VPCSettings": {
+                    "VpcId": &network.vpc,
+                    "SubnetIds": [&network.client[0].id, absent]
+                }
+            }),
+            UNHELD_SUBNET_IDS,
+            &format!("{case}: {form}"),
+        )
+        .await;
+    }
+
+    // Nothing was recorded by any of those: the directory still holds the ONE Region it was
+    // created in, read back through the operation that reports the inventory.
+    let inventory = ok(
+        router,
+        "DescribeRegions",
+        json!({ "DirectoryId": &directory_id }),
+        case,
+    )
+    .await;
+    let regions: Vec<String> = inventory["RegionsDescription"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|region| region["RegionName"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        regions,
+        vec![REGION.to_string()],
+        "case {case:?}: expected the directory to keep the one Region it was created in, got \
+         {regions:?}"
+    );
 }

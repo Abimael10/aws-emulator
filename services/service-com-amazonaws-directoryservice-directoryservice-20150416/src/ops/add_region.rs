@@ -248,14 +248,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let subnet_networks = crate::state::resolve_subnet_networks(
+        let resolved_subnets = crate::state::resolve_subnet_networks(
             ctx,
             &input.region_name,
             &input.vpc_settings.subnet_ids,
         )
         .await;
         if let Some(defect) = crate::state::placement_defect(
-            &subnet_networks,
+            &resolved_subnets,
             &input.vpc_settings.subnet_ids,
             &input.vpc_settings.vpc_id,
         ) {

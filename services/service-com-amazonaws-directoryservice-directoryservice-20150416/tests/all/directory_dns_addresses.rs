@@ -34,7 +34,7 @@ use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 use crate::ad_connector::connect_directory;
 use crate::directory_lifecycle::{
-    create_directory, descriptions, ok, string, PASSWORD, REGION, STAGE_ACTIVE,
+    call, create_directory, descriptions, ok, string, PASSWORD, REGION, STAGE_ACTIVE,
 };
 use crate::microsoft_ad::create_microsoft_ad;
 
@@ -53,8 +53,9 @@ const CUSTOMER_DNS_IPS: [&str; 2] = ["10.7.0.10", "10.7.1.10"];
 
 /// A `SubnetId` of the shape the modelled pattern
 /// `^(subnet-[0-9a-f]{8}|subnet-[0-9a-f]{17})$` admits that EC2 mints no subnet for, so it
-/// reaches the create's resolution and resolves to nothing. `pub(crate)` because the sibling
-/// suite `directory_security_group` asserts what a directory placed in nothing reports.
+/// reaches the create's resolution and the owner of subnets reports nothing for it.
+/// `pub(crate)` because the sibling suites assert what the placement rules do with an
+/// identifier the account holds no subnet for.
 pub(crate) const ABSENT_SUBNET: &str = "subnet-00000000deadbeef0";
 
 /// How long a polled state may take to settle before a case fails: far longer than any span
@@ -712,61 +713,69 @@ async fn an_ad_connector_serves_the_self_managed_directorys_dns_servers() {
     );
 }
 
-/// RULE: nothing is invented for a subnet the account does not have — a directory placed in
-/// identifiers the owner of subnets reports nothing for serves no address at all, rather
-/// than one made up here.
+/// RULE: nothing is invented for a subnet the account does not have — a placement naming an
+/// identifier the owner of subnets reports nothing for names no network of the VPC the create
+/// names, so the create is REFUSED in the resource-semantics class and no directory is left
+/// serving an address out of a block nobody holds.
+///
+/// The rows differ in how much of the pick the account holds and where the identifier it holds
+/// no subnet for sits in the list.
 #[tokio::test]
-async fn a_directory_placed_in_subnets_the_account_does_not_have_serves_no_address() {
+async fn a_directory_is_not_placed_in_subnets_the_account_does_not_have() {
     let network = network().await;
     let router = &network.router;
 
-    // (case, the subnets the create names, how many of them the account has)
-    let rows: [(&str, Vec<String>, usize); 3] = [
+    let rows: [(&str, Vec<String>); 3] = [
         (
             "two identifiers the account has no subnet for",
             vec![ABSENT_SUBNET.to_string(), "subnet-0000beef".to_string()],
-            0,
         ),
         (
             "one held subnet and one absent",
             vec![network.client[0].id.clone(), ABSENT_SUBNET.to_string()],
-            1,
         ),
         (
             "an absent subnet named first",
             vec![ABSENT_SUBNET.to_string(), network.client[1].id.clone()],
-            1,
         ),
     ];
 
-    for (index, (case, subnet_ids, held)) in rows.iter().enumerate() {
+    for (index, (case, subnet_ids)) in rows.iter().enumerate() {
         let body = json!({
             "Name": format!("absent{index}.example.com"),
             "Password": PASSWORD,
             "VpcSettings": { "VpcId": &network.vpc, "SubnetIds": subnet_ids }
         });
-        let answer = ok(router, "CreateMicrosoftAD", body, case).await;
-        let directory_id = string(&answer, "DirectoryId", case);
-        // The servers a create places come up on the clock, so the description is read once
-        // the directory reports itself in service rather than after a fixed wait.
-        in_service(router, &directory_id, case).await;
-
-        let described = describe_one(router, &directory_id, case).await;
-        // The placement the request named is still reported back as the request spelled it:
-        // this service echoes the settings block whatever the owner of subnets holds.
+        let (status, parsed) = call(router, "CreateMicrosoftAD", body).await;
         assert_eq!(
-            described["VpcSettings"]["SubnetIds"],
-            json!(subnet_ids),
-            "case {case:?}: expected the requested SubnetIds, got {described}"
+            status, 400,
+            "case {case:?}: expected a placement the account has no subnet for to be refused, \
+             got {status} with {parsed}"
         );
-        let served = described["DnsIpAddrs"]
-            .as_array()
-            .map(|addresses| addresses.len())
-            .unwrap_or_default();
         assert_eq!(
-            served, *held,
-            "case {case:?}: expected an address only for the subnets the account has, got \
-             {described}"
+            parsed["__type"],
+            json!("ClientException"),
+            "case {case:?}: expected the resource-semantics refusal, got {parsed}"
+        );
+        assert!(
+            parsed.get("DirectoryId").is_none(),
+            "case {case:?}: a refused create must mint no directory, got {parsed}"
         );
     }
+
+    // And nothing was stored by any of them: the account holds no directory to serve an
+    // address for at all.
+    let listed = ok(
+        router,
+        "DescribeDirectories",
+        json!({}),
+        "after every refused placement",
+    )
+    .await;
+    let held = descriptions(&listed, "after every refused placement");
+    assert!(
+        held.is_empty(),
+        "case \"after every refused placement\": expected no directory to have been stored, \
+         got {held:?}"
+    );
 }

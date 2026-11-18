@@ -242,27 +242,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
-        let subnet_networks = match input.vpc_settings.as_ref() {
+        let resolved_subnets = match input.vpc_settings.as_ref() {
             Some(requested) => {
                 crate::state::resolve_subnet_networks(ctx, &primary_region, &requested.subnet_ids)
                     .await
             }
-            None => ::std::collections::BTreeMap::new(),
+            None => crate::state::SubnetResolution::default(),
         };
-        // WHICH VPC the directory's servers end up on is the VPC of those subnets, as their
-        // owner reports it — the network the security group this create provisions for them
-        // has to be in. Read before the placement is moved into the record below.
-        let placement_vpc = crate::state::placement_vpc_id(&subnet_networks);
 
         // The subnets have to be subnets OF the VPC the placement names, and two DIFFERENT
         // subnets still have to be in two different zones — which only that service can
-        // answer: a pick EC2 reports in another VPC or in ONE zone is refused as the
-        // resource-semantics failure it is (`ClientException`), a different class to the
-        // validation refusal a MALFORMED subnet id gets — and nothing is refused where EC2
-        // could not be asked.
+        // answer: a pick the owner of subnets does not report as two subnets of that VPC in
+        // two zones — one it reports in another VPC, in ONE zone, or holds no subnet for at
+        // all — is refused as the resource-semantics failure it is (`ClientException`), a
+        // different class to the validation refusal a MALFORMED subnet id gets — and nothing
+        // is refused where EC2 could not be asked.
         if let Some(defect) = input.vpc_settings.as_ref().and_then(|requested| {
             crate::state::placement_defect(
-                &subnet_networks,
+                &resolved_subnets,
                 &requested.subnet_ids,
                 &requested.vpc_id,
             )
@@ -271,6 +268,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateDirectoryErrorModeled::ClientException(crate::state::refusal(defect)).into(),
             );
         }
+        // WHICH VPC the directory's servers end up on is the VPC of those subnets, as their
+        // owner reports it — the network the security group this create provisions for them
+        // has to be in. Read before the placement is moved into the record below.
+        let subnet_networks = resolved_subnets.networks;
+        let placement_vpc = crate::state::placement_vpc_id(&subnet_networks);
 
         // Nothing caller-sized reaches the store unchecked: the tag list is bounded
         // before the store lock is taken at all. `CreateDirectory` models no

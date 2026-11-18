@@ -41,7 +41,13 @@ const CUSTOMER_DNS_IPS: [&str; 2] = ["10.9.0.10", "10.9.1.10"];
 /// Every security group identifier EC2 — the service that owns security groups — reports the
 /// account holding, so a case can assert what is there and what is gone without naming an id
 /// EC2 would refuse to describe.
-async fn groups_held_by_ec2(ec2: &::aws_sdk_ec2::Client, case: &str) -> BTreeSet<String> {
+///
+/// `pub(crate)` because the sibling suite `directory_security_group` asserts over the same
+/// account network that a refused create adds none, rather than keeping a second copy.
+pub(crate) async fn groups_held_by_ec2(
+    ec2: &::aws_sdk_ec2::Client,
+    case: &str,
+) -> BTreeSet<String> {
     let described = ec2
         .describe_security_groups()
         .send()
@@ -311,10 +317,11 @@ async fn the_security_group_a_create_provisioned_leaves_with_the_directory() {
 
 /// RULE: a directory that was given no security group has none to release, so its teardown
 /// asks the owner of security groups for nothing and leaves the account's network exactly as
-/// it was.
+/// it was — and a create whose placement the owner of subnets holds nothing for is refused, so
+/// there is no directory and no group for it either way.
 ///
-/// The rows differ in WHY there is no group: a placement the account has no subnet for, so
-/// there was no network to provision one in, and a directory created with no placement at all.
+/// The rows differ in WHY there is no group: a directory created with no placement at all, and
+/// a placement the account has no subnet for, which never gets a directory to tear down.
 #[tokio::test]
 async fn a_directory_that_was_given_no_security_group_releases_nothing() {
     let network = network().await;
@@ -322,9 +329,12 @@ async fn a_directory_that_was_given_no_security_group_releases_nothing() {
     let ec2 = ec2_client(&EmbeddedEmulator::from_router(router.clone()));
     let before = groups_held_by_ec2(&ec2, "the account's groups before any directory").await;
 
+    // A placement the account has no subnet for never becomes a directory at all: the create
+    // is refused in the resource-semantics class, so no group was provisioned to release.
     let unresolved = "a Managed Microsoft AD whose subnets the account has none of";
-    let placed_in_nothing = create_microsoft_ad(
+    let (status, parsed) = crate::directory_lifecycle::call(
         router,
+        "CreateMicrosoftAD",
         json!({
             "Name": "nogroup.example.com",
             "Password": PASSWORD,
@@ -333,9 +343,17 @@ async fn a_directory_that_was_given_no_security_group_releases_nothing() {
                 "SubnetIds": [ABSENT_SUBNET, "subnet-0000beef"],
             }
         }),
-        unresolved,
     )
     .await;
+    assert_eq!(
+        status, 400,
+        "case {unresolved:?}: expected the placement to be refused, got {status} with {parsed}"
+    );
+    assert_eq!(
+        groups_held_by_ec2(&ec2, unresolved).await,
+        before,
+        "case {unresolved:?}: expected a refused create to leave the account's groups alone"
+    );
 
     let unplaced = "a Simple AD created with no VpcSettings at all";
     let without_placement = create_directory(
@@ -345,25 +363,22 @@ async fn a_directory_that_was_given_no_security_group_releases_nothing() {
     )
     .await;
 
-    for (case, directory_id) in [
-        (unresolved, &placed_in_nothing),
-        (unplaced, &without_placement),
-    ] {
-        let described = described_if_held(router, directory_id, case)
-            .await
-            .unwrap_or_else(|| panic!("case {case:?}: expected {directory_id} to be described"));
-        assert!(
-            described["VpcSettings"]["SecurityGroupId"].is_null()
-                && described["ConnectSettings"]["SecurityGroupId"].is_null(),
-            "case {case:?}: expected no SecurityGroupId to be reported at all, got {described}"
-        );
+    let described = described_if_held(router, &without_placement, unplaced)
+        .await
+        .unwrap_or_else(|| {
+            panic!("case {unplaced:?}: expected {without_placement} to be described")
+        });
+    assert!(
+        described["VpcSettings"]["SecurityGroupId"].is_null()
+            && described["ConnectSettings"]["SecurityGroupId"].is_null(),
+        "case {unplaced:?}: expected no SecurityGroupId to be reported at all, got {described}"
+    );
 
-        delete(router, directory_id, case).await;
-        let held = groups_held_by_ec2(&ec2, case).await;
-        assert_eq!(
-            held, before,
-            "case {case:?}: expected a teardown with no group to release to leave the \
-             account's groups alone"
-        );
-    }
+    delete(router, &without_placement, unplaced).await;
+    assert_eq!(
+        groups_held_by_ec2(&ec2, unplaced).await,
+        before,
+        "case {unplaced:?}: expected a teardown with no group to release to leave the account's \
+         groups alone"
+    );
 }

@@ -570,9 +570,10 @@ async fn deleting_a_directory_releases_the_interfaces_ec2_held_for_its_servers()
     );
 }
 
-/// RULE: nothing is placed on a network the account does not have — a directory whose subnets
-/// the owner of subnets reports nothing for, or one created with no placement at all, holds no
-/// interface anywhere, and its teardown releases nothing.
+/// RULE: nothing is placed on a network the account does not have — a create whose subnets the
+/// owner of subnets holds nothing for is refused, so no interface is created anywhere for it,
+/// and a directory created with no placement at all holds none either and its teardown
+/// releases nothing.
 #[tokio::test]
 async fn a_directory_whose_placement_does_not_resolve_holds_no_interface() {
     let network = network().await;
@@ -584,11 +585,12 @@ async fn a_directory_whose_placement_does_not_resolve_holds_no_interface() {
         .filter_map(|interface| interface.network_interface_id().map(str::to_string))
         .collect();
 
-    // The rows differ in WHY there is no network to place an interface on: a placement the
-    // account has no subnet for, and no placement at all.
+    // A placement the account has no subnet for never becomes a directory: the create is
+    // refused before any network is asked for, so EC2 holds exactly what it held.
     let unresolved = "a Managed Microsoft AD whose subnets the account has none of";
-    let placed_in_nothing = create_microsoft_ad(
+    let (status, parsed) = crate::directory_lifecycle::call(
         router,
+        "CreateMicrosoftAD",
         json!({
             "Name": "noeni.example.com",
             "Password": PASSWORD,
@@ -597,9 +599,21 @@ async fn a_directory_whose_placement_does_not_resolve_holds_no_interface() {
                 "SubnetIds": [ABSENT_SUBNET, "subnet-0000beef"],
             }
         }),
-        unresolved,
     )
     .await;
+    assert_eq!(
+        status, 400,
+        "case {unresolved:?}: expected the placement to be refused, got {status} with {parsed}"
+    );
+    let after_refusal: BTreeSet<String> = interfaces_held_by_ec2(&ec2, unresolved)
+        .await
+        .iter()
+        .filter_map(|interface| interface.network_interface_id().map(str::to_string))
+        .collect();
+    assert_eq!(
+        after_refusal, before,
+        "case {unresolved:?}: expected a refused create to place no interface anywhere"
+    );
 
     let unplaced = "a Simple AD created with no VpcSettings at all";
     let without_placement = create_directory(
@@ -609,26 +623,21 @@ async fn a_directory_whose_placement_does_not_resolve_holds_no_interface() {
     )
     .await;
 
-    for (case, directory_id) in [
-        (unresolved, &placed_in_nothing),
-        (unplaced, &without_placement),
-    ] {
-        let interfaces = directory_interfaces(&ec2, directory_id, case).await;
-        assert!(
-            interfaces.is_empty(),
-            "case {case:?}: expected no interface for a placement that resolves to nothing, \
-             got {interfaces:?}"
-        );
-        delete(router, directory_id, case).await;
-        let after: BTreeSet<String> = interfaces_held_by_ec2(&ec2, case)
-            .await
-            .iter()
-            .filter_map(|interface| interface.network_interface_id().map(str::to_string))
-            .collect();
-        assert_eq!(
-            after, before,
-            "case {case:?}: expected a teardown with no interface to release to leave the \
-             account's interfaces alone"
-        );
-    }
+    let interfaces = directory_interfaces(&ec2, &without_placement, unplaced).await;
+    assert!(
+        interfaces.is_empty(),
+        "case {unplaced:?}: expected no interface for a directory created without a placement, \
+         got {interfaces:?}"
+    );
+    delete(router, &without_placement, unplaced).await;
+    let after: BTreeSet<String> = interfaces_held_by_ec2(&ec2, unplaced)
+        .await
+        .iter()
+        .filter_map(|interface| interface.network_interface_id().map(str::to_string))
+        .collect();
+    assert_eq!(
+        after, before,
+        "case {unplaced:?}: expected a teardown with no interface to release to leave the \
+         account's interfaces alone"
+    );
 }
