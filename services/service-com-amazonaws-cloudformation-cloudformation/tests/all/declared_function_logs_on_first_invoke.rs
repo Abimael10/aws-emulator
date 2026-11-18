@@ -318,7 +318,16 @@ async fn awaited_state(router: &MultiServiceRouter, case: &str, name: &str) -> S
 
 /// The messages of the events one stream holds, in the order they were written, read through
 /// `GetLogEvents`.
-async fn event_messages(router: &MultiServiceRouter, group: &str, stream: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the reason [`logs`] is `pub(crate)`: the suite over a stack refused for a
+/// log-group name an earlier function's invocation left behind
+/// (`implicit_log_group_collision.rs`) reads that group's events back through this one reader
+/// rather than a second copy of it.
+pub(crate) async fn event_messages(
+    router: &MultiServiceRouter,
+    group: &str,
+    stream: &str,
+) -> Vec<String> {
     let (status, document) = logs(
         router,
         "GetLogEvents",
