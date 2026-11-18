@@ -7,8 +7,10 @@
 //! under an id the bucket already carries replaces THAT configuration and leaves the rest
 //! in place, and a put that would add one past the ceiling answers
 //! `TooManyConfigurations`. Refused before anything is written when the payload is not a
-//! configuration S3 can apply: an `Id` that is not the one the request identifies or a
-//! `Status` outside its enum (`InvalidArgument`), an `Id` longer than
+//! configuration S3 can apply: a document the published schema does not admit — an `Id` that
+//! is not the one the request identifies, or a `Filter` naming more than the one predicate
+//! such a container is a choice of ([`crate::state::MALFORMED_XML_CODE`]) — a `Status`
+//! outside its enum (`InvalidArgument`), an `Id` longer than
 //! [`crate::state::MAX_CONFIGURATION_ID_CHARS`] characters (`InvalidConfigId`), or a
 //! tiering whose `Days` is outside the range the `AccessTier` it names publishes
 //! (`InvalidAccessTier`). Success is
@@ -400,6 +402,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that names a predicate it cannot evaluate scopes the configuration to nothing
         // determinate, so it is refused rather than recorded.
         if let Some(filter) = &configuration.filter {
+            // A filter container is a CHOICE of ONE predicate — a prefix, a tag, or the
+            // conjunction that carries several — so a container naming two of them directly
+            // is not a filter of the published shape, which is a document that "did not
+            // validate against our published schema". Read through the crate's one reading
+            // of that rule ([`crate::state::filter_names_several_predicates`]); a filter
+            // that names NONE scopes the configuration to the whole bucket and is not
+            // refused.
+            if crate::state::filter_names_several_predicates(&[
+                filter.prefix.is_some(),
+                filter.tag.is_some(),
+                filter.and.is_some(),
+            ])
+            .is_some()
+            {
+                return Err(malformed_tiering_configuration());
+            }
             // "The prefix that an object must have to be included in the metrics results"
             // — an EMPTY prefix states no prefix at all, so a document that spells the
             // element out and leaves it empty names a predicate that is not one.

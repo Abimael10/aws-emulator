@@ -27,11 +27,23 @@
 //! * A lifecycle rule whose actions cannot be scoped the way its filter asks, or whose
 //!   filter names a predicate that is not one, is refused with the code and the sentence S3
 //!   publishes for the rule it broke rather than stored.
+//! * A configuration `Filter` container is a CHOICE of ONE predicate — "a `Filter` must
+//!   specify exactly one `Prefix`, `Tag`, or an `And` child element"
+//!   (`ReplicationRuleFilter`), "a `Filter` can have exactly one of `Prefix`, `Tag`,
+//!   `ObjectSizeGreaterThan`, `ObjectSizeLessThan`, or `And` specified"
+//!   (`LifecycleRuleFilter`), and "if you specify both a `Prefix` and a `Tag` filter, wrap
+//!   these filters in an `And` tag" (`ReplicationRuleFilter$And`) — so a document whose
+//!   filter names more than one of them directly does not validate against the published
+//!   schema and is refused `MalformedXML` (HTTP 400), under that code's own FIXED sentence,
+//!   with nothing recorded. One rule, so it holds for every configuration family that
+//!   carries such a container.
 
+use service_com_amazonaws_s3_amazons3::ops::put_bucket_intelligent_tiering_configuration::PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS;
 use service_com_amazonaws_s3_amazons3::state::{
     INTERNAL_ERROR_CODE, INTERNAL_ERROR_MESSAGE, MALFORMED_CONTINUATION_TOKEN_CODE,
     MALFORMED_CONTINUATION_TOKEN_MESSAGE, MALFORMED_XML_CODE, MALFORMED_XML_MESSAGE,
-    MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
+    MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, NO_SUCH_CONFIGURATION_CODE,
+    VERSIONING_ENABLED_STATUS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -44,11 +56,12 @@ use super::object_and_tagging_roundtrip::{bucket, put_object, text};
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// `PUT /<bucket>?versioning` with `Enabled`, so a delete lays a marker instead of removing
-/// the object.
+/// the object — and so the bucket may carry a replication configuration, which applies to
+/// object VERSIONS.
 async fn enable_versioning(router: &MultiServiceRouter, name: &str) {
     let document = format!(
-        "<VersioningConfiguration xmlns=\"{XMLNS}\"><Status>Enabled</Status>\
-         </VersioningConfiguration>"
+        "<VersioningConfiguration xmlns=\"{XMLNS}\">\
+         <Status>{VERSIONING_ENABLED_STATUS}</Status></VersioningConfiguration>"
     );
     let answer = send(
         router,
@@ -830,6 +843,454 @@ async fn an_undefined_transition_default_minimum_object_size_is_refused_with_its
             format!("Invalid TransitionDefaultMinimumObjectSize found: {value}"),
             "case {value:?}: expected the value to be named, got {:?}",
             refused.error_message()
+        );
+    }
+}
+
+/// One `Tag` predicate, as every filter container of this service spells one: `Tag$Key` and
+/// `$Value` are both `@required` (`smithy_query(query="shape",shape="Tag")`).
+const ONE_TAG: &str = "<Tag><Key>team</Key><Value>gold</Value></Tag>";
+
+/// One `Filter` container, as a configuration document spells it, and whether the published
+/// schema admits it.
+///
+/// The predicates are the three every STRUCTURE-typed filter of this service declares —
+/// `Prefix`, `Tag` and `And`
+/// (`smithy_query(query="shape",shape="IntelligentTieringFilter,ReplicationRuleFilter,LifecycleRuleFilter")`)
+/// — so one table is spellable in every family that carries such a container.
+struct FilterCase {
+    /// What the row is about, named in every assertion.
+    case: &'static str,
+    /// The `<Filter>` element, exactly as the document carries it.
+    filter: String,
+    /// Whether the schema admits it: a container naming at most the ONE predicate a filter
+    /// is a choice of.
+    admitted: bool,
+}
+
+/// The filter containers every configuration family is judged over.
+///
+/// The rows differ along what the rule generalises over: WHICH predicates the container names
+/// (a prefix, a tag, a conjunction, and each combination of them) and HOW MANY it names
+/// directly (one, two and three). A container naming NONE is each family's own documented
+/// reading of an empty filter rather than this rule, and is pinned where that family is
+/// tested.
+fn filter_cases() -> Vec<FilterCase> {
+    vec![
+        FilterCase {
+            case: "one prefix",
+            filter: "<Filter><Prefix>logs/</Prefix></Filter>".to_string(),
+            admitted: true,
+        },
+        FilterCase {
+            case: "one tag",
+            filter: format!("<Filter>{ONE_TAG}</Filter>"),
+            admitted: true,
+        },
+        FilterCase {
+            case: "a conjunction of a prefix and a tag",
+            filter: format!("<Filter><And><Prefix>logs/</Prefix>{ONE_TAG}</And></Filter>"),
+            admitted: true,
+        },
+        FilterCase {
+            case: "a prefix and a tag, both named directly",
+            filter: format!("<Filter><Prefix>logs/</Prefix>{ONE_TAG}</Filter>"),
+            admitted: false,
+        },
+        FilterCase {
+            case: "a prefix beside a conjunction",
+            filter: format!(
+                "<Filter><Prefix>logs/</Prefix><And><Prefix>logs/</Prefix>{ONE_TAG}</And>\
+                 </Filter>"
+            ),
+            admitted: false,
+        },
+        FilterCase {
+            case: "a tag beside a conjunction",
+            filter: format!(
+                "<Filter>{ONE_TAG}<And><Prefix>logs/</Prefix>{ONE_TAG}</And></Filter>"
+            ),
+            admitted: false,
+        },
+        FilterCase {
+            case: "a prefix, a tag and a conjunction",
+            filter: format!(
+                "<Filter><Prefix>logs/</Prefix>{ONE_TAG}\
+                 <And><Prefix>logs/</Prefix>{ONE_TAG}</And></Filter>"
+            ),
+            admitted: false,
+        },
+    ]
+}
+
+/// Every refusal of a document the published schema does not admit: 400 `MalformedXML`,
+/// carrying that code's own FIXED sentence and nothing of the request.
+fn assert_malformed(case: &str, answer: &Answer) {
+    assert_eq!(
+        answer.status,
+        400,
+        "case {case:?}: expected 400, got {} ({})",
+        answer.status,
+        text(answer)
+    );
+    assert_eq!(
+        answer.error_code(),
+        MALFORMED_XML_CODE,
+        "case {case:?}: expected the code {MALFORMED_XML_CODE}, got {}",
+        answer.error_code()
+    );
+    assert_eq!(
+        answer.error_message(),
+        MALFORMED_XML_MESSAGE,
+        "case {case:?}: expected the published sentence {MALFORMED_XML_MESSAGE:?}, got {:?}",
+        answer.error_message()
+    );
+}
+
+/// `PUT /<bucket>?intelligent-tiering&id=<id>` — `PutBucketIntelligentTieringConfiguration`
+/// with `filter` as the configuration's filter container.
+async fn put_tiering(
+    router: &MultiServiceRouter,
+    name: &str,
+    id: &str,
+    filter: &str,
+) -> Answer {
+    let document = format!(
+        "<IntelligentTieringConfiguration xmlns=\"{XMLNS}\"><Id>{id}</Id>{filter}\
+         <Status>Enabled</Status>\
+         <Tiering><Days>90</Days><AccessTier>ARCHIVE_ACCESS</AccessTier></Tiering>\
+         </IntelligentTieringConfiguration>"
+    );
+    send(
+        router,
+        "PUT",
+        &format!("/{name}?intelligent-tiering&id={id}"),
+        &[],
+        &document,
+    )
+    .await
+}
+
+/// `GET /<bucket>?intelligent-tiering&id=<id>` —
+/// `GetBucketIntelligentTieringConfiguration`.
+async fn get_tiering(router: &MultiServiceRouter, name: &str, id: &str) -> Answer {
+    send(
+        router,
+        "GET",
+        &format!("/{name}?intelligent-tiering&id={id}"),
+        &[],
+        "",
+    )
+    .await
+}
+
+/// An S3 Intelligent-Tiering configuration whose `Filter` names more than the one predicate
+/// such a container is a choice of is refused as a document that did not validate, and
+/// leaves whatever the bucket carried under that id exactly as it was.
+#[tokio::test]
+async fn an_intelligent_tiering_filter_names_at_most_one_predicate() {
+    let router = router();
+    let name = "itc-filter-choice";
+    bucket(&router, name).await;
+
+    for (index, row) in filter_cases().into_iter().enumerate() {
+        let case = row.case;
+        let id = format!("choice-{index}");
+        // What the bucket carries under this id BEFORE the case's put: a configuration the
+        // schema admits, so a refused put is visible as this one surviving.
+        let kept = "<Filter><Prefix>kept/</Prefix></Filter>";
+        let seeded = put_tiering(&router, name, &id, kept).await;
+        assert_eq!(
+            seeded.status,
+            PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: the seed configuration must be stored, got {} ({})",
+            seeded.status,
+            text(&seeded)
+        );
+
+        let answer = put_tiering(&router, name, &id, &row.filter).await;
+        if row.admitted {
+            assert_eq!(
+                answer.status,
+                PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+                "case {case:?}: expected the put to answer {}, got {} ({})",
+                PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+                answer.status,
+                text(&answer)
+            );
+        } else {
+            assert_malformed(case, &answer);
+        }
+
+        let read = get_tiering(&router, name, &id).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: the configuration under {id:?} must read back, got {} ({})",
+            read.status,
+            text(&read)
+        );
+        // The payload IS the configuration, so the filter the LAST stored put named is the
+        // one the read reports: the case's own filter when it was admitted, and the seeded
+        // one when it was refused.
+        let expected = match row.admitted {
+            true => row.filter.as_str(),
+            false => kept,
+        };
+        assert!(
+            text(&read).contains(expected),
+            "case {case:?}: expected the read to report {expected}, got {}",
+            text(&read)
+        );
+    }
+}
+
+/// A configuration a bucket carries no configuration of reads as absent, which is what a
+/// refused put of a NEW id leaves behind.
+#[tokio::test]
+async fn a_refused_intelligent_tiering_filter_records_no_configuration() {
+    let router = router();
+    let name = "itc-filter-choice-absent";
+    bucket(&router, name).await;
+
+    for (index, row) in filter_cases()
+        .into_iter()
+        .filter(|row| !row.admitted)
+        .enumerate()
+    {
+        let case = row.case;
+        let id = format!("never-stored-{index}");
+        let answer = put_tiering(&router, name, &id, &row.filter).await;
+        assert_malformed(case, &answer);
+
+        let read = get_tiering(&router, name, &id).await;
+        assert_eq!(
+            read.status,
+            404,
+            "case {case:?}: a refused put must record nothing, got {} ({})",
+            read.status,
+            text(&read)
+        );
+        assert_eq!(
+            read.error_code(),
+            NO_SUCH_CONFIGURATION_CODE,
+            "case {case:?}: expected {NO_SUCH_CONFIGURATION_CODE}, got {}",
+            read.error_code()
+        );
+    }
+}
+
+/// The ARN of the IAM role a replication configuration names, and the destination bucket as
+/// `Destination$Bucket` takes it — an S3 bucket ARN.
+const REPLICATION_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/s3-replication-role";
+const REPLICATION_DESTINATION_ARN: &str = "arn:aws:s3:::replication-destination";
+
+/// `PUT /<bucket>?replication` — `PutBucketReplication` with one V2 rule identified by `id`
+/// and scoped by `filter`.
+async fn put_replication_filter(
+    router: &MultiServiceRouter,
+    name: &str,
+    id: &str,
+    filter: &str,
+) -> Answer {
+    let document = format!(
+        "<ReplicationConfiguration xmlns=\"{XMLNS}\">\
+         <Role>{REPLICATION_ROLE_ARN}</Role>\
+         <Rule><ID>{id}</ID><Priority>1</Priority>{filter}<Status>Enabled</Status>\
+         <Destination><Bucket>{REPLICATION_DESTINATION_ARN}</Bucket></Destination></Rule>\
+         </ReplicationConfiguration>"
+    );
+    send(
+        router,
+        "PUT",
+        &format!("/{name}?replication"),
+        &[],
+        &document,
+    )
+    .await
+}
+
+/// A replication rule whose `Filter` names more than one predicate directly is refused the
+/// same way, and leaves the stored configuration as it was.
+#[tokio::test]
+async fn a_replication_filter_names_at_most_one_predicate() {
+    let router = router();
+    let name = "replication-filter-choice";
+    bucket(&router, name).await;
+    // Replication copies object VERSIONS, so the configuration applies only to a bucket whose
+    // versioning is enabled — put in force through this file's one versioning helper.
+    enable_versioning(&router, name).await;
+
+    for (index, row) in filter_cases().into_iter().enumerate() {
+        let case = row.case;
+        // The configuration the bucket carries BEFORE the case's put, under an id of its
+        // own, so a refused put is visible as this one surviving.
+        let kept = format!("kept-{index}");
+        let seeded = put_replication_filter(
+            &router,
+            name,
+            &kept,
+            "<Filter><Prefix>kept/</Prefix></Filter>",
+        )
+        .await;
+        assert_eq!(
+            seeded.status,
+            200,
+            "case {case:?}: the seed configuration must be stored, got {} ({})",
+            seeded.status,
+            text(&seeded)
+        );
+
+        let id = format!("choice-{index}");
+        let answer = put_replication_filter(&router, name, &id, &row.filter).await;
+        if row.admitted {
+            assert_eq!(
+                answer.status,
+                200,
+                "case {case:?}: expected the put to answer 200, got {} ({})",
+                answer.status,
+                text(&answer)
+            );
+        } else {
+            assert_malformed(case, &answer);
+        }
+
+        let read = send(&router, "GET", &format!("/{name}?replication"), &[], "").await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: the stored configuration must read back, got {} ({})",
+            read.status,
+            text(&read)
+        );
+        // The payload is the complete container, so the rule the LAST stored put named is the
+        // only one the read reports.
+        let (reported, absent) = match row.admitted {
+            true => (&id, &kept),
+            false => (&kept, &id),
+        };
+        assert!(
+            text(&read).contains(&format!("<ID>{reported}</ID>")),
+            "case {case:?}: expected the rule {reported:?} to read back, got {}",
+            text(&read)
+        );
+        assert!(
+            !text(&read).contains(&format!("<ID>{absent}</ID>")),
+            "case {case:?}: expected no rule {absent:?} in the report, got {}",
+            text(&read)
+        );
+    }
+}
+
+/// A lifecycle rule's filter is the same choice, judged through the same reading: the family
+/// whose own documentation states the rule for five predicates rather than three.
+#[tokio::test]
+async fn a_lifecycle_filter_names_at_most_one_predicate() {
+    let router = router();
+    let name = "lifecycle-filter-choice";
+    bucket(&router, name).await;
+
+    for (index, row) in filter_cases().into_iter().enumerate() {
+        let case = row.case;
+        let id = format!("choice-{index}");
+        let document = configuration(&[rule(&format!(
+            "<ID>{id}</ID><Status>Enabled</Status>{}\
+             <Expiration><Days>30</Days></Expiration>",
+            row.filter
+        ))]);
+        let answer = put_lifecycle(&router, name, &[], &document).await;
+        if row.admitted {
+            assert_eq!(
+                answer.status,
+                200,
+                "case {case:?}: expected the put to answer 200, got {} ({})",
+                answer.status,
+                text(&answer)
+            );
+        } else {
+            assert_malformed(case, &answer);
+        }
+
+        let read = send(&router, "GET", &format!("/{name}?lifecycle"), &[], "").await;
+        assert_eq!(
+            text(&read).contains(&format!("<ID>{id}</ID>")),
+            row.admitted,
+            "case {case:?}: expected the rule {id:?} to be stored: {}, got {}",
+            row.admitted,
+            text(&read)
+        );
+    }
+}
+
+/// A lifecycle filter also names the two OBJECT SIZE bounds its own documentation lists, so
+/// the same choice holds for a container naming one of them beside another predicate.
+///
+/// The rows are the bounds the shape declares beside `Prefix`, `Tag` and `And`
+/// (`smithy_query(query="shape",shape="LifecycleRuleFilter")`), each on its own and each
+/// beside a prefix — a predicate the issue's own family cannot spell, which is why it is
+/// pinned here.
+#[tokio::test]
+async fn a_lifecycle_filter_counts_its_object_size_bounds_as_predicates() {
+    let router = router();
+    let name = "lifecycle-filter-size-choice";
+    bucket(&router, name).await;
+
+    let rows = [
+        (
+            "one size floor alone",
+            "<Filter><ObjectSizeGreaterThan>128</ObjectSizeGreaterThan></Filter>",
+            true,
+        ),
+        (
+            "one size ceiling alone",
+            "<Filter><ObjectSizeLessThan>4096</ObjectSizeLessThan></Filter>",
+            true,
+        ),
+        (
+            "a size floor beside a prefix",
+            "<Filter><Prefix>logs/</Prefix>\
+             <ObjectSizeGreaterThan>128</ObjectSizeGreaterThan></Filter>",
+            false,
+        ),
+        (
+            "both size bounds, named directly",
+            "<Filter><ObjectSizeGreaterThan>128</ObjectSizeGreaterThan>\
+             <ObjectSizeLessThan>4096</ObjectSizeLessThan></Filter>",
+            false,
+        ),
+        (
+            "both size bounds inside the conjunction",
+            "<Filter><And><ObjectSizeGreaterThan>128</ObjectSizeGreaterThan>\
+             <ObjectSizeLessThan>4096</ObjectSizeLessThan></And></Filter>",
+            true,
+        ),
+    ];
+
+    for (index, (case, filter, admitted)) in rows.into_iter().enumerate() {
+        let id = format!("sized-{index}");
+        let document = configuration(&[rule(&format!(
+            "<ID>{id}</ID><Status>Enabled</Status>{filter}\
+             <Expiration><Days>30</Days></Expiration>"
+        ))]);
+        let answer = put_lifecycle(&router, name, &[], &document).await;
+        if admitted {
+            assert_eq!(
+                answer.status,
+                200,
+                "case {case:?}: expected the put to answer 200, got {} ({})",
+                answer.status,
+                text(&answer)
+            );
+        } else {
+            assert_malformed(case, &answer);
+        }
+
+        let read = send(&router, "GET", &format!("/{name}?lifecycle"), &[], "").await;
+        assert_eq!(
+            text(&read).contains(&format!("<ID>{id}</ID>")),
+            admitted,
+            "case {case:?}: expected the rule {id:?} to be stored: {admitted}, got {}",
+            text(&read)
         );
     }
 }

@@ -822,6 +822,32 @@ pub fn first_repeated_tag_key(tags: &[crate::ops::types::Tag]) -> Option<&str> {
         .map(|tag| tag.key.as_str())
 }
 
+/// How many TOP-LEVEL predicates a configuration `Filter` names, when it names more than
+/// the one such a container is — or `None` when it names at most one.
+///
+/// `named` is one entry per predicate the container declares, each saying whether the
+/// document named that one.
+///
+/// A `Filter` is a CHOICE: "a `Filter` must specify exactly one `Prefix`, `Tag`, or an `And`
+/// child element" (`ReplicationRuleFilter`), "a `Filter` can have exactly one of `Prefix`,
+/// `Tag`, `ObjectSizeGreaterThan`, `ObjectSizeLessThan`, or `And` specified"
+/// (`LifecycleRuleFilter`) — several predicates travel INSIDE the `And` container, which is
+/// what "if you specify both a `Prefix` and a `Tag` filter, wrap these filters in an `And`
+/// tag" (`ReplicationRuleFilter$And`) states. A container naming two of them directly is
+/// therefore not a filter of the shape the schema publishes, whatever family of
+/// configuration it arrived in.
+///
+/// ONE reading for every filter container of this service — the families whose filter is a
+/// STRUCTURE, so a document naming two predicates parses to a container carrying both; a
+/// family whose filter is a union (`AnalyticsFilter`, `MetricsFilter`) is a choice the codec
+/// itself cannot bind two members of, and is judged where that document is read
+/// ([`analytics_document_rejection`]). Each family keeps its own refusal shape; the count is
+/// handed back so one that names it can.
+pub fn filter_names_several_predicates(named: &[bool]) -> Option<usize> {
+    let count = named.iter().filter(|named| **named).count();
+    (count > 1).then_some(count)
+}
+
 /// The punctuation a tag key or value may carry, beside Unicode letters, digits and
 /// whitespace.
 ///

@@ -723,20 +723,17 @@ pub(super) fn validate_lifecycle_filter(
 ) -> Result<(), LifecycleConfigurationRejection> {
     use LifecycleConfigurationRejection as Rejection;
 
-    let named = [
+    // A filter is a CHOICE of one predicate, read through the crate's one reading of that
+    // rule ([`super::filter_names_several_predicates`]). An EMPTY filter is not a refusal:
+    // "If the Filter element is left empty, the Lifecycle Rule applies to all objects in the
+    // bucket" (`LifecycleRuleFilter`'s own documentation).
+    if let Some(named) = filter_names_several_predicates(&[
         filter.prefix.is_some(),
         filter.tag.is_some(),
         filter.object_size_greater_than.is_some(),
         filter.object_size_less_than.is_some(),
         filter.and.is_some(),
-    ]
-    .into_iter()
-    .filter(|named| *named)
-    .count();
-    // An EMPTY filter is not a refusal: "If the Filter element is left empty, the Lifecycle
-    // Rule applies to all objects in the bucket" (`LifecycleRuleFilter`'s own
-    // documentation).
-    if named > 1 {
+    ]) {
         return Err(Rejection::FilterNamesSeveralPredicates {
             rule: position,
             named,

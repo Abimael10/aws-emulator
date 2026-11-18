@@ -331,6 +331,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         for rule in &configuration.rules {
+            // A rule's `Filter` is a CHOICE of ONE predicate — "a `Filter` must specify
+            // exactly one `Prefix`, `Tag`, or an `And` child element"
+            // (`ReplicationRuleFilter`), and "if you specify both a `Prefix` and a `Tag`
+            // filter, wrap these filters in an `And` tag" (`$And`) — so a container naming
+            // two of them directly is not a filter of the published shape, which is what
+            // `MalformedXML` reports, under that code's own FIXED published sentence. Read
+            // through the crate's one reading of that rule
+            // ([`crate::state::filter_names_several_predicates`]), and judged BEFORE the
+            // schema questions below: a document the schema does not admit is refused ahead
+            // of a configuration S3 cannot carry out. A filter naming NONE leaves the rule
+            // covering the whole bucket and is not refused.
+            if let Some(filter) = &rule.filter {
+                if crate::state::filter_names_several_predicates(&[
+                    filter.prefix.is_some(),
+                    filter.tag.is_some(),
+                    filter.and.is_some(),
+                ])
+                .is_some()
+                {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::MALFORMED_XML_CODE,
+                        MALFORMED_XML_STATUS,
+                        crate::state::MALFORMED_XML_MESSAGE,
+                    ));
+                }
+            }
+
             // "When you add the Filter element in the configuration, you must also add the
             // following elements: DeleteMarkerReplication, Status, and Priority" (this
             // operation's own documentation): a rule carrying a `Filter` is written in the
