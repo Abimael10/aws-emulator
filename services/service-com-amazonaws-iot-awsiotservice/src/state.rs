@@ -3294,8 +3294,9 @@ pub use fleet_metrics::{
 // `state/thing_group_membership.rs`, beside the thing-group update for the same reason.
 pub mod thing_group_membership;
 pub use thing_group_membership::{
-    named_thing, named_thing_group, DynamicGroupQuery, MembershipRefusal, DYNAMIC_GROUP_ACTIVE,
-    MAX_DYNAMIC_THING_GROUPS, MAX_THING_GROUPS_PER_THING, MAX_THINGS_PER_THING_GROUP,
+    named_thing, named_thing_group, DynamicGroupQuery, MembershipRefusal,
+    DEFAULT_DYNAMIC_GROUP_QUERY_VERSION, DYNAMIC_GROUP_ACTIVE, MAX_DYNAMIC_THING_GROUPS,
+    MAX_THING_GROUPS_PER_THING, MAX_THINGS_PER_THING_GROUP,
 };
 
 // What a DOMAIN CONFIGURATION is — the record one holds, the server certificate it

@@ -22,6 +22,9 @@
 //! * a dynamic thing group IS its query: an unparsable `queryString` is
 //!   `InvalidQueryException` (400) with nothing created, and a created one reports the
 //!   query that decides its membership;
+//! * a member the model documents a default for — the index a dynamic group is over
+//!   and the version its query is read under — is recorded at that default when the
+//!   request omits it, and an `indexName` outside the recognised set is refused;
 //! * a BULK update of the groups one thing belongs to
 //!   (`UpdateThingGroupsForThing`) leaves the thing in exactly the groups it belonged
 //!   to, minus the ones it left, plus the ones it joined, under the same rules one add
@@ -36,7 +39,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_iot_awsiotservice::state::{
-    MAX_THING_GROUPS_PER_THING, UNPARSABLE_QUERY_MESSAGE,
+    DEFAULT_DYNAMIC_GROUP_QUERY_VERSION, MAX_THING_GROUPS_PER_THING, UNPARSABLE_QUERY_MESSAGE,
 };
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -622,6 +625,134 @@ async fn a_group_targeted_job_runs_on_the_groups_members() {
         "case listing a dynamic group's things: got {}",
         dynamic_listing.text()
     );
+}
+
+/// RULE: a member the model documents a default for is recorded at that default when
+/// the request omits it, so the group reads back under the index and the query version
+/// its query is read under whether or not the writer stated them.
+#[tokio::test]
+async fn an_omitted_dynamic_group_default_is_recorded_and_reported() {
+    let emulator = Emulator::new();
+
+    // Each row: what the create sent beside `queryString`, and the `indexName` and
+    // `queryVersion` the group is then recorded under. The defaults are the model's own
+    // — `smithy_query(query="doc",shape="CreateDynamicThingGroupRequest",member="indexName")`
+    // ("Currently one index is supported: AWS_Things") and `member="queryVersion"`
+    // ("Currently one query version is supported: "2017-09-30". If not specified, the
+    // query version defaults to this value").
+    let rows: Vec<(&str, Value, &str, &str)> = vec![
+        (
+            "neither member stated",
+            json!({ "queryString": "attributes.zone:north" }),
+            "AWS_Things",
+            DEFAULT_DYNAMIC_GROUP_QUERY_VERSION,
+        ),
+        (
+            "the query version stated as the supported one",
+            json!({
+                "queryString": "thingName:sensor-*",
+                "queryVersion": DEFAULT_DYNAMIC_GROUP_QUERY_VERSION,
+            }),
+            "AWS_Things",
+            DEFAULT_DYNAMIC_GROUP_QUERY_VERSION,
+        ),
+        (
+            "the index stated, the query version omitted",
+            json!({ "queryString": "registry.version:[1 TO 10]", "indexName": "AWS_Things" }),
+            "AWS_Things",
+            DEFAULT_DYNAMIC_GROUP_QUERY_VERSION,
+        ),
+        (
+            "both members stated",
+            json!({
+                "queryString": "attributes.zone:\"north west\"",
+                "indexName": "AWS_Things",
+                "queryVersion": DEFAULT_DYNAMIC_GROUP_QUERY_VERSION,
+            }),
+            "AWS_Things",
+            DEFAULT_DYNAMIC_GROUP_QUERY_VERSION,
+        ),
+    ];
+
+    for (index, (case, body, expected_index, expected_version)) in rows.iter().enumerate() {
+        let group_name = format!("defaulted-{index}");
+        let created = emulator.create_dynamic_group(&group_name, body).await;
+        assert_eq!(
+            created.status,
+            200,
+            "case {case}: expected 200, got {} body {}",
+            created.status,
+            created.text()
+        );
+        let reported = created.json();
+        assert_eq!(
+            reported["indexName"],
+            json!(expected_index),
+            "case {case}: expected indexName {expected_index}, got {reported}"
+        );
+        assert_eq!(
+            reported["queryVersion"],
+            json!(expected_version),
+            "case {case}: expected queryVersion {expected_version}, got {reported}"
+        );
+
+        // What the create reported is what the reader reads: the default was PERSISTED,
+        // not filled into one response.
+        let read = emulator.describe_group(&group_name).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case}: expected the read to answer 200, got {} body {}",
+            read.status,
+            read.text()
+        );
+        let read = read.json();
+        assert_eq!(
+            read["indexName"],
+            json!(expected_index),
+            "case {case}: the read must report the recorded index, got {read}"
+        );
+        assert_eq!(
+            read["queryVersion"],
+            json!(expected_version),
+            "case {case}: the read must report the recorded query version, got {read}"
+        );
+    }
+
+    // An `indexName` outside the set this service recognises is not a default to fill
+    // in but a request it cannot act on, and nothing is written for it.
+    for index_name in ["AWS_ThingGroups", "my-index"] {
+        let refused = emulator
+            .create_dynamic_group(
+                "unrecognized",
+                &json!({ "queryString": "thingName:*", "indexName": index_name }),
+            )
+            .await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case the index {index_name}: expected 400, got {} body {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            refused.error_code(),
+            "InvalidRequestException",
+            "case the index {index_name}: got {}",
+            refused.text()
+        );
+        assert_eq!(
+            refused.error_message(),
+            format!("Unrecognized indexName {index_name}"),
+            "case the index {index_name}: got {}",
+            refused.text()
+        );
+        assert_eq!(
+            emulator.describe_group("unrecognized").await.status,
+            404,
+            "case the index {index_name}: a refused create must leave no group behind"
+        );
+    }
 }
 
 /// RULE: a dynamic thing group IS its query — an unparsable one is refused and nothing

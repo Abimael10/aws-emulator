@@ -254,10 +254,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `queryVersion` is "Currently one query version is supported: "2017-09-30". If
+        // not specified, the query version defaults to this value", so a request that
+        // named none records that version rather than nothing: the group is read back
+        // under the version its query is read under, whoever wrote it.
         let query = crate::state::DynamicGroupQuery {
             index_name,
             query_string: input.query_string,
-            query_version: input.query_version,
+            query_version: input
+                .query_version
+                .unwrap_or_else(|| crate::state::DEFAULT_DYNAMIC_GROUP_QUERY_VERSION.to_string()),
         };
         let thing_group_arn = crate::state::thing_group_arn(&region, &input.thing_group_name);
         let group = crate::state::RegisteredThingGroup::new_dynamic(
@@ -288,7 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             query_version: group
                 .dynamic_query
                 .as_ref()
-                .and_then(|query| query.query_version.clone()),
+                .map(|query| query.query_version.clone()),
         };
         store
             .thing_groups

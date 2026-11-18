@@ -56,6 +56,17 @@ pub const MAX_DYNAMIC_THING_GROUPS: usize = 100;
 /// owes the group and a reader reports it active.
 pub const DYNAMIC_GROUP_ACTIVE: &str = "ACTIVE";
 
+/// The `QueryVersion` a dynamic thing group's query is recorded under when the
+/// request named none.
+///
+/// `CreateDynamicThingGroup$queryVersion` —
+/// `smithy_query(query="doc",shape="CreateDynamicThingGroupRequest",member="queryVersion")`
+/// — is "Currently one query version is supported: \"2017-09-30\". If not specified,
+/// the query version defaults to this value", so the version a group is recorded
+/// under is known whether or not the writer stated it, exactly as the index name is
+/// ([`super::THING_INDEX_NAME`]).
+pub const DEFAULT_DYNAMIC_GROUP_QUERY_VERSION: &str = "2017-09-30";
+
 /// What makes a thing group DYNAMIC: the fleet-index query whose things it holds.
 ///
 /// Every member is the create's own
@@ -70,8 +81,10 @@ pub struct DynamicGroupQuery {
     /// `CreateDynamicThingGroup$queryString` — "The dynamic thing group search query
     /// string", verbatim as the writer supplied it.
     pub query_string: String,
-    /// `CreateDynamicThingGroup$queryVersion`, when the request carried one.
-    pub query_version: Option<String>,
+    /// `CreateDynamicThingGroup$queryVersion` — the version the query is read under,
+    /// which a request that named none records at
+    /// [`DEFAULT_DYNAMIC_GROUP_QUERY_VERSION`], so every recorded query carries one.
+    pub query_version: String,
 }
 
 /// How this service states that a thing group a request named is DYNAMIC, so its

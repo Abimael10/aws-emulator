@@ -229,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             query_version: group
                 .dynamic_query
                 .as_ref()
-                .and_then(|query| query.query_version.clone()),
+                .map(|query| query.query_version.clone()),
             status: group
                 .dynamic_query
                 .as_ref()

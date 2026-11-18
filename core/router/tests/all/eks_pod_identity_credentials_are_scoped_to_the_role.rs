@@ -112,7 +112,10 @@ fn allow_and_deny(action: &str) -> String {
 /// action, the resource the request was made on and why the decision went that way.
 ///
 /// `ListRoles` is decided on the account's `role` collection under the path prefix being
-/// listed, which for a request naming none is the default path.
+/// listed, which for a request naming none is the default path. The sentence is the whole
+/// of what this suite pins: a refusal of the identity service continues with the pointer at
+/// that request's own authorization details, whose id is a fact of the run and not a value
+/// to pin.
 fn refusal(session_arn: &str, reason: &str) -> String {
     format!(
         "User: {session_arn} is not authorized to perform: {ACTION} on resource: \
