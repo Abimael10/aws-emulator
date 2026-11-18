@@ -239,6 +239,30 @@ pub fn admit_invocation(
     })
 }
 
+/// Whether `function_name` admits NO invocation at all, however idle it is.
+///
+/// "The number of simultaneous executions to reserve for the function"
+/// (`PutFunctionConcurrency`), and "concurrency settings apply to the function as a whole,
+/// including all published versions and the unpublished version": a reservation of zero is a
+/// pool with no slot in it, so there is no capacity for an invocation of this function to come
+/// free and nothing admits one at a later instant either. That is what tells a wait for
+/// capacity apart from a pool that nothing can ever release.
+///
+/// A READ of the reservation: it changes nothing a later caller sees. `false` for a function
+/// nobody has reserved concurrency for, which is bounded by the account's capacity instead, and
+/// for a name the store holds no function under.
+#[must_use]
+pub fn admits_no_invocation(
+    state: &ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
+    function_name: &str,
+) -> bool {
+    state.lock().functions.get(function_name).is_some_and(|record| {
+        record
+            .reserved_concurrent_executions
+            .is_some_and(|reserved| reserved <= 0)
+    })
+}
+
 impl FunctionRecord {
     /// The provisioned concurrency ready to serve invocations of `qualifier` at `now`.
     ///

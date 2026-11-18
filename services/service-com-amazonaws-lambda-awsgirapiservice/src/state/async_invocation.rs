@@ -20,7 +20,15 @@
 //! more times"; so is one that found no capacity to run the function at all, because "if your
 //! function is throttled, Lambda returns the event to the queue and attempts to run the
 //! function again" — how busy this host is decides WHEN the function runs the event, never
-//! whether it ever does. Nothing about the run reaches the accepting call's response, because
+//! whether it ever does.
+//!
+//! An attempt is only MADE for an event the function's own concurrency pool admits
+//! ([`super::execution_slot`]), as a synchronous invocation is; and the one pool that admits
+//! nothing at any instant — a function reserving no concurrency at all — is why an event can
+//! end without the handler having run once: there is no slot for it to wait for, so the event
+//! is one Lambda is done with rather than one it keeps attempting.
+//!
+//! Nothing about the run reaches the accepting call's response, because
 //! the response was given before the run happened; the entry keeps what the last attempt came
 //! to ([`AsyncInvocationOutcome`]).
 //!
@@ -255,36 +263,86 @@ pub fn deliver(
             let journal = durable_execution
                 .as_ref()
                 .map(|name| super::DurableStepJournal::new(&state, &function_name, name));
-            let run = super::execution::run_invocation(invocation.clone(), journal).await;
+            // Lambda ADMITS an accepted event to the function only while the function's own
+            // concurrency pool has room for it — "Lambda returns TooManyRequestsException if
+            // running the function would cause you to exceed a concurrency limit at either
+            // the account level […] or function level" — and that pool is the function's as a
+            // whole, drawn on by every qualifier alike (`super::execution_slot`). An event
+            // the pool had no room for RAN nothing, so it is the throttle below rather than
+            // an outcome of the function; the slot an admitted attempt takes is held for
+            // exactly as long as its run lasts and released however that run ends.
+            let run = match super::execution_slot::admit_invocation(
+                &state,
+                &function_name,
+                &claimed.qualifier,
+                SystemTime::now(),
+            ) {
+                Ok(admitted) => {
+                    let _slot = admitted.slot;
+                    super::execution::run_invocation(invocation.clone(), journal).await
+                }
+                Err(refused) => {
+                    // The attempt was throttled, which is one invocation request the service
+                    // throttled on this function's own series (`super::metrics`), exactly as
+                    // a synchronous request the same pool had no room for is.
+                    if let Some(metrics) = invocation.metrics.as_ref() {
+                        metrics.publish_throttle();
+                    }
+                    Err(super::execution::Unrunnable::Overloaded(refused.message))
+                }
+            };
             // A THROTTLED attempt is not what became of the event: nothing about the event
             // stopped it, so "Lambda returns the event to the queue and attempts to run the
             // function again" for as long as the event is retained. The entry goes back to
             // being queued, with the instant the next attempt is due on it, rather than
             // recording a capacity this host happened not to have as the event's outcome.
+            //
+            // Unless there is no capacity to wait FOR: a function that reserves none admits
+            // no invocation at all, so returning the event to the queue would wait on a slot
+            // nothing can release. Such an event is one Lambda is done with here and now —
+            // the handler is never run for it — and what follows is the completion every
+            // event the function did not process earns: the record to the destination the
+            // qualifier's `DestinationConfig$OnFailure` names, and the event itself to the
+            // version's dead-letter target (`super::async_completion_delivery`).
             if matches!(&run, Err(super::execution::Unrunnable::Overloaded(_))) {
                 throttles = throttles.saturating_add(1);
-                let retention = event_retention_of(&state, &function_name, &request_id);
-                if let Some(again) = super::async_delivery::next_throttled_attempt_in(
-                    throttles,
-                    accepted.elapsed(),
-                    retention,
-                ) {
+                if super::execution_slot::admits_no_invocation(&state, &function_name) {
                     ::tracing::warn!(
                         function = %function_name,
                         request_id = %request_id,
-                        next_attempt_seconds = again.as_secs(),
-                        "no capacity was free to run this function for an accepted \
-                         asynchronous invocation, so the event goes back on the queue"
+                        "this function reserves no concurrency at all, so no capacity can \
+                         come free to run it for an accepted asynchronous invocation and the \
+                         event was not delivered to the handler"
                     );
-                    requeue(&state, &function_name, &request_id, again);
-                    ::tokio::time::sleep(again).await;
-                    continue;
+                    // The reservation is what ENDED the event, and neither the attempts it
+                    // was allowed nor its retention window, which is what the record a
+                    // destination reads reports
+                    // (`super::async_completion_delivery::Ending`).
+                    ending = super::async_completion_delivery::Ending::ZeroReservedConcurrency;
+                } else {
+                    let retention = event_retention_of(&state, &function_name, &request_id);
+                    if let Some(again) = super::async_delivery::next_throttled_attempt_in(
+                        throttles,
+                        accepted.elapsed(),
+                        retention,
+                    ) {
+                        ::tracing::warn!(
+                            function = %function_name,
+                            request_id = %request_id,
+                            next_attempt_seconds = again.as_secs(),
+                            "no capacity was free to run this function for an accepted \
+                             asynchronous invocation, so the event goes back on the queue"
+                        );
+                        requeue(&state, &function_name, &request_id, again);
+                        ::tokio::time::sleep(again).await;
+                        continue;
+                    }
+                    // The window the event is retained for is spent, so this is what ENDED
+                    // it: its age rather than the attempts it was allowed, which is what the
+                    // record a destination reads reports
+                    // (`super::async_completion_delivery::Ending`).
+                    ending = super::async_completion_delivery::Ending::AgeExceeded;
                 }
-                // The window the event is retained for is spent, so this is what ENDED it:
-                // its age rather than the attempts it was allowed, which is what the record
-                // a destination reads reports
-                // (`super::async_completion_delivery::Ending`).
-                ending = super::async_completion_delivery::Ending::AgeExceeded;
             }
             if run.is_ok() {
                 runs = runs.saturating_add(1);

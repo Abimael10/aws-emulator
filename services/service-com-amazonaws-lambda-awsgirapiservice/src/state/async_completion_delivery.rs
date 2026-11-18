@@ -120,6 +120,14 @@ const CONDITION_RETRIES_EXHAUSTED: &str = "RetriesExhausted";
 /// ([`super::async_delivery::next_throttled_attempt_in`]).
 const CONDITION_EVENT_AGE_EXCEEDED: &str = "EventAgeExceeded";
 
+/// The `requestContext.condition` of a record for an event the function was never run for
+/// because it RESERVES NO CONCURRENCY: "The number of simultaneous executions to reserve for
+/// the function" (`PutFunctionConcurrency`) is zero, so no invocation of it is admitted at any
+/// instant ([`super::execution_slot::admits_no_invocation`]) and the event is not one Lambda
+/// keeps attempting. It is its own condition rather than one of the two above, because neither
+/// the attempts the event was allowed nor its retention window is what ended it.
+const CONDITION_ZERO_RESERVED_CONCURRENCY: &str = "ZeroReservedConcurrency";
+
 /// The status an invocation of a function that RAN answers with: "A success response (202
 /// Accepted) indicates that the request is queued for invocation" is the accepting call's,
 /// and the run itself is reported on the `200` an invocation that executed carries — which
@@ -187,17 +195,20 @@ pub struct Completion<'run> {
 
 /// What ended an accepted asynchronous event, as `requestContext.condition` words it.
 ///
-/// The two endings this emulator can reach, and the two AWS words for an event it gave up
-/// on: the attempts the configuration allowed are spent, or the event was held for as long as
-/// it is retained without a run ever being made for it
-/// ([`super::async_delivery::event_retention`]). A handler that RETURNED ends neither way and
-/// is the success condition instead.
+/// The endings this emulator can reach, each AWS's own word for an event it gave up on: the
+/// attempts the configuration allowed are spent, the event was held for as long as it is
+/// retained without a run ever being made for it
+/// ([`super::async_delivery::event_retention`]), or the function reserves no concurrency at
+/// all, so nothing admits an invocation of it to run the event. A handler that RETURNED ends
+/// none of those ways and is the success condition instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ending {
     /// The event had every delivery attempt it was allowed.
     AttemptsSpent,
     /// Its retention window was spent before the function could be run for it.
     AgeExceeded,
+    /// The function reserves no concurrency, so no invocation of it was ever admitted.
+    ZeroReservedConcurrency,
 }
 
 impl Completion<'_> {
@@ -218,6 +229,7 @@ impl Completion<'_> {
         match self.ending {
             Ending::AttemptsSpent => CONDITION_RETRIES_EXHAUSTED,
             Ending::AgeExceeded => CONDITION_EVENT_AGE_EXCEEDED,
+            Ending::ZeroReservedConcurrency => CONDITION_ZERO_RESERVED_CONCURRENCY,
         }
     }
 
@@ -893,6 +905,18 @@ mod tests {
                 )),
                 ending: Ending::AgeExceeded,
                 condition: CONDITION_EVENT_AGE_EXCEEDED,
+                response: None,
+            },
+            // An event of a function that RESERVES NO CONCURRENCY: no invocation of it is
+            // admitted at any instant, so the reservation is what ended the event and the
+            // record says so rather than reporting spent attempts or a spent window.
+            Row {
+                case: "the function reserves no concurrency at all",
+                run: Err(super::super::execution::Unrunnable::Overloaded(
+                    super::super::execution_slot::THROTTLED_INVOCATION_MESSAGE.to_string(),
+                )),
+                ending: Ending::ZeroReservedConcurrency,
+                condition: CONDITION_ZERO_RESERVED_CONCURRENCY,
                 response: None,
             },
         ];
