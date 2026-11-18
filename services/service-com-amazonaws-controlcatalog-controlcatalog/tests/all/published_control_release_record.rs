@@ -136,6 +136,106 @@ const PUBLISHED_RECORDS: &[PublishedRecord] = &[
                       CloudTrail trail includes read and write management events.",
         release_time: 1_669_593_600,
     },
+    // Controls an AWS Config managed rule implements: each carries the published text of
+    // the surface that publishes it — the rule's own title and description for a control
+    // the catalog publishes under a `CONFIG.…` designator, and Control Tower's own control
+    // name and description for a control Control Tower publishes — together with the
+    // instant the catalog records as its release time. These rows widen the class the
+    // table spans: a description that restates the name and adds the rule's own
+    // NON_COMPLIANT criterion, one that names the resource field the rule reads, one that
+    // quotes a policy document, one that states no criterion at all, and two controls the
+    // catalog released together.
+    PublishedRecord {
+        identifier: "9vnj728czsv4m6pflfqt21bw2",
+        name: "Checks if AWS CloudTrail trails are configured to send logs to CloudWatch \
+               logs",
+        description: "Checks if AWS CloudTrail trails are configured to send logs to \
+                      CloudWatch logs. The trail is NON_COMPLIANT if the \
+                      CloudWatchLogsLogGroupArn property of the trail is empty.",
+        release_time: 1_540_166_400,
+    },
+    PublishedRecord {
+        identifier: "87qo8rsoettjrxjevmjqcw1tu",
+        name: "Detect whether Amazon EBS snapshots are restorable by all AWS accounts",
+        description: "Detects whether all AWS accounts have access to restore Amazon EBS \
+                      snapshots. The rule is NON_COMPLIANT if any snapshots have the \
+                      RestorableByUserIds field set to the value All. In that case, the \
+                      Amazon EBS snapshots are public.",
+        release_time: 1_638_316_800,
+    },
+    PublishedRecord {
+        identifier: "aazzef7lptl5umta6690p6u5c",
+        name: "Checks if Application Load Balancers and Network Load Balancers are \
+               configured to use certificates from Amazon Certificate Manager (ACM)",
+        description: "Checks if Application Load Balancers and Network Load Balancers \
+                      are configured to use certificates from Amazon Certificate Manager \
+                      (ACM). This rule is NON_COMPLIANT if at least 1 load balancer is \
+                      configured without a certificate from ACM.",
+        release_time: 1_594_771_200,
+    },
+    PublishedRecord {
+        identifier: "byrg7iwyl4azhecyhqtq8ocw1",
+        name: "Checks whether the default version of AWS Identity and Access Management \
+               (IAM) policies do not have administrator access",
+        description: "Checks whether the default version of AWS Identity and Access \
+                      Management (IAM) policies do not have administrator access. If any \
+                      statement has \"Effect\": \"Allow\" with \"Action\": \"*\" over \
+                      \"Resource\": \"*\", the rule is non-compliant.",
+        release_time: 1_537_228_800,
+    },
+    PublishedRecord {
+        identifier: "84hd48gyrb6e5ribkmsoub44c",
+        name: "Checks if Amazon Relational Database Service (Amazon RDS) DB snapshots are \
+               encrypted",
+        description: "Checks if Amazon Relational Database Service (Amazon RDS) DB \
+                      snapshots are encrypted. The rule is NON_COMPLIANT if the Amazon \
+                      RDS DB snapshots are not encrypted.",
+        release_time: 1_590_364_800,
+    },
+    PublishedRecord {
+        identifier: "1oxkwnc4hwhi2ndv6ekwy7np7",
+        name: "Detect whether Amazon Redshift clusters are blocked from public access",
+        description: "Detects whether Amazon Redshift clusters are blocked from public \
+                      access. The rule is NON_COMPLIANT if the publiclyAccessible field \
+                      is true in the cluster configuration item.",
+        release_time: 1_638_230_400,
+    },
+    PublishedRecord {
+        identifier: "df2ta5ytg2zatj1q7y5e09u32",
+        name: "Disallow Internet connection via RDP",
+        description: "Reduces a server's exposure to risk by removing unfettered \
+                      connectivity to remote console services such as RDP.",
+        release_time: 1_542_240_000,
+    },
+    PublishedRecord {
+        identifier: "227ph3vim64tdwv5mfagjd22r",
+        name: "Checks if your AWS account is enabled to use multi-factor authentication \
+               (MFA) hardware device to sign in with root credentials",
+        description: "Checks if your AWS account is enabled to use multi-factor \
+                      authentication (MFA) hardware device to sign in with root \
+                      credentials. The rule is NON_COMPLIANT if any virtual MFA devices \
+                      are permitted for signing in with root credentials.",
+        release_time: 1_535_587_200,
+    },
+    PublishedRecord {
+        identifier: "66gfl06uj1v999z53szvu0exa",
+        name: "Detect whether an Amazon SageMaker notebook instance allows direct \
+               internet access",
+        description: "Detects whether direct internet access is allowed for an Amazon \
+                      SageMaker notebook instance. The rule is NON_COMPLIANT if Amazon \
+                      SageMaker notebook instances allow direct internet access.",
+        release_time: 1_638_230_400,
+    },
+    PublishedRecord {
+        identifier: "4tf01viblttjxqhu35yz90vw1",
+        name: "Checks whether AWS Secret Manager secret has rotation enabled",
+        description: "Checks whether AWS Secret Manager secret has rotation enabled. If \
+                      the maximumAllowedRotationFrequency or the \
+                      maximumAllowedRotationFrequencyInHours parameter is specified, the \
+                      rotation frequency of the secret is compared with the maximum \
+                      allowed frequency.",
+        release_time: 1_779_840_000,
+    },
 ];
 
 /// Every control the catalog serves, keyed by its ARN, listed with `max_results` as the
@@ -179,6 +279,32 @@ fn create_time(case: &str, control: &Value) -> i64 {
     seconds as i64
 }
 
+/// A served control carries the published name, description and release instant `row`
+/// records for it.
+fn assert_published_record(case: &str, control: &Value, row: &PublishedRecord) {
+    assert_eq!(
+        control["Name"].as_str(),
+        Some(row.name),
+        "case {case}: expected the catalog's published Name {:?}, got {:?}",
+        row.name,
+        control["Name"]
+    );
+    assert_eq!(
+        control["Description"].as_str(),
+        Some(row.description),
+        "case {case}: expected the catalog's published Description {:?}, got {:?}",
+        row.description,
+        control["Description"]
+    );
+    assert_eq!(
+        create_time(case, control),
+        row.release_time,
+        "case {case}: expected the control's published release instant {}, got {:?}",
+        row.release_time,
+        control["CreateTime"]
+    );
+}
+
 /// Every published control is served with the catalog's own name, description and
 /// release instant, by `ListControls` whatever the page size and by `GetControl`.
 #[tokio::test]
@@ -197,27 +323,7 @@ async fn every_published_control_carries_the_catalogs_own_text_and_release_time(
                 .get(&arn)
                 .unwrap_or_else(|| panic!("case {case}: the catalog must publish {arn}"));
 
-            assert_eq!(
-                summary["Name"].as_str(),
-                Some(row.name),
-                "case {case}: expected the catalog's published Name {:?}, got {:?}",
-                row.name,
-                summary["Name"]
-            );
-            assert_eq!(
-                summary["Description"].as_str(),
-                Some(row.description),
-                "case {case}: expected the catalog's published Description {:?}, got {:?}",
-                row.description,
-                summary["Description"]
-            );
-            assert_eq!(
-                create_time(&case, summary),
-                row.release_time,
-                "case {case}: expected the control's published release instant {}, got {:?}",
-                row.release_time,
-                summary["CreateTime"]
-            );
+            assert_published_record(&case, summary, row);
 
             // The summary is a projection of the record GetControl answers with, so the
             // control reads back with the same three values.
@@ -234,6 +340,61 @@ async fn every_published_control_carries_the_catalogs_own_text_and_release_time(
                 "case {case}: GetControl must report the same published record, got \
                  {read_back:?}"
             );
+        }
+    }
+}
+
+/// A published record is served through a narrowing filter too: a control selected by the
+/// implementing surface's own identifier for it carries the published name, description and
+/// release instant the catalog records for it — the record belongs to the control, not to
+/// the request that found it. (Selecting by implementation TYPE is covered by the stability
+/// test below, which compares every served control against the whole listing.)
+#[tokio::test]
+async fn every_published_control_keeps_its_record_when_a_filter_selects_it() {
+    let emulator = Emulator::new();
+    let whole_catalog = listing_by_arn(&emulator, None, "{}").await;
+
+    for row in PUBLISHED_RECORDS {
+        let arn = catalog_arn(row.identifier);
+        let summary = whole_catalog.get(&arn).unwrap_or_else(|| {
+            panic!("case {}: the catalog must publish {arn}", row.identifier)
+        });
+        let identifier = summary["Implementation"]["Identifier"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {}: a published control states the identifier the implementing \
+                     surface knows it by, got {summary:?}",
+                    row.identifier
+                )
+            });
+
+        // The identifier filter, over the whole selection and then one control per page, so
+        // the record is read on a page of its own as well as beside the controls the filter
+        // selected with it.
+        let body =
+            format!(r#"{{"Filter":{{"Implementations":{{"Identifiers":["{identifier}"]}}}}}}"#);
+        let requests = [(None, body.clone()), (Some(1u32), body)];
+
+        for (page_size, body) in &requests {
+            let selected = listing_by_arn(&emulator, *page_size, body).await;
+            let case = format!("{} {body} maxResults={page_size:?}", row.identifier);
+            let control = selected
+                .get(&arn)
+                .unwrap_or_else(|| panic!("case {case}: the filter must select {arn}"));
+            assert_published_record(&case, control, row);
+            // The filter narrows to what it names, so the selection holds no control the
+            // implementing surface knows by another identifier: without this the test would
+            // pass against a filter that ignored its input.
+            for (selected_arn, selected_control) in &selected {
+                assert_eq!(
+                    selected_control["Implementation"]["Identifier"].as_str(),
+                    Some(identifier),
+                    "case {case}: the identifier filter must select only controls that \
+                     surface implements, got {selected_arn} with {:?}",
+                    selected_control["Implementation"]
+                );
+            }
         }
     }
 }

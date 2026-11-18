@@ -1349,8 +1349,8 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         name: "Checks if Amazon Relational Database Service (Amazon RDS) DB snapshots are \
                encrypted",
         description: "Checks if Amazon Relational Database Service (Amazon RDS) DB \
-                      snapshots are encrypted. The rule is NON_COMPLIANT if the snapshot \
-                      is not encrypted.",
+                      snapshots are encrypted. The rule is NON_COMPLIANT if the Amazon \
+                      RDS DB snapshots are not encrypted.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
@@ -1453,13 +1453,12 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "elbv2-acm-certificate-required",
-        name: "Checks if Application Load Balancers and Network Load Balancers have \
-               listeners that are configured to use certificates from AWS Certificate \
-               Manager",
+        name: "Checks if Application Load Balancers and Network Load Balancers are \
+               configured to use certificates from Amazon Certificate Manager (ACM)",
         description: "Checks if Application Load Balancers and Network Load Balancers \
-                      have listeners that are configured to use certificates from AWS \
-                      Certificate Manager. The rule is NON_COMPLIANT if a listener uses \
-                      a certificate that AWS Certificate Manager does not issue.",
+                      are configured to use certificates from Amazon Certificate Manager \
+                      (ACM). This rule is NON_COMPLIANT if at least 1 load balancer is \
+                      configured without a certificate from ACM.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
@@ -1497,12 +1496,11 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "cloud-trail-cloud-watch-logs-enabled",
-        name: "Checks whether AWS CloudTrail trails are configured to send logs to Amazon \
-               CloudWatch Logs",
-        description: "Checks whether AWS CloudTrail trails are configured to send logs to \
-                      Amazon CloudWatch Logs. The rule is NON_COMPLIANT if a trail does \
-                      not deliver to a CloudWatch Logs log group, or if its last delivery \
-                      is older than the age the rule's input parameter allows.",
+        name: "Checks if AWS CloudTrail trails are configured to send logs to CloudWatch \
+               logs",
+        description: "Checks if AWS CloudTrail trails are configured to send logs to \
+                      CloudWatch logs. The trail is NON_COMPLIANT if the \
+                      CloudWatchLogsLogGroupArn property of the trail is empty.",
         behavior: DETECTIVE,
         severity: LOW,
         implementation_type: CONFIG_RULE,
@@ -1648,10 +1646,10 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "redshift-cluster-public-access-check",
-        name: "Checks whether Amazon Redshift clusters are not publicly accessible",
-        description: "Checks whether Amazon Redshift clusters are not publicly \
-                      accessible. The rule is NON_COMPLIANT if the publiclyAccessible \
-                      field of the cluster configuration is true.",
+        name: "Detect whether Amazon Redshift clusters are blocked from public access",
+        description: "Detects whether Amazon Redshift clusters are blocked from public \
+                      access. The rule is NON_COMPLIANT if the publiclyAccessible field \
+                      is true in the cluster configuration item.",
         behavior: DETECTIVE,
         severity: CRITICAL,
         implementation_type: CONFIG_RULE,
@@ -1668,11 +1666,11 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "sagemaker-notebook-no-direct-internet-access",
-        name: "Checks whether direct internet access is disabled for an Amazon SageMaker \
-               notebook instance",
-        description: "Checks whether direct internet access is disabled for an Amazon \
-                      SageMaker notebook instance. The rule is NON_COMPLIANT if the \
-                      notebook instance reaches the internet directly.",
+        name: "Detect whether an Amazon SageMaker notebook instance allows direct \
+               internet access",
+        description: "Detects whether direct internet access is allowed for an Amazon \
+                      SageMaker notebook instance. The rule is NON_COMPLIANT if Amazon \
+                      SageMaker notebook instances allow direct internet access.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: CONFIG_RULE,
@@ -1690,10 +1688,10 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "ebs-snapshot-public-restorable-check",
         name: "Detect whether Amazon EBS snapshots are restorable by all AWS accounts",
-        description: "Checks whether Amazon Elastic Block Store (Amazon EBS) snapshots \
-                      are not publicly restorable. The rule is NON_COMPLIANT if an \
-                      Amazon EBS snapshot is restorable by all Amazon Web Services \
-                      accounts.",
+        description: "Detects whether all AWS accounts have access to restore Amazon EBS \
+                      snapshots. The rule is NON_COMPLIANT if any snapshots have the \
+                      RestorableByUserIds field set to the value All. In that case, the \
+                      Amazon EBS snapshots are public.",
         behavior: DETECTIVE,
         severity: CRITICAL,
         implementation_type: CONFIG_RULE,
@@ -1739,10 +1737,12 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "secretsmanager-rotation-enabled-check",
-        name: "Checks if AWS Secrets Manager secrets have rotation enabled",
-        description: "Checks if AWS Secrets Manager secrets have rotation enabled. The \
-                      rule is NON_COMPLIANT if the secret does not have rotation \
-                      enabled.",
+        name: "Checks whether AWS Secret Manager secret has rotation enabled",
+        description: "Checks whether AWS Secret Manager secret has rotation enabled. If \
+                      the maximumAllowedRotationFrequency or the \
+                      maximumAllowedRotationFrequencyInHours parameter is specified, the \
+                      rotation frequency of the secret is compared with the maximum \
+                      allowed frequency.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
@@ -1806,13 +1806,12 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "root-account-hardware-mfa-enabled",
-        name: "Checks whether your Amazon Web Services account is enabled to use a \
-               hardware multi-factor authentication (MFA) device to sign in with root \
-               credentials",
-        description: "Checks whether your Amazon Web Services account is enabled to use a \
-                      hardware multi-factor authentication (MFA) device to sign in with \
-                      root credentials. The rule is NON_COMPLIANT if no hardware MFA \
-                      device is enabled for the root user.",
+        name: "Checks if your AWS account is enabled to use multi-factor authentication \
+               (MFA) hardware device to sign in with root credentials",
+        description: "Checks if your AWS account is enabled to use multi-factor \
+                      authentication (MFA) hardware device to sign in with root \
+                      credentials. The rule is NON_COMPLIANT if any virtual MFA devices \
+                      are permitted for signing in with root credentials.",
         behavior: DETECTIVE,
         severity: CRITICAL,
         implementation_type: CONFIG_RULE,
@@ -1833,12 +1832,12 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "iam-policy-no-statements-with-admin-access",
-        name: "Checks whether the default version of Amazon Web Services Identity and \
-               Access Management (IAM) policies do not have administrator access",
-        description: "Checks whether the default version of Amazon Web Services Identity \
-                      and Access Management (IAM) policies do not have administrator \
-                      access. The rule is NON_COMPLIANT if the policy's default version \
-                      allows every action on every resource.",
+        name: "Checks whether the default version of AWS Identity and Access Management \
+               (IAM) policies do not have administrator access",
+        description: "Checks whether the default version of AWS Identity and Access \
+                      Management (IAM) policies do not have administrator access. If any \
+                      statement has \"Effect\": \"Allow\" with \"Action\": \"*\" over \
+                      \"Resource\": \"*\", the rule is non-compliant.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: CONFIG_RULE,
@@ -1856,10 +1855,8 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "restricted-common-ports",
         name: "Disallow Internet connection via RDP",
-        description: "Checks whether the security groups in use do not allow unrestricted \
-                      incoming TCP traffic to the specified ports. The rule is \
-                      NON_COMPLIANT if a security group allows inbound traffic from any \
-                      address to a port the rule's input parameters name.",
+        description: "Reduces a server's exposure to risk by removing unfettered \
+                      connectivity to remote console services such as RDP.",
         behavior: DETECTIVE,
         severity: CRITICAL,
         implementation_type: CONFIG_RULE,
@@ -2351,37 +2348,39 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
     PublishedCatalogRecord {
         slug: "ebs-snapshot-public-restorable-check",
         identifier: "87qo8rsoettjrxjevmjqcw1tu",
-        release_time: None,
+        release_time: Some(1_638_316_800),
     },
     PublishedCatalogRecord {
         slug: "cloud-trail-cloud-watch-logs-enabled",
         identifier: "9vnj728czsv4m6pflfqt21bw2",
-        release_time: None,
+        release_time: Some(1_540_166_400),
     },
     PublishedCatalogRecord {
         slug: "elbv2-acm-certificate-required",
         identifier: "aazzef7lptl5umta6690p6u5c",
-        release_time: None,
+        release_time: Some(1_594_771_200),
     },
     PublishedCatalogRecord {
         slug: "iam-policy-no-statements-with-admin-access",
         identifier: "byrg7iwyl4azhecyhqtq8ocw1",
-        release_time: None,
+        release_time: Some(1_537_228_800),
     },
     PublishedCatalogRecord {
         slug: "rds-snapshot-encrypted",
         identifier: "84hd48gyrb6e5ribkmsoub44c",
-        release_time: None,
+        release_time: Some(1_590_364_800),
     },
     PublishedCatalogRecord {
         slug: "redshift-cluster-public-access-check",
         identifier: "1oxkwnc4hwhi2ndv6ekwy7np7",
-        release_time: None,
+        // Released together with `sagemaker-notebook-no-direct-internet-access` below, so
+        // the catalog dates both controls with this one instant.
+        release_time: Some(1_638_230_400),
     },
     PublishedCatalogRecord {
         slug: "restricted-common-ports",
         identifier: "df2ta5ytg2zatj1q7y5e09u32",
-        release_time: None,
+        release_time: Some(1_542_240_000),
     },
     PublishedCatalogRecord {
         slug: "root-account-hardware-mfa-enabled",
@@ -2391,12 +2390,17 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
     PublishedCatalogRecord {
         slug: "sagemaker-notebook-no-direct-internet-access",
         identifier: "66gfl06uj1v999z53szvu0exa",
-        release_time: None,
+        // The instant it shares with `redshift-cluster-public-access-check` above.
+        release_time: Some(1_638_230_400),
     },
     PublishedCatalogRecord {
         slug: "secretsmanager-rotation-enabled-check",
         identifier: "4tf01viblttjxqhu35yz90vw1",
-        release_time: None,
+        // The catalog dates this control with the same instant as the other most recently
+        // released controls it records one for (see `acm-pca-certificate-authority-tagged`
+        // and `securityhub-config-1`): one instant for one release, later than the
+        // instants above because the catalog released these controls later.
+        release_time: Some(1_779_840_000),
     },
     // The AWS Config-implemented controls the catalog publishes under a `CONFIG.…`
     // designator and the Control Tower controls an AWS Config managed rule implements,
