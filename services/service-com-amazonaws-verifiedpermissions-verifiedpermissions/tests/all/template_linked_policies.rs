@@ -904,3 +904,227 @@ async fn a_client_token_replay_does_not_create_a_second_linked_policy() {
         );
     }
 }
+
+/// Create one policy template per row in `store_id`, in the order given, and
+/// return their ids. Every create must succeed, so the rows handed here are text
+/// the store's settings at that moment accept.
+async fn templates_in(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    store_id: &str,
+    rows: &[Template],
+) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for row in rows {
+        ids.push(template_of(router, store_id, row).await);
+    }
+    ids
+}
+
+/// A policy store whose validation mode is `STRICT` while it holds no schema
+/// refuses exactly the submissions `ValidationSettings$mode` enumerates — "all
+/// static policies and policy templates" — and a `templateLinked` definition
+/// submits neither: it carries a reference to a template the store already holds
+/// plus the entities to bind, so it is instantiated with nothing to validate it
+/// against, exactly as it would be in a store that validates nothing.
+///
+/// The rows span both ways that state is reached after a template is already in
+/// the store (switching a store that validated nothing to `STRICT`, and deleting
+/// a `STRICT` store's schema by putting the empty document) crossed with the ways
+/// a template's scope can use its placeholders ([`TEMPLATES`]), and each route
+/// also asserts the two submissions the rule DOES refuse in that same state, so
+/// the boundary is pinned from both sides.
+#[tokio::test]
+async fn a_strict_store_with_no_schema_still_instantiates_a_policy_template() {
+    let router = router();
+
+    // Route 1: the templates go in while the store validates nothing, and the
+    // store is then switched to STRICT — which requires no schema.
+    let switched = crate::harness::store_with_mode(&router, "OFF").await;
+    let switched_templates = templates_in(&router, &switched, TEMPLATES).await;
+    ok(
+        &router,
+        "UpdatePolicyStore",
+        &json!({
+            "policyStoreId": &switched,
+            "validationSettings": { "mode": "STRICT" },
+        }),
+    )
+    .await;
+
+    // Route 2: a STRICT store that HAD a schema while its template was created,
+    // whose schema is then deleted by putting the empty document. Only a template
+    // the schema sanctions can be created in that window, so this route carries
+    // the sanctioned row alone.
+    let sanctioned = &TEMPLATES[..1];
+    let deleted = crate::harness::store_with_mode(&router, "STRICT").await;
+    ok(
+        &router,
+        "PutSchema",
+        &json!({
+            "policyStoreId": &deleted,
+            "definition": { "cedarJson": photo_app_schema() },
+        }),
+    )
+    .await;
+    let deleted_templates = templates_in(&router, &deleted, sanctioned).await;
+    ok(
+        &router,
+        "PutSchema",
+        &json!({
+            "policyStoreId": &deleted,
+            "definition": { "cedarJson": "{}" },
+        }),
+    )
+    .await;
+
+    let routes: Vec<(&str, &String, &[Template], Vec<String>)> = vec![
+        (
+            "a store switched to STRICT after its templates were created",
+            &switched,
+            TEMPLATES,
+            switched_templates,
+        ),
+        (
+            "a STRICT store whose schema was deleted after its template was created",
+            &deleted,
+            sanctioned,
+            deleted_templates,
+        ),
+    ];
+
+    for (route, store_id, rows, template_ids) in &routes {
+        for (row, template_id) in rows.iter().zip(template_ids.iter()) {
+            let case = format!("{route}: {}", row.case);
+            let (status, created) = call(
+                &router,
+                "CreatePolicy",
+                &json!({
+                    "policyStoreId": store_id,
+                    "definition": definition(template_id, row),
+                }),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a link submits no Cedar text, so this state must not refuse \
+                 it, got {status} {created}"
+            );
+            assert_eq!(
+                created["policyType"].as_str(),
+                Some("TEMPLATE_LINKED"),
+                "case {case:?}: expected policyType TEMPLATE_LINKED, got {created}"
+            );
+            assert_eq!(
+                entity(&created["principal"]),
+                row.principal.and_then(owned),
+                "case {case:?}: unexpected principal in {created}"
+            );
+            assert_eq!(
+                entity(&created["resource"]),
+                row.resource.and_then(owned),
+                "case {case:?}: unexpected resource in {created}"
+            );
+            assert_eq!(
+                actions(&created["actions"]),
+                row.actions
+                    .iter()
+                    .map(|(t, i)| (t.to_string(), i.to_string()))
+                    .collect::<Vec<_>>(),
+                "case {case:?}: unexpected actions in {created}"
+            );
+            assert_eq!(
+                created["effect"].as_str(),
+                Some(row.effect),
+                "case {case:?}: expected effect {:?}, got {created}",
+                row.effect
+            );
+
+            // The round trip: the link really reached state, with the template it
+            // follows and the bindings it was given.
+            let policy_id = created["policyId"].as_str().unwrap_or_default();
+            let fetched = ok(
+                &router,
+                "GetPolicy",
+                &json!({ "policyStoreId": store_id, "policyId": policy_id }),
+            )
+            .await;
+            assert_eq!(
+                fetched["definition"]["templateLinked"]["policyTemplateId"].as_str(),
+                Some(template_id.as_str()),
+                "case {case:?}: the stored link must name the template it follows, got {fetched}"
+            );
+            assert_eq!(
+                entity(&fetched["definition"]["templateLinked"]["principal"]),
+                row.binds_principal.then(|| owned(PRINCIPAL)).flatten(),
+                "case {case:?}: the stored link must report the bound principal, got {fetched}"
+            );
+            assert_eq!(
+                entity(&fetched["definition"]["templateLinked"]["resource"]),
+                row.binds_resource.then(|| owned(RESOURCE)).flatten(),
+                "case {case:?}: the stored link must report the bound resource, got {fetched}"
+            );
+        }
+
+        // The other side of the boundary, in the very same state: the two
+        // submissions the rule enumerates are still refused, naming the store.
+        let refused: [(&str, &str, Value, &str); 2] = [
+            (
+                "a static policy",
+                "CreatePolicy",
+                json!({
+                    "policyStoreId": store_id,
+                    "definition": {
+                        "static": {
+                            "statement": crate::store_validation_settings::CONFORMANT_POLICY,
+                        },
+                    },
+                }),
+                "a policy",
+            ),
+            (
+                "a policy template",
+                "CreatePolicyTemplate",
+                json!({
+                    "policyStoreId": store_id,
+                    "statement": crate::store_validation_settings::CONFORMANT_TEMPLATE,
+                }),
+                "a policy template",
+            ),
+        ];
+        for (submission, operation, request, noun) in &refused {
+            let case = format!("{route}: {submission}");
+            let (status, body) = call(&router, operation, request).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {case:?}: expected a ValidationException, got {body}"
+            );
+            assert_eq!(
+                crate::harness::field_list(&body),
+                vec![(
+                    "/policyStoreId".to_string(),
+                    crate::store_validation_settings::no_schema_reason(noun),
+                )],
+                "case {case:?}: expected the store to be named at fault, got {body}"
+            );
+        }
+
+        // Exactly the links that were accepted are in the store: every refusal
+        // above stored nothing.
+        let listed = ok(
+            &router,
+            "ListPolicies",
+            &json!({ "policyStoreId": store_id }),
+        )
+        .await;
+        assert_eq!(
+            listed["policies"].as_array().map(Vec::len),
+            Some(rows.len()),
+            "case {route:?}: only the instantiated links may be stored, got {listed}"
+        );
+    }
+}

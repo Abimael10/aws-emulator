@@ -324,24 +324,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::cedar::check_statement_size(&def.statement).map_err(invalid)?;
         }
 
-        // What the store's validation settings say this policy is checked
-        // against — `None` when the store validates nothing, and the refusal a
-        // STRICT store with no schema raises. The rule lives on the store, so
-        // every write handler that validates Cedar asks it the same way.
-        let schema_json = store
-            .schema_to_validate_against(crate::state::ValidatedContent::Policy)
-            .map_err(invalid)?;
-
         // The effect and the scope are properties of the Cedar this definition
         // resolves to, so they come from Cedar: the parser for a `static`
         // definition, and the real template LINK for a `templateLinked` one.
         // What the policy persists differs by arm — a static policy holds its own
         // text, a link holds the template it follows and the entities it bound —
         // and nothing else below depends on which arm it was.
+        //
+        // What the store's validation settings say the policy is checked against
+        // is asked PER ARM, because the two arms submit different things. Only a
+        // `static` definition SUBMITS Cedar text, so only it is refused by a
+        // store whose mode is STRICT while it holds no schema
+        // ([`crate::state::PolicyStore::schema_to_validate_against`]); a
+        // `templateLinked` definition submits no Cedar text at all — it
+        // instantiates a template this store already accepted — so in that state
+        // it is validated against nothing
+        // ([`crate::state::PolicyStore::validation_schema`]).
         let (policy_type, statement, description, template_link, scope) =
             match &input.definition {
                 PolicyDefinition::Static(def) => {
-                    if let Some(schema_json) = schema_json {
+                    if let Some(schema_json) = store
+                        .schema_to_validate_against(crate::state::ValidatedContent::Policy)
+                        .map_err(invalid)?
+                    {
                         crate::state::cedar::validate_static_policy(schema_json, &def.statement)
                             .map_err(refused)?;
                     }
@@ -382,7 +387,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let scope = crate::state::cedar::link_template(
                         &template.statement,
                         &link,
-                        schema_json,
+                        store.validation_schema(),
                     )
                     .map_err(refused)?;
                     ("TEMPLATE_LINKED", None, None, Some(link), scope)
