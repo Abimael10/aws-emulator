@@ -178,7 +178,7 @@ impl DueRun {
     /// `EvaluationJobArn`, which is part of where a job's results live.
     #[must_use]
     pub fn job_id(&self) -> &str {
-        self.arn.rsplit('/').next().unwrap_or(self.arn.as_str())
+        crate::state::evaluation_job_id_of(&self.arn)
     }
 }
 

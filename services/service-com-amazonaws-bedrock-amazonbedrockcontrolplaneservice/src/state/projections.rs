@@ -521,6 +521,29 @@ pub fn evaluation_job_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn("bedrock", region, &format!("evaluation-job/{id}"))
 }
 
+/// The BARE evaluation-job id an `EvaluationJobArn` is addressed by: the resource-id
+/// segment that ARN's `evaluation-job/` resource type is followed by, which is the id
+/// [`evaluation_job_arn`] built it from.
+///
+/// Anchored on the resource type, the way the other identifier readers of this module are
+/// ([`guardrail_id_of`], [`base_model_id_of`]), so the trailing segment of some other ARN
+/// form is not mistaken for a job id. A TOTAL read of the value — `rsplit_once` answering
+/// `None` rather than panicking, in which case the value is read as the id itself, which is
+/// what an `EvaluationJobIdentifier` carrying no resource type can only be — so nothing a
+/// caller can send reaches a panic here.
+///
+/// Lives here rather than in one operation's file because everything that reports a job's
+/// identity as an id rather than as an ARN reads the same segment out of the same ARN: the
+/// acceptance items of a batch delete, and the prefix a run's results are saved under
+/// ([`evaluation_run::DueRun::job_id`]).
+#[must_use]
+pub fn evaluation_job_id_of(identifier: &str) -> &str {
+    match identifier.rsplit_once(":evaluation-job/") {
+        Some((_, id)) => id,
+        None => identifier,
+    }
+}
+
 /// The ARN of an advanced prompt optimization job in `region`:
 /// `arn:aws:bedrock:<region>:<account>:advanced-prompt-optimization-job/<id>`, as
 /// `AdvancedPromptOptimizationJobArn`

@@ -119,6 +119,19 @@ pub fn label(identifier: &str) -> String {
         .replace('/', "%2F")
 }
 
+/// The bare resource id the ARN `arn` carries: the segment after its last `/`.
+///
+/// The suites' OWN reading of the id inside an identifier, written from the ARN shapes the
+/// model spells rather than taken from the handlers, so a row asserting that a response
+/// reports an id rather than an identifier checks the rule and not the implementation.
+/// Here rather than in one suite because several of them read the same segment.
+pub fn job_id_of(arn: &str) -> String {
+    arn.rsplit_once('/')
+        .unwrap_or_else(|| panic!("{arn:?} must be an ARN carrying its resource id last"))
+        .1
+        .to_string()
+}
+
 /// The `FoundationModelArn` of the base model `model_id` in `region`: a foundation model is
 /// published by AWS rather than owned by the account reading it, so the ARN carries an
 /// EMPTY account field
@@ -546,6 +559,34 @@ pub fn age_model_customization_job(emu: &Emulator, arn: &str, by: Duration) {
     job.created_at -= by;
     job.last_modified_at -= by;
     for due in [&mut job.completed_due_at, &mut job.stopped_due_at] {
+        if let Some(instant) = due.as_mut() {
+            *instant -= by;
+        }
+    }
+}
+
+/// Age the stored evaluation job `arn` names by `by`, as though it had been submitted that
+/// much earlier: its own timeline is untouched and only how much of it has elapsed changes,
+/// so a rule about a span of wall-clock time needs no sleep.
+///
+/// Beside [`age_model_customization_job`] for the reason that one is here: ONE shift of a
+/// job's instants is what keeps the suites that age this record from drifting apart when
+/// [`bedrock::state::EvaluationJobRecord`] gains another due instant.
+pub fn age_evaluation_job(emu: &Emulator, arn: &str, by: Duration) {
+    let state = bedrock::state::service_state(&*emu.engine)
+        .expect("the shared engine carries this service's store");
+    let mut store = state.lock();
+    let job = store
+        .evaluation_jobs
+        .get_mut(arn)
+        .unwrap_or_else(|| panic!("the store must hold the evaluation job {arn}"));
+    job.created_at -= by;
+    job.last_modified_at -= by;
+    for due in [
+        &mut job.completed_due_at,
+        &mut job.stopped_due_at,
+        &mut job.deleted_due_at,
+    ] {
         if let Some(instant) = due.as_mut() {
             *instant -= by;
         }

@@ -7,8 +7,8 @@
 //! Deletes the evaluation jobs the `jobIdentifiers` ARNs name. A job is deletable only in a
 //! terminal status ([`crate::state::EVALUATION_JOB_DELETABLE_STATUSES`]), so a request that
 //! names one in any other status is refused with `ValidationException` and deletes none of
-//! them; every accepted job moves to `Deleting` and is reported under `evaluationJobs` with
-//! that status, and the clock owes it its removal from the store
+//! them; every accepted job moves to `Deleting` and is reported under `evaluationJobs` by
+//! its BARE job id with that status, and the clock owes it its removal from the store
 //! ([`crate::state::EVALUATION_JOB_DELETED_AFTER`]), after which `GetEvaluationJob` no
 //! longer finds it. An identifier no stored job answers to deletes nothing, so it is
 //! reported per job under `errors`.
@@ -230,10 +230,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the job is reported `Deleting` from here onwards and the clock owes it
                 // its removal. What the caller is told is read back out of the STORED
                 // record, so it is exactly what a later `GetEvaluationJob` finds.
+                //
+                // The accepted item reports the job's identity as its BARE id — the
+                // resource-id segment of the job's ARN
+                // ([`crate::state::evaluation_job_id_of`]) — which is what Amazon Bedrock
+                // answers here, and not the identifier the request supplied echoed back.
+                // The sibling `errors` branch below reports the ARN, as its own member
+                // documents ("The ARN of the evaluation job being deleted").
                 Some(job) => {
                     job.delete(now);
                     evaluation_jobs.push(BatchDeleteEvaluationJobItem {
-                        job_identifier: job.arn.clone(),
+                        job_identifier: crate::state::evaluation_job_id_of(&job.arn).to_string(),
                         job_status: job.status.to_string(),
                     });
                 }

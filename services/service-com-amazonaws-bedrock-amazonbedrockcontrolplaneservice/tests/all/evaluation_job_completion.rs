@@ -38,7 +38,8 @@ use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 use bedrock::state::EvaluationJobRecord;
 
 use crate::support::{
-    emulator, label, wall_clock_seconds, Emulator, Reply, ACCOUNT, REGION,
+    age_evaluation_job as age, emulator, job_id_of, label, wall_clock_seconds, Emulator, Reply,
+    ACCOUNT, REGION,
 };
 
 // ---------------------------------------------------------------------------------------
@@ -209,26 +210,6 @@ fn stored(emu: &Emulator, arn: &str) -> EvaluationJobRecord {
         .get(arn)
         .cloned()
         .unwrap_or_else(|| panic!("the store must hold the created job {arn}"))
-}
-
-/// Age the stored job `arn` names by `by`, as though it had been created that much earlier:
-/// its own timeline is untouched and only how much of it has elapsed changes, so a rule
-/// about a span of wall-clock time needs no sleep.
-fn age(emu: &Emulator, arn: &str, by: Duration) {
-    let state = bedrock::state::service_state(&*emu.engine)
-        .expect("the shared engine carries this service's store");
-    let mut store = state.lock();
-    let job = store
-        .evaluation_jobs
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("the store must hold the created job {arn}"));
-    job.created_at -= by;
-    job.last_modified_at -= by;
-    for due in [&mut job.completed_due_at, &mut job.stopped_due_at] {
-        if let Some(instant) = due.as_mut() {
-            *instant -= by;
-        }
-    }
 }
 
 /// A read's body with every member the CLOCK bears on removed — the status the move is
@@ -512,11 +493,14 @@ async fn a_completed_evaluation_job_is_terminal() {
             "case {case:?}: BatchDeleteEvaluationJob is modelled @http(code: 202), got {} {:?}",
             deleted.status, deleted.body
         );
+        // The accepted item reports the job's BARE id — the resource-id segment of its ARN
+        // — which is what Amazon Bedrock answers under `evaluationJobs[].jobIdentifier`.
+        let job_id = job_id_of(&arn);
         assert_eq!(
             deleted.get("evaluationJobs"),
-            json!([{ "jobIdentifier": arn, "jobStatus": DELETING }]),
-            "case {case:?}: a completed job is accepted for deletion and reported {DELETING}, \
-             got {:?}",
+            json!([{ "jobIdentifier": job_id, "jobStatus": DELETING }]),
+            "case {case:?}: a completed job is accepted for deletion and reported {DELETING} \
+             by its bare job id, got {:?}",
             deleted.body
         );
     }

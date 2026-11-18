@@ -11,7 +11,11 @@
 //!    modelled 202, reports every job it accepted under `evaluationJobs` with the
 //!    `Deleting` status, reports nothing under `errors`, and the stored job is `Deleting`
 //!    from that call onwards — over batches differing in size (one, three, the same ARN
-//!    twice) and in the region they address.
+//!    twice) and in the region they address. Each accepted job is reported by its BARE job
+//!    id — the resource-id segment of its ARN, the `[a-z0-9]{12}` id the ARN the request
+//!    named ends in — so a caller can correlate the item with the job it submitted and
+//!    rebuild that job's ARN from it, while the sibling `errors[].jobIdentifier` carries
+//!    the ARN, as its own member documents ("The ARN of the evaluation job being deleted").
 //! 2. **The `Deleting` status is owed the job's REMOVAL by the clock**: once
 //!    `EVALUATION_JOB_DELETED_AFTER` has passed the job is gone, so a read of its ARN is
 //!    refused with 404 `ResourceNotFoundException` and its `jobName` is free for a new job.
@@ -28,7 +32,9 @@
 
 use serde_json::{json, Value};
 
-use crate::support::{emulator, label, Emulator, Reply, ACCOUNT, REGION};
+use crate::support::{
+    age_evaluation_job, emulator, job_id_of as job_id, label, Emulator, Reply, ACCOUNT, REGION,
+};
 
 // ---------------------------------------------------------------------------------------
 // Values the model admits, and the spans the handlers hold.
@@ -58,9 +64,9 @@ const STOP_SPAN: std::time::Duration =
 const DELETE_SPAN: std::time::Duration =
     service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::EVALUATION_JOB_DELETED_AFTER;
 
-/// A little past a span, so a test that asserts what the clock owes asks for it after the
-/// instant it was owed at.
-const SETTLE_SLACK: std::time::Duration = std::time::Duration::from_millis(150);
+/// How much past a span a record is aged, so a row that asserts what the clock owes reads
+/// it strictly after the instant it was owed at.
+const PAST_THE_DUE_INSTANT: std::time::Duration = std::time::Duration::from_millis(150);
 
 // ---------------------------------------------------------------------------------------
 // Request helpers.
@@ -151,6 +157,11 @@ async fn batch_delete(emu: &Emulator, identifiers: &[String]) -> Reply {
 /// Walk a job to the terminal [`STOPPED`] status: a caller stops it and the clock owes the
 /// move. The only terminal status this emulator mints — reaching `Completed` or `Failed`
 /// would mean the inference and the metric computation ran.
+///
+/// The move the clock owes is reached by AGEING the stored record past the instant it was
+/// owed at ([`age_evaluation_job`]) rather than by waiting for that instant: the job's own
+/// timeline is untouched and only how much of it has elapsed changes, so what the read
+/// reports does not depend on how fast the host runs.
 async fn given_stopped_job(emu: &Emulator, region: &str, job_name: &str) -> String {
     let arn = given_job(emu, region, job_name).await;
     let stopped = stop_in_region(emu, region, &arn).await;
@@ -159,7 +170,7 @@ async fn given_stopped_job(emu: &Emulator, region: &str, job_name: &str) -> Stri
         "case {job_name:?}: the stop that seeds this row must be accepted, got {} {:?}",
         stopped.status, stopped.body
     );
-    tokio::time::sleep(STOP_SPAN + SETTLE_SLACK).await;
+    age_evaluation_job(emu, &arn, STOP_SPAN + PAST_THE_DUE_INSTANT);
     let read = get_in_region(emu, region, &arn).await;
     assert_eq!(
         read.get("status"),
@@ -273,10 +284,11 @@ async fn a_batch_delete_accepts_every_job_in_a_terminal_status() {
             "case {case:?}: BatchDeleteEvaluationJob is modelled @http(code: 202), got {} {:?}",
             reply.status, reply.body
         );
-        // The same ARN twice names one job, so the batch reports it ONCE.
+        // The same ARN twice names one job, so the batch reports it ONCE — by its bare id
+        // (rule 1a, asserted on its own below).
         let expected: Vec<(String, String)> = arns
             .iter()
-            .map(|arn| (arn.clone(), DELETING.to_string()))
+            .map(|arn| (job_id(arn), DELETING.to_string()))
             .collect();
         assert_eq!(
             accepted(&reply),
@@ -306,8 +318,11 @@ async fn a_batch_delete_accepts_every_job_in_a_terminal_status() {
     }
 
     // 2. The removal is owed by the CLOCK: once the span has passed the job is gone, so its
-    // ARN names nothing.
-    tokio::time::sleep(DELETE_SPAN + SETTLE_SLACK).await;
+    // ARN names nothing. The record is aged past the instant the removal was owed at rather
+    // than waited on, so the row does not depend on how fast the host runs.
+    for (_, _, arn) in &deleted {
+        age_evaluation_job(&emu, arn, DELETE_SPAN + PAST_THE_DUE_INSTANT);
+    }
     for (case, region, arn) in &deleted {
         let read = get_in_region(&emu, region, arn).await;
         assert_eq!(
@@ -443,7 +458,7 @@ async fn a_job_that_is_not_in_a_terminal_status_cannot_be_deleted() {
         );
         assert_eq!(
             accepted(&alone),
-            vec![(bystander.clone(), DELETING.to_string())],
+            vec![(job_id(&bystander), DELETING.to_string())],
             "case {case:?}: the deletable job alone is reported {DELETING}, got {:?}",
             alone.body
         );
@@ -459,11 +474,7 @@ async fn an_identifier_no_stored_job_answers_to_is_reported_per_job() {
     let emu = emulator();
 
     let live = given_stopped_job(&emu, REGION, "deletable-job").await;
-    let live_id = live
-        .rsplit_once('/')
-        .expect("an evaluation-job ARN carries its id after the slash")
-        .1
-        .to_string();
+    let live_id = job_id(&live);
 
     // The rows a well-formed `EvaluationJobIdentifier` can name no stored job through: an
     // id that was never minted, the live id under another account, and the live id under
@@ -517,7 +528,7 @@ async fn an_identifier_no_stored_job_answers_to_is_reported_per_job() {
     );
     assert_eq!(
         accepted(&mixed),
-        vec![(live.clone(), DELETING.to_string())],
+        vec![(job_id(&live), DELETING.to_string())],
         "case a mixed batch: the live job is accepted for deletion, got {:?}",
         mixed.body
     );
@@ -530,4 +541,118 @@ async fn an_identifier_no_stored_job_answers_to_is_reported_per_job() {
         "case a mixed batch: every unknown ARN is reported under errors, got {:?}",
         mixed.body
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// 1a. An accepted job is reported by its bare job id.
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_accepted_job_is_reported_by_its_bare_job_id() {
+    let emu = emulator();
+
+    // The rows differ along what the rule generalises over: how many jobs one batch names,
+    // whether the same job is named twice, the region the batch addresses, and whether the
+    // batch also names an identifier no stored job answers to.
+    let rows: Vec<(&str, &str, usize, bool, bool)> = vec![
+        ("one job", REGION, 1, false, false),
+        ("three jobs in one batch", REGION, 3, false, false),
+        ("the same job named twice", REGION, 1, true, false),
+        ("two jobs in another region", "eu-central-1", 2, false, false),
+        ("a job beside an unknown ARN", REGION, 1, false, true),
+    ];
+
+    // A well-formed `EvaluationJobIdentifier` that names no stored job, so the row that
+    // carries it exercises the sibling `errors` member beside the accepted items.
+    let unknown = format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:evaluation-job/cccccccccccc");
+
+    for (case, region, count, repeat, with_unknown) in rows {
+        let mut arns: Vec<String> = Vec::new();
+        for index in 0..count {
+            let job_name = format!("bare-id-{}-{index}", case.replace(' ', "-").to_lowercase());
+            arns.push(given_stopped_job(&emu, region, &job_name).await);
+        }
+
+        let mut sent: Vec<String> = if repeat {
+            vec![arns[0].clone(), arns[0].clone()]
+        } else {
+            arns.clone()
+        };
+        if with_unknown {
+            sent.push(unknown.clone());
+        }
+        let reply = batch_delete_in_region(&emu, region, &sent).await;
+
+        assert_eq!(
+            reply.status, 202,
+            "case {case:?}: BatchDeleteEvaluationJob is modelled @http(code: 202), got {} {:?}",
+            reply.status, reply.body
+        );
+
+        // Every accepted job is reported by the resource-id segment of its ARN, in request
+        // order, with the status the delete moved it to.
+        let expected: Vec<(String, String)> = arns
+            .iter()
+            .map(|arn| (job_id(arn), DELETING.to_string()))
+            .collect();
+        assert_eq!(
+            accepted(&reply),
+            expected,
+            "case {case:?}: every accepted job is reported by its bare job id, got {:?}",
+            reply.body
+        );
+
+        for (arn, (reported, _)) in arns.iter().zip(accepted(&reply)) {
+            // The value is an id, not an identifier echoed back.
+            assert_ne!(
+                reported, *arn,
+                "case {case:?}: the accepted item carries the job's id, not the ARN the \
+                 request named, got {reported:?}"
+            );
+            // `EvaluationJobArn` admits `[a-z0-9]{12}` for that segment, so the id the
+            // emulator mints and reports is 12 of those characters.
+            assert_eq!(
+                reported.len(),
+                12,
+                "case {case:?}: a job id is the 12-character segment of its ARN, got \
+                 {reported:?}"
+            );
+            assert!(
+                reported
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "case {case:?}: a job id is lower-case alphanumeric, got {reported:?}"
+            );
+            // And the value correlates back to the job: the ARN rebuilt from it is the ARN
+            // the request named, and a read of that ARN finds the job the batch accepted.
+            let rebuilt = format!("arn:aws:bedrock:{region}:{ACCOUNT}:evaluation-job/{reported}");
+            assert_eq!(
+                rebuilt, *arn,
+                "case {case:?}: an ARN rebuilt from the reported id addresses the same job, \
+                 got {rebuilt:?}"
+            );
+            let read = get_in_region(&emu, region, &rebuilt).await;
+            assert_eq!(
+                read.get("status"),
+                json!(DELETING),
+                "case {case:?}: the job the reported id names is the one the batch accepted, \
+                 got {:?}",
+                read.body
+            );
+        }
+
+        // The sibling `errors` member documents the ARN ("The ARN of the evaluation job
+        // being deleted"), so an identifier no job answers to is reported in full.
+        let expected_errors: Vec<(String, String)> = if with_unknown {
+            vec![(unknown.clone(), "404".to_string())]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            reported_errors(&reply),
+            expected_errors,
+            "case {case:?}: a per-job error names the ARN the request supplied, got {:?}",
+            reply.body
+        );
+    }
 }
