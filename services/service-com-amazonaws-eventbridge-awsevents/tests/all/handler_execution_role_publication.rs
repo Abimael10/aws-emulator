@@ -385,9 +385,9 @@ impl Emulator {
         (signal, payload)
     }
 
-    /// A queue named `queue_name` carrying the resource policy an EventBridge delivery to it
-    /// needs; answers its url and its ARN.
-    pub(crate) async fn events_queue(&self, case: &str, queue_name: &str) -> (String, String) {
+    /// A queue named `queue_name` carrying no policy of its own; answers its url and its ARN,
+    /// as the queue itself reports them.
+    pub(crate) async fn queue(&self, case: &str, queue_name: &str) -> (String, String) {
         let created = self
             .sqs(case, "CreateQueue", &json!({ "QueueName": queue_name }))
             .await;
@@ -406,6 +406,26 @@ impl Emulator {
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: no QueueArn in {attributes}"))
             .to_string();
+        (url, arn)
+    }
+
+    /// Every message waiting on the queue at `url`, taken off it as Amazon SQS reports them —
+    /// the body and the attributes of each, read by the caller.
+    pub(crate) async fn raw_messages(&self, case: &str, url: &str) -> Vec<Value> {
+        let received = self
+            .sqs(
+                case,
+                "ReceiveMessage",
+                &json!({ "QueueUrl": url, "MaxNumberOfMessages": 10 }),
+            )
+            .await;
+        received["Messages"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// A queue named `queue_name` carrying the resource policy an EventBridge delivery to it
+    /// needs; answers its url and its ARN.
+    pub(crate) async fn events_queue(&self, case: &str, queue_name: &str) -> (String, String) {
+        let (url, arn) = self.queue(case, queue_name).await;
         let policy = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -465,14 +485,7 @@ impl Emulator {
         url: &str,
         source: &str,
     ) -> Vec<String> {
-        let received = self
-            .sqs(
-                case,
-                "ReceiveMessage",
-                &json!({ "QueueUrl": url, "MaxNumberOfMessages": 10 }),
-            )
-            .await;
-        let messages = received["Messages"].as_array().cloned().unwrap_or_default();
+        let messages = self.raw_messages(case, url).await;
         let mut markers: Vec<String> = messages
             .iter()
             .map(|message| {
