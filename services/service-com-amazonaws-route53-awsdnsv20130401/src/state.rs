@@ -955,15 +955,14 @@ pub struct StoredZone {
     pub accelerated_recovery: Option<AcceleratedRecovery>,
     /// Whether public DNS fallback is turned on for this zone — the state a
     /// hosted-zone read reports as the public-DNS fallback status inside
-    /// `Features`.
+    /// `Features`, for a zone the feature applies to.
     ///
-    /// Unlike the accelerated recovery setting beside it, this one is a state
-    /// every zone HAS: a zone is created with it off and reports that off
-    /// status, which is why it is a flag rather than an `Option`. This API
-    /// version (2013-04-01) carries no operation that turns it on, so every zone
-    /// this store holds reports it off; it is held on the zone rather than
-    /// answered as a constant by the read, so the day an operation can set it,
-    /// every hosted-zone read already reports what was set.
+    /// A zone is created with it off, and this API version (2013-04-01) carries
+    /// no operation that turns it on, so every zone this store holds reports it
+    /// off; it is held on the zone rather than answered as a constant by the
+    /// read, so the day an operation can set it, every hosted-zone read already
+    /// reports what was set. Which zones report it at all follows from the zone
+    /// itself ([`StoredZone::public_dns_fallback_status`]).
     pub public_dns_fallback_enabled: bool,
 }
 
@@ -1007,12 +1006,12 @@ impl StoredZone {
     /// deserialising `HostedZone` into a strict shape always finds the member,
     /// and "no feature configured" is distinguishable from "not reported". Its
     /// MEMBERS are what the zone's state decides, one child per feature status
-    /// the zone HOLDS: the public-DNS fallback status is reported on every zone,
-    /// because every zone has the feature either on or off (see
-    /// [`StoredZone::public_dns_fallback_status`]), while
+    /// the zone HOLDS: the public-DNS fallback status on a zone the feature
+    /// applies to (see [`StoredZone::public_dns_fallback_status`]), while
     /// `AcceleratedRecoveryStatus` has no status until
     /// `UpdateHostedZoneFeatures` has configured the zone and `FailureReasons`
-    /// stays absent because no features change this store accepts fails.
+    /// stays absent because no features change this store accepts fails. A zone
+    /// holding neither therefore reports the container empty.
     pub fn to_hosted_zone_features(&self) -> HostedZoneFeatures {
         HostedZoneFeatures {
             accelerated_recovery_status: self
@@ -1020,25 +1019,38 @@ impl StoredZone {
                 .as_ref()
                 .map(|feature| feature.status().to_string()),
             failure_reasons: None,
-            // A state every zone has, so every zone reports it: see
+            // Reported only where the feature applies: see
             // [`StoredZone::public_dns_fallback_status`].
-            public_dns_fallback_status: Some(self.public_dns_fallback_status().to_string()),
+            public_dns_fallback_status: self
+                .public_dns_fallback_status()
+                .map(str::to_string),
         }
     }
 
     /// The public-DNS fallback status a hosted-zone read reports for this zone:
     /// the on status while the zone has the feature turned on, the off status
-    /// while it does not.
+    /// while it does not, and NOTHING for a zone the feature does not apply to.
+    ///
+    /// Falling back to public DNS is a feature of a zone that is ANSWERED on the
+    /// public internet, so only a public zone has a status for it. A private
+    /// hosted zone is "visible only in the VPCs that you specify"
+    /// (`HostedZoneConfig$PrivateZone`) and is never answered publicly, so it
+    /// holds no fallback state to report — the same reason accelerated recovery,
+    /// the other recovery feature of the container, cannot be configured on one
+    /// (`crate::ops::update_hosted_zone_features`).
     ///
     /// Derived from the zone's own state, like [`StoredZone::serve_signature`]
     /// beside it, so whatever turns the feature on moves what every read reports
     /// by itself.
-    pub fn public_dns_fallback_status(&self) -> &'static str {
-        if self.public_dns_fallback_enabled {
+    pub fn public_dns_fallback_status(&self) -> Option<&'static str> {
+        if self.private_zone {
+            return None;
+        }
+        Some(if self.public_dns_fallback_enabled {
             PUBLIC_DNS_FALLBACK_ENABLED
         } else {
             PUBLIC_DNS_FALLBACK_DISABLED
-        }
+        })
     }
 
     /// Whether accelerated recovery is the setting the zone holds or is moving

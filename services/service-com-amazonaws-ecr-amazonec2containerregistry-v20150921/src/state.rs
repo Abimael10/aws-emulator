@@ -2115,9 +2115,8 @@ pub fn evaluate_lifecycle_policy(
 
 /// One stored repository, with the identity fields computed once at creation so every
 /// later read reports exactly what the create returned. The one field NOT stored is the
-/// repository's URI: it is composed from the registry id and the Region this record
-/// already carries, so every read reports the same URI without a second copy of it
-/// ([`Repo::to_repository`]).
+/// repository's URI: it is an address the caller reading it dials, so it is composed from
+/// that caller's own endpoint and this record's name ([`Repo::to_repository`]).
 #[derive(Debug, Clone)]
 pub struct Repo {
     pub name: String,
@@ -2223,20 +2222,19 @@ impl Repo {
     /// The `Repository` every operation that reports this repository returns.
     ///
     /// `repositoryUri` is composed here rather than stored on the record, from the
-    /// repository's own identity — the registry it belongs to, which is this account's in
-    /// the Region the record is keyed by, and the repository's own name — announced in the
-    /// zone this emulator answers the caller being served in ([`announced_registry_host`],
-    /// read off `registry_endpoint`, and [`repository_uri`]). It follows from the record,
-    /// so every operation that reports this repository reports the one URI a client pushes
-    /// and pulls it at, and two Regions' repositories of one name are never one URI.
+    /// repository's own name and the endpoint this emulator answers the caller being served
+    /// at ([`announced_registry_endpoint`], read off `registry_endpoint`, and
+    /// [`repository_uri`]): the value is an ADDRESS the client dials next, so it names the
+    /// one address that client can reach, with the repository's own name as the path (see
+    /// [`registry_address`](crate::state::registry_address)). Which registry holds the
+    /// repository is reported by the members that carry it — `registryId` and the ARN, both
+    /// read off this record — so two Regions' repositories of one name are still told apart.
     pub fn to_repository(&self, registry_endpoint: &str) -> Repository {
-        let registry_host =
-            announced_registry_host(registry_endpoint, &self.registry_id, &self.region);
         Repository {
             repository_arn: Some(self.arn.clone()),
             registry_id: Some(self.registry_id.clone()),
             repository_name: Some(self.name.clone()),
-            repository_uri: Some(repository_uri(&registry_host, &self.name)),
+            repository_uri: Some(repository_uri(registry_endpoint, &self.name)),
             created_at: Some(reported_instant(self.created_at)),
             image_tag_mutability: Some(self.image_tag_mutability.clone()),
             image_tag_mutability_exclusion_filters: if self

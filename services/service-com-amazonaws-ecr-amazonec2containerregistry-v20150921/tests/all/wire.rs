@@ -36,48 +36,30 @@ pub fn endpoint_host(region: &str) -> String {
 /// only kind of address a client on the machine an emulator runs on can reach.
 pub const SERVED_URL_BASE: &str = "https://127.0.0.1:9297";
 
-/// The zone and port every registry address this harness's emulator ANNOUNCES is named in.
+/// The endpoint every registry address this harness's emulator REPORTS is built on.
 ///
 /// Its calls are addressed to [`endpoint_host`], which names a service and is therefore an
-/// endpoint no registry client can use, so the address the registry is announced on is built
-/// on the one this emulator is served at ([`SERVED_URL_BASE`]) — a loopback ADDRESS, and the
-/// zone a resolver answers with that interface is the loopback zone RFC 6761 reserves
-/// together with every name under it, on the port the emulator is served on.
-pub const ANNOUNCED_REGISTRY_ZONE: &str = "localhost:9297";
+/// endpoint no registry client can use, so the address reported to them is the one this
+/// emulator is served at ([`SERVED_URL_BASE`]) — host and port, without the scheme.
+pub const ANNOUNCED_REGISTRY_ENDPOINT: &str = "127.0.0.1:9297";
 
-/// The host this emulator announces this account's registry in `region` at: the owning
-/// account's id, the two fixed labels of a registry host, the registry's own Region and the
-/// zone this emulator answers in ([`ANNOUNCED_REGISTRY_ZONE`]) — the layout
-/// `AuthorizationData$proxyEndpoint` documents ("The Amazon ECR registry URL format is
-/// `https://aws_account_id.dkr.ecr.region.amazonaws.com`"), in the zone a client of these
-/// suites can reach.
-pub fn announced_registry_host(region: &str) -> String {
-    format!("{REGISTRY_ID}.dkr.ecr.{region}.{ANNOUNCED_REGISTRY_ZONE}")
-}
-
-/// The registry URL a `docker login` of a call signed for `region` is pointed at
-/// (`AuthorizationData$proxyEndpoint`): a scheme followed by that registry's own host
-/// ([`announced_registry_host`]).
-pub fn announced_registry_url(region: &str) -> String {
-    format!("https://{}", announced_registry_host(region))
+/// The registry URL a `docker login` of a call made through this harness is pointed at
+/// (`AuthorizationData$proxyEndpoint`): a scheme followed by the endpoint this emulator
+/// answers the caller's registry requests at ([`ANNOUNCED_REGISTRY_ENDPOINT`]).
+pub fn announced_registry_url() -> String {
+    format!("https://{ANNOUNCED_REGISTRY_ENDPOINT}")
 }
 
 /// The account id every generated emulator vends, spelled out here rather than imported
 /// so a wrong registry id in the implementation fails these tests.
 pub const REGISTRY_ID: &str = "000000000000";
 
-/// The URI Amazon ECR reports for the repository `name` of the registry in `region`
+/// The URI Amazon ECR reports for the repository `name`
 /// (`Repository$repositoryUri`: "The URI for the repository. You can use this URI for
-/// container image `push` and `pull` operations"): the host of the registry that HOLDS it
-/// ([`announced_registry_host`]), followed by the repository's own name.
-pub fn repository_uri_in(region: &str, name: &str) -> String {
-    format!("{}/{name}", announced_registry_host(region))
-}
-
-/// [`repository_uri_in`] for a repository of the Region these suites sign for
-/// ([`REGION`]).
+/// container image `push` and `pull` operations"): the endpoint this emulator answers the
+/// caller at ([`ANNOUNCED_REGISTRY_ENDPOINT`]), followed by the repository's own name.
 pub fn repository_uri(name: &str) -> String {
-    repository_uri_in(REGION, name)
+    format!("{ANNOUNCED_REGISTRY_ENDPOINT}/{name}")
 }
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire protocol").
@@ -184,6 +166,37 @@ pub async fn ok(router: &MultiServiceRouter, case: &str, operation: &str, body: 
 /// assertion reports the member that is missing rather than panicking on the lookup.
 pub fn at(value: &Value, pointer: &str) -> Value {
     value.pointer(pointer).cloned().unwrap_or(Value::Null)
+}
+
+/// `GET <path>` at the registry address `authority`, presenting `token` the way a container
+/// client presents a `docker login` credential (HTTP Basic, which is what an authorization
+/// token decodes to) — the ONE dialling convention this crate's suites use for the Docker
+/// Registry v2 plane this registry serves. `accept` is the media type the client offers,
+/// where the addressed endpoint serves content.
+///
+/// The HTTP status and the body, so a suite asserts on what a registry client would see.
+pub async fn registry_get(
+    router: &MultiServiceRouter,
+    authority: &str,
+    path: &str,
+    token: &str,
+    accept: Option<&str>,
+) -> (u16, String) {
+    let mut request = ::http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", authority)
+        .header("authorization", format!("Basic {token}"));
+    if let Some(media_type) = accept {
+        request = request.header("accept", media_type);
+    }
+    let request = request
+        .body(Bytes::new())
+        .expect("the registry request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(&response.into_body()).to_string();
+    (status, body)
 }
 
 /// How long [`ok_until`] keeps looking before it gives up.

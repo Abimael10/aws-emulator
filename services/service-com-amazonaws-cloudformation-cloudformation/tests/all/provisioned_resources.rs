@@ -1069,28 +1069,25 @@ fn repository_arn(name: &str) -> String {
     format!("arn:aws:ecr:{REGION}:{ACCOUNT_ID}:repository/{name}")
 }
 
-/// `<registry host>/<name>` — the URI `Fn::GetAtt <repository>.RepositoryUri` reports and
+/// `<endpoint>/<name>` — the URI `Fn::GetAtt <repository>.RepositoryUri` reports and
 /// a container image reference is built on. `Repository$repositoryUri` is "The URI for the
 /// repository. You can use this URI for container image `push` and `pull` operations", so it
-/// names the registry that HOLDS the repository — this account's, in the Region the stack is
-/// created in, in the registry URL layout `AuthorizationData$proxyEndpoint` documents
-/// (`aws_account_id.dkr.ecr.region.<zone>`) — followed by the repository's name. The stack's
-/// value is the one the repository's owning service reported, so this is the URI Amazon ECR
-/// itself reports for a repository of this account's registry.
+/// is an ADDRESS a container client dials: the endpoint this emulator answers the caller at,
+/// followed by the repository's name. The stack's value is the one the repository's owning
+/// service reported, so this is the URI Amazon ECR itself reports for a repository of this
+/// account's registry.
 fn repository_uri(name: &str) -> String {
-    format!("{}/{name}", registry_host())
+    format!("{}/{name}", registry_endpoint())
 }
 
-/// The host this emulator announces this account's registry in this harness's Region at: the
-/// registry's own labels in the zone this emulator answers in, which is the zone of the
-/// address it is served at — this harness's router is served on no port of its own, so that
-/// is the base `smithy_server_runtime` reports for one.
-fn registry_host() -> String {
+/// The endpoint this emulator answers on, which every registry address it reports is built
+/// on — this harness's router is served on no port of its own, so that is the authority of
+/// the base `smithy_server_runtime` reports for one.
+fn registry_endpoint() -> String {
     let base = ::smithy_server_runtime::UNSERVED_URL_BASE;
-    let zone = base
-        .split_once("://")
-        .map_or(base, |(_scheme, authority)| authority);
-    format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.{zone}")
+    base.split_once("://")
+        .map_or(base, |(_scheme, authority)| authority)
+        .to_string()
 }
 
 /// `arn:aws:ecs:<region>:<account>:task-definition/<family>:1` — what `Ref` of an
@@ -1377,7 +1374,7 @@ fn cases() -> Vec<Case> {
                         value
                             .strip_prefix(&format!(
                                 "{}/warehouse-registry-",
-                                registry_host()
+                                registry_endpoint()
                             ))
                             .is_some_and(|id| {
                                 !id.is_empty() && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())

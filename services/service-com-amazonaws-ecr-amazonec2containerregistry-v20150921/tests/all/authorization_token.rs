@@ -9,13 +9,13 @@
 //! UNIT the member documents — "the Unix time in seconds and milliseconds", so a whole
 //! number of milliseconds and nothing finer, whatever precision the host clock carries —
 //! and whose
-//! `proxyEndpoint` names THE REGISTRY THE TOKEN WAS ISSUED FOR — this account's registry in
-//! the Region the call was signed for, in the registry URL layout the member documents
-//! (`https://aws_account_id.dkr.ecr.region.amazonaws.com`) — in the zone this emulator
-//! answers in. `proxyEndpoint` is where `docker login` and every pull after it go, and this
-//! emulator is what answers the registry API (`service/registry_v2.rs`), so a host in AWS's
-//! own zone would send the next client out of the emulator entirely, while a host naming
-//! neither account nor Region would not say which registry was logged in to.
+//! `proxyEndpoint` is the registry URL a `docker login` is pointed at, which this emulator
+//! answers the registry API on: `proxyEndpoint` is where `docker login` and every pull after
+//! it GO, and AWS's own `https://aws_account_id.dkr.ecr.region.amazonaws.com` resolves
+//! nowhere near this process, so the value names the endpoint this emulator answered the
+//! call at (`service/registry_v2.rs` is what serves a registry request there). Which
+//! registry the token speaks FOR is recorded with the issue — a pull presenting it reaches
+//! that Region's registry — rather than spelled into the URL.
 //! `registryIds` is `@deprecated` — "specifying a
 //! registry ID doesn't change the permissions scope of the authorization token" — so it
 //! selects nothing: a request carrying any accepted value for it is answered exactly like
@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
-    announced_registry_url, call, emulator, ok, ok_in_region, REGION, REGISTRY_ID,
+    announced_registry_url, call, emulator, ok, ok_in_region, registry_get, REGION, REGISTRY_ID,
 };
 
 /// The user half of the `user:password` pair the token decodes to, as the handler's
@@ -71,11 +71,12 @@ const MEMBER_PROXY: &str = "proxyEndpoint";
 /// An account id that is NOT this emulator's registry.
 const OTHER_REGISTRY_ID: &str = "123456789012";
 
-/// The registry URL a token issued to a call signed for `region` must name: the host of
-/// this account's registry in THAT Region, in the zone this emulator answers in (see the
-/// module docs and [`announced_registry_url`]).
-fn expected_proxy_endpoint(region: &str) -> String {
-    announced_registry_url(region)
+/// The registry URL every token issued through this harness must name: the endpoint this
+/// emulator answers the caller's registry requests at (see the module docs and
+/// [`announced_registry_url`]). It carries no Region of its own — an address is an address,
+/// and which registry the token speaks for is recorded with the issue.
+fn expected_proxy_endpoint() -> String {
+    announced_registry_url()
 }
 
 /// Ten distinct 12-digit account ids — the modelled maximum of
@@ -185,7 +186,7 @@ async fn issue(
     let proxy_endpoint = data[MEMBER_PROXY]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a string proxyEndpoint in {body}"));
-    let expected = expected_proxy_endpoint(region);
+    let expected = expected_proxy_endpoint();
     assert_eq!(
         proxy_endpoint, expected,
         "case {case:?}: expected the registry URL {expected:?}, got {proxy_endpoint:?}"
@@ -348,17 +349,18 @@ async fn two_independent_registries_issue_different_tokens() {
     );
 }
 
-/// The registry the token was issued FOR is what its registry URL names: a registry is one
-/// account's in ONE Region, so the URL carries the Region the call was signed for and no two
-/// Regions' tokens are pointed at one host. The rows span the published Region naming forms
-/// rather than one recorded Region.
+/// The registry URL a token names is the address this emulator answers the registry API at,
+/// whatever Region the call was signed for: it is an address the client DIALS next, and the
+/// one address it can reach is the endpoint it is already talking to. The rows span the
+/// published Region naming forms rather than one recorded Region, and each one's URL is then
+/// dialled with the credential that token carries — so the value is proved to be served
+/// rather than merely well shaped.
 #[tokio::test]
-async fn the_proxy_endpoint_names_the_registry_the_token_was_issued_for() {
+async fn the_proxy_endpoint_names_the_address_the_registry_api_is_served_at() {
     // Regions spanning the naming forms AWS publishes: a classic three-part name, a
     // numbered one, a four-part one, and a non-`aws` partition's.
     let regions = ["us-east-1", "ap-southeast-2", "us-gov-west-1", "cn-north-1"];
     let router = emulator();
-    let mut announced: BTreeSet<String> = BTreeSet::new();
     for region in regions {
         let body = ok_in_region(
             &router,
@@ -370,18 +372,25 @@ async fn the_proxy_endpoint_names_the_registry_the_token_was_issued_for() {
         .await;
         let endpoint = body["authorizationData"][0][MEMBER_PROXY]
             .as_str()
-            .unwrap_or_else(|| panic!("case {region:?}: expected a string proxyEndpoint in {body}"));
-        let expected = expected_proxy_endpoint(region);
+            .unwrap_or_else(|| panic!("case {region:?}: expected a string proxyEndpoint in {body}"))
+            .to_string();
+        let expected = expected_proxy_endpoint();
         assert_eq!(
             endpoint, expected,
             "case {region:?}: expected the registry URL {expected:?}, got {endpoint:?}"
         );
-        // The one thing naming the registry is FOR: two Regions are two registries, so a
-        // client cannot be pointed at the same host for both.
-        assert!(
-            announced.insert(endpoint.to_string()),
-            "case {region:?}: expected a registry URL no other Region's token names, but \
-             {endpoint:?} was already announced in {announced:?}"
+        let token = body["authorizationData"][0][MEMBER_TOKEN]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {region:?}: expected a token in {body}"))
+            .to_string();
+        // The one thing the URL is FOR: a `docker login` at it is answered by this
+        // registry's own API, with the credential the token carries.
+        let authority = endpoint.strip_prefix("https://").unwrap_or(&endpoint);
+        let (status, served) = registry_get(&router, authority, "/v2/", &token, None).await;
+        assert_eq!(
+            status, 200,
+            "case {region:?}: the registry API must answer at {endpoint:?}, got HTTP \
+             {status} with {served:?}"
         );
     }
 }

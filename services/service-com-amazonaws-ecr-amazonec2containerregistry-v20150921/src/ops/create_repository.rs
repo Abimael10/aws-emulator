@@ -256,9 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_tag_count(&[], &tags).map_err(fault_error)?;
 
         let now = ::std::time::SystemTime::now();
-        // ECR is regional: the ARN and the repository's URI both name the Region the
-        // request was signed for, since a registry is one account's in one Region
-        // (`crate::state::repository_uri`).
+        // ECR is regional: the repository's ARN names the Region the request was signed
+        // for, since a registry is one account's in one Region, and the record is keyed by
+        // it (`crate::state::registry_address`).
         let region = crate::state::request_region(ctx.parts());
         let name = input.repository_name;
         let mut store = state.lock();

@@ -1,54 +1,56 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The registry ADDRESS a repository is pushed and pulled at, and the zone an address this
-//! service ANNOUNCES for a client to DIAL is named in.
+//! The registry ADDRESS this service REPORTS for a repository — the one a container client
+//! DIALS — and the reading of a registry host a client wrote a reference in.
 //!
-//! # What such an address names
-//!
-//! An Amazon ECR registry is ONE account's in ONE Region ("the region of the repository,
-//! Amazon Web Services account ID of the repository owner, repository namespace, and
-//! repository name", `Repository$repositoryArn`), so the same repository name names two
-//! different repositories in two Regions. Every address this service announces for one
-//! therefore names the registry that holds it, in the layout
-//! `AuthorizationData$proxyEndpoint` spells out ("The Amazon ECR registry URL format is
-//! `https://aws_account_id.dkr.ecr.region.amazonaws.com`"): the owning account's id, the
-//! two fixed labels, the registry's Region, then the zone the registry is served in
-//! ([`announced_registry_host`]). Two registries are then never one host, and the account
-//! and Region an address addresses can be read back off it ([`registry_host_parts`]) —
-//! which is what a client that derives a `docker login` target, a task definition's `image`
-//! or a cross-account check from the address it was handed does with it.
+//! # What the reported address has to be
 //!
 //! `Repository$repositoryUri` ("The URI for the repository. You can use this URI for
-//! container image `push` and `pull` operations") is that host followed by `/` and the
-//! repository's own name ([`repository_uri`]), and `AuthorizationData$proxyEndpoint` ("The
-//! registry URL to use for this authorization token in a `docker login` command") is the
-//! same host behind a scheme ([`registry_login_url`]), so a client logs in at the host it
-//! pushes to, exactly as it does on AWS.
+//! container image `push` and `pull` operations") and `AuthorizationData$proxyEndpoint`
+//! ("The registry URL to use for this authorization token in a `docker login` command") are
+//! not labels a caller reads back: they are ADDRESSES it dials next, with `docker login`,
+//! `docker push` and every pull after them. AWS reports them on its own registry host
+//! (`AuthorizationData$proxyEndpoint`: "The Amazon ECR registry URL format is
+//! `https://aws_account_id.dkr.ecr.region.amazonaws.com`"), and that name resolves to
+//! nothing on the machine this emulator runs on — or, worse, to AWS itself — so a client
+//! handed it leaves the emulated environment carrying the credential it was just issued, and
+//! the repository can never hold an image. A name UNDER a zone this emulator answers in is
+//! no better: nothing resolves one either, because this emulator answers on an ENDPOINT, not
+//! in a DNS zone it can add names to.
 //!
-//! # Which zone it is announced in
+//! What a client handed such a value can always reach is therefore the one thing this
+//! service knows is reachable: the endpoint the caller is already talking to
+//! ([`announced_registry_endpoint`], the tree's one reading of that question). So a
+//! repository is reported at that endpoint with its own name as the path
+//! ([`repository_uri`]), and a `docker login` is pointed at the same endpoint behind a scheme
+//! ([`registry_login_url`]) — so a client logs in where it pushes, and both addresses lead
+//! back to the registry that answered the call.
 //!
-//! The one thing that cannot carry over from AWS is the ZONE. These values are not labels a
-//! caller reads back: they are addresses a container client DIALS, and AWS's own
-//! `amazonaws.com` registry host resolves to nothing on the machine this emulator runs on,
-//! so a URI naming it sends every push and pull out of the emulator entirely and the
-//! repository can never hold an image. The registry's labels are therefore announced in the
-//! zone this emulator ANSWERS in, with the port it is reached on
-//! ([`announced_registry_host`], built on the tree's one reading of that zone,
-//! `service_common::data_plane_addressing::announced_zone_of_authority`) — the loopback zone
-//! for an emulator reached by address, which RFC 6761 reserves together with every name
-//! under it for the loopback interface, and the operator's own name where they serve it at
-//! one. A zone AWS publishes its own endpoints in is never announced, whatever host a request
-//! carries; a caller that reached this emulator at a registry host in a zone of its own keeps
-//! that zone, so an address this registry announces is announced the same wherever a client
-//! dialled it from.
+//! The registry's IDENTITY is reported in the members that carry it rather than inside the
+//! address: `Repository$registryId` is the owning account and `Repository$repositoryArn`
+//! carries "the region of the repository, Amazon Web Services account ID of the repository
+//! owner, repository namespace, and repository name", so a caller still reads back which
+//! account's registry in which Region holds the repository. An Amazon ECR registry is one
+//! account's in ONE Region, which is why those two are keyed by Region
+//! (`super::repository_key`) even though one endpoint answers for every Region: a push or
+//! pull at the reported address names the repository in the path and the registry through the
+//! credential it presents (`super::registry_v2::RegistryCredential::region`), which is the
+//! registry the token was issued for.
 //!
-//! This registry's `/v2` data plane claims a request whatever host it arrived on
-//! (`crate::service::registry_v2`) and reads which Region's registry the client dialled off
-//! that host ([`dialled_registry_region`]), so a push or pull written on an announced
-//! address reaches the very repository the address names.
+//! # Reading a registry host a client wrote
+//!
+//! A reference a client brings IN is another matter: it is written in the registry URL form
+//! AWS publishes, so a pull through cache rule's upstream URL, an in-process pull's image
+//! reference and the host a `/v2` request was addressed to are read back through the one
+//! reading of that layout ([`registry_host_parts`]) — the owning account's id, the two fixed
+//! labels, the Region, then the zone the registry is served in. That reading is what says
+//! which Region's registry a client dialled ([`dialled_registry_region`]), and this
+//! registry's `/v2` data plane claims a request whatever host it arrived on
+//! (`crate::service::registry_v2`), so both a reference written on AWS's spelling and one
+//! written on the address this service reported reach the very repository they name.
 
-/// The endpoint this emulator answers THIS caller at, which is the zone and port every
-/// registry address announced to it is named in ([`announced_registry_host`]).
+/// The endpoint this emulator answers THIS caller at, which is the address every registry
+/// address reported to it is built on ([`repository_uri`], [`registry_login_url`]).
 ///
 /// Two endpoints can satisfy that, and the tree's one reading of the question picks between
 /// them (`service_common::data_plane_addressing::reached_emulator_endpoint`):
@@ -56,16 +58,16 @@
 /// - the endpoint the CALLER reached this emulator on, when that endpoint names no
 ///   service — the emulator's own socket, a loopback name, and a registry host itself,
 ///   whose first label is an account id. `crate::service`'s registry data plane claims a
-///   `/v2` request exactly when its endpoint names no service, so such a caller is named
-///   an address in the zone it is already talking to and reaches the registry there;
+///   `/v2` request exactly when its endpoint names no service, so such a caller is reported
+///   the address it is already talking to and reaches the registry there;
 /// - otherwise the address this emulator is served at: a caller that came in on some
 ///   service's endpoint host (an SDK pointed at `api.ecr.<region>.amazonaws.com`) would be
 ///   handed an address a registry client cannot use, because that host routes to a service
 ///   and no registry request addressed to it reaches this plane — and so would a caller that
 ///   came in on a host inside a zone AWS publishes its OWN endpoints in
-///   (`addresses_an_aws_endpoint`), which is not a zone this emulator announces a name in at
-///   all: a name there resolves nowhere near this process. Taking the served address WHOLE,
-///   zone and port together, is what keeps the announced host dialable.
+///   (`addresses_an_aws_endpoint`), which resolves nowhere near this process. Taking the
+///   served address WHOLE, host and port together, is what keeps the reported address
+///   dialable.
 pub fn announced_registry_endpoint(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
 ) -> String {
@@ -104,14 +106,15 @@ pub fn dialled_registry_region(authority: &str) -> Option<String> {
     super::registry_pull::host_region(authority)
 }
 
-/// `<registry host>/<name>` — the URI a client pushes the repository `name` to and pulls it
-/// from, in the registry `registry_host` names ([`announced_registry_host`]).
+/// `<endpoint>/<name>` — the URI a client pushes the repository `name` to and pulls it from,
+/// at the endpoint this emulator answers that client at ([`announced_registry_endpoint`]).
 ///
-/// The repository's own name is appended to the host exactly as AWS appends it to a registry
-/// host, so a client composes the same tag, digest or registry v2 path on what it was
-/// handed, and the path after the first `/` is exactly the repository name.
-pub fn repository_uri(registry_host: &str, name: &str) -> String {
-    format!("{registry_host}/{name}")
+/// The repository's own name is appended to the address exactly as AWS appends it to a
+/// registry host, so a client composes the same tag, digest or registry v2 path on what it
+/// was handed, and the path after the first `/` is exactly the repository name — which is
+/// what the `/v2` data plane resolves the repository from.
+pub fn repository_uri(announced_endpoint: &str, name: &str) -> String {
+    format!("{announced_endpoint}/{name}")
 }
 
 /// The two fixed labels every Amazon ECR registry host carries between the owning account's
@@ -119,72 +122,10 @@ pub fn repository_uri(registry_host: &str, name: &str) -> String {
 /// `AuthorizationData$proxyEndpoint` documents spells them
 /// (`https://aws_account_id.dkr.ecr.region.amazonaws.com`).
 ///
-/// The one composition of that host ([`registry_host_in`]) and the one reading of it
-/// ([`registry_host_parts`]) are both written on them, so a host this registry announces
-/// parses back as a reference to the very registry it names.
+/// The one reading of such a host ([`registry_host_parts`]) is written on them, so a
+/// reference a client wrote in AWS's spelling parses back as a reference to the registry it
+/// names.
 pub const REGISTRY_HOST_LABELS: [&str; 2] = ["dkr", "ecr"];
-
-/// `<registryId>.dkr.ecr.<region>.<zone>` — the host of the registry account `registry_id`
-/// holds in `region`, as this emulator ANNOUNCES it to the caller it is answering: the
-/// registry's own labels in the zone this emulator answers that caller in, carrying the port
-/// it is reached on (see the module docs).
-///
-/// `announced_endpoint` is the endpoint this emulator answers that caller at
-/// ([`announced_registry_endpoint`]). Its ZONE is where the labels are announced — the
-/// tree's one reading of that question
-/// (`service_common::data_plane_addressing::announced_zone_of_authority`), which answers the
-/// loopback zone for an endpoint named by address or named in a zone AWS publishes its own
-/// endpoints in, and the operator's own name for one they serve at a name — except for an
-/// endpoint that is a registry host in a zone of its own already, whose zone is kept so that
-/// re-announcing an address a client dialled yields the same host rather than a deeper one.
-pub fn announced_registry_host(
-    announced_endpoint: &str,
-    registry_id: &str,
-    region: &str,
-) -> String {
-    let zone = announced_registry_zone(announced_endpoint);
-    match ::service_common::data_plane_addressing::addressed_port(Some(announced_endpoint)) {
-        Some(port) => registry_host_in(registry_id, region, &format!("{zone}:{port}")),
-        None => registry_host_in(registry_id, region, &zone),
-    }
-}
-
-/// The zone the registry labels are announced in for a caller answered at
-/// `announced_endpoint`, without its port: that endpoint's own zone, read through the tree's
-/// one reading of it.
-///
-/// An endpoint that is ITSELF a registry host keeps the zone that host sits in rather than
-/// being read as a zone to announce one more registry host inside of — so re-announcing an
-/// address a client dialled yields the same host. The endpoint is one this emulator answers
-/// at ([`announced_registry_endpoint`]), never a host in a zone AWS publishes its own
-/// endpoints in, so that carve-out cannot echo AWS's zone.
-fn announced_registry_zone(announced_endpoint: &str) -> String {
-    match registry_host_parts(announced_endpoint) {
-        Some(parts) => parts.zone.to_ascii_lowercase(),
-        None => ::service_common::data_plane_addressing::announced_zone_of_authority(
-            announced_endpoint,
-        ),
-    }
-}
-
-/// `<registryId>.dkr.ecr.<region>.<dnsSuffix>` — the host AWS ITSELF publishes the registry
-/// account `registry_id` holds in `region` at, in the registry URL form
-/// `AuthorizationData$proxyEndpoint` documents
-/// (`https://aws_account_id.dkr.ecr.region.amazonaws.com`).
-///
-/// The same composition as [`announced_registry_host`] in the zone AWS serves that Region's
-/// partition in ([`registry_dns_suffix`]), which is the spelling a caller that resolves
-/// AWS's own hosts writes a reference in.
-pub fn registry_host(registry_id: &str, region: &str) -> String {
-    registry_host_in(registry_id, region, registry_dns_suffix(region))
-}
-
-/// The ONE composition of a registry host: the owning account's id, the two fixed labels,
-/// the registry's Region, then the `zone` it is served in ([`REGISTRY_HOST_LABELS`]).
-fn registry_host_in(registry_id: &str, region: &str, zone: &str) -> String {
-    let [first, second] = REGISTRY_HOST_LABELS;
-    format!("{registry_id}.{first}.{second}.{region}.{zone}")
-}
 
 /// What a registry host NAMES, read off an authority ([`registry_host_parts`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,20 +134,19 @@ pub struct RegistryHostParts<'host> {
     pub registry_id: &'host str,
     /// The Region that registry serves.
     pub region: &'host str,
-    /// The zone the registry is served in: AWS's own partition suffix for a host AWS
-    /// publishes, and the zone this emulator answers in for one it announced.
+    /// The zone the registry is served in: AWS's own partition suffix for the host AWS
+    /// publishes, and a zone of its own for a host this emulator is reached at.
     pub zone: &'host str,
 }
 
 /// The account, the Region and the zone the registry host `authority` names, and `None` for
 /// every authority of another shape.
 ///
-/// The ONE reading of a registry host's layout, and the inverse of the one composition of it
-/// ([`registry_host_in`]): what makes a host a registry's is the account label, the two
-/// fixed labels ([`REGISTRY_HOST_LABELS`]) and the Region label — the zone that follows is
-/// wherever the registry is SERVED, AWS's own partition suffix for a host AWS publishes and
-/// this emulator's zone for a host it announced ([`announced_registry_host`]), so both
-/// spellings of one registry read back as that registry. A pull asks which Region and
+/// The ONE reading of a registry host's layout: what makes a host a registry's is the account
+/// label, the two fixed labels ([`REGISTRY_HOST_LABELS`]) and the Region label — the zone
+/// that follows is wherever the registry is SERVED, AWS's own partition suffix for the host
+/// AWS publishes and a zone of its own for a host an operator points a client at, so every
+/// spelling of one registry reads back as that registry. A pull asks which Region and
 /// account the reference it carries addresses
 /// (`super::registry_pull::parse_registry_reference`) and the data plane which Region the
 /// client dialled ([`dialled_registry_region`]), so neither walks the labels itself.
@@ -215,8 +155,8 @@ pub struct RegistryHostParts<'host> {
 /// names no registry: AWS serves a Region's registries only under that suffix
 /// ([`registry_dns_suffix`]), so `<account>.dkr.ecr.<a commercial Region>.amazonaws.com.cn`
 /// and a deeper name in such a zone ([`names_an_aws_endpoint_zone`]) are hosts nothing
-/// answers on. Every other zone is one this emulator may be announced in — the loopback zone,
-/// or the name an operator serves it at — which no static list can enumerate.
+/// answers on. Every other zone is one a client may have been pointed at — the loopback zone,
+/// or the name an operator serves this emulator at — which no static list can enumerate.
 ///
 /// Any userinfo and `:port` belong to the address rather than to the name and are removed
 /// first; the fixed labels are compared without regard to case, as a host is.
@@ -302,13 +242,14 @@ pub const PARTITION_DNS_SUFFIXES: [(&str, &str); 6] = [
     ("eu-isoe-", "cloud.adc-e.uk"),
 ];
 
-/// `https://<registry host>` — the registry URL a `docker login` is pointed at, for the
-/// registry `registry_host` names ([`announced_registry_host`]).
+/// `https://<endpoint>` — the registry URL a `docker login` is pointed at: the endpoint this
+/// emulator answers the caller at ([`announced_registry_endpoint`]), behind a scheme.
 ///
 /// `AuthorizationData$proxyEndpoint` states the shape — "The Amazon ECR registry URL
 /// format is `https://aws_account_id.dkr.ecr.region.amazonaws.com`" — a scheme followed by
-/// the registry's own host, which here is that host in the zone this emulator answers the
-/// caller in. The scheme is the one this emulator's endpoint carries.
-pub fn registry_login_url(registry_host: &str) -> String {
-    format!("https://{registry_host}")
+/// the registry's address, which here is the address this emulator answers the registry API
+/// on. It is the address a repository's own URI is built on too ([`repository_uri`]), so a
+/// client logs in where it pushes.
+pub fn registry_login_url(announced_endpoint: &str) -> String {
+    format!("https://{announced_endpoint}")
 }

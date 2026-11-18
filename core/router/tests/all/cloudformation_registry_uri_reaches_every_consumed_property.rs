@@ -43,10 +43,10 @@ use super::query_wire::outputs_of;
 /// its own examples) — what every stand-in for a `RepositoryUri` carries, and so what no value
 /// a deployed resource holds may still carry here.
 ///
-/// The address Amazon ECR ASSIGNS here carries the same `dkr.ecr` labels, because a repository
-/// URI names the account and the Region whose registry HOLDS the repository; what tells a
-/// stand-in from the assigned value is the ZONE those labels sit in — AWS's own for a stand-in,
-/// and one this emulator answers in for the address it assigned.
+/// The address Amazon ECR ASSIGNS here carries neither mark: a repository URI is an ADDRESS a
+/// container client dials, so what this registry assigns is the endpoint this emulator answers
+/// on ([`published_repository_uri`]). A value still carrying both marks is therefore a
+/// stand-in the deployment never re-pointed.
 const AWS_REGISTRY_LABELS_MARK: &str = ".dkr.ecr.";
 const AWS_REGISTRY_ZONE_MARK: &str = ".amazonaws.com";
 

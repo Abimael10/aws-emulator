@@ -2,18 +2,21 @@
 
 use super::*;
 
-/// The endpoint the request reached this emulator on, as every address this registry
-/// ANNOUNCES for a client to DIAL names it — a layer download URL and the registry endpoint
-/// a `docker login` is pointed at alike: the request's own `Host`, else the authority its
+/// The endpoint the request reached this emulator on, as a layer download URL this registry
+/// hands out for a client to FETCH names it: the request's own `Host`, else the authority its
 /// URI carries, else [`LOOPBACK_HOST`].
 ///
-/// Read from the request rather than built from this registry's own
-/// `<account>.dkr.ecr.<region>.<dnsSuffix>` host, because the address
+/// Read from the request rather than built from AWS's own
+/// `<account>.dkr.ecr.<region>.<dnsSuffix>` registry host, because the address
 /// has to resolve for whoever was handed it: that host is AWS's, and an address naming it
 /// would send the next client out of the emulator entirely, while a client addressing
-/// the emulator by socket is handed that socket. A repository's own `repositoryUri` is not
-/// such an address: it NAMES the registry that holds the repository, so it carries the
-/// account and the Region instead (`super::registry_address`).
+/// the emulator by socket is handed that socket. A repository's `repositoryUri` and the
+/// registry URL a `docker login` is pointed at are addresses a client dials too, and are
+/// built on the endpoint it reached for the same reason — through the tree's own reading of
+/// that question, which also declines a host that routes to a SERVICE, since no registry
+/// request addressed to one reaches this plane (`super::announced_registry_endpoint`). A
+/// download URL is served from the path space this plane owns, which every endpoint of this
+/// emulator answers, so what it needs of the endpoint is only that the holder can reach it.
 ///
 /// The value is the CALLER's and it is interpolated into a URL this service announces, so
 /// only a BARE AUTHORITY is honoured: anything else is not an endpoint, and the loopback

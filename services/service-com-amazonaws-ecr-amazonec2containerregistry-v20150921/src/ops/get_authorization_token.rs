@@ -14,15 +14,15 @@
 //! login`"), it expires [`AUTHORIZATION_TOKEN_LIFETIME`] after this call, and it is
 //! reported beside the registry URL a `docker login` points at.
 //!
-//! That URL names the registry the token was issued for — this account's registry in the
-//! Region the call was made against — in the zone THIS emulator answers in
-//! ([`crate::state::announced_registry_host`]), rather than the zone AWS publishes its own
-//! registries in: `proxyEndpoint` is an address the client is expected to FETCH from next —
-//! it is where `docker login` and every pull after it go — and this emulator is what answers
-//! the registry API (`crate::service`'s registry data plane), so a host in AWS's own zone
-//! would send the next client out of the emulator entirely. It is the same host a
-//! repository's `repositoryUri` is built on (`crate::state::registry_address`), so a client
-//! logs in at the registry it pushes to.
+//! That URL is where `docker login` and every pull after it GO, so it names the address this
+//! caller can reach the registry API at: the endpoint this emulator answers it on
+//! (`crate::state::registry_login_url`, built on
+//! `crate::state::announced_registry_endpoint`), rather than the host AWS publishes its own
+//! registries at, which resolves nowhere near this process — and `crate::service`'s registry
+//! data plane is what answers there. It is the same address a repository's `repositoryUri` is
+//! built on (`crate::state::registry_address`), so a client logs in at the registry it pushes
+//! to. WHICH registry the token speaks for is recorded with the issue, and a pull presenting
+//! it addresses that registry (`crate::state::registry_v2`).
 //!
 //! `registryIds` selects nothing. The model marks the member `@deprecated` with the
 //! reason spelled out — "This field is deprecated. The returned authorization token can
@@ -223,15 +223,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             expires_at,
             &principal_arn,
         );
-        // The registry URL a `docker login` is pointed at: the host of the registry this
-        // token was issued for, in the zone this emulator answers this caller in (see the
-        // module docs).
-        let proxy_endpoint =
-            crate::state::registry_login_url(&crate::state::announced_registry_host(
-                &crate::state::announced_registry_endpoint(ctx),
-                crate::state::registry_id(),
-                &region,
-            ));
+        // The registry URL a `docker login` is pointed at: the endpoint this emulator
+        // answers this caller's registry requests on (see the module docs).
+        let proxy_endpoint = crate::state::registry_login_url(
+            &crate::state::announced_registry_endpoint(ctx),
+        );
 
         // Issuing a registry credential is the security-relevant event of this
         // operation, so it is attributable in the emulator's log: which operation, the
