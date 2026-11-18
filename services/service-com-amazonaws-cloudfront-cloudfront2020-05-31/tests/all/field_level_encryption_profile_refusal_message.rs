@@ -15,19 +15,20 @@
 //!   profile, its update and its delete, where the id travels in the path, and the create and
 //!   the update of a field-level encryption CONFIGURATION, where it travels in the submitted
 //!   document as a mapping's `ProfileId`;
-//! * the SHAPES of an id the store holds no profile for (one never minted, a stored id in
-//!   lower case, a token that is no profile id at all, and a caller reference rather than an
-//!   id), each of which earns the one absent-profile sentence;
+//! * the SHAPES of an id the store holds no profile for (one of the issued form never minted,
+//!   a stored id in lower case, a token that is no profile id at all, and a caller reference
+//!   rather than an id), each of which earns the sentence its own form decides;
 //! * which MAPPING KIND of which section of a configuration still names the profile a delete
 //!   is refused for — a query argument-profile mapping, a content type-profile mapping, or one
 //!   of each at once.
 //!
 //! The id travels in the path on four of those operations and in a submitted DOCUMENT on the
-//! other two, and either way an id the store holds no profile for is the absent profile: these
-//! operations model this one not-found code and no argument error, so no shape of an
-//! unresolvable id earns a different sentence. The rows below span those shapes — another
-//! namespace of this service, a value of no minted id's alphabet, a caller reference — beside
-//! well-formed profile ids nothing answers to.
+//! other two. An id borne by a document addresses nothing, so any id the store holds no profile
+//! for is the absent profile there; an id that ADDRESSES the operation is read for its ISSUED
+//! FORM first, and a value of no profile id's form is the identifier reported unreadable under
+//! that same one not-found code — these operations model no argument error. The rows below span
+//! those shapes — another namespace of this service, a value of no minted id's alphabet, a
+//! caller reference — beside well-formed profile ids nothing answers to.
 //!
 //! Every message is also asserted NOT to be the documentation prose of its error shape
 //! (`smithy_query(query="doc",shape="NoSuchFieldLevelEncryptionProfile")` and
@@ -198,9 +199,9 @@ fn assert_refusal(answer: &Answer, case: &str, status: u16, code: &str, message:
 
 /// Every path that reports a field-level encryption profile id as naming nothing answers
 /// `NoSuchFieldLevelEncryptionProfile`, with the absent-profile wire sentence where the id is
-/// of the identifier alphabet and the unreadable-identifier sentence where it is not — while
-/// an id that travels in a submitted DOCUMENT as a mapping's `ProfileId` addresses nothing, so
-/// it reports the absent profile whatever shape it takes.
+/// of the form CloudFront ISSUES a profile id in and the unreadable-identifier sentence where
+/// it is not — while an id that travels in a submitted DOCUMENT as a mapping's `ProfileId`
+/// addresses nothing, so it reports the absent profile whatever shape it takes.
 #[tokio::test]
 async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
     let router = emulator();
@@ -339,11 +340,10 @@ async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
 }
 
 /// A READ of a profile answers its one not-found code for every `Id` it cannot resolve, and
-/// the identifier's ALPHABET decides the sentence: every value of the alphabet CloudFront
-/// issues its identifiers in that nothing answers to reports the profile that is ABSENT — a
-/// minted id of ANOTHER resource kind of this service included, since which kind an identifier
-/// was issued for is a property of the store — while a value outside that alphabet, a
-/// lower-cased id, a UUID, a word or a caller reference, is the identifier reported UNREADABLE.
+/// the identifier's ISSUED FORM decides the sentence: a value written as CloudFront issues a
+/// PROFILE id — the profile namespace letter over a body of the issued width — that nothing
+/// answers to reports the profile that is ABSENT, while every other value, a minted id of
+/// another resource kind of this service included, is the identifier reported UNREADABLE.
 ///
 /// The rows span the shapes an `Id` takes outside a profile id's: the namespaces of this
 /// service a profile id's is disjoint from, taking two of them from ids this emulator really
@@ -369,17 +369,17 @@ async fn a_profile_read_answers_one_sentence_for_every_id_it_cannot_resolve() {
         (
             "the sibling configuration's own id",
             config_id.clone(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a public key id this service minted",
             key.clone(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a distribution id's namespace",
             "E1234567890ABC".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a UUID, the namespace the policy kinds are keyed by",

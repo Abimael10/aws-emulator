@@ -3485,16 +3485,17 @@ pub const MAX_FIELD_LEVEL_ENCRYPTION_PROFILE_COMMENT: usize = MAX_ORIGIN_ACCESS_
 /// The modelled `NoSuchFieldLevelEncryptionProfile` (HTTP 404) for a profile id the store
 /// does not hold.
 ///
-/// ONE sentence for the whole condition, whatever shape the id takes:
+/// ONE sentence for the whole condition, whatever body the id takes:
 /// `GetFieldLevelEncryptionProfile` and its siblings model this one not-found code and no
 /// argument error
 /// (`smithy_query(query="operation",operation="GetFieldLevelEncryptionProfile")` reports
 /// `errors: [AccessDenied, NoSuchFieldLevelEncryptionProfile]`), and the recorded answers of
-/// this surface report every id the account holds no profile under as the profile that is
-/// absent — a profile id of another width, another namespace, a UUID, a name, a caller
-/// reference or a word included. So an operation ADDRESSED by a profile `Id` answers one it
-/// cannot resolve with this, exactly as a profile id borne by a submitted document does. The
-/// same rule the public key reads keep ([`no_such_public_key`]) and the one
+/// this surface report every id of the form CloudFront ISSUES a profile id in that the account
+/// holds no profile under as the profile that is absent. A profile id borne
+/// by a submitted DOCUMENT addresses nothing, so it is resolved against the store alone and
+/// reports the absent profile whatever shape it takes; an id that ADDRESSES one is read for
+/// its form first ([`unresolved_field_level_encryption_profile`]). The same rule the
+/// public key reads keep ([`no_such_public_key`]) and the one
 /// [`no_such_field_level_encryption_config`] keeps for the other field-level encryption
 /// resource.
 ///
@@ -3524,13 +3525,13 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
 /// These operations model this one not-found code and no argument error, so one code and one
 /// status cover two conditions and the MESSAGE is what tells them apart, decided from the value
 /// alone and therefore before the store is consulted. The FORM this route reads of the value is
-/// the identifier ALPHABET CloudFront issues its identifiers in ([`is_entity_identifier`]): the
-/// `Id` member is a plain `string` in the model — no `@pattern`, no `@length` — so neither the
-/// namespace letter nor the width this emulator happens to MINT is a constraint a request may be
-/// refused on, and the recorded refusals of this surface answer the absent-record sentence for a
-/// value of that alphabet whatever letter it opens with and however wide it is. A value outside
-/// the alphabet was never an identifier this service issued, and is the identifier it reports it
-/// cannot read ([`id_format_invalid_message`]).
+/// the one CloudFront ISSUES a profile identifier in —
+/// [`FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX`] over a body of the issued width
+/// ([`is_field_level_encryption_profile_id`]), the form every id this surface hands out and
+/// accepts back as a listing `Marker` carries: a value of any other form was never a profile
+/// identifier CloudFront issued, and is the identifier the service reports it cannot read
+/// ([`id_format_invalid_message`]), while an identifier of that form the account holds no
+/// profile under is the profile that is absent.
 ///
 /// Only an identifier that ADDRESSES the operation is judged this way: a profile id borne by a
 /// submitted CONFIGURATION (a query-arg or content-type mapping's `ProfileId`) addresses
@@ -3539,7 +3540,7 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
 pub fn unresolved_field_level_encryption_profile(
     id: &str,
 ) -> crate::ops::types::NoSuchFieldLevelEncryptionProfile {
-    if is_entity_identifier(id) {
+    if is_field_level_encryption_profile_id(id) {
         no_such_field_level_encryption_profile()
     } else {
         crate::ops::types::NoSuchFieldLevelEncryptionProfile {
@@ -3633,13 +3634,13 @@ pub const MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT: usize = MAX_ORIGIN_ACCESS_I
 /// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) for a configuration id the
 /// store does not hold.
 ///
-/// ONE sentence for the whole condition, whatever namespace letter and width the id carries —
-/// the SAME rule [`no_such_field_level_encryption_profile`] keeps for the other field-level
-/// encryption resource: these operations model this one not-found code and no argument error
+/// ONE sentence for the whole condition, whatever body the id carries — the SAME rule
+/// [`no_such_field_level_encryption_profile`] keeps for the other field-level encryption
+/// resource: these operations model this one not-found code and no argument error
 /// (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` reports
 /// `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`), and the recorded answers of
-/// this surface report every id of the identifier alphabet the account holds no configuration
-/// under as the configuration that is absent
+/// this surface report every id of the form CloudFront ISSUES a configuration id in that the
+/// account holds no configuration under as the configuration that is absent
 /// ([`unresolved_field_level_encryption_config`]).
 ///
 /// The sentence states a property of the store rather than of the request — the id names no
@@ -3663,11 +3664,12 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE: &str =
 /// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) an operation ADDRESSED by a
 /// field-level encryption configuration `Id` in its path answers an `Id` it cannot resolve —
 /// the split [`unresolved_field_level_encryption_profile`] makes for the other field-level
-/// encryption record, over the same identifier ALPHABET ([`is_entity_identifier`]).
+/// encryption record, over that record's own ISSUED FORM
+/// ([`is_field_level_encryption_config_id`]).
 pub fn unresolved_field_level_encryption_config(
     id: &str,
 ) -> crate::ops::types::NoSuchFieldLevelEncryptionConfig {
-    if is_entity_identifier(id) {
+    if is_field_level_encryption_config_id(id) {
         no_such_field_level_encryption_config()
     } else {
         crate::ops::types::NoSuchFieldLevelEncryptionConfig {

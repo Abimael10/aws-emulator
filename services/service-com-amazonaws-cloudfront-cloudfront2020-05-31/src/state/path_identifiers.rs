@@ -10,14 +10,14 @@
 //! makes is that resource kind's own recorded contract:
 //!
 //! * the FORM — how much of the way CloudFront writes that kind's identifiers a route reads of
-//!   the value, which is a property of the value alone. The two field-level encryption records
-//!   read only the ALPHABET CloudFront issues an identifier in ([`is_entity_identifier`]),
-//!   their recorded refusals answering the absent record for a value of that alphabet whatever
-//!   letter it opens with and however wide it is
-//!   ([`super::unresolved_field_level_encryption_config`]); the origin access control reads
-//!   NONE of the form, its recorded refusals answering the absent control for a value written
-//!   in no alphabet CloudFront mints an identifier in; the distribution reads the whole form
-//!   its ids are minted in ([`super::is_distribution_id`] and its neighbours);
+//!   the value, which is a property of the value alone. The origin access control reads NONE
+//!   of the form, its recorded refusals answering the absent control for a value written in no
+//!   alphabet CloudFront mints an identifier in; the two field-level encryption records read
+//!   the whole form their identifiers are ISSUED in — the record's own namespace letter over a
+//!   body of the issued width ([`super::is_field_level_encryption_config_id`],
+//!   [`super::is_field_level_encryption_profile_id`],
+//!   [`super::unresolved_field_level_encryption_config`]); the distribution reads the whole
+//!   form its ids are minted in ([`super::is_distribution_id`] and its neighbours);
 //! * which KIND an identifier belongs to, for the family CloudFront draws from ONE form. A
 //!   distribution, a streaming distribution, an origin access identity and an origin access
 //!   control all carry an `E` followed by an identifier body of the same width and alphabet,
@@ -42,22 +42,6 @@
 //! Nothing here echoes the submitted value: both sentences are fixed text.
 
 use super::*;
-
-/// Whether `value` could be an identifier CloudFront ISSUED for an entity of this service: a
-/// non-empty run of the one alphabet it writes them in (a decimal digit or an uppercase ASCII
-/// letter).
-///
-/// This is all the FORM the two field-level encryption records' routes read
-/// ([`super::unresolved_field_level_encryption_config`],
-/// [`super::unresolved_field_level_encryption_profile`]). Their `Id` member is a plain `string`
-/// in the model — no `@pattern`, no `@length` — and their recorded refusals answer the absent
-/// record for a value of this alphabet whatever letter it opens with and however wide it is, so
-/// the namespace letter and the width this emulator happens to MINT are no part of the
-/// decision; a value outside the alphabet was never an identifier this service issued, and is
-/// the identifier it reports it cannot read.
-pub fn is_entity_identifier(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(is_token_byte)
-}
 
 /// The resource kinds whose identifiers CloudFront draws from ONE namespace it shares with
 /// others — an `E` followed by an identifier body — and which are therefore told apart by the

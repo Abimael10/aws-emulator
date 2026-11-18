@@ -172,12 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// opaque and the caller has nothing to look up with it.
     ///
     /// That last refusal is TWO conditions with two sentences under the one status and
-    /// code, told apart by the token's FORM
-    /// ([`state::confirmation_token::is_confirmation_token_form`]): a value that is not of a
-    /// confirmation token's form faults the request member and is refused with the bare
-    /// parameter sentence, judged with the other arguments before the store is consulted,
-    /// while a value of that form matching no pending confirmation of the topic faults the
-    /// token itself. Neither confirms anything.
+    /// code, told apart by the MATERIAL the value is written in
+    /// ([`state::confirmation_token::confirmation_token_form_refusal`]): a value written in a
+    /// confirmation token's own material at a width no token is issued at is a token damaged
+    /// on its way back, which faults the request member and is refused with the bare parameter
+    /// sentence, judged with the other arguments before the store is consulted; every other
+    /// value that matches no pending confirmation of the topic faults the token itself.
+    /// Neither confirms anything.
     async fn handle(
         &self,
         input: Self::Input,
@@ -185,9 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Argument validation, BEFORE the store is consulted: a `TopicArn` that is not
         // an ARN at all — or whose resource is no topic name, which names no topic
-        // anywhere — is bad input, not a topic that does not exist; and a `Token` that
-        // is not of a confirmation token's form is bad input for the same reason, since
-        // it could not be a token this service sent to any endpoint.
+        // anywhere — is bad input, not a topic that does not exist; and a `Token` written in
+        // a confirmation token's own material at a width no token is issued at is bad input
+        // for the same reason, since it is a token that reached this call damaged.
         if let Some(message) = state::arn_refusal("TopicArn", &input.topic_arn)
             .or_else(|| state::topic_name_refusal(&input.topic_arn))
             .or_else(|| {

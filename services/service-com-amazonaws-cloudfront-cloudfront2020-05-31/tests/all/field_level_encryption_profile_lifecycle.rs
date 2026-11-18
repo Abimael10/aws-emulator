@@ -63,8 +63,8 @@ const CALLER_REFERENCE_ALREADY_EXISTS_MESSAGE: &str =
     "The caller reference that you are using to create a field level encryption profile is \
      associated with another field level encryption profile in your account.";
 
-/// The sentence a read of this surface answers a value outside the identifier alphabet
-/// CloudFront issues its identifiers in: the identifier the service reports it cannot read,
+/// The sentence a read of this surface answers a value outside the form CloudFront ISSUES
+/// this resource's identifiers in: the identifier the service reports it cannot read,
 /// naming the member that carried it.
 pub(crate) const UNREADABLE_PROFILE_ID_MESSAGE: &str = "Id format is invalid";
 
@@ -966,18 +966,15 @@ async fn an_id_no_profile_holds_is_refused_by_both_readers() {
 
     // The rows span the ways an id can name no profile: a well-shaped profile id that was
     // never minted, an id in another namespace and of a width no identifier of this kind is
-    // issued at, and a value of no CloudFront identifier form at all. Every value of the
-    // identifier alphabet is the profile reported absent, whatever letter it opens with and
-    // however wide it is; only a value outside that alphabet is reported unreadable.
+    // issued at, and a value of no CloudFront identifier form at all. Only an id of the form
+    // CloudFront ISSUES a profile id in is the profile reported absent; every other value is
+    // the identifier reported unreadable.
     for (case, expected) in [
         (
             "P280MFCLSYOCVU",
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
-        (
-            "EDFDVBD6EXAMPLE",
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
-        ),
+        ("EDFDVBD6EXAMPLE", UNREADABLE_PROFILE_ID_MESSAGE),
         ("not-a-profile-id", UNREADABLE_PROFILE_ID_MESSAGE),
     ] {
         for (reader, answer) in [

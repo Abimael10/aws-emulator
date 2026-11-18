@@ -317,12 +317,13 @@ async fn each_token_confirms_only_the_subscription_it_was_minted_for() {
 /// A token no endpoint of the named topic was sent is refused as bad input, with the
 /// sentence its own condition carries, and leaves every subscription exactly as it was.
 ///
-/// The rows are the shapes a wrong token takes, on both sides of the FORM boundary: values
-/// that are no confirmation token's form at all (a word, whitespace, the subscription's own
-/// ARN) carry the member's parameter sentence, while values OF that form which confirm
-/// nothing (a token-width run never minted, the token of a subscription of ANOTHER topic, the
-/// minted token with one character changed — the value is opaque, so only equality against it
-/// counts) carry the fixed invalid-token sentence.
+/// The rows are the shapes a wrong token takes, on both sides of the MATERIAL boundary: a
+/// value written in a confirmation token's own material (hexadecimal) at a width no token is
+/// issued at is a token that reached the call damaged and carries the member's parameter
+/// sentence, while every other value — a token-width run never minted, the token of a
+/// subscription of ANOTHER topic, the minted token with one character changed (the value is
+/// opaque, so only equality against it counts), and equally a word, whitespace or the
+/// subscription's own ARN — carries the fixed invalid-token sentence.
 #[tokio::test]
 async fn a_token_no_endpoint_of_the_topic_was_sent_is_refused() {
     let sns = Sns::new();
@@ -356,14 +357,24 @@ async fn a_token_no_endpoint_of_the_topic_was_sent_is_refused() {
         characters.into_iter().collect()
     };
     let never_minted = "f".repeat(CONFIRMATION_TOKEN_HEX_CHARS);
+    let one_digest_wide = "f".repeat(CONFIRMATION_TOKEN_HEX_CHARS / 5);
     let malformed = malformed_confirmation_token_refusal();
     // (case, the value presented, the sentence it is refused with)
     let cases: Vec<(&str, &str, &str)> = vec![
-        ("not a token at all", "bogus", malformed.as_str()),
-        ("whitespace", " ", malformed.as_str()),
+        (
+            "not a token at all",
+            "bogus",
+            INVALID_CONFIRMATION_TOKEN_REFUSAL,
+        ),
+        ("whitespace", " ", INVALID_CONFIRMATION_TOKEN_REFUSAL),
         (
             "the subscription's own ARN",
             arn.as_str(),
+            INVALID_CONFIRMATION_TOKEN_REFUSAL,
+        ),
+        (
+            "a token's material at a width no token is issued at",
+            one_digest_wide.as_str(),
             malformed.as_str(),
         ),
         (

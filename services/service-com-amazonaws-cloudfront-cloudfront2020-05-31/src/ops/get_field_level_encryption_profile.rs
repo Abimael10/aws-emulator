@@ -145,8 +145,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Get the ID for the field-level encryption profile information": whether the value
         // could be an identifier of THIS resource kind is decided before the profile is
-        // resolved — a value outside the namespace CloudFront issues this record's identifiers
-        // in is the identifier it reports it cannot read, and an identifier of that namespace
+        // resolved — a value outside the form CloudFront ISSUES this record's identifiers
+        // in is the identifier it reports it cannot read, and an identifier of that form
         // the store holds no profile under is the profile that is absent
         // ([`crate::state::unresolved_field_level_encryption_profile`]).
         let Some(stored) = store.field_level_encryption_profile(&input.id) else {

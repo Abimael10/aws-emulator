@@ -7,24 +7,30 @@
 //! status and one error code (HTTP 400 / `InvalidParameter`), and the MESSAGE is what
 //! distinguishes them:
 //!
-//! * a `Token` that is not of a confirmation token's FORM — a run of exactly
-//!   [`CONFIRMATION_TOKEN_HEX_CHARS`] hexadecimal characters, which is what a confirmation
-//!   token is and nothing else is — faults the request member, and is refused with the bare
-//!   parameter sentence `Invalid parameter: Token`;
-//! * a `Token` OF that form which matches no pending confirmation of the topic named faults
-//!   the token: an expired, superseded or foreign confirmation link, refused with the wholly
-//!   fixed `Invalid token`.
+//! * a `Token` written in a confirmation token's own MATERIAL — hexadecimal characters, which
+//!   is what SNS issues a token in — but NOT at the width one is issued at
+//!   ([`CONFIRMATION_TOKEN_HEX_CHARS`]) is a token that reached the call damaged: a
+//!   confirmation link truncated or run together by whatever carried it, so the request member
+//!   is at fault and it is refused with the bare parameter sentence `Invalid parameter: Token`;
+//! * every OTHER value that matches no pending confirmation of the topic named faults the
+//!   token: an expired, superseded or foreign confirmation link, and equally a word, a URL or
+//!   an ARN presented where a token belongs, refused with the wholly fixed `Invalid token`.
 //!
 //! Neither sentence takes any part from the request: the token is a short-lived secret sent to
 //! the endpoint, so it is never echoed and no reason clause is read off it.
 //!
-//! The rows differ along what the rule generalises over: the FORM of the value presented as a
-//! token (a bare word, one character, whitespace, a URL, a run of one letter at one digest's
-//! width, non-hexadecimal characters at a token's width, one character short of and one past
-//! that width, an ARN), and — on the other side of the boundary — tokens OF the form that
-//! confirm nothing (a run of one hexadecimal digit at a token's width, the same in upper case,
-//! another topic's real token, and a real token with one character changed). No refused call
-//! confirms anything.
+//! The rows differ along what the rule generalises over: values written in a token's material
+//! at widths other than the issued one (one character, one digest's worth, one character short
+//! of and one past a token's width), and — on the other side of the boundary — values not of
+//! that material at all (a bare word, whitespace, a URL, an ARN, a token's width of
+//! non-hexadecimal characters) beside tokens AT the issued width that confirm nothing (a run of
+//! one hexadecimal digit, the same in upper case, another topic's real token, and a real token
+//! with one character changed). No refused call confirms anything.
+//!
+//! The second table takes the same rule over the PRODUCT of the two dimensions it turns on —
+//! every width around and far below the issued one, in lower-case hexadecimal, upper-case
+//! hexadecimal, characters outside that alphabet, and hexadecimal with one character outside it
+//! — so neither the width nor the material alone decides the sentence.
 //!
 //! Every call goes over the wire through the router the emulator serves in production,
 //! so nothing but persisted state carries information between calls.
@@ -38,8 +44,8 @@ use super::topics_subscriptions_publish::{Answer, Sns};
 /// text and not just the constant.
 const INVALID_TOKEN: &str = "Invalid token";
 
-/// The sentence AWS refuses a value that is not of a confirmation token's form with — its
-/// bare `Invalid parameter: <member>` frame, whose only variable part is the member name the
+/// The sentence AWS refuses a damaged confirmation token with — its bare
+/// `Invalid parameter: <member>` frame, whose only variable part is the member name the
 /// model spells `Token`. Stated here as the recorded response words it, for the same reason.
 const INVALID_PARAMETER_TOKEN: &str = "Invalid parameter: Token";
 
@@ -131,13 +137,17 @@ async fn the_two_token_refusals_carry_their_own_sentences() {
 
     // (case, the value presented as a token, the sentence the condition carries)
     let rows: Vec<(&str, String, &str)> = vec![
-        ("a bare word", "nope".to_string(), INVALID_PARAMETER_TOKEN),
-        ("one character", "a".to_string(), INVALID_PARAMETER_TOKEN),
-        ("whitespace", " ".to_string(), INVALID_PARAMETER_TOKEN),
+        ("a bare word", "nope".to_string(), INVALID_TOKEN),
+        (
+            "one character of a token's material",
+            "a".to_string(),
+            INVALID_PARAMETER_TOKEN,
+        ),
+        ("whitespace", " ".to_string(), INVALID_TOKEN),
         (
             "a value shaped like a URL",
             "https://example.test/?Token=x".to_string(),
-            INVALID_PARAMETER_TOKEN,
+            INVALID_TOKEN,
         ),
         (
             "one digest's worth of hexadecimal characters",
@@ -157,12 +167,12 @@ async fn the_two_token_refusals_carry_their_own_sentences() {
         (
             "a token's width of characters that are not hexadecimal",
             not_hexadecimal,
-            INVALID_PARAMETER_TOKEN,
+            INVALID_TOKEN,
         ),
         (
             "the subscription's own ARN",
             awaiting[0].clone(),
-            INVALID_PARAMETER_TOKEN,
+            INVALID_TOKEN,
         ),
         (
             "a token's width of one hexadecimal digit",
@@ -262,9 +272,9 @@ async fn the_two_token_refusals_carry_their_own_sentences() {
     );
 }
 
-/// A token this service minted is of the form it judges by, so the form judgement never
-/// refuses a real token: every minted token is a run of hexadecimal characters of the one
-/// width, and each confirms its own subscription.
+/// A token this service minted is of the material and the width the refusal judges by, so the
+/// judgement never refuses a real token: every minted token is a run of hexadecimal characters
+/// of the one width, and each confirms its own subscription.
 #[tokio::test]
 async fn a_minted_token_is_of_the_form_the_refusal_judges_by() {
     let sns = Sns::new();
@@ -300,4 +310,155 @@ async fn a_minted_token_is_of_the_form_the_refusal_judges_by() {
             "case {case:?}: the confirmed subscription must no longer be pending"
         );
     }
+}
+
+/// One digest written in hexadecimal — a width far short of a token's, named here because it is
+/// the narrowest value a caller plausibly mistakes for a token.
+const ONE_DIGEST_HEX_CHARS: usize = 64;
+
+/// The widths the table below presents a value at: around the width a token is issued at, and
+/// far below it. Every width is derived from the issued width, so the table cannot drift from
+/// what the service mints.
+fn widths() -> Vec<usize> {
+    vec![
+        1,
+        2,
+        ONE_DIGEST_HEX_CHARS,
+        CONFIRMATION_TOKEN_HEX_CHARS - 1,
+        CONFIRMATION_TOKEN_HEX_CHARS,
+        CONFIRMATION_TOKEN_HEX_CHARS + 1,
+        CONFIRMATION_TOKEN_HEX_CHARS * 2,
+    ]
+}
+
+/// `width` characters cycled out of `alphabet`.
+fn run(alphabet: &str, width: usize) -> String {
+    alphabet.chars().cycle().take(width).collect()
+}
+
+/// Every value the table below presents as a `Token`, as `(case, value, the sentence it earns)`:
+/// an empty value, then the product of the WIDTHS in [`widths`] and the MATERIALS a value can be
+/// written in.
+fn material_and_width_rows() -> Vec<(String, String, &'static str)> {
+    // An empty `Token`: present, so the member is there, but carrying no confirmation material
+    // at all — the token that confirms nothing, like every other value of no token's material.
+    let mut rows = vec![(
+        "an empty Token".to_string(),
+        String::new(),
+        INVALID_TOKEN,
+    )];
+    for width in widths() {
+        // Of a token's material, the issued width is the only width a token is issued at: at
+        // any other, the value is a token that reached the call damaged.
+        let of_the_material = if width == CONFIRMATION_TOKEN_HEX_CHARS {
+            INVALID_TOKEN
+        } else {
+            INVALID_PARAMETER_TOKEN
+        };
+
+        rows.push((
+            format!("{width} lower-case hexadecimal characters"),
+            run("0123456789abcdef", width),
+            of_the_material,
+        ));
+        rows.push((
+            format!("{width} upper-case hexadecimal characters"),
+            run("0123456789ABCDEF", width),
+            of_the_material,
+        ));
+        rows.push((
+            format!("{width} characters outside the hexadecimal alphabet"),
+            run("ghijklmnopqrstuv", width),
+            INVALID_TOKEN,
+        ));
+        if width > 1 {
+            // Hexadecimal but for ONE character: the value is not of a token's material at
+            // all, however much of it reads like one.
+            let mut mixed: Vec<char> = run("0123456789abcdef", width).chars().collect();
+            let middle = mixed.len() / 2;
+            mixed[middle] = 'z';
+            rows.push((
+                format!("{width} hexadecimal characters with one character outside the alphabet"),
+                mixed.into_iter().collect(),
+                INVALID_TOKEN,
+            ));
+        }
+    }
+    rows
+}
+
+/// The MATERIAL and the WIDTH of the value presented together decide which of the two sentences
+/// it earns, over the whole product of the two: a value of a token's material at the issued
+/// width that confirms nothing is the token that confirms nothing, the same material at any
+/// other width is the damaged token, and a value of any other material is the token that
+/// confirms nothing whatever its width. The subscription the topic is holding stays awaiting
+/// confirmation throughout, and the token the service minted still confirms it afterwards.
+#[tokio::test]
+async fn the_material_and_the_width_decide_which_refusal_a_token_earns() {
+    let sns = Sns::new();
+    let topic = sns.topic("token-material-and-width").await;
+    let awaiting = subscribe(&sns, &topic, "https", "https://example.test/material").await;
+    let minted = token_of(&sns, &awaiting);
+
+    for (case, value, expected) in material_and_width_rows() {
+        assert_ne!(
+            value, minted,
+            "case {case:?}: the generated value must not be the token the service minted"
+        );
+
+        let answer = confirm(&sns, &topic, &value).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {} / {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.code(),
+            "InvalidParameter",
+            "case {case:?}: expected the InvalidParameter code, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.element("Message").as_deref(),
+            Some(expected),
+            "case {case:?}: expected exactly {expected:?}, got {}",
+            answer.body
+        );
+        assert!(
+            answer.element("SubscriptionArn").is_none(),
+            "case {case:?}: a refused confirmation must report no subscription, got {}",
+            answer.body
+        );
+        assert!(
+            // A one- or two-character value is characters that occur in the sentence itself;
+            // what must never be reproduced is the token-shaped value the caller presented.
+            value.chars().count() < 20 || !answer.body.contains(value.as_str()),
+            "case {case:?}: the refusal must not echo the value presented, got {}",
+            answer.body
+        );
+        assert!(
+            pending(&sns, &awaiting),
+            "case {case:?}: the refused confirmation must leave the subscription awaiting \
+             confirmation"
+        );
+    }
+
+    // The control: the token the service minted confirms the subscription, so every refusal
+    // above was about the value presented rather than about the call.
+    let answer = confirm(&sns, &topic, &minted).await;
+    assert_eq!(
+        answer.status, 200,
+        "the minted token must confirm the subscription, got {} / {}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.element("SubscriptionArn").as_deref(),
+        Some(awaiting.as_str()),
+        "the confirmation must report the subscription's ARN, got {}",
+        answer.body
+    );
+    assert!(
+        !pending(&sns, &awaiting),
+        "the confirmed subscription must no longer be awaiting confirmation"
+    );
 }

@@ -197,22 +197,23 @@ pub fn is_pending_confirmation_sentinel(value: &str) -> bool {
 /// sent to an endpoint during the Subscribe action", so the token is opaque: nothing
 /// but equality against the minted value is read off it. The width is still part of the
 /// token's FORM, which is what [`confirmation_token::is_confirmation_token_form`] judges a
-/// presented value by — and it is far more than one digest's worth, so a short run of
-/// hexadecimal characters is not a token at all.
+/// presented value by — a value of a token's own material at any other width is a token that
+/// was damaged on its way back rather than a token at all.
 pub const CONFIRMATION_TOKEN_HEX_CHARS: usize = 320;
 
-/// The sentence a `ConfirmSubscription` carrying a token OF A TOKEN'S FORM that is not the
-/// one sent to any of the topic's awaiting endpoints is refused with — an expired,
-/// already-superseded or foreign confirmation link.
+/// The sentence a `ConfirmSubscription` whose `Token` is not the one sent to any of the
+/// topic's awaiting endpoints is refused with — an expired, already-superseded or foreign
+/// confirmation link, and equally a value that carries no confirmation material at all.
 ///
 /// WHOLLY FIXED text: the token is opaque and secret, so the sentence reproduces NEITHER
 /// the token the caller sent nor the one that was sent to the endpoint, and it states no
 /// reason clause either — nothing about an opaque token is readable enough to report. The
 /// sentence names the token rather than the member, which is how this operation words the
-/// condition: recorded evidence has `ConfirmSubscription` with a well-formed token that is
-/// not a confirmation token of the topic answering `400 InvalidParameter` with exactly this
-/// sentence. A value that is not of a token's form at all is the OTHER condition, and is
-/// refused with [`confirmation_token::malformed_confirmation_token_refusal`].
+/// condition: recorded evidence has `ConfirmSubscription` answering `400 InvalidParameter`
+/// with exactly this sentence for a token that is not a confirmation token of the topic. A
+/// value written in a token's own material at a width no token is issued at is the OTHER
+/// condition — a token damaged on its way back — and is refused with
+/// [`confirmation_token::malformed_confirmation_token_refusal`].
 pub const INVALID_CONFIRMATION_TOKEN_REFUSAL: &str = "Invalid token";
 
 /// The attribute names SNS defines for a subscription, from the `Subscribe` /
