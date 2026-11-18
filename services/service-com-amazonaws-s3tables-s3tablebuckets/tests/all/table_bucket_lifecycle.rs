@@ -35,6 +35,8 @@ use s3tables::state::{
     TableBucket, TableBucketType,
 };
 
+use crate::wire_forms::assert_canonical_uuid;
+
 /// The account id every emulated ARN carries (`engine::emulator_account_id()`),
 /// restated so an ARN assertion reads whole.
 const ACCOUNT: &str = "000000000000";
@@ -146,6 +148,11 @@ impl Emulator {
 
     async fn get_table_bucket(&self, region: &str, arn: &str) -> Reply {
         self.call("GET", &format!("/buckets/{}", encode(arn)), region, None)
+            .await
+    }
+
+    async fn delete_table_bucket(&self, region: &str, arn: &str) -> Reply {
+        self.call("DELETE", &format!("/buckets/{}", encode(arn)), region, None)
             .await
     }
 
@@ -375,14 +382,20 @@ async fn a_created_table_bucket_is_readable_field_for_field() {
         );
 
         let bucket_id = read.text("tableBucketId");
-        assert!(
-            !bucket_id.is_empty(),
-            "case {label:?}: tableBucketId must be a server-generated id, got {bucket_id:?}",
-            label = case.label
-        );
-        assert!(
-            !bucket_id.contains(&case.name),
-            "case {label:?}: tableBucketId must not be derived from the request, got {bucket_id:?}",
+        // What marks the id as the service's own is its FORM: the canonical
+        // hyphenated UUID every identifier this service mints carries, which no
+        // name the model accepts is spelled as. A substring check against the
+        // requested name is not that test — a name written only in the hex
+        // digits a UUID is spelled with is a substring of some ids and not of
+        // others, so its outcome would be decided by whichever id this run's
+        // mint produced rather than by the service's behaviour. That the id
+        // belongs to the BUCKET and not to its name is pinned, over these same
+        // names, by
+        // `a_table_bucket_id_is_minted_per_bucket_and_never_computed_from_the_name`.
+        assert_canonical_uuid(&bucket_id, "GetTableBucket's tableBucketId", case.label);
+        assert_ne!(
+            bucket_id, case.name,
+            "case {label:?}: tableBucketId must be a minted id, not the requested name",
             label = case.label
         );
         assert!(
@@ -463,6 +476,82 @@ async fn a_created_table_bucket_is_readable_field_for_field() {
         cases.len(),
         "every row must have left exactly one bucket in the store"
     );
+}
+
+/// Create `name` in `region` and answer with the `tableBucketId` the reader
+/// reports for the bucket, checked to be in the canonical form every identifier
+/// this service mints carries.
+async fn created_bucket_id(emulator: &Emulator, region: &str, name: &str) -> String {
+    let case = format!("{name} in {region}");
+    let created = emulator
+        .create_table_bucket(region, &json!({ "name": name }))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: CreateTableBucket must succeed, got {status} {body}",
+        status = created.status,
+        body = created.body
+    );
+    let arn = created.text("arn");
+    let read = emulator.get_table_bucket(region, &arn).await;
+    assert_eq!(
+        read.status, 200,
+        "case {case:?}: GetTableBucket must succeed, got {status} {body}",
+        status = read.status,
+        body = read.body
+    );
+    let bucket_id = read.text("tableBucketId");
+    assert_canonical_uuid(&bucket_id, "GetTableBucket's tableBucketId", &case);
+    bucket_id
+}
+
+/// `tableBucketId` identifies the BUCKET, never the name the request asked for:
+/// one name carried by several buckets — the same name in another Region, and
+/// the same name again in one Region after the bucket holding it is deleted —
+/// gets a distinct minted id each time, whatever the name is spelled with.
+#[tokio::test]
+async fn a_table_bucket_id_is_minted_per_bucket_and_never_computed_from_the_name() {
+    let emulator = Emulator::new();
+
+    // One row per name form, spanning what a name can be spelled with: only the
+    // hex digits a UUID is written in, letters outside that alphabet, and digits
+    // only.
+    for name in ["ab1", "my-table-bucket", "20260101"] {
+        let mut ids: Vec<String> = Vec::new();
+
+        // The same name in two Regions names two buckets, so two ids.
+        for region in ["us-east-1", "eu-west-1"] {
+            ids.push(created_bucket_id(&emulator, region, name).await);
+        }
+
+        // And the name re-used in one Region, once the bucket holding it is
+        // gone, names a third bucket — not the one that carried the name
+        // before.
+        let deleted = emulator
+            .delete_table_bucket("us-east-1", &expected_arn("us-east-1", name))
+            .await;
+        assert!(
+            (200..300).contains(&deleted.status),
+            "case {name:?}: DeleteTableBucket must succeed, got {status} {body}",
+            status = deleted.status,
+            body = deleted.body
+        );
+        ids.push(created_bucket_id(&emulator, "us-east-1", name).await);
+
+        let distinct: BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            ids.len(),
+            "case {name:?}: each bucket carrying one name must have its own id, got {ids:?}"
+        );
+        for id in &ids {
+            assert_ne!(
+                id.as_str(),
+                name,
+                "case {name:?}: a minted id must not be the requested name"
+            );
+        }
+    }
 }
 
 #[tokio::test]
