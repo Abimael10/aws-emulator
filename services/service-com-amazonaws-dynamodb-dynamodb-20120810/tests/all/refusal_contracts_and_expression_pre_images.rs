@@ -275,11 +275,22 @@ async fn an_expression_refusal_names_its_member_and_the_request_detail() {
                 .to_string(),
         ),
         (
-            "arithmetic given a string operand",
+            // The operand whose type is wrong is read from the ITEM, so the refusal is
+            // the class sentence that names neither operand; the row below states the
+            // same arithmetic over a type the REQUEST spelled.
+            "arithmetic over a stored string",
             "UpdateItem",
             json!({"TableName": "Expressions", "Key": {"pk": {"S": "one"}},
                    "UpdateExpression": "SET n = s + :v",
                    "ExpressionAttributeValues": {":v": {"N": "1"}}}),
+            "An operand in the update expression has an incorrect data type".to_string(),
+        ),
+        (
+            "arithmetic given a string operand",
+            "UpdateItem",
+            json!({"TableName": "Expressions", "Key": {"pk": {"S": "one"}},
+                   "UpdateExpression": "SET n = :v + :one",
+                   "ExpressionAttributeValues": {":v": {"S": "X"}, ":one": {"N": "1"}}}),
             "1 validation error detected: Invalid UpdateExpression: Incorrect operand type for \
              operator or function; operator or function: +, operand type: S"
                 .to_string(),

@@ -753,7 +753,8 @@ async fn the_legacy_filter_surface_is_bounded() {
 
     // The ceilings the service holds the legacy surface to, read from the service
     // itself so the rows cannot drift from the constants they are about: how many
-    // entries one condition map may state, and how many values one `IN` entry may list.
+    // entries one condition map may state, beside the operand count the EXPRESSION
+    // spelling of `IN` is held to, which this surface is not.
     let conditions = |count: usize| {
         let mut map = Map::new();
         for at in 0..count {
@@ -770,14 +771,26 @@ async fn the_legacy_filter_surface_is_bounded() {
     };
 
     // Each row: the case, the `ScanFilter` it sends, and the HTTP status it must be
-    // answered with — each published bound, and one past it.
+    // answered with — each published bound, and one past it. The `IN` entry's
+    // `AttributeValueList` states no count of its own, so the 100-value ceiling the
+    // EXPRESSION operator carries ([`MAX_IN_OPERANDS`]) does not bind it: a longer list is
+    // served.
     let cases: Vec<(&str, Value, u16)> = vec![
         ("one condition", conditions(1), 200),
         ("as many conditions as the ceiling", conditions(MAX_LEGACY_CONDITIONS), 200),
         ("one condition past the ceiling", conditions(MAX_LEGACY_CONDITIONS + 1), 400),
         ("an IN entry with one value", in_values(1), 200),
-        ("an IN entry at the operand ceiling", in_values(MAX_IN_OPERANDS), 200),
-        ("an IN entry one operand past the ceiling", in_values(MAX_IN_OPERANDS + 1), 400),
+        ("an IN entry at the expression's operand ceiling", in_values(MAX_IN_OPERANDS), 200),
+        (
+            "an IN entry one operand past that ceiling",
+            in_values(MAX_IN_OPERANDS + 1),
+            200,
+        ),
+        (
+            "an IN entry well past that ceiling",
+            in_values(MAX_IN_OPERANDS * 3),
+            200,
+        ),
         (
             "an IN entry with no values at all",
             json!({"note": {"ComparisonOperator": "IN", "AttributeValueList": []}}),

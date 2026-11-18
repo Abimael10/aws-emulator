@@ -18,8 +18,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::ops::types::Condition;
 use crate::state::{
-    check_legacy_conditions, expression_conflict, legacy_conditions_match, Item, ParsedCondition,
-    RequestError, Substitutions,
+    check_legacy_conditions, expression_conflict, legacy_conditions_match, Item, LegacyMembership,
+    ParsedCondition, RequestError, Substitutions,
 };
 
 /// The member a `FilterExpression` arrives in, which is what its refusals name.
@@ -46,6 +46,11 @@ pub enum ReadFilter<'a> {
         member: &'a str,
         conditions: &'a HashMap<String, Condition>,
         conditional_operator: Option<&'a str>,
+        /// The `IN` entries of that map, indexed once here rather than scanned per item
+        /// ([`LegacyMembership`]): the length of one entry's operand list is the
+        /// request's to choose, and the entry is evaluated for every item the read
+        /// evaluates.
+        membership: LegacyMembership,
     },
 }
 
@@ -117,6 +122,10 @@ impl<'a> ReadFilter<'a> {
                     member: legacy_member,
                     conditions,
                     conditional_operator,
+                    // Indexed here, where every other fact of this filter is settled, so
+                    // what one `IN` entry costs per item is a constant of this service
+                    // rather than the number of values the request listed.
+                    membership: LegacyMembership::of(conditions),
                 })
             }
             (None, None) => {
@@ -141,8 +150,9 @@ impl<'a> ReadFilter<'a> {
             Self::Legacy {
                 conditions,
                 conditional_operator,
+                membership,
                 ..
-            } => legacy_conditions_match(conditions, *conditional_operator, seen),
+            } => legacy_conditions_match(conditions, *conditional_operator, membership, seen),
         }
     }
 

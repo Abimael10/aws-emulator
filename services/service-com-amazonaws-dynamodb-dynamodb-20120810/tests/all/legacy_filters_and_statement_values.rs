@@ -293,13 +293,16 @@ async fn a_begins_with_operand_that_has_no_prefix_is_refused() {
 }
 
 #[tokio::test]
-async fn an_in_comparison_is_held_to_a_hundred_operands_on_both_surfaces() {
+async fn the_in_operand_ceiling_binds_the_expression_and_not_the_legacy_list() {
     let router = seeded().await;
 
     // "The IN operator can have up to 100 comparison values" (the comparator and
-    // function reference for `ConditionExpression`/`FilterExpression`), the same ceiling
-    // the legacy `IN` comparison's `AttributeValueList` is held to. The rows are the
-    // published bound, one past it and one well past it.
+    // function reference for `ConditionExpression`/`FilterExpression`) is a ceiling of
+    // that OPERATOR. The legacy comparison states no count of its own —
+    // "AttributeValueList can contain one or more AttributeValue elements of type String,
+    // Number, or Binary" (`ComparisonOperator`, the `IN` entry) — so a list the expression
+    // refuses is compared against every item read when it arrives in `ScanFilter`. The
+    // rows are the published bound, one past it and one well past it.
     for (case, count, refused) in [
         ("the published ceiling", 100usize, false),
         ("one operand past it", 101, true),
@@ -328,27 +331,32 @@ async fn an_in_comparison_is_held_to_a_hundred_operands_on_both_surfaces() {
                 "case an expression IN at {case}: expected a served scan, got {status} with \
                  {answered}"
             );
-            continue;
+        } else {
+            assert_eq!(
+                (status, error_code(&answered).as_str()),
+                (400, "ValidationException"),
+                "case an expression IN {case}: expected 400 ValidationException, got {status} \
+                 with {answered}"
+            );
+            assert_eq!(
+                message(&answered),
+                format!(
+                    "Invalid FilterExpression: The IN operator is provided with too many \
+                     operands; number of operands: {count}"
+                ),
+                "case an expression IN {case}: expected the operand-count sentence naming \
+                 {count}, got {}",
+                message(&answered)
+            );
         }
-        assert_eq!(
-            (status, error_code(&answered).as_str()),
-            (400, "ValidationException"),
-            "case an expression IN {case}: expected 400 ValidationException, got {status} with \
-             {answered}"
-        );
-        assert_eq!(
-            message(&answered),
-            format!(
-                "Invalid FilterExpression: The IN operator is provided with too many operands; \
-                 number of operands: {count}"
-            ),
-            "case an expression IN {case}: expected the operand-count sentence naming {count}, \
-             got {}",
-            message(&answered)
-        );
 
-        // The legacy comparison carries the same ceiling, in its own member's words.
-        let operands: Vec<Value> = (0..count).map(|at| json!({"S": format!("v{at}")})).collect();
+        // The legacy comparison carries no such ceiling: the list is compared against
+        // every item the scan reads, however many values it holds. The last value is one
+        // an item holds, so what the row proves is that the whole list was read.
+        let mut operands: Vec<Value> = (0..count - 1)
+            .map(|at| json!({"S": format!("v{at}")}))
+            .collect();
+        operands.push(json!({"S": "alpha"}));
         let (status, answered) = call(
             &router,
             "Scan",
@@ -359,17 +367,14 @@ async fn an_in_comparison_is_held_to_a_hundred_operands_on_both_surfaces() {
         )
         .await;
         assert_eq!(
-            (status, error_code(&answered).as_str()),
-            (400, "ValidationException"),
-            "case a legacy IN {case}: expected 400 ValidationException, got {status} with \
-             {answered}"
+            status, 200,
+            "case a legacy IN {case}: expected a served scan, got {status} with {answered}"
         );
         assert_eq!(
-            message(&answered),
-            "One or more parameter values were invalid: Invalid number of argument(s) for the IN \
-             ComparisonOperator",
-            "case a legacy IN {case}: expected the argument-count sentence, got {}",
-            message(&answered)
+            reported(&answered),
+            vec!["has-match".to_string()],
+            "case a legacy IN {case}: expected the item holding the listed value, got \
+             {answered}"
         );
     }
 }
