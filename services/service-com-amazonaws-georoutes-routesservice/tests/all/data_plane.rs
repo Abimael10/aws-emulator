@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use crate::routing::{int, post, routes_service, MATRIX, OPTIMIZE, ROUTES, SNAP};
+use crate::routing::{great_circle_m, int, position, post, routes_service, MATRIX, OPTIMIZE, ROUTES, SNAP};
 
 /// Positions in mapped territory, where the road network has coverage.
 const SEATTLE: [f64; 2] = [-122.3321, 47.6062];
@@ -37,18 +37,57 @@ const MEDITERRANEAN: [f64; 2] = [17.0, 35.0];
 const CARIBBEAN: [f64; 2] = [-75.0, 18.0];
 const DEEP_PACIFIC: [f64; 2] = [-130.5, 44.6];
 
+/// `RoadSnapNoticeCode`, as
+/// `smithy_query(query="shape",shape="RoadSnapNoticeCode")` enumerates it, for the two
+/// conditions `SnapToRoads` reports about a trace point.
+const MOVED_BY_LARGE_DISTANCE: &str = "TracePointsMovedByLargeDistance";
+const NOT_MATCHED: &str = "TracePointsNotMatched";
+
+/// Spacing of the synthetic road grid, in degrees, as documented on `ROAD_SPACING_DEG` in
+/// `src/state.rs`. A position read off the network lies on a road, so at least one of its
+/// coordinates is a multiple of this.
+const ROAD_SPACING_DEG: f64 = 0.0005;
+
+/// A position exactly on a junction of the grid: both coordinates are multiples of the
+/// spacing, so the network matches it with no offset at any radius.
+const ON_A_JUNCTION: [f64; 2] = [-123.1, 49.28];
+/// The centre of the grid cell north-east of that junction: about as far from a road as a
+/// position inside this network's coverage gets, which is what a tight radius leaves
+/// without a road of its own.
+const OFF_THE_ROADS: [f64; 2] = [-123.100_25, 49.280_25];
+
+/// Three fixes along neighbouring downtown streets, every one of them inside the mapped
+/// territory the network covers.
+const DOWNTOWN: [[f64; 2]; 3] = [
+    [-122.3421, 47.6101],
+    [-122.3428, 47.6110],
+    [-122.3433, 47.6120],
+];
+
+/// Whether `coordinate` is a multiple of the grid spacing, i.e. the fixed coordinate of a
+/// road of the network.
+fn on_a_road_line(coordinate: f64) -> bool {
+    let multiples = coordinate / ROAD_SPACING_DEG;
+    (multiples - multiples.round()).abs() * ROAD_SPACING_DEG <= 1e-9
+}
+
 // ---------------------------------------------------------------------------
 // SnapToRoads: the points no road matched
 // ---------------------------------------------------------------------------
 
-/// A trace point the road network could not match is REPORTED: its index is listed under
-/// a `RoadSnapNotice`, and only the indexes of the points that were not matched are.
+/// A trace point with no road of its own is REPORTED: its index is listed under a
+/// `RoadSnapNotice`, only the indexes of such points are, and the notice's `Code` says
+/// what became of them — a trace that matched roads elsewhere carries its stray point onto
+/// that path, which moves it a long way, while a trace that matched none has nothing to
+/// carry it onto and reports it unmatched. A notice carries that code and its indexes and
+/// nothing else.
 ///
-/// Rows differ along what the rule generalises over: where the unmatched points sit in the
-/// trace, how many there are, which travel mode was asked for and how wide a snap radius
-/// the caller allowed — a radius does not conjure a road where the network has none.
+/// Rows differ along what the rule generalises over: where the points with no road of
+/// their own sit in the trace, how many there are, whether the rest of the trace matched
+/// anything, which travel mode was asked for and how wide a snap radius the caller allowed
+/// — a radius does not conjure a road where the network has none.
 #[tokio::test]
-async fn snap_to_roads_reports_the_trace_points_no_road_matched() {
+async fn snap_to_roads_reports_the_trace_points_with_no_road_of_their_own() {
     let router = routes_service();
     let on_road = [
         [-122.3331, 47.6052],
@@ -57,13 +96,22 @@ async fn snap_to_roads_reports_the_trace_points_no_road_matched() {
         [-122.3301, 47.6082],
     ];
 
-    // name, the trace, the indexes no road can match, travel mode, SnapRadius.
-    type SnapCase = (&'static str, Vec<[f64; 2]>, Vec<i64>, &'static str, Option<i64>);
+    // name, the trace, the indexes with no road of their own, the code they are reported
+    // under, travel mode, SnapRadius.
+    type SnapCase = (
+        &'static str,
+        Vec<[f64; 2]>,
+        Vec<i64>,
+        &'static str,
+        &'static str,
+        Option<i64>,
+    );
     let cases: [SnapCase; 7] = [
         (
             "every point on a road",
             vec![on_road[0], on_road[1], on_road[2]],
             vec![],
+            MOVED_BY_LARGE_DISTANCE,
             "Car",
             None,
         ),
@@ -71,6 +119,7 @@ async fn snap_to_roads_reports_the_trace_points_no_road_matched() {
             "open water last",
             vec![on_road[0], on_road[1], on_road[2], PACIFIC],
             vec![3],
+            MOVED_BY_LARGE_DISTANCE,
             "Truck",
             None,
         ),
@@ -78,6 +127,7 @@ async fn snap_to_roads_reports_the_trace_points_no_road_matched() {
             "open water in the middle",
             vec![on_road[0], on_road[1], PACIFIC, on_road[2]],
             vec![2],
+            MOVED_BY_LARGE_DISTANCE,
             "Car",
             None,
         ),
@@ -85,13 +135,15 @@ async fn snap_to_roads_reports_the_trace_points_no_road_matched() {
             "open water first",
             vec![DEEP_PACIFIC, on_road[0], on_road[1]],
             vec![0],
+            MOVED_BY_LARGE_DISTANCE,
             "Pedestrian",
             None,
         ),
         (
-            "two unmatched points, in different oceans",
+            "two stray points, in different oceans",
             vec![on_road[0], ATLANTIC, on_road[1], MEDITERRANEAN],
             vec![1, 3],
+            MOVED_BY_LARGE_DISTANCE,
             "Scooter",
             None,
         ),
@@ -99,6 +151,7 @@ async fn snap_to_roads_reports_the_trace_points_no_road_matched() {
             "the widest radius the model allows still matches no road",
             vec![on_road[0], on_road[1], PACIFIC],
             vec![2],
+            MOVED_BY_LARGE_DISTANCE,
             "Car",
             Some(10_000),
         ),
@@ -106,12 +159,13 @@ async fn snap_to_roads_reports_the_trace_points_no_road_matched() {
             "a trace entirely in open water",
             vec![PACIFIC, DEEP_PACIFIC],
             vec![0, 1],
+            NOT_MATCHED,
             "Car",
             None,
         ),
     ];
 
-    for (case, trace, unmatched, travel_mode, snap_radius) in cases {
+    for (case, trace, stray, code, travel_mode, snap_radius) in cases {
         let mut body = json!({
             "TracePoints": trace.iter().map(|position| json!({ "Position": position })).collect::<Vec<Value>>(),
             "TravelMode": travel_mode,
@@ -129,12 +183,12 @@ async fn snap_to_roads_reports_the_trace_points_no_road_matched() {
         let mut flagged: BTreeSet<i64> = BTreeSet::new();
         for notice in notices {
             assert_eq!(
-                notice["Code"], json!("TracePointsNotMatched"),
-                "case {case:?}: a point no road matched is reported under the code for it, got {notice:?}"
+                notice["Code"], json!(code),
+                "case {case:?}: expected the {code} code, got {notice:?}"
             );
-            assert!(
-                notice["Title"].as_str().is_some_and(|title| !title.is_empty()),
-                "case {case:?}: Title is required on a notice, got {notice:?}"
+            assert_eq!(
+                notice.as_object().map(serde_json::Map::len), Some(2),
+                "case {case:?}: a notice carries its code and its indexes and nothing else, got {notice:?}"
             );
             let indexes = notice["TracePointIndexes"]
                 .as_array()
@@ -148,13 +202,14 @@ async fn snap_to_roads_reports_the_trace_points_no_road_matched() {
         }
         assert_eq!(
             flagged,
-            unmatched.iter().copied().collect::<BTreeSet<i64>>(),
-            "case {case:?}: exactly the unmatched indexes are flagged, got notices {notices:?}"
+            stray.iter().copied().collect::<BTreeSet<i64>>(),
+            "case {case:?}: exactly the indexes with no road of their own are flagged, got notices {notices:?}"
         );
 
-        // Every submitted point is answered for, at its own index: an unmatched one keeps
-        // the position it was submitted at and scores no confidence, so the notice is the
-        // only thing that tells it apart from a road fix.
+        // Every submitted point is answered for, at its own index. A point carried onto
+        // the trace's path is reported on that path rather than where it was submitted; a
+        // point nothing could be placed on keeps its submitted position and scores no
+        // confidence, so the notice is the only thing that tells it apart from a road fix.
         let snapped = answer["SnappedTracePoints"]
             .as_array()
             .unwrap_or_else(|| panic!("case {case:?}: SnappedTracePoints is required, got {answer:?}"));
@@ -166,26 +221,326 @@ async fn snap_to_roads_reports_the_trace_points_no_road_matched() {
             let confidence = point["Confidence"]
                 .as_f64()
                 .unwrap_or_else(|| panic!("case {case:?}: Confidence is required, got {point:?}"));
-            let is_unmatched = unmatched.contains(&(index as i64));
-            assert_eq!(
-                confidence == 0.0, is_unmatched,
-                "case {case:?}: point {index} scores no confidence exactly when no road matched it, got {point:?}"
+            assert!(
+                (0.0..=1.0).contains(&confidence),
+                "case {case:?}: point {index} confidence must be in 0..1, got {confidence}"
             );
-            if is_unmatched {
-                assert_eq!(
-                    point["SnappedPosition"], point["OriginalPosition"],
-                    "case {case:?}: point {index} was not moved onto a road, got {point:?}"
+            let is_stray = stray.contains(&(index as i64));
+            if !is_stray {
+                assert!(
+                    confidence > 0.0,
+                    "case {case:?}: point {index} matched a road of its own, so it scores confidence, got {point:?}"
                 );
             }
+            assert_eq!(
+                point["SnappedPosition"] == point["OriginalPosition"],
+                is_stray && code == NOT_MATCHED,
+                "case {case:?}: point {index} is reported where it was submitted only when nothing could place it, got {point:?}"
+            );
         }
 
-        // The snapped geometry is the line through the points that DID match a road, so a
-        // trace with fewer than two of them has no line to draw.
-        let matched = trace.len() - unmatched.len();
+        // The snapped geometry is the line through the points that matched a road of their
+        // own, so a trace with fewer than two of them has no line to draw — a point
+        // carried onto that line adds no vertex to it.
+        let matched = trace.len() - stray.len();
         assert_eq!(
             answer["SnappedGeometry"]["LineString"].is_array(), matched >= 2,
             "case {case:?}: {matched} matched points, got geometry {:?}",
             answer["SnappedGeometry"]
+        );
+    }
+}
+
+/// One case's `SnapToRoads` request.
+fn snap_body(trace: &[[f64; 2]], travel_mode: &str, snap_radius: Option<i64>) -> Value {
+    let mut body = json!({
+        "TracePoints": trace.iter().map(|position| json!({ "Position": position })).collect::<Vec<Value>>(),
+        "TravelMode": travel_mode,
+    });
+    if let Some(radius) = snap_radius {
+        body["SnapRadius"] = json!(radius);
+    }
+    body
+}
+
+/// The indexes the notices of `answer` hold, grouped by the code they are held under, with
+/// every notice checked to carry that code and those indexes and NOTHING else — the
+/// modelled `Title` is the service's own prose for the condition, which this emulator
+/// holds none of and so never composes.
+fn flagged_by_code(answer: &Value, case: &str) -> Vec<(String, BTreeSet<i64>)> {
+    let notices = answer["Notices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: Notices is required, got {answer:?}"));
+    let mut by_code: Vec<(String, BTreeSet<i64>)> = Vec::new();
+    for notice in notices {
+        let notice = notice
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case:?}: a notice is a structure, got {notice:?}"));
+        assert_eq!(
+            notice.keys().cloned().collect::<BTreeSet<String>>(),
+            BTreeSet::from(["Code".to_string(), "TracePointIndexes".to_string()]),
+            "case {case:?}: a notice carries its code and its indexes and nothing else, got {notice:?}"
+        );
+        let code = notice["Code"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: Code is required, got {notice:?}"))
+            .to_string();
+        let indexes = notice["TracePointIndexes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: TracePointIndexes is required, got {notice:?}"));
+        assert!(
+            (1..=1_000).contains(&indexes.len()),
+            "case {case:?}: TracePointIndexes carries 1..1000 entries, got {}",
+            indexes.len()
+        );
+        let indexes: BTreeSet<i64> = indexes.iter().filter_map(Value::as_i64).collect();
+        match by_code.iter_mut().find(|(seen, _)| seen == &code) {
+            Some((_, seen)) => seen.extend(indexes),
+            None => by_code.push((code, indexes)),
+        }
+    }
+    by_code
+}
+
+/// A trace point with no road of its own, in a trace that matched roads elsewhere, is
+/// carried onto the path those matches lie on and reported under the code for a point
+/// moved by a large distance — never under the code for a point that was not matched,
+/// which this same answer contradicts by reporting a road position for it.
+///
+/// Rows differ along what the rule generalises over: where the stray point sits in the
+/// trace, how many there are, why it has no road of its own (outside the mapped territory
+/// the network covers, or inside it but outside the radius the request allowed), the
+/// travel mode and the radius itself.
+#[tokio::test]
+async fn a_stray_trace_point_is_carried_onto_the_matched_path_and_reported_as_moved() {
+    let router = routes_service();
+
+    // name, the trace, the indexes with no road of their own, travel mode, SnapRadius.
+    type Case = (&'static str, Vec<[f64; 2]>, Vec<i64>, &'static str, Option<i64>);
+    let cases: [Case; 7] = [
+        (
+            "a downtown trace with one offshore fix last",
+            vec![DOWNTOWN[0], DOWNTOWN[1], DOWNTOWN[2], PACIFIC],
+            vec![3],
+            "Truck",
+            None,
+        ),
+        (
+            "the offshore fix first",
+            vec![PACIFIC, DOWNTOWN[0], DOWNTOWN[1], DOWNTOWN[2]],
+            vec![0],
+            "Car",
+            None,
+        ),
+        (
+            "the offshore fix in the middle",
+            vec![DOWNTOWN[0], DEEP_PACIFIC, DOWNTOWN[2]],
+            vec![1],
+            "Pedestrian",
+            None,
+        ),
+        (
+            "two stray fixes, in different oceans",
+            vec![DOWNTOWN[0], ATLANTIC, DOWNTOWN[1], CARIBBEAN],
+            vec![1, 3],
+            "Scooter",
+            None,
+        ),
+        (
+            "the widest radius the model allows reaches no road either",
+            vec![DOWNTOWN[0], DOWNTOWN[1], PACIFIC],
+            vec![2],
+            "Car",
+            Some(10_000),
+        ),
+        (
+            "one fix on a junction, one off the roads at a one-metre radius",
+            vec![ON_A_JUNCTION, OFF_THE_ROADS],
+            vec![1],
+            "Car",
+            Some(1),
+        ),
+        (
+            "two fixes off the roads at a two-metre radius, one on a junction",
+            vec![OFF_THE_ROADS, ON_A_JUNCTION, OFF_THE_ROADS],
+            vec![0, 2],
+            "Car",
+            Some(2),
+        ),
+    ];
+
+    for (case, trace, stray, travel_mode, snap_radius) in cases {
+        let (status, answer, _) =
+            post(&router, SNAP, &snap_body(&trace, travel_mode, snap_radius)).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+
+        assert_eq!(
+            flagged_by_code(&answer, case),
+            vec![(
+                MOVED_BY_LARGE_DISTANCE.to_string(),
+                stray.iter().copied().collect::<BTreeSet<i64>>()
+            )],
+            "case {case:?}: exactly the stray indexes are reported under {MOVED_BY_LARGE_DISTANCE}, got {:?}",
+            answer["Notices"]
+        );
+
+        let snapped = answer["SnappedTracePoints"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: SnappedTracePoints is required, got {answer:?}"));
+        assert_eq!(
+            snapped.len(), trace.len(),
+            "case {case:?}: one snapped point per trace point, got {snapped:?}"
+        );
+        // The radius the service applies: 0 or an absent member means the documented
+        // default of 300 m.
+        let allowed = snap_radius.filter(|radius| *radius > 0).unwrap_or(300) as f64;
+        for (index, point) in snapped.iter().enumerate() {
+            assert_eq!(
+                position(&point["OriginalPosition"], case), trace[index],
+                "case {case:?}: point {index} must echo the submitted position, got {point:?}"
+            );
+            let reported = position(&point["SnappedPosition"], case);
+            // Every point of this answer is reported ON the network, so at least one of
+            // its coordinates is the fixed coordinate of a road.
+            assert!(
+                on_a_road_line(reported[0]) || on_a_road_line(reported[1]),
+                "case {case:?}: point {index} must be reported on a road, got {reported:?}"
+            );
+            let confidence = point["Confidence"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("case {case:?}: Confidence is required, got {point:?}"));
+            assert!(
+                (0.0..=1.0).contains(&confidence),
+                "case {case:?}: point {index} confidence must be in 0..1, got {confidence}"
+            );
+            // A flagged point is exactly the one moved further than the radius the request
+            // allowed; every other point matched a road inside it.
+            let moved = great_circle_m(trace[index], reported);
+            assert_eq!(
+                moved > allowed, stray.contains(&(index as i64)),
+                "case {case:?}: point {index} moved {moved:.1} m against the {allowed} m allowed, got {point:?}"
+            );
+        }
+    }
+}
+
+/// A trace that matched no road at all has no path to carry anything onto, so its points
+/// are reported where they were submitted, score no confidence, are listed under the code
+/// for a point that was not matched, and the answer draws no line.
+///
+/// Rows differ along what the rule generalises over: how many points the trace carries,
+/// why none of them has a road (open water, or a radius too tight for the roads around
+/// them), the travel mode and the radius.
+#[tokio::test]
+async fn a_trace_that_matched_nothing_reports_its_points_unmatched() {
+    let router = routes_service();
+
+    // name, the trace, travel mode, SnapRadius.
+    type Case = (&'static str, Vec<[f64; 2]>, &'static str, Option<i64>);
+    let cases: [Case; 5] = [
+        ("two fixes in open water", vec![PACIFIC, DEEP_PACIFIC], "Car", None),
+        (
+            "three fixes in open water, in different oceans",
+            vec![PACIFIC, ATLANTIC, MEDITERRANEAN],
+            "Truck",
+            None,
+        ),
+        (
+            "fixes in open water at the widest radius the model allows",
+            vec![PACIFIC, CARIBBEAN],
+            "Pedestrian",
+            Some(10_000),
+        ),
+        (
+            "fixes off the roads at a one-metre radius",
+            vec![OFF_THE_ROADS, OFF_THE_ROADS],
+            "Car",
+            Some(1),
+        ),
+        (
+            "fixes off the roads at a two-metre radius",
+            vec![OFF_THE_ROADS, OFF_THE_ROADS],
+            "Scooter",
+            Some(2),
+        ),
+    ];
+
+    for (case, trace, travel_mode, snap_radius) in cases {
+        let (status, answer, _) =
+            post(&router, SNAP, &snap_body(&trace, travel_mode, snap_radius)).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+
+        assert_eq!(
+            flagged_by_code(&answer, case),
+            vec![(
+                NOT_MATCHED.to_string(),
+                (0..trace.len() as i64).collect::<BTreeSet<i64>>()
+            )],
+            "case {case:?}: every index is reported under {NOT_MATCHED}, got {:?}",
+            answer["Notices"]
+        );
+
+        let snapped = answer["SnappedTracePoints"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: SnappedTracePoints is required, got {answer:?}"));
+        assert_eq!(
+            snapped.len(), trace.len(),
+            "case {case:?}: one snapped point per trace point, got {snapped:?}"
+        );
+        for (index, point) in snapped.iter().enumerate() {
+            assert_eq!(
+                position(&point["SnappedPosition"], case), trace[index],
+                "case {case:?}: point {index} must be reported where it was submitted, got {point:?}"
+            );
+            assert_eq!(
+                point["Confidence"], json!(0.0),
+                "case {case:?}: point {index} is on no road, so it scores nothing, got {point:?}"
+            );
+        }
+        assert!(
+            answer["SnappedGeometry"].is_null(),
+            "case {case:?}: with nothing matched there is no line to draw, got {:?}",
+            answer["SnappedGeometry"]
+        );
+    }
+}
+
+/// A trace every point of which matched a road of its own is worth no notice at all: the
+/// `@required` notice list is answered, and empty.
+///
+/// Rows differ along what the rule generalises over: the trace, the travel mode and how
+/// much slack the radius left — including the radius that leaves none to spare.
+#[tokio::test]
+async fn a_trace_matched_throughout_carries_no_notice() {
+    let router = routes_service();
+
+    // name, the trace, travel mode, SnapRadius.
+    type Case = (&'static str, Vec<[f64; 2]>, &'static str, Option<i64>);
+    let cases: [Case; 4] = [
+        ("a downtown trace at the default radius", DOWNTOWN.to_vec(), "Truck", None),
+        ("the same trace at 10 km", DOWNTOWN.to_vec(), "Car", Some(10_000)),
+        (
+            "two junction fixes at a one-metre radius",
+            vec![ON_A_JUNCTION, ON_A_JUNCTION],
+            "Car",
+            Some(1),
+        ),
+        (
+            "fixes off the roads at the default radius",
+            vec![OFF_THE_ROADS, OFF_THE_ROADS],
+            "Car",
+            None,
+        ),
+    ];
+
+    for (case, trace, travel_mode, snap_radius) in cases {
+        let (status, answer, _) =
+            post(&router, SNAP, &snap_body(&trace, travel_mode, snap_radius)).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+        assert_eq!(
+            answer["Notices"], json!([]),
+            "case {case:?}: nothing here is worth a notice, got {:?}",
+            answer["Notices"]
         );
     }
 }

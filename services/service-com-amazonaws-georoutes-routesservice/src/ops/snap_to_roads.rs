@@ -8,18 +8,28 @@
 //! `OriginalPosition`, the point on the road as `SnappedPosition` and a `Confidence` read
 //! off the match itself ([`match_confidence`]): how far the point had to move to reach its
 //! road, so a point already on a road matches with the range's own maximum and one as far
-//! from every road as a position can be scores near its minimum. A point whose
-//! nearest usable road is further away than `SnapRadius` is not matched: it keeps its
-//! submitted position, scores zero confidence, and its index is listed under a
-//! `TracePointsNotMatched` notice. So is a point the network holds no road anywhere near —
-//! one in the open sea, where [`crate::state`] materialises no road at all — which is the
-//! case the notice exists for: a client reading `SnappedTracePoints` alone could not tell
-//! that fix from a road fix.
+//! from every road as a position can be scores near its minimum.
+//!
+//! A trace is matched as a WHOLE, not as independent points. A point with no road of its
+//! own inside `SnapRadius` — one whose nearest usable road is further away than that, and
+//! one in the open sea, where [`crate::state`] materialises no road at all — is placed on
+//! the stretch of the matched path its neighbours in the trace establish, which is a road
+//! of the network and so a position a client can use. Placing it there moves it further
+//! than the radius the request allowed, so its index is listed under the notice code for a
+//! point moved by a large distance. Only a trace that matched no road anywhere has no path
+//! to place such a point on: its points keep the positions they were submitted at, score no
+//! confidence, and their indexes are listed under the code for a point that was not
+//! matched. So the notice and `SnappedTracePoints` always agree — the "not matched" code is
+//! reported for a point, and only for a point, the answer reports no road position for.
+//!
+//! A notice carries the code of the condition and the trace-point indexes it holds for,
+//! and nothing else: see [`RoadSnapNotice`] for the `Title` the model marks `@required`
+//! and this service does not put on the wire.
 //!
 //! `SnappedGeometry` is the line along the ROADS the matched points were matched onto,
-//! from the first of them to the last ([`matched_geometry`]); a point reported unmatched is
-//! left out of it, so the geometry and the per-point confidence cannot disagree, and a
-//! trace with fewer than two matched points reports no geometry at all.
+//! from the first of them to the last ([`matched_geometry`]); a point with no road of its
+//! own contributes no vertex to it — it is placed ON that line rather than bending it — and
+//! a trace with fewer than two matched points reports no geometry at all.
 //!
 //! `TracePoints[].Timestamp`, `Speed` and `Heading` are read but have nothing to act on:
 //! the network carries no one-way or direction data for a heading to disambiguate and no
@@ -280,72 +290,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let pricing_bucket = state_handle.lock().pricing_bucket(Self::NAME);
 
-        let mut snapped_trace_points = Vec::with_capacity(positions.len());
+        // The road each point matched ONTO, where the network held one inside the radius
+        // the request allowed: a road outside that radius is not considered, which is what
+        // `SnapRadius` ("the radius around the provided tracepoint that is considered for
+        // snapping") says.
+        let matched: Vec<Option<state::SnappedPosition>> = snapped
+            .into_iter()
+            .map(|candidate| candidate.filter(|candidate| candidate.offset_m <= snap_radius_m))
+            .collect();
         // The matched points in order, each with the road it matched onto: the snapped
         // geometry is the stretch of ROAD between consecutive ones, so the road is needed
         // beside the position.
-        let mut matched_path: Vec<state::SnappedPosition> = Vec::with_capacity(positions.len());
-        // The unmatched points, kept apart by WHY no road matched them: one lies beyond
-        // the radius of the roads around it, the other lies where the network holds no
-        // road at any radius. The notice states the reason, so the two cannot be reported
-        // as each other.
-        let mut beyond_radius: Vec<i32> = Vec::new();
-        let mut off_network: Vec<i32> = Vec::new();
-        for ((index, position), candidate) in positions.iter().enumerate().zip(snapped) {
-            // Within the radius the point matches a road; beyond it there is no candidate
-            // to match, so the point is reported unmatched rather than moved.
-            let matched = candidate.filter(|candidate| candidate.offset_m <= snap_radius_m);
-            match matched {
-                Some(candidate) => {
-                    snapped_trace_points.push(RoadSnapSnappedTracePoint {
-                        confidence: match_confidence(*position, &candidate),
-                        original_position: state::position_to_vec(*position),
-                        snapped_position: state::position_to_vec(candidate.position),
-                    });
-                    matched_path.push(candidate);
+        let matched_path: Vec<state::SnappedPosition> = matched.iter().flatten().cloned().collect();
+        // The matched points that bracket each point of the trace, which is the stretch of
+        // the matched path a point with no road of its own belongs to ([`place`]).
+        let bracketing = bracketing_matches(&matched);
+
+        let mut snapped_trace_points = Vec::with_capacity(positions.len());
+        // The indexes the answer reports a notice for, kept apart by WHICH notice: one set
+        // was placed on the trace's path from further away than the request's radius, the
+        // other could not be placed on a road at all.
+        let mut moved_by_large_distance: Vec<i32> = Vec::new();
+        let mut not_matched: Vec<i32> = Vec::new();
+        for (index, ((position, matched_here), (before, after))) in
+            positions.iter().zip(&matched).zip(&bracketing).enumerate()
+        {
+            let bracket = |at: Option<usize>| at.and_then(|at| matched.get(at)?.as_ref());
+            let placed = place(
+                *position,
+                matched_here.as_ref(),
+                bracket(*before),
+                bracket(*after),
+                snap_radius_m,
+            );
+            let (snapped_position, confidence) = match placed {
+                Placement::OnRoad {
+                    position: on_road,
+                    offset_m,
                 }
-                None => {
-                    if let Ok(index) = i32::try_from(index) {
-                        if state::is_mapped_territory(*position) {
-                            beyond_radius.push(index);
-                        } else {
-                            off_network.push(index);
-                        }
-                    }
-                    // An unmatched point is NOT on the snapped route, so it is left out of
-                    // the snapped geometry: the line would otherwise run through a
-                    // position the same answer reports as matching no road.
-                    snapped_trace_points.push(RoadSnapSnappedTracePoint {
-                        confidence: 0.0,
-                        original_position: state::position_to_vec(*position),
-                        snapped_position: state::position_to_vec(*position),
-                    });
+                | Placement::Moved {
+                    position: on_road,
+                    offset_m,
+                } => (on_road, match_confidence(*position, offset_m)),
+                // A point the answer reports no road position for is reported where it was
+                // submitted and scores nothing: the notice is what tells it apart from a
+                // road fix.
+                Placement::Unplaced => (*position, 0.0),
+            };
+            if let Ok(index) = i32::try_from(index) {
+                match placed {
+                    Placement::OnRoad { .. } => {}
+                    Placement::Moved { .. } => moved_by_large_distance.push(index),
+                    Placement::Unplaced => not_matched.push(index),
                 }
             }
+            snapped_trace_points.push(RoadSnapSnappedTracePoint {
+                confidence,
+                original_position: state::position_to_vec(*position),
+                snapped_position: state::position_to_vec(snapped_position),
+            });
         }
 
-        // The indexes of the points no road matched, as the model's notice reports them,
-        // under the title of the reason they were not matched.
+        // The notices, in the order the model's own enum declares their codes. Each carries
+        // the code of the condition and the indexes it holds for and nothing else.
         // `TracePointIndexes` carries at most `MAX_NOTICE_INDEXES` entries, so a trace with
-        // more unmatched points than that is reported over as many notices of the same
-        // code as it takes: every unmatched index is reported, and no notice breaks the
-        // modeled length.
+        // more flagged points than that is reported over as many notices of the same code
+        // as it takes: every flagged index is reported, and no notice breaks the modeled
+        // length.
         let mut notices = Vec::new();
-        for (indexes, reason) in [
-            (
-                &beyond_radius,
-                format!("no road within the {snap_radius_m} metre snap radius"),
-            ),
-            (
-                &off_network,
-                "no road of the network at all: the position is outside the mapped territory the network covers"
-                    .to_string(),
-            ),
+        for (code, indexes) in [
+            (MOVED_BY_LARGE_DISTANCE, &moved_by_large_distance),
+            (NOT_MATCHED, &not_matched),
         ] {
             for indexes in indexes.chunks(MAX_NOTICE_INDEXES) {
                 notices.push(RoadSnapNotice {
-                    code: "TracePointsNotMatched".to_string(),
-                    title: format!("{} trace points had {reason}", indexes.len()),
+                    code: code.to_string(),
                     trace_point_indexes: indexes.to_vec(),
                 });
             }
@@ -378,7 +397,111 @@ const SNAP_CHUNK: usize = 256;
 /// 1..1000).
 const MAX_NOTICE_INDEXES: usize = 1_000;
 
-/// How certain the match of `position` onto the road `candidate` names is, as
+/// The `RoadSnapNoticeCode` for a trace point the matcher had to move further than the
+/// radius the request allowed to put it on a road: it had no road of its own inside that
+/// radius, so it was placed on the stretch of matched path its neighbours establish.
+const MOVED_BY_LARGE_DISTANCE: &str = "TracePointsMovedByLargeDistance";
+
+/// The `RoadSnapNoticeCode` for a trace point that was not matched to a road at all: the
+/// trace it belongs to matched none either, so there was no path to place it on.
+const NOT_MATCHED: &str = "TracePointsNotMatched";
+
+/// Where one trace point ended up, which is what decides the position the answer reports
+/// for it and the notice, if any, that names its index.
+enum Placement {
+    /// On a road no further from the submitted position than the radius the request
+    /// allowed: the match itself, which is worth no notice.
+    OnRoad { position: Position, offset_m: f64 },
+    /// On a road further away than that radius — the point had none of its own inside it,
+    /// so it was placed on the stretch of matched path its neighbours establish.
+    Moved { position: Position, offset_m: f64 },
+    /// On no road at all: the point had none inside the radius and the trace matched none
+    /// to place it on, so the answer reports it where it was submitted.
+    Unplaced,
+}
+
+/// Where `position` is placed, given the road it matched onto if any and the matched
+/// points that bracket it in the trace.
+///
+/// A trace is matched as a whole: a point with no road of its own inside `radius_m` is
+/// still a point of a trace that runs along roads, so it is placed on the stretch of that
+/// path its neighbours in the trace establish ([`state::road_path_between`]) — a position
+/// on a road of the network, carried at the network's own precision like every other
+/// position read off it. A point with a neighbour on one side only is placed on the road
+/// that neighbour matched; only a trace that matched nothing at all leaves a point
+/// unplaced.
+///
+/// The stretch weighed is the ONE between the two neighbours, so the work per point is
+/// fixed whatever the trace's length.
+fn place(
+    position: Position,
+    matched: Option<&state::SnappedPosition>,
+    before: Option<&state::SnappedPosition>,
+    after: Option<&state::SnappedPosition>,
+    radius_m: f64,
+) -> Placement {
+    let (on_road, offset_m) = match matched {
+        Some(matched) => (matched.position, matched.offset_m),
+        None => {
+            let stretch: Vec<Position> = match (before, after) {
+                (Some(before), Some(after)) => state::road_path_between(before, after),
+                (Some(neighbour), None) | (None, Some(neighbour)) => vec![neighbour.position],
+                (None, None) => return Placement::Unplaced,
+            };
+            let (on_path, offset_m) = state::nearest_point_on_polyline(position, &stretch);
+            (state::round_to_network_precision(on_path), offset_m)
+        }
+    };
+    if offset_m <= radius_m {
+        Placement::OnRoad {
+            position: on_road,
+            offset_m,
+        }
+    } else {
+        Placement::Moved {
+            position: on_road,
+            offset_m,
+        }
+    }
+}
+
+/// For every point of the trace, the nearest point AT OR BEFORE it that matched a road of
+/// its own and the nearest one AT OR AFTER it — the two ends of the stretch of matched path
+/// it belongs to. Either is `None` where the trace matched nothing on that side.
+///
+/// Two linear passes over the trace, so a long trace costs no more per point than a short
+/// one.
+fn bracketing_matches(
+    matched: &[Option<state::SnappedPosition>],
+) -> Vec<(Option<usize>, Option<usize>)> {
+    let mut before: Option<usize> = None;
+    let nearest_before: Vec<Option<usize>> = matched
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            if slot.is_some() {
+                before = Some(index);
+            }
+            before
+        })
+        .collect();
+    let mut after: Option<usize> = None;
+    let mut nearest_after: Vec<Option<usize>> = matched
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, slot)| {
+            if slot.is_some() {
+                after = Some(index);
+            }
+            after
+        })
+        .collect();
+    nearest_after.reverse();
+    nearest_before.into_iter().zip(nearest_after).collect()
+}
+
+/// How certain the placement of `position` on a road `offset_m` metres away is, as
 /// `Confidence` ("Confidence value for the correctness of this point match", a
 /// `@range 0..1` double) reports it.
 ///
@@ -392,17 +515,17 @@ const MAX_NOTICE_INDEXES: usize = 1_000;
 /// and of two points the one further from its road always scores less.
 ///
 /// The radius the request allowed is deliberately NOT part of it: `SnapRadius` says which
-/// points may be matched at all, so scoring against it would report the same match as
+/// roads are considered for a point, so scoring against it would report the same match as
 /// confident or not depending on how much slack the caller left, and would never signal a
 /// poor match at a generous radius.
-fn match_confidence(position: Position, candidate: &state::SnappedPosition) -> f64 {
+fn match_confidence(position: Position, offset_m: f64) -> f64 {
     // A Gaussian error model on the distance from the observed point to the road: the
     // likelihood that a point this far off was travelling on it. Its scale is half the
     // farthest a position in this network can lie from a road, so a match at that farthest
     // offset is two scales out — an explanation the model has all but ruled out — while a
     // point on the road scores 1.
     let scale = (state::snap_ambiguity_m(position[1]) / 2.0).max(f64::MIN_POSITIVE);
-    (-(candidate.offset_m / scale).powi(2)).exp().clamp(0.0, 1.0)
+    (-(offset_m / scale).powi(2)).exp().clamp(0.0, 1.0)
 }
 
 /// The geometry of the snapped route: the roads the trace was matched onto, from the first
@@ -411,9 +534,9 @@ fn match_confidence(position: Position, candidate: &state::SnappedPosition) -> f
 /// Between two consecutive matched points the line is the stretch of the NETWORK that
 /// joins them ([`state::road_path_between`]), not the chord between them: the trace was
 /// matched onto roads, so the geometry the answer carries runs along those roads and a
-/// client drawing it stays on the network. An unmatched point contributes nothing — the
-/// line would otherwise run through a position the same answer reports as matching no
-/// road.
+/// client drawing it stays on the network. A point with no road of its own contributes no
+/// vertex — it is placed ON this line ([`place`]) rather than bending it towards a position
+/// no road of the network passes through.
 fn matched_geometry(matched: &[state::SnappedPosition]) -> Vec<Position> {
     let mut path: Vec<Position> = matched.first().map(|first| vec![first.position]).unwrap_or_default();
     for pair in matched.windows(2) {

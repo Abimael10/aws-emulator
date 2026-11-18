@@ -65,11 +65,23 @@ pub struct SnapToRoadsOutput {
     pub snapped_trace_points: Vec<RoadSnapSnappedTracePoint>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.georoutes#RoadSnapNotice")]
+/// A notice of the snapping, carrying the two members this service puts on the wire for
+/// one: the code of the condition it reports and the trace-point indexes it reports it
+/// for.
+///
+/// `Title` is `@required` in the model, but the recorded answer for a snapping notice
+/// carries no such key: the title is the service's own prose for the condition, and this
+/// emulator holds none of it. A member the generated struct declares is written on every
+/// response and a `@required` member cannot be declared `Option`, so the member sits in
+/// `unsupported = [..]`, which keeps it out of the schema and so out of the body the
+/// framework writes — rather than being answered with a sentence this emulator composed.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.georoutes#RoadSnapNotice",
+    unsupported = ["Title"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct RoadSnapNotice {
     pub code: String,
-    pub title: String,
     pub trace_point_indexes: Vec<i32>,
 }
 

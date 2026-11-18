@@ -1424,7 +1424,11 @@ fn interpolate(from: Position, to: Position, t: f64) -> Position {
 }
 
 /// The point of `polyline` nearest `pos`, and its distance from `pos` in metres.
-fn nearest_point_on_polyline(pos: Position, polyline: &[Position]) -> (Position, f64) {
+///
+/// A polyline carrying a single vertex is answered with that vertex, and an empty one with
+/// `pos` itself at no distance, so a caller passing a line it may not have decides for
+/// itself what an empty one means.
+pub fn nearest_point_on_polyline(pos: Position, polyline: &[Position]) -> (Position, f64) {
     let mut best = (pos, f64::INFINITY);
     for pair in polyline.windows(2) {
         let candidate = nearest_point_on_segment(pos, pair[0], pair[1]);
