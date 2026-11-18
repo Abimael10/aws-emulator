@@ -129,7 +129,7 @@ async fn form_call(
 ///
 /// Every value a case sends is free of `&`, `=`, `+` and `%`, so it travels in the form
 /// body as written.
-async fn ec2(
+pub(crate) async fn ec2(
     router: &MultiServiceRouter,
     region: &str,
     action: &str,
@@ -144,7 +144,7 @@ async fn ec2(
 
 /// One IAM action over the `awsQuery` wire its model declares. IAM is global; the request is
 /// still signed for a Region, which is what its credential scope carries.
-async fn iam(
+pub(crate) async fn iam(
     router: &MultiServiceRouter,
     action: &str,
     parameters: &[(&str, &str)],
@@ -171,7 +171,7 @@ pub(crate) async fn iam_ok(
 }
 
 /// The text of the first `<tag>` of an XML body, if it carries one.
-fn element(body: &str, tag: &str) -> Option<String> {
+pub(crate) fn element(body: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = body.find(&open)? + open.len();
@@ -343,7 +343,7 @@ pub(crate) async fn launch(
 
 /// The `InstanceInformation` this service reports for `instance_id` in `region`, or `None`
 /// when it reports none.
-async fn node(router: &MultiServiceRouter, region: &str, instance_id: &str) -> Option<Value> {
+pub(crate) async fn node(router: &MultiServiceRouter, region: &str, instance_id: &str) -> Option<Value> {
     let (status, body) = call_in_region(
         router,
         region,
