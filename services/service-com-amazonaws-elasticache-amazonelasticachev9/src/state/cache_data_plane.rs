@@ -45,6 +45,7 @@ pub mod commands;
 pub mod keyspace;
 pub mod resp_frame;
 pub mod resp_wire;
+pub mod slow_log;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
@@ -53,6 +54,7 @@ use std::time::SystemTime;
 
 use access_control::AccessRules;
 use keyspace::{Keyspace, Limits};
+use slow_log::{SlowLog, SlowLogDelivery, SlowLogPolicy};
 
 /// The address one cache's own socket answers on, as the control plane publishes it.
 ///
@@ -68,6 +70,13 @@ pub struct ServedEndpoint {
 /// socket.
 pub type SharedKeyspace = Arc<Mutex<Keyspace>>;
 
+/// The slow log of ONE node, shared by every session on that node's socket.
+///
+/// Per SOCKET rather than per keyspace: the members of a replication group read and write
+/// one keyspace, but the slow log is the log of what ONE node executed, which is also the
+/// node a delivered record names.
+pub type SharedSlowLog = Arc<Mutex<SlowLog>>;
+
 /// The SigV4 signing name of this service, which is what the in-process register names as
 /// the service answering at an address this service opened a listener at
 /// (`smithy_query(query="service_info")`: `sigv4Name: elasticache`).
@@ -77,6 +86,11 @@ const SIGNING_NAME: &str = "elasticache";
 /// does: one session that panicked must not wedge the cache for every later client.
 pub fn lock_keyspace(keyspace: &SharedKeyspace) -> std::sync::MutexGuard<'_, Keyspace> {
     keyspace.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Lock a node's slow log, recovering from a poisoned lock as [`lock_keyspace`] does.
+pub fn lock_slow_log(slow_log: &SharedSlowLog) -> std::sync::MutexGuard<'_, SlowLog> {
+    slow_log.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// WHICH cache a socket serves, as a session resolves it against the store on every
@@ -299,6 +313,12 @@ pub struct CacheFacts {
     pub limits: Limits,
     /// The `maxmemory-policy` the cache runs under, as a client reads it back.
     pub maxmemory_policy: String,
+    /// How this cache's slow log is kept, as its `slowlog-log-slower-than` and
+    /// `slowlog-max-len` parameters state it.
+    pub slow_log: SlowLogPolicy,
+    /// Where this node's slow log is delivered, when the cache carries an active slow-log
+    /// `LogDeliveryConfiguration` whose destination is a CloudWatch Logs log group.
+    pub slow_log_delivery: Option<SlowLogDelivery>,
 }
 
 /// Who a session is: the user it acts as, and what that user may do.
@@ -339,6 +359,15 @@ pub fn cache_facts(
                 user_group_id: None,
                 limits,
                 maxmemory_policy: policy,
+                slow_log: slow_log_policy(
+                    store,
+                    &cluster.cache_parameter_group_name,
+                    cluster.cache_node_type.as_deref(),
+                ),
+                slow_log_delivery: slow_log_delivery(
+                    cluster,
+                    &cluster.log_delivery_configurations,
+                ),
             }
         }
         CacheIdentity::ReplicationGroupMember {
@@ -369,6 +398,27 @@ pub fn cache_facts(
                 user_group_id: group.user_group_ids.first().cloned(),
                 limits,
                 maxmemory_policy: policy,
+                slow_log: slow_log_policy(
+                    store,
+                    &group.cache_parameter_group_name,
+                    group
+                        .cache_node_type
+                        .as_deref()
+                        .or_else(|| member.and_then(|cluster| cluster.cache_node_type.as_deref())),
+                ),
+                // The log delivery of a group's MEMBER: the member's own record carries the
+                // configurations the group was created or modified with, and the group's own
+                // are what a member minted before a change not yet copied down reads.
+                slow_log_delivery: member.and_then(|cluster| {
+                    slow_log_delivery(
+                        cluster,
+                        if cluster.log_delivery_configurations.is_empty() {
+                            &group.log_delivery_configurations
+                        } else {
+                            &cluster.log_delivery_configurations
+                        },
+                    )
+                }),
             }
         }
         CacheIdentity::ServerlessCache { name } => {
@@ -389,6 +439,11 @@ pub fn cache_facts(
                 user_group_id: cache.user_group_id.clone(),
                 limits: Limits::of(keyspace::MAX_KEYSPACE_BYTES_U64, &policy),
                 maxmemory_policy: policy,
+                // No parameter group to read a threshold off, and a serverless cache carries
+                // no `LogDeliveryConfigurations` at all, so its slow log is kept on the
+                // engine's own defaults and delivered nowhere.
+                slow_log: SlowLogPolicy::default(),
+                slow_log_delivery: None,
             }
         }
     }
@@ -399,6 +454,63 @@ pub fn cache_facts(
 /// A serverless cache publishes no parameter group, so there is no caller-set policy to
 /// read: the engine's own default is what it runs under.
 pub const SERVERLESS_MAXMEMORY_POLICY: &str = "volatile-lru";
+
+/// How the slow log of a cache running under the parameter group `group_name` on
+/// `node_type` is kept: the `slowlog-log-slower-than` and `slowlog-max-len` values
+/// `DescribeCacheParameters` reports for that group, so the engine's slow log is held to the
+/// parameters the control plane published for it.
+fn slow_log_policy(
+    store: &super::ComAmazonawsElasticacheAmazonelasticachev9State,
+    group_name: &str,
+    node_type: Option<&str>,
+) -> SlowLogPolicy {
+    SlowLogPolicy::of(
+        parameter_value(store, group_name, node_type, slow_log::THRESHOLD_PARAMETER).as_deref(),
+        parameter_value(store, group_name, node_type, slow_log::MAX_LENGTH_PARAMETER).as_deref(),
+    )
+}
+
+/// Where the slow log of the node `cluster` is delivered, from the log-delivery
+/// configurations `configurations` — `None` when none of them is an active `slow-log`
+/// configuration whose destination is a CloudWatch Logs log group, which is every cache that
+/// asked for no slow-log delivery.
+fn slow_log_delivery(
+    cluster: &super::CacheClusterRecord,
+    configurations: &[super::LogDeliveryRecord],
+) -> Option<SlowLogDelivery> {
+    let configured = configurations.iter().find(|record| {
+        record
+            .log_type
+            .as_deref()
+            .is_some_and(|log_type| log_type == slow_log::LOG_TYPE)
+            && record
+                .destination_type
+                .as_deref()
+                .is_some_and(|destination| destination == slow_log::CLOUDWATCH_LOGS_DESTINATION)
+    })?;
+    let log_group = configured
+        .destination_details
+        .as_ref()?
+        .cloud_watch_logs_details
+        .as_ref()?
+        .log_group
+        .clone()
+        .filter(|group| !group.is_empty())?;
+    Some(SlowLogDelivery {
+        log_group,
+        log_format: configured.log_format.clone().unwrap_or_default(),
+        cache_cluster_id: cluster.cache_cluster_id.clone(),
+        // The node whose commands this socket serves: a cache this data plane serves is one
+        // node, which is the first of the cluster's own nodes — and a cluster whose node
+        // detail is not reported yet holds the one id such a cluster's node has.
+        cache_node_id: cluster
+            .nodes
+            .first()
+            .map(|node| node.cache_node_id.clone())
+            .unwrap_or_else(|| super::FIRST_CACHE_NODE_ID.to_string()),
+        region: cluster.region.clone(),
+    })
+}
 
 /// What a cache running under the parameter group `group_name` on `node_type` may hold,
 /// and the `maxmemory-policy` it makes room by — the values
@@ -678,6 +790,14 @@ pub async fn open_cache_data_plane<Eng: Send + Sync + 'static>(
         identity,
         keyspace: Arc::clone(&keyspace),
         next_connection_id: Arc::new(AtomicU64::new(1)),
+        // One slow log per SOCKET, which is one per node: it is the log of what this node
+        // executed, whoever the session was and whichever keyspace it reached.
+        slow_log: Arc::new(Mutex::new(SlowLog::default())),
+        // The CloudWatch Logs store of this same engine, which is where a slow-log
+        // `LogDeliveryConfiguration` naming a log group delivers. Read once, when the
+        // socket is opened: the HANDLE is to the one shared store, so a group created later
+        // is still the group a record lands in.
+        logs: ::service_com_amazonaws_cloudwatchlogs_logs_20140328::state::service_state(engine),
     }));
     // The handshake an in-process connection meets at byte 0: a cache with in-transit
     // encryption is terminated by the CORE on its socket, so the core's own server runs the

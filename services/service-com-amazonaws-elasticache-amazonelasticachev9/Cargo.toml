@@ -67,6 +67,12 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # written here: `src/state/cache_data_plane/resp_frame.rs` frames every command a
 # client sends and every reply the cache answers with.
 redis-protocol = { version = "6.0.0", default-features = false, features = ["std", "resp2", "resp3"] }
+# The Amazon CloudWatch Logs store, which holds the log groups a cache's logs are
+# delivered to: a slow-log `LogDeliveryConfiguration` names a log group by name, and
+# the records the engine's slow log produces are written where `logs:FilterLogEvents`
+# and `logs:GetLogEvents` answer from
+# (`src/state/cache_data_plane/slow_log.rs`), the way the EC2 store above is read.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

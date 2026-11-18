@@ -527,13 +527,6 @@ impl Sockets {
             return Err(nothing_answers(&host));
         };
         let waiting = clamped(asked, within);
-        let wire = runtime.block_on(async {
-            match ::tokio::time::timeout(waiting, plane.dial()).await {
-                Ok(Ok(wire)) => Ok(wire),
-                Ok(Err(error)) => Err(Failure::of_io(&error)),
-                Err(_elapsed) => Err(Failure::timed_out()),
-            }
-        })?;
         // Where the connection LEAVES from, read off the same route a datagram's is
         // ([`Self::source_toward`]): the private address of the interface the function's VPC
         // attachment holds for an address of that VPC, and this machine's own interface for a
@@ -541,6 +534,34 @@ impl Sockets {
         // the socket bound to nothing, which is what an unbound socket reports. Read BEFORE
         // the connections are locked, because the route lends a port out of the same state.
         let source = self.source_toward(inside, &host).ok();
+        // WHO the plane is serving, as the plane's own protocol states its client: a data
+        // plane of this emulator is published at an address of THIS MACHINE, so the transport
+        // is a pipe inside the process — but the client is the FUNCTION, which reaches the
+        // VPC the plane was placed in through the interfaces Lambda stood up for it, and the
+        // address its traffic carries there is the private address of one of them. A function
+        // attached to no VPC has no such address and the plane is told none.
+        //
+        // So the two readings of ONE socket differ on purpose, and each is right about its
+        // own side: `sourceHost` below is where the GUEST's traffic toward this destination
+        // leaves from — this machine's own interface for a plane served in this process — and
+        // what the plane is told is where the function sits in the VPC the plane belongs to,
+        // which is the address its protocol would state for this client. The PORT is the one
+        // the socket was lent, so both readings name the same socket.
+        let from = inside.and_then(VpcAttachment::private_address).map(|address| {
+            ::std::net::SocketAddr::new(
+                ::std::net::IpAddr::V4(address),
+                source
+                    .as_ref()
+                    .map_or_else(|| self.lent_port(), |(_address, port)| *port),
+            )
+        });
+        let wire = runtime.block_on(async {
+            match ::tokio::time::timeout(waiting, plane.dial(from)).await {
+                Ok(Ok(wire)) => Ok(wire),
+                Ok(Err(error)) => Err(Failure::of_io(&error)),
+                Err(_elapsed) => Err(Failure::timed_out()),
+            }
+        })?;
         let mut held = self.locked();
         held.handed += 1;
         held.opened += 1;

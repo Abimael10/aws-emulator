@@ -13814,6 +13814,7 @@ dependencies = [
  "redis-protocol",
  "rustls",
  "serde_json",
+ "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-s3-amazons3",

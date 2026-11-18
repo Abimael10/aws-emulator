@@ -98,7 +98,7 @@ impl Session {
         );
         let wire = dialed
             .plane
-            .dial()
+            .dial(None)
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: the plane must open a connection: {error}"));
         Self {

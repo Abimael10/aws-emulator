@@ -27,17 +27,22 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use ::emulator_server::{ListenerConn, NativeHandler};
 use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::access_control::AccessRules;
 use super::resp_frame::{encoded, next_command, FrameError, Reply};
-use super::{commands, CacheFacts, CacheIdentity, SharedKeyspace};
+use super::slow_log::{SlowLogEntry, UNKNOWN_CLIENT_ADDRESS};
+use super::{commands, CacheFacts, CacheIdentity, SharedKeyspace, SharedSlowLog};
 
 /// How many bytes one read off a connection takes at most.
 const READ_CHUNK: usize = 16 * 1024;
+
+/// How many entries a `SLOWLOG GET` that names no count answers with: the engine's own
+/// default of ten ("default: 10").
+const SLOW_LOG_PAGE: usize = 10;
 
 /// What every session on one cache's socket is served from.
 #[derive(Clone)]
@@ -50,6 +55,17 @@ pub struct CacheSocket {
     pub keyspace: SharedKeyspace,
     /// The id the next connection on this socket reports as its `CLIENT ID`.
     pub next_connection_id: Arc<AtomicU64>,
+    /// The slow log of the node this socket serves — shared by every session on it, as the
+    /// engine's own slow log is shared by every client of one node.
+    pub slow_log: SharedSlowLog,
+    /// The CloudWatch Logs store of the same shared engine, where an active slow-log
+    /// `LogDeliveryConfiguration` of this cache delivers its records. `None` on an engine
+    /// that holds no such store.
+    pub logs: Option<
+        ::engine::ServiceState<
+            ::service_com_amazonaws_cloudwatchlogs_logs_20140328::state::ComAmazonawsCloudwatchlogsLogs20140328State,
+        >,
+    >,
 }
 
 impl CacheSocket {
@@ -128,6 +144,10 @@ struct Session {
     identity: Option<Identity>,
     /// The name a `CLIENT SETNAME` gave this connection.
     client_name: String,
+    /// The address this client reached the cache from, as the engine states a client's
+    /// address (`address:port`) — and [`UNKNOWN_CLIENT_ADDRESS`] for a connection whose peer
+    /// this server is told nothing about.
+    client_address: String,
 }
 
 impl Session {
@@ -137,6 +157,13 @@ impl Session {
             connection_id,
             identity: None,
             client_name: String::new(),
+            // WHO opened this connection, as the client stated when it opened it: a client of
+            // this emulator that reaches the cache's published address in process carries the
+            // address its own traffic leaves from, and a connection the core accepted on the
+            // cache's socket carries none, because the core hands its handlers a byte stream
+            // rather than a peer.
+            client_address: ::service_common::dialable_data_planes::connected_from()
+                .map_or_else(|| UNKNOWN_CLIENT_ADDRESS.to_string(), |from| from.to_string()),
         }
     }
 
@@ -285,6 +312,9 @@ impl Session {
                 false,
             );
         }
+        // The command is about to be EXECUTED, and how long that takes is what the engine's
+        // slow log records it by.
+        let started = Instant::now();
         let reply = match spec.name {
             "ping" => match arguments.len() {
                 1 => Reply::Status("PONG".to_string()),
@@ -306,6 +336,7 @@ impl Session {
             "info" => Reply::Bulk(self.info(&facts).into_bytes()),
             "config" => self.config_command(&facts, arguments),
             "cluster" => cluster_command(&facts, arguments),
+            "slowlog" => self.slowlog_command(arguments),
             _ => {
                 let now = SystemTime::now();
                 let limits = facts.limits;
@@ -314,7 +345,102 @@ impl Session {
                 commands::execute(spec, arguments, &mut keyspace, &limits, now)
             }
         };
+        // What the engine's own slow log records: a command it EXECUTED, by the duration
+        // executing it really took. The commands refused above — unknown, mis-arited, denied
+        // by the user's access string, written to a replica — were never executed, and the
+        // two that carry a credential (`AUTH`, and the `HELLO` that authenticates) are
+        // answered before this point, so no credential reaches the log.
+        self.record_slow_command(&facts, arguments, started.elapsed());
         (Some(reply), false)
+    }
+
+    /// Record the command `arguments`, which took `took` to execute, in the slow log of the
+    /// node this session is on — when the cache's own threshold makes it slow — and deliver
+    /// it to the log group an active slow-log `LogDeliveryConfiguration` of the cache names.
+    ///
+    /// The threshold and the depth are the cache's own parameters, read off the store with
+    /// the rest of the facts; the duration is the one this emulator really took, so nothing
+    /// is recorded for work that was not slow.
+    fn record_slow_command(&self, facts: &CacheFacts, arguments: &[Vec<u8>], took: Duration) {
+        if !facts.slow_log.records(took) {
+            return;
+        }
+        let entry = {
+            let mut log = super::lock_slow_log(&self.socket.slow_log);
+            log.record(
+                arguments,
+                took,
+                facts.slow_log.kept(),
+                &self.client_address,
+                &self.client_name,
+                SystemTime::now(),
+            )
+        };
+        // Delivered with NO store of this service held: the facts were read off it and the
+        // guard released, and the write below is into the store CloudWatch Logs owns.
+        if let (Some(delivery), Some(logs)) =
+            (facts.slow_log_delivery.as_ref(), self.socket.logs.as_ref())
+        {
+            super::slow_log::deliver(logs, delivery, &entry);
+        }
+    }
+
+    /// `SLOWLOG GET [count] | LEN | RESET | HELP`: the engine's own slow log of this node.
+    ///
+    /// What it answers is what this node recorded, most recent entry first; `GET` with no
+    /// count answers the [`SLOW_LOG_PAGE`] most recent, and a count of `-1` every entry
+    /// there is.
+    fn slowlog_command(&mut self, arguments: &[Vec<u8>]) -> Reply {
+        let subcommand = String::from_utf8_lossy(&arguments[1]).to_ascii_lowercase();
+        match subcommand.as_str() {
+            "get" => {
+                let asked = match arguments.get(2) {
+                    None => Some(SLOW_LOG_PAGE),
+                    Some(count) => match String::from_utf8_lossy(count).trim().parse::<i64>() {
+                        Ok(-1) => None,
+                        Ok(count) if count >= 0 => Some(usize::try_from(count).unwrap_or_default()),
+                        _ => {
+                            return Reply::Error(
+                                "ERR count should be greater than or equal to -1".to_string(),
+                            )
+                        }
+                    },
+                };
+                let log = super::lock_slow_log(&self.socket.slow_log);
+                Reply::Array(log.recent(asked).into_iter().map(SlowLogEntry::reply).collect())
+            }
+            "len" => Reply::Integer(
+                i64::try_from(super::lock_slow_log(&self.socket.slow_log).len())
+                    .unwrap_or(i64::MAX),
+            ),
+            "reset" => {
+                super::lock_slow_log(&self.socket.slow_log).reset();
+                Reply::ok()
+            }
+            "help" => Reply::Array(
+                [
+                    "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                    "GET [<count>]",
+                    "    Return top <count> entries from the slowlog (default: 10, -1 mean all).",
+                    "    Entries are made of:",
+                    "    id, timestamp, time in microseconds, arguments array, client IP and \
+                     port, client name",
+                    "LEN",
+                    "    Return the length of the slowlog.",
+                    "RESET",
+                    "    Reset the slowlog.",
+                    "HELP",
+                    "    Print this help.",
+                ]
+                .into_iter()
+                .map(Reply::text)
+                .collect(),
+            ),
+            other => Reply::Error(format!(
+                "ERR Unknown subcommand or wrong number of arguments for '{other}'. Try SLOWLOG \
+                 HELP."
+            )),
+        }
     }
 
     /// `AUTH password` / `AUTH username password`.
@@ -458,8 +584,8 @@ impl Session {
             // connection's own line below, which is what `CLIENT INFO` reports.
             "setinfo" => Reply::ok(),
             "info" => Reply::text(format!(
-                "id={} name={} resp=2",
-                self.connection_id, self.client_name
+                "id={} addr={} name={} resp=2",
+                self.connection_id, self.client_address, self.client_name
             )),
             other => Reply::Error(format!(
                 "ERR Unknown subcommand or wrong number of arguments for '{other}'. Try CLIENT \

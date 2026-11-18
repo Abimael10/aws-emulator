@@ -202,6 +202,17 @@ impl VpcAttachment {
             .map(|interface| interface.address)
     }
 
+    /// The private address the function's traffic carries INSIDE the VPC it is attached to:
+    /// the address of the first interface Lambda stood up for it, which is the one a
+    /// destination elsewhere in the VPC is reached through.
+    ///
+    /// What a plane of that VPC states its client as ([`super::guest_socket`]), where the
+    /// transport that carried the connection has an address of its own.
+    #[must_use]
+    pub fn private_address(&self) -> Option<Ipv4Addr> {
+        self.interfaces.first().map(|interface| interface.address)
+    }
+
     /// Whether `destination` is an address of the VPC this function is attached to.
     #[must_use]
     pub fn holds(&self, destination: Ipv4Addr) -> bool {

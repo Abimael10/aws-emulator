@@ -41,6 +41,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -64,7 +65,35 @@ pub trait DialablePlane: Send + Sync + 'static {
     /// Open ONE connection to this plane: the stream answered is the CLIENT end of a pipe
     /// whose other end this plane's own handler is serving, so the bytes written to it are
     /// the bytes that handler reads, and the bytes it writes are the ones read back.
-    fn dial(&self) -> Pin<Box<dyn Future<Output = std::io::Result<ListenerConn>> + Send>>;
+    ///
+    /// `from` is the address the CLIENT reaches this plane from, which the plane's own handler
+    /// reads back with [`connected_from`] — the address a protocol that states who its client
+    /// is (an engine's own log of a command, a connection list) names. `None` for a client
+    /// with no such address, and then the handler is told nothing about where it is.
+    fn dial(
+        &self,
+        from: Option<SocketAddr>,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<ListenerConn>> + Send>>;
+}
+
+::tokio::task_local! {
+    /// The address the client of the connection being served reaches this plane FROM, set
+    /// around the handler of an in-process connection ([`DialablePlane::dial`]).
+    ///
+    /// Per CONNECTION, which is what a task serves one of: the handler of a connection reads
+    /// its own client's address and no other's.
+    static CONNECTED_FROM: Option<SocketAddr>;
+}
+
+/// The address the client of the connection being served reaches this plane from, as the
+/// client stated it when it opened the connection ([`DialablePlane::dial`]).
+///
+/// `None` where nothing stated one: a connection the CORE accepted on the resource's own
+/// socket, whose peer the core does not hand its handlers, and a client that carries no
+/// address of its own.
+#[must_use]
+pub fn connected_from() -> Option<SocketAddr> {
+    CONNECTED_FROM.try_with(|from| *from).ok().flatten()
 }
 
 /// A plane served by the protocol handler of a core listener: the ONE kind this emulator has.
@@ -83,15 +112,20 @@ struct ServedInProcess<H> {
 }
 
 impl<H: NativeHandler> DialablePlane for ServedInProcess<H> {
-    fn dial(&self) -> Pin<Box<dyn Future<Output = std::io::Result<ListenerConn>> + Send>> {
+    fn dial(
+        &self,
+        from: Option<SocketAddr>,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<ListenerConn>> + Send>> {
         let (client, served) = ::tokio::io::duplex(CONNECTION_BUFFER_BYTES);
         let handler = Arc::clone(&self.handler);
         let tls = self.tls.clone();
         Box::pin(async move {
             // The plane's end is served on a task of its own, exactly as the core serves one
             // accepted connection: the client's reads and writes are answered while it holds
-            // the stream, and dropping the stream ends the task's own.
-            ::tokio::spawn(async move {
+            // the stream, and dropping the stream ends the task's own. The task carries the
+            // address its client opened the connection from, so the handler can state who it
+            // is serving.
+            ::tokio::spawn(CONNECTED_FROM.scope(from, async move {
                 let served: ListenerConn = Box::new(served);
                 let served = match tls {
                     Some(upgrader) => match upgrader.accept(served, None).await {
@@ -103,7 +137,7 @@ impl<H: NativeHandler> DialablePlane for ServedInProcess<H> {
                     None => served,
                 };
                 handler.serve(served).await;
-            });
+            }));
             Ok(Box::new(client) as ListenerConn)
         })
     }
@@ -445,7 +479,11 @@ mod tests {
             };
             // And the plane really is reached: the bytes written to the connection are the
             // bytes its handler read, and the answer is the one that handler wrote.
-            let mut conn = dialed.plane.dial().await.expect("the plane opens a connection");
+            let mut conn = dialed
+                .plane
+                .dial(None)
+                .await
+                .expect("the plane opens a connection");
             conn.write_all(b"ping").await.expect("the plane reads what is written");
             let mut answered = [0_u8; 64];
             let read = conn.read(&mut answered).await.expect("the plane answers");
@@ -500,5 +538,55 @@ mod tests {
             DialablePlanes::of(&Elsewhere).is_none(),
             "expected no records for an engine of another kind"
         );
+    }
+
+    /// RULE: the handler serving an in-process connection reads back the address its client
+    /// opened that connection FROM, and reads none where the client stated none — which is
+    /// what lets a plane state who it is serving.
+    ///
+    /// The rows span what the reading generalises over: an IPv4 client address, an IPv6 one,
+    /// and a client that stated none.
+    #[tokio::test]
+    async fn a_plane_reads_back_the_address_its_client_dialled_from() {
+        /// A plane that answers with the address its client was recorded as reaching it from.
+        struct Stating;
+
+        impl NativeHandler for Stating {
+            fn serve(&self, conn: ListenerConn) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                let stated = connected_from()
+                    .map(|from| from.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                Box::pin(async move {
+                    let mut conn = conn;
+                    let _ = conn.write_all(stated.as_bytes()).await;
+                })
+            }
+        }
+
+        let plane = served_in_process(Arc::new(Stating), None);
+        let rows: &[(&str, Option<&str>)] = &[
+            ("an IPv4 client", Some("10.42.1.7:41234")),
+            ("an IPv6 client", Some("[fd00::7]:41235")),
+            ("a client that stated no address", None),
+        ];
+        for (case, from) in rows {
+            let dialled = from.map(|from| {
+                from.parse::<SocketAddr>()
+                    .unwrap_or_else(|error| panic!("case {case:?}: {from} is an address: {error}"))
+            });
+            let mut conn = plane
+                .dial(dialled)
+                .await
+                .unwrap_or_else(|error| panic!("case {case:?}: the plane opens one: {error}"));
+            let mut stated = String::new();
+            conn.read_to_string(&mut stated)
+                .await
+                .unwrap_or_else(|error| panic!("case {case:?}: the plane answers: {error}"));
+            assert_eq!(
+                stated,
+                from.unwrap_or("none"),
+                "case {case:?}: expected the plane to be told {from:?}, got {stated:?}"
+            );
+        }
     }
 }

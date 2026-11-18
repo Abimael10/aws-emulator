@@ -71,6 +71,7 @@ pub const CATALOG: &[CommandSpec] = &[
     CommandSpec { name: "info", arity: -1, write: false, keys: None, categories: &["slow", "dangerous"] },
     CommandSpec { name: "config", arity: -2, write: false, keys: None, categories: &["admin", "slow", "dangerous"] },
     CommandSpec { name: "cluster", arity: -2, write: false, keys: None, categories: &["slow"] },
+    CommandSpec { name: "slowlog", arity: -2, write: false, keys: None, categories: &["admin", "slow", "dangerous"] },
     CommandSpec { name: "dbsize", arity: 1, write: false, keys: None, categories: &["keyspace", "read", "fast"] },
     CommandSpec { name: "flushall", arity: -1, write: true, keys: None, categories: &["keyspace", "write", "slow", "dangerous"] },
     CommandSpec { name: "flushdb", arity: -1, write: true, keys: None, categories: &["keyspace", "write", "slow", "dangerous"] },
@@ -87,6 +88,8 @@ pub const CATALOG: &[CommandSpec] = &[
     CommandSpec { name: "getdel", arity: 2, write: true, keys: Some((1, 1, 1)), categories: &["write", "string", "fast"] },
     CommandSpec { name: "append", arity: 3, write: true, keys: Some((1, 1, 1)), categories: &["write", "string", "fast"] },
     CommandSpec { name: "strlen", arity: 2, write: false, keys: Some((1, 1, 1)), categories: &["read", "string", "fast"] },
+    CommandSpec { name: "getrange", arity: 4, write: false, keys: Some((1, 1, 1)), categories: &["read", "string", "slow"] },
+    CommandSpec { name: "setrange", arity: 4, write: true, keys: Some((1, 1, 1)), categories: &["write", "string", "slow"] },
     CommandSpec { name: "mget", arity: -2, write: false, keys: Some((1, -1, 1)), categories: &["read", "string", "fast"] },
     CommandSpec { name: "mset", arity: -3, write: true, keys: Some((1, -1, 2)), categories: &["write", "string", "slow"] },
     CommandSpec { name: "incr", arity: 2, write: true, keys: Some((1, 1, 1)), categories: &["write", "string", "fast"] },
@@ -274,6 +277,59 @@ pub fn execute(
                 .map(|value| i64::try_from(value.len()).unwrap_or(i64::MAX))
                 .unwrap_or_default(),
         ),
+        "getrange" => {
+            let start = match integer(&arguments[2]) {
+                Ok(start) => start,
+                Err(reply) => return reply,
+            };
+            let end = match integer(&arguments[3]) {
+                Ok(end) => end,
+                Err(reply) => return reply,
+            };
+            let held = keyspace.get(&key, now).unwrap_or_default();
+            Reply::Bulk(value_range(&held, start, end))
+        }
+        "setrange" => {
+            let offset = match integer(&arguments[2]) {
+                Ok(offset) if offset >= 0 => usize::try_from(offset).unwrap_or(usize::MAX),
+                // The engine's own answer for an offset before the start of the value.
+                Ok(_) => return Reply::Error("ERR offset is out of range".to_string()),
+                Err(reply) => return reply,
+            };
+            let written = &arguments[3];
+            let held = keyspace.peek(&key, now).map(<[u8]>::to_vec);
+            // "If … the string is empty, SETRANGE is a no-op": the length of whatever the
+            // key holds is answered without writing anything, and a key that holds nothing
+            // is not created.
+            if written.is_empty() {
+                return Reply::Integer(
+                    held.map(|value| i64::try_from(value.len()).unwrap_or(i64::MAX))
+                        .unwrap_or_default(),
+                );
+            }
+            let mut value = held.unwrap_or_default();
+            let end = offset.saturating_add(written.len());
+            // The length the write would make, checked BEFORE the value grows: the engine
+            // refuses a `SETRANGE` whose result would be longer than a value may be
+            // ("ERR string exceeds maximum allowed size"), and that is what keeps an offset a
+            // client chose from asking for an allocation this process cannot hold.
+            if end > super::keyspace::MAX_VALUE_BYTES {
+                return refusal_reply(WriteRefusal::ValueTooLarge);
+            }
+            if value.len() < end {
+                // "If the offset is larger than the current length of the string … the
+                // string is padded with zero-bytes to make offset fit."
+                value.resize(end, 0);
+            }
+            value[offset..end].copy_from_slice(written);
+            let length = i64::try_from(value.len()).unwrap_or(i64::MAX);
+            // The value keeps the life the key had: SETRANGE writes bytes of a value and
+            // not a new value, so it clears no expiry.
+            match keyspace.set(&key, value, None, true, limits, now) {
+                Ok(()) => Reply::Integer(length),
+                Err(refusal) => refusal_reply(refusal),
+            }
+        }
         "mget" => Reply::Array(
             keys.iter()
                 .map(|key| keyspace.get(key, now).map_or(Reply::Nil, Reply::Bulk))
@@ -460,6 +516,37 @@ fn object_command(
 /// `OBJ_ENCODING_EMBSTR_SIZE_LIMIT`.
 const EMBEDDED_STRING_BYTES: usize = 44;
 
+/// The bytes `GETRANGE` answers for the value `value` between the offsets `start` and `end`,
+/// both inclusive, as the engine resolves them.
+///
+/// "The function handles out of range requests by limiting the resulting range to the actual
+/// length of the string", and a negative offset counts from the end of the value (`-1` being
+/// its last byte); a range that ends before it starts, and any range of a value the keyspace
+/// does not hold, answers nothing.
+fn value_range(value: &[u8], start: i64, end: i64) -> Vec<u8> {
+    let length = i64::try_from(value.len()).unwrap_or(i64::MAX);
+    if length == 0 {
+        return Vec::new();
+    }
+    let from_end = |offset: i64| {
+        if offset < 0 {
+            length.saturating_add(offset).max(0)
+        } else {
+            offset
+        }
+    };
+    let start = from_end(start);
+    let end = from_end(end).min(length - 1);
+    if start > end {
+        return Vec::new();
+    }
+    let start = usize::try_from(start).unwrap_or(0);
+    let end = usize::try_from(end).unwrap_or(0);
+    // `end` is already inside the value (clamped to its last offset above) and not before
+    // `start`, so this is the one clamp point the range has.
+    value[start..=end].to_vec()
+}
+
 /// `SET key value [EX s] [PX ms] [EXAT s] [PXAT ms] [NX|XX] [KEEPTTL] [GET]`.
 fn set_command(
     key: &str,
@@ -594,4 +681,137 @@ fn scan_command(arguments: &[Vec<u8>], keyspace: &mut Keyspace, now: SystemTime)
     let walked = cursor.saturating_add(count);
     let next = if walked >= keys.len() { 0 } else { walked };
     Reply::Array(vec![Reply::text(next.to_string()), Reply::Array(page)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run one command against `keyspace`, as the session layer does.
+    fn run(keyspace: &mut Keyspace, arguments: &[&str]) -> Reply {
+        let arguments: Vec<Vec<u8>> = arguments
+            .iter()
+            .map(|argument| argument.as_bytes().to_vec())
+            .collect();
+        let spec = spec(&String::from_utf8_lossy(&arguments[0]))
+            .expect("the command is one this data plane serves");
+        assert!(
+            arity_satisfied(spec, &arguments),
+            "the case must satisfy the command's own arity"
+        );
+        execute(
+            spec,
+            &arguments,
+            keyspace,
+            &Limits::default(),
+            SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    /// RULE: `GETRANGE` answers the bytes of the value between the two offsets it names,
+    /// both inclusive, with a negative offset counting from the END of the value and a range
+    /// outside it limited to the value's own length.
+    ///
+    /// The rows span what the rule generalises over: a whole value, a prefix, a suffix, a
+    /// single byte, both offsets negative, offsets past each end, a range that ends before it
+    /// starts, and a key the keyspace does not hold.
+    #[test]
+    fn getrange_answers_the_range_of_the_value_it_names() {
+        let mut keyspace = Keyspace::default();
+        assert_eq!(
+            run(&mut keyspace, &["SET", "held", "This is a string"]),
+            Reply::ok(),
+            "the value under test must be stored"
+        );
+        let rows: &[(&str, &str, &str, &str)] = &[
+            ("the whole value", "0", "-1", "This is a string"),
+            ("a prefix", "0", "3", "This"),
+            ("a suffix", "-6", "-1", "string"),
+            ("one byte", "5", "5", "i"),
+            ("past the end", "10", "100", "string"),
+            ("past the start", "-100", "3", "This"),
+            ("an empty range", "6", "3", ""),
+            ("a negative start past the value", "-100", "-50", "T"),
+        ];
+        for (case, start, end, expected) in rows {
+            let answered = run(&mut keyspace, &["GETRANGE", "held", start, end]);
+            assert_eq!(
+                answered,
+                Reply::Bulk(expected.as_bytes().to_vec()),
+                "case {case:?}: expected {expected:?}, got {answered:?}"
+            );
+        }
+        let absent = run(&mut keyspace, &["GETRANGE", "absent", "0", "-1"]);
+        assert_eq!(
+            absent,
+            Reply::Bulk(Vec::new()),
+            "case \"a key the keyspace does not hold\": expected the empty string, got {absent:?}"
+        );
+    }
+
+    /// RULE: `SETRANGE` overwrites the value from the offset it names, padding with zero
+    /// bytes where the offset is past the value's end, and answers the length of the value it
+    /// left; an empty value writes nothing, a negative offset is out of range, and a write
+    /// whose result would be longer than a value may be is refused.
+    #[test]
+    fn setrange_overwrites_from_the_offset_it_names() {
+        let mut keyspace = Keyspace::default();
+        assert_eq!(
+            run(&mut keyspace, &["SET", "key", "Hello World"]),
+            Reply::ok(),
+            "the value under test must be stored"
+        );
+        assert_eq!(
+            run(&mut keyspace, &["SETRANGE", "key", "6", "Redis"]),
+            Reply::Integer(11),
+            "a write inside the value answers the length it left"
+        );
+        assert_eq!(
+            run(&mut keyspace, &["GETRANGE", "key", "0", "-1"]),
+            Reply::Bulk(b"Hello Redis".to_vec()),
+            "the write must be what a read answers"
+        );
+        // A key the keyspace does not hold, written past its start: the value is padded with
+        // zero bytes to make the offset fit.
+        assert_eq!(
+            run(&mut keyspace, &["SETRANGE", "fresh", "5", "tail"]),
+            Reply::Integer(9),
+            "a write past the end answers the padded length"
+        );
+        assert_eq!(
+            run(&mut keyspace, &["GETRANGE", "fresh", "0", "-1"]),
+            Reply::Bulk(b"\0\0\0\0\0tail".to_vec()),
+            "the padding must be zero bytes"
+        );
+        // An empty value writes nothing: the length of what the key holds is answered, and a
+        // key that holds nothing is not created.
+        assert_eq!(
+            run(&mut keyspace, &["SETRANGE", "key", "0", ""]),
+            Reply::Integer(11),
+            "an empty write answers the length the key already held"
+        );
+        assert_eq!(
+            run(&mut keyspace, &["SETRANGE", "untouched", "0", ""]),
+            Reply::Integer(0),
+            "an empty write on a key that is not there answers zero"
+        );
+        assert_eq!(
+            run(&mut keyspace, &["EXISTS", "untouched"]),
+            Reply::Integer(0),
+            "an empty write must create no key"
+        );
+        assert_eq!(
+            run(&mut keyspace, &["SETRANGE", "key", "-1", "x"]),
+            Reply::Error("ERR offset is out of range".to_string()),
+            "an offset before the start of the value is out of range"
+        );
+        // One past the longest value the keyspace holds: refused, and nothing is allocated
+        // for it.
+        let past = super::super::keyspace::MAX_VALUE_BYTES.to_string();
+        assert_eq!(
+            run(&mut keyspace, &["SETRANGE", "key", &past, "x"]),
+            refusal_reply(WriteRefusal::ValueTooLarge),
+            "a write past the longest value a key may hold must be refused"
+        );
+    }
 }
