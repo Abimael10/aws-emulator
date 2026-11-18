@@ -31,6 +31,13 @@
 //! (projection, filter, traversal, aggregate, ordering) over two graphs holding DIFFERENT
 //! data — so no answer here can be a constant.
 //!
+//! The authorization rule is spanned twice over: once along WHERE a grant is held and
+//! WHICH identity holds it (an inline policy, a managed policy's default version, an
+//! attachment with no readable document, a permissions boundary; an IAM user, a user under
+//! a path, and a session of an assumed role under either), and once along WHEN it is held
+//! — the documents the account holds change between calls, and each call is decided by
+//! what the IAM store holds at the moment it arrives.
+//!
 //! The data is seeded through the store's own writers (`crate::state::GraphData`), which
 //! is where a bulk load and a restore write it too: the engine behind this operation
 //! evaluates read-only openCypher, so a query cannot be used to write the rows another
@@ -38,9 +45,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::User;
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::{
+    AttachedPermissionsBoundary, Policy, PolicyVersion, Role, User,
+};
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
     service_state, GraphEdge, GraphNode, MAX_QUERY_STRING_CHARS, PROVISIONING_SPAN,
@@ -255,52 +265,20 @@ fn seed(
 /// for an IAM user named `user_name` carrying `policy` (when it carries one) as an inline
 /// policy — the records `iam:CreateUser`, `iam:CreateAccessKey` and `iam:PutUserPolicy`
 /// write — and answer that user's ARN.
+///
+/// The user at the root of the account's path, which is the one kind of principal the
+/// suites below that are not about the kind of principal are signed as: it is this file's
+/// one seeding of an identity ([`hold_identity`]) with one inline policy on it.
 fn hold_user(
     engine: &Arc<engine::InMemoryEngine>,
     user_name: &str,
     access_key_id: &str,
     policy: Option<&str>,
 ) -> String {
-    let arn = format!(
-        "arn:aws:iam::{}:user/{user_name}",
-        engine::emulator_account_id()
-    );
-    let state = iam::service_state(&**engine).expect("the engine carries the IAM store");
-    let mut account = state.lock();
-    account.users.insert(
-        iam::name_key(user_name),
-        User {
-            path: "/".to_string(),
-            user_name: user_name.to_string(),
-            user_id: sts::state::unique_id("AIDA", &arn),
-            arn: arn.clone(),
-            create_date: ::aws_smithy_types::DateTime::from_secs(0),
-            password_last_used: None,
-            permissions_boundary: None,
-            tags: None,
-        },
-    );
-    account.access_keys.insert(
-        access_key_id.to_string(),
-        iam::AccessKeyRecord {
-            user_key: iam::name_key(user_name),
-            status: iam::ACCESS_KEY_ACTIVE_STATUS.to_string(),
-            create_date: ::aws_smithy_types::DateTime::from_secs(0),
-        },
-    );
+    let principal = Principal::IamUser { path: "/" };
+    let arn = hold_identity(engine, principal, user_name, access_key_id);
     if let Some(document) = policy {
-        account.user_inline_policies.insert(
-            iam::name_key(user_name),
-            [(
-                iam::name_key("query"),
-                iam::InlinePolicy {
-                    policy_name: "query".to_string(),
-                    policy_document: document.to_string(),
-                },
-            )]
-            .into_iter()
-            .collect(),
-        );
+        put_inline_policy(engine, principal, user_name, "query", document);
     }
     arn
 }
@@ -1050,4 +1028,720 @@ async fn a_parse_refusal_states_the_input_the_alternatives_and_the_position() {
         "case \"a projection after the refusals\": expected the one projected row, got \
          {payload}"
     );
+}
+
+/// The three IAM actions a query is served under, as the operation's own documentation
+/// lists them (`smithy_query(query="doc",shape="ExecuteQuery")`), in the order a denial
+/// names them. One of them suffices for the query to run.
+const QUERY_ACTIONS: [&str; 3] = [
+    "neptune-graph:DeleteDataViaQuery",
+    "neptune-graph:ReadDataViaQuery",
+    "neptune-graph:WriteDataViaQuery",
+];
+
+/// How long a seeded role session lasts: far longer than a run of this suite, so no row's
+/// credential expires while it is in use.
+const SESSION_LIFETIME: Duration = Duration::from_secs(3600);
+
+/// An AWS-managed policy allowing every action on every resource, whose document the IAM
+/// emulator carries in its catalog of AWS's own published policies.
+const ADMINISTRATOR_ACCESS_ARN: &str = "arn:aws:iam::aws:policy/AdministratorAccess";
+
+/// A policy of AWS's OWN managed-policy namespace that the IAM emulator carries no
+/// document for — a grant belonging to AWS rather than to the account, whose statements
+/// nothing here can read. The row that uses it asks the IAM store to confirm that, so it
+/// stays the case it is named for.
+///
+/// What the row asserts is the deliberate reading this emulator takes of an attachment it
+/// cannot read, stated in the module docs of `crate::state`'s query-authorization part: on
+/// AWS that attachment IS a set of statements, and the account really holds it, so
+/// refusing the call would withhold access the real service grants — whereas serving it
+/// withholds nothing a readable document says, because an explicit deny in a document
+/// that CAN be read still refuses (the row above it) and a permissions boundary the store
+/// does hold still caps the grant (the rows below it).
+const UNREADABLE_POLICY_ARN: &str = "arn:aws:iam::aws:policy/NeptuneFullAccess";
+
+/// The sentence a caller whose identity policies allow none of [`QUERY_ACTIONS`] on the
+/// graph it named is refused with: the principal that signed, the actions it would have
+/// needed and the resource it addressed.
+fn query_denial_sentence(principal: &str, graph_arn: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {} on resource: {graph_arn}",
+        QUERY_ACTIONS.join(", ")
+    )
+}
+
+/// One identity-policy document: a single statement of `effect` over `actions` and
+/// `resources`.
+fn document(effect: &str, actions: &[&str], resources: &[&str]) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": effect, "Action": actions, "Resource": resources}],
+    })
+    .to_string()
+}
+
+/// Which kind of IAM principal a query is signed as, and the IAM path the identity is
+/// held under — the path its own ARN carries, which a session ARN does not.
+#[derive(Clone, Copy, Debug)]
+enum Principal {
+    /// A session of an assumed role: the permissions in force are the ROLE's, held under
+    /// the role's own ARN.
+    AssumedRole { path: &'static str },
+    /// An IAM user, addressed by its own ARN, whose permissions are its own.
+    IamUser { path: &'static str },
+}
+
+/// Every kind of principal each row of the table below is run for.
+const PRINCIPAL_KINDS: [(&str, Principal); 4] = [
+    ("an IAM user", Principal::IamUser { path: "/" }),
+    (
+        "an IAM user under a path",
+        Principal::IamUser {
+            path: "/team/analytics/",
+        },
+    ),
+    (
+        "a session of an assumed role",
+        Principal::AssumedRole { path: "/" },
+    ),
+    (
+        "a session of a role under a path",
+        Principal::AssumedRole {
+            path: "/team/analytics/",
+        },
+    ),
+];
+
+/// Where a row holds the document it puts in the account.
+#[derive(Clone, Debug)]
+enum Source {
+    /// An inline policy embedded on the principal itself, where `iam:PutUserPolicy` and
+    /// `iam:PutRolePolicy` write one.
+    Inline(String),
+    /// A managed policy the account owns, attached to the principal — what
+    /// `iam:CreatePolicy` plus `iam:AttachUserPolicy` / `iam:AttachRolePolicy` leave
+    /// behind. Each version as `(version id, document, whether it is the default)`.
+    Attached(Vec<(String, String, bool)>),
+    /// An attachment of the policy this ARN names, with no document of the ACCOUNT's
+    /// behind it: AWS's own catalog answers for it, or nothing does.
+    AttachedByArn(String),
+    /// A permissions boundary carrying this document, attached as a managed policy —
+    /// where `iam:PutUserPermissionsBoundary` and `iam:PutRolePermissionsBoundary` put
+    /// one.
+    Boundary(String),
+}
+
+/// Put the IAM identity `name` of this kind into the account and hold `access_key_id` for
+/// it — the records `iam:CreateUser` plus `iam:CreateAccessKey` write for a user, and the
+/// ones `sts:AssumeRole` writes for a session — and answer the principal ARN
+/// `sts:GetCallerIdentity` reports for that credential.
+fn hold_identity(
+    engine: &Arc<engine::InMemoryEngine>,
+    principal: Principal,
+    name: &str,
+    access_key_id: &str,
+) -> String {
+    let account = engine::emulator_account_id().to_string();
+    let state = iam::service_state(&**engine).expect("the engine carries the IAM store");
+    match principal {
+        Principal::IamUser { path } => {
+            let arn = iam::user_arn(path, name);
+            let mut store = state.lock();
+            store.users.insert(
+                iam::name_key(name),
+                User {
+                    path: path.to_string(),
+                    user_name: name.to_string(),
+                    user_id: sts::state::unique_id("AIDA", &arn),
+                    arn: arn.clone(),
+                    create_date: iam::now(),
+                    password_last_used: None,
+                    permissions_boundary: None,
+                    tags: None,
+                },
+            );
+            store.access_keys.insert(
+                access_key_id.to_string(),
+                iam::AccessKeyRecord {
+                    user_key: iam::name_key(name),
+                    status: iam::ACCESS_KEY_ACTIVE_STATUS.to_string(),
+                    create_date: iam::now(),
+                },
+            );
+            arn
+        }
+        Principal::AssumedRole { path } => {
+            let role_arn = iam::role_arn(path, name);
+            state.lock().roles.insert(
+                iam::name_key(name),
+                Role {
+                    path: path.to_string(),
+                    role_name: name.to_string(),
+                    role_id: sts::state::unique_id("AROA", &role_arn),
+                    arn: role_arn.clone(),
+                    create_date: iam::now(),
+                    assume_role_policy_document: None,
+                    description: None,
+                    max_session_duration: None,
+                    permissions_boundary: None,
+                    tags: None,
+                    role_last_used: None,
+                    source_role_template: None,
+                },
+            );
+            let session_name = format!("{name}-session");
+            let arn = format!("arn:aws:sts::{account}:assumed-role/{name}/{session_name}");
+            let vended = sts::state::NewSession {
+                role_arn: Some(role_arn.clone()),
+                ..sts::state::NewSession::new(
+                    sts::state::Identity {
+                        user_id: format!(
+                            "{}:{session_name}",
+                            sts::state::unique_id("AROA", &role_arn)
+                        ),
+                        account,
+                        arn: arn.clone(),
+                    },
+                    sts::state::SessionKind::AssumedRole,
+                    i32::try_from(SESSION_LIFETIME.as_secs()).unwrap_or(i32::MAX),
+                )
+            };
+            sts::state::service_state(&**engine)
+                .expect("the engine carries the STS store")
+                .lock()
+                .insert(vended.into_session(access_key_id, SystemTime::now()))
+                .expect("the session registry has room for one session");
+            arn
+        }
+    }
+}
+
+/// Embed an inline identity policy on the principal, where `iam:PutUserPolicy` and
+/// `iam:PutRolePolicy` write one — overwriting a policy of the same name, as those calls
+/// do.
+fn put_inline_policy(
+    engine: &Arc<engine::InMemoryEngine>,
+    principal: Principal,
+    name: &str,
+    policy_name: &str,
+    policy_document: &str,
+) {
+    let state = iam::service_state(&**engine).expect("the engine carries the IAM store");
+    let mut store = state.lock();
+    let held = match principal {
+        Principal::AssumedRole { .. } => &mut store.role_inline_policies,
+        Principal::IamUser { .. } => &mut store.user_inline_policies,
+    };
+    held.entry(iam::name_key(name)).or_default().insert(
+        iam::name_key(policy_name),
+        iam::InlinePolicy {
+            policy_name: policy_name.to_string(),
+            policy_document: policy_document.to_string(),
+        },
+    );
+}
+
+/// Remove an inline identity policy from the principal, where `iam:DeleteUserPolicy` and
+/// `iam:DeleteRolePolicy` remove one.
+fn delete_inline_policy(
+    engine: &Arc<engine::InMemoryEngine>,
+    principal: Principal,
+    name: &str,
+    policy_name: &str,
+) {
+    let state = iam::service_state(&**engine).expect("the engine carries the IAM store");
+    let mut store = state.lock();
+    let held = match principal {
+        Principal::AssumedRole { .. } => &mut store.role_inline_policies,
+        Principal::IamUser { .. } => &mut store.user_inline_policies,
+    };
+    if let Some(policies) = held.get_mut(&iam::name_key(name)) {
+        policies.remove(&iam::name_key(policy_name));
+    }
+}
+
+/// Attach the managed policy `policy_arn` names to the principal, where
+/// `iam:AttachUserPolicy` and `iam:AttachRolePolicy` write the attachment.
+fn attach_policy(
+    engine: &Arc<engine::InMemoryEngine>,
+    principal: Principal,
+    name: &str,
+    policy_arn: &str,
+) {
+    let state = iam::service_state(&**engine).expect("the engine carries the IAM store");
+    let mut store = state.lock();
+    let attached = match principal {
+        Principal::AssumedRole { .. } => &mut store.role_attached_policies,
+        Principal::IamUser { .. } => &mut store.user_attached_policies,
+    };
+    attached
+        .entry(iam::name_key(name))
+        .or_default()
+        .insert(policy_arn.to_string());
+}
+
+/// Set (or, with `None`, lift) the permissions boundary in force on the principal, where
+/// `iam:PutUserPermissionsBoundary` and `iam:PutRolePermissionsBoundary` write one.
+fn set_boundary(
+    engine: &Arc<engine::InMemoryEngine>,
+    principal: Principal,
+    name: &str,
+    policy_arn: Option<&str>,
+) {
+    let attached = policy_arn.map(|arn| AttachedPermissionsBoundary {
+        permissions_boundary_type: Some(iam::PERMISSIONS_BOUNDARY_TYPE.to_string()),
+        permissions_boundary_arn: Some(arn.to_string()),
+    });
+    let state = iam::service_state(&**engine).expect("the engine carries the IAM store");
+    let mut store = state.lock();
+    match principal {
+        Principal::AssumedRole { .. } => {
+            let role = store
+                .roles
+                .get_mut(&iam::name_key(name))
+                .unwrap_or_else(|| panic!("the account holds a role named {name}"));
+            role.permissions_boundary = attached;
+        }
+        Principal::IamUser { .. } => {
+            let user = store
+                .users
+                .get_mut(&iam::name_key(name))
+                .unwrap_or_else(|| panic!("the account holds a user named {name}"));
+            user.permissions_boundary = attached;
+        }
+    }
+}
+
+/// Put a managed policy the ACCOUNT owns into the IAM store, where `iam:CreatePolicy`
+/// (plus one `iam:CreatePolicyVersion` per further version) writes it, and answer its ARN.
+fn hold_managed_policy(
+    engine: &Arc<engine::InMemoryEngine>,
+    policy_name: &str,
+    versions: &[(String, String, bool)],
+) -> String {
+    let arn = iam::policy_arn("/", policy_name);
+    let created = iam::now();
+    let default_version_id = versions
+        .iter()
+        .find(|(_, _, is_default)| *is_default)
+        .map(|(version_id, _, _)| version_id.clone());
+    let held: BTreeMap<String, PolicyVersion> = versions
+        .iter()
+        .map(|(version_id, policy_document, is_default)| {
+            (
+                version_id.clone(),
+                PolicyVersion {
+                    document: Some(policy_document.clone()),
+                    version_id: Some(version_id.clone()),
+                    is_default_version: *is_default,
+                    create_date: Some(created),
+                },
+            )
+        })
+        .collect();
+    let state = iam::service_state(&**engine).expect("the engine carries the IAM store");
+    state.lock().policies.insert(
+        iam::name_key(policy_name),
+        iam::ManagedPolicy {
+            policy: Policy {
+                arn: Some(arn.clone()),
+                policy_id: Some(sts::state::unique_id("ANPA", &arn)),
+                policy_name: Some(policy_name.to_string()),
+                path: Some("/".to_string()),
+                default_version_id,
+                attachment_count: Some(1),
+                permissions_boundary_usage_count: Some(0),
+                is_attachable: true,
+                description: None,
+                create_date: Some(created),
+                update_date: Some(created),
+                tags: None,
+            },
+            versions: held,
+        },
+    );
+    arn
+}
+
+/// Hold every document of `sources` where its variant says, for the principal `name`.
+fn hold_sources(
+    engine: &Arc<engine::InMemoryEngine>,
+    principal: Principal,
+    name: &str,
+    label: &str,
+    sources: &[Source],
+) {
+    for (index, source) in sources.iter().enumerate() {
+        match source {
+            Source::Inline(policy_document) => put_inline_policy(
+                engine,
+                principal,
+                name,
+                &format!("{label}-inline-{index}"),
+                policy_document,
+            ),
+            Source::Attached(versions) => {
+                let arn =
+                    hold_managed_policy(engine, &format!("{label}-managed-{index}"), versions);
+                attach_policy(engine, principal, name, &arn);
+            }
+            Source::AttachedByArn(arn) => attach_policy(engine, principal, name, arn),
+            Source::Boundary(policy_document) => {
+                let arn = hold_managed_policy(
+                    engine,
+                    &format!("{label}-boundary-{index}"),
+                    &[("v1".to_string(), policy_document.clone(), true)],
+                );
+                set_boundary(engine, principal, name, Some(&arn));
+            }
+        }
+    }
+}
+
+/// RULE: a query is served only when the identity-based policies in force on the calling
+/// principal allow one of the three query actions on the graph the request named, capped
+/// by the principal's permissions boundary — read out of the IAM store wherever those
+/// documents are held and whichever kind of identity holds them — and a caller they allow
+/// none for is refused `AccessDeniedException` (403) naming that principal, those three
+/// actions and that graph.
+#[tokio::test]
+async fn every_policy_source_and_principal_kind_decides_the_query_alike() {
+    let (router, engine) = emulator();
+    let (graph_id, graph_arn) = graph_in_service(&router, "query-policy-sources").await;
+    // Two stored nodes, so an answered query is read off the graph rather than being the
+    // empty result any graph would give.
+    seed(
+        &engine,
+        "the policy-sources graph",
+        &graph_id,
+        &[
+            ("n1", &["Person"], &[("name", json!("Ada"))]),
+            ("n2", &["Person"], &[("name", json!("Grace"))]),
+        ],
+        &[],
+    );
+    let other_graph_arn = graph_arn.replace(&graph_id, "g-9999999999");
+
+    // The row below is only about an attachment with no readable document if the store
+    // really holds none for it, which the store itself is asked.
+    {
+        let store = iam::service_state(&*engine).expect("the engine carries the IAM store");
+        assert!(
+            store
+                .lock()
+                .default_version_document(UNREADABLE_POLICY_ARN)
+                .is_none(),
+            "case \"an attachment this emulator carries no document for\": \
+             {UNREADABLE_POLICY_ARN} must be a policy no document is held for"
+        );
+    }
+
+    let read_here = document("Allow", &["neptune-graph:ReadDataViaQuery"], &[&graph_arn]);
+    let write_here = document("Allow", &["neptune-graph:WriteDataViaQuery"], &[&graph_arn]);
+    let delete_here = document("Allow", &["neptune-graph:DeleteDataViaQuery"], &[&graph_arn]);
+    let read_elsewhere = document(
+        "Allow",
+        &["neptune-graph:ReadDataViaQuery"],
+        &[&other_graph_arn],
+    );
+    let every_action_of_the_service = document("Allow", &["neptune-graph:*"], &["*"]);
+    let deny_every_query_action = document("Deny", &QUERY_ACTIONS, &["*"]);
+    let another_service = document("Allow", &["s3:GetObject"], &["*"]);
+
+    // (case, where the account holds the principal's documents, whether the query is
+    // served). The rows differ along WHERE a statement lives and WHICH way it bears on
+    // the query — an inline policy, a managed policy's default version, a version that is
+    // not the default, an attachment AWS's catalog answers for, one nothing answers for,
+    // and a permissions boundary — and each is run for every kind of principal below, so
+    // no row is decided by the shape of one credential.
+    let cases: Vec<(&str, Vec<Source>, bool)> = vec![
+        ("no document at all", Vec::new(), false),
+        (
+            "an inline grant of the read action on this graph",
+            vec![Source::Inline(read_here.clone())],
+            true,
+        ),
+        (
+            "an inline grant naming another graph",
+            vec![Source::Inline(read_elsewhere.clone())],
+            false,
+        ),
+        (
+            "an attached policy granting the write action in its default version",
+            vec![Source::Attached(vec![(
+                "v1".to_string(),
+                write_here.clone(),
+                true,
+            )])],
+            true,
+        ),
+        (
+            "an attached policy granting the delete action outside its default version",
+            vec![Source::Attached(vec![
+                ("v1".to_string(), delete_here.clone(), false),
+                ("v2".to_string(), another_service.clone(), true),
+            ])],
+            false,
+        ),
+        (
+            "an inline deny beside an attached grant of every action of the service",
+            vec![
+                Source::Inline(deny_every_query_action.clone()),
+                Source::Attached(vec![(
+                    "v1".to_string(),
+                    every_action_of_the_service.clone(),
+                    true,
+                )]),
+            ],
+            false,
+        ),
+        (
+            "an attached policy of AWS's own catalog granting every action",
+            vec![Source::AttachedByArn(ADMINISTRATOR_ACCESS_ARN.to_string())],
+            true,
+        ),
+        // Served, not refused: see [`UNREADABLE_POLICY_ARN`] for the reading this pins.
+        (
+            "an attachment this emulator carries no document for",
+            vec![Source::AttachedByArn(UNREADABLE_POLICY_ARN.to_string())],
+            true,
+        ),
+        (
+            "an inline grant under a boundary naming another service",
+            vec![
+                Source::Inline(read_here.clone()),
+                Source::Boundary(another_service.clone()),
+            ],
+            false,
+        ),
+        (
+            "an inline grant under a boundary naming every action of the service",
+            vec![
+                Source::Inline(read_here.clone()),
+                Source::Boundary(every_action_of_the_service.clone()),
+            ],
+            true,
+        ),
+    ];
+
+    let mut blamed: Vec<String> = Vec::new();
+    for (row, (case, sources, served)) in cases.iter().enumerate() {
+        for (kind, (kind_case, principal)) in PRINCIPAL_KINDS.iter().enumerate() {
+            let case = format!("{case} held for {kind_case}");
+            let label = format!("q{row}k{kind}");
+            let name = format!("neptune-query-{label}");
+            // A long-term key is spelled `AKIA…` and a session's `ASIA…`; neither carries
+            // the identity's name, so a principal read off the key id cannot pass a row.
+            let access_key_id = match principal {
+                Principal::AssumedRole { .. } => format!("ASIA{}", label.to_uppercase()),
+                Principal::IamUser { .. } => format!("AKIA{}", label.to_uppercase()),
+            };
+            let principal_arn = hold_identity(&engine, *principal, &name, &access_key_id);
+            hold_sources(&engine, *principal, &name, &label, sources);
+
+            let (status, body) =
+                execute_query_as(&router, &access_key_id, &graph_id, ANY_QUERY).await;
+            if *served {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the query to be served, got {status}: {body}"
+                );
+                assert_eq!(
+                    Value::Array(rows(&case, &body)),
+                    json!([{"nodes": 2}]),
+                    "case {case:?}: expected the count of the graph's stored nodes, got \
+                     {body}"
+                );
+                continue;
+            }
+            assert_eq!(
+                status, 403,
+                "case {case:?}: expected 403, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "AccessDeniedException",
+                "case {case:?}: unexpected error code in {body}"
+            );
+            assert_eq!(
+                body["message"],
+                json!(query_denial_sentence(&principal_arn, &graph_arn)),
+                "case {case:?}: unexpected message in {body}"
+            );
+            blamed.push(principal_arn);
+        }
+    }
+
+    // The refusals are not one sentence asserted many times: each names the identity its
+    // own credential speaks for, in the spelling that identity carries.
+    for spelling in [":user/", ":assumed-role/", "/team/analytics/"] {
+        assert!(
+            blamed.iter().any(|arn| arn.contains(spelling)),
+            "case \"the principals the refusals name\": expected one spelled with \
+             {spelling:?}, got {blamed:?}"
+        );
+    }
+}
+
+/// Every step of the sequence below: the query is sent again and must be answered by what
+/// the IAM store holds AT THAT MOMENT.
+///
+/// A served step answers the count of the graph's stored nodes, `nodes`, so a step the
+/// decision let through is an evaluation over the graph rather than a bare 200.
+async fn assert_query_outcome(
+    router: &MultiServiceRouter,
+    case: &str,
+    access_key_id: &str,
+    graph: (&str, &str),
+    principal_arn: &str,
+    served: Option<i64>,
+) {
+    let (graph_id, graph_arn) = graph;
+    let (status, body) = execute_query_as(router, access_key_id, graph_id, ANY_QUERY).await;
+    if let Some(nodes) = served {
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the query to be served, got {status}: {body}"
+        );
+        assert_eq!(
+            Value::Array(rows(case, &body)),
+            json!([{"nodes": nodes}]),
+            "case {case:?}: expected the count of the graph's stored nodes, got {body}"
+        );
+        return;
+    }
+    assert_eq!(
+        status, 403,
+        "case {case:?}: expected 403, got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "AccessDeniedException",
+        "case {case:?}: unexpected error code in {body}"
+    );
+    assert_eq!(
+        body["message"],
+        json!(query_denial_sentence(principal_arn, graph_arn)),
+        "case {case:?}: unexpected message in {body}"
+    );
+}
+
+/// RULE (the same decision, from the other side): it is taken from the IAM store on every
+/// call, so a document written, replaced, capped or removed between two queries decides
+/// the second one — no call is answered by what was in force for an earlier call.
+#[tokio::test]
+async fn the_decision_follows_the_policies_the_account_holds_at_each_call() {
+    let (router, engine) = emulator();
+    let (graph_id, graph_arn) = graph_in_service(&router, "query-live-policies").await;
+    // Three stored nodes, so a step the decision lets through answers this graph's own
+    // count rather than the empty result any graph would give.
+    seed(
+        &engine,
+        "the live-policies graph",
+        &graph_id,
+        &[
+            ("n1", &["Person"], &[("name", json!("Ada"))]),
+            ("n2", &["Person"], &[("name", json!("Grace"))]),
+            ("n3", &["Person"], &[("name", json!("Alan"))]),
+        ],
+        &[],
+    );
+    let graph = (graph_id.as_str(), graph_arn.as_str());
+    let served = Some(3);
+    let refused = None;
+    let principal = Principal::IamUser { path: "/" };
+    let name = "neptune-query-live";
+    let access_key_id = "AKIAQUERYLIVE";
+    let principal_arn = hold_identity(&engine, principal, name, access_key_id);
+
+    let grant = document("Allow", &["neptune-graph:ReadDataViaQuery"], &[&graph_arn]);
+    let deny = document("Deny", &QUERY_ACTIONS, &["*"]);
+    let boundary = hold_managed_policy(
+        &engine,
+        "neptune-query-live-cap",
+        &[(
+            "v1".to_string(),
+            document("Allow", &["s3:GetObject"], &["*"]),
+            true,
+        )],
+    );
+
+    // Each step changes the account the way one IAM call would, then asks again. The
+    // outcome alternates, so no step's answer can be a constant or a cached decision.
+    assert_query_outcome(
+        &router,
+        "before any policy is written",
+        access_key_id,
+        graph,
+        &principal_arn,
+        refused,
+    )
+    .await;
+
+    put_inline_policy(&engine, principal, name, "query", &grant);
+    assert_query_outcome(
+        &router,
+        "after a grant of the read action is written",
+        access_key_id,
+        graph,
+        &principal_arn,
+        served,
+    )
+    .await;
+
+    put_inline_policy(&engine, principal, name, "query", &deny);
+    assert_query_outcome(
+        &router,
+        "after the grant is replaced by a deny",
+        access_key_id,
+        graph,
+        &principal_arn,
+        refused,
+    )
+    .await;
+
+    put_inline_policy(&engine, principal, name, "query", &grant);
+    assert_query_outcome(
+        &router,
+        "after the deny is replaced by the grant again",
+        access_key_id,
+        graph,
+        &principal_arn,
+        served,
+    )
+    .await;
+
+    set_boundary(&engine, principal, name, Some(&boundary));
+    assert_query_outcome(
+        &router,
+        "after a boundary naming no query action is attached",
+        access_key_id,
+        graph,
+        &principal_arn,
+        refused,
+    )
+    .await;
+
+    set_boundary(&engine, principal, name, None);
+    assert_query_outcome(
+        &router,
+        "after the boundary is lifted",
+        access_key_id,
+        graph,
+        &principal_arn,
+        served,
+    )
+    .await;
+
+    delete_inline_policy(&engine, principal, name, "query");
+    assert_query_outcome(
+        &router,
+        "after the grant is deleted",
+        access_key_id,
+        graph,
+        &principal_arn,
+        refused,
+    )
+    .await;
 }
