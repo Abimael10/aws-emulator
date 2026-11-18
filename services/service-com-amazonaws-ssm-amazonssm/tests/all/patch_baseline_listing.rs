@@ -156,7 +156,7 @@ async fn register_ok(router: &MultiServiceRouter, case: &str, region: &str, base
 /// The `BaselineId` `GetDefaultPatchBaseline` reports for `operating_system` at `region`'s
 /// endpoint — while nothing has registered a default there, the full ARN of the baseline
 /// Systems Manager predefines for it.
-async fn default_baseline_id(
+pub(crate) async fn default_baseline_id(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,

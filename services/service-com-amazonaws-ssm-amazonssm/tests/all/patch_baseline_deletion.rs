@@ -26,7 +26,7 @@ use crate::parameter_store::{call_in_region, error_code, error_message, router, 
 
 /// A second Region, so a case can prove a delete reaches the records of the endpoint it was
 /// signed for and no other's.
-const OTHER_REGION: &str = "eu-central-1";
+pub(crate) const OTHER_REGION: &str = "eu-central-1";
 
 /// The sentence `DoesNotExistException` carries for a `BaselineId` that names no patch
 /// baseline reachable through the endpoint: fixed text for this error class, naming the
@@ -41,7 +41,12 @@ const NOT_FOUND_CODE: &str = "DoesNotExistException";
 
 /// `CreatePatchBaseline` at `region`'s endpoint, asserting it succeeded, and returning the
 /// `BaselineId` it minted.
-async fn create_ok(router: &MultiServiceRouter, case: &str, region: &str, body: &Value) -> String {
+pub(crate) async fn create_ok(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    body: &Value,
+) -> String {
     let (status, response) = call_in_region(router, region, "CreatePatchBaseline", body).await;
     assert_eq!(
         status, 200,
@@ -54,7 +59,11 @@ async fn create_ok(router: &MultiServiceRouter, case: &str, region: &str, body: 
 }
 
 /// `GetPatchBaseline` at `region`'s endpoint for `baseline_id`.
-async fn get(router: &MultiServiceRouter, region: &str, baseline_id: &str) -> (u16, Value) {
+pub(crate) async fn get(
+    router: &MultiServiceRouter,
+    region: &str,
+    baseline_id: &str,
+) -> (u16, Value) {
     call_in_region(
         router,
         region,
@@ -76,7 +85,7 @@ async fn delete(router: &MultiServiceRouter, region: &str, baseline_id: &str) ->
 }
 
 /// The same delete, asserting it succeeded, and returning the `BaselineId` it reports.
-async fn delete_ok(
+pub(crate) async fn delete_ok(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -95,7 +104,12 @@ async fn delete_ok(
 
 /// Assert that `baseline_id` names no baseline at `region`'s endpoint: the modelled refusal,
 /// its status, its wire code and the sentence it carries.
-async fn assert_absent(router: &MultiServiceRouter, case: &str, region: &str, baseline_id: &str) {
+pub(crate) async fn assert_absent(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    baseline_id: &str,
+) {
     let (status, response) = get(router, region, baseline_id).await;
     assert_eq!(
         status, 400,
@@ -115,19 +129,27 @@ async fn assert_absent(router: &MultiServiceRouter, case: &str, region: &str, ba
 
 /// The ARN of the patch baseline `baseline_id` names in `region`, the form the account's own
 /// ARNs carry.
-fn baseline_arn(region: &str, baseline_id: &str) -> String {
+pub(crate) fn baseline_arn(region: &str, baseline_id: &str) -> String {
     format!("arn:aws:ssm:{region}:{ACCOUNT}:patchbaseline/{baseline_id}")
+}
+
+/// The bare id a baseline ARN names: the resource after the last `/` of the ARN, which is
+/// what the `patchbaseline/` resource-type prefix is followed by.
+fn id_of_arn(arn: &str) -> String {
+    arn.rsplit_once('/')
+        .map(|(_, baseline_id)| baseline_id.to_string())
+        .unwrap_or_else(|| panic!("a baseline ARN names a resource, got {arn:?}"))
 }
 
 /// A patch id a create names among its approved patches, so the baseline satisfies "Approved
 /// Patches and Approval Rule, at least one must be non empty" without a case having to pick
 /// filter criteria its operating system accepts.
-const APPROVED_PATCH: &str = "KB2032276";
+pub(crate) const APPROVED_PATCH: &str = "KB2032276";
 
 /// One approval rule selecting patches of `classification`, approving them after a day — the
 /// shape `PatchRule` requires: a filter group, plus "a value for either `ApproveAfterDays`
 /// or `ApproveUntilDate`".
-fn patch_rule(classification: &str) -> Value {
+pub(crate) fn patch_rule(classification: &str) -> Value {
     json!({
         "PatchFilterGroup": {
             "PatchFilters": [{ "Key": "CLASSIFICATION", "Values": [classification] }],
@@ -492,10 +514,15 @@ async fn deleting_a_baseline_again_reports_the_id_it_was_given() {
 async fn a_predefined_baseline_is_not_the_accounts_to_remove() {
     let router = router();
 
-    // (case, the operating system whose predefined baseline the delete names).
+    // (case, the operating system whose predefined baseline the delete names). Each is a
+    // value of the modelled `OperatingSystem` enum (`smithy_query(query="shape",
+    // shape="OperatingSystem")`) that Patch Manager predefines a baseline for.
     let cases: &[(&str, &str)] = &[
         ("the predefined windows baseline", "WINDOWS"),
         ("the predefined ubuntu baseline", "UBUNTU"),
+        ("the predefined amazon linux 2023 baseline", "AMAZON_LINUX_2023"),
+        ("the predefined macos baseline", "MACOS"),
+        ("the predefined debian baseline", "DEBIAN"),
     ];
 
     for (case, operating_system) in cases {
@@ -521,17 +548,27 @@ async fn a_predefined_baseline_is_not_the_accounts_to_remove() {
             "case {case}: the predefined baseline must be readable, got {status} {before}"
         );
 
-        delete_ok(&router, case, REGION, &predefined).await;
+        // Either spelling of that baseline: the full ARN a read names it by, and the bare id
+        // that ARN carries. Both reach the same baseline, and the delete reports it in the
+        // spelling this service NAMES a baseline of Patch Manager's by — its full ARN.
+        for named in [predefined.clone(), id_of_arn(&predefined)] {
+            let reported = delete_ok(&router, case, REGION, &named).await;
+            assert_eq!(
+                reported, predefined,
+                "case {case}: a delete naming {named:?} reports the ARN the service names that \
+                 baseline by, got {reported:?}"
+            );
 
-        let (status, after) = get(&router, REGION, &predefined).await;
-        assert_eq!(
-            status, 200,
-            "case {case}: the predefined baseline must stay readable, got {status} {after}"
-        );
-        assert_eq!(
-            after, before,
-            "case {case}: a delete of a predefined baseline changes nothing about it, \
-             got {after}"
-        );
+            let (status, after) = get(&router, REGION, &predefined).await;
+            assert_eq!(
+                status, 200,
+                "case {case}: the predefined baseline must stay readable, got {status} {after}"
+            );
+            assert_eq!(
+                after, before,
+                "case {case}: a delete naming {named:?} changes nothing about that baseline, \
+                 got {after}"
+            );
+        }
     }
 }
