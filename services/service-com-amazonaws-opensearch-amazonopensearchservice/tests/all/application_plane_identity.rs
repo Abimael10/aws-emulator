@@ -143,6 +143,11 @@ async fn get_default(emulator: &Emulator) -> Answer {
         .await
 }
 
+/// The data source every start in this suite exports from: the search-collection ARN this
+/// service validates a migration source against, and the one the application a start is
+/// taken on holds — a job exports from a data source OF the application it migrates into.
+const MIGRATION_SOURCE: &str = "arn:aws:aoss:us-east-1:000000000000:collection/identityprobe";
+
 /// `StartMigration`: `POST /2021-01-01/opensearch/app-migrations` into `application_id`.
 /// The source is the search-collection ARN this service validates a migration source
 /// against, so a refusal under test is about the application and nothing else.
@@ -154,10 +159,7 @@ async fn start_migration(emulator: &Emulator, application_id: &str) -> Answer {
             Some(json!({
                 "applicationId": application_id,
                 "migrationOptions": {
-                    "source": {
-                        "datasourceArn":
-                            "arn:aws:aoss:us-east-1:000000000000:collection/identityprobe",
-                    },
+                    "source": { "datasourceArn": MIGRATION_SOURCE },
                     "workspace": { "workspaceId": "ws-identity" },
                 },
             })),
@@ -431,7 +433,14 @@ async fn a_migration_into_an_application_this_account_does_not_hold_states_that_
     // The application the account DOES hold, so every refusal below is about the id the
     // request carried rather than about an empty store — and so the same call is shown
     // to be served for an id that resolves.
-    let created = create_application(&emulator, json!({ "name": "migration-identity-ui" })).await;
+    let created = create_application(
+        &emulator,
+        json!({
+            "name": "migration-identity-ui",
+            "dataSources": [{ "dataSourceArn": MIGRATION_SOURCE }],
+        }),
+    )
+    .await;
     let held = string_member(&created.body, "id", "the held application");
     // A migration is started INTO an application's workspace, so the start is taken only on
     // an application that is ACTIVE: the condition is polled for rather than waited out.

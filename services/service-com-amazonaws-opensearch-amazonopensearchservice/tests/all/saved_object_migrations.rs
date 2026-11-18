@@ -30,7 +30,14 @@
 //!   resolution or a source that is no collection ARN is refused with the modelled
 //!   `ValidationException` and starts nothing;
 //! * an `applicationId` naming no application of this account, and a `migrationId`
-//!   naming no job, are refused with the modelled `ResourceNotFoundException`.
+//!   naming no job, are refused with the modelled `ResourceNotFoundException`;
+//! * the SOURCE is resolved against the application's own data sources — linked by the
+//!   create, named by an update or attached afterwards — so a `datasourceArn` it holds none
+//!   under is refused with the modelled `ResourceNotFoundException` naming the data source and
+//!   the application, and mints nothing, while every way one reaches the application is
+//!   served;
+//! * an `applicationId` the account holds no application under is refused by the start and by
+//!   the listing of its jobs, each in the words its own surface states that miss in.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
@@ -86,6 +93,55 @@ pub(crate) async fn active_application(emulator: &Emulator, name: &str) -> Strin
     })
     .await;
     id
+}
+
+/// The same ACTIVE application, holding `source` as one of its data sources — the state a
+/// start is taken on, since a job exports from a data source OF the application it migrates
+/// into.
+///
+/// The data source is LINKED by the create (`CreateApplicationRequest$dataSources`, "the data
+/// sources to link to the OpenSearch application"), which is one call rather than a create
+/// and an attach, and it is the same set an attach adds to — so a row that needs a source the
+/// application holds names it here. Shared with the sibling suites that start a migration.
+pub(crate) async fn application_with_source(
+    emulator: &Emulator,
+    name: &str,
+    source: &str,
+) -> String {
+    let answer = emulator
+        .call(
+            "POST",
+            &format!("{PREFIX}/opensearch/application"),
+            Some(json!({
+                "name": name,
+                "dataSources": [{ "dataSourceArn": source }],
+            })),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case CreateApplication({name:?}, {source}): expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let id = string_member(&answer.body, "id", name);
+    poll_until(&format!("the application {name:?} becoming active"), || async {
+        let read = emulator
+            .call(
+                "GET",
+                &format!("{PREFIX}/opensearch/application/{id}"),
+                None,
+            )
+            .await;
+        read.body["status"].as_str() == Some(APPLICATION_STATUS_ACTIVE)
+    })
+    .await;
+    id
+}
+
+/// The source ARN a start's `migrationOptions` names, read out of the options themselves —
+/// what the application that start is taken on has to hold as a data source.
+pub(crate) fn named_source(options: &Value) -> &str {
+    options["source"]["datasourceArn"].as_str().unwrap_or(SOURCE)
 }
 
 /// `GetMigration`: `GET /2021-01-01/opensearch/app-migrations/{migrationId}`.
@@ -279,7 +335,7 @@ async fn a_start_mints_one_pending_job_the_read_reports() {
 
     for row in rows() {
         let case = row.case;
-        let id = active_application(&emulator, row.name).await;
+        let id = application_with_source(&emulator, row.name, named_source(&row.options)).await;
         let answer = start_migration(
             &emulator,
             json!({ "applicationId": id, "migrationOptions": row.options }),
@@ -419,7 +475,7 @@ async fn a_start_mints_one_pending_job_the_read_reports() {
 #[tokio::test]
 async fn the_clock_moves_a_job_through_its_lifecycle_in_order() {
     let emulator = Emulator::new();
-    let id = active_application(&emulator, "migration-progression").await;
+    let id = application_with_source(&emulator, "migration-progression", SOURCE).await;
     let answer = start_migration(
         &emulator,
         json!({
@@ -535,8 +591,8 @@ async fn the_clock_moves_a_job_through_its_lifecycle_in_order() {
 #[tokio::test]
 async fn a_client_token_identifies_the_start_of_one_job() {
     let emulator = Emulator::new();
-    let one = active_application(&emulator, "migration-token-one").await;
-    let other = active_application(&emulator, "migration-token-other").await;
+    let one = application_with_source(&emulator, "migration-token-one", SOURCE).await;
+    let other = application_with_source(&emulator, "migration-token-other", SOURCE).await;
     let options = json!({
         "source": { "datasourceArn": SOURCE },
         "workspace": { "workspaceId": "ws-reporting" },
@@ -623,7 +679,7 @@ async fn a_client_token_identifies_the_start_of_one_job() {
 #[tokio::test]
 async fn a_request_the_service_cannot_run_is_refused_and_starts_nothing() {
     let emulator = Emulator::new();
-    let id = active_application(&emulator, "migration-refusals").await;
+    let id = application_with_source(&emulator, "migration-refusals", SOURCE).await;
 
     // (case, the applicationId, the migrationOptions, the status and code expected)
     let rows: Vec<(&str, String, Value, u16, &str)> = vec![
@@ -739,7 +795,7 @@ async fn a_request_the_service_cannot_run_is_refused_and_starts_nothing() {
 #[tokio::test]
 async fn an_id_naming_no_job_is_refused() {
     let emulator = Emulator::new();
-    let id = active_application(&emulator, "migration-unknown-ids").await;
+    let id = application_with_source(&emulator, "migration-unknown-ids", SOURCE).await;
     let started = start_migration(
         &emulator,
         json!({
@@ -822,5 +878,274 @@ async fn an_id_naming_no_job_is_refused() {
         held.status, 200,
         "case the job that was started: expected 200, got {} with {:?}",
         held.status, held.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The SOURCE a start exports from is a data source OF the application
+// ---------------------------------------------------------------------------
+
+/// A collection ARN of this account with the id `id`: the shape `StartMigration` validates a
+/// source against, so a row below is about the RESOLUTION rather than about the value's shape
+/// or its owner.
+fn collection(id: &str) -> String {
+    format!(
+        "arn:aws:aoss:us-east-1:{}:collection/{id}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// A start of `application_id` from `source`.
+async fn start_from(emulator: &Emulator, application_id: &str, source: &str) -> Answer {
+    start_migration(
+        emulator,
+        json!({
+            "applicationId": application_id,
+            "migrationOptions": {
+                "source": { "datasourceArn": source },
+                "workspace": { "workspaceId": "ws-source-resolution" },
+            },
+        }),
+    )
+    .await
+}
+
+/// The sentence this service states about a source the application holds no data source
+/// under: the data source as the request spelled it, and the application it was resolved
+/// against.
+fn not_found_for_application(source: &str, application_id: &str) -> String {
+    format!("Data source {source} not found for application {application_id}")
+}
+
+/// RULE: saved objects are exported from a data source OF the application a job migrates
+/// into, so a `datasourceArn` the application holds no data source under names nothing to
+/// export from: the start is refused with the modelled `ResourceNotFoundException` naming both
+/// values the lookup was made from, and mints no job.
+#[tokio::test]
+async fn a_start_from_a_source_the_application_does_not_hold_is_refused_and_starts_nothing() {
+    let emulator = Emulator::new();
+
+    // The application under test holds ONE data source, so every refusal below is about the
+    // source the request named rather than about an application holding none at all.
+    let held_source = collection("heldsource");
+    let id = application_with_source(&emulator, "sourceresolution", &held_source).await;
+
+    // Another application holds a second data source, so a row can name a data source that
+    // exists — for someone else.
+    let other_source = collection("othersource");
+    let other = application_with_source(&emulator, "sourceresolutionother", &other_source).await;
+    assert_ne!(id, other, "the two applications must be distinct");
+
+    // Rows differ along WHY this application holds no data source under the value: never
+    // named, named by another application, and one character away from the one it holds.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "a collection no call ever named",
+            collection("nosuchcollection"),
+        ),
+        (
+            "a collection another application holds",
+            other_source.clone(),
+        ),
+        (
+            "a collection whose id differs from the held one by one character",
+            collection("heldsources"),
+        ),
+    ];
+
+    for (case, source) in &rows {
+        assert_ne!(
+            source, &held_source,
+            "case {case}: the row must name another data source than the one held"
+        );
+        let answer = start_from(&emulator, &id, source).await;
+        assert_eq!(
+            (answer.status, error_code(&answer).as_str()),
+            (RECORDED_NOT_FOUND_STATUS, "ResourceNotFoundException"),
+            "case {case}: expected {RECORDED_NOT_FOUND_STATUS} ResourceNotFoundException, got {} \
+             with {:?}",
+            answer.status,
+            answer.body
+        );
+        let expected = not_found_for_application(source, &id);
+        let stated = string_member(&answer.body, "message", case);
+        assert_eq!(
+            stated, expected,
+            "case {case}: expected {expected:?}, got {stated:?}"
+        );
+    }
+
+    // Nothing was minted: the store holds no job at all.
+    assert!(
+        emulator.store().lock().migrations.is_empty(),
+        "case the refused starts: expected them to mint nothing, got {:?}",
+        emulator.store().lock().migrations.keys().collect::<Vec<_>>()
+    );
+
+    // The CONTROL: a start from the data source the application DOES hold is served, so the
+    // refusals above are about the source and nothing else.
+    let served = start_from(&emulator, &id, &held_source).await;
+    assert_eq!(
+        served.status, 200,
+        "case a start from the held data source: expected 200, got {} with {:?}",
+        served.status, served.body
+    );
+}
+
+/// RULE: the lookup is of the application's DATA SOURCES, however one reached it — linked by
+/// the create, attached afterwards, or named by an update (which replaces the linked set, so
+/// a source it dropped is no longer one the application holds).
+#[tokio::test]
+async fn a_start_resolves_its_source_however_that_data_source_reached_the_application() {
+    let emulator = Emulator::new();
+
+    // Row 1: LINKED by the create.
+    let linked = collection("linkedsource");
+    let one = application_with_source(&emulator, "sourcelinked", &linked).await;
+    let served = start_from(&emulator, &one, &linked).await;
+    assert_eq!(
+        served.status, 200,
+        "case a source linked by the create: expected 200, got {} with {:?}",
+        served.status, served.body
+    );
+
+    // Row 2: ATTACHED after the application was created, the other way one reaches an
+    // application.
+    let two = active_application(&emulator, "sourceattached").await;
+    let attached_source = collection("attachedsource");
+    let attached = emulator
+        .call(
+            "POST",
+            &format!("{PREFIX}/opensearch/application/{two}/attachDataSource"),
+            Some(json!({ "dataSourceArn": attached_source })),
+        )
+        .await;
+    assert_eq!(
+        attached.status, 200,
+        "case AttachDataSource(the attached row): expected 200, got {} with {:?}",
+        attached.status, attached.body
+    );
+    let served = start_from(&emulator, &two, &attached_source).await;
+    assert_eq!(
+        served.status, 200,
+        "case a source attached after the create: expected 200, got {} with {:?}",
+        served.status, served.body
+    );
+
+    // Row 3: named by an UPDATE of the application, which replaces the set the create linked.
+    let three = application_with_source(&emulator, "sourceupdated", &collection("oldsource")).await;
+    let updated_source = collection("updatedsource");
+    let updated = emulator
+        .call(
+            "PUT",
+            &format!("{PREFIX}/opensearch/application/{three}"),
+            Some(json!({ "dataSources": [{ "dataSourceArn": updated_source }] })),
+        )
+        .await;
+    assert_eq!(
+        updated.status, 200,
+        "case UpdateApplication(the updated row): expected 200, got {} with {:?}",
+        updated.status, updated.body
+    );
+    let served = start_from(&emulator, &three, &updated_source).await;
+    assert_eq!(
+        served.status, 200,
+        "case a source named by an update: expected 200, got {} with {:?}",
+        served.status, served.body
+    );
+
+    // ...and the source that update REPLACED is no longer one the application holds.
+    let answer = start_from(&emulator, &three, &collection("oldsource")).await;
+    assert_eq!(
+        (answer.status, error_code(&answer).as_str()),
+        (RECORDED_NOT_FOUND_STATUS, "ResourceNotFoundException"),
+        "case a source the update replaced: expected {RECORDED_NOT_FOUND_STATUS} \
+         ResourceNotFoundException, got {} with {:?}",
+        answer.status,
+        answer.body
+    );
+}
+
+/// RULE: an `applicationId` the account holds no application under is refused by the start and
+/// by the LISTING of its jobs, each in the words its own surface states that miss in, rather
+/// than answered with a job id or with an empty listing.
+#[tokio::test]
+async fn an_application_this_account_does_not_hold_is_refused_by_the_start_and_by_the_listing() {
+    let emulator = Emulator::new();
+    let source = collection("absentapplication");
+    let held = application_with_source(&emulator, "sourceabsentapp", &source).await;
+
+    // Rows differ along the length and the alphabet of the id the request carries, inside the
+    // expression the model declares for an application id.
+    let absent = [
+        "abc".to_string(),
+        "a".repeat(30),
+        "0123456789".to_string(),
+        "nosuchapplicationid".to_string(),
+    ];
+
+    for id in &absent {
+        assert_ne!(
+            id, &held,
+            "case {id:?}: the row must name another application"
+        );
+
+        let started = start_from(&emulator, id, &source).await;
+        assert_eq!(
+            (started.status, error_code(&started).as_str()),
+            (RECORDED_NOT_FOUND_STATUS, "ResourceNotFoundException"),
+            "case StartMigration({id:?}): expected {RECORDED_NOT_FOUND_STATUS} \
+             ResourceNotFoundException, got {} with {:?}",
+            started.status,
+            started.body
+        );
+        let expected = format!("Application {id} does not exist");
+        let stated = string_member(&started.body, "message", id);
+        assert_eq!(
+            stated, expected,
+            "case StartMigration({id:?}): expected {expected:?}, got {stated:?}"
+        );
+
+        let listed = emulator
+            .call(
+                "GET",
+                &format!("{PREFIX}/opensearch/app-migrations?applicationId={id}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            (listed.status, error_code(&listed).as_str()),
+            (RECORDED_NOT_FOUND_STATUS, "ResourceNotFoundException"),
+            "case ListMigrations({id:?}): expected {RECORDED_NOT_FOUND_STATUS} \
+             ResourceNotFoundException rather than a listing, got {} with {:?}",
+            listed.status,
+            listed.body
+        );
+        let expected = format!("Application {id} not found");
+        let stated = string_member(&listed.body, "message", id);
+        assert_eq!(
+            stated, expected,
+            "case ListMigrations({id:?}): expected {expected:?}, got {stated:?}"
+        );
+    }
+
+    // The CONTROL: the application the account DOES hold is served by both.
+    let served = start_from(&emulator, &held, &source).await;
+    assert_eq!(
+        served.status, 200,
+        "case the held application: expected 200 from StartMigration, got {} with {:?}",
+        served.status, served.body
+    );
+    let listed = emulator
+        .call(
+            "GET",
+            &format!("{PREFIX}/opensearch/app-migrations?applicationId={held}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        listed.status, 200,
+        "case the held application: expected 200 from ListMigrations, got {} with {:?}",
+        listed.status, listed.body
     );
 }

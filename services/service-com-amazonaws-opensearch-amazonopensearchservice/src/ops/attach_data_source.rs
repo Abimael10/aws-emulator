@@ -457,7 +457,9 @@ const DATA_SOURCE_ARN_PATH: &str = "dataSourceArn";
 
 /// The expression a data source's ARN has to satisfy: an ARN of any partition, naming a
 /// resource of a service whose namespace is letters alone, in a Region and under an
-/// account, whose resource is a TYPE and an id.
+/// account, whose resource is a TYPE and an id — the id spelled with letters, digits,
+/// underscores and hyphens, and nothing else: no dot is part of a resource id this grammar
+/// admits.
 ///
 /// The model declares `ARN` with `@pattern(".*")`, which admits every string, so this
 /// expression is the service's own: it is the one the wire refusal recorded for this
@@ -465,7 +467,7 @@ const DATA_SOURCE_ARN_PATH: &str = "dataSourceArn";
 /// CHECK below runs it as written and the clause quotes it through the service's one
 /// `@pattern` rendering.
 const DATA_SOURCE_ARN_PATTERN: &str =
-    r"arn:aws[a-z\-]*:[a-z]+:[a-z0-9\-]*:[0-9]*:[a-z0-9\-]+/[a-z0-9_\-\.]+";
+    r"arn:aws[a-z\-]*:[a-z]+:[a-z0-9\-]*:[0-9]*:[a-z0-9\-]+/[a-z0-9_\-]+";
 
 /// The data source ARN's trait map: the expression, run the way the request boundary runs a
 /// `@pattern`.

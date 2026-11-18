@@ -24,7 +24,14 @@
 //! * these operations are served by a domain whose ENGINE serves them: a domain running an
 //!   engine release that does not is refused `ValidationException` with the service's
 //!   software-version sentence, and that refusal is answered BEFORE the index is looked up,
-//!   so a name no index of the domain carries earns it too.
+//!   so a name no index of the domain carries earns it too;
+//! * an analysis component is addressed by the NAME its settings define it under, and a name
+//!   carrying a character outside ASCII is one the domain's cluster cannot be handed: both
+//!   index writes refuse such a document with the modelled `DependencyFailureException` and
+//!   the service's fixed dependency sentence, the refusal is sustained across retries, and
+//!   nothing is stored — over a table spanning every kind of component those settings define,
+//!   both spellings of the settings section and a range of scripts, with the ASCII control
+//!   served on the same domain.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
@@ -474,4 +481,224 @@ async fn the_index_operations_are_served_only_by_an_engine_that_carries_them() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The NAME an index's analysis settings may define a component under
+// ---------------------------------------------------------------------------
+
+/// The status this service answers a dependency failure on: `DependencyFailureException` is
+/// `@httpError(424)` (`smithy_query(query="shape",shape="DependencyFailureException")`), and
+/// the code that shape carries on the wire.
+const DEPENDENCY_FAILURE_STATUS: u16 = 424;
+const DEPENDENCY_FAILURE: &str = "DependencyFailureException";
+
+/// The component names the rows below write, one per script: Han, a Latin letter carrying a
+/// diacritic, Cyrillic, Greek and a name that is ASCII everywhere but one character — so the
+/// rule is asserted over the name's characters rather than over one value, the almost
+/// admissible value included.
+const NON_ASCII_NAMES: [(&str, &str); 5] = [
+    ("Han characters", "分析器"),
+    ("a Latin letter with a diacritic", "analyseur_français"),
+    ("Cyrillic characters", "анализатор"),
+    ("Greek characters", "αναλυτής"),
+    ("one non-ASCII character in an ASCII name", "s2r_analyzer_é"),
+];
+
+/// The ASCII name every control row defines its component under.
+const ASCII_COMPONENT: &str = "s2r_custom_analyzer";
+
+/// One kind of component an index's `analysis` settings define: the member they are defined
+/// under, and a definition this engine can otherwise build, so a refusal is about the NAME.
+struct ComponentKind {
+    case: &'static str,
+    member: &'static str,
+    definition: Value,
+}
+
+/// Every kind of component those settings define, each with a definition built out of what
+/// this engine registers.
+fn component_kinds() -> Vec<ComponentKind> {
+    vec![
+        ComponentKind {
+            case: "an analyzer",
+            member: "analyzer",
+            definition: json!({ "type": "custom", "tokenizer": "standard" }),
+        },
+        ComponentKind {
+            case: "a token filter",
+            member: "filter",
+            definition: json!({ "type": "lowercase" }),
+        },
+        ComponentKind {
+            case: "a tokenizer",
+            member: "tokenizer",
+            definition: json!({ "type": "standard" }),
+        },
+        ComponentKind {
+            case: "a character filter",
+            member: "char_filter",
+            definition: json!({ "type": "html_strip" }),
+        },
+    ]
+}
+
+/// Where in the document a row writes the analysis settings: the same settings reach the
+/// cluster written under the `index` section inside the index's settings and written directly
+/// under them, so a row names which spelling it uses and the rule holds for both.
+#[derive(Debug, Clone, Copy)]
+enum AnalysisSection {
+    UnderIndex,
+    DirectlyUnderSettings,
+}
+
+/// The schema a row sends: `member` defining one component under `name`, in `section`.
+fn analysis_schema(
+    section: AnalysisSection,
+    member: &str,
+    name: &str,
+    definition: &Value,
+) -> Value {
+    let analysis = json!({ member: { name: definition } });
+    match section {
+        AnalysisSection::UnderIndex => {
+            json!({ "settings": { "index": { "analysis": analysis } } })
+        }
+        AnalysisSection::DirectlyUnderSettings => json!({ "settings": { "analysis": analysis } }),
+    }
+}
+
+/// Assert that `answer` is the dependency failure this service answers a schema it cannot
+/// hand the domain's cluster with: the modelled shape, its status and the fixed sentence.
+fn assert_dependency_failure(answer: &super::domain_lifecycle::Answer, case: &str) {
+    assert_eq!(
+        (answer.status, error_code(answer).as_str()),
+        (DEPENDENCY_FAILURE_STATUS, DEPENDENCY_FAILURE),
+        "case {case}: expected {DEPENDENCY_FAILURE_STATUS} {DEPENDENCY_FAILURE}, got {} with \
+         {:?}",
+        answer.status,
+        answer.body
+    );
+    assert_eq!(
+        string_member(&answer.body, "message", case),
+        state::DOMAIN_UNAVAILABLE,
+        "case {case}: expected the service's dependency sentence, got {:?}",
+        answer.body
+    );
+}
+
+/// RULE: an analysis component is addressed by the NAME its settings define it under, and a
+/// name carrying a character outside ASCII is one the domain's cluster cannot be handed — so
+/// a `CreateIndex` whose settings define one is refused with the modelled
+/// `DependencyFailureException` and its fixed sentence, is refused again on a retry, and
+/// creates no index.
+#[tokio::test]
+async fn a_create_defining_a_component_under_a_non_ascii_name_is_refused_and_creates_nothing() {
+    let emulator = Emulator::new();
+    let domain = "analysis-names";
+    created_domain(&emulator, domain).await;
+
+    for (kind_index, kind) in component_kinds().into_iter().enumerate() {
+        for (script_index, (script, name)) in NON_ASCII_NAMES.iter().enumerate() {
+            for (section_index, section) in [
+                AnalysisSection::UnderIndex,
+                AnalysisSection::DirectlyUnderSettings,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let case = format!("{} named with {script} in {section:?}", kind.case);
+                let index =
+                    format!("analysis-names-{kind_index}-{script_index}-{section_index}");
+                let schema = analysis_schema(section, kind.member, name, &kind.definition);
+                let body = json!({ "IndexName": &index, "IndexSchema": &schema });
+
+                // SUSTAINED: the same request is refused the same way twice, since nothing
+                // about the decision depends on the call.
+                for attempt in 0..2 {
+                    let answer = create_index(&emulator, domain, body.clone()).await;
+                    assert_dependency_failure(&answer, &format!("{case}, attempt {attempt}"));
+                }
+
+                // And it created nothing: the read of that index answers the missing resource
+                // it is.
+                let read = get_index(&emulator, domain, &index).await;
+                assert_eq!(
+                    (read.status, error_code(&read).as_str()),
+                    (404, "ResourceNotFoundException"),
+                    "case {case}: expected the refused create to leave no index, got {} with {:?}",
+                    read.status,
+                    read.body
+                );
+            }
+        }
+    }
+
+    // The CONTROL: the same documents with an ASCII component name are served on the same
+    // domain and read back verbatim, so the refusals above are about the name and nothing
+    // else.
+    for (kind_index, kind) in component_kinds().into_iter().enumerate() {
+        let index = format!("analysis-names-ascii-{kind_index}");
+        let schema = analysis_schema(
+            AnalysisSection::UnderIndex,
+            kind.member,
+            ASCII_COMPONENT,
+            &kind.definition,
+        );
+        created_index(&emulator, domain, &index, &schema, kind.case).await;
+        let read = read_schema(&emulator, domain, &index, kind.case).await;
+        assert_eq!(
+            read, schema,
+            "case {}: expected the stored schema to read back verbatim, got {read:?}",
+            kind.case
+        );
+    }
+}
+
+/// RULE: the same name rule holds for the other index write — an `UpdateIndex` whose analysis
+/// settings define a component under a non-ASCII name is refused with the same dependency
+/// failure, and the stored schema is left exactly as it was.
+#[tokio::test]
+async fn an_update_defining_a_component_under_a_non_ascii_name_is_refused_and_writes_nothing() {
+    let emulator = Emulator::new();
+    let domain = "analysis-name-updates";
+    created_domain(&emulator, domain).await;
+
+    let index = "analysis-name-updates-index";
+    let stored = json!({
+        "settings": { "index": { "analysis": { "analyzer": { ASCII_COMPONENT: {
+            "type": "custom",
+            "tokenizer": "standard",
+        } } } } },
+        "mappings": { "properties": { "title": { "type": "text", "analyzer": ASCII_COMPONENT } } },
+    });
+    created_index(&emulator, domain, index, &stored, "the stored index").await;
+
+    for kind in component_kinds() {
+        for (script, name) in NON_ASCII_NAMES {
+            let case = format!("an update defining {} named with {script}", kind.case);
+            // An update writes an index's MAPPINGS, so the analysis settings it carries are
+            // written where no settings section stands — the spelling this operation reads
+            // them in.
+            let schema = json!({ "analysis": { kind.member: { name: &kind.definition } } });
+            let answer = update_index(&emulator, domain, index, &schema).await;
+            assert_dependency_failure(&answer, &case);
+
+            let read = read_schema(&emulator, domain, index, &case).await;
+            assert_eq!(
+                read, stored,
+                "case {case}: expected the refused update to leave the stored schema as it was, \
+                 got {read:?}"
+            );
+        }
+    }
+
+    // The CONTROL: the same update with an ASCII component name is served.
+    let accepted = json!({ "analysis": { "filter": { "s2r_lowercase": { "type": "lowercase" } } } });
+    let answer = update_index(&emulator, domain, index, &accepted).await;
+    assert_eq!(
+        answer.status, 200,
+        "case an ASCII component name: expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
 }

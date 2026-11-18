@@ -97,15 +97,21 @@ pub fn unsupported_data_source_refusal(member: &str, arn: &str) -> Option<Valida
 /// in someone else's account. An ARN carrying NO account field names no account to compare —
 /// a partition-global resource — so there is nothing to refuse, and neither does a value
 /// that is no ARN at all, which its operation's own malformed-ARN refusal states.
+///
+/// The sentence names the member, the account the VALUE carries and the account the request
+/// was made for, and nothing else: the two account ids are what a caller compares to see
+/// which end is wrong, and both are read off the request and the caller's own identity rather
+/// than written here. The ARN is not quoted whole — the member says which value it is, and
+/// the account segment is the part of it this refusal is about.
 pub fn foreign_account_arn_refusal(member: &str, arn: &str) -> Option<ValidationException> {
     let account = arn::parse(arn)?.account;
-    if account.is_empty() || account == ::engine::emulator_account_id() {
+    let caller = ::engine::emulator_account_id();
+    if account.is_empty() || account == caller {
         return None;
     }
     Some(ValidationException {
         message: Some(format!(
-            "{member} {arn} names a resource of account {account}, which is not the Amazon Web \
-             Services account ID this request was made for."
+            "{member} account {account} does not match caller account {caller}"
         )),
     })
 }

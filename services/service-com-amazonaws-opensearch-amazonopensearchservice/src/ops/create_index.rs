@@ -340,6 +340,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // And a component those settings DEFINE has to be one the domain's cluster can be
+        // handed at all: it is addressed by the NAME the settings define it under, and a name
+        // the cluster does not take leaves the index unbuildable on the domain however well
+        // formed the document is. That is a failure of the dependency the index is built on
+        // rather than a verdict on the request, so it is answered with the service's
+        // dependency sentence ([`crate::state::domain_unavailable`]) — a condition that
+        // passes, which is why the error it carries is a retryable one — and nothing is
+        // stored. The same rule `UpdateIndex` applies to the settings it is handed.
+        if crate::state::unnameable_analysis_component(&input.index_schema).is_some() {
+            return Err(CreateIndexErrorModeled::DependencyFailureException(
+                crate::state::domain_unavailable(),
+            )
+            .into());
+        }
+
         domain.indexes.insert(
             input.index_name.clone(),
             Index {

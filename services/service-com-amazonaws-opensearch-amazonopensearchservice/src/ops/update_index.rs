@@ -354,6 +354,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // And a component the REQUEST's settings define has to be one the domain's cluster
+        // can be handed at all, by the rule the create path applies
+        // ([`crate::state::unnameable_analysis_component`]): a name the cluster does not take
+        // leaves the index unbuildable on the domain, which is a failure of the dependency
+        // the index is built on rather than a verdict on the request, so it is answered with
+        // the service's dependency sentence and the index keeps the schema it had.
+        if crate::state::unnameable_analysis_component(&input.index_schema).is_some() {
+            return Err(UpdateIndexErrorModeled::DependencyFailureException(
+                crate::state::domain_unavailable(),
+            )
+            .into());
+        }
+
         // "The updated JSON schema for the index including any CHANGES to mappings,
         // settings, and semantic enrichment configuration": what the request names
         // is written onto the stored schema, and what it does not name the index

@@ -100,9 +100,9 @@
 use super::types::*;
 
 use crate::state::{
-    migration_client_token_taken, migration_quota_exceeded, migration_workspace_refusal,
-    service_state, state_unavailable, unsupported_conflict_resolution, Migration,
-    MIGRATION_QUOTA, MIGRATION_STATUS_PENDING,
+    data_source_not_found_for_application, migration_client_token_taken, migration_quota_exceeded,
+    migration_workspace_refusal, service_state, state_unavailable, unsupported_conflict_resolution,
+    Migration, MIGRATION_QUOTA, MIGRATION_STATUS_PENDING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -285,16 +285,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused with the same sentence, because what the caller is told is that the
         // account holds no such application to migrate into; a start is taken only on an
         // application that is ACTIVE ("the application is up and can be used").
-        let active = store
+        let application = store
             .applications
             .get(&input.application_id)
-            .is_some_and(|application| {
+            .filter(|application| {
                 application.removal_due.is_none()
                     && application.status == crate::state::APPLICATION_STATUS_ACTIVE
-            });
-        if !active {
+            })
+            .ok_or_else(|| {
+                StartMigrationErrorModeled::ResourceNotFoundException(application_does_not_exist(
+                    &input.application_id,
+                ))
+            })?;
+
+        // And the SOURCE is resolved against that application once it is: saved objects are
+        // exported from "the data source to migrate saved objects from", and the data sources
+        // a job can export from are the ones the application holds — linked when it was
+        // created or updated, or attached since
+        // ([`crate::state::Application::holds_data_source`]). A value the application holds
+        // no data source under names nothing to export from, so it is refused as the missing
+        // resource it is ([`crate::state::data_source_not_found_for_application`]) rather
+        // than minting a job that could never run — and the refusal comes before any
+        // migration state is created, so nothing is left behind. Resolved AFTER the
+        // application, because a source is a data source OF an application: an id naming none
+        // has nothing for the source to be looked up in.
+        if !application.holds_data_source(&options.source.datasource_arn) {
             return Err(StartMigrationErrorModeled::ResourceNotFoundException(
-                application_does_not_exist(&input.application_id),
+                data_source_not_found_for_application(
+                    &options.source.datasource_arn,
+                    &input.application_id,
+                ),
             )
             .into());
         }

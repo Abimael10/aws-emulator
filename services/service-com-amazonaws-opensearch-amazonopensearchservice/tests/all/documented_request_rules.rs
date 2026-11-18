@@ -45,7 +45,9 @@ use super::domain_lifecycle::{
     error_code, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS, REGION,
 };
 use super::index_registry::create as create_index;
-use super::saved_object_migrations::{active_application, get_migration, start_migration};
+use super::saved_object_migrations::{
+    active_application, application_with_source, get_migration, start_migration,
+};
 
 /// The status a refused request is answered on, and the error code it carries: this
 /// service answers every rule below with the modelled `ValidationException` (HTTP 400)
@@ -788,7 +790,7 @@ async fn a_migration_into_an_application_being_deleted_is_refused() {
 
     // A start into an application the account holds, and which is ACTIVE, is served, and
     // the job reads back.
-    let held = active_application(&emulator, "migration-held").await;
+    let held = application_with_source(&emulator, "migration-held", &source).await;
     let started = start_migration(
         &emulator,
         json!({ "applicationId": held, "migrationOptions": options }),

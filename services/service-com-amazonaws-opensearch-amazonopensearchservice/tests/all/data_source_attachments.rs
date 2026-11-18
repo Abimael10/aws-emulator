@@ -36,7 +36,12 @@
 //!   parameters, while a token reused for a different data source is the modelled
 //!   conflict;
 //! * an id naming no application is refused with the modelled
-//!   `ResourceNotFoundException` by every one of the four operations.
+//!   `ResourceNotFoundException` by every one of the four operations;
+//! * an ARN naming another account's resource is refused stating the member, the account the
+//!   value carries and the account the request was made for, over a table of kinds and
+//!   account ids and for both operations that take such an ARN;
+//! * an ARN outside the grammar a data source is named with is refused with the one clause
+//!   that quotes that grammar, over a table of ARNs differing in which field leaves it.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
@@ -1187,5 +1192,203 @@ async fn the_attachment_set_of_one_application_is_bounded() {
         whole_set(&emulator, &id, "an attach past the bound").await.len(),
         ATTACHMENT_QUOTA,
         "case an attach past the bound: the refused attach stored nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What the two refusals of a `dataSourceArn` STATE
+// ---------------------------------------------------------------------------
+
+/// The expression an ARN handed to this service as a data source has to satisfy, as the
+/// clause quotes it: an ARN of any partition naming a resource of a service whose namespace
+/// is letters alone, in a Region and under an account, whose resource is a type and an id
+/// spelled with letters, digits, underscores and hyphens.
+///
+/// Declared here as the refusal states it, so the assertion reads the requirement a client is
+/// told rather than the constant the handler runs.
+const DATA_SOURCE_ARN_EXPRESSION: &str =
+    r"arn:aws[a-z\-]*:[a-z]+:[a-z0-9\-]*:[0-9]*:[a-z0-9\-]+/[a-z0-9_\-]+";
+
+/// An account id that is not the one this emulator serves, and a second one, so no row's
+/// outcome is a property of one account id.
+const OTHER_ACCOUNT: &str = "111122223333";
+const THIRD_ACCOUNT: &str = "555555555555";
+
+/// The sentence this service states about a member whose ARN names another account's
+/// resource: the member, the account the value carries and the account the request was made
+/// for.
+fn account_mismatch(member: &str, arn_account: &str, caller_account: &str) -> String {
+    format!("{member} account {arn_account} does not match caller account {caller_account}")
+}
+
+/// RULE: an ARN naming a resource of another Amazon Web Services account names no data source
+/// a request of this account can reach, and the refusal states the member, the account the
+/// VALUE carries and the account the request was made for — both read off the request and the
+/// caller's own identity — so a client can see which end is wrong.
+#[tokio::test]
+async fn an_arn_of_another_account_is_refused_naming_both_accounts() {
+    let emulator = Emulator::new();
+    let id = application(&emulator, "arnwording").await;
+    let caller = ::engine::emulator_account_id();
+    let region = "us-east-1";
+
+    // Rows differ along the KIND of resource the ARN names — each kind this service attaches
+    // as a data source — and along the account id it carries, so the sentence is asserted
+    // over the value rather than over one ARN.
+    let rows: Vec<(&str, String, &str)> = vec![
+        (
+            "a domain of another account",
+            format!("arn:aws:es:{region}:{OTHER_ACCOUNT}:domain/elsewhere"),
+            OTHER_ACCOUNT,
+        ),
+        (
+            "a domain of a third account",
+            format!("arn:aws:es:{region}:{THIRD_ACCOUNT}:domain/elsewhere"),
+            THIRD_ACCOUNT,
+        ),
+        (
+            "a direct query data source of another account",
+            format!("arn:aws:es:{region}:{OTHER_ACCOUNT}:datasource/elsewhere_source"),
+            OTHER_ACCOUNT,
+        ),
+        (
+            "a search collection of another account",
+            format!("arn:aws:aoss:{region}:{OTHER_ACCOUNT}:collection/elsewherecollection"),
+            OTHER_ACCOUNT,
+        ),
+        (
+            "the Data Catalog of another account",
+            format!("arn:aws:glue:{region}:{OTHER_ACCOUNT}:catalog"),
+            OTHER_ACCOUNT,
+        ),
+    ];
+
+    for (case, arn, account) in &rows {
+        assert_ne!(
+            *account, caller,
+            "case {case}: the row must name another account than the caller's"
+        );
+        let answer = attach(&emulator, &id, json!({ "dataSourceArn": arn })).await;
+        assert_eq!(
+            (answer.status, error_code(&answer).as_str()),
+            (400, "ValidationException"),
+            "case {case}: expected 400 ValidationException, got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+        let expected = account_mismatch("dataSourceArn", account, caller);
+        let stated = string_member(&answer.body, "message", case);
+        assert_eq!(
+            stated, expected,
+            "case {case}: expected {expected:?}, got {stated:?}"
+        );
+    }
+
+    // The same rule states the same sentence for the other operation that takes such an ARN,
+    // under the member path IT carries the value in — one statement of the rule, not two.
+    let source = format!("arn:aws:aoss:{region}:{OTHER_ACCOUNT}:collection/elsewherecollection");
+    let case = "StartMigration from another account's collection";
+    let started = emulator
+        .call(
+            "POST",
+            &format!("{PREFIX}/opensearch/app-migrations"),
+            Some(json!({
+                "applicationId": id,
+                "migrationOptions": {
+                    "source": { "datasourceArn": source },
+                    "workspace": { "workspaceId": "ws-arn-wording" },
+                },
+            })),
+        )
+        .await;
+    assert_eq!(
+        (started.status, error_code(&started).as_str()),
+        (400, "ValidationException"),
+        "case {case}: expected 400 ValidationException, got {} with {:?}",
+        started.status,
+        started.body
+    );
+    let expected = account_mismatch(
+        "migrationOptions.source.datasourceArn",
+        OTHER_ACCOUNT,
+        caller,
+    );
+    let stated = string_member(&started.body, "message", case);
+    assert_eq!(
+        stated, expected,
+        "case {case}: expected {expected:?}, got {stated:?}"
+    );
+
+    // None of the refusals attached anything.
+    assert!(
+        whole_set(&emulator, &id, "the refused attaches").await.is_empty(),
+        "case the attachment set: expected the refused attaches to record nothing"
+    );
+}
+
+/// RULE: an ARN outside the grammar a data source is named with is refused with the one clause
+/// that QUOTES that grammar, and the expression quoted is the requirement a client can
+/// reproduce: its service namespace is letters alone and its resource id admits letters,
+/// digits, underscores and hyphens — no dot.
+#[tokio::test]
+async fn an_arn_outside_the_data_source_grammar_is_refused_quoting_that_grammar() {
+    let emulator = Emulator::new();
+    let id = application(&emulator, "arngrammar").await;
+    let account = ::engine::emulator_account_id();
+    let region = "us-east-1";
+
+    // Rows differ along WHICH field of the ARN leaves the grammar: the service namespace (a
+    // digit in it, in two partitions), the resource (no id at all, an empty id) and the
+    // value's own shape.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "a service namespace carrying a digit",
+            format!("arn:aws:ec2:{region}:{account}:instance/i-0123456789abcdef0"),
+        ),
+        (
+            "a service namespace carrying a digit in another partition",
+            format!("arn:aws-cn:s3outposts:{region}:{account}:outpost/op-0123456789abcdef0"),
+        ),
+        (
+            "a resource naming no id",
+            format!("arn:aws:lambda:{region}:{account}:function"),
+        ),
+        (
+            "a resource whose id is empty",
+            format!("arn:aws:lambda:{region}:{account}:function/"),
+        ),
+        (
+            "a value that is no ARN at all",
+            "not-an-arn-at-all-but-long-enough".to_string(),
+        ),
+    ];
+
+    for (case, arn) in &rows {
+        let answer = attach(&emulator, &id, json!({ "dataSourceArn": arn })).await;
+        assert_eq!(
+            (answer.status, error_code(&answer).as_str()),
+            (400, "ValidationException"),
+            "case {case}: expected 400 ValidationException, got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+        let expected = super::constraint_refusal_messages::report(&[
+            super::constraint_refusal_messages::clause(
+                arn,
+                "dataSourceArn",
+                &super::constraint_refusal_messages::expression(DATA_SOURCE_ARN_EXPRESSION),
+            ),
+        ]);
+        let stated = string_member(&answer.body, "message", case);
+        assert_eq!(
+            stated, expected,
+            "case {case}: expected {expected:?}, got {stated:?}"
+        );
+    }
+
+    // None of the refusals attached anything.
+    assert!(
+        whole_set(&emulator, &id, "the refused attaches").await.is_empty(),
+        "case the attachment set: expected the refused attaches to record nothing"
     );
 }

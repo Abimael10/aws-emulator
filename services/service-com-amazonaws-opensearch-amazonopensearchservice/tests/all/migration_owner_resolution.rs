@@ -29,7 +29,7 @@ use super::control_plane_refusal_wording::message;
 use super::domain_lifecycle::{
     error_code, poll_until, string_member, Emulator, RECORDED_NOT_FOUND_STATUS,
 };
-use super::saved_object_migrations::{active_application, get_migration, start_migration};
+use super::saved_object_migrations::{application_with_source, get_migration, start_migration};
 
 /// The data source a job exports saved objects out of: a search COLLECTION ARN, the shape
 /// `StartMigration` validates its source against.
@@ -102,7 +102,7 @@ async fn a_migration_id_whose_application_is_not_held_is_refused_for_that_applic
     let emulator = Emulator::new();
     // One application the account DOES hold, so every row below is about the id the
     // request carried rather than about an empty store.
-    let held = active_application(&emulator, "owner-resolution-held").await;
+    let held = application_with_source(&emulator, "owner-resolution-held", SOURCE).await;
     let job = started_job(&emulator, &held, "the held application's job").await;
     assert!(
         job.starts_with(&format!("{held}-")),
@@ -156,7 +156,7 @@ async fn a_migration_id_whose_application_is_not_held_is_refused_for_that_applic
 #[tokio::test]
 async fn a_jobs_own_id_is_refused_for_its_application_once_the_clock_removes_it() {
     let emulator = Emulator::new();
-    let id = active_application(&emulator, "owner-resolution-removed").await;
+    let id = application_with_source(&emulator, "owner-resolution-removed", SOURCE).await;
     let job = started_job(&emulator, &id, "the job of the removed application").await;
 
     let read = get_migration(&emulator, &job).await;

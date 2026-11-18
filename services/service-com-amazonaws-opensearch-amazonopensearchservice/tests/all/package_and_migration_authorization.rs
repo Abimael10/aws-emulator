@@ -37,7 +37,7 @@ use super::domain_lifecycle::{
 };
 use super::index_authorization::{allow, assert_refused, Refusal};
 use super::package_associations::PACKAGE_CONTENT;
-use super::saved_object_migrations::active_application;
+use super::saved_object_migrations::application_with_source;
 
 /// The operations addressed by PACKAGE id, which this service's IAM actions decide
 /// against the account's DOMAIN resource: a package is not a domain, and its content is
@@ -284,7 +284,8 @@ impl Fixture {
         let emulator = Emulator::new();
         given_principals(&emulator);
         created_domain(&emulator, DOMAIN).await;
-        let application_id = active_application(&emulator, "packageauthz").await;
+        let application_id =
+            application_with_source(&emulator, "packageauthz", MIGRATION_SOURCE).await;
         emulator.given_object(
             "my-package-bucket",
             &format!("packages/{package_name}.txt"),

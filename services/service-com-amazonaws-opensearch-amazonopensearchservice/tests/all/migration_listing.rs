@@ -38,11 +38,18 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 use super::domain_lifecycle::{
     error_code, poll_until, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS,
 };
-use super::saved_object_migrations::active_application;
+use super::saved_object_migrations::application_with_source;
 
 /// The ARN of the data source every job below migrates saved objects out of: the search
 /// COLLECTION shape `StartMigration` validates a source against.
 const SOURCE: &str = "arn:aws:aoss:us-east-1:000000000000:collection/listedobjects";
+
+/// An ACTIVE application of this account that holds [`SOURCE`] as one of its data sources —
+/// the state a start is taken on, since a job exports from a data source OF the application
+/// it migrates into.
+async fn application(emulator: &Emulator, name: &str) -> String {
+    application_with_source(emulator, name, SOURCE).await
+}
 
 /// `ListMigrations`: `GET /2021-01-01/opensearch/app-migrations?applicationId=…`.
 pub(crate) async fn list_migrations(
@@ -132,7 +139,7 @@ async fn the_listing_reports_every_job_of_the_application_from_the_stored_record
 
     for (case, name, scopes) in rows {
         let emulator = Emulator::new();
-        let id = active_application(&emulator, name).await;
+        let id = application(&emulator, name).await;
         let mut started: Vec<String> = Vec::new();
         for objects in &scopes {
             started.push(start(&emulator, &id, *objects).await);
@@ -207,8 +214,8 @@ async fn the_listing_reports_every_job_of_the_application_from_the_stored_record
 #[tokio::test]
 async fn the_listing_is_scoped_to_the_application_it_names() {
     let emulator = Emulator::new();
-    let one = active_application(&emulator, "listing-scope-one").await;
-    let other = active_application(&emulator, "listing-scope-other").await;
+    let one = application(&emulator, "listing-scope-one").await;
+    let other = application(&emulator, "listing-scope-other").await;
 
     let mut of_one = Vec::new();
     let mut of_other = Vec::new();
@@ -239,7 +246,7 @@ async fn the_listing_is_scoped_to_the_application_it_names() {
 #[tokio::test]
 async fn any_page_size_walks_the_whole_listing_once() {
     let emulator = Emulator::new();
-    let id = active_application(&emulator, "listing-pages").await;
+    let id = application(&emulator, "listing-pages").await;
     let mut started = Vec::new();
     for objects in 0..5 {
         started.push(start(&emulator, &id, objects).await);
@@ -309,7 +316,7 @@ async fn any_page_size_walks_the_whole_listing_once() {
 #[tokio::test]
 async fn a_status_filter_selects_the_jobs_in_that_status() {
     let emulator = Emulator::new();
-    let id = active_application(&emulator, "listing-status-filter").await;
+    let id = application(&emulator, "listing-status-filter").await;
     let mut started = Vec::new();
     for objects in 0..3 {
         started.push(start(&emulator, &id, objects).await);
@@ -394,8 +401,8 @@ async fn a_status_filter_selects_the_jobs_in_that_status() {
 #[tokio::test]
 async fn a_request_the_listing_cannot_run_is_refused() {
     let emulator = Emulator::new();
-    let id = active_application(&emulator, "listing-refusals").await;
-    let other = active_application(&emulator, "listing-refusals-other").await;
+    let id = application(&emulator, "listing-refusals").await;
+    let other = application(&emulator, "listing-refusals-other").await;
     let mut started = Vec::new();
     for objects in 0..2 {
         started.push(start(&emulator, &id, objects).await);

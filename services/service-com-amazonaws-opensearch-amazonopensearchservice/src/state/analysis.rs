@@ -1211,6 +1211,37 @@ impl IndexAnalysis {
         named
     }
 
+    /// The first COMPONENT NAME these settings define that the domain's cluster cannot be
+    /// handed — one carrying a character outside ASCII — or `None` where every name they
+    /// define is one it can.
+    ///
+    /// An analysis component is addressed BY NAME: the index's own settings define it under
+    /// that name, its field mappings and its chains refer back to it by that name, and the
+    /// cluster the index is built on is handed those names as they were written. A name
+    /// carrying a character outside ASCII is one the cluster does not take, so the index
+    /// cannot be built from settings that define one — which is a failure of the DOMAIN the
+    /// write was for rather than a verdict on the document's shape, and is why an index write
+    /// refuses it with the service's dependency sentence
+    /// ([`super::index_schema::domain_unavailable`]) and stores nothing.
+    ///
+    /// Every kind of component one of these sections defines is held to the one rule — an
+    /// analyzer, a token filter, a tokenizer and a character filter are all named the same
+    /// way — and the sections are visited in a fixed order, so one document defining two such
+    /// names is refused for the same name however it was written.
+    #[must_use]
+    pub fn unnameable_component(&self) -> Option<&str> {
+        [
+            &self.analyzers,
+            &self.filters,
+            &self.tokenizers,
+            &self.char_filters,
+        ]
+        .into_iter()
+        .flat_map(Map::keys)
+        .find(|name| !name.is_ascii())
+        .map(String::as_str)
+    }
+
     /// The filter one element of a chain names: one this index defines, one configured
     /// inline, or one of the engine's own.
     fn filter(&self, named: &Value, files: &PackageFiles) -> Result<Filter, Unresolved> {

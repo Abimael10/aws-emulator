@@ -23,7 +23,7 @@ use super::{
     engine_type_of, index_settings, json_from_document, upgrade_rank, Domain,
     ENGINE_TYPE_OPENSEARCH, SCHEMA_MAPPINGS, SCHEMA_SETTINGS, SETTINGS_INDEX_SECTION,
 };
-use crate::ops::types::{InternalException, ValidationException};
+use crate::ops::types::{DependencyFailureException, InternalException, ValidationException};
 
 /// The engine that serves the index-management operations: they write an index's mappings,
 /// its settings and its SEMANTIC ENRICHMENT configuration on the domain's own engine, and
@@ -148,6 +148,44 @@ pub fn index_settings_update_unsupported() -> ValidationException {
     ValidationException {
         message: Some(INDEX_SETTINGS_UPDATE_UNSUPPORTED.to_string()),
     }
+}
+
+/// How the service states that the domain a call was for could not serve it, and that the
+/// condition passes.
+///
+/// The whole message, with no variable part: what a caller can act on is that the domain
+/// could not take the work and that trying again is the remedy, so nothing of the request
+/// stands in it — the same shape as the service's other dependency sentence
+/// ([`super::NODE_INFORMATION_UNAVAILABLE`]).
+pub const DOMAIN_UNAVAILABLE: &str = "The domain is not available now, please try again later.";
+
+/// The `DependencyFailureException` payload for work the domain's own cluster could not be
+/// handed.
+///
+/// `DependencyFailureException` is "an exception for when a failure in one of the
+/// dependencies results in the service being unable to fetch details about the resource"
+/// (`@httpError 424`): the cluster is that dependency, so work it cannot take is reported as
+/// the dependency failure it is rather than as a verdict on the request — which is also why
+/// a caller may retry it.
+pub fn domain_unavailable() -> DependencyFailureException {
+    DependencyFailureException {
+        message: Some(DOMAIN_UNAVAILABLE.to_string()),
+    }
+}
+
+/// The analysis component name an index write cannot hand the domain's cluster, or `None`
+/// where `schema` defines no such name.
+///
+/// ONE statement of the rule both index writes apply (`crate::ops::create_index` and
+/// `crate::ops::update_index`), read off the analysis sections wherever the document carries
+/// them ([`super::analysis::IndexAnalysis::unnameable_component`], which states what makes a
+/// name one the cluster cannot take) — so a schema defining one is refused by both writes
+/// alike, before either stores anything.
+#[must_use]
+pub fn unnameable_analysis_component(schema: &::aws_smithy_types::Document) -> Option<String> {
+    super::analysis::IndexAnalysis::of(schema)
+        .unnameable_component()
+        .map(str::to_owned)
 }
 
 /// Whether `schema` names an index SETTINGS section at all — what

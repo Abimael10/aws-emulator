@@ -45,7 +45,7 @@ use super::cross_cluster_connections::{
 use super::data_source_attachments::attach;
 use super::data_source_kinds::domain_arn;
 use super::domain_lifecycle::{poll_until, string_member, Emulator, REGION};
-use super::saved_object_migrations::{active_application, start_migration};
+use super::saved_object_migrations::{active_application, application_with_source, start_migration};
 use super::vpc_endpoints::{create_endpoint, member, minted as minted_endpoint, vpc_domain};
 
 /// How many fresh stores the application-id rule is asserted across. Each one answers
@@ -277,7 +277,12 @@ async fn application_plane_identity(kind: ApplicationPlaneKind) -> Minted {
             Minted { served: id, drawn }
         }
         ApplicationPlaneKind::MigrationId => {
-            let application = active_application(&emulator, "drawnmigration").await;
+            let application = application_with_source(
+                &emulator,
+                "drawnmigration",
+                &collection_arn("drawnsource"),
+            )
+            .await;
             let answer = start_migration(
                 &emulator,
                 json!({

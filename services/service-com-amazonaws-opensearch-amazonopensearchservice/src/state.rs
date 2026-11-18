@@ -1505,6 +1505,25 @@ impl Application {
             .find(|attachment| attachment.client_token.as_deref() == Some(client_token))
     }
 
+    /// Whether this application holds a data source under `data_source_arn` — the lookup a
+    /// call made ABOUT one of its data sources resolves that value against.
+    ///
+    /// An application's data sources are the ones it reads from, and they reach it two ways:
+    /// a create or an update LINKS them (`CreateApplicationRequest$dataSources`, "the data
+    /// sources to link to the OpenSearch application"), and `AttachDataSource` ATTACHES one
+    /// afterwards. Both are the application's, so both answer this lookup — and a record
+    /// whose detach has been accepted is not one of them, for the reason
+    /// [`Self::attachment`] states.
+    ///
+    /// Reads ONLY.
+    pub fn holds_data_source(&self, data_source_arn: &str) -> bool {
+        self.attachment(data_source_arn).is_some()
+            || self
+                .data_sources
+                .iter()
+                .any(|linked| linked.data_source_arn.as_deref() == Some(data_source_arn))
+    }
+
     /// This application's data source attachments in the order a listing reports them:
     /// the order they were attached in, oldest first.
     ///
@@ -2316,6 +2335,29 @@ pub fn migration_quota_exceeded(application_id: &str) -> ValidationException {
         message: Some(format!(
             "Application {application_id} already holds the maximum of {MIGRATION_QUOTA} \
              migrations."
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a start whose source names no data source
+/// of the application it migrates into.
+///
+/// Saved objects are exported from "the data source to migrate saved objects from"
+/// (`MigrationSource$datasourceArn`), and the data sources a job can export from are the ones
+/// the APPLICATION holds ([`Application::holds_data_source`]): a value the application holds
+/// none under names nothing to export, so the start is refused as the missing resource it is
+/// rather than minting a job with no source to read.
+///
+/// The sentence names both values the lookup was made from — the data source as the request
+/// spelled it and the application it was resolved against — because which of the two the
+/// caller has to fix is not decidable from either alone.
+pub fn data_source_not_found_for_application(
+    data_source_arn: &str,
+    application_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Data source {data_source_arn} not found for application {application_id}"
         )),
     }
 }
