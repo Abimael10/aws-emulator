@@ -30,11 +30,15 @@
 //!   principal handed to it.
 //! * `public.ecr.aws/<registry alias>/<repository>[:<tag>|@<digest>]` addresses the Amazon ECR
 //!   Public gallery, which answers it the same way against the repositories and tags it holds
-//!   ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull`]).
+//!   ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull`]) — for
+//!   the ONE registry this emulator holds there ([`gallery_pull::serves_registry_alias`]). An
+//!   alias it holds no registry for is another account's public registry, which this emulator
+//!   has no store for, so nothing is decided about such a reference either.
 //!
 //! A reference naming any OTHER registry is not one this emulator holds and so not one it
-//! answers for: nothing is decided about such an image, and the job's container reaches the
-//! same end it always does ([`NO_CONTAINER_RUNTIME_REASON`]). Neither is anything decided when
+//! answers for: nothing is decided about such an image, and the job's container runs the
+//! program it declares exactly as one whose registry served it does ([`container_run`]).
+//! Neither is anything decided when
 //! the engine carries no store for the registry the reference names at all — an absent store
 //! is not evidence that an image is missing.
 //!
@@ -48,8 +52,9 @@
 //! ([`settle_job_image_fetches`], the shape [`super::job_logs`] and
 //! [`super::service_job_dispatch`] follow). The verdict is then recorded on the job, and the
 //! PLACEMENT that falls due one span later is what materialises it
-//! ([`ComAmazonawsBatchAwsbatchv20160810State::place_job`]): a placement always ends the job
-//! in one critical section, so no caller ever sees a job placed and not yet ended.
+//! ([`ComAmazonawsBatchAwsbatchv20160810State::place_job`]): a fetch the registry refused
+//! ends the job's initiation one span later, before any container exists, so no run is ever
+//! reported for it ([`super::container_run`]).
 //!
 //! A job whose fetch has not been answered yet is not placed — its placement stays due, and
 //! the next drain answers the fetch — so the reason a job ends with never depends on how
@@ -210,7 +215,16 @@ pub fn settle_job_image_fetches<Eng: Send + Sync + 'static>(engine: &Eng) {
                         ImageFetch::Refused(cannot_pull_image_message(&fetch.image, &message))
                     }
                 }
-            } else if let Some(reference) = gallery_pull::parse_gallery_reference(&fetch.image) {
+            } else if let Some(reference) = gallery_pull::parse_gallery_reference(&fetch.image)
+                .filter(|reference| {
+                    // The gallery answers for the registry alias it was ASSIGNED; an alias it
+                    // holds no registry for names another account's public registry, which
+                    // this emulator has no store for, so such a reference falls to the branch
+                    // below and nothing is decided against it — the same reading the Amazon
+                    // ECS crate's own image fetch takes.
+                    gallery_pull::serves_registry_alias(engine, &reference.registry_alias)
+                })
+            {
                 match gallery_pull::serve_pull(engine, &reference) {
                     Ok(_) => ImageFetch::Served,
                     Err(gallery_pull::GalleryPullRefusal::NotFound { message }) => {

@@ -13,8 +13,9 @@
 //! decides from the job definition and the placed task. What an attempt reports of the RUN
 //! appears only once its container got that far — `exitCode` is "the exit code for the job
 //! attempt", `startedAt` is the `STARTING` -> `RUNNING` transition and `stoppedAt` the
-//! `RUNNING` -> terminal one — so a placement whose container never ran reports none of
-//! them, only the reason that attempt ended. A job no placement has taken has had no
+//! `RUNNING` -> terminal one — so an attempt whose container ran the program the job declared
+//! reports each of them, beside the reason that attempt ended. A job no placement has taken
+//! has had no
 //! attempt, so the list it reports is EMPTY and present — "nothing has run yet" is an empty
 //! list, not a missing member.
 //!
@@ -169,9 +170,9 @@ fn assert_task_arn(case: &str, cluster: &str, task_arn: &str) {
     );
 }
 
-/// Assert everything ONE attempt of a placed job whose container never ran reports: the
+/// Assert everything ONE attempt of a placed job reports: the
 /// task the placement made, the log stream that task's container writes to, the reason the
-/// attempt ended, and nothing a run would have produced.
+/// attempt ended, and what its container's program produced.
 fn assert_placement_attempt(
     case: &str,
     cluster: &str,
@@ -218,24 +219,26 @@ fn assert_placement_attempt(
         Some(reason),
         "case {case}: the attempt's container reports why it ended, got {attempt}"
     );
-    // Nothing ran, so nothing a run produces is reported — for the attempt or its
-    // container. The attempt's `stoppedAt` is not one of those: the task this attempt was
-    // made for stopped when the attempt ended, whatever its container got to.
+    // The attempt's container RAN the program the job's container declares, so the attempt
+    // reports the instant it started, the instant the task it was made for stopped and the
+    // status that program exited with — the same exit code the job's own container reports.
     assert!(
-        attempt["startedAt"].is_null(),
-        "case {case}: an attempt whose container never ran reports no startedAt, got {attempt}"
+        attempt["startedAt"].as_i64().unwrap_or_default() > 0,
+        "case {case}: an attempt whose container ran reports when it started, got {attempt}"
     );
     assert!(
         attempt["stoppedAt"].as_i64().is_some(),
         "case {case}: an attempt that has ended reports when its task stopped, got {attempt}"
     );
-    for member in ["exitCode", "containerInstanceArn"] {
-        assert!(
-            attempt["container"][member].is_null(),
-            "case {case}: an attempt whose container never ran reports no {member}, got \
-             {attempt}"
-        );
-    }
+    assert_eq!(
+        attempt["container"]["exitCode"].as_i64(),
+        detail["container"]["exitCode"].as_i64(),
+        "case {case}: the attempt and the job report one exit code, got {attempt}"
+    );
+    assert!(
+        attempt["container"]["containerInstanceArn"].is_null(),
+        "case {case}: no container instance hosts the attempt, got {attempt}"
+    );
 }
 
 /// Re-enable `fixture`'s compute environment, which is what publishes the capacity its
@@ -313,11 +316,13 @@ async fn a_job_reports_one_attempt_per_placement_and_none_without_one() {
         let job_id = submit(&fixture, &format!("j{index}"), json!({})).await;
 
         let detail = match row.ending {
-            Ending::Placed => until_status(&fixture.batch, case, &job_id, state::JOB_FAILED).await,
+            Ending::Placed => {
+                until_status(&fixture.batch, case, &job_id, state::JOB_SUCCEEDED).await
+            }
             Ending::EnabledThenPlaced => {
                 until_status(&fixture.batch, case, &job_id, state::JOB_RUNNABLE).await;
                 enable_environment(&fixture).await;
-                until_status(&fixture.batch, case, &job_id, state::JOB_FAILED).await
+                until_status(&fixture.batch, case, &job_id, state::JOB_SUCCEEDED).await
             }
             Ending::Rests => {
                 let resting =
@@ -373,8 +378,8 @@ async fn a_job_reports_one_attempt_per_placement_and_none_without_one() {
         if row.attempts > 0 {
             assert_eq!(
                 detail["statusReason"].as_str(),
-                Some(state::NO_CONTAINER_RUNTIME_REASON),
-                "case {case}: a placed job whose container nothing ran says so, got {detail}"
+                Some(state::ESSENTIAL_CONTAINER_EXITED_REASON),
+                "case {case}: a placed job whose container exited says so, got {detail}"
             );
             assert_placement_attempt(
                 case,
@@ -398,7 +403,7 @@ async fn each_placement_names_its_own_task_and_a_read_records_none() {
     for index in 0..3 {
         let case = format!("job {index}");
         let job_id = submit(&fixture, &format!("t{index}"), json!({})).await;
-        let detail = until_status(&fixture.batch, &case, &job_id, state::JOB_FAILED).await;
+        let detail = until_status(&fixture.batch, &case, &job_id, state::JOB_SUCCEEDED).await;
         let listed = attempts(&detail)
             .unwrap_or_else(|| panic!("case {case}: expected one attempt, got {detail}"));
         assert_eq!(
@@ -461,7 +466,7 @@ async fn array_children_report_their_own_attempts_and_the_parent_reports_none() 
     for index in 0..SIZE {
         let case = format!("child {index}");
         let child_id = state::array_child_job_id(&parent_id, index);
-        let child = until_status(&fixture.batch, &case, &child_id, state::JOB_FAILED).await;
+        let child = until_status(&fixture.batch, &case, &child_id, state::JOB_SUCCEEDED).await;
         let listed = attempts(&child)
             .unwrap_or_else(|| panic!("case {case}: expected one attempt, got {child}"));
         assert_eq!(
@@ -493,7 +498,7 @@ async fn array_children_report_their_own_attempts_and_the_parent_reports_none() 
         "case the array: each child's placement names its own task, got {task_arns:?}"
     );
 
-    let parent = until_status(&fixture.batch, "the parent", &parent_id, state::JOB_FAILED).await;
+    let parent = until_status(&fixture.batch, "the parent", &parent_id, state::JOB_SUCCEEDED).await;
     assert_eq!(
         attempts(&parent).map(|listed| listed.len()),
         Some(0),

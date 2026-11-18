@@ -287,10 +287,10 @@ async fn a_described_job_reports_every_collection_of_its_document() {
             attempts: 0,
         },
         Job {
-            case: "a job the clock placed and ended".to_string(),
+            case: "a job the clock placed and ran".to_string(),
             placed: true,
             extra: json!({}),
-            wait_for: Some(state::JOB_FAILED),
+            wait_for: Some(state::JOB_SUCCEEDED),
             attempts: 1,
         },
         Job {
@@ -309,7 +309,7 @@ async fn a_described_job_reports_every_collection_of_its_document() {
             case: "a placed job submitted with two parameters".to_string(),
             placed: true,
             extra: json!({"parameters": {"shard": "1", "size": "2"}}),
-            wait_for: Some(state::JOB_FAILED),
+            wait_for: Some(state::JOB_SUCCEEDED),
             attempts: 1,
         },
     ];

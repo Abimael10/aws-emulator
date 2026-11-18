@@ -25,11 +25,11 @@
 //! ARN of the task the job was placed as, the log stream that task's container writes to
 //! and the reason that attempt ended. The member is ALWAYS reported: a job no placement has
 //! started an attempt for has had none, and that is the EMPTY list — the evidence that
-//! nothing has run yet — never a missing member. No `startedAt` or `exitCode` is reported
-//! for any of them: this
-//! emulator has no container runtime, nothing ran, and the engine contract forbids
-//! inventing a result for work that did not happen. The run ends in the modelled `FAILED`
-//! status whose `statusReason` says exactly that.
+//! nothing has run yet — never a missing member. An attempt whose container RAN the program
+//! that container declares reports the instant it started and the status it exited with
+//! ([`crate::state::container_run`]); one whose container never ran — a fetch the registry
+//! refused, a program this emulator performs none of — reports neither, because the engine
+//! contract forbids inventing a result for work that did not happen.
 //!
 //! The same holds for every other collection of the document: `attempts`, `dependsOn`,
 //! `parameters` and `tags` are materialised, so a client that indexes a modelled collection
@@ -38,11 +38,13 @@
 //! job's details "in the same form as the `DescribeJobs` API returns them".
 //!
 //! `JobDetail$startedAt` is a KNOWN DEPARTURE forced by the model: it is `@required`
-//! (`smithy_query(query="shape",shape="JobDetail")`), so a value is always serialized,
-//! and a job that never started has none to report. It is therefore `0` — the Long
-//! default, a documented sentinel for "never started" rather than a fabricated start
-//! instant — and no job here reports a non-zero `startedAt` until something actually
-//! starts one. The crate's integration tests pin this.
+//! (`smithy_query(query="shape",shape="JobDetail")`), so the framework would serialize a
+//! value for every job, and a job whose container never ran has none to report. The member is
+//! therefore left out of this projection altogether (`ops::types`) rather than filled with a
+//! `0` a client would read as "started at the epoch"; the instant a placed job's container
+//! started is reported where the model leaves the member optional — `AttemptDetail$startedAt`
+//! on the attempt that ran it, and `JobSummary$startedAt` in `ListJobs`. The crate's
+//! integration tests pin this.
 //!
 //! This is the ONLY file to touch for this operation.
 //!

@@ -24,41 +24,18 @@
 //! placed has had no attempt, so the list it reports is EMPTY — present, because an empty
 //! list is what "nothing has run yet" looks like, and a missing member is not that answer.
 //!
-//! What a placed job can report of the RUN is where the engine contract binds
-//! (`vendor/engine/src/lib.rs`): containers are not available in-process, so the attempt a
-//! placement starts never gets a container, and the job ends in the modelled failure state
-//! saying so — unless the fetch of its container image already ended it ([`image_pull`]).
-//! The attempt therefore carries the reason it ended, the instant the task it was made for
-//! stopped, and nothing a run would have produced: no `exitCode` ("the exit code for the job
-//! attempt") and no `startedAt` (the `STARTING` -> `RUNNING` transition).
-//! It does carry the log stream its container's output would have gone to, which the
+//! What a placed job can report of the RUN is what its container's own program did
+//! ([`container_run`]): the argument vector the container declares is performed in process,
+//! so the attempt a placement starts reports the instant that program started, the status it
+//! exited with and the lines it wrote — and an attempt whose container declared a program
+//! nothing here performs, or whose image the registry would not serve ([`image_pull`]),
+//! reports none of those, because nothing ran.
+//! It does carry the log stream its container's output goes to, which the
 //! placement already decides ([`job_log_stream_name`]) — and that stream is MATERIALISED
 //! where CloudWatch Logs holds it, so a client can list, read or delete it
 //! ([`job_logs`]).
 
 use super::*;
-
-/// `statusReason` of a job the scheduler placed and whose container nothing ran.
-///
-/// A placed job's work is a container image, which this emulator has no runtime for and
-/// the engine contract (`vendor/engine/src/lib.rs`) forbids pretending to run: so the run
-/// the caller asked for ends in the modelled failure state saying exactly that, and no
-/// `startedAt` or `exitCode` is invented for it. It names the condition that
-/// stopped the run and nothing from the job.
-pub const NO_CONTAINER_RUNTIME_REASON: &str =
-    "This emulator does not run containers, so the job's container was never started";
-
-/// What the container initiation a placement started comes to, as the job's `statusReason`:
-/// the failure of the image fetch that initiation begins with ([`image_pull`]), or — for an
-/// image a registry served — [`NO_CONTAINER_RUNTIME_REASON`], the one end a container of this
-/// emulator can reach. ONE reading, so the reason the job ends with and the reason its attempt
-/// ends with cannot disagree.
-pub fn placement_end_reason(fetch: &ImageFetch) -> String {
-    match fetch {
-        ImageFetch::Served => NO_CONTAINER_RUNTIME_REASON.to_string(),
-        ImageFetch::Refused(reason) => reason.clone(),
-    }
-}
 
 /// ONE job attempt: what the scheduler placing a job's container started, and what the
 /// attempt is known to have produced.
@@ -73,8 +50,9 @@ pub struct JobAttempt {
     /// attempt ([`ecs_task_arn`]).
     pub task_arn: String,
     /// `AttemptDetail$startedAt`: "when the attempt was started (when the attempt
-    /// transitioned from the `STARTING` state to the `RUNNING` state)". `None` for an
-    /// attempt whose container never ran.
+    /// transitioned from the `STARTING` state to the `RUNNING` state)" — written when the
+    /// container's own program starts ([`container_run`]). `None` for an attempt whose
+    /// container never ran.
     pub started_at: Option<i64>,
     /// `AttemptDetail$stoppedAt`: "when the attempt was stopped (when the attempt
     /// transitioned from the `RUNNING` state to a terminal state)" — the instant the task this
@@ -82,7 +60,8 @@ pub struct JobAttempt {
     /// `None` while it is still open.
     pub stopped_at: Option<i64>,
     /// `AttemptContainerDetail$exitCode`: "the exit code for the job attempt. A non-zero
-    /// exit code is considered failed". `None` until a container of this attempt exits.
+    /// exit code is considered failed" — the status the container's program exited with.
+    /// `None` until a container of this attempt exits.
     pub exit_code: Option<i32>,
     /// `AttemptContainerDetail$logStreamName`: the CloudWatch Logs stream the attempt's
     /// container writes its output to, named by the placement ([`job_log_stream_name`]).
@@ -282,12 +261,12 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// What that placement then runs into is the answer the registry gave for the container's
     /// image, which the job already carries by the time it is placed ([`image_pull`]): an
     /// image the registry would not serve stops the initiation before any container is
-    /// created, while one that is there to be fetched gets the container that
-    /// [`NO_CONTAINER_RUNTIME_REASON`] says nothing here can run ([`placement_end_reason`]).
-    /// Either way the task was made, so the stream its container's output would have gone to
-    /// is named and held — empty, because nothing ran — and nothing about a RUN is recorded:
-    /// the attempt has no exit code and no start instant, because nothing reached those
-    /// statuses.
+    /// created, while one that is there to be fetched gets the container that runs the
+    /// program the job declared ([`container_run`]).
+    /// Either way the task was made, so the stream its container's output goes to
+    /// is named and held, and nothing about a RUN is recorded by the placement itself:
+    /// the attempt has no exit code and no start instant until the program it runs reaches
+    /// those statuses.
     ///
     /// A queue with no capacity places nothing, so a job resting in `RUNNABLE` records no
     /// attempt — there has been none.
@@ -365,8 +344,8 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// placement has started: the task exists, the logger its container's output goes to is
     /// initialised, and the image the container runs is fetched. So a placed job is reported
     /// there — never in `RUNNABLE`, which it has left: it is out of its queue's ordering, and
-    /// the jobs behind it move forward at this instant — until the end that initiation comes
-    /// to falls due, one span later like every other transition this service owes.
+    /// the jobs behind it move forward at this instant — until the program its container
+    /// declares starts, one span later like every other transition this service owes.
     pub(super) fn start_placed_job(&mut self, id: &str, at: i64) {
         self.advance_queue_positions(id, at);
         if let Some(job) = self.jobs.get_mut(id) {

@@ -19,12 +19,14 @@
 //! ("for jobs that run on Fargate resources, you must provide an execution role" —
 //! `ContainerProperties$executionRoleArn`), so a role no policy grants
 //! `ecr:GetAuthorizationToken`/`ecr:BatchGetImage` to is refused the pull it makes; the Amazon
-//! ECR Public gallery answers for a reference into the registry alias it was assigned and
-//! holds nothing under any other; and a reference naming a registry this emulator does not
+//! ECR Public gallery answers for a reference into the registry alias it was assigned, and an
+//! alias it holds no registry for names another account's public registry this emulator has no
+//! store for; and a reference naming a registry this emulator does not
 //! hold at all is nobody's here to answer, so nothing is decided against it. Either way the
 //! placement MADE a task, so the stream the `awslogs` driver opened for that task exists where
-//! CloudWatch Logs holds it — and holds no event, because no container ever wrote one — and
-//! nothing of a run is reported: no `startedAt`, no `exitCode`.
+//! CloudWatch Logs holds it — holding the lines the container's program wrote, and none at all
+//! where the fetch stopped any container from being created, which is also where no `startedAt`
+//! and no `exitCode` are reported.
 //!
 //! Sources: `smithy_query(query="operation",operation="DescribeJobs")` for `JobDetail`'s
 //! `statusReason`, `attempts` and `container`;
@@ -74,10 +76,12 @@ const CANNOT_PULL: &str = "CannotPullContainerError";
 /// CloudWatch Logs' own API before any job is submitted.
 const LOG_GROUP: &str = "/sim2real/batch/pull-reasons";
 
-/// The terminal `JobStatus` a placed job of this emulator reaches, and the `CEStatus`/
-/// `JQStatus` a compute environment and a job queue come to rest in. Source:
+/// The terminal `JobStatus`es a placed job of this emulator reaches — the one a container
+/// that exited zero ends on, and the one a job whose image fetch was refused ends on — and
+/// the `CEStatus`/`JQStatus` a compute environment and a job queue come to rest in. Source:
 /// `smithy_query(query="shape",shape="JobStatus,CEStatus,JQStatus")`.
 const FAILED: &str = "FAILED";
+const SUCCEEDED: &str = "SUCCEEDED";
 const VALID: &str = "VALID";
 
 /// How long this suite waits for something the clock owes — a compute environment reaching
@@ -363,20 +367,19 @@ async fn until_reads(
     }
 }
 
-/// Poll `DescribeJobs` until `job_id` reports the terminal status every placed job of this
-/// emulator reaches, then answer its whole detail.
+/// Poll `DescribeJobs` until `job_id` reports a terminal status, then answer its whole detail.
 async fn until_terminal(router: &MultiServiceRouter, case: &str, job_id: &str) -> Value {
     let request = json!({"jobs": [job_id]});
     let deadline = Instant::now() + DEADLINE;
     loop {
         let answer = batch(router, case, "/v1/describejobs", &request).await;
         let detail = answer["jobs"][0].clone();
-        if detail["status"].as_str() == Some(FAILED) {
+        if matches!(detail["status"].as_str(), Some(FAILED) | Some(SUCCEEDED)) {
             return detail;
         }
         assert!(
             Instant::now() < deadline,
-            "case {case:?}: expected the job to reach {FAILED}, last {detail}"
+            "case {case:?}: expected the job to reach {FAILED} or {SUCCEEDED}, last {detail}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -415,6 +418,44 @@ async fn until_stream_exists(router: &MultiServiceRouter, case: &str, name: &str
             "case {case:?}: expected CloudWatch Logs to hold the stream {name:?} in \
              {LOG_GROUP:?}, got {:?}",
             streams_named(router, "").await
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Poll the stream `name` in [`LOG_GROUP`] until CloudWatch Logs holds exactly the messages
+/// `expected`, in that order.
+///
+/// A wait for the CONDITION: the events a container's program wrote are delivered by the drain
+/// that follows the transition they belong to, so a reader that happens to observe the job's
+/// terminal status first looks again rather than concluding the container wrote nothing.
+async fn until_events(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    expected: &[&str],
+) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let (status, events) = logs(
+            router,
+            "GetLogEvents",
+            &json!({"logGroupName": LOG_GROUP, "logStreamName": name}),
+        )
+        .await;
+        let written: Vec<String> = events["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|event| event["message"].as_str().map(str::to_string))
+            .collect();
+        if status == 200 && written == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the stream {name:?} to hold {expected:?}, last {status} \
+             with {events}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -634,12 +675,13 @@ async fn a_placed_job_reports_what_the_fetch_of_its_image_answered() {
             says: None,
         },
         Row {
-            // The public gallery answers for the registry alias it was ASSIGNED and holds
-            // nothing under any other, whichever tag the reference then asks for.
+            // The public gallery answers for the registry alias it was ASSIGNED; an alias it
+            // holds no registry for names another ACCOUNT's public registry, which this
+            // emulator has no store for, so nothing is decided against such a reference.
             case: "a gallery alias this registry was not assigned, under a tag nothing holds",
             image: format!("public.ecr.aws/docker/{GALLERY_REPOSITORY}:no-such-tag"),
             execution_role: granted.clone(),
-            refused: true,
+            refused: false,
             says: None,
         },
     ];
@@ -702,10 +744,10 @@ async fn a_placed_job_reports_what_the_fetch_of_its_image_answered() {
         });
     }
 
-    // The one end every placed container of this emulator reaches, learned from the rows whose
-    // image a registry SERVED rather than spelled out here: what the rule requires of it is
-    // that it is not the fetch failure and names no image, and that it is the same for all of
-    // them, so a client can tell an unpullable image from it.
+    // The one end every placed container whose image was served reaches, learned from those
+    // rows rather than spelled out here: what the rule requires of it is that it is not the
+    // fetch failure and names no image, and that it is the same for all of them, so a client
+    // can tell an unpullable image from a container that ran.
     let mut served_reasons: Vec<(&str, String)> = Vec::new();
     for Submitted {
         case,
@@ -765,34 +807,25 @@ async fn a_placed_job_reports_what_the_fetch_of_its_image_answered() {
             "case {case:?}: expected the container's own reason to be {reason:?}, got {detail}"
         );
 
-        // The task was made either way, so the stream its container's output would have gone
-        // to is named, held where CloudWatch Logs holds it — and empty, because nothing ran.
+        // The task was made either way, so the stream its container's output goes to is
+        // named and held where CloudWatch Logs holds it — holding the line the container's
+        // program wrote, and nothing when the fetch stopped any container from being created.
         let stream = member(case, &attempts[0], "/container/logStreamName");
         until_stream_exists(&router, case, &stream).await;
-        let (status, events) = logs(
-            &router,
-            "GetLogEvents",
-            &json!({"logGroupName": LOG_GROUP, "logStreamName": &stream}),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected the stream to be readable, got {status} with {events}"
-        );
-        assert_eq!(
-            events["events"].as_array().map(Vec::len),
-            Some(0),
-            "case {case:?}: a job that ran no container wrote no log event, got {events}"
-        );
+        let expected_lines: &[&str] = if *refused { &[] } else { &["hello"] };
+        until_events(&router, case, &stream, expected_lines).await;
 
-        // And nothing of a RUN is reported, whatever the fetch answered.
-        assert!(
-            detail["startedAt"].is_null(),
-            "case {case:?}: no startedAt is reported for a job nothing ran, got {detail}"
+        // And what a RUN produced is reported only where a container really ran.
+        assert_eq!(
+            attempts[0]["container"]["exitCode"].as_i64(),
+            (!*refused).then_some(0),
+            "case {case:?}: the exit code belongs to a container that exited, got {:?}",
+            attempts[0]
         );
-        assert!(
-            attempts[0]["container"]["exitCode"].is_null(),
-            "case {case:?}: no exit code is reported for a container nothing ran, got {:?}",
+        assert_eq!(
+            attempts[0]["startedAt"].is_null(),
+            *refused,
+            "case {case:?}: startedAt belongs to an attempt whose container ran, got {:?}",
             attempts[0]
         );
     }

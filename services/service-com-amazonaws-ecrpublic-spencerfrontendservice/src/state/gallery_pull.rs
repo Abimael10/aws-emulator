@@ -21,8 +21,12 @@
 //!
 //! Only this registry's own alias is answered: an alias this registry was not assigned names
 //! some other public registry ([`ComAmazonawsEcrpublicSpencerfrontendserviceState::is_this_registry`]
-//! states the same thing for a request's `registryId`), which this emulator does not hold and
-//! so has nothing to serve.
+//! states the same thing for a request's `registryId`) — a registry of another account,
+//! published in the gallery AWS serves and held nowhere in this emulator. So a reference into
+//! one is not this gallery's to decide, and a caller about to start a container asks
+//! [`serves_registry_alias`] FIRST: what this gallery holds decides a reference into THIS
+//! gallery, while a reference into a registry this emulator does not hold is not answered at
+//! all — an absent store is not evidence that an image does not exist.
 //!
 //! A READ: deciding a pull consults the store and writes nothing, so a container start cannot
 //! change what a later caller reads back from the gallery.
@@ -169,7 +173,8 @@ pub fn serve_pull<Eng: Send + Sync + 'static>(
         // A registry alias this registry was not assigned names no repository OF THIS
         // registry at all, so what the gallery holds for the reference is nothing — worded
         // as this registry words a repository name it does not hold, over the whole path the
-        // reference named.
+        // reference named. A caller that must not decide an image of another registry asks
+        // [`serves_registry_alias`] before it asks for the pull.
         return Err(GalleryPullRefusal::NotFound {
             message: store.repository_not_found_message(&format!(
                 "{}/{}",

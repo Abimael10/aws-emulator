@@ -111,8 +111,8 @@ fn is_region_name(value: &str) -> bool {
         })
 }
 
-/// ONE log stream a placed job's container writes to: where it is, and whether its group is
-/// the driver's to create.
+/// ONE log stream a placed job's container writes to: where it is, whether its group is
+/// the driver's to create, and the events the driver delivers to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobLogStream {
     /// The Region whose CloudWatch Logs store holds the group ([`OPTION_LOG_REGION`]).
@@ -126,6 +126,14 @@ pub struct JobLogStream {
     /// the service's to hold, and a group the configuration names is created only when it
     /// asked for that ([`OPTION_CREATE_GROUP`]).
     pub create_group: bool,
+    /// The events the driver delivers to the stream, as `(timestamp, message)` in the order
+    /// the container wrote them.
+    ///
+    /// EMPTY for the record a placement queues: the stream is opened for the TASK, before
+    /// any line exists, and the lines the container's program wrote are queued as their own
+    /// record once that program has run ([`super::container_run`]) — so a container that
+    /// wrote nothing leaves exactly the one empty stream behind.
+    pub events: Vec<(i64, String)>,
 }
 
 /// The PREFIX the `awslogs` driver names a job container's log stream with: the
@@ -190,6 +198,7 @@ pub fn job_log_target(
         log_group,
         log_stream: log_stream.to_string(),
         create_group,
+        events: Vec::new(),
     })
 }
 
@@ -222,7 +231,8 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     }
 }
 
-/// Create every log stream this store's placements have named and nothing has created yet.
+/// Create every log stream this store's placements have named and nothing has created yet,
+/// and deliver the events the containers of those placements wrote.
 ///
 /// Called by the publisher once this store's lock is released, so no guard is held across
 /// the in-process request. Creation is BEST EFFORT, as every cross-service delivery in this
@@ -281,6 +291,41 @@ pub(super) async fn open_pending_log_streams(
                      read or delete it"
                 );
             }
+        }
+        if stream.events.is_empty() {
+            continue;
+        }
+        // What the container WROTE, delivered to the stream the driver opened for it: the
+        // lines are the program's own output ([`super::container_run`]), so the stream holds
+        // what ran and nothing else. They are in the order the container wrote them, which
+        // is chronological — "the log events in the batch must be in chronological order by
+        // their timestamp" (`PutLogEvents`).
+        let events: Vec<::aws_sdk_cloudwatchlogs::types::InputLogEvent> = stream
+            .events
+            .iter()
+            .filter_map(|(at, message)| {
+                ::aws_sdk_cloudwatchlogs::types::InputLogEvent::builder()
+                    .timestamp(*at)
+                    .message(message)
+                    .build()
+                    .ok()
+            })
+            .collect();
+        if let Err(error) = client
+            .put_log_events()
+            .log_group_name(&stream.log_group)
+            .log_stream_name(&stream.log_stream)
+            .set_log_events(Some(events))
+            .send()
+            .await
+        {
+            ::tracing::warn!(
+                log_group = %stream.log_group,
+                log_stream = %stream.log_stream,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the output of a placed Batch job's container could not be delivered to its \
+                 log stream"
+            );
         }
     }
 }

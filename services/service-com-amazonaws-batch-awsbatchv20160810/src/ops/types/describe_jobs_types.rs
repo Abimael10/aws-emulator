@@ -23,14 +23,16 @@ pub struct DescribeJobsOutput {
     pub jobs: Option<Vec<JobDetail>>,
 }
 
-// `JobDetail` models `startedAt` @required, but AWS Batch does not put it on the wire for
-// a job that never reached `RUNNING`: the member is documented as "when the job
-// transitioned from the STARTING state to the RUNNING state", and every recorded detail of
-// a job that was not placed carries `createdAt` and no `startedAt` at all. Nothing in this
-// emulator places a job on compute capacity, so no response it can produce has a start
-// instant; the member is therefore declared unsupported, which keeps it out of the shape's
-// schema and so out of the body the framework writes, rather than filling it with a 0 a
-// client would read as "started at the epoch".
+// `JobDetail` models `startedAt` @required (with `clientOptional`, so every SDK reads it as
+// optional), but AWS Batch does not put it on the wire for a job that never reached
+// `RUNNING`: the member is documented as "when the job transitioned from the STARTING state
+// to the RUNNING state", and every recorded detail of a job that was not placed carries
+// `createdAt` and no `startedAt` at all. A @required member must not be `Option<T>` here, so
+// reporting it at all would mean reporting a 0 a client would read as "started at the epoch"
+// for every job whose container never ran; the member is therefore declared unsupported,
+// which keeps it out of the shape's schema and so out of the body the framework writes. The
+// instant a placed job's container STARTED is reported where the model leaves it optional:
+// `AttemptDetail$startedAt` on the attempt that ran it (`state::container_run`).
 #[smithy_macros::smithy(
     shape = "com.amazonaws.batch#JobDetail",
     unsupported = ["startedAt"]

@@ -18,13 +18,13 @@
 //! 2. a placed job's container image is FETCHED before any container starts, and the registry
 //!    the reference names answers the fetch where this emulator holds that registry: a
 //!    reference it resolves to no image fails the fetch, so the job ends with the container
-//!    runtime's `CannotPullContainerError`; one it serves, and one naming a registry this
-//!    emulator does not hold, leave the job to the end a placed container always reaches here
-//!    (`state::NO_CONTAINER_RUNTIME_REASON`). Either way the placement made a task, so the
-//!    stream the `awslogs` driver opened for it is held — and empty, because nothing ran. The
-//!    rows span the registries (a private Amazon ECR registry, the Amazon ECR Public gallery,
-//!    registries this emulator holds nothing of) and what each holds for the reference (the
-//!    image, a different tag, no repository, no registry alias).
+//!    runtime's `CannotPullContainerError` having run nothing; one it serves, and one naming a
+//!    registry this emulator does not hold, let the job RUN the program its container declares
+//!    and end on the status that program exited with. Either way the placement made a task, so
+//!    the stream the `awslogs` driver opened for it is held — holding what that program wrote.
+//!    The rows span the registries (a private Amazon ECR registry, the Amazon ECR Public
+//!    gallery, registries this emulator holds nothing of) and what each holds for the reference
+//!    (the image, a different tag, no repository, no registry alias).
 //!
 //! 3. the stream a placed container writes to is named the way the `awslogs` driver names one,
 //!    from the prefix the container's configuration carries — or the job definition's own name
@@ -541,6 +541,39 @@ async fn until_terminal(emulator: &Emulator, case: &str, job_id: &str) -> Value 
     }
 }
 
+/// Poll the stream `name` of `group` until CloudWatch Logs holds exactly the messages
+/// `expected`, in that order.
+///
+/// A wait for the CONDITION: the stream is created and its events delivered by the drain that
+/// follows the transition they belong to, so a reader that happens to observe the job's
+/// terminal status first looks again rather than concluding the container wrote nothing.
+async fn until_events(emulator: &Emulator, case: &str, group: &str, name: &str, expected: &[&str]) {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (status, events) = emulator
+            .logs(
+                "GetLogEvents",
+                json!({"logGroupName": group, "logStreamName": name}),
+            )
+            .await;
+        let written: Vec<String> = events["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|event| event["message"].as_str().map(str::to_string))
+            .collect();
+        if status == 200 && written == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: expected the stream {name:?} to hold {expected:?}, last {status} with \
+             {events}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// The log streams CloudWatch Logs holds in `group` whose name starts with `prefix`.
 ///
 /// A group CloudWatch Logs holds nothing for holds no such stream either, so the refusal for an
@@ -712,10 +745,10 @@ struct PullRow {
 /// RULE: a placed job's container image is fetched from the registry its reference names, and a
 /// reference a registry THIS emulator holds resolves to no image fails that fetch — the job
 /// ends with the container runtime's `CannotPullContainerError` naming the reference and that
-/// registry's own refusal. A reference the registry serves, and one naming a registry this
-/// emulator does not hold, leave the placed job to the end its container always reaches here.
-/// Either way the placement made a task, so the stream the driver opened for it is held and
-/// empty, and nothing of a run is reported.
+/// registry's own refusal, having run nothing. A reference the registry serves, and one naming
+/// a registry this emulator does not hold, let the placed job RUN the program its container
+/// declares. Either way the placement made a task, so the stream the driver opened for it is
+/// held — holding what that program wrote, and nothing when nothing ran.
 #[tokio::test]
 async fn an_image_no_registry_here_serves_fails_the_job_at_the_fetch() {
     let rows: &[PullRow] = &[
@@ -754,9 +787,12 @@ async fn an_image_no_registry_here_serves_fails_the_job_at_the_fetch() {
             refused: true,
         },
         PullRow {
+            // The alias names another ACCOUNT's public registry in the gallery AWS serves,
+            // which this emulator holds no store for: nothing is decided against the fetch,
+            // exactly as for another registry host.
             case: "a gallery alias this registry was not assigned",
             image: |_| "public.ecr.aws/docker/library/busybox:latest".to_string(),
-            refused: true,
+            refused: false,
         },
         PullRow {
             case: "a private registry repository that is not there",
@@ -807,10 +843,15 @@ async fn an_image_no_registry_here_serves_fails_the_job_at_the_fetch() {
             .to_string();
 
         let detail = until_terminal(&fixture.emulator, case, &job_id).await;
+        let expected_status = if row.refused {
+            state::JOB_FAILED
+        } else {
+            state::JOB_SUCCEEDED
+        };
         assert_eq!(
             detail["status"].as_str(),
-            Some(state::JOB_FAILED),
-            "case {case}: expected the job to end FAILED, got {detail}"
+            Some(expected_status),
+            "case {case}: expected the job to end {expected_status}, got {detail}"
         );
         let reason = detail["statusReason"].as_str().unwrap_or_else(|| {
             panic!("case {case}: expected a statusReason, got {detail}")
@@ -823,12 +864,14 @@ async fn an_image_no_registry_here_serves_fails_the_job_at_the_fetch() {
         } else {
             assert_eq!(
                 Some(reason),
-                Some(state::NO_CONTAINER_RUNTIME_REASON),
-                "case {case}: expected the placed job's own end, got {reason:?}"
+                Some(state::ESSENTIAL_CONTAINER_EXITED_REASON),
+                "case {case}: expected the reason a container that exited carries, got \
+                 {reason:?}"
             );
         }
-        // The task was made either way, so the stream its container's output would have gone
-        // to is named and held — and holds no event, because no container ran.
+        // The task was made either way, so the stream its container's output goes to is named
+        // and held — holding the line the program wrote, and nothing at all when the fetch
+        // stopped the container from being created.
         let attempt = detail["attempts"][0].clone();
         let named = attempt["container"]["logStreamName"]
             .as_str()
@@ -843,35 +886,31 @@ async fn an_image_no_registry_here_serves_fails_the_job_at_the_fetch() {
                 .any(|held| held["logStreamName"].as_str() == Some(named.as_str())),
             "case {case}: expected CloudWatch Logs to hold {named:?}, got {found:?}"
         );
-        let (status, events) = fixture
-            .emulator
-            .logs(
-                "GetLogEvents",
-                json!({"logGroupName": DEFAULT_LOG_GROUP, "logStreamName": &named}),
-            )
-            .await;
+        let expected_lines: &[&str] = if row.refused { &[] } else { &["hi"] };
+        until_events(
+            &fixture.emulator,
+            case,
+            DEFAULT_LOG_GROUP,
+            &named,
+            expected_lines,
+        )
+        .await;
+        // What a RUN produced is reported only for a container that ran: a fetch the registry
+        // refused created none. The job's `stoppedAt` is not that — it is when the task the
+        // placement made stopped, which every placed job reports.
         assert_eq!(
-            status, 200,
-            "case {case}: expected the stream to be readable, got {status} with {events}"
-        );
-        assert_eq!(
-            events["events"].as_array().map(Vec::len),
-            Some(0),
-            "case {case}: a job that ran no container wrote no log event, got {events}"
-        );
-        // Whatever the fetch answered, nothing of a RUN is reported: no container ran. The
-        // job's `stoppedAt` is not that — it is when the task the placement made stopped.
-        assert!(
-            detail["startedAt"].is_null(),
-            "case {case}: no startedAt is reported for a job nothing ran, got {detail}"
+            attempt["startedAt"].is_null(),
+            row.refused,
+            "case {case}: startedAt belongs to an attempt whose container ran, got {attempt}"
         );
         assert!(
             detail["stoppedAt"].as_i64().is_some(),
             "case {case}: a placed job reports when its task stopped, got {detail}"
         );
-        assert!(
-            attempt["container"]["exitCode"].is_null(),
-            "case {case}: no exit code is reported for a container nothing ran, got {attempt}"
+        assert_eq!(
+            attempt["container"]["exitCode"].as_i64(),
+            (!row.refused).then_some(0),
+            "case {case}: the exit code belongs to a container that exited, got {attempt}"
         );
     }
 }

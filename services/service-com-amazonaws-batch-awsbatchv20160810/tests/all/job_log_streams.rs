@@ -143,9 +143,9 @@ async fn until_stream_exists(batch: &Batch, case: &str, group: &str, name: &str)
     );
 }
 
-/// The one attempt of a job `DescribeJobs` reports as placed and ended.
+/// The one attempt of a job `DescribeJobs` reports as placed and run to its end.
 async fn placed_attempt(batch: &Batch, case: &str, job_id: &str) -> Value {
-    let detail = until_status(batch, case, job_id, state::JOB_FAILED).await;
+    let detail = until_status(batch, case, job_id, state::JOB_SUCCEEDED).await;
     let attempts = detail["attempts"].as_array().cloned().unwrap_or_default();
     assert_eq!(
         attempts.len(),
@@ -418,7 +418,7 @@ async fn every_placed_array_child_has_its_own_log_stream_and_the_parent_has_none
         "case the array: the group holds one stream per placed child and no more, got {held:?}"
     );
 
-    let parent = until_status(&fixture.batch, "the parent", &parent_id, state::JOB_FAILED).await;
+    let parent = until_status(&fixture.batch, "the parent", &parent_id, state::JOB_SUCCEEDED).await;
     assert!(
         parent["attempts"].as_array().is_none_or(Vec::is_empty),
         "case the parent: an array parent is never placed, so it has no attempt, got {parent}"

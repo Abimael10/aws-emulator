@@ -26,10 +26,23 @@
 //! jobs store evicts the jobs that have been terminal longest before it refuses, so the
 //! store cannot grow for the emulator's lifetime.
 //!
-//! A job's container is NOT run: this emulator has no container runtime, and the
-//! engine contract (`vendor/engine/src/lib.rs`) forbids reporting a status,
-//! duration or exit code for work nothing ran. `RUNNABLE` is where a job waits to be
-//! placed on compute capacity, so what happens next is decided by the compute
+//! A job's container is NOT an image this emulator starts: there is no container runtime
+//! here, and the engine contract (`vendor/engine/src/lib.rs`) forbids reporting a status,
+//! duration or exit code for work nothing ran. What a container job declares as its
+//! `command` is PERFORMED instead ([`container_run`]) — and performed is narrower than run:
+//! NO process is started, for the caller's words or for anything else, and nothing of the
+//! host is reachable. The words are parsed by a grammar crate and then answered by a FIXED
+//! CATALOG of session-local utilities ([`::service_common::posix_shell_session`], the one
+//! such session this workspace holds, which `service-com-amazonaws-sagemaker-sagemaker` and
+//! `service-com-amazonaws-codebuild-codebuild-20161006` drive for their own declared
+//! programs): a command outside that catalog, and every command form the session does not
+//! perform, FAILS CLOSED, so there is no host program, host file, host environment variable
+//! or socket a declared command can reach: the grammar composes catalog commands and
+//! nothing else, which is why a metacharacter in a caller's words has nothing to reach past
+//! the session. Every bound it runs inside is this emulator's.
+//!
+//! `RUNNABLE` is where a job
+//! waits to be placed on compute capacity, so what happens next is decided by the compute
 //! environments behind the job's queue ([`ComAmazonawsBatchAwsbatchv20160810State::job_is_placeable`]):
 //! a queue with no capacity of its own to offer — one whose environments are all
 //! `UNMANAGED`, `DISABLED` or not created yet — leaves the job RESTING in `RUNNABLE`,
@@ -38,13 +51,14 @@
 //! and the placement RECORDS the job attempt it starts — one [`JobAttempt`] carrying the
 //! ARN of the task the job was placed as — and reports the job in `STARTING`, where "the
 //! relevant container initiation operations are underway": the task's logger is initialised
-//! and the image its container runs is FETCHED ([`image_pull`]). One span later that
-//! initiation comes to its end — the fetch failure, or [`NO_CONTAINER_RUNTIME_REASON`] for an
-//! image a registry served — which is what that attempt ends with too. Either way no
-//! `startedAt` or `exitCode` is invented for a container nothing
-//! ran, and no job is ever advanced to `RUNNING`.
-//! Everything around it — accepting, resolving, scheduling, placing, listing, cancelling,
-//! terminating — is real.
+//! and the image its container runs is FETCHED ([`image_pull`]). One span later the program
+//! that container declares is RUNNING, and the status that program exits with is the status
+//! the job ends on — `SUCCEEDED` for zero, `FAILED` otherwise — with its exit code and the
+//! lines it wrote. A fetch the registry refused, and a program this emulator performs none
+//! of (the one inside the caller's own image), end the job without a run: no `startedAt`
+//! and no `exitCode` is invented for a container nothing ran.
+//! Everything around it — accepting, resolving, scheduling, placing, running, listing,
+//! cancelling, terminating — is real.
 //!
 //! An ARRAY job's parent runs no container of its own, so it is never placed: its status
 //! is what its children add up to
@@ -79,6 +93,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod array_jobs;
+mod container_run;
 mod described_collections;
 mod ec2_capacity;
 mod ecs_cluster;
@@ -93,6 +108,7 @@ mod service_job_dispatch;
 mod share_selection;
 
 pub use array_jobs::*;
+pub use container_run::*;
 pub use described_collections::*;
 pub use ec2_capacity::*;
 pub use ecs_cluster::*;
@@ -144,115 +160,9 @@ pub const JOB_PHASE_MILLIS: i64 = 500;
 /// emulator cannot accumulate records without bound. The indexes beside those maps are
 /// bounded by them: the due index and the dependency index hold only entries for jobs the
 /// store still holds, and an entry goes when either end of it does.
-pub mod limits {
-    /// AWS Batch service quota "Compute environments per Region": 50 (adjustable).
-    pub const MAX_COMPUTE_ENVIRONMENTS: usize = 50;
-
-    /// AWS Batch service quota "Job queues per Region": 50 (adjustable).
-    pub const MAX_JOB_QUEUES: usize = 50;
-
-    /// Service environments kept at once. An EMULATOR bound (AWS publishes no quota for
-    /// this resource): `CreateServiceEnvironment` fills the store and anyone can repeat
-    /// it, so a create past this answers the modelled `ClientException`. Sized like the
-    /// other per-Region, name-keyed Batch resources above.
-    pub const MAX_SERVICE_ENVIRONMENTS: usize = 50;
-
-    /// Dependencies one submit may name. AWS Batch documents it on `SubmitJob$dependsOn`:
-    /// "A job can depend upon a maximum of 20 jobs."
-    pub const MAX_JOB_DEPENDENCIES: usize = 20;
-
-    /// Jobs one bulk `CancelJobs`/`TerminateJobs` request may name, from both operations'
-    /// own docs: "An array of up to 50 Batch job IDs of the jobs to cancel" /
-    /// "...to terminate". Both members target a plain string list, so the bound is applied
-    /// in the handlers.
-    pub const MAX_BULK_JOBS: usize = 50;
-
-    /// Jobs kept at once. An emulator bound, as above: a submit that would exceed it
-    /// first evicts the jobs that have been terminal longest, and is refused only when
-    /// there is nothing evictable left.
-    pub const MAX_JOBS: usize = 500;
-
-    /// Consumable resources kept at once. An EMULATOR-CHOSEN ceiling, not an AWS quota:
-    /// `CreateConsumableResource` is a request anyone can repeat, so the store answers the
-    /// modelled `ClientException` past this point rather than growing without bound.
-    pub const MAX_CONSUMABLE_RESOURCES: usize = 500;
-
-    /// How many `UpdateConsumableResource` client tokens this store remembers at once, so
-    /// an identical repeat of one resolves to the update it already applied
-    /// ([`super::ComAmazonawsBatchAwsbatchv20160810State::consumable_resource_update_for_token`]).
-    /// An EMULATOR bound: the cache is a replay index anyone can fill, so the oldest entry
-    /// is dropped past this point rather than letting the store grow without bound.
-    pub const MAX_CONSUMABLE_RESOURCE_UPDATE_TOKENS: usize = 500;
-
-    /// Quota shares kept at once. An EMULATOR bound (AWS publishes no quota for this
-    /// resource): `CreateQuotaShare` fills the store and anyone can repeat it, so a create
-    /// past this answers the modelled `ClientException`. Sized like the other per-Region
-    /// Batch resources above.
-    pub const MAX_QUOTA_SHARES: usize = 50;
-
-    /// Service jobs kept at once, the same emulator bound as [`MAX_JOBS`] and with the
-    /// same eviction-before-refusal rule
-    /// ([`super::ComAmazonawsBatchAwsbatchv20160810State::insert_service_job`]).
-    pub const MAX_SERVICE_JOBS: usize = 500;
-
-    /// How many bytes of `SubmitServiceJob$serviceRequestPayload` this service stores for
-    /// one service job. An EMULATOR bound (AWS publishes none for the member): the payload
-    /// is a caller-supplied string kept on the record and read once to derive what capacity
-    /// the job asks for ([`super::requested_capacity`]), so a submit past this answers the
-    /// modelled `ClientException` rather than letting one request decide how much is stored
-    /// and parsed. 1 MiB, which is far more than a SageMaker training request needs.
-    pub const MAX_SERVICE_REQUEST_PAYLOAD_BYTES: usize = 1024 * 1024;
-
-    /// How many instance groups of one service job's request are weighed against a service
-    /// environment's capacity ([`super::requested_capacity`]). An EMULATOR bound: the
-    /// request chooses how many groups it names, so the derived demand is capped here
-    /// instead, which is what keeps the admission check constant-sized per record.
-    pub const MAX_REQUESTED_INSTANCE_GROUPS: usize = 16;
-
-    /// How many `capacityLimits` entries ONE service environment publishes. An EMULATOR
-    /// bound (AWS publishes no quota and the model declares no length): the list is filled
-    /// by `CreateServiceEnvironment`/`UpdateServiceEnvironment` and is walked whenever a
-    /// service job is weighed against the environment, so a request past this answers the
-    /// modelled `ClientException`.
-    pub const MAX_SERVICE_ENVIRONMENT_CAPACITY_LIMITS: usize = 20;
-
-    /// How many `computeEnvironmentOrder` entries ONE job queue carries. An EMULATOR bound
-    /// (the model declares no length for the list): the list is caller-filled and is walked
-    /// whenever a job of the queue is placed or the capacity behind the queue is scaled
-    /// ([`super::ec2_capacity`]), so one request cannot decide how much work a later one
-    /// costs. Sized at the compute environments this store holds at once
-    /// ([`MAX_COMPUTE_ENVIRONMENTS`]) — an entry has to name an environment that exists
-    /// before a queue can be attached to it, so no queue can usefully order more.
-    pub const MAX_COMPUTE_ENVIRONMENT_ORDER_ENTRIES: usize = MAX_COMPUTE_ENVIRONMENTS;
-
-    /// How many `serviceEnvironmentOrder` entries ONE job queue carries, bounded for the
-    /// same reason as the capacity limits above: the list is caller-filled and is walked
-    /// when a service job of the queue is placed.
-    pub const MAX_SERVICE_ENVIRONMENT_ORDER_ENTRIES: usize = 10;
-
-    /// Scheduling policies kept at once. An EMULATOR bound (AWS publishes no quota for
-    /// this resource): `CreateSchedulingPolicy` fills the store and anyone can repeat it,
-    /// so a create past this answers the modelled `ClientException`. Sized like the other
-    /// per-Region, name-keyed Batch resources above.
-    pub const MAX_SCHEDULING_POLICIES: usize = 50;
-
-    /// How many tags ONE resource carries at most.
-    ///
-    /// The model's own bound: every tag map on this service — `TagResource$tags`,
-    /// `ListTagsForResource$tags`, `CreateJobQueue$tags`, … — targets
-    /// `com.amazonaws.batch#TagrisTagsMap`, declared `@length(min: 1, max: 50)`
-    /// (`smithy_query(query="shape", shape="TagrisTagsMap")`). A resource holding more
-    /// than this could not be reported through that shape at all, so a `TagResource`
-    /// whose merge would take a resource past it is refused instead.
-    pub const MAX_TAGS_PER_RESOURCE: usize = 50;
-
-    /// Job ids ONE `DescribeJobs` call may name. AWS documents it on the member:
-    /// `DescribeJobsRequest$jobs` is "A list of up to 100 job IDs"
-    /// (`smithy_query(query="doc", shape="DescribeJobsRequest", member="jobs")`); the
-    /// model types it as a plain `StringList`, so the request validator admits any length
-    /// and the handler applies the bound.
-    pub const MAX_DESCRIBE_JOBS: usize = 100;
-}
+pub mod limits;
+mod job_events;
+pub use job_events::*;
 
 /// What AWS Batch answers a `DescribeJobs` naming more than
 /// [`limits::MAX_DESCRIBE_JOBS`] job ids with, inside its frontend envelope.
@@ -996,211 +906,6 @@ pub const DEFAULT_EVENT_BUS: &str = "default";
 /// the jobs store itself is capped at [`limits::MAX_JOBS`]).
 const MAX_PENDING_EVENTS: usize = 4 * limits::MAX_JOBS;
 
-/// One job state change waiting to be published to EventBridge.
-///
-/// The `detail` is rendered WHEN THE CHANGE HAPPENS (see
-/// [`job_state_change_detail`]), so the event reports the job as it was at that
-/// transition rather than as it is when the queue is drained.
-#[derive(Debug, Clone)]
-pub struct JobStateChange {
-    /// The job's ARN, which the event envelope carries in `resources`.
-    pub job_arn: String,
-    /// The `JobStatus` the job moved INTO, kept beside the detail so a caller
-    /// (and a test) can see which transition this record is for without parsing.
-    pub status: String,
-    /// WHEN the job moved, in epoch milliseconds: the event's `time`, so the
-    /// envelope reports the transition's instant rather than the instant the queue
-    /// was drained (which a reader can materialise much later).
-    pub at: i64,
-    /// The rendered `detail` of the event: the job's own description.
-    pub detail: ::serde_json::Value,
-}
-
-/// The `detail` of a `Batch Job State Change` event: the job as this store holds
-/// it, in the member names the `JobDetail` shape documents.
-///
-/// "The `detail` section of the event contains the job's details, in the same
-/// form as the `DescribeJobs` API returns them" ("AWS Batch events"), so every
-/// member below is read from the stored record — the SAME record `DescribeJobs`
-/// projects — and nothing that is not stored is invented: `attempts` reports the
-/// attempts the record holds (empty for a job nothing has placed, as the sample
-/// event shows it), and `startedAt`, `stoppedAt`, `statusReason` and the optional
-/// members appear only once the record carries them.
-pub fn job_state_change_detail(job: &Job) -> ::serde_json::Value {
-    use ::serde_json::{json, Map, Value};
-
-    let mut detail = Map::new();
-    detail.insert("jobArn".to_string(), json!(job.job_arn));
-    detail.insert("jobName".to_string(), json!(job.job_name));
-    detail.insert("jobId".to_string(), json!(job.job_id));
-    detail.insert("jobQueue".to_string(), json!(job.job_queue_arn));
-    detail.insert("jobDefinition".to_string(), json!(job.job_definition_arn));
-    detail.insert("status".to_string(), json!(job.status));
-    if let Some(reason) = &job.status_reason {
-        detail.insert("statusReason".to_string(), json!(reason));
-    }
-    detail.insert("createdAt".to_string(), json!(job.created_at));
-    if let Some(at) = job.started_at {
-        detail.insert("startedAt".to_string(), json!(at));
-    }
-    if let Some(at) = job.stopped_at {
-        detail.insert("stoppedAt".to_string(), json!(at));
-    }
-    // One entry per attempt the record holds, present and empty for a job no placement
-    // has started an attempt for (the "AWS Batch events" sample event shows
-    // `"attempts": []`).
-    detail.insert(
-        "attempts".to_string(),
-        Value::Array(job.attempts.iter().map(attempt_event_detail).collect()),
-    );
-    detail.insert(
-        "dependsOn".to_string(),
-        Value::Array(
-            job.depends_on
-                .iter()
-                .flatten()
-                .map(|dependency| {
-                    let mut entry = Map::new();
-                    if let Some(id) = &dependency.job_id {
-                        entry.insert("jobId".to_string(), json!(id));
-                    }
-                    if let Some(kind) = &dependency.r#type {
-                        entry.insert("type".to_string(), json!(kind));
-                    }
-                    Value::Object(entry)
-                })
-                .collect(),
-        ),
-    );
-    detail.insert(
-        "parameters".to_string(),
-        json!(job.parameters.clone().unwrap_or_default()),
-    );
-    if let Some(container) = &job.container {
-        detail.insert("container".to_string(), container_event_detail(container));
-    }
-    if let Some(identifier) = &job.share_identifier {
-        detail.insert("shareIdentifier".to_string(), json!(identifier));
-    }
-    if let Some(priority) = job.scheduling_priority {
-        detail.insert("schedulingPriority".to_string(), json!(priority));
-    }
-    if let Some(timeout) = &job.timeout {
-        if let Some(seconds) = timeout.attempt_duration_seconds {
-            detail.insert(
-                "timeout".to_string(),
-                json!({ "attemptDurationSeconds": seconds }),
-            );
-        }
-    }
-    if let Some(strategy) = &job.retry_strategy {
-        let mut rendered = Map::new();
-        if let Some(attempts) = strategy.attempts {
-            rendered.insert("attempts".to_string(), json!(attempts));
-        }
-        detail.insert("retryStrategy".to_string(), Value::Object(rendered));
-    }
-    if let Some(capabilities) = &job.platform_capabilities {
-        detail.insert("platformCapabilities".to_string(), json!(capabilities));
-    }
-    if let Some(propagate) = job.propagate_tags {
-        detail.insert("propagateTags".to_string(), json!(propagate));
-    }
-    if let Some(tags) = &job.tags {
-        detail.insert("tags".to_string(), json!(tags));
-    }
-    // The array properties the RECORD holds: a child's own index, a parent's size. The
-    // parent's `statusSummary` is counted from the children's records and so is not a
-    // member of the job this detail is about; it is reported by the readers that can see
-    // them (`DescribeJobs`, `ListJobs`).
-    if let Some(index) = job.array_index {
-        detail.insert("arrayProperties".to_string(), json!({ "index": index }));
-    } else if let Some(size) = job.array_size {
-        detail.insert("arrayProperties".to_string(), json!({ "size": size }));
-    }
-    detail.insert("isCancelled".to_string(), json!(job.is_cancelled));
-    detail.insert("isTerminated".to_string(), json!(job.is_terminated));
-    Value::Object(detail)
-}
-
-/// The `container` member of a job state change's detail: the stored effective
-/// container, in the member names `ContainerDetail` documents.
-///
-/// Only the members this store actually holds are rendered — the effective
-/// container the definition and the request's overrides add up to. Nothing a run
-/// would have produced (an `exitCode`, a `logStreamName`, a `taskArn`, a network
-/// interface) is invented, because no container ran; `reason` appears only
-/// because `finish_job` records the modelled failure reason on it.
-fn container_event_detail(container: &ContainerDetail) -> ::serde_json::Value {
-    use ::serde_json::{json, Map, Value};
-
-    let mut rendered = Map::new();
-    if let Some(image) = &container.image {
-        rendered.insert("image".to_string(), json!(image));
-    }
-    if let Some(vcpus) = container.vcpus {
-        rendered.insert("vcpus".to_string(), json!(vcpus));
-    }
-    if let Some(memory) = container.memory {
-        rendered.insert("memory".to_string(), json!(memory));
-    }
-    if let Some(command) = &container.command {
-        rendered.insert("command".to_string(), json!(command));
-    }
-    if let Some(role) = &container.job_role_arn {
-        rendered.insert("jobRoleArn".to_string(), json!(role));
-    }
-    if let Some(role) = &container.execution_role_arn {
-        rendered.insert("executionRoleArn".to_string(), json!(role));
-    }
-    if let Some(user) = &container.user {
-        rendered.insert("user".to_string(), json!(user));
-    }
-    if let Some(privileged) = container.privileged {
-        rendered.insert("privileged".to_string(), json!(privileged));
-    }
-    if let Some(readonly) = container.readonly_root_filesystem {
-        rendered.insert("readonlyRootFilesystem".to_string(), json!(readonly));
-    }
-    if let Some(reason) = &container.reason {
-        rendered.insert("reason".to_string(), json!(reason));
-    }
-    if let Some(environment) = &container.environment {
-        rendered.insert(
-            "environment".to_string(),
-            Value::Array(
-                environment
-                    .iter()
-                    .map(|pair| {
-                        let mut entry = Map::new();
-                        if let Some(name) = &pair.name {
-                            entry.insert("name".to_string(), json!(name));
-                        }
-                        if let Some(value) = &pair.value {
-                            entry.insert("value".to_string(), json!(value));
-                        }
-                        Value::Object(entry)
-                    })
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(requirements) = &container.resource_requirements {
-        rendered.insert(
-            "resourceRequirements".to_string(),
-            Value::Array(
-                requirements
-                    .iter()
-                    .map(|requirement| {
-                        json!({ "type": requirement.r#type, "value": requirement.value })
-                    })
-                    .collect(),
-            ),
-        );
-    }
-    Value::Object(rendered)
-}
-
 /// A digest of the members ONE request carries, so an identical repeat of a `clientToken`
 /// can be told apart from the same token carrying a different payload — the comparison
 /// every `clientToken` on this service documents ("two requests with identical payloads and
@@ -1649,9 +1354,10 @@ pub struct Job {
     pub status_reason: Option<String>,
     pub created_at: i64,
     /// `startedAt`: "when the job transitioned from the `STARTING` state to the `RUNNING`
-    /// state" (`JobDetail$startedAt`). Nothing here places a job on compute capacity, so
-    /// no job ever starts and this stays `None` — the member is then ABSENT from every
-    /// projection, rather than carrying an instant nothing ran at.
+    /// state" (`JobDetail$startedAt`). Written when the container's own program STARTS
+    /// ([`container_run`]), and `None` for a job whose program nothing performed — the
+    /// member is then ABSENT from every projection, rather than carrying an instant nothing
+    /// ran at.
     pub started_at: Option<i64>,
     /// `stoppedAt`: "when the job transitioned from the `RUNNING` state to a terminal
     /// state" (`JobDetail$stoppedAt`) — the instant the job's WORK stopped, which AWS is
@@ -1740,6 +1446,14 @@ pub struct Job {
     /// materialises — a job whose image could not be fetched ends with the fetch failure and
     /// has no container, and so no container output, at all.
     pub image_fetch: Option<ImageFetch>,
+    /// What this job's container PROGRAM did, or `None` while nothing has performed it
+    /// ([`container_run`]).
+    ///
+    /// Internal bookkeeping, not a modelled member: it is what the clock materialises after
+    /// the placement — the move into `RUNNING` and the terminal status the program's exit
+    /// status decides are both read off this one recording, so two readers cannot see a job
+    /// end differently.
+    pub container_run: Option<ContainerRun>,
 }
 
 /// A consumable resource, exactly as `CreateConsumableResource` stored it.
@@ -3463,18 +3177,43 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                             None
                         }
                     }
-                    // The container initiation a placement started comes to ONE end here:
-                    // the failure of the image fetch it begins with, or the modelled failure
-                    // state saying nothing in this emulator can run the container that fetch
-                    // served ([`placement_end_reason`]).
+                    // The container initiation a placement started comes to its end here.
+                    // A fetch the registry REFUSED ends it before any container exists, so
+                    // the job ends with that failure ([`image_pull`]); otherwise the
+                    // container's own program is what the job does next, and the job is
+                    // reported `RUNNING` from the instant that program starts
+                    // ([`container_run`]).
                     JOB_STARTING => {
-                        let reason = self
-                            .image_fetch_of(id)
-                            .map_or_else(
-                                || NO_CONTAINER_RUNTIME_REASON.to_string(),
-                                |fetch| placement_end_reason(&fetch),
-                            );
-                        self.finish_job(id, JOB_FAILED, Some(&reason), due);
+                        if let Some(ImageFetch::Refused(reason)) = self.image_fetch_of(id) {
+                            self.finish_job(id, JOB_FAILED, Some(&reason), due);
+                            return Some(Advanced::Terminal);
+                        }
+                        match self.container_run_of(id) {
+                            // Nothing has performed the program yet
+                            // ([`settle_job_container_runs`]): the move stays due, so what
+                            // the job reports is the program's own outcome and never a
+                            // verdict nothing took.
+                            None => None,
+                            // A program nothing performed produced no run at all, so the job
+                            // never reaches `RUNNING`: it ends with the reason naming what
+                            // was not performed, and with no exit code or `startedAt`.
+                            Some(run) if !run.performed() => {
+                                let (status, reason) = run.ending();
+                                self.finish_job(id, status, Some(&reason), due);
+                                Some(Advanced::Terminal)
+                            }
+                            Some(_) => {
+                                self.start_running_job(id, due);
+                                Some(Advanced::Moved)
+                            }
+                        }
+                    }
+                    // The program the container is running comes to its end one span after
+                    // it started, and the status it exited with is the status the job ends
+                    // on ([`container_run`]).
+                    JOB_RUNNING => {
+                        let run = self.container_run_of(id)?;
+                        self.end_running_job(id, &run, due);
                         Some(Advanced::Terminal)
                     }
                     _ => None,
@@ -3588,6 +3327,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             || self.has_pending_log_streams()
             || self.has_pending_ecs_clusters()
             || self.has_pending_image_fetches()
+            || self.has_pending_container_runs()
         {
             return Some(now);
         }
@@ -3711,11 +3451,9 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     ///
     /// AWS Batch documents for `TerminateJob`: jobs in `SUBMITTED`, `PENDING` or
     /// `RUNNABLE` are cancelled, jobs that have progressed to `STARTING` or `RUNNING` are
-    /// terminated; either way the job ends `FAILED` carrying `reason`. `STARTING` and
-    /// `RUNNING` are modelled but unreachable here (nothing places a job, so a job rests
-    /// in `RUNNABLE` until a caller ends it), and the rule is kept for both so the
-    /// distinction holds the day a runtime exists. A job already in a terminal status is
-    /// left exactly as it is.
+    /// terminated; either way the job ends `FAILED` carrying `reason`. Both halves are
+    /// reachable here — a job the scheduler placed runs its container's program
+    /// ([`container_run`]) — and a job already in a terminal status is left exactly as it is.
     pub fn terminate_job(&mut self, id: &str, reason: &str, now: i64) -> bool {
         let Some(job) = self.jobs.get(id) else {
             return false;
@@ -4820,6 +4558,12 @@ async fn publish_pending<Eng: Send + Sync + 'static>(
     // streams and the events below, because the verdict it records is what the placement
     // ahead of it materialises.
     settle_job_image_fetches(engine);
+    // The program the container of a job the scheduler has just PLACED runs, performed in
+    // process with this store's lock released (see [`container_run`]). It runs after the
+    // fetch above, because a job is only placed once its image has been answered for, and
+    // before the streams and the events below, because the lines it wrote are delivered to
+    // the job's own log stream.
+    settle_job_container_runs(engine).await;
     // The clusters backing this store's compute environments, created and deleted where
     // Amazon ECS holds them, over the same callback (see [`ecs_cluster`]).
     settle_backing_clusters(callback, &state).await;

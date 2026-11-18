@@ -23,9 +23,9 @@
 //! is a `MANAGED` environment's, and an `UNMANAGED` one holds only instances the caller
 //! registered. `CEState$DISABLED` withholds placement until a caller re-enables the
 //! environment. A job whose queue offers none of that waits in `RUNNABLE`; a job whose queue
-//! does is placed, and because this emulator has no container runtime the placement ends in
-//! the modelled failure state with `state::NO_CONTAINER_RUNTIME_REASON` — never with an
-//! invented `startedAt`, `stoppedAt` or `exitCode`. What the PLACEMENT itself records — the
+//! does is placed, and the placement RUNS the program its container declares — so the job
+//! reports the instant that program started, the status it exited with and the terminal
+//! status that status decides. What the PLACEMENT itself records — the
 //! one job attempt, the task it was placed as and the log stream that task writes to — is
 //! pinned in `job_attempt_records.rs`.
 
@@ -199,6 +199,45 @@ fn assert_nothing_ran(case: &str, detail: &Value) {
         assert!(
             attempt["container"]["exitCode"].is_null(),
             "case {case}: no attempt exit code is invented, got {attempt}"
+        );
+    }
+}
+
+/// Assert that `detail` reports a job whose container PROGRAM ran: the instant it started,
+/// the instant it stopped and the status it exited with, on the job's container and on the
+/// attempt the placement recorded for it.
+///
+/// The instant it STARTED is read off the attempt, which is where the model leaves the member
+/// optional (`AttemptDetail$startedAt`); `JobDetail$startedAt` is @required, so this emulator
+/// withholds it rather than report a 0 for every job whose container never ran (see
+/// `ops::types`). What a placed job's attempt carries is pinned in `job_attempt_records.rs`;
+/// this is the part every placed job of this suite reports, whatever its queue's capacity
+/// looked like before the placement.
+fn assert_the_program_ran(case: &str, detail: &Value, exit_code: i64) {
+    assert!(
+        detail["stoppedAt"].as_i64().unwrap_or_default() > 0,
+        "case {case}: a job whose program ran reports when it stopped, got {detail}"
+    );
+    assert_eq!(
+        detail["container"]["exitCode"].as_i64(),
+        Some(exit_code),
+        "case {case}: the container reports the status its program exited with, got {detail}"
+    );
+    let attempts = detail["attempts"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "case {case}: one placement made one attempt, got {detail}"
+    );
+    for attempt in &attempts {
+        assert!(
+            attempt["startedAt"].as_i64().unwrap_or_default() > 0,
+            "case {case}: the attempt reports when its container started, got {attempt}"
+        );
+        assert_eq!(
+            attempt["container"]["exitCode"].as_i64(),
+            Some(exit_code),
+            "case {case}: the attempt reports the same exit code, got {attempt}"
         );
     }
 }
@@ -524,9 +563,9 @@ const PLACEMENT_ROWS: &[PlacementRow] = &[
 
 /// RULE: a `RUNNABLE` job is placed on the capacity its queue's compute environments offer
 /// the scheduler, and only there — a queue with none leaves the job waiting in `RUNNABLE`
-/// indefinitely. A placed job becomes terminal; because no container runtime is available
-/// it ends `FAILED` saying so, and neither outcome invents a start instant, a stop instant,
-/// an attempt or an exit code.
+/// indefinitely. A placed job RUNS the program its container declares and ends on the status
+/// that program exited with; a job no placement took invents no start instant, no stop
+/// instant, no attempt and no exit code.
 #[tokio::test]
 async fn a_job_is_placed_only_where_its_queue_offers_capacity() {
     for (index, row) in PLACEMENT_ROWS.iter().enumerate() {
@@ -535,13 +574,13 @@ async fn a_job_is_placed_only_where_its_queue_offers_capacity() {
         let job_id = submit_ok(&fixture, &format!("p{index}"), json!({})).await;
 
         if row.placed {
-            let detail = until_status(&fixture.batch, case, &job_id, state::JOB_FAILED).await;
+            let detail = until_status(&fixture.batch, case, &job_id, state::JOB_SUCCEEDED).await;
             assert_eq!(
                 detail["statusReason"].as_str(),
-                Some(state::NO_CONTAINER_RUNTIME_REASON),
-                "case {case}: a placed job whose container nothing ran says so, got {detail}"
+                Some(state::ESSENTIAL_CONTAINER_EXITED_REASON),
+                "case {case}: a job whose container exited says so, got {detail}"
             );
-            assert_nothing_ran(case, &detail);
+            assert_the_program_ran(case, &detail, 0);
             // Terminal is FINAL: further spans of the clock leave it exactly as it is.
             let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
             tokio::time::sleep(Duration::from_millis(span * 3)).await;
@@ -591,13 +630,13 @@ async fn re_enabling_an_environment_releases_the_jobs_waiting_on_it() {
         )
         .await;
 
-    let placed = until_status(&fixture.batch, "re-enabled", &job_id, state::JOB_FAILED).await;
+    let placed = until_status(&fixture.batch, "re-enabled", &job_id, state::JOB_SUCCEEDED).await;
     assert_eq!(
         placed["statusReason"].as_str(),
-        Some(state::NO_CONTAINER_RUNTIME_REASON),
-        "case re-enabled: the placement is what ends the job, got {placed}"
+        Some(state::ESSENTIAL_CONTAINER_EXITED_REASON),
+        "case re-enabled: the placement is what runs the job's container, got {placed}"
     );
-    assert_nothing_ran("re-enabled", &placed);
+    assert_the_program_ran("re-enabled", &placed, 0);
 }
 
 /// RULE: an ending a caller asks of an array PARENT is asked of every child it spawned —
@@ -684,20 +723,21 @@ async fn an_array_parent_reports_what_its_children_add_up_to() {
     )
     .await;
 
-    // Every child is placed and every placement ends in the modelled failure state, so the
-    // parent becomes terminal too — FAILED, because its children did not succeed.
+    // Every child is placed and every placement runs the program the container declares, so
+    // the parent becomes terminal too — SUCCEEDED, because every child succeeded.
     for index in 0..SIZE {
         let child_id = state::array_child_job_id(&parent_id, index);
-        let child = until_status(&fixture.batch, "a placed child", &child_id, state::JOB_FAILED).await;
+        let child =
+            until_status(&fixture.batch, "a placed child", &child_id, state::JOB_SUCCEEDED).await;
         assert_eq!(
             child["statusReason"].as_str(),
-            Some(state::NO_CONTAINER_RUNTIME_REASON),
-            "case child {index}: a placed child whose container nothing ran says so, got {child}"
+            Some(state::ESSENTIAL_CONTAINER_EXITED_REASON),
+            "case child {index}: a placed child whose container exited says so, got {child}"
         );
-        assert_nothing_ran("a placed child", &child);
+        assert_the_program_ran("a placed child", &child, 0);
     }
 
-    let parent = until_status(&fixture.batch, "the parent", &parent_id, state::JOB_FAILED).await;
+    let parent = until_status(&fixture.batch, "the parent", &parent_id, state::JOB_SUCCEEDED).await;
     assert_eq!(
         parent["statusReason"],
         Value::Null,
@@ -705,9 +745,9 @@ async fn an_array_parent_reports_what_its_children_add_up_to() {
          summary reports, so no statusReason is authored for it, got {parent}"
     );
     assert_eq!(
-        parent["arrayProperties"]["statusSummary"][state::JOB_FAILED].as_i64(),
+        parent["arrayProperties"]["statusSummary"][state::JOB_SUCCEEDED].as_i64(),
         Some(i64::from(SIZE)),
-        "case the parent: the summary counts every failed child, got {parent}"
+        "case the parent: the summary counts every child that succeeded, got {parent}"
     );
     assert_eq!(
         parent["arrayProperties"]["size"].as_i64(),

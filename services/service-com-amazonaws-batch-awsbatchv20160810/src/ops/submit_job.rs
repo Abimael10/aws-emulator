@@ -440,6 +440,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Nothing has fetched this job's container image yet: the fetch is attempted
                 // while the job waits in `RUNNABLE` for capacity (`state::image_pull`).
                 image_fetch: None,
+                // And nothing has performed its container's program: that happens once the
+                // scheduler has placed the job (`state::container_run`).
+                container_run: None,
                 node_properties: definition.node_properties.clone(),
                 retry_strategy: input.retry_strategy.or(definition.retry_strategy),
                 timeout: input.timeout.or(definition.timeout),
