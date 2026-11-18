@@ -8,9 +8,10 @@
 //! the account's registry only when that workgroup may go — the account's default workgroup
 //! never may, and one this account does not hold is not there to remove — and only when
 //! either it holds none of the contents `RecursiveDeleteOption` names (named queries, query
-//! executions, notebooks) or the request set that option; the workgroup and its contents
-//! then stop resolving for every later call, and a refused delete leaves both exactly as
-//! they were.
+//! executions, notebooks) or the request set that option; the workgroup then stops resolving
+//! for every later call, together with everything the workgroup itself was the address of,
+//! while a saved query — addressed by the `NamedQueryId` its own create minted — keeps
+//! resolving. A refused delete leaves everything exactly as it was.
 //!
 //! Each test asserts that rule over a TABLE rather than one request: the rows differ along
 //! what the rule generalises over — WHICH kind of content the workgroup holds and HOW MANY,
@@ -19,8 +20,7 @@
 //!
 //! The named-query round trip at the end is what makes the contents real rather than
 //! assumed: a query saved through `CreateNamedQuery` is read back through `GetNamedQuery`
-//! member for member, and stops reading back exactly when the workgroup holding it is
-//! deleted with its contents.
+//! member for member.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -159,6 +159,16 @@ impl Held {
             Self::Notebook(id) => ("ExportNotebook", json!({ "NotebookId": id })),
         }
     }
+
+    /// Whether the resource still resolves once the workgroup that held it is deleted.
+    ///
+    /// A saved query does: it is addressed by the `NamedQueryId` its create minted, and
+    /// `RecursiveDeleteOption` is permission to delete a workgroup that still holds saved
+    /// queries rather than an instruction to delete them. The other two are the workgroup's
+    /// own — its query history and its notebooks — and go with it.
+    fn outlives_its_work_group(&self) -> bool {
+        matches!(self, Self::NamedQuery(_))
+    }
 }
 
 /// Whether the resource still resolves: `true` for a read that answers 200, `false` for one
@@ -296,7 +306,8 @@ async fn given_contents(router: &MultiServiceRouter, case: &ContentsCase) -> Vec
 
 /// A delete that did not ask for the contents removes the workgroup only when it holds
 /// none of them; otherwise it is refused and changes nothing. The same delete carrying
-/// `RecursiveDeleteOption` removes the workgroup and everything it held.
+/// `RecursiveDeleteOption` removes the workgroup, and with it everything the workgroup was
+/// the address of — while the saved queries, addressed by their own ids, keep resolving.
 #[tokio::test]
 async fn a_workgroup_with_contents_is_deleted_only_with_the_recursive_option() {
     let router = router();
@@ -386,7 +397,8 @@ async fn a_workgroup_with_contents_is_deleted_only_with_the_recursive_option() {
             }
         }
 
-        // A workgroup that still holds contents goes only with them.
+        // A workgroup that still holds contents goes only with the recursive option, and
+        // what goes with it is what it was the address of.
         if !empty {
             let (status, body) = call(
                 &router,
@@ -401,10 +413,14 @@ async fn a_workgroup_with_contents_is_deleted_only_with_the_recursive_option() {
                 case.case
             );
             for resource in held {
-                assert!(
-                    !resolves(&router, case.case, resource).await,
-                    "case {:?}: expected {resource:?} to be gone with its workgroup",
-                    case.case
+                let resolved = resolves(&router, case.case, resource).await;
+                assert_eq!(
+                    resolved,
+                    resource.outlives_its_work_group(),
+                    "case {:?}: expected {resource:?} to resolve {:?} after the recursive \
+                     delete, got {resolved:?}",
+                    case.case,
+                    resource.outlives_its_work_group()
                 );
             }
         }

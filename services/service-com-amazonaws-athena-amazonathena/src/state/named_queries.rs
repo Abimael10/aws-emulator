@@ -13,8 +13,10 @@
 //! `CreateNamedQueryInput$WorkGroup` is "the name of the workgroup in which the named query
 //! is being created" and `ListNamedQueries` lists "the saved queries for the primary
 //! workgroup" when a request names none — so a named query always belongs to exactly one
-//! workgroup, and that workgroup is what a delete of the workgroup takes it with (see
-//! [`NamedQueryRegistry::remove_work_group`]).
+//! workgroup, and that membership is a VALUE on the record rather than the query's address.
+//! Nothing but [`NamedQueryRegistry::remove`] takes a query out of the registry: a delete of
+//! the workgroup it names removes the workgroup, and the saved queries keep resolving under
+//! their own ids, reporting the workgroup they were saved in.
 //!
 //! There is no lifecycle the clock owes one: Athena answers a create with a query a client
 //! can already read back, so the record is stored in its terminal shape and a read never has
@@ -226,26 +228,6 @@ impl NamedQueryRegistry {
         Some(removed)
     }
 
-    /// Remove every query `work_group` holds, as a recursive delete of that workgroup
-    /// does, and answer with how many were removed.
-    ///
-    /// A named query belongs to one workgroup and is addressed within it, so a query whose
-    /// workgroup no longer exists could never be read or listed again; it is dropped with
-    /// the workgroup rather than left in the registry, where a workgroup later created
-    /// under the same name would inherit it.
-    pub fn remove_work_group(&mut self, work_group: &str) -> usize {
-        let removed: Vec<String> = self
-            .ids_in(work_group)
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        for id in &removed {
-            self.queries.remove(id);
-        }
-        self.create_tokens
-            .retain(|_, minted| !removed.iter().any(|id| id == minted));
-        removed.len()
-    }
 }
 
 /// A fresh `NamedQueryId`: a version-4 UUID in its hyphenated, lower-case form, which is
@@ -266,6 +248,17 @@ pub fn new_named_query_id() -> String {
 /// carries for an id it could not resolve say the same thing about the same miss.
 pub fn named_query_not_found(id: &str) -> String {
     format!("NamedQuery: {id} does not exist")
+}
+
+/// The message `ListNamedQueries` refuses a `NextToken` it did not mint with.
+///
+/// Amazon Athena words a pagination-token refusal per OPERATION — this listing's wording is
+/// the fixed text `The nextPageToken is malformed: ` with the token the CALLER supplied as its
+/// one variable part, so a client reads back the token this listing would not resume from. Not
+/// the sentence the other paginated listings of this service answer with
+/// ([`super::INVALID_NEXT_TOKEN`]), which is why it is worded here rather than shared.
+pub fn named_queries_page_token_malformed(token: &str) -> String {
+    format!("The nextPageToken is malformed: {token}")
 }
 
 /// The refusal message for a create that would take `work_group` past

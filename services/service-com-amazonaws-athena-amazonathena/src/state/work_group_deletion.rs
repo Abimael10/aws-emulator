@@ -9,11 +9,14 @@
 //! three are the CONTENTS a delete weighs ([`WorkGroupContents`]) and a delete that did not
 //! ask for them is refused rather than orphaning them.
 //!
-//! A delete that does proceed removes them in the same critical section as the workgroup
-//! record itself ([`ComAmazonawsAthenaAmazonathenaState::delete_work_group`]), so no read
-//! can see a workgroup that is half gone — and nothing is left addressed to a workgroup
-//! this account no longer holds, which a workgroup later created under the same name would
-//! otherwise inherit.
+//! The option only PERMITS such a delete, though: it is what lets a non-empty workgroup go,
+//! not an instruction to destroy what is addressed on its own. A saved query is addressed by
+//! the `NamedQueryId` Athena minted for it — `GetNamedQuery` and `BatchGetNamedQuery` take
+//! that id and nothing else — so it outlives the workgroup it was saved in and keeps reporting
+//! it. What a delete does take with the workgroup is what could not be reached without it: a
+//! resource addressed TOGETHER WITH its workgroup, or one whose own record the workgroup owns
+//! ([`ComAmazonawsAthenaAmazonathenaState::delete_work_group`]). Those go in the same critical
+//! section as the workgroup record itself, so no read can see a workgroup that is half gone.
 
 use std::collections::HashSet;
 
@@ -69,22 +72,26 @@ impl ComAmazonawsAthenaAmazonathenaState {
     /// Remove the workgroup `name` and everything addressed to it, and answer with the
     /// record the registry no longer holds — or `None` when it held none under that name.
     ///
-    /// The contents go with the workgroup: its named queries, the query executions of its
-    /// history (and any `ClientRequestToken` that named one of them), its notebooks, its
-    /// prepared statements and its sessions. The statements and the sessions are not among the
-    /// three kinds `RecursiveDeleteOption` names, and so are not what a delete is refused
-    /// over, but each is addressed TOGETHER WITH its workgroup — a statement by its
+    /// What goes with the workgroup is what the workgroup is the address of: the query
+    /// executions of its history (and any `ClientRequestToken` that named one of them), its
+    /// notebooks, its prepared statements and its sessions. The statements and the sessions are
+    /// not among the three kinds `RecursiveDeleteOption` names, and so are not what a delete is
+    /// refused over, but each is addressed TOGETHER WITH its workgroup — a statement by its
     /// `StatementName` and a workgroup, a session by the workgroup whose engine configuration
     /// and execution role it runs under — so one whose workgroup is gone could never be read,
     /// listed or deleted again, and keeping it would hand a workgroup later created under the
     /// same name contents nobody created in it.
+    ///
+    /// The named queries do NOT go with it: each is addressed by the id its create minted,
+    /// independently of any workgroup, so removing the workgroup takes nothing away from the
+    /// reads that resolve that id. The recursive option is permission to delete a workgroup
+    /// that still holds saved queries, not an instruction to delete them.
     ///
     /// Whether the delete may proceed at all — the account's default workgroup cannot be
     /// deleted, and a workgroup that still holds contents needs the recursive option — is
     /// the handler's decision; this is the write that carries it out.
     pub fn delete_work_group(&mut self, name: &str) -> Option<WorkGroupRecord> {
         let removed = self.work_groups.remove(name)?;
-        self.named_queries.remove_work_group(name);
         self.notebooks.remove_work_group(name);
         self.prepared_statements.remove_work_group(name);
         self.sessions.remove_work_group(name);

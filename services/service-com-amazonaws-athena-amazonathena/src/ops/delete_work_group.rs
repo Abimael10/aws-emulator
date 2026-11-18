@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkGroup
-//! IMPLEMENTED: removes the named workgroup, and everything addressed to it, from this
-//! service's registries — so a later `GetWorkGroup` of that name is refused and a listing
-//! stops reporting it. The account's default workgroup cannot be deleted, and a workgroup
-//! that still holds contents is deleted only by a request that asked for its contents to
-//! go with it.
+//! IMPLEMENTED: removes the named workgroup, and everything the workgroup is the address of,
+//! from this service's registries — so a later `GetWorkGroup` of that name is refused and a
+//! listing stops reporting it. The account's default workgroup cannot be deleted, and a
+//! workgroup that still holds contents is deleted only by a request that asked for them to go
+//! with it; a saved query, which is addressed by the id its own create minted, keeps resolving
+//! afterwards.
 //!
 //! ## Shape of an operation
 //!
@@ -183,7 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // even if the workgroup contains any named queries, query executions, or
         // notebooks" — so a workgroup still holding any of those is deleted only by a
         // request that asked for them to go with it, and is refused otherwise rather than
-        // leaving them addressed to a workgroup this account no longer holds.
+        // leaving them addressed to a workgroup this account no longer holds. The option
+        // PERMITS this delete; what it removes besides the workgroup record is decided by
+        // what the workgroup is the address of (see `crate::state::delete_work_group`): a
+        // saved query, addressed by the id its create minted, is not removed.
         let recursive = input.recursive_delete_option.unwrap_or(false);
         if !recursive && !store.work_group_contents(&input.work_group).is_empty() {
             return Err(invalid_request(crate::state::work_group_not_empty(
@@ -191,7 +195,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The registry stops holding the workgroup here, and its contents go with it.
+        // The registry stops holding the workgroup here, and everything only it addressed
+        // goes with it.
         store.delete_work_group(&input.work_group);
 
         // `DeleteWorkGroupOutput` models no members: that the workgroup is gone is read

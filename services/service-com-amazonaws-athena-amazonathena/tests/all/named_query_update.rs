@@ -254,7 +254,7 @@ async fn an_update_writes_what_it_carries_and_leaves_the_rest() {
 
 /// An id this account holds no query under is refused, and the refusal writes nothing: the
 /// rows differ along WHY the id resolves to nothing — one no create ever minted, one whose
-/// query a delete removed, and one whose workgroup was deleted with its contents.
+/// query a delete removed, and one of a form no create mints.
 #[tokio::test]
 async fn an_unknown_id_is_refused_and_writes_nothing() {
     let router = router();
@@ -292,43 +292,12 @@ async fn an_unknown_id_is_refused_and_writes_nothing() {
         "the query {deleted} must be deleted, got {delete_status} with {delete_body:?}"
     );
 
-    // An id of a query whose workgroup was deleted with its contents.
-    create_work_group(&router, "wg-named-query-update-dropped").await;
-    let orphaned = create_named_query(
-        &router,
-        &json!({
-            "Name": "orphaned-query",
-            "Database": "logs",
-            "QueryString": query_text(1),
-            "WorkGroup": "wg-named-query-update-dropped",
-        }),
-    )
-    .await;
-    let (drop_status, drop_body) = call(
-        &router,
-        "DeleteWorkGroup",
-        &json!({
-            "WorkGroup": "wg-named-query-update-dropped",
-            "RecursiveDeleteOption": true,
-        }),
-    )
-    .await;
-    assert_eq!(
-        drop_status, 200,
-        "the workgroup holding {orphaned} must be deleted with its contents, got {drop_status} \
-         with {drop_body:?}"
-    );
-
     let unknown: Vec<(&str, String)> = vec![
         (
             "an id no create ever minted",
             "11111111-2222-3333-4444-555555555555".to_string(),
         ),
         ("an id of a deleted query", deleted.clone()),
-        (
-            "an id whose workgroup was deleted with its contents",
-            orphaned.clone(),
-        ),
         ("an id that is not a UUID at all", "not-an-id".to_string()),
     ];
     for (case, id) in &unknown {
@@ -379,13 +348,11 @@ async fn an_unknown_id_is_refused_and_writes_nothing() {
             "Description": "the standing description",
         }),
     );
-    for id in [&deleted, &orphaned] {
-        let (status, body) = read_named_query(&router, id).await;
-        assert_eq!(
-            status, 400,
-            "expected the id {id} to still resolve to no query, got {status} with {body:?}"
-        );
-    }
+    let (status, body) = read_named_query(&router, &deleted).await;
+    assert_eq!(
+        status, 400,
+        "expected the id {deleted} to still resolve to no query, got {status} with {body:?}"
+    );
 }
 
 /// An update touches the ONE query its id names: every other saved query of that workgroup
