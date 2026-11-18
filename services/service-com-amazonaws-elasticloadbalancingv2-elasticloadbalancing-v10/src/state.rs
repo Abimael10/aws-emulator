@@ -109,6 +109,12 @@ pub mod health_check_firewall;
 
 pub use health_check_firewall::{interface_admits_check, CheckSource, GuardingGroups};
 
+/// Whether the network a load balancer checks FROM can carry a check to the address a
+/// registration names at all.
+pub mod health_check_delivery;
+
+pub use health_check_delivery::check_crosses_networks;
+
 /// The periodic health check of the registrations a load balancer routes to, and the
 /// host-count series that check is published as.
 pub mod host_counts;

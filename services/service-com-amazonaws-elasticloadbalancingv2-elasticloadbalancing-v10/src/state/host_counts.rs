@@ -43,6 +43,11 @@
 //!   declared ([`super::GuardingGroups`]), else the ones the account's inventory reports for
 //!   the resource the registration NAMES — the interfaces attached to an instance it names,
 //!   and the interface holding an address it names ([`super::health_check_firewall`]);
+//! * a registration naming an ADDRESS the account holds in a VPC the group's own does not
+//!   reach fails every check as well: a check travels the network the load balancer is placed
+//!   in, which is the network the group names, and a VPC carries traffic to the addresses
+//!   inside it and to a VPC an accepted peering joins it to, and to nothing else
+//!   ([`super::health_check_delivery`]);
 //! * otherwise, a registration another emulated service's SCHEDULER made for a workload it
 //!   runs stands for that workload, which is running here, so the check passes;
 //! * an `instance` target passes while EC2 — which owns instances — reports that instance
@@ -689,9 +694,20 @@ fn observe_all<Eng: Send + Sync + 'static>(
         let mut interface_groups: HashMap<String, Vec<String>> = HashMap::new();
         let mut interface_addresses: HashMap<String, Vec<String>> = HashMap::new();
         let mut instance_groups: HashMap<String, Vec<String>> = HashMap::new();
+        let mut interface_networks: HashMap<String, Vec<String>> = HashMap::new();
         for interface in store.network_interfaces.values() {
             let addresses = interface_addresses_of(interface);
             let groups = interface_group_ids(interface);
+            // The network this interface is IN, which is the network every address it holds
+            // is reached through: the interface's own `VpcId`, else the VPC of the subnet it
+            // was created in (`NetworkInterface$SubnetId`).
+            let network = interface.vpc_id.clone().or_else(|| {
+                interface
+                    .subnet_id
+                    .as_deref()
+                    .and_then(|subnet_id| store.subnets.get(subnet_id))
+                    .and_then(|subnet| subnet.vpc_id.clone())
+            });
             if let Some(id) = interface.network_interface_id.clone() {
                 interface_addresses.insert(id, addresses.clone());
             }
@@ -711,10 +727,43 @@ fn observe_all<Eng: Send + Sync + 'static>(
             for address in addresses {
                 // An address is held by one interface, so the groups of the interface holding
                 // it are the groups governing traffic to it.
-                interface_groups.entry(address).or_insert_with(|| groups.clone());
+                interface_groups
+                    .entry(address.clone())
+                    .or_insert_with(|| groups.clone());
+                // And the networks holding it are the networks of the interfaces holding it:
+                // a check arrives if ONE of them is the network it is performed in
+                // ([`super::health_check_delivery`]).
+                if let Some(network) = network.clone() {
+                    interface_networks.entry(address).or_default().push(network);
+                }
             }
         }
         Inventory {
+            interface_networks,
+            // The pairs of VPCs an ACTIVE peering joins, which is what makes a check from one
+            // of them reach an address the other holds
+            // ([`super::health_check_delivery`]). Only an active one carries traffic.
+            vpc_peerings: store
+                .vpc_peering_connections
+                .values()
+                .filter(|record| {
+                    record
+                        .view
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.code.as_deref())
+                        == Some(ec2::VPC_PEERING_CONNECTION_STATE_ACTIVE)
+                })
+                .filter_map(|record| {
+                    let side = |info: &Option<ec2_types::VpcPeeringConnectionVpcInfo>| {
+                        info.as_ref().and_then(|info| info.vpc_id.clone())
+                    };
+                    Some((
+                        side(&record.view.requester_vpc_info)?,
+                        side(&record.view.accepter_vpc_info)?,
+                    ))
+                })
+                .collect(),
             vpcs: store.vpcs.keys().cloned().collect(),
             addresses: store
                 .network_interfaces
@@ -775,6 +824,15 @@ struct Inventory {
     /// The security groups of the interface holding each address, keyed by that address:
     /// the rules that decide whether a check of a target at it may arrive.
     interface_groups: HashMap<String, Vec<String>>,
+    /// The VPC of each interface holding an address, keyed by that address: the networks a
+    /// check of a target at it would have to be performed IN to arrive
+    /// ([`super::health_check_delivery`]). An address absent from this is one no interface of
+    /// the account holds, whose network is therefore not known.
+    interface_networks: HashMap<String, Vec<String>>,
+    /// The two VPCs of every ACTIVE VPC peering connection of the account: the pairs a check
+    /// performed in one of them can be carried over to the other
+    /// ([`super::health_check_delivery`]).
+    vpc_peerings: Vec<(String, String)>,
     /// The addresses each network interface holds, keyed by `NetworkInterfaceId` — read for
     /// the load balancer's OWN interfaces, which is where its checks come from.
     interface_addresses: HashMap<String, Vec<String>>,
@@ -815,6 +873,24 @@ impl Inventory {
         }
         .map(Vec::as_slice)
     }
+
+    /// The networks a health check performed in `group_vpc` can be carried over: that VPC
+    /// itself, and every one an ACTIVE peering joins to it
+    /// ([`super::health_check_delivery`]).
+    ///
+    /// Bounded by the peerings the account HOLDS, which is what the pass already read, so
+    /// this costs no more than one walk of them per checked registration.
+    fn networks_reaching(&self, group_vpc: &str) -> Vec<String> {
+        let mut reaching = vec![group_vpc.to_string()];
+        for (requester, accepter) in &self.vpc_peerings {
+            if requester == group_vpc {
+                reaching.push(accepter.clone());
+            } else if accepter == group_vpc {
+                reaching.push(requester.clone());
+            }
+        }
+        reaching
+    }
 }
 
 /// What one check of `target` observed, given what the account's EC2 inventory holds — see
@@ -841,6 +917,15 @@ fn observe(target: &Checked, held: Option<&Inventory>) -> Observation {
         // the target, for the same reason the port is.
         return Some(false);
     }
+    if held.is_some_and(|held| health_check_crosses_networks(target, held)) {
+        // The check is a connection from the load balancer's own subnets, which are in the
+        // network the target group names, and the address this registration names is held in
+        // a network that one does not reach: nothing carries a check there, whatever stands
+        // behind the registration ([`super::health_check_delivery`]). Read beside the two
+        // conditions above, and for the same reason — a check that cannot be delivered
+        // answers nothing.
+        return Some(false);
+    }
     if target.scheduled {
         // The workload another service's scheduler registered this target for runs in this
         // emulator, and that is what stands behind the registration.
@@ -857,6 +942,31 @@ fn observe(target: &Checked, held: Option<&Inventory>) -> Observation {
         // service does not read is one no check here observes anything about.
         _ => None,
     }
+}
+
+/// Whether the account's EC2 inventory says a check of this registration would have to leave
+/// the networks the one it is performed in reaches — the VPC the target group names and the
+/// ones an active peering joins to it — because the address the registration names is held in
+/// another one ([`super::health_check_delivery`]).
+///
+/// Only a registration that names an ADDRESS is read: see that module for why an `instance`
+/// and a `lambda` registration are not.
+fn health_check_crosses_networks(target: &Checked, held: &Inventory) -> bool {
+    if target.target_type != IP_TARGET_TYPE {
+        return false;
+    }
+    let Some(group_vpc) = target.vpc_id.as_deref() else {
+        return false;
+    };
+    let networks = held
+        .interface_networks
+        .get(&target.id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    super::health_check_delivery::check_crosses_networks(
+        &held.networks_reaching(group_vpc),
+        networks,
+    )
 }
 
 /// Whether the security groups governing what this registration names are known to admit NO
