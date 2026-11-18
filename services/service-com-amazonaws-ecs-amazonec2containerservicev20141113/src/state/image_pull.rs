@@ -34,17 +34,28 @@
 //!      not an AWS service and publishes no endpoint, so an image held in one needs the
 //!      internet.
 //!
-//! 2. **an image the registry serves to this task's principal**, for an image reference
-//!    that names a repository of this account's Amazon ECR registry. Amazon ECS pulls it as
-//!    the task's EXECUTION ROLE — "the task execution role that grants the Amazon ECS
-//!    container agent permission to make Amazon Web Services API calls on your behalf"
-//!    (`TaskDefinition$executionRoleArn`) — so the registry decides the pull over the
-//!    policies in force on that role and its own repository policy, resolves the reference,
-//!    and caches the upstream image when a pull through cache rule covers the repository
-//!    ([`::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull`]).
-//!    A reference that names another registry — a public one, or a bare name a container
-//!    runtime resolves against Docker Hub — is not this registry's to answer, so nothing
-//!    beyond the path above is decided for it.
+//! 2. **an image the registry it names serves**, for an image reference that names a
+//!    registry this emulator HOLDS, which is either of two:
+//!
+//!    * a repository of this account's AMAZON ECR private registry, which Amazon ECS pulls
+//!      from as the task's EXECUTION ROLE — "the task execution role that grants the Amazon
+//!      ECS container agent permission to make Amazon Web Services API calls on your behalf"
+//!      (`TaskDefinition$executionRoleArn`) — so that registry decides the pull over the
+//!      policies in force on that role and its own repository policy, resolves the
+//!      reference, and caches the upstream image when a pull through cache rule covers the
+//!      repository
+//!      ([`::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull`]);
+//!    * a repository under the registry ALIAS of the one public gallery this emulator
+//!      serves, which resolves the reference against the repositories and tags it holds
+//!      ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull`]).
+//!
+//!    Either way the registry that holds the image is the one that answers, and the manifest
+//!    digest it resolved is what the container reports for the image it ran
+//!    (`Container$imageDigest`). A reference naming any OTHER registry — an alias that
+//!    gallery was not assigned, which names another public registry, another registry
+//!    altogether, or a bare name a container runtime resolves against Docker Hub — is no
+//!    registry's here to answer, so nothing beyond the path above is decided for it and no
+//!    digest is known for it.
 //!
 //! The pull is attempted at LAUNCH, by the call that places the task: the instants it took
 //! are recorded on the task (`Task$pullStartedAt`/`pullStoppedAt`) and a failure with them
@@ -176,11 +187,31 @@ pub fn pull_access_denied_message(image: &str, refusal: &str) -> String {
     )
 }
 
+/// How many times the container agent retried the image MANIFEST fetch before it reported
+/// the failure, which is the count its account of a reference that resolves to nothing
+/// carries ([`image_not_found_message`]).
+///
+/// A reference the registry ANSWERS for — it holds no such repository, and no such tag or
+/// digest in one it does hold — resolves to nothing however often it is asked, so the fetch
+/// is retried until the agent's whole retry budget is spent and that budget is what the
+/// failure reports. The number is the agent's own, not a quota of the API: between two such
+/// failures what differs is the reference, not the count.
+const MANIFEST_FETCH_RETRIES: u32 = 7;
+
 /// The `stoppedReason` of a task whose image the registry holds nothing for: the same
-/// class, with the condition the runtime words for a reference that resolves to no content
-/// and the registry's own account of what it does not hold.
-pub fn image_not_found_message(image: &str, refusal: &str) -> String {
-    format!("CannotPullContainerError: failed to resolve ref {image}: not found: {refusal}")
+/// class, with the condition the container runtime words for a reference that resolves to
+/// no content.
+///
+/// The image's MANIFEST is what is fetched first, and the agent retries that fetch before it
+/// gives up ([`MANIFEST_FETCH_RETRIES`]); the runtime then names the reference it could not
+/// resolve twice — once as the reference the fetch asked for, and once as the answer the
+/// registry gave about it, which for a reference that resolves to nothing is that same
+/// reference and `not found`.
+pub fn image_not_found_message(image: &str) -> String {
+    format!(
+        "CannotPullContainerError: pull image manifest has been retried \
+         {MANIFEST_FETCH_RETRIES} time(s): failed to resolve ref {image}: {image}: not found"
+    )
 }
 
 /// The REGISTRY an image reference is fetched from: the part before the first `/` when
@@ -223,26 +254,28 @@ pub fn evaluate_image_pulls<Eng: Send + Sync + 'static>(engine: &Eng) {
     }
     // The network half, under the Amazon EC2 store's lock alone: every launch is answered
     // in one pass, so the lock is taken once however many tasks were placed.
-    let mut failures: Vec<(String, Option<String>)> = match ::service_com_amazonaws_ec2_amazonec2::state::service_state(engine) {
+    let mut failures: Vec<ImagePullVerdict> = match ::service_com_amazonaws_ec2_amazonec2::state::service_state(engine) {
         Some(ec2) => {
             let store = ec2.lock();
             launches
                 .iter()
-                .map(|launch| (launch.task_arn.clone(), unfetchable_image(&store, launch)))
+                .map(|launch| ImagePullVerdict::of(launch, unfetchable_image(&store, launch)))
                 .collect()
         }
         None => launches
             .iter()
-            .map(|launch| (launch.task_arn.clone(), None))
+            .map(|launch| ImagePullVerdict::of(launch, None))
             .collect(),
     };
     // The registry half, with no lock of this service's or Amazon EC2's held: the registry
     // answers each pull itself, which is also what imports an upstream image through a pull
-    // through cache rule.
+    // through cache rule, and states the digest of the manifest it resolved.
     let now = SystemTime::now();
-    for (launch, failure) in launches.iter().zip(failures.iter_mut()) {
-        if failure.1.is_none() {
-            failure.1 = unservable_image(engine, launch, now);
+    for (launch, verdict) in launches.iter().zip(failures.iter_mut()) {
+        if verdict.failure.is_none() {
+            let (failure, digests) = fetch_launch_images(engine, launch, now);
+            verdict.failure = failure;
+            verdict.image_digests = digests;
         }
     }
     // The SECRETS the agent fetches for the task's containers, in the same step and as the
@@ -251,8 +284,8 @@ pub fn evaluate_image_pulls<Eng: Send + Sync + 'static>(engine: &Eng) {
     // as one that cannot fetch an image does ([`super::container_secrets`]). Decided after
     // the images, with no lock held: the verdict is the owning service's.
     for (launch, failure) in launches.iter().zip(failures.iter_mut()) {
-        if failure.1.is_none() {
-            failure.1 = unretrievable_secret(engine, launch);
+        if failure.failure.is_none() {
+            failure.failure = unretrievable_secret(engine, launch);
         }
     }
     // The LOGGER each container's `awslogs` configuration describes, which the agent
@@ -262,48 +295,136 @@ pub fn evaluate_image_pulls<Eng: Send + Sync + 'static>(engine: &Eng) {
     // retrieves the task's resources and then creates each container, and with no lock held:
     // the verdict is the owning service's.
     for (launch, failure) in launches.iter().zip(failures.iter_mut()) {
-        if failure.1.is_none() {
-            failure.1 = uninitialisable_logger(engine, launch);
+        if failure.failure.is_none() {
+            failure.failure = uninitialisable_logger(engine, launch);
         }
     }
     state.lock().record_image_pulls(&failures, now);
 }
 
-/// Why the images of `launch` are not served to the task's execution role by this account's
-/// Amazon ECR registry — the `stoppedReason` of the first image it will not serve — or
-/// `None` when every image is served, or names a registry this one does not answer for.
+/// What the image fetch of ONE launched task answered: why its containers could not be
+/// fetched, and the manifest digest of each image that WAS fetched.
+#[derive(Debug, Clone)]
+pub struct ImagePullVerdict {
+    /// The task the verdict belongs to.
+    pub task_arn: String,
+    /// The `stoppedReason` of the stop a task whose containers could not be fetched earns,
+    /// and `None` when nothing was decided against the fetch.
+    pub failure: Option<String>,
+    /// `(image reference, manifest digest)` for each of the task's images a registry this
+    /// emulator holds served: `Container$imageDigest` is "The container image manifest
+    /// digest", and the registry that served the pull is what states it.
+    pub image_digests: Vec<(String, String)>,
+}
+
+impl ImagePullVerdict {
+    /// The verdict of `launch` with `failure` recorded and no image fetched yet.
+    fn of(launch: &TaskLaunch, failure: Option<String>) -> Self {
+        Self {
+            task_arn: launch.task_arn.clone(),
+            failure,
+            image_digests: Vec::new(),
+        }
+    }
+}
+
+/// Fetch each image of `launch` from the registry its reference names, and answer what that
+/// took: why the FIRST image a registry this emulator holds would not serve could not be
+/// fetched, and the manifest digest of each image that was served.
 ///
-/// The pull itself is Amazon ECR's: it decides the authorization, resolves the reference and
-/// caches an upstream image where a pull through cache rule covers the repository, which is
-/// why the import happens on the FIRST pull of such a reference and is visible to every
-/// later read of that repository.
-fn unservable_image<Eng: Send + Sync + 'static>(
+/// Two registries are this emulator's to answer for, and an image reference names one of
+/// them by its host (the module docs stand this on what each registry documents):
+///
+/// * this account's AMAZON ECR private registry, which decides the authorization, resolves
+///   the reference and caches an upstream image where a pull through cache rule covers the
+///   repository — which is why the import happens on the FIRST pull of such a reference and
+///   is visible to every later read of that repository;
+/// * the one public gallery this emulator serves, which resolves a reference into ITS OWN
+///   registry alias against the repositories and tags it holds.
+///
+/// Nothing else is decided: a reference naming an alias that gallery was not assigned names
+/// another public registry, and one naming any other registry — or a bare name a container
+/// runtime resolves against Docker Hub — names a registry this emulator does not hold, so
+/// neither is evidence about an image and the network path above is all that was decided for
+/// it.
+fn fetch_launch_images<Eng: Send + Sync + 'static>(
     engine: &Eng,
     launch: &TaskLaunch,
     now: SystemTime,
-) -> Option<String> {
-    use ::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull;
+) -> (Option<String>, Vec<(String, String)>) {
+    let mut digests: Vec<(String, String)> = Vec::new();
+    for image in &launch.images {
+        match fetch_image(engine, launch, image, now) {
+            ImageFetch::Undecided => {}
+            ImageFetch::Served(digest) => {
+                if let Some(digest) = digest {
+                    digests.push((image.clone(), digest));
+                }
+            }
+            // The first image that cannot be fetched is what stops the task: its containers
+            // are not started, so the images after it are not fetched either.
+            ImageFetch::Refused(reason) => return (Some(reason), digests),
+        }
+    }
+    (None, digests)
+}
 
-    launch.images.iter().find_map(|image| {
-        // A reference naming another registry is not this one's to serve: whether it can be
-        // fetched was decided by the path above.
-        let addressed = reference_into_this_registry(image, &launch.task_arn);
-        let reference = registry_pull::parse_reference(&addressed)?;
-        match registry_pull::serve_pull(
+/// What the fetch of ONE image reference answered.
+enum ImageFetch {
+    /// A registry this emulator holds served the reference, under the manifest digest it
+    /// resolved it to — `None` where that registry states no digest for it.
+    Served(Option<String>),
+    /// The reference names no registry this emulator holds, so nothing is decided about it.
+    Undecided,
+    /// A registry this emulator holds would not serve it: the `stoppedReason` of the stop
+    /// the task earns.
+    Refused(String),
+}
+
+/// What the fetch of ONE of `launch`'s image references answered ([`fetch_launch_images`]
+/// for which registries are answered for).
+fn fetch_image<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    launch: &TaskLaunch,
+    image: &str,
+    now: SystemTime,
+) -> ImageFetch {
+    use ::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull;
+    use ::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull;
+
+    let addressed = reference_into_this_registry(image, &launch.task_arn);
+    if let Some(reference) = registry_pull::parse_reference(&addressed) {
+        return match registry_pull::serve_pull(
             engine,
             &reference,
             launch.execution_role_arn.as_deref(),
             now,
         ) {
-            Ok(_) => None,
+            Ok(digest) => ImageFetch::Served(digest),
             Err(registry_pull::PullRefusal::NotAuthorized { message, .. }) => {
-                Some(pull_access_denied_message(image, &message))
+                ImageFetch::Refused(pull_access_denied_message(image, &message))
             }
-            Err(registry_pull::PullRefusal::NotFound { message }) => {
-                Some(image_not_found_message(image, &message))
+            Err(registry_pull::PullRefusal::NotFound { .. }) => {
+                ImageFetch::Refused(image_not_found_message(image))
+            }
+        };
+    }
+    // The public gallery answers for the alias it was ASSIGNED: the pull is a question for
+    // the registry the reference names, and an alias this gallery was not given names a
+    // registry this emulator does not hold.
+    match gallery_pull::parse_gallery_reference(image) {
+        Some(reference)
+            if gallery_pull::serves_registry_alias(engine, &reference.registry_alias) =>
+        {
+            match gallery_pull::serve_pull(engine, &reference) {
+                Ok(digest) => ImageFetch::Served(digest),
+                Err(gallery_pull::GalleryPullRefusal::NotFound { .. }) => {
+                    ImageFetch::Refused(image_not_found_message(image))
+                }
             }
         }
-    })
+        _ => ImageFetch::Undecided,
+    }
 }
 
 /// The reference `image` makes into AMAZON ECR, in the AWS-hosted spelling that registry's
@@ -640,10 +761,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ///
     /// Only a task that is still on its way UP takes a FAILURE: one that has started has
     /// already fetched its images, and one that is stopping is on its way out either way.
-    pub fn record_image_pulls(&mut self, verdicts: &[(String, Option<String>)], now: SystemTime) {
+    ///
+    /// Each container whose image the fetch RESOLVED reports the manifest digest the registry
+    /// resolved it to: `Container$imageDigest` is "The container image manifest digest",
+    /// which is known from the pull on — and stays absent for an image no registry here
+    /// resolved, because no manifest of it was fetched to digest.
+    pub fn record_image_pulls(&mut self, verdicts: &[ImagePullVerdict], now: SystemTime) {
         let at = DateTime::from(now);
-        for (task_arn, failure) in verdicts {
-            if let Some(task) = self.tasks.get_mut(task_arn) {
+        for verdict in verdicts {
+            if let Some(task) = self.tasks.get_mut(&verdict.task_arn) {
                 if task.pull_started_at.is_some() || task.desired_status != STATUS_RUNNING {
                     continue;
                 }
@@ -656,9 +782,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 let task_id = task.task_id.clone();
                 for container in &mut task.containers {
                     container.report_runtime_id(&task_id);
+                    if let Some((_, digest)) = verdict
+                        .image_digests
+                        .iter()
+                        .find(|(image, _)| Some(image.as_str()) == container.image.as_deref())
+                    {
+                        container.image_digest = Some(digest.clone());
+                    }
                 }
                 if task.launch_failure.is_none() && task.is_pending() {
-                    task.launch_failure = failure.clone();
+                    task.launch_failure = verdict.failure.clone();
                 }
             }
         }

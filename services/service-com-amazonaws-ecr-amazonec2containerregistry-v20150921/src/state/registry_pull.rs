@@ -152,9 +152,12 @@ pub enum PullRefusal {
 /// against. `now` is the instant the pull is made at, which is what an imported image
 /// records as its push instant.
 ///
-/// What the pull SERVED — the manifest and its digest — stays in this registry, where every
-/// read of the repository reports it; the caller is told only whether it was served, because
-/// that is what decides whether the container it is pulling for can start.
+/// What the pull SERVED — the manifest the registry resolved the reference to, reported as
+/// its DIGEST, which is the image's identity in this registry and what a compute service
+/// pulling for a container reports for it (`Container$imageDigest` in Amazon ECS is "The
+/// container image manifest digest"). `None` comes back where no store of this service is
+/// there to resolve one. The manifest itself stays in this registry, where every read of the
+/// repository reports it.
 ///
 /// A WRITE, and only through the import: a pull of an image this registry already holds
 /// changes nothing a later caller sees.
@@ -163,20 +166,20 @@ pub fn serve_pull<Eng: Send + Sync + 'static>(
     reference: &RegistryReference,
     principal: Option<&str>,
     now: SystemTime,
-) -> Result<(), PullRefusal> {
+) -> Result<Option<String>, PullRefusal> {
     if let Some(refusal) = withheld_pull(engine, reference, principal) {
         return Err(refusal);
     }
     let Some(state) = service_state(engine) else {
         // No store of this service to ask: nothing is known about the image, so the pull
         // is not refused on it.
-        return Ok(());
+        return Ok(None);
     };
     let mut store = state.lock();
     let identifier = reference.identifier();
     if let Ok(repository) = store.repository(&reference.region, &reference.repository_name) {
-        if repository.lookup_image(&identifier).is_ok() {
-            return Ok(());
+        if let Ok(image) = repository.lookup_image(&identifier) {
+            return Ok(Some(image.digest.clone()));
         }
     }
     match import_covered_image(
@@ -186,7 +189,7 @@ pub fn serve_pull<Eng: Send + Sync + 'static>(
         reference.tag.as_deref(),
         now,
     ) {
-        CacheImport::Imported(_) => Ok(()),
+        CacheImport::Imported(digest) => Ok(Some(digest)),
         // A rule covers the repository and nothing was cached through it: the container
         // cannot start either way, and what it is told is why.
         CacheImport::Unavailable(message) | CacheImport::AtCapacity(message) => {

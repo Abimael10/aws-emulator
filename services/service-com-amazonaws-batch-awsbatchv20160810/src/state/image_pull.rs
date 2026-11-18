@@ -202,7 +202,7 @@ pub fn settle_job_image_fetches<Eng: Send + Sync + 'static>(engine: &Eng) {
                     fetch.execution_role_arn.as_deref(),
                     now,
                 ) {
-                    Ok(()) => ImageFetch::Served,
+                    Ok(_) => ImageFetch::Served,
                     Err(registry_pull::PullRefusal::NotAuthorized { message, .. }) => {
                         ImageFetch::Refused(pull_access_denied_message(&fetch.image, &message))
                     }
@@ -212,7 +212,7 @@ pub fn settle_job_image_fetches<Eng: Send + Sync + 'static>(engine: &Eng) {
                 }
             } else if let Some(reference) = gallery_pull::parse_gallery_reference(&fetch.image) {
                 match gallery_pull::serve_pull(engine, &reference) {
-                    Ok(()) => ImageFetch::Served,
+                    Ok(_) => ImageFetch::Served,
                     Err(gallery_pull::GalleryPullRefusal::NotFound { message }) => {
                         ImageFetch::Refused(cannot_pull_image_message(&fetch.image, &message))
                     }

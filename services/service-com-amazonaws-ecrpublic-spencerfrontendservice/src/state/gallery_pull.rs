@@ -130,8 +130,29 @@ pub enum GalleryPullRefusal {
     },
 }
 
-/// Serve the pull of `reference` from this gallery: `Ok(())` when the registry holds the image
-/// the reference names, and the refusal it words otherwise.
+/// Whether `registry_alias` is the alias THIS gallery was assigned, which is what makes a
+/// reference carrying it one this registry has an answer for.
+///
+/// An alias this registry was not assigned names some other public registry (see the module
+/// docs), so a caller deciding a pull for a container it is about to start reads this first:
+/// what this gallery holds decides a reference into THIS gallery, while a reference into a
+/// registry this emulator does not hold is not its to answer at all. An engine carrying no
+/// gallery store has no registry here for any alias to name.
+#[must_use]
+pub fn serves_registry_alias<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    registry_alias: &str,
+) -> bool {
+    service_state(engine).is_some_and(|state| state.lock().is_this_registry(registry_alias))
+}
+
+/// Serve the pull of `reference` from this gallery: the manifest DIGEST the registry resolved
+/// it to when it holds the image the reference names, and the refusal it words otherwise.
+///
+/// The digest is what this registry stored the manifest under, so a compute service pulling
+/// for a container reports the image it really fetched (`Container$imageDigest` in Amazon ECS
+/// is "The container image manifest digest"). `None` comes back where no store of this
+/// service is there to resolve one.
 ///
 /// A READ — nothing about the registry changes — so a caller may decide a pull for a container
 /// it is about to start without changing what a later reader sees. An engine carrying no
@@ -139,9 +160,9 @@ pub enum GalleryPullRefusal {
 pub fn serve_pull<Eng: Send + Sync + 'static>(
     engine: &Eng,
     reference: &GalleryReference,
-) -> Result<(), GalleryPullRefusal> {
+) -> Result<Option<String>, GalleryPullRefusal> {
     let Some(state) = service_state(engine) else {
-        return Ok(());
+        return Ok(None);
     };
     let store = state.lock();
     if !store.is_this_registry(&reference.registry_alias) {
@@ -163,7 +184,7 @@ pub fn serve_pull<Eng: Send + Sync + 'static>(
     };
     repository
         .resolve_identifier(&reference.identifier())
-        .map(|_| ())
+        .map(|image| Some(image.digest.clone()))
         .map_err(|problem| GalleryPullRefusal::NotFound {
             message: format!(
                 "{}: {}",

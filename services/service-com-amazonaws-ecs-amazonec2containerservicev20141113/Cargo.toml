@@ -47,6 +47,13 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # answered by the service that owns them rather than by a copy kept here. No cycle: that
 # crate does not depend on this one.
 service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = true }
+# The Amazon ECR Public service, which SERVES that same pull for a reference into the public
+# gallery it holds (`crate::state::evaluate_image_pulls` ->
+# `…ecrpublic…::state::gallery_pull::serve_pull`). Its registry alias, repositories and image
+# tags are that service's own resources, held in its own store in the shared engine, so a
+# reference addressing the gallery is answered by the service that owns it rather than by a
+# copy kept here. No cycle: that crate does not depend on this one.
+service-com-amazonaws-ecrpublic-spencerfrontendservice = { workspace = true }
 # IAM, for ONE read of the roles a launched task runs under — its execution role and its task
 # role: whether the trust policy each carries lets this service's own service principal assume
 # it, which decides whether Amazon ECS can act under the role and so launch the task at all

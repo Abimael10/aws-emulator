@@ -13675,6 +13675,7 @@ dependencies = [
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-ecr-amazonec2containerregistry-v20150921",
+ "service-com-amazonaws-ecrpublic-spencerfrontendservice",
  "service-com-amazonaws-efs-magnolioapiservice-v20150201",
  "service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7",
  "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
