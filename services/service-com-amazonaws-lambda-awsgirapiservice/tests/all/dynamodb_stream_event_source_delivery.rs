@@ -501,7 +501,11 @@ pub(crate) async fn results_until(
 }
 
 /// How many invocations CloudWatch holds for `function`, summed over a window around now.
-async fn invocation_count(router: &MultiServiceRouter, case: &str, function: &str) -> f64 {
+pub(crate) async fn invocation_count(
+    router: &MultiServiceRouter,
+    case: &str,
+    function: &str,
+) -> f64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

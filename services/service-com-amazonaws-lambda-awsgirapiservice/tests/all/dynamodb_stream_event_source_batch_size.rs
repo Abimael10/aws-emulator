@@ -42,7 +42,7 @@ use crate::dynamodb_stream_event_source_delivery::{
 
 /// The key of the one row the handler counts its invocations on. Nothing in the emulator
 /// reads it: the handler writes it and the assertions read it back through DynamoDB.
-const COUNTER: &str = "batch-attempts";
+pub(crate) const COUNTER: &str = "batch-attempts";
 
 /// The prefix of the per-record rows the handler writes, one per delivered stream record.
 const RECORD_PREFIX: &str = "rec-";
@@ -54,7 +54,7 @@ const BATCH_SIZE_ATTRIBUTE: &str = "batch_size";
 const KEY_ID_ATTRIBUTE: &str = "key_id";
 
 /// The attribute the counter row counts invocations under.
-const ATTEMPTS_ATTRIBUTE: &str = "attempts";
+pub(crate) const ATTEMPTS_ATTRIBUTE: &str = "attempts";
 
 /// The handler every row runs: for each record of the batch it was handed it writes one row
 /// keyed on that record's `eventID`, carrying the batch's size and the changed item's key,
@@ -64,7 +64,7 @@ const ATTEMPTS_ATTRIBUTE: &str = "attempts";
 /// DELIVERED rather than of the invocations made: a record handed over twice (which the
 /// contract allows) writes the same row again, while a record the mapping invented or split
 /// would show up as a row of its own.
-fn observing_handler() -> String {
+pub(crate) fn observing_handler() -> String {
     format!(
         r##"
 import os
@@ -108,7 +108,11 @@ def lambda_handler(event, context):
 }
 
 /// Everything the observation table holds, read where a client reads it.
-async fn observations(router: &MultiServiceRouter, case: &str, table: &str) -> Vec<Value> {
+pub(crate) async fn observations(
+    router: &MultiServiceRouter,
+    case: &str,
+    table: &str,
+) -> Vec<Value> {
     let (status, read) = dynamodb(router, "Scan", &json!({ "TableName": table })).await;
     assert_eq!(status, 200, "case {case:?}: Scan answered {status} {read}");
     assert!(
@@ -119,7 +123,7 @@ async fn observations(router: &MultiServiceRouter, case: &str, table: &str) -> V
 }
 
 /// The per-record rows of `items`, which are the stream records that were delivered.
-fn delivered(items: &[Value]) -> Vec<&Value> {
+pub(crate) fn delivered(items: &[Value]) -> Vec<&Value> {
     items
         .iter()
         .filter(|item| {
@@ -132,7 +136,7 @@ fn delivered(items: &[Value]) -> Vec<&Value> {
 
 /// Wait until the handler has recorded at least `expected` delivered records, answering
 /// everything the observation table then holds.
-async fn wait_for_delivery(
+pub(crate) async fn wait_for_delivery(
     router: &MultiServiceRouter,
     case: &str,
     table: &str,
