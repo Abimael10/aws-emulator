@@ -699,16 +699,11 @@ pub(super) fn instance_network_interface_view(
             public_dns_name: association.public_dns_name.clone(),
             public_ip: association.public_ip.clone(),
         };
-    // The same association as the private ADDRESS it is bound to reports it: the addressing
-    // members alone. The public DNS name belongs to the interface — it is reported once, by
-    // the interface's own association, and by the instance as its `dnsName` — so a per-address
-    // association carries none, and a client walking the addresses reads a name against the
-    // interface rather than against every address of it.
-    let address_association =
-        |association: &NetworkInterfaceAssociation| InstanceNetworkInterfaceAssociation {
-            public_dns_name: None,
-            ..interface_association(association)
-        };
+    // The same association as the INTERFACE reports: a public address is bound to one
+    // private address of the interface, and AWS reports it against both — the interface and
+    // that private address — with the same addressing members, the public hostname included.
+    // So the one stored association is projected once and read the same way wherever a
+    // client walks to it.
     InstanceNetworkInterface {
         association: interface.association.as_ref().map(interface_association),
         attachment: Some(InstanceNetworkInterfaceAttachment {
@@ -743,7 +738,7 @@ pub(super) fn instance_network_interface_view(
             addresses
                 .iter()
                 .map(|address| InstancePrivateIpAddress {
-                    association: address.association.as_ref().map(address_association),
+                    association: address.association.as_ref().map(interface_association),
                     primary: address.primary,
                     private_dns_name: address.private_dns_name.clone(),
                     private_ip_address: address.private_ip_address.clone(),

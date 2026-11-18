@@ -2257,18 +2257,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// belongs to is no longer one of the instance's — the same reading
     /// [`Self::network_interface_attachment`] takes.
     pub fn instance_network_interfaces(&self, instance_id: &str) -> Vec<InstanceNetworkInterface> {
-        let Some(held) = self.network_interfaces_by_instance.get(instance_id) else {
-            return Vec::new();
-        };
-        let mut attached: Vec<(i32, InstanceNetworkInterface)> = held
-            .iter()
-            .filter_map(|network_interface_id| {
-                let interface = self.network_interfaces.get(network_interface_id)?;
-                let attachment = interface
-                    .attachment
-                    .as_ref()
-                    .filter(|attachment| !attachment_is_detached(attachment))
-                    .filter(|attachment| attachment.instance_id.as_deref() == Some(instance_id))?;
+        let mut attached: Vec<(i32, InstanceNetworkInterface)> = self
+            .attached_network_interface_records(instance_id)
+            .into_iter()
+            .filter_map(|interface| {
+                let attachment = interface.attachment.as_ref()?;
                 Some((
                     attachment.device_index.unwrap_or_default(),
                     instance_network_interface_view(interface, attachment),
@@ -2644,6 +2637,17 @@ impl ComAmazonawsEc2Amazonec2State {
             // that are in one.
             "vpc-id" => single(self.instance_vpc_id_of(instance, attached)),
             "tag-key" => Some(instance.tags.keys().cloned().collect()),
+            // "tag-value - The value of a tag assigned to the resource": the values of the
+            // instance's own tags, the companion of `tag-key` beside it.
+            "tag-value" => Some(instance.tags.values().cloned().collect()),
+            // "group-id" and "group-name": the EC2-Classic group filters, which read a
+            // reservation's own group list (`Reservation$Groups`) — the member AWS documents
+            // as "not supported" and which every reservation of this store reports EMPTY,
+            // because a VPC instance's groups live on its primary network interface and are
+            // filtered by `instance.group-id` / `instance.group-name` above. So a request
+            // naming one is answered with the instances it selects, which is none, rather
+            // than refused.
+            "group-id" | "group-name" => Some(Vec::new()),
             // The `network-interface.*` family: the members of the interfaces attached to
             // this instance, each read off the SAME projection the instance report carries
             // ([`Self::instance_network_interfaces`]), so a filter cannot select on
@@ -2838,15 +2842,32 @@ impl ComAmazonawsEc2Amazonec2State {
         let needs_interfaces = filters
             .iter()
             .any(|filter| filter_reads_network_interfaces(&filter.name));
-        let attached = if needs_interfaces {
-            let held = self.instance_network_interfaces(&instance.instance_id);
-            if !budget.spend_steps(u64::try_from(held.len()).unwrap_or(u64::MAX)) {
-                return false;
-            }
-            held
-        } else {
-            Vec::new()
+        // And the instance's own REPORT, for the filters answered off it
+        // ([`filter_reads_instance_report`]): projected ONCE per instance here, like the
+        // interfaces above and charged like them, because a projection per filter would
+        // multiply the store's ceilings by the filter count. A request whose filters all read
+        // the stored record pays for no projection at all.
+        let reported = filters
+            .iter()
+            .any(|filter| filter_reads_instance_report(&filter.name))
+            .then(|| self.instance_view(instance));
+        let attached = match &reported {
+            // The report already carries this instance's interfaces, projected from the same
+            // store, so the record-based filters read them off it rather than scanning for
+            // them a second time.
+            Some(view) => view.network_interfaces.clone().unwrap_or_default(),
+            None if needs_interfaces => self.instance_network_interfaces(&instance.instance_id),
+            None => Vec::new(),
         };
+        // The interfaces, and the whole report's own projection, are each charged to the same
+        // budget: the report costs more than one interface to assemble, so it is charged a
+        // step of its own beside them, and the PRODUCT of stored instances and filters stays
+        // bounded however the caller combines them.
+        let projections = u64::from(reported.is_some())
+            .saturating_add(u64::try_from(attached.len()).unwrap_or(u64::MAX));
+        if !budget.spend_steps(projections) {
+            return false;
+        }
         filters.iter().all(|filter| {
             // One step per FILTER as well as per candidate, so the filter count cannot
             // multiply this instance's projections for free however many filters one
@@ -2854,9 +2875,22 @@ impl ComAmazonawsEc2Amazonec2State {
             if !budget.spend() {
                 return false;
             }
-            let Some(held) = self.filter_values(reservation, instance, &filter.name, &attached)
-            else {
-                return false;
+            let held = match self.filter_values(reservation, instance, &filter.name, &attached) {
+                Some(values) => values,
+                // A name the stored record does not resolve is one the REPORT answers, read
+                // off the projection made above.
+                None => {
+                    let Some(values) = reported.as_ref().and_then(|view| {
+                        self.reported_instance_filter_values(
+                            view,
+                            &instance.instance_id,
+                            &filter.name,
+                        )
+                    }) else {
+                        return false;
+                    };
+                    values
+                }
             };
             filter.patterns.iter().any(|pattern| {
                 held.iter()
@@ -2922,12 +2956,20 @@ impl CompiledFilter {
 
 /// Whether this slice resolves `name` as a `DescribeInstances` filter.
 ///
+/// The documented catalog: the names read off the stored record
+/// ([`SUPPORTED_INSTANCE_FILTERS`]) and those read off the instance report
+/// ([`REPORTED_INSTANCE_FILTERS`]). Every name EC2 documents for the operation is resolved —
+/// a request carrying one is answered with the instances whose value matches, and with an
+/// empty reservation set when none does — so only a name the operation does not document is
+/// refused.
+///
 /// A `tag:` prefix with no key names no tag, so it is as undocumented as any other
 /// misspelling — the same reading every other describe of this service takes.
 pub fn filter_name_supported(name: &str) -> bool {
     name.strip_prefix(TAG_FILTER_PREFIX)
         .is_some_and(|key| !key.is_empty())
         || SUPPORTED_INSTANCE_FILTERS.contains(&name)
+        || filter_reads_instance_report(name)
 }
 
 /// The Region an instance runs in: the Region of its own Availability Zone.

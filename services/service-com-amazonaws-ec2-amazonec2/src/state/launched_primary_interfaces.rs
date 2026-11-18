@@ -179,13 +179,13 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         // The address goes to the interface this created, out of Amazon's own pool, through
         // the one place such an address is assigned ([`Self::assign_amazon_public_ipv4`]) —
-        // so the instance, its interface's association and `DescribeNetworkInterfaces` all
-        // report the one record.
+        // which also gives the instance holding that interface the address as its own, so the
+        // instance, its interface's association and `DescribeNetworkInterfaces` all report
+        // the one record.
         if maps_public_ip_on_launch {
             if let Some(network_interface_id) = network_interface_id {
-                let assigned = self.assign_amazon_public_ipv4(&network_interface_id, &region);
+                self.assign_amazon_public_ipv4(&network_interface_id, &region);
                 if let Some(instance) = self.instances.get_mut(instance_id) {
-                    instance.public_ip = assigned;
                     // The address is Amazon's and belongs to the RUNNING instance: a stop
                     // releases it and a later start is given a fresh one
                     // ([`crate::state::instance_mapped_public_ipv4`]), which is what this

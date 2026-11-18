@@ -223,6 +223,20 @@ async fn a_stop_releases_the_mapped_public_address_and_a_start_assigns_a_new_one
         .await;
         element(&body, "subnetId").unwrap_or_default()
     };
+    // The public DNS name of a public address is the VPC's to give — "only available if
+    // you've enabled DNS hostnames for your VPC" (`Instance$PublicDnsName`), which a VPC a
+    // caller creates does not do until asked — so this VPC is asked to hand them out, and the
+    // rows below can read the name beside the address each one holds.
+    ok(
+        "the VPC's DNS hostnames",
+        &router,
+        "ModifyVpcAttribute",
+        &[
+            param("VpcId", &vpc_id),
+            param("EnableDnsHostnames.Value", "true"),
+        ],
+    )
+    .await;
 
     let rows: Vec<Row> = vec![
         Row {

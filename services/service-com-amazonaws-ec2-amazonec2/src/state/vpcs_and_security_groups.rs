@@ -9,6 +9,7 @@
 //! other primitive there.
 
 use super::*;
+use crate::ops::types::NetworkInterfaceAssociation;
 
 impl ComAmazonawsEc2Amazonec2State {
     /// Mint the next id for `prefix`, e.g. `vpc-00000000000000001`.
@@ -340,6 +341,96 @@ impl ComAmazonawsEc2Amazonec2State {
             // defaults AWS gives a VPC of that kind.
             VpcAttributes::for_vpc(vpc.is_default.unwrap_or(false))
         }))
+    }
+
+    /// Whether the VPC `vpc_id` hands the resources in it public DNS hostnames.
+    ///
+    /// "This name is only available if you've enabled DNS hostnames for your VPC"
+    /// (`Instance$PublicDnsName`): an Amazon public hostname is a property of the VPC's
+    /// `enableDnsHostnames` attribute and not of the address, so a VPC that hands out none —
+    /// which is every VPC a caller creates ([`VpcAttributes::for_vpc`]) — gives every public
+    /// address in it the EMPTY name. A resource this store holds no VPC for sits under no
+    /// VPC's DNS attributes at all, so it keeps the hostname of its address.
+    ///
+    /// A READ ONLY, and the ONE reading of that attribute every public-hostname report of
+    /// this crate takes.
+    pub fn vpc_hands_out_public_hostnames(&self, vpc_id: Option<&str>) -> bool {
+        vpc_id.is_none_or(|vpc_id| {
+            self.vpc_attributes_of(vpc_id)
+                .is_none_or(|attributes| attributes.enable_dns_hostnames)
+        })
+    }
+
+    /// The public DNS name a resource in the VPC `vpc_id` has for the public IPv4 address
+    /// `public_ip`, as every report of such a name carries it.
+    ///
+    /// [`Self::vpc_hands_out_public_hostnames`] applied to [`public_hostname`]: the hostname
+    /// of the address where that VPC hands out hostnames, and the empty name where it does
+    /// not. What the instance's own `dnsName`, its interface's `publicDnsName` and the
+    /// association on the interface and on the private address the public one is bound to are
+    /// all read through, so enabling the attribute shows the name through all of them at once.
+    pub fn public_dns_name_in_vpc(
+        &self,
+        vpc_id: Option<&str>,
+        public_ip: &str,
+        region: &str,
+    ) -> String {
+        public_hostname(
+            self.vpc_hands_out_public_hostnames(vpc_id),
+            public_ip,
+            region,
+        )
+    }
+
+    /// Give every network interface of the VPC `vpc_id` the public DNS name that VPC's
+    /// `enableDnsHostnames` attribute now gives each public address it holds.
+    ///
+    /// Amazon VPC User Guide, "DNS attributes in your VPC": enabling the attribute gives
+    /// public DNS hostnames to the instances already in the VPC that hold a public IPv4
+    /// address, and disabling it takes them away. The name lives on the interface's own
+    /// record, where `DescribeNetworkInterfaces` and the instance report both read it, so the
+    /// one writer of that attribute calls this and every reader of a public hostname answers
+    /// from the attribute as it now stands.
+    ///
+    /// Each association is given the name of the address IT holds, not the interface's: an
+    /// interface can hold an Elastic IP bound to one of its private addresses while another
+    /// of them holds the address AWS assigned the interface
+    /// ([`Self::associate_elastic_ip`]), and a hostname beside an address it does not name
+    /// would be a name no reader could act on. An interface holding no public address keeps
+    /// the EMPTY name it already reports.
+    pub fn apply_public_dns_names_of_vpc(&mut self, vpc_id: &str) {
+        let hands_out = self.vpc_hands_out_public_hostnames(Some(vpc_id));
+        for interface in self
+            .network_interfaces
+            .values_mut()
+            .filter(|interface| interface.vpc_id.as_deref() == Some(vpc_id))
+        {
+            let region = interface
+                .availability_zone
+                .as_deref()
+                .map(region_of_zone_name)
+                .unwrap_or_default()
+                .to_string();
+            let named = |association: &mut NetworkInterfaceAssociation| -> String {
+                let name = association
+                    .public_ip
+                    .as_deref()
+                    .map_or_else(String::new, |public_ip| {
+                        public_hostname(hands_out, public_ip, &region)
+                    });
+                association.public_dns_name = Some(name.clone());
+                name
+            };
+            let held_by_the_interface = interface.association.as_mut().map(named);
+            for held in interface.private_ip_addresses.iter_mut().flatten() {
+                if let Some(association) = held.association.as_mut() {
+                    named(association);
+                }
+            }
+            // "A public hostname" (`NetworkInterface$PublicDnsName`) is the name of the
+            // address the INTERFACE holds, and the empty name for one holding none.
+            interface.public_dns_name = Some(held_by_the_interface.unwrap_or_default());
+        }
     }
 
     /// Insert a subnet, and answer the `SubnetId` it was given.

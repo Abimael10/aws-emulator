@@ -216,6 +216,10 @@ impl ComAmazonawsEc2Amazonec2State {
         // (`NetworkInterface$Association`), carried on the interface AND on the private
         // address it is bound to, which is where `DescribeNetworkInterfaces` reports each.
         if let Some(network_interface_id) = spec.network_interface_id.as_deref() {
+            let interface_vpc_id = self
+                .network_interfaces
+                .get(network_interface_id)
+                .and_then(|interface| interface.vpc_id.clone());
             let region = self
                 .network_interfaces
                 .get(network_interface_id)
@@ -229,9 +233,12 @@ impl ComAmazonawsEc2Amazonec2State {
                 // address AWS assigned itself reports `amazon`
                 // (`NetworkInterfaceAssociation$IpOwnerId`).
                 ip_owner_id: Some(ip_owner_id),
-                public_dns_name: public_ip
-                    .as_deref()
-                    .map(|public_ip| public_dns_name(public_ip, &region)),
+                // The hostname of a public address is the VPC's to give, whoever allocated
+                // the address: read through the one place that attribute is applied
+                // ([`Self::public_dns_name_in_vpc`]).
+                public_dns_name: public_ip.as_deref().map(|public_ip| {
+                    self.public_dns_name_in_vpc(interface_vpc_id.as_deref(), public_ip, &region)
+                }),
                 public_ip: public_ip.clone(),
                 // Both belong to address pools this emulator allocates no address out of:
                 // a customer-owned pool and a carrier's.

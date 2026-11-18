@@ -15,10 +15,11 @@
 //!    product code of its own charges for its software beside the instance hours the Free
 //!    Tier covers, so it cannot be launched under those limits; an image carrying no such
 //!    code can, whoever published it.
-//! 3. THE PUBLIC DNS NAME BELONGS TO THE INTERFACE: the association an instance reports
-//!    against ONE private IPv4 address carries the addressing members of that association
-//!    and no public DNS name — the name is reported once, by the interface's own association
-//!    and by the instance's `dnsName`.
+//! 3. A PUBLIC ADDRESS IS REPORTED AGAINST THE PRIVATE ADDRESS IT IS BOUND TO: the
+//!    association an instance reports against ONE private IPv4 address carries the same
+//!    members as the interface's own association — the public address, its owner and its
+//!    public DNS name — because one public address is mapped onto one private address of the
+//!    interface, and the instance reports that same hostname as its `dnsName`.
 //!
 //! Every row is a distinct input along what its rule generalises over — how many devices the
 //! AMI maps, whether a device restores an encrypted snapshot, an unencrypted one or none at
@@ -513,47 +514,19 @@ async fn allocate(router: &MultiServiceRouter, case: &str) -> (String, String) {
     )
 }
 
-/// Assert RULE 3 over one instance report: no association reported against a private address
-/// carries a public DNS name, the one that exists carries the public address and its owner,
-/// and the name is reported by the INTERFACE that holds that address instead, with the
-/// instance reporting a public hostname of its own.
-fn assert_the_name_belongs_to_the_interface(
+/// Assert RULE 3 over one instance report: exactly ONE private address reports the public
+/// address `public_ip`, that association carries its owner and the public DNS name the
+/// INTERFACE holding the address reports for it, and the instance reports a public hostname of
+/// its own. Answers the private address the public one is bound to.
+fn assert_the_address_reports_the_whole_association(
     case: &str,
     account: &str,
     public_ip: &str,
     dns_name: &str,
     interfaces: &[ReportedInterface],
-) {
-    let mut associated_addresses = 0usize;
-    for interface in interfaces {
-        for (address, held) in &interface.addresses {
-            let Some(held) = held else { continue };
-            associated_addresses += 1;
-            assert_eq!(
-                held.public_dns_name, None,
-                "case {case:?}: the association of private address {address} must report no \
-                 publicDnsName, got {held:?}"
-            );
-            assert_eq!(
-                held.public_ip.as_deref(),
-                Some(public_ip),
-                "case {case:?}: the association of private address {address} reports the \
-                 public address it is bound to, got {held:?}"
-            );
-            assert_eq!(
-                held.ip_owner_id.as_deref(),
-                Some(account),
-                "case {case:?}: the association of private address {address} reports the \
-                 account that owns the Elastic IP, got {held:?}"
-            );
-        }
-    }
-    assert_eq!(
-        associated_addresses, 1,
-        "case {case:?}: exactly the private address the Elastic IP is bound to reports an \
-         association, got {interfaces:?}"
-    );
-
+) -> String {
+    // The name the interface holding the address reports for it, which is what every report of
+    // that one association has to agree on.
     let holder = interfaces
         .iter()
         .filter_map(|interface| interface.interface.as_ref())
@@ -564,9 +537,45 @@ fn assert_the_name_belongs_to_the_interface(
                  association, got {interfaces:?}"
             )
         });
-    let name = holder.public_dns_name.clone().unwrap_or_default();
+    let held_name = holder.public_dns_name.clone().unwrap_or_default();
+    // The private addresses this public one is bound to: exactly one, whichever other public
+    // addresses the instance's interfaces hold.
+    let bound: Vec<&(String, Option<ReportedAssociation>)> = interfaces
+        .iter()
+        .flat_map(|interface| interface.addresses.iter())
+        .filter(|(_, held)| {
+            held.as_ref()
+                .and_then(|held| held.public_ip.as_deref())
+                == Some(public_ip)
+        })
+        .collect();
+    assert_eq!(
+        bound.len(),
+        1,
+        "case {case:?}: exactly the private address {public_ip} is bound to reports it, got \
+         {interfaces:?}"
+    );
+    let (address, held) = &bound[0];
+    let held = held
+        .as_ref()
+        .unwrap_or_else(|| panic!("case {case:?}: {address} reports no association"));
+    assert_eq!(
+        held.public_dns_name.as_deref(),
+        Some(held_name.as_str()),
+        "case {case:?}: the association of private address {address} reports the public DNS \
+         name its interface reports ({held_name:?}), got {held:?}"
+    );
+    assert_eq!(
+        held.ip_owner_id.as_deref(),
+        Some(account),
+        "case {case:?}: the association of private address {address} reports the account that \
+         owns the Elastic IP, got {held:?}"
+    );
+
+    // These instances run in the account's DEFAULT VPC, which hands its instances public
+    // hostnames (`enableDnsHostnames`), so the name itself is reported everywhere it belongs.
     assert!(
-        !name.is_empty(),
+        !held_name.is_empty(),
         "case {case:?}: the interface's own association reports the public DNS name of \
          {public_ip}, got {holder:?}"
     );
@@ -574,17 +583,18 @@ fn assert_the_name_belongs_to_the_interface(
         !dns_name.is_empty(),
         "case {case:?}: the instance reports a public hostname of its own, got {dns_name:?}"
     );
+    address.clone()
 }
 
 /// RULE 3: the association an instance reports against ONE private IPv4 address carries the
-/// addressing members and no public DNS name, which the interface's association and the
-/// instance's `dnsName` carry.
+/// whole association the interface holding it reports — the public address, its owner and its
+/// public DNS name — which the instance also reports as its `dnsName`.
 ///
 /// The rows differ along how the address came to be associated: bound to the interface's
 /// primary private address, swapped for another Elastic IP on that same address, and bound to
 /// a SECONDARY private address of an interface the instance was given later.
 #[tokio::test]
-async fn an_instance_reports_no_public_dns_name_against_a_private_address() {
+async fn an_instance_reports_the_whole_association_against_the_bound_private_address() {
     let (router, _engine) = super::ec2_query::emulator();
     let account = engine::emulator_account_id();
 
@@ -604,7 +614,13 @@ async fn an_instance_reports_no_public_dns_name_against_a_private_address() {
     .await;
     let (dns_name, interfaces) =
         poll_until_an_address_is_associated(&router, case, &instance_id).await;
-    assert_the_name_belongs_to_the_interface(case, account, &public_ip, &dns_name, &interfaces);
+    assert_the_address_reports_the_whole_association(
+        case,
+        account,
+        &public_ip,
+        &dns_name,
+        &interfaces,
+    );
 
     // Row 2: a second Elastic IP swapped onto the same address — "if you associate an Elastic
     // IP address with an instance that has an existing Elastic IP address, the existing
@@ -623,7 +639,13 @@ async fn an_instance_reports_no_public_dns_name_against_a_private_address() {
     .await;
     let (dns_name, interfaces) =
         poll_until_an_address_is_associated(&router, case, &instance_id).await;
-    assert_the_name_belongs_to_the_interface(case, account, &swapped_ip, &dns_name, &interfaces);
+    assert_the_address_reports_the_whole_association(
+        case,
+        account,
+        &swapped_ip,
+        &dns_name,
+        &interfaces,
+    );
 
     // Row 3: an Elastic IP bound to a SECONDARY private address of an interface the instance
     // was given after it was launched — the address-level association is on that one address,
@@ -693,18 +715,19 @@ async fn an_instance_reports_no_public_dns_name_against_a_private_address() {
     .await;
     let (dns_name, interfaces) =
         poll_until_an_address_is_associated(&router, case, &instance_id).await;
-    // The association is on the SECONDARY address and on no other.
-    let associated: Vec<&String> = interfaces
-        .iter()
-        .flat_map(|interface| interface.addresses.iter())
-        .filter(|(_, held)| held.is_some())
-        .map(|(address, _)| address)
-        .collect();
-    assert_eq!(
-        associated,
-        vec![&secondary],
-        "case {case:?}: the Elastic IP is bound to {secondary}, so only that address reports \
-         an association, got {interfaces:?}"
+    // The Elastic IP is reported against the SECONDARY address it was bound to, and against
+    // no other — the primary address of the instance's own interface reports the public
+    // address AWS assigned THAT interface instead.
+    let bound_to = assert_the_address_reports_the_whole_association(
+        case,
+        account,
+        &bound_ip,
+        &dns_name,
+        &interfaces,
     );
-    assert_the_name_belongs_to_the_interface(case, account, &bound_ip, &dns_name, &interfaces);
+    assert_eq!(
+        bound_to, secondary,
+        "case {case:?}: the Elastic IP was bound to {secondary}, so that is the address \
+         reporting it, got {interfaces:?}"
+    );
 }

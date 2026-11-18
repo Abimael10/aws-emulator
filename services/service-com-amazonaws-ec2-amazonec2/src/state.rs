@@ -2985,6 +2985,11 @@ mod instance_ids_and_instance_types;
 /// projection reaches it as `crate::state::region_display` like any other primitive here.
 mod availability_zone_display;
 mod instances_and_filters;
+/// The `DescribeInstances` filters answered off the instance REPORT rather than off the
+/// stored record — every documented filter name the record-based catalog beside it does not
+/// cover. Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::REPORTED_INSTANCE_FILTERS` like any other primitive of this module.
+mod instance_report_filters;
 mod vpcs_and_security_groups;
 /// The default subnet of one Availability Zone: the block of its default VPC it takes, the one
 /// a zone already has, and the refusals a request for one is answered with. Everything it
@@ -3012,6 +3017,7 @@ pub use store::*;
 pub use vpcs_and_security_groups::*;
 pub use default_subnets::*;
 pub use instances_and_filters::*;
+pub use instance_report_filters::*;
 pub use instance_ids_and_instance_types::*;
 pub use availability_zone_display::*;
 pub use local_gateways_and_filter_patterns::*;

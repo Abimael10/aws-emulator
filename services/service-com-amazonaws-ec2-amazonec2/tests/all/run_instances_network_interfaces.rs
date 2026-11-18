@@ -69,6 +69,7 @@ async fn ok(case: &str, router: &MultiServiceRouter, action: &str, params: &[Par
 /// another, two groups of this VPC and one of a second VPC.
 struct Network {
     router: MultiServiceRouter,
+    vpc_id: String,
     subnet_a: String,
     subnet_b: String,
     subnet_other_zone: String,
@@ -141,6 +142,7 @@ impl Network {
         let foreign_group = group(&foreign_vpc, "interfaces-elsewhere").await;
         Self {
             router,
+            vpc_id,
             subnet_a,
             subnet_b,
             subnet_other_zone,
@@ -922,6 +924,10 @@ async fn an_existing_interface_the_launch_names_is_attached_where_it_is() {
 /// THE RULE, the public-address half: an eth0 that asks for a public IPv4 address gets one
 /// out of Amazon's pool — reported by the instance, by its interface's association and as
 /// the interface's owner — and one that does not ask gets none.
+///
+/// The HOSTNAME of that address is the VPC's to give: "only available if you've enabled DNS
+/// hostnames for your VPC" (`Instance$PublicDnsName`), and a VPC a caller creates does not,
+/// so the name is reported EMPTY here until the attribute is turned on.
 #[tokio::test]
 async fn a_launch_asks_its_primary_interface_for_a_public_address() {
     let network = Network::create().await;
@@ -960,13 +966,6 @@ async fn a_launch_asks_its_primary_interface_for_a_public_address() {
                 Some("amazon"),
                 "case {case:?}: expected an AWS-assigned address, got {reported:?}"
             );
-            assert!(
-                instance
-                    .public_dns_name
-                    .as_deref()
-                    .is_some_and(|name| !name.is_empty()),
-                "case {case:?}: expected a public DNS name beside the address, got {instance:?}"
-            );
             let read_back =
                 described_interface(case, &network.router, &reported.network_interface_id).await;
             assert_eq!(
@@ -974,16 +973,75 @@ async fn a_launch_asks_its_primary_interface_for_a_public_address() {
                 "case {case:?}: the describe of the interface reports another address: \
                  {read_back:?}"
             );
-        } else {
-            assert!(
-                instance
-                    .public_dns_name
-                    .as_deref()
-                    .is_none_or(str::is_empty),
-                "case {case:?}: expected no public DNS name, got {instance:?}"
-            );
         }
+        // Whether or not the launch was given an address, this VPC hands out no public
+        // hostnames, so the instance reports the EMPTY name either way.
+        assert!(
+            instance
+                .public_dns_name
+                .as_deref()
+                .is_none_or(str::is_empty),
+            "case {case:?}: a VPC with DNS hostnames disabled gives its instances no public \
+             hostname, got {instance:?}"
+        );
     }
+
+    // The same launch into the same VPC once its `enableDnsHostnames` attribute is on: the
+    // address now carries the Amazon hostname of that address, reported by the instance and
+    // by its interface's association alike.
+    let case = "an eth0 that asks for a public address in a VPC with DNS hostnames enabled";
+    ok(
+        case,
+        &network.router,
+        "ModifyVpcAttribute",
+        &[
+            param("VpcId", &network.vpc_id),
+            param("EnableDnsHostnames.Value", "true"),
+        ],
+    )
+    .await;
+    let body = network
+        .launch(
+            case,
+            1,
+            &interface(
+                1,
+                &[
+                    ("DeviceIndex", "0"),
+                    ("SubnetId", network.subnet_a.as_str()),
+                    ("AssociatePublicIpAddress", "true"),
+                ],
+            ),
+        )
+        .await;
+    let instances = launched(case, &body);
+    let instance = &instances[0];
+    let public_ip = instance
+        .public_ip
+        .clone()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a public address, got {instance:?}"));
+    // AWS builds an Amazon public hostname as `ec2-<dash-separated address>` under the
+    // Region's public DNS domain, which is `compute-1.amazonaws.com` in `us-east-1` — the
+    // Region this suite signs for (Amazon EC2 User Guide, "Amazon EC2 instance hostname
+    // types").
+    let expected_name = format!("ec2-{}.compute-1.amazonaws.com", public_ip.replace('.', "-"));
+    assert_eq!(
+        instance.public_dns_name.as_deref(),
+        Some(expected_name.as_str()),
+        "case {case:?}: the public DNS name names the address the instance holds, got \
+         {instance:?}"
+    );
+    let read_back = described_interface(
+        case,
+        &network.router,
+        &instance.interfaces[0].network_interface_id,
+    )
+    .await;
+    assert_eq!(
+        read_back.association_public_ip.as_deref(),
+        Some(public_ip.as_str()),
+        "case {case:?}: the interface reports the address the instance holds, got {read_back:?}"
+    );
 }
 
 /// THE RULE, undone: an interface a launch created `DeleteOnTermination` goes when its

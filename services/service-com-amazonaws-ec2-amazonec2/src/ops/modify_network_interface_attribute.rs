@@ -780,33 +780,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::dry_run_operation());
         }
 
-        // The public IPv4 address an enabled `associatePublicIpAddress` needs, minted out of
-        // Amazon's own pool through the store's one mint — a caller cannot specify which
-        // address AWS assigns it — and only for an interface that holds none, so enabling
-        // the attribute twice keeps the address the first call assigned.
-        let assigned_association = match &change {
+        // Both halves of `associatePublicIpAddress` are served through the store's OWN
+        // seams for an address AWS assigns itself, so the address, the hostname its VPC
+        // gives it and the association on the interface and on the private address it is
+        // bound to are derived and dropped exactly where a launch that asks for one derives
+        // them. An address is assigned only to an interface that holds none, so enabling the
+        // attribute twice keeps the one the first call assigned, and disabling it takes off
+        // only an address AWS assigned — an Elastic IP the ACCOUNT allocated is ended by
+        // `DisassociateAddress` instead.
+        match change {
             Change::AssociatePublicIpAddress(true) if association_owner.is_none() => {
-                let Some(public_ip) = store.mint_elastic_ip() else {
+                let region = state::region_of_zone_name(&availability_zone).to_string();
+                if store
+                    .assign_amazon_public_ipv4(network_interface_id, &region)
+                    .is_none()
+                {
                     return Err(state::internal_error(
                         "Amazon's pool of IPv4 addresses has no free address left to assign",
                     ));
-                };
-                let region = state::region_of_zone_name(&availability_zone).to_string();
-                Some(NetworkInterfaceAssociation {
-                    // An address AWS assigned itself is no allocation of the account's, so
-                    // it has neither an allocation nor an association id: both belong to an
-                    // Elastic IP the account allocated and associated.
-                    allocation_id: None,
-                    association_id: None,
-                    ip_owner_id: Some(AMAZON_ASSIGNED_IP_OWNER_ID.to_string()),
-                    public_dns_name: Some(state::public_dns_name(&public_ip, &region)),
-                    public_ip: Some(public_ip),
-                    customer_owned_ip: None,
-                    carrier_ip: None,
-                })
+                }
             }
-            _ => None,
-        };
+            Change::AssociatePublicIpAddress(false) => {
+                store.release_amazon_public_ipv4(network_interface_id);
+            }
+            _ => {}
+        }
         // The budget follows the record: the old description's bytes go back and the new
         // one's are charged, so replacing a description grows the store by the difference
         // and never by the whole new text.
@@ -848,17 +846,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     attachment.ena_queue_count = count;
                 }
             }
-            Change::AssociatePublicIpAddress(enabled) => {
-                if enabled {
-                    // `None` when the interface already holds an AWS-assigned address: the
-                    // one it holds stays.
-                    if let Some(association) = assigned_association {
-                        interface.association = Some(association);
-                    }
-                } else if association_owner.as_deref() == Some(AMAZON_ASSIGNED_IP_OWNER_ID) {
-                    interface.association = None;
-                }
-            }
+            // Served above, through the store's own seams, because an address AWS assigns
+            // reaches more of the record than this one borrow does.
+            Change::AssociatePublicIpAddress(_) => {}
             Change::PrimaryIpv6 { enabled, assign } => {
                 let addresses = interface.ipv6_addresses.get_or_insert_with(Vec::new);
                 if let Some(address) = assign {

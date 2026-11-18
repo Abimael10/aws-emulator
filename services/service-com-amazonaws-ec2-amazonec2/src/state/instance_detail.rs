@@ -954,15 +954,21 @@ impl ComAmazonawsEc2Amazonec2State {
         // [`ComAmazonawsEc2Amazonec2State::instance_network_interfaces`].
         view.secondary_interfaces = Some(Vec::new());
         // "The public DNS name assigned to the instance … only available if you've enabled
-        // DNS hostnames for your VPC" (`Instance$PublicDnsName`): derived from the public
-        // address the instance holds, and the EMPTY name AWS reports for an instance that
-        // holds none — the member is reported either way.
+        // DNS hostnames for your VPC" (`Instance$PublicDnsName`): the hostname of the public
+        // address the instance holds, read through the one place that VPC attribute is
+        // applied ([`ComAmazonawsEc2Amazonec2State::public_dns_name_in_vpc`]) — so a VPC
+        // that hands out no public hostnames reports the EMPTY name, which is also what an
+        // instance holding no public address reports. The member is reported either way.
         view.public_dns_name = Some(
             instance
                 .public_ip
                 .as_deref()
                 .map(|public_ip| {
-                    super::public_dns_name(public_ip, region_of_zone_name(&instance.placement_az))
+                    self.public_dns_name_in_vpc(
+                        self.instance_vpc_id(instance).as_deref(),
+                        public_ip,
+                        region_of_zone_name(&instance.placement_az),
+                    )
                 })
                 .unwrap_or_default(),
         );

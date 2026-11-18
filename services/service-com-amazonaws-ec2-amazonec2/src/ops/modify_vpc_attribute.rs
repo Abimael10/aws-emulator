@@ -244,6 +244,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .vpc_attributes
             .insert(input.vpc_id.clone(), attributes);
+        // "The public DNS name … is only available if you've enabled DNS hostnames for your
+        // VPC" (`Instance$PublicDnsName`): the attribute just written is what decides that
+        // name, so the interfaces of this VPC are given the name it now says they have —
+        // through the store's one seam for it, so the instance report, the interface report
+        // and each association answer from the attribute as it now stands.
+        store.apply_public_dns_names_of_vpc(&input.vpc_id);
         Ok(ModifyVpcAttributeOutput)
     }
 }

@@ -27,7 +27,7 @@ use crate::ops::types::{
 use super::{
     ATTACHMENT_STATUS_ATTACHING, ComAmazonawsEc2Amazonec2State, DEFAULT_SECURITY_GROUP_NAME,
     NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX, NetworkInterfaceAttachmentSpec, NetworkInterfaceSpec,
-    PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX, public_dns_name, system_time_to_date_time,
+    PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX, system_time_to_date_time,
 };
 
 /// The `IpOwnerId` of a public IPv4 address AWS assigned itself, as opposed to an Elastic IP
@@ -206,16 +206,14 @@ impl ComAmazonawsEc2Amazonec2State {
             // in a VPC. The public IP address can only be assigned to a network interface for
             // eth0, and can only be assigned to a new network interface, not an existing one"
             // (`AssociatePublicIpAddress`) — so the address goes to the interface the launch
-            // created at device index 0, and the instance reports it as its own public
-            // address.
+            // created at device index 0, through the one seam that assigns one, which also
+            // gives the instance holding that interface the address as its own.
             if interface.associate_public_ip_address
                 && interface.network_interface_id.is_none()
                 && interface.device_index == PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX
             {
-                let assigned =
-                    self.assign_amazon_public_ipv4(&network_interface_id, &interface.region);
+                self.assign_amazon_public_ipv4(&network_interface_id, &interface.region);
                 if let Some(instance) = self.instances.get_mut(instance_id) {
-                    instance.public_ip = assigned;
                     // Amazon's address, which belongs to the RUNNING instance: a stop
                     // releases it and a later start is given a fresh one
                     // ([`crate::state::instance_mapped_public_ipv4`]).
@@ -238,6 +236,12 @@ impl ComAmazonawsEc2Amazonec2State {
     /// `DescribeNetworkInterfaces`, `DescribeNetworkInterfaceAttribute`'s
     /// `associatePublicIpAddress` and the instance's own report all read that one record.
     ///
+    /// The INSTANCE holding the interface reports the address as its own
+    /// (`Instance$PublicIpAddress`, and the hostname its VPC gives it as
+    /// `Instance$PublicDnsName`), so it is given it here rather than by each caller: an
+    /// address assigned by a launch and one assigned by `ModifyNetworkInterfaceAttribute`
+    /// reach the instance the same way.
+    ///
     /// `pub` because the public address of an interface ANOTHER service created for a
     /// resource of the account — the elastic network interface an Amazon ECS `awsvpc` task
     /// runs on, whose launch may ask for one — is assigned through this same one place, so
@@ -247,13 +251,19 @@ impl ComAmazonawsEc2Amazonec2State {
         network_interface_id: &str,
         region: &str,
     ) -> Option<String> {
-        if !self.network_interfaces.contains_key(network_interface_id) {
-            return None;
-        }
+        let vpc_id = self
+            .network_interfaces
+            .get(network_interface_id)?
+            .vpc_id
+            .clone();
         let public_ip = self.mint_elastic_ip()?;
-        let public_dns = public_dns_name(&public_ip, region);
+        // The hostname of a public address is the VPC's to give — "only available if you've
+        // enabled DNS hostnames for your VPC" — so it is read through the one place that
+        // attribute is applied ([`Self::public_dns_name_in_vpc`]) rather than built from the
+        // address alone.
+        let public_dns = self.public_dns_name_in_vpc(vpc_id.as_deref(), &public_ip, region);
         let interface = self.network_interfaces.get_mut(network_interface_id)?;
-        interface.association = Some(NetworkInterfaceAssociation {
+        let association = NetworkInterfaceAssociation {
             allocation_id: None,
             association_id: None,
             ip_owner_id: Some(AMAZON_ASSIGNED_IP_OWNER_ID.to_string()),
@@ -261,10 +271,98 @@ impl ComAmazonawsEc2Amazonec2State {
             public_ip: Some(public_ip.clone()),
             customer_owned_ip: None,
             carrier_ip: None,
-        });
+        };
+        interface.association = Some(association.clone());
+        // "The public IP address can only be assigned to a network interface for eth0"
+        // (`AssociatePublicIpAddress`), where it maps onto that interface's PRIMARY private
+        // address, so the address it is bound to carries the association as well — the same
+        // two places an Elastic IP association is written in
+        // ([`Self::associate_elastic_ip`]), which is what makes a client walking an
+        // interface's addresses read the public address against the private one it maps to.
+        if let Some(bound_to) = interface
+            .private_ip_addresses
+            .iter_mut()
+            .flatten()
+            .find(|held| held.primary == Some(true))
+        {
+            bound_to.association = Some(association);
+        }
         // "The public DNS name" of the interface follows the public address it holds, which is
         // what makes the two one fact rather than two.
         interface.public_dns_name = Some(public_dns);
+        // And the instance that holds the interface as its PRIMARY one reports the address
+        // as its own: `Instance$PublicIpAddress` is the address of eth0, so an address on a
+        // secondary interface is the interface's alone
+        // ([`primary_instance_of_interface`], the one reading of that).
+        let held_by = primary_instance_of_interface(interface);
+        if let Some(instance) = held_by.and_then(|instance_id| self.instances.get_mut(&instance_id))
+        {
+            instance.public_ip = Some(public_ip.clone());
+        }
         Some(public_ip)
     }
+
+    /// Take the public IPv4 address AWS assigned the interface `network_interface_id` off
+    /// it, wherever that address is reported.
+    ///
+    /// The exact reverse of [`Self::assign_amazon_public_ipv4`], and on the same terms: the
+    /// interface's own association, the association on the private address the public one
+    /// was bound to, the interface's public hostname and the address the instance holding it
+    /// reports all go together, so no reader can see an address the others no longer report.
+    /// An interface holding an Elastic IP the ACCOUNT allocated holds nothing of AWS's to
+    /// take, so it is left exactly as it stands — that association is ended by
+    /// [`Self::detach_elastic_ip`] instead.
+    pub fn release_amazon_public_ipv4(&mut self, network_interface_id: &str) {
+        let amazon_assigned = |association: &NetworkInterfaceAssociation| {
+            association.ip_owner_id.as_deref() == Some(AMAZON_ASSIGNED_IP_OWNER_ID)
+        };
+        let Some(interface) = self.network_interfaces.get_mut(network_interface_id) else {
+            return;
+        };
+        if !interface.association.as_ref().is_some_and(amazon_assigned) {
+            return;
+        }
+        let released = interface
+            .association
+            .as_ref()
+            .and_then(|association| association.public_ip.clone());
+        let held_by = primary_instance_of_interface(interface);
+        interface.association = None;
+        for held in interface.private_ip_addresses.iter_mut().flatten() {
+            if held.association.as_ref().is_some_and(amazon_assigned) {
+                held.association = None;
+            }
+        }
+        // An interface that holds no public address has the EMPTY public hostname, which is
+        // the member AWS reports for one rather than no member at all.
+        interface.public_dns_name = Some(String::new());
+        // And the instance holding the interface no longer reports the address either, where
+        // the address it reported is the one just released: an instance reports the public
+        // address its primary interface holds, so one nothing holds any more is not its.
+        if let Some(instance) = held_by.and_then(|instance_id| self.instances.get_mut(&instance_id))
+        {
+            if instance.public_ip == released {
+                instance.public_ip = None;
+            }
+        }
+    }
+}
+
+/// The `InstanceId` of the instance `interface` is the PRIMARY network interface of, or `None`
+/// when it is held by no instance that way.
+///
+/// "The public IPv4 address … will only apply to the primary network interface (eth0)"
+/// (`ModifyNetworkInterfaceAttributeRequest$AssociatePublicIpAddress`), and
+/// `Instance$PublicIpAddress` is that interface's address, so an address on a secondary
+/// interface is the interface's alone and never the instance's. An attachment that has reached
+/// `detached` holds nothing, so the interface is no longer the instance's at all — the same
+/// reading [`ComAmazonawsEc2Amazonec2State::attached_network_interface_records`] takes.
+fn primary_instance_of_interface(interface: &crate::ops::types::NetworkInterface) -> Option<String> {
+    let attachment = interface.attachment.as_ref()?;
+    if super::attachment_is_detached(attachment)
+        || attachment.device_index != Some(PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX)
+    {
+        return None;
+    }
+    attachment.instance_id.clone()
 }

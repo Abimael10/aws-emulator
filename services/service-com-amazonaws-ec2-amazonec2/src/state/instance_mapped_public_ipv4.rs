@@ -15,8 +15,8 @@
 //! Elastic IP address […] remains associated with your instance when you stop it" — an
 //! allocation outlives the running instance, which is the whole point of allocating one.
 //! The two are told apart by the owner of the interface's association
-//! ([`AMAZON_ASSIGNED_IP_OWNER_ID`]), the same way every other reader of this crate tells
-//! them apart.
+//! ([`super::AMAZON_ASSIGNED_IP_OWNER_ID`]), the same way every other reader of this crate
+//! tells them apart.
 //!
 //! Both seams here are the CLOCK's: the release is owed at the instant the stop completes
 //! and the assignment at the instant the start does, so
@@ -25,8 +25,7 @@
 //! again still sees the address released and re-assigned.
 
 use super::{
-    AMAZON_ASSIGNED_IP_OWNER_ID, ComAmazonawsEc2Amazonec2State,
-    PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX, region_of_zone_name,
+    ComAmazonawsEc2Amazonec2State, PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX, region_of_zone_name,
 };
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -66,39 +65,16 @@ impl ComAmazonawsEc2Amazonec2State {
     /// ([`super::InstanceRecord::mapped_public_ipv4`]), which is what makes the start below
     /// assign it a fresh one.
     pub(super) fn release_mapped_public_ipv4(&mut self, instance_id: &str) {
-        // The addresses actually released, so the INSTANCE's own report follows what its
-        // interfaces lost: an instance whose public address is an Elastic IP the account
-        // associated keeps reporting it, because no interface of it lost one.
-        let mut released: Vec<String> = Vec::new();
         for (_, network_interface_id) in self.instance_interface_ids(instance_id) {
-            let Some(interface) = self.network_interfaces.get_mut(&network_interface_id) else {
-                continue;
-            };
-            let amazon_assigned = interface
-                .association
-                .as_ref()
-                .filter(|association| {
-                    association.ip_owner_id.as_deref() == Some(AMAZON_ASSIGNED_IP_OWNER_ID)
-                })
-                .and_then(|association| association.public_ip.clone());
-            if let Some(public_ip) = amazon_assigned {
-                interface.association = None;
-                // The interface's public DNS name follows the public address it holds, which
-                // is what makes the two one fact rather than two
-                // ([`ComAmazonawsEc2Amazonec2State::assign_amazon_public_ipv4`], which sets
-                // both).
-                interface.public_dns_name = None;
-                released.push(public_ip);
-            }
-        }
-        if let Some(instance) = self.instances.get_mut(instance_id) {
-            if instance
-                .public_ip
-                .as_deref()
-                .is_some_and(|held| released.iter().any(|address| address == held))
-            {
-                instance.public_ip = None;
-            }
+            // Through the ONE seam that takes an address AWS assigned off an interface
+            // ([`ComAmazonawsEc2Amazonec2State::release_amazon_public_ipv4`]), so the
+            // interface's own association, the association on the private address the public
+            // one was bound to, the interface's public hostname and the address the instance
+            // reports all go together — the exact reverse of the assignment. An interface
+            // holding an Elastic IP the ACCOUNT allocated holds nothing of AWS's to take, so
+            // the seam leaves it exactly where it is, and an instance reporting one goes on
+            // reporting it.
+            self.release_amazon_public_ipv4(&network_interface_id);
         }
     }
 

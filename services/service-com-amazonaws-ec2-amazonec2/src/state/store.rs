@@ -259,13 +259,23 @@ pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
 /// create still answers off the record as it stored it.
 pub const VPC_PROVISIONING_DELAY: Duration = Duration::ZERO;
 
-/// The `DescribeInstances` filter names this slice resolves.
+/// The `DescribeInstances` filter names this slice reads off the stored instance RECORD.
 ///
 /// Source: the `Filters` member documentation of
 /// `com.amazonaws.ec2#DescribeInstancesRequest`
 /// (`smithy_query(query="doc",shape="DescribeInstancesRequest",member="Filters")`).
-/// It lists many more; the ones here are those whose value this slice actually
-/// stores. `tag:<key>` is matched separately because its name carries the key.
+/// The ones here are the documented names whose value the record itself carries; every
+/// OTHER documented name is answered off the instance REPORT
+/// ([`REPORTED_INSTANCE_FILTERS`]), and the two together are the catalog
+/// [`filter_name_supported`] accepts. `tag:<key>` is matched separately because its name
+/// carries the key.
+///
+/// The last three are the EC2-Classic names AWS documents beside the `tag:<key>` family and
+/// the `instance.group-*` pair — `group-id` and `group-name` filter a reservation's own
+/// EC2-Classic group list (`Reservation$Groups`, which AWS documents as "not supported" and
+/// no VPC instance carries, so they match nothing), and `tag-value` the values of the
+/// resource's tags. They are accepted rather than refused because EC2 answers a request
+/// carrying one with the instances it selects, which for the first two is none.
 pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "architecture",
     "availability-zone",
@@ -300,6 +310,9 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "state-reason-message",
     "subnet-id",
     "tag-key",
+    "tag-value",
+    "group-id",
+    "group-name",
     "vpc-id",
     // The interfaces attached to the instance, which the launch's own primary interface
     // means every instance has: the members of each one that this slice stores.

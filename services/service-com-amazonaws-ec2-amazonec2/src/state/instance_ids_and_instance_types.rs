@@ -696,6 +696,22 @@ pub fn public_dns_name(public_ip: &str, region: &str) -> String {
     format!("ec2-{host}.{domain}", domain = public_dns_domain(region))
 }
 
+/// The public DNS name a public IPv4 address has where the VPC holding it hands out public
+/// hostnames (`hands_out`), and the EMPTY name where it does not.
+///
+/// The one place that choice is made, so every report of such a name — an instance's own
+/// `dnsName`, an interface's `publicDnsName` and the association on the interface and on the
+/// private address the public one is bound to — carries the same name for one address.
+/// [`ComAmazonawsEc2Amazonec2State::public_dns_name_in_vpc`] is this applied to one VPC's own
+/// attribute, which is how a caller asks for it.
+pub fn public_hostname(hands_out: bool, public_ip: &str, region: &str) -> String {
+    if hands_out {
+        public_dns_name(public_ip, region)
+    } else {
+        String::new()
+    }
+}
+
 /// The processor architecture an instance type runs on.
 ///
 /// AWS names an instance type `<family><generation><capabilities>.<size>` and
