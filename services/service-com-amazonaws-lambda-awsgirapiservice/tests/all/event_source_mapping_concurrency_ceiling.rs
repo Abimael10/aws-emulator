@@ -9,8 +9,8 @@
 //! itself reserves ("the number of simultaneous executions to reserve for the function",
 //! `PutFunctionConcurrency`); it holds for as long as the mapping is draining, not merely on
 //! the first pass, and the mapping goes on draining until the backlog is gone, so a deep queue
-//! is emptied without the ceiling ever being passed. A mapping configuring no concurrency has
-//! one batch in flight at a time.
+//! is emptied without the ceiling ever being passed. A mapping configuring no concurrency is
+//! bounded by its backlog alone ([`crate::event_source_mapping_backlog_scaling`]).
 //!
 //! This is the other side of [`crate::event_source_mapping_scaling_concurrency`], which pins
 //! how many batches ONE pass hands over and that the batches of one pass really overlap. Here
@@ -73,11 +73,13 @@ struct Row {
     ceiling: u32,
 }
 
-/// The catalog: a mapping that configures no concurrency, one at each end of the published
-/// range of `MaximumConcurrency` (`smithy_query(query="shape", shape="MaximumConcurrency")`:
-/// `@range(min: 2, max: 1000)`), one inside it, one whose batches hold several messages, and one
-/// whose function reserves less concurrency than the mapping asks for. Every backlog is deeper
-/// than one pass can take, so each row is drained over several passes.
+/// The catalog: a mapping that configures no concurrency — bounded by its backlog alone — one
+/// at each end of the published range of `MaximumConcurrency`
+/// (`smithy_query(query="shape", shape="MaximumConcurrency")`: `@range(min: 2, max: 1000)`), one
+/// inside it, one whose batches hold several messages, and one
+/// whose function reserves less concurrency than the mapping asks for. Every backlog a
+/// ceiling bounds is deeper than one pass can take, so those rows are drained over several
+/// passes; the drain itself is a loop over passes either way.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -86,7 +88,7 @@ fn rows() -> Vec<Row> {
             batch_size: 1,
             reserved: None,
             waiting: 3,
-            ceiling: 1,
+            ceiling: 3,
         },
         Row {
             case: "the published minimum concurrency over a backlog of six",

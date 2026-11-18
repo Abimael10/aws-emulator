@@ -57,16 +57,18 @@
 //! * INVOKE. The messages the filter admits are handed to the mapping's function as ONE
 //!   event, over the in-process callback into the `Invoke` surface of this same emulator
 //!   ([`smithy_server_runtime::EmbeddedEmulator`]), so nothing is delivered that this
-//!   emulator does not serve itself. A pass hands over as many batches AT ONCE as the
-//!   mapping may have invocations in flight ([`in_flight_batches`]) — "Limits the number of
-//!   concurrent instances that the Amazon SQS event source can invoke"
-//!   (`ScalingConfig$MaximumConcurrency`) — so a mapping draining a backlog really does run
-//!   batches concurrently up to what it configures, and the drain rate a client sized that
-//!   setting for is the one it gets. Each mapping's batches also go over while every OTHER
-//!   mapping's do: "Lambda reads items from the event source and invokes the function" for
-//!   each mapping, so a mapping is a consumer of its own — one whose function is slow, or
-//!   whose invocations fail, delays no other mapping's records, however many of them this
-//!   store holds.
+//!   emulator does not serve itself. A pass hands over AS MANY BATCHES AT ONCE as the
+//!   backlog holds, bounded by the most invocations the mapping may have in flight
+//!   ([`in_flight_batches`]) — "Limits the number of concurrent instances that the Amazon SQS
+//!   event source can invoke" (`ScalingConfig$MaximumConcurrency`) when the mapping configures
+//!   one, and otherwise the most concurrent instances a queue source can be asked to invoke at
+//!   all — so a mapping draining a backlog scales its batch consumers out with the depth of
+//!   that backlog instead of consuming it one batch at a time, and the drain rate a client
+//!   sized its concurrency for is the one it gets. Each mapping's batches also go over while
+//!   every OTHER mapping's do: "Lambda reads items from the event source and invokes the
+//!   function" for each mapping, so a mapping is a consumer of its own — one whose function is
+//!   slow, or whose invocations fail, delays no other mapping's records, however many of them
+//!   this store holds.
 //! * DELETE. A message leaves the queue only once the invocation it was handed to has
 //!   succeeded. A batch whose invocation did not succeed is left exactly where it was: its
 //!   messages come back when their visibility timeout lapses, which is precisely the case a
@@ -172,10 +174,10 @@ const MAX_SOURCE_CONCURRENCY: i32 = 1_000;
 /// The other end of that range; see [`MAX_SOURCE_CONCURRENCY`].
 const MIN_SOURCE_CONCURRENCY: i32 = 2;
 
-/// How many batches one pass of a mapping that configures NO concurrency hands over: the one
-/// this poller has always handed over per wake-up, which is its own cadence rather than
-/// anything AWS publishes.
-const ONE_BATCH_PER_PASS: usize = 1;
+/// The fewest batches a mapping may have in flight: one. A pass always hands over the one
+/// batch it found, whatever the bounds a mapping's concurrency is read inside
+/// ([`batches_in_flight`]) leave it.
+const MIN_BATCHES_IN_FLIGHT: usize = 1;
 
 /// The `eventSource` each record of the event a queue mapping hands its function carries.
 const SQS_EVENT_SOURCE: &str = "aws:sqs";
@@ -990,15 +992,23 @@ fn invisible_for_seconds(
         .clamp(floor, ceiling)
 }
 
-/// How many batches a mapping may have in flight at ONE instant, which is how many
-/// invocations of its function one pass hands over concurrently.
+/// The CEILING on how many batches a mapping may have in flight at ONE instant, which is how
+/// many invocations of its function one pass may hand over concurrently.
 ///
 /// "Limits the number of concurrent instances that the Amazon SQS event source can invoke"
 /// (`ScalingConfig$MaximumConcurrency`) is what a mapping configuring one scales to: that
 /// many batches are handed over together, read inside the range the member admits
 /// ([`MAX_SOURCE_CONCURRENCY`]) however the value got into the store. A mapping configuring
-/// none keeps this poller's own cadence of [`ONE_BATCH_PER_PASS`], which is what it has
-/// always handed over per wake-up.
+/// NONE is a mapping that has asked for no limit, not one that consumes a batch at a time: a
+/// queue source scales its batch consumers out with the backlog on its own, so what bounds it
+/// then is the most concurrent instances such a source can be asked to invoke at all, which is
+/// the top of that same range ([`MAX_SOURCE_CONCURRENCY`]).
+///
+/// This is a CEILING and not a count: how many batches a pass really hands over is how many
+/// the backlog holds, which is what [`due_batches`] polls for — one batch per consumer while
+/// the queue has messages to hand over, stopping as soon as it has none — so the consumers of
+/// a mapping grow with the depth of its queue and a mapping with nothing waiting still polls
+/// once.
 ///
 /// Two further bounds hold whatever a mapping configures, because neither is the mapping's to
 /// raise:
@@ -1018,11 +1028,14 @@ pub fn in_flight_batches(
     maximum_concurrency: Option<i32>,
     reserved_concurrent_executions: Option<i32>,
 ) -> usize {
-    let Some(configured) = maximum_concurrency else {
-        return ONE_BATCH_PER_PASS;
-    };
     batches_in_flight(
-        configured.clamp(MIN_SOURCE_CONCURRENCY, MAX_SOURCE_CONCURRENCY),
+        // An absent `MaximumConcurrency` is a mapping that limited itself to nothing, so the
+        // ceiling is the top of the range that member admits rather than a value to read
+        // inside it.
+        maximum_concurrency
+            .map_or(MAX_SOURCE_CONCURRENCY, |configured| {
+                configured.clamp(MIN_SOURCE_CONCURRENCY, MAX_SOURCE_CONCURRENCY)
+            }),
         reserved_concurrent_executions,
     )
 }
@@ -1043,8 +1056,8 @@ pub fn batches_in_flight(configured: i32, reserved_concurrent_executions: Option
     let reserved = reserved_concurrent_executions.unwrap_or(i32::MAX);
     let host = i32::try_from(super::execution::MAX_CONCURRENT_RUNS).unwrap_or(i32::MAX);
     usize::try_from(configured.min(reserved).min(host))
-        .unwrap_or(ONE_BATCH_PER_PASS)
-        .max(ONE_BATCH_PER_PASS)
+        .unwrap_or(MIN_BATCHES_IN_FLIGHT)
+        .max(MIN_BATCHES_IN_FLIGHT)
 }
 
 /// How many more messages `target` may take out of its queue on this pass: its `BatchSize`,

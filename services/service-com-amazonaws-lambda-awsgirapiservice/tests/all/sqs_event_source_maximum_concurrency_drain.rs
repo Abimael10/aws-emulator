@@ -9,8 +9,8 @@
 //! shape="ScalingConfig")`) — is a CEILING on how many invocations of the function the mapping
 //! has running at ONE instant, and it is a ceiling and nothing more: the mapping goes on
 //! handing batches over until the backlog is drained, so every message of a deep queue is
-//! invoked exactly once however low the ceiling is. A mapping configuring none has one batch
-//! in flight at a time.
+//! invoked exactly once however low the ceiling is. A mapping configuring none is bounded by
+//! the depth of its backlog instead ([`crate::event_source_mapping_backlog_scaling`]).
 //!
 //! Each row drives real HTTP requests through one router carrying Lambda and Amazon SQS on ONE
 //! engine, and observes the invocations the way an independent client would: the handler
@@ -119,14 +119,15 @@ struct Row {
     maximum_concurrency: Option<i64>,
     /// How many messages are waiting before anything polls the queue.
     backlog: u32,
-    /// The ceiling that follows: the concurrency configured, or the one batch a mapping
-    /// configuring none has in flight.
+    /// The ceiling that follows: the concurrency configured, or the batches the backlog itself
+    /// holds for a mapping configuring none.
     running: usize,
 }
 
-/// The catalog: a mapping configuring no concurrency, one at the published minimum of
-/// `MaximumConcurrency`, and one inside the published range — each over a backlog deeper than
-/// its own ceiling, so every row needs more than one hand-over to drain.
+/// The catalog: a mapping configuring no concurrency — whose ceiling is the backlog itself —
+/// one at the published minimum of `MaximumConcurrency`, and one inside the published range,
+/// each configured one over a backlog deeper than its own ceiling, so those rows need more
+/// than one hand-over to drain.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -134,7 +135,7 @@ fn rows() -> Vec<Row> {
             name: "esm-drain-none",
             maximum_concurrency: None,
             backlog: 3,
-            running: 1,
+            running: 3,
         },
         Row {
             case: "the published minimum concurrency",

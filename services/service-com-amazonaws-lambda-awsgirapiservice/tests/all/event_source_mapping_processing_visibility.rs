@@ -117,14 +117,6 @@ impl Row {
     fn hold_span(&self) -> Duration {
         Duration::from_secs(u64::try_from(self.hold()).unwrap_or(0))
     }
-
-    /// How many passes it takes to get every waiting message out of the queue: one batch per
-    /// pass, each at most `BatchSize` messages, so a row whose ceiling is below what is
-    /// waiting takes several — and no row takes more than that, which is the ceiling itself
-    /// being honoured.
-    fn passes(&self) -> usize {
-        self.messages.div_ceil(self.batch_size.max(1))
-    }
 }
 
 /// The catalog: the queue's timeout below the function's (including a queue that hides a
@@ -218,52 +210,42 @@ async fn a_polled_batch_stays_in_flight_for_as_long_as_its_attempt_may_last() {
             .await;
         }
 
-        // One pass per batch, each awaited: when a pass answers, the batch it took is out of
-        // the queue and the attempt it was handed to has been decided. Every message that
-        // pass took is then hidden for the LONGER of the two spans, counted from the pass —
-        // which is the rule, read off the instant the queue recorded rather than guessed at
-        // from a count read later.
-        let mut taken = 0usize;
-        for pass in 0..row.passes() {
-            let before = SystemTime::now();
-            let hidden_before = hidden(driven.engine(), &arn, before);
-            driven.poll_once().await;
-            let after = SystemTime::now();
-            let spent = after.duration_since(before).unwrap_or_default();
-            let fresh: Vec<(String, SystemTime)> = hidden(driven.engine(), &arn, after)
-                .into_iter()
-                .filter(|(body, _)| !hidden_before.contains_key(body))
-                .collect();
-            assert!(
-                !fresh.is_empty() && fresh.len() <= row.batch_size,
-                "case {case:?}: pass {pass} must take a batch of at most the {} message(s) \
-                 its BatchSize allows out of the queue, and it took {}",
-                row.batch_size,
-                fresh.len()
-            );
-            taken += fresh.len();
-            for (body, until) in fresh {
-                let measured = until.duration_since(before).unwrap_or_default();
-                assert!(
-                    measured >= row.hold_span() && measured <= row.hold_span() + spent,
-                    "case {case:?}: the message {body:?} must stay out of its queue for the \
-                     longer of the queue's {}s VisibilityTimeout and the function's {}s \
-                     Timeout — {:?} from the pass that polled it — and the queue hides it \
-                     for {measured:?} (the pass itself took {spent:?})",
-                    row.visibility_timeout,
-                    row.function_timeout,
-                    row.hold_span()
-                );
-            }
-        }
+        // ONE pass: it takes a batch of at most the mapping's `BatchSize` out of the queue for
+        // every batch the backlog holds ([`crate::event_source_mapping_backlog_scaling`]), so
+        // every waiting message is out of the queue once it answers and the attempt each batch
+        // was handed to has been decided. Every one of those messages is then hidden for the
+        // LONGER of the two spans, counted from the pass — which is the rule, read off the
+        // instant the queue recorded rather than guessed at from a count read later.
+        let before = SystemTime::now();
+        let hidden_before = hidden(driven.engine(), &arn, before);
+        driven.poll_once().await;
+        let after = SystemTime::now();
+        let spent = after.duration_since(before).unwrap_or_default();
+        let fresh: Vec<(String, SystemTime)> = hidden(driven.engine(), &arn, after)
+            .into_iter()
+            .filter(|(body, _)| !hidden_before.contains_key(body))
+            .collect();
         assert_eq!(
-            taken, row.messages,
-            "case {case:?}: the {} pass(es) a BatchSize of {} takes must get all {} waiting \
-             message(s) out of the queue, and they took {taken}",
-            row.passes(),
-            row.batch_size,
-            row.messages
+            fresh.len(),
+            row.messages,
+            "case {case:?}: one pass must take all {} waiting message(s) out of the queue, and \
+             it took {}",
+            row.messages,
+            fresh.len()
         );
+        for (body, until) in fresh {
+            let measured = until.duration_since(before).unwrap_or_default();
+            assert!(
+                measured >= row.hold_span() && measured <= row.hold_span() + spent,
+                "case {case:?}: the message {body:?} must stay out of its queue for the \
+                 longer of the queue's {}s VisibilityTimeout and the function's {}s \
+                 Timeout — {:?} from the pass that polled it — and the queue hides it \
+                 for {measured:?} (the pass itself took {spent:?})",
+                row.visibility_timeout,
+                row.function_timeout,
+                row.hold_span()
+            );
+        }
 
         // Nothing was deleted: a message leaves a queue only once the attempt it was handed
         // to processed it, and no deployment package ran here.

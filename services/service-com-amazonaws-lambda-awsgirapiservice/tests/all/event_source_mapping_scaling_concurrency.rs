@@ -7,8 +7,9 @@
 //! concurrent instances that the Amazon SQS event source can invoke" — hands that many
 //! batches of at most its `BatchSize` to its function AT ONCE, bounded by what the function
 //! itself reserves ("the number of simultaneous executions to reserve for the function",
-//! `PutFunctionConcurrency`); a mapping configuring none hands over one batch per pass, this
-//! poller's own cadence.
+//! `PutFunctionConcurrency`); a mapping configuring none is limited by neither, so its
+//! consumers grow with the depth of its backlog instead
+//! ([`crate::event_source_mapping_backlog_scaling`], which pins that half).
 //!
 //! Both tests drive real HTTP requests through the production `MultiServiceRouter` with
 //! Lambda, Amazon SQS and CloudWatch on ONE engine, and both make the poll passes THEMSELVES
@@ -113,11 +114,12 @@ struct Row {
     takes: u32,
 }
 
-/// The catalog: a mapping that configures no concurrency, one at each end of the published
-/// range of `MaximumConcurrency` (`smithy_query(query="shape", shape="MaximumConcurrency")`:
-/// `@range(min: 2, max: 1000)`), one inside it, one whose batches hold several messages, one
-/// whose backlog is shorter than its concurrency, and one whose function reserves less
-/// concurrency than the mapping asks for.
+/// The catalog: a mapping that configures no concurrency — and is therefore bounded by its
+/// backlog alone — one at each end of the published range of `MaximumConcurrency`
+/// (`smithy_query(query="shape", shape="MaximumConcurrency")`: `@range(min: 2, max: 1000)`),
+/// one inside it, one whose batches hold several messages, one whose backlog is shorter than
+/// its concurrency, and one whose function reserves less concurrency than the mapping asks
+/// for.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -126,7 +128,7 @@ fn rows() -> Vec<Row> {
             batch_size: 1,
             reserved: None,
             waiting: 6,
-            takes: 1,
+            takes: 6,
         },
         Row {
             case: "the published minimum concurrency",
@@ -260,7 +262,8 @@ pub(crate) async fn given_mapping(
 }
 
 /// RULE: one pass hands over as many batches as the mapping's configured concurrency admits,
-/// bounded by what its function reserves, and one batch for a mapping configuring none.
+/// bounded by what its function reserves, and as many as its backlog holds for a mapping
+/// configuring none.
 #[tokio::test]
 async fn one_pass_hands_over_as_many_batches_as_the_configured_concurrency_admits() {
     for (index, row) in rows().iter().enumerate() {

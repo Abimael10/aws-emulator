@@ -14,8 +14,10 @@
 //! The RULE under test, in one sentence: while a caller holds a store's poll claim, that
 //! store's queue mappings advance only on the caller's passes — nothing is taken out of a
 //! queue, handed over or reported in between — and ONE pass is the whole of what one wake-up
-//! of the poller does for every mapping that is polling: at most `BatchSize` messages taken
-//! out of the queue, the mapping's `FilterCriteria` applied to them, the admitted ones handed
+//! of the poller does for every mapping that is polling: a batch of at most `BatchSize`
+//! messages taken out of the queue for every consumer the backlog puts on it
+//! ([`crate::event_source_mapping_backlog_scaling`]), the mapping's `FilterCriteria` applied to
+//! them, the admitted ones handed
 //! to the function, exactly the messages the attempt consumed deleted, and what that attempt
 //! came to recorded as the mapping's `LastProcessingResult` before the call answers.
 //!
@@ -100,7 +102,7 @@ fn rows() -> Vec<Row> {
             batch_size: 2,
             pattern: None,
             bodies: &[r#"{"kind":"a"}"#, r#"{"kind":"b"}"#, r#"{"kind":"c"}"#],
-            first_pass_takes: 2,
+            first_pass_takes: 3,
             held_after_first_pass: 3,
             reported: Some(LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED),
         },
@@ -226,7 +228,8 @@ async fn one_poll_pass_is_the_whole_of_a_wake_up_and_the_only_thing_that_advance
             );
         }
 
-        // ONE pass: it takes at most the mapping's `BatchSize` out of the queue, applies the
+        // ONE pass: it takes a batch of at most the mapping's `BatchSize` out of the queue for
+        // every consumer the backlog puts on it, applies the
         // filter, hands the admitted messages over, deletes exactly what left the queue for
         // good and records the attempt — all before it answers.
         driven.poll_once().await;
