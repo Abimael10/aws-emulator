@@ -55,7 +55,11 @@
 //! ([`SessionRecord::state_at`]) — so a session a caller reads straight back is still
 //! CREATING, it becomes idle whether or not anybody polls it, and no read has to write to
 //! move it on. A session lives as long as its workgroup does, deleting the workgroup taking
-//! its sessions with it ([`ComAmazonawsAthenaAmazonathenaState::delete_work_group`]).
+//! its sessions with it ([`ComAmazonawsAthenaAmazonathenaState::delete_work_group`]). A
+//! session's own ARN addresses the user interface it serves ([`addressed_session`]), which
+//! `GetResourceDashboard` answers with the presigned address of
+//! ([`SessionRecord::dashboard_url`]) — a projection of that same record rather than a
+//! resource of its own.
 //!
 //! PREPARED STATEMENTS live in the [`PreparedStatementRegistry`] of
 //! [`ComAmazonawsAthenaAmazonathenaState::prepared_statements`], scoped to the workgroup
@@ -107,6 +111,10 @@ pub use notebooks::*;
 /// notebook a notebook session was started in.
 mod sessions;
 pub use sessions::*;
+
+/// The interface one session serves, and the ARN that addresses it.
+mod session_dashboards;
+pub use session_dashboards::*;
 
 /// The provisioned capacity this account reserved, and each reservation's lifecycle.
 mod capacity_reservations;
