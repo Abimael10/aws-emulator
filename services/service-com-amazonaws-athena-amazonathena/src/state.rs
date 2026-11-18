@@ -170,8 +170,9 @@ use crate::ops::types::{
     ManagedQueryResultsConfiguration, ManagedQueryResultsTimeToLive, MonitoringConfiguration,
     QueryExecution, QueryExecutionContext, QueryExecutionDetail, QueryExecutionDetailStats,
     QueryExecutionDetailStatus, QueryExecutionStatistics, QueryExecutionStatus, ResultConfiguration,
-    ResultReuseConfiguration, ResultReuseInformation, TableMetadata, Tag, WorkGroup,
-    WorkGroupConfiguration, WorkGroupSummary, CONNECTION_TYPE_VALUES, DATA_CATALOG_TYPE_VALUES,
+    ResultReuseConfiguration, ResultReuseInformation, TableMetadata, Tag,
+    UnprocessedQueryExecutionId, WorkGroup, WorkGroupConfiguration, WorkGroupSummary,
+    CONNECTION_TYPE_VALUES, DATA_CATALOG_TYPE_VALUES,
 };
 
 /// The `WorkGroupState` a freshly created workgroup is in. One of
@@ -2082,6 +2083,34 @@ pub fn same_result_reuse_configuration(
 /// The message a read of a query execution no `StartQueryExecution` minted answers with.
 pub fn query_execution_not_found(id: &str) -> String {
     format!("QueryExecution {id} was not found")
+}
+
+/// How a batch read of query executions reports ONE requested id it could not resolve.
+///
+/// A batch read answers in two parts rather than refusing the whole request, and the entry
+/// it reports an id under carries the CLASS of that id's failure under `ErrorCode` — which
+/// is what a client branches on for a partial answer. There are two classes an id can fail
+/// in, and they are decided one before the other:
+///
+/// * an id that is not a query execution identifier at all — one outside the modelled
+///   `QueryExecutionId`, 1 to 128 characters matching `^\S+$` — is the request itself being
+///   wrong, so it is refused whole, with the class a bad request carries
+///   ([`ERROR_CODE_INVALID_INPUT`]), before any handler sees it (see
+///   [`crate::service::input_validation`]);
+/// * an id that IS one and that this account holds no execution under failed only at
+///   RESOLVING, which is its own class ([`ERROR_CODE_QUERY_EXECUTION_NOT_FOUND`]) — a
+///   permanent miss a poller must stop on rather than a request it could rebuild.
+///
+/// So an id reaching this far is well formed and the entry states the miss, in the one
+/// sentence a miss of that id is stated in ([`query_execution_not_found`]) — the same one a
+/// single read of it is refused with, so the two never disagree about an id neither can
+/// resolve.
+pub fn unprocessed_query_execution(id: &str) -> UnprocessedQueryExecutionId {
+    UnprocessedQueryExecutionId {
+        query_execution_id: Some(id.to_string()),
+        error_code: Some(ERROR_CODE_QUERY_EXECUTION_NOT_FOUND.to_string()),
+        error_message: Some(query_execution_not_found(id)),
+    }
 }
 
 /// The message an operation addressing a workgroup this account holds none of answers

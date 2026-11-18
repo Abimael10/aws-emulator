@@ -3,9 +3,10 @@
 //! @op BatchGetQueryExecution
 //! IMPLEMENTED: partitions the requested ids by what this account holds — the stored
 //! execution for each id there is one for, and an unprocessed entry for each there is
-//! not. Every state a query has moved into and that has not been announced yet is
-//! published onto the account's default EventBridge bus (`crate::state::query_events`);
-//! the answer itself is unchanged by that.
+//! not, carrying the class of that id's failure (`crate::state::unprocessed_query_execution`).
+//! Every state a query has moved into and that has not been announced yet is published
+//! onto the account's default EventBridge bus (`crate::state::query_events`); the answer
+//! itself is unchanged by that.
 //!
 //! ## Shape of an operation
 //!
@@ -163,16 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             for id in &input.query_execution_ids {
                 match store.query_execution(id) {
                     Some(record) => executions.push(record.to_query_execution(now)),
-                    None => unprocessed.push(UnprocessedQueryExecutionId {
-                        query_execution_id: Some(id.clone()),
-                        // An id this account minted no execution under is its own refusal
-                        // class — a permanent miss a poller must stop on — and not a request
-                        // this service found otherwise wrong.
-                        error_code: Some(
-                            crate::state::ERROR_CODE_QUERY_EXECUTION_NOT_FOUND.to_string(),
-                        ),
-                        error_message: Some(crate::state::query_execution_not_found(id)),
-                    }),
+                    // An id this account minted no execution under failed at RESOLVING and
+                    // not at being an execution id — one that is not an execution id at all
+                    // never reaches this handler — so the entry carries the class of a
+                    // permanent miss, stated once in
+                    // `crate::state::unprocessed_query_execution`.
+                    None => unprocessed.push(crate::state::unprocessed_query_execution(id)),
                 }
             }
 
