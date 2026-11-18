@@ -37,7 +37,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cloud_connector_validation::{
-    create_federating_role, federation_permitted, listed, put_role_policy, trusted_by_ssm,
+    create_federating_role, enable_outbound_federation, federation_permitted, listed,
+    put_role_policy, trusted_by_ssm,
 };
 use crate::hybrid_activation_role::{create_role, router_with_iam};
 use crate::parameter_store::{
@@ -186,6 +187,9 @@ async fn a_connector_is_minted_only_for_a_role_this_service_may_assume() {
             // question and nothing else.
             put_role_policy(&router, case, role, &federation_permitted()).await;
         }
+        // The token is vended only while the ACCOUNT has outbound web identity federation
+        // on, which every row here holds constant.
+        enable_outbound_federation(&router, case).await;
 
         let (status, body) = call(&router, "CreateCloudConnector", &create_body(&row.role_arn)).await;
         if row.served {

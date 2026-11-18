@@ -150,6 +150,28 @@ pub fn is_cloud_connector_id(token: &str) -> bool {
     super::is_activation_id(token)
 }
 
+/// The tenant a `CloudConnectorConfiguration` targets — `AzureConfiguration$TenantId`,
+/// "The ID of the Azure tenant", which a configuration always carries because the member is
+/// `@required`.
+///
+/// Read off the CONFIGURATION rather than off a stored connector, so a create resolves the
+/// tenant of the configuration it was handed before any connector exists to read it from;
+/// [`CloudConnectorRecord::tenant_id`] is this over the one a record holds.
+pub fn configuration_tenant_id(configuration: &CloudConnectorConfiguration) -> &str {
+    match configuration {
+        CloudConnectorConfiguration::AzureConfiguration(azure) => azure.tenant_id.as_str(),
+    }
+}
+
+/// The application a `CloudConnectorConfiguration` authenticates as in that tenant —
+/// `AzureConfiguration$ApplicationId`, "The ID of the Azure application registration used
+/// for authentication", `@required` too. The sibling of [`configuration_tenant_id`].
+pub fn configuration_application_id(configuration: &CloudConnectorConfiguration) -> &str {
+    match configuration {
+        CloudConnectorConfiguration::AzureConfiguration(azure) => azure.application_id.as_str(),
+    }
+}
+
 /// One cloud connector, as the connector reads report it.
 #[derive(Debug, Clone)]
 pub struct CloudConnectorRecord {
@@ -222,9 +244,7 @@ impl CloudConnectorRecord {
     /// "The ID of the Azure tenant", which the configuration always carries because the
     /// member is `@required`.
     pub fn tenant_id(&self) -> &str {
-        match &self.configuration {
-            CloudConnectorConfiguration::AzureConfiguration(azure) => azure.tenant_id.as_str(),
-        }
+        configuration_tenant_id(&self.configuration)
     }
 
     /// The application this connector authenticates as in that tenant —
@@ -232,9 +252,7 @@ impl CloudConnectorRecord {
     /// used for authentication", which the configuration always carries because that member
     /// is `@required` too.
     pub fn application_id(&self) -> &str {
-        match &self.configuration {
-            CloudConnectorConfiguration::AzureConfiguration(azure) => azure.application_id.as_str(),
-        }
+        configuration_application_id(&self.configuration)
     }
 
     /// The subscriptions this connector targets, in the order its configuration lists them.

@@ -15,12 +15,16 @@
 //!
 //! Both the create and the validation ask the SAME questions of the same records — which
 //! role of this account the value names and what its trust policy admits
-//! ([`super::activation_role`]), then what IAM answers about that role's permissions
-//! ([`::service_common::iam_role::role_withholds_action`]) — so a connector the create
-//! admitted validates clean, and one whose role lost the permission after it was minted
-//! validates with the finding that says so. A refusal and a finding are therefore both
-//! grounded in what IAM ANSWERED: an emulator with no IAM mounted to ask refuses nothing
-//! and reports no such finding.
+//! ([`super::activation_role`]), what IAM answers about that role's permissions
+//! ([`::service_common::iam_role::role_withholds_action`]), whether the ACCOUNT has the
+//! outbound web identity federation that vends the token on, and whether the provider
+//! credential the token is exchanged FOR can be created for the tenant and the application
+//! the configuration names ([`super::provider_credentials`]) — so a connector the create
+//! admitted validates clean, and one whose role lost the permission, or whose account or
+//! verified provider credential went away, after it was minted validates with the finding
+//! that says so. A refusal and a finding are therefore both grounded in what the service
+//! HOLDING those records ANSWERED: an emulator with no IAM and no Config mounted to ask
+//! refuses nothing and reports no such finding.
 
 use crate::ops::types::{ValidationFinding, ValidationFindingScope};
 
@@ -90,6 +94,17 @@ pub const FINDING_CODE_ROLE_ASSUMPTION_FAILED: &str = "AwsRoleAssumptionFailed";
 /// web identity token the federation step needs.
 pub const FINDING_CODE_WEB_IDENTITY_TOKEN_FAILED: &str = "WebIdentityTokenFailed";
 
+/// The `ValidationFindingCode` of the finding that reports the ACCOUNT not having outbound
+/// web identity federation on, so none of its principals can obtain the token at all.
+pub const FINDING_CODE_OUTBOUND_FEDERATION_DISABLED: &str =
+    "OutboundWebIdentityFederationDisabled";
+
+/// The `ValidationFindingCode` of the finding that reports the step AFTER that token: the
+/// provider credential it is exchanged for could not be created for the tenant and the
+/// application the connector's configuration names.
+pub const FINDING_CODE_PROVIDER_CREDENTIAL_CREATION_FAILED: &str =
+    "ProviderCredentialCreationFailed";
+
 /// The `ValidationFindingScopeType` of a finding about the Azure TENANT a connector targets
 /// (`crate::ops::types::VALIDATION_FINDING_SCOPE_TYPE_VALUES`).
 pub const FINDING_SCOPE_TENANT: &str = "azure:tenant";
@@ -117,9 +132,10 @@ pub const TARGET_INACCESSIBLE_MESSAGE: &str =
 /// Why the federation of ONE connector fails, as a validation reports it: which step of it
 /// IAM answered about.
 ///
-/// `None` — nothing failed — is the connector whose role IAM admits and permits, and also
-/// the connector no IAM answered about at all: a finding, like a refusal, is grounded in
-/// what IAM said.
+/// `None` — nothing failed — is the connector whose role IAM admits and permits and whose
+/// tenant this account holds a verified credential for, and also the connector nothing
+/// answered about at all: a finding, like a refusal, is grounded in what the service holding
+/// those records said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FederationFailure {
     /// IAM answered that this service cannot assume the connector's role: the account
@@ -128,6 +144,15 @@ pub enum FederationFailure {
     /// IAM answered that the role's permissions withhold
     /// [`WEB_IDENTITY_TOKEN_ACTION`], so the federation step can obtain no token.
     WebIdentityToken,
+    /// IAM answered that the ACCOUNT has outbound web identity federation off, so none of
+    /// its principals can obtain that token
+    /// ([`super::provider_credentials::outbound_federation_is_disabled`]).
+    OutboundFederationDisabled,
+    /// The token can be obtained, but nothing this account holds verifies a credential for
+    /// the tenant and the application the configuration names, so the provider credential
+    /// the token is exchanged for cannot be created
+    /// ([`super::provider_credentials::azure_credentials_are_unobtainable`]).
+    ProviderCredential,
 }
 
 impl FederationFailure {
@@ -136,6 +161,8 @@ impl FederationFailure {
         match self {
             Self::RoleAssumption => FINDING_CODE_ROLE_ASSUMPTION_FAILED,
             Self::WebIdentityToken => FINDING_CODE_WEB_IDENTITY_TOKEN_FAILED,
+            Self::OutboundFederationDisabled => FINDING_CODE_OUTBOUND_FEDERATION_DISABLED,
+            Self::ProviderCredential => FINDING_CODE_PROVIDER_CREDENTIAL_CREATION_FAILED,
         }
     }
 
@@ -145,33 +172,87 @@ impl FederationFailure {
         match self {
             Self::RoleAssumption => super::activation_role::unassumable_role_message(role_arn),
             Self::WebIdentityToken => WEB_IDENTITY_TOKEN_UNAVAILABLE.to_string(),
+            Self::OutboundFederationDisabled => {
+                super::provider_credentials::OUTBOUND_FEDERATION_DISABLED.to_string()
+            }
+            Self::ProviderCredential => {
+                super::provider_credentials::AZURE_CREDENTIALS_UNOBTAINABLE.to_string()
+            }
         }
     }
 }
 
-/// Why the federation of the connector that acts under `role_arn` fails, or `None` when
-/// nothing IAM answered says it does.
+/// What the federation of ONE connector is resolved from: the role it acts under, and where
+/// the verified credential for the tenant it acts in lives.
 ///
-/// The two steps are asked in the order the federation takes them: this service assumes the
-/// role first ([`super::activation_role::arn_refusal`]), and the assumed role then obtains
-/// the web identity token the provider's credential is exchanged for
-/// ([`web_identity_token_is_unobtainable`]). A create resolves this BEFORE it mints a
-/// connector and refuses with the failing step's own sentence; a validation reports it as a
-/// finding of the connector it is asked about.
+/// The same four values whether the connector is being CREATED — where they come out of the
+/// request — or already held, where they come out of the record ([`Self::of`]), so one
+/// question is asked of both.
+#[derive(Debug, Clone, Copy)]
+pub struct FederatedConnector<'a> {
+    /// "The Amazon Resource Name (ARN) of the IAM role that the cloud connector uses to
+    /// communicate with the third-party cloud environment."
+    pub role_arn: &'a str,
+    /// "The ARN of the Amazon Web Services Config connector associated with this cloud
+    /// connector", which is where the verified provider credential lives.
+    pub config_connector_arn: &'a str,
+    /// The tenant the connector acts in (`AzureConfiguration$TenantId`).
+    pub tenant_id: &'a str,
+    /// The application registration it acts as there (`AzureConfiguration$ApplicationId`).
+    pub application_id: &'a str,
+}
+
+impl<'a> FederatedConnector<'a> {
+    /// The four values of a connector this service already holds.
+    pub fn of(record: &'a super::cloud_connectors::CloudConnectorRecord) -> Self {
+        Self {
+            role_arn: &record.role_arn,
+            config_connector_arn: &record.config_connector_arn,
+            tenant_id: record.tenant_id(),
+            application_id: record.application_id(),
+        }
+    }
+}
+
+/// Why the federation of `connector` fails, or `None` when nothing the services holding
+/// those records answered says it does.
+///
+/// The steps are asked in the order the federation takes them: this service assumes the
+/// role first ([`super::activation_role::arn_refusal`]), the assumed role then obtains the
+/// web identity token, which takes both the role's own permission
+/// ([`web_identity_token_is_unobtainable`]) and the ACCOUNT having the feature that vends it
+/// on ([`super::provider_credentials::outbound_federation_is_disabled`]), and that token is
+/// finally exchanged for the provider's own credential, which can be created only for a
+/// tenant and an application this account holds a verified credential for
+/// ([`super::provider_credentials::azure_credentials_are_unobtainable`]). A create resolves
+/// this BEFORE it mints a connector and refuses with the failing step's own sentence; a
+/// validation reports it as a finding of the connector it is asked about.
 pub async fn federation_failure(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
-    role_arn: &str,
+    connector: FederatedConnector<'_>,
 ) -> Option<FederationFailure> {
-    if super::activation_role::arn_refusal(ctx, region, role_arn)
+    if super::activation_role::arn_refusal(ctx, region, connector.role_arn)
         .await
         .is_some()
     {
         return Some(FederationFailure::RoleAssumption);
     }
-    web_identity_token_is_unobtainable(ctx, region, role_arn)
-        .await
-        .then_some(FederationFailure::WebIdentityToken)
+    if web_identity_token_is_unobtainable(ctx, region, connector.role_arn).await {
+        return Some(FederationFailure::WebIdentityToken);
+    }
+    if super::provider_credentials::outbound_federation_is_disabled(ctx, region).await {
+        return Some(FederationFailure::OutboundFederationDisabled);
+    }
+    super::provider_credentials::azure_credentials_are_unobtainable(
+        ctx,
+        region,
+        connector.config_connector_arn,
+        connector.tenant_id,
+        connector.application_id,
+    )
+    .await
+    .then_some(FederationFailure::ProviderCredential)
 }
 
 /// One finding of `code`, reported at `scope_type`/`scope_id`.
@@ -201,12 +282,12 @@ fn finding(
 /// (`failure`).
 ///
 /// Every finding is read out of what the connector's own configuration persisted and what
-/// IAM answered about the role it holds — the tenant it targets, the application it acts
-/// as, the subscriptions it targets — so two validations of one unchanged connector report
-/// the same findings and a validation changes none of them.
+/// the services holding the records answered about it (`failure`) — the tenant it targets,
+/// the application it acts as, the subscriptions it targets — so two validations of one
+/// unchanged connector report the same findings and a validation changes none of them.
 ///
 /// The order is total, which is what lets a page resume at the finding it stopped on: the
-/// tenant it targets first, then what IAM answered about the role, then its targets in the
+/// tenant it targets first, then what the step that failed answered, then its targets in the
 /// order the configuration lists them.
 pub fn findings(
     record: &super::cloud_connectors::CloudConnectorRecord,

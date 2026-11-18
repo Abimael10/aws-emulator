@@ -197,6 +197,10 @@ pub mod cloud_connectors;
 /// federation its role has to obtain, and the findings a validation of one reports.
 pub mod cloud_connector_validation;
 
+/// The provider credential a cloud connector acts with, and whether this account holds a
+/// verified credential for the tenant and the application its configuration names.
+pub mod provider_credentials;
+
 /// Rendering a persisted document's content in the `DocumentFormat` a read asks for.
 pub mod document_format;
 

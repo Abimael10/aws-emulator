@@ -223,6 +223,22 @@ pub(crate) fn router_with_iam() -> MultiServiceRouter {
 /// One awsQuery call to IAM that must succeed, answering the XML body it served. Shared with
 /// the sibling suite above.
 pub(crate) async fn iam(router: &MultiServiceRouter, case: &str, action: &str, params: &[(&str, String)]) -> String {
+    let (status, text) = iam_answer(router, action, params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from IAM {action}, got {status} with {text}"
+    );
+    text
+}
+
+/// The same call, answering whatever IAM answered — for a caller asking for a state the
+/// account may already be in, where the call's own status is not what matters. Shared with
+/// the sibling suites above.
+pub(crate) async fn iam_answer(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, String)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -247,11 +263,7 @@ pub(crate) async fn iam(router: &MultiServiceRouter, case: &str, action: &str, p
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let text = String::from_utf8_lossy(&response.into_body()).to_string();
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected 200 from IAM {action}, got {status} with {text}"
-    );
-    text
+    (status, text)
 }
 
 /// Create `role_name` under `path` carrying `trust` through IAM's own `CreateRole`. Shared

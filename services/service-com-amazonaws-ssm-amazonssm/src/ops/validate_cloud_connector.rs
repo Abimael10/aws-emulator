@@ -154,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::cloud_connector_validation::{
-            federation_failure, findings, validation_findings_page_size,
+            federation_failure, findings, validation_findings_page_size, FederatedConnector,
         };
         use crate::state::cloud_connectors::CLOUD_CONNECTOR_NOT_FOUND;
 
@@ -193,9 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // What the connector can actually do: the role it holds has to be one this service
         // may assume and one permitted to obtain the token the cross-cloud federation is
-        // exchanged for. The store's lock is released before the hop to IAM, which is a
-        // call of its own.
-        let failure = federation_failure(ctx, &region, &record.role_arn).await;
+        // exchanged for, and the provider credential that token is exchanged for has to be
+        // one this account still holds a verified credential for. The store's lock is
+        // released before those hops, each of which is a call of its own.
+        let failure = federation_failure(ctx, &region, FederatedConnector::of(&record)).await;
         let reported = findings(&record, failure);
 
         // The token this read hands out is the position the next page starts at within one

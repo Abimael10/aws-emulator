@@ -38,7 +38,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::hybrid_activation_role::{create_role, iam, router_with_iam};
+use crate::hybrid_activation_role::{create_role, iam, iam_answer, router_with_iam};
 use crate::parameter_store::{call_in_region, error_code, error_message, ACCOUNT, REGION};
 
 /// A second Region, to pin that a validation resolves the id at the endpoint's Region.
@@ -155,6 +155,29 @@ pub(crate) async fn put_role_policy(
     .await;
 }
 
+/// Turn the ACCOUNT's outbound web identity federation on through IAM's own
+/// `EnableOutboundWebIdentityFederation`, which is what lets this account's principals
+/// obtain the web identity token a connector's cross-cloud federation presents ("When
+/// true, IAM principals in the account can call the `GetWebIdentityToken` API",
+/// `GetOutboundWebIdentityFederationInfoResponse$JwtVendingEnabled`). Shared with the
+/// sibling suite that resolves a connector's role through IAM
+/// ([`crate::cloud_connector_role_and_deletion`]).
+///
+/// An account already holding the feature on refuses a second enable, so what is asserted
+/// is the STATE the account ends in — IAM serves
+/// `GetOutboundWebIdentityFederationInfo` only while the feature is on — rather than this
+/// one call's own status.
+pub(crate) async fn enable_outbound_federation(router: &MultiServiceRouter, case: &str) {
+    let _ = iam_answer(router, "EnableOutboundWebIdentityFederation", &[]).await;
+    let (status, reported) =
+        iam_answer(router, "GetOutboundWebIdentityFederationInfo", &[]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the account's outbound web identity federation must be on, got \
+         {status} with {reported}"
+    );
+}
+
 /// Create `role_name` trusting this service and permitted to federate, which is the role a
 /// served create names.
 pub(crate) async fn create_federating_role(
@@ -164,6 +187,9 @@ pub(crate) async fn create_federating_role(
 ) {
     create_role(router, case, "/", role_name, &trusted_by_ssm()).await;
     put_role_policy(router, case, role_name, &federation_permitted()).await;
+    // The token that role is permitted to obtain is vended only while the ACCOUNT has the
+    // feature on, so a role that can federate needs both.
+    enable_outbound_federation(router, case).await;
 }
 
 /// The ARN of the role `role_name` of this account.
@@ -675,6 +701,9 @@ async fn a_create_is_refused_for_a_role_that_cannot_obtain_a_web_identity_token(
         if let Some(permissions) = row.permissions.as_ref() {
             put_role_policy(&router, case, role, permissions).await;
         }
+        // What each row varies is the ROLE's own permissions, so the account-level feature
+        // the token is vended under is on throughout.
+        enable_outbound_federation(&router, case).await;
 
         let before = listed(&router, REGION).await;
         let (status, body) = call_in_region(

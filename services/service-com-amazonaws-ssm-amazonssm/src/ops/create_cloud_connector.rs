@@ -16,14 +16,18 @@
 //! ([`crate::state::cloud_connectors::MAX_CLOUD_CONNECTORS`]): a create past that
 //! ceiling is refused with `ServiceQuotaExceededException` and writes nothing.
 //!
-//! One member is resolved before anything is minted: the connector "uses [the IAM role
-//! `RoleArn` names] to communicate with the third-party cloud environment", so that role
-//! has to exist and admit this service the assume, which is the reading
+//! Two things are resolved before anything is minted. The connector "uses [the IAM role
+//! `RoleArn` names] to communicate with the third-party cloud environment", so that role has
+//! to exist and admit this service the assume, which is the reading
 //! [`crate::state::activation_role`] holds for every member of this service that hands it a
-//! role, and it has to be permitted to obtain the web identity token the cross-cloud
-//! federation is exchanged for ([`crate::state::cloud_connector_validation`]). A create
-//! naming a role IAM answered about either way is refused 400 `ValidationException` and
-//! writes nothing.
+//! role, and the web identity token the cross-cloud federation is exchanged for has to be
+//! obtainable — which takes both that role's own permission and the ACCOUNT having outbound
+//! web identity federation on ([`crate::state::cloud_connector_validation`]). The provider
+//! credential that token is exchanged FOR is then created for the tenant and the application
+//! the `Configuration` names, which takes a credential this account already verified for
+//! them — the Amazon Web Services Config connector `ConfigConnectorArn` names, read from that
+//! service's own store ([`crate::state::provider_credentials`]). A create whose failing step
+//! was answered either way is refused 400 `ValidationException` and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -188,16 +192,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // environment", so before a connector is minted against it the role has to exist,
         // admit this service the assume — the same reading of a caller-supplied role every
         // other member of this service that hands it one takes
-        // ([`crate::state::activation_role`]) — and be permitted to obtain the web identity
-        // token the cross-cloud federation is exchanged for, which is the call the
-        // federation step makes under it
-        // ([`crate::state::cloud_connector_validation`]). The refusal is grounded in what
-        // IAM answered about the role, carries the failing step's own sentence, and nothing
-        // is written when it is refused.
+        // ([`crate::state::activation_role`]) — the web identity token the cross-cloud
+        // federation is exchanged for has to be obtainable, which takes both that role's own
+        // permission and the account having that feature on, and the credential that token is
+        // exchanged FOR has to be one this account holds a verified credential for: the
+        // Amazon Web Services Config connector `ConfigConnectorArn` names, read from that
+        // service's own store ([`crate::state::provider_credentials`]). The refusal is
+        // grounded in what the service holding those records answered, carries the failing
+        // step's own sentence, and nothing is written when it is refused.
         if let Some(failure) = crate::state::cloud_connector_validation::federation_failure(
             ctx,
             &region,
-            &input.role_arn,
+            crate::state::cloud_connector_validation::FederatedConnector {
+                role_arn: &input.role_arn,
+                config_connector_arn: &input.config_connector_arn,
+                tenant_id: crate::state::cloud_connectors::configuration_tenant_id(
+                    &input.configuration,
+                ),
+                application_id: crate::state::cloud_connectors::configuration_application_id(
+                    &input.configuration,
+                ),
+            },
         )
         .await
         {

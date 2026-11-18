@@ -15,6 +15,16 @@
 //! `GetCloudConnector` after this call reports the new members beside the untouched
 //! ones, with `UpdatedAt` moved to when this call ran.
 //!
+//! A `Configuration` replaces the tenant and the application the connector acts as, so it
+//! is resolved before it is stored, exactly as a create resolves the configuration it was
+//! handed: the connector's cross-cloud federation is put the same questions about the
+//! connector as this update would leave it
+//! ([`crate::state::cloud_connector_validation::federation_failure`]) — among them that the
+//! provider credential it would act with can be created only for a tenant and an
+//! application this account holds a verified credential for
+//! ([`crate::state::provider_credentials`]) — and an update whose replacement names a pair
+//! those services answered about is refused 400 `ValidationException` and writes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -165,12 +175,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx.parts());
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
 
         // An id no create minted names no connector, which is a not-found rather than a
         // conflict: the resolution comes FIRST, so a request naming an absent connector
-        // is refused the same way whether it arrives alone or beside others.
+        // is refused the same way whether it arrives alone or beside others. What it
+        // resolves to carries the role the connector acts under and where the verified
+        // provider credential of this connector lives, which the question below is put
+        // about.
+        let (role_arn, config_connector_arn) = {
+            let store = state.lock();
+            let Some(record) = store.cloud_connector(&region, &input.cloud_connector_id) else {
+                return Err(UpdateCloudConnectorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::cloud_connectors::CLOUD_CONNECTOR_NOT_FOUND.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+            (
+                record.role_arn.clone(),
+                record.config_connector_arn.clone(),
+            )
+        };
+
+        // A `Configuration` REPLACES the tenant and the application the connector acts as,
+        // so the federation it would then have is resolved before the replacement is stored —
+        // the same question the create resolved about the configuration it was handed, put
+        // about the connector as this update would leave it
+        // ([`crate::state::cloud_connector_validation::federation_failure`]), grounded the
+        // same way and writing nothing when it is refused. An update carrying no
+        // configuration changes neither the tenant nor the application, so there is nothing
+        // to resolve.
+        if let Some(configuration) = input.configuration.as_ref() {
+            if let Some(failure) = crate::state::cloud_connector_validation::federation_failure(
+                ctx,
+                &region,
+                crate::state::cloud_connector_validation::FederatedConnector {
+                    role_arn: &role_arn,
+                    config_connector_arn: &config_connector_arn,
+                    tenant_id: crate::state::cloud_connectors::configuration_tenant_id(
+                        configuration,
+                    ),
+                    application_id: crate::state::cloud_connectors::configuration_application_id(
+                        configuration,
+                    ),
+                },
+            )
+            .await
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    failure.message(&role_arn),
+                ));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The connector is resolved again on the writing side: the questions above are calls
+        // of their own, so the record is read back under the lock the write holds rather than
+        // across them.
         let Some(record) = store.cloud_connector_mut(&region, &input.cloud_connector_id) else {
             return Err(UpdateCloudConnectorErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
