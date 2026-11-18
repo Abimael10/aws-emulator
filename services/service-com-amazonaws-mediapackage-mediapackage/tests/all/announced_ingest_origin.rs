@@ -28,108 +28,15 @@
 //! `UpdateChannel`, `ConfigureLogs`, `RotateChannelCredentials` and
 //! `RotateIngestEndpointCredentials`.
 
-use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::{EndpointUrl, MultiServiceRouter};
 
 use service_com_amazonaws_mediapackage_mediapackage::state;
 
 use super::data_plane::{
-    challenge_parameter, control_authorization, digest_authorization, emulator, path_of, plane,
-    Ingest, REGION,
+    announced_origin as origin, challenge_parameter, control, control_addressed,
+    digest_authorization, emulator, path_of, plane, Ingest, Reached, OWN_ENDPOINTS, REGION,
 };
-
-/// One address a client reaches this emulator at: the authority its request URI names and
-/// the `Host` header it carries (`None` sends none at all, as an absolute-form request
-/// does).
-struct Addressing {
-    case: &'static str,
-    authority: &'static str,
-    host_header: Option<&'static str>,
-    /// The authority the announced origin must name, which is the one the request reached.
-    announced: &'static str,
-}
-
-/// The addresses a client on the machine this emulator runs on reaches it at. Each is an
-/// address rather than a service hostname, so each is the emulator's own endpoint.
-const OWN_ENDPOINTS: &[Addressing] = &[
-    Addressing {
-        case: "an IPv4 literal with the data port",
-        authority: "127.0.0.1:9297",
-        host_header: Some("127.0.0.1:9297"),
-        announced: "127.0.0.1:9297",
-    },
-    Addressing {
-        case: "an IPv4 literal on the default port",
-        authority: "127.0.0.1",
-        host_header: Some("127.0.0.1"),
-        announced: "127.0.0.1",
-    },
-    Addressing {
-        case: "a loopback name",
-        authority: "localhost:9297",
-        host_header: Some("localhost:9297"),
-        announced: "localhost:9297",
-    },
-    Addressing {
-        case: "a bracketed IPv6 literal",
-        authority: "[::1]:9297",
-        host_header: Some("[::1]:9297"),
-        announced: "[::1]:9297",
-    },
-    Addressing {
-        case: "no Host header, the endpoint on an absolute-form URI",
-        authority: "127.0.0.1:39355",
-        host_header: None,
-        announced: "127.0.0.1:39355",
-    },
-];
-
-/// The scheme every announced ingest origin carries
-/// ([`state::INGEST_ORIGIN_PREFIX`]), so a row states the authority and not the whole URL.
-fn origin(authority: &str) -> String {
-    format!("{}{authority}", state::INGEST_ORIGIN_PREFIX)
-}
-
-/// One control-plane round trip addressed at `authority`, carrying `host_header` when the
-/// client sends one: the HTTP status and the parsed JSON body.
-async fn control_addressed(
-    router: &MultiServiceRouter,
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    authority: &str,
-    host_header: Option<&str>,
-) -> (u16, Value) {
-    let payload = body.map(|value| value.to_string()).unwrap_or_default();
-    let mut request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://{authority}{uri}"))
-        .header("authorization", control_authorization())
-        .header("content-type", "application/json");
-    if let Some(host) = host_header {
-        request = request.header("host", host);
-    }
-    let request = request
-        .body(Bytes::from(payload))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = serde_json::from_slice(&response.into_body()).unwrap_or(Value::Null);
-    (status, parsed)
-}
-
-/// One control-plane round trip addressed at this service's OWN regional hostname, as an
-/// SDK client that resolves AWS's names makes it.
-async fn control(
-    router: &MultiServiceRouter,
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-) -> (u16, Value) {
-    let host = format!("mediapackage.{REGION}.amazonaws.com");
-    control_addressed(router, method, uri, body, &host, Some(&host)).await
-}
 
 /// The ingest endpoints a projection reports, as `(url, username, password)` triples.
 fn ingests_of(body: &Value) -> Vec<Ingest> {
@@ -167,16 +74,12 @@ fn urls_of(body: &Value) -> Vec<String> {
 
 /// Create a channel through one addressing, asserting it succeeded, and report the
 /// projection the create answered with.
-async fn create_channel_at(
-    router: &MultiServiceRouter,
-    addressing: &Addressing,
-    id: &str,
-) -> Value {
+async fn create_channel_at(router: &MultiServiceRouter, addressing: &Reached, id: &str) -> Value {
     let (status, created) = control_addressed(
         router,
         "POST",
         "/channels",
-        Some(json!({ "id": id })),
+        Some(&json!({ "id": id })),
         addressing.authority,
         addressing.host_header,
     )
@@ -219,7 +122,7 @@ async fn projected_urls(
         router,
         "PUT",
         &path,
-        Some(json!({ "description": "re-read" })),
+        Some(&json!({ "description": "re-read" })),
     )
     .await;
     assert_eq!(status, 200, "UpdateChannel {id}: body {updated}");
@@ -228,7 +131,7 @@ async fn projected_urls(
         router,
         "PUT",
         &format!("{path}/configure_logs"),
-        Some(json!({ "egressAccessLogs": { "logGroupName": "/aws/MediaPackage/egress" } })),
+        Some(&json!({ "egressAccessLogs": { "logGroupName": "/aws/MediaPackage/egress" } })),
     )
     .await;
     assert_eq!(status, 200, "ConfigureLogs {id}: body {configured}");
@@ -379,7 +282,7 @@ async fn a_caller_on_an_aws_hostname_is_announced_the_port_the_emulator_is_serve
         }
         let id = format!("aws-host-{index}");
         let (status, created) =
-            control(&router, "POST", "/channels", Some(json!({ "id": id }))).await;
+            control(&router, "POST", "/channels", Some(&json!({ "id": id }))).await;
         assert_eq!(status, 200, "case {case:?}: create body {created}");
 
         let published = urls_of(&created);
@@ -393,7 +296,7 @@ async fn a_caller_on_an_aws_hostname_is_announced_the_port_the_emulator_is_serve
                 None => {
                     let path = path_of(url);
                     let announced = url
-                        .strip_prefix(state::INGEST_ORIGIN_PREFIX)
+                        .strip_prefix(state::MEDIA_ORIGIN_PREFIX)
                         .and_then(|rest| rest.strip_suffix(path))
                         .unwrap_or_default();
                     let (label, domain) = announced.split_once('.').unwrap_or_default();

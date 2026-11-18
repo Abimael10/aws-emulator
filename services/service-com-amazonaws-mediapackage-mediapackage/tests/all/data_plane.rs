@@ -56,25 +56,107 @@ pub(crate) fn control_authorization() -> String {
     )
 }
 
-/// One control-plane round trip: the HTTP status and the parsed JSON body.
-async fn control(
+/// One address a client reaches this emulator at: the authority its request URI names, the
+/// `Host` header it carries (`None` sends none at all, as an absolute-form request does),
+/// and the authority every data-plane URL published by a request that reached it must then
+/// be announced under — the one it reached.
+///
+/// Shared by every suite that drives the announcement rule (this one for the playback
+/// plane, `super::announced_ingest_origin` for the ingest plane), so the addressing table
+/// below is written once.
+pub(crate) struct Reached {
+    pub(crate) case: &'static str,
+    pub(crate) authority: &'static str,
+    pub(crate) host_header: Option<&'static str>,
+    /// The authority the announced origin must name, which is the one the request reached.
+    pub(crate) announced: &'static str,
+}
+
+/// The addresses a client on the machine this emulator runs on reaches it at. Each is an
+/// address rather than a service hostname, so each is the emulator's own endpoint; together
+/// they span the shapes such an address takes and both places a request carries it.
+pub(crate) const OWN_ENDPOINTS: &[Reached] = &[
+    Reached {
+        case: "an IPv4 literal with the data port",
+        authority: "127.0.0.1:9297",
+        host_header: Some("127.0.0.1:9297"),
+        announced: "127.0.0.1:9297",
+    },
+    Reached {
+        case: "an IPv4 literal on the default port",
+        authority: "127.0.0.1",
+        host_header: Some("127.0.0.1"),
+        announced: "127.0.0.1",
+    },
+    Reached {
+        case: "a loopback name",
+        authority: "localhost:9297",
+        host_header: Some("localhost:9297"),
+        announced: "localhost:9297",
+    },
+    Reached {
+        case: "a bracketed IPv6 literal",
+        authority: "[::1]:9297",
+        host_header: Some("[::1]:9297"),
+        announced: "[::1]:9297",
+    },
+    Reached {
+        case: "no Host header, the endpoint on an absolute-form URI",
+        authority: "127.0.0.1:39355",
+        host_header: None,
+        announced: "127.0.0.1:39355",
+    },
+];
+
+/// The origin an announced URL carries for a request that reached `authority`: the scheme
+/// every announced data-plane origin is written with ([`state::MEDIA_ORIGIN_PREFIX`]), then
+/// that authority — so a row states the authority and not the whole URL.
+pub(crate) fn announced_origin(authority: &str) -> String {
+    format!("{}{authority}", state::MEDIA_ORIGIN_PREFIX)
+}
+
+/// One control-plane round trip ADDRESSED at `authority`, carrying `host_header` when the
+/// client sends one (`None` sends none at all, as an absolute-form request does): the HTTP
+/// status and the parsed JSON body.
+///
+/// WHERE a request reached the emulator is what decides the address the data-plane URLs it
+/// publishes are announced under, so a case driving that rule chooses it.
+pub(crate) async fn control_addressed(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
     body: Option<&Value>,
+    authority: &str,
+    host_header: Option<&str>,
 ) -> (u16, Value) {
     let payload = body.map(ToString::to_string).unwrap_or_default();
-    let request = http::Request::builder()
+    let mut request = http::Request::builder()
         .method(method)
-        .uri(format!("https://mediapackage.{REGION}.amazonaws.com{uri}"))
+        .uri(format!("https://{authority}{uri}"))
         .header("authorization", control_authorization())
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    if let Some(host) = host_header {
+        request = request.header("host", host);
+    }
+    let request = request
         .body(Bytes::from(payload))
         .expect("a well-formed request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let parsed = serde_json::from_slice(&response.into_body()).unwrap_or(Value::Null);
     (status, parsed)
+}
+
+/// One control-plane round trip at this service's own regional hostname, as an SDK client
+/// that resolves AWS's names makes it: the HTTP status and the parsed JSON body.
+pub(crate) async fn control(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    let host = format!("mediapackage.{REGION}.amazonaws.com");
+    control_addressed(router, method, uri, body, &host, Some(&host)).await
 }
 
 /// One answer of a data plane: the status, the headers and the bytes.
@@ -1087,4 +1169,293 @@ async fn a_data_plane_address_this_service_never_published_is_routed_to_nothing(
         answer.status,
         answer.text()
     );
+}
+
+// ---------------------------------------------------------------------------
+// RULE 6 — an origin endpoint's playback URL is announced where it is served
+// ---------------------------------------------------------------------------
+
+/// One row of RULE 6: the endpoint a case creates, and what its published URL answers.
+///
+/// The addressing a row creates it through is [`OWN_ENDPOINTS`]' entry at the same
+/// position, so the two tables are read together: the rule is a function of the address the
+/// create reached, and the packaging format is varied across those addresses.
+struct Announced {
+    id: &'static str,
+    /// The single packaging member the create and every update of this endpoint sends.
+    package_member: &'static str,
+    package: Value,
+    /// What the published URL answers while nothing refuses playback: the ingested playlist
+    /// for a format the channel carries, and "nothing here" for one it does not.
+    served: u16,
+}
+
+/// Whether `label` is one of this service's opaque path labels: 32 lowercase hex characters.
+fn is_path_label(label: &str) -> bool {
+    label.len() == 32
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Assert `url` is a playback URL announced under `expected_origin`, keeping the playback
+/// path this service publishes below it: `/out/v1/<endpoint label>/…`.
+fn assert_playback_url(case: &str, url: &str, expected_origin: &str) {
+    let under = format!("{expected_origin}/out/v1/");
+    let tail = url.strip_prefix(&under).unwrap_or_default();
+    let label = tail.split('/').next().unwrap_or_default();
+    assert!(
+        is_path_label(label),
+        "case {case:?}: a playback URL must be {under:?} plus the endpoint's 32-hex label, \
+         got {url:?}"
+    );
+    // The point of the rule: the address handed to a viewer is not a host off this process.
+    assert!(
+        !url.contains("amazonaws.com"),
+        "case {case:?}: a playback URL announced at the emulator's own endpoint must not name \
+         an AWS host, got {url:?}"
+    );
+}
+
+/// The `url` a projection of an origin endpoint reports, and the `url` of each child HLS
+/// manifest of its CMAF package.
+fn published_urls(body: &Value) -> Vec<String> {
+    let mut urls: Vec<String> = body
+        .get("url")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .into_iter()
+        .collect();
+    for child in body
+        .pointer("/cmafPackage/hlsManifests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        urls.push(
+            child
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    urls
+}
+
+/// RULE — the playback URLs an origin endpoint publishes are announced at the endpoint the
+/// CREATING request reached, so a viewer dialing the URL AS PUBLISHED reaches this
+/// emulator's playback plane: it is served there, and refused there with the 403 the
+/// endpoint's own access control decides.
+///
+/// The rows differ along what the rule generalises over: the shape of the emulator's own
+/// address the create reached it at (an IPv4 literal with and without a port, a loopback
+/// name, a bracketed IPv6 literal, an absolute-form URI carrying no `Host` header at all),
+/// the packaging format (and so the manifest the URL ends in), whether the endpoint
+/// publishes child manifests of its own, and whether its channel carries that format's
+/// manifest at all. Both access controls are driven at the published URL, because that is
+/// the address whose answer a viewer sees.
+#[tokio::test]
+async fn the_published_playback_url_is_announced_where_this_emulator_serves_it() {
+    let router = emulator();
+    let ingests = channel_with_ingest(&router, "announced-ch").await;
+    let ingest = ingests.first().cloned().expect("an ingest endpoint");
+    let manifest = b"#EXTM3U\n#EXT-X-VERSION:3\n";
+    let pushed = push(&router, &ingest, "index.m3u8", manifest, &ingest.password).await;
+    assert_eq!(
+        pushed.status, 200,
+        "the setup push must be accepted, got {} {}",
+        pushed.status,
+        pushed.text()
+    );
+
+    // One row per entry of `OWN_ENDPOINTS`, read together with it.
+    let rows = vec![
+        Announced {
+            id: "announced-hls",
+            package_member: "hlsPackage",
+            package: json!({}),
+            served: 200,
+        },
+        Announced {
+            id: "announced-cmaf",
+            package_member: "cmafPackage",
+            package: json!({ "hlsManifests": [{ "id": "a" }, { "id": "b", "manifestName": "master" }] }),
+            served: 200,
+        },
+        Announced {
+            id: "announced-dash",
+            package_member: "dashPackage",
+            package: json!({}),
+            // The channel was pushed an HLS playlist and nothing of this format.
+            served: 404,
+        },
+        Announced {
+            id: "announced-mss",
+            package_member: "mssPackage",
+            package: json!({}),
+            served: 404,
+        },
+        Announced {
+            id: "announced-second-hls",
+            package_member: "hlsPackage",
+            package: json!({}),
+            served: 200,
+        },
+    ];
+    assert_eq!(
+        rows.len(),
+        OWN_ENDPOINTS.len(),
+        "every addressing of the shared table must be driven, got {} rows for {} addressings",
+        rows.len(),
+        OWN_ENDPOINTS.len()
+    );
+
+    for (reached, row) in OWN_ENDPOINTS.iter().zip(rows) {
+        let case = reached.case;
+        let announced = announced_origin(reached.announced);
+        let mut request = json!({ "channelId": "announced-ch", "id": row.id });
+        request[row.package_member] = row.package.clone();
+        let (status, created) = control_addressed(
+            &router,
+            "POST",
+            "/origin_endpoints",
+            Some(&request),
+            reached.authority,
+            reached.host_header,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateOriginEndpoint expected 200, got {status} {created}"
+        );
+
+        // Every URL the create published — the endpoint's own and each child manifest's —
+        // is announced at the address the create reached.
+        let published = published_urls(&created);
+        assert!(
+            !published.is_empty(),
+            "case {case:?}: the create must publish a playback URL, got {created}"
+        );
+        for url in &published {
+            assert_playback_url(case, url, &announced);
+        }
+        let url = published
+            .first()
+            .cloned()
+            .expect("the endpoint's own playback URL");
+
+        // Persisted: a read, and a write that reaches a DIFFERENT address, both re-report
+        // the URLs the create published. The announcement is a property of the endpoint,
+        // decided once, not of the call that reads it.
+        let (status, described) = control(
+            &router,
+            "GET",
+            &format!("/origin_endpoints/{}", row.id),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeOriginEndpoint expected 200, got {status} {described}"
+        );
+        assert_eq!(
+            published_urls(&described),
+            published,
+            "case {case:?}: DescribeOriginEndpoint must re-report the published URLs, got \
+             {described}"
+        );
+        let (status, updated) = control(
+            &router,
+            "PUT",
+            &format!("/origin_endpoints/{}", row.id),
+            Some(&json!({ row.package_member: row.package.clone() })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UpdateOriginEndpoint expected 200, got {status} {updated}"
+        );
+        assert_eq!(
+            published_urls(&updated),
+            published,
+            "case {case:?}: an update reaching another address must not move the announced \
+             playback URLs, got {updated}"
+        );
+
+        // The promise the URL makes: dialed AS PUBLISHED, it is this emulator's playback
+        // plane that answers — serving what the channel ingested for this format.
+        let answer = plane(&router, "GET", &url, &[], b"").await;
+        assert_eq!(
+            answer.status, row.served,
+            "case {case:?}: expected {} at the published URL, got {} {}",
+            row.served,
+            answer.status,
+            answer.text()
+        );
+        if row.served == 200 {
+            assert_eq!(
+                answer.body, manifest,
+                "case {case:?}: the published URL serves the ingested playlist, got {:?}",
+                answer.text()
+            );
+        }
+
+        // And the endpoint's own access control is what the published URL answers with:
+        // origination denied, then a whitelist the caller is outside of, each lifted again
+        // on the IDENTICAL URL.
+        let refusals: &[(&str, Value, u16)] = &[
+            ("origination denied", json!({ "origination": "DENY" }), 403),
+            (
+                "origination allowed again",
+                json!({ "origination": "ALLOW" }),
+                row.served,
+            ),
+            (
+                // RFC 5737 TEST-NET-3: never the address a caller of this emulator comes
+                // from.
+                "a whitelist the caller is outside of",
+                json!({ "whitelist": ["203.0.113.0/32"] }),
+                403,
+            ),
+            ("the whitelist cleared", json!({ "whitelist": [] }), row.served),
+        ];
+        for (refusal, member, expected) in refusals {
+            let mut request = json!({ row.package_member: row.package.clone() });
+            for (name, value) in member.as_object().cloned().unwrap_or_default() {
+                request[name] = value;
+            }
+            let (status, updated) = control(
+                &router,
+                "PUT",
+                &format!("/origin_endpoints/{}", row.id),
+                Some(&request),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} {refusal:?}: UpdateOriginEndpoint expected 200, got {status} \
+                 {updated}"
+            );
+            assert_eq!(
+                published_urls(&updated),
+                published,
+                "case {case:?} {refusal:?}: the published URLs must not move, got {updated}"
+            );
+            let answer = plane(&router, "GET", &url, &[], b"").await;
+            assert_eq!(
+                answer.status, *expected,
+                "case {case:?} {refusal:?}: expected {expected} at the published URL, got {} {}",
+                answer.status,
+                answer.text()
+            );
+            if *expected == 403 {
+                assert!(
+                    answer.body.is_empty(),
+                    "case {case:?} {refusal:?}: the refusal is bare, got {:?}",
+                    answer.text()
+                );
+            }
+        }
+    }
 }

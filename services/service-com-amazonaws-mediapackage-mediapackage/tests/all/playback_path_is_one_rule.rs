@@ -2,20 +2,21 @@
 
 //! Every URL MediaPackage derives for one OriginEndpoint sits under ONE playback path.
 //!
-//! RULE under test: the playback path of an OriginEndpoint is the egress host for this
-//! account and Region — the account's own label, then `mediapackage.<region>.amazonaws.com`,
-//! the same host the channel's ingest URLs name — followed by `/out/v1/<endpoint label>`;
-//! the endpoint's own `url` is that path plus the manifest its packaging type serves, and
-//! the `url` of every child HLS manifest inside its `cmafPackage` is that SAME path plus
-//! the child's own label and name. So an endpoint and its children can never be served
-//! from different hosts or different playback paths.
+//! RULE under test: the playback path of an OriginEndpoint is the egress host this
+//! endpoint is announced under — the same host the channel's ingest URLs name, which for a
+//! caller that resolves AWS's own hostnames (how every case below addresses the emulator)
+//! is the account's own label then `mediapackage.<region>.amazonaws.com` — followed by
+//! `/out/v1/<endpoint label>`; the endpoint's own `url` is that path plus the manifest its
+//! packaging type serves, and the `url` of every child HLS manifest inside its
+//! `cmafPackage` is that SAME path plus the child's own label and name. So an endpoint and
+//! its children can never be served from different hosts or different playback paths.
 //!
-//! This is the behaviour both former copies of the derivation implemented, now stated
-//! once in `state::media_hostname` / `state::playback_url_prefix`; the test drives it
-//! through an operation reaching each former copy: `CreateChannel` (the ingest host),
-//! and `CreateOriginEndpoint`, whose response carries both the endpoint's own `url` and,
-//! for a CMAF endpoint, its children's. Every case is read back through
-//! `DescribeOriginEndpoint`, so the URLs are pinned as PERSISTED.
+//! This is the behaviour both former copies of the derivation implemented, now stated once
+//! in `state::playback_url_prefix`; the test drives it through an operation reaching each
+//! former copy: `CreateChannel` (the ingest host), and `CreateOriginEndpoint`, whose
+//! response carries both the endpoint's own `url` and, for a CMAF endpoint, its children's.
+//! Every case is read back through `DescribeOriginEndpoint`, so the URLs are pinned as
+//! PERSISTED.
 //!
 //! The rows span what the rule generalises over: the packaging type (and so the manifest
 //! tail), the Region, the channel and endpoint ids, whether the request names a

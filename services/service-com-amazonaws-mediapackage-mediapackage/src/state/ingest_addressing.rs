@@ -1,49 +1,55 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHERE a channel's HLS ingest endpoints are ANNOUNCED: the origin every ingest URL
-//! `CreateChannel` publishes for a channel is rooted at.
+//! WHERE this service's two data planes are ANNOUNCED: the origin every URL the control
+//! plane publishes for a caller to dial later is rooted at — a channel's HLS ingest URLs
+//! (`CreateChannel`) and an origin endpoint's playback URLs (`CreateOriginEndpoint`).
 //!
-//! `IngestEndpoint$Url` is "The ingest URL to which the source stream should be sent"
+//! `IngestEndpoint$Url` is "The ingest URL to which the source stream should be sent" and
+//! `OriginEndpoint$Url` "The URL of the packaged OriginEndpoint for consumption"
 //! (`smithy_query(query="shape",shape="com.amazonaws.mediapackage#IngestEndpoint",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`),
-//! so it is an address an encoder DIALS afterwards — and a Digest client is driven
-//! entirely by what that address answers ([`super::data_plane`]). It therefore has to name
-//! a host this emulator answers on. AWS publishes a channel's ingest on a per-account
-//! hostname beneath its own regional domain ([`super::media_hostname`]), and a client on
-//! the machine this emulator runs on resolves none of those names: announcing one sends
-//! that encoder off this process entirely, where it is never challenged and can never
-//! push. The address announced is therefore the endpoint the creating request reached, in
-//! three cases:
+//! so each is an address a client DIALS afterwards — an encoder driven entirely by what the
+//! ingest address answers, a viewer by what the playback address answers
+//! ([`super::data_plane`]). Both therefore have to name a host this emulator answers on.
+//! AWS publishes both planes of an account beneath its own regional domain
+//! ([`super::media_hostname`]), and a client on the machine this emulator runs on resolves
+//! none of those names: announcing one sends that client off this process entirely, where
+//! it is never challenged, never refused and never served. The address announced is
+//! therefore the endpoint the creating request reached, in three cases:
 //!
 //! * a request that reached the EMULATOR'S OWN endpoint comes from a client configured
-//!   with that one endpoint and resolving nothing else, so the channel is announced there;
+//!   with that one endpoint and resolving nothing else, so the resource is announced there;
 //! * a request that addressed some other host on an emulator that IS served on a port is
-//!   announced that port — the one address this process answers on — so a channel minted
+//!   announced that port — the one address this process answers on — so a resource minted
 //!   by an in-process call of another service publishes an address its caller can reach
 //!   too;
 //! * a request that addressed one of AWS's own hosts on an emulator served on no port at
 //!   all comes from a client that resolves them, and there is no own address to announce,
 //!   so the hostname AWS itself would publish stands.
 //!
-//! The choice is made ONCE, when the channel is created, and persisted in the ingest
-//! endpoints stored on the channel record: the create answer, every `DescribeChannel`,
-//! every `ListChannels` element, `UpdateChannel`, `ConfigureLogs` and both credential
-//! rotations project those stored endpoints ([`super::ChannelRecord::to_channel`]), so a
-//! channel is announced at one stable address however it is read.
+//! The choice is made ONCE, by the request that creates the resource, and persisted on that
+//! resource's record: a channel's in the ingest endpoints stored on it, an origin
+//! endpoint's in [`super::OriginEndpointRecord::playback_origin`]. Every projection of
+//! either resource renders those stored values — the create answer, both `Describe*`, both
+//! `List*`, both updates, `ConfigureLogs` and the two credential rotations
+//! ([`super::ChannelRecord::to_channel`],
+//! [`super::OriginEndpointRecord::to_origin_endpoint`]) — so a resource is announced at one
+//! stable address however it is read.
 
 use super::*;
 
-/// The scheme-and-separator prefix an announced ingest origin carries. Ingest is TLS-only,
-/// so the prefix is always this one; it carries the `://` separator, so the path below the
-/// origin ([`super::data_plane::ingest_path`]) is appended and no scheme is re-added.
-pub const INGEST_ORIGIN_PREFIX: &str = "https://";
+/// The scheme-and-separator prefix an announced data-plane origin carries. Both planes are
+/// TLS-only, so the prefix is always this one; it carries the `://` separator, so the path
+/// below the origin ([`super::data_plane::ingest_path`],
+/// [`super::data_plane::PLAYBACK_PATH_PREFIX`]) is appended and no scheme is re-added.
+pub const MEDIA_ORIGIN_PREFIX: &str = "https://";
 
-/// The origin the ingest URLs of a channel created by `parts` are ANNOUNCED under — the
-/// scheme and authority every one of that channel's ingest URLs is rooted at.
+/// The origin the data-plane URLs of a resource created by `parts` are ANNOUNCED under —
+/// the scheme and authority every one of that resource's published URLs is rooted at.
 ///
 /// See the module docs for the three cases. `parts` is the request that creates the
-/// channel and `served_base` the base URL
+/// resource and `served_base` the base URL
 /// [`::smithy_server_runtime::OperationContext::endpoint`] reports for this emulator.
-pub fn announced_ingest_origin(
+pub fn announced_media_origin(
     parts: &::http::request::Parts,
     served_base: &str,
     region: &str,
@@ -51,7 +57,7 @@ pub fn announced_ingest_origin(
     let authority = reached_emulator_endpoint(parts)
         .or_else(|| served_endpoint_authority(served_base))
         .unwrap_or_else(|| media_hostname(region));
-    format!("{INGEST_ORIGIN_PREFIX}{authority}")
+    format!("{MEDIA_ORIGIN_PREFIX}{authority}")
 }
 
 /// The EMULATOR'S OWN endpoint this request reached — an address or a loopback name, which

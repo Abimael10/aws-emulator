@@ -13,13 +13,14 @@
 //! ## Addressing
 //!
 //! Both planes are addressed by the PATH of the URL the control plane published
-//! ([`ingest_path`], [`super::playback_url_prefix`]), because that path is what a client
-//! on this machine can carry: the published HOST names no service the emulator's front
-//! door resolves, so a client reaching the emulator's own endpoint keeps the path and
-//! nothing else. Each path carries the opaque label of the resource it belongs to, which
-//! is derived from that resource's own identity ([`super::stable_label`]) — so a request is
-//! claimed only when the label names a channel or an endpoint THIS store holds, and the
-//! label resolves the Region too.
+//! ([`ingest_path`], [`super::playback_url_prefix`]), because that path is what every
+//! client carries whatever address it dials: the published URL is announced at the endpoint
+//! the creating request reached ([`super::ingest_addressing`]), and a client told some other
+//! host — AWS's own, which this emulator never answers on — still arrives here with the
+//! path and nothing else. Each path carries the opaque label of the resource it belongs to,
+//! which is derived from that resource's own identity ([`super::stable_label`]) — so a
+//! request is claimed only when the label names a channel or an endpoint THIS store holds,
+//! and the label resolves the Region too.
 //!
 //! ## The ingest plane
 //!

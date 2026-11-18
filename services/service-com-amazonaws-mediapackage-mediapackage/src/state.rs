@@ -19,9 +19,11 @@
 pub mod data_plane;
 pub mod harvest_destination;
 pub mod harvest_export;
+/// WHERE the URLs of both data planes are ANNOUNCED — the origin a published ingest or
+/// playback URL is rooted at.
 pub mod ingest_addressing;
 
-pub use ingest_addressing::{announced_ingest_origin, INGEST_ORIGIN_PREFIX};
+pub use ingest_addressing::{announced_media_origin, MEDIA_ORIGIN_PREFIX};
 
 use crate::ops::types::{
     Authorization, Channel, CmafPackage, CmafPackageCreateOrUpdateParameters, DashPackage,
@@ -2347,6 +2349,17 @@ pub struct OriginEndpointRecord {
     /// its packaging format by [`playback_url`], and re-derived by every write of the
     /// record, so every read returns the URL the endpoint serves NOW.
     pub url: String,
+    /// The scheme and authority every playback URL of this endpoint is ANNOUNCED under:
+    /// the origin the request that CREATED the endpoint reached
+    /// ([`announced_media_origin`]).
+    ///
+    /// Persisted, because the address a viewer is handed has to be one this emulator
+    /// answers the playback plane on and the choice is a property of the endpoint rather
+    /// than of the call that reads it: every projection renders [`Self::url`] and the
+    /// `url` of each child manifest of the CMAF package from this one origin, and a later
+    /// write re-derives them from it too, so the endpoint is announced at one stable
+    /// address however it is read. See [`ingest_addressing`].
+    pub playback_origin: String,
     pub created_at: String,
     pub hls_package: Option<HlsPackage>,
     pub dash_package: Option<DashPackage>,
@@ -2707,7 +2720,7 @@ impl ComAmazonawsMediapackageMediapackageState {
     ///
     /// `origin` is the scheme and authority every one of this channel's ingest URLs is
     /// announced under — the endpoint the creating request reached
-    /// ([`announced_ingest_origin`]) — so the address an encoder is handed is one this
+    /// ([`announced_media_origin`]) — so the address an encoder is handed is one this
     /// emulator answers the ingest plane on ([`data_plane`]).
     pub fn mint_ingest_endpoints(
         &mut self,
@@ -3368,31 +3381,33 @@ pub fn packaging_refusal(supplied: &[&str]) -> ServiceError {
 ///
 /// The single statement of that rule, so every URL built from the host AWS publishes
 /// names the same one. It is what a client that resolves AWS's own hostnames is told: the
-/// ingest URLs of a Channel are announced under it only when this emulator has no own
-/// address to announce in its place ([`ingest_addressing`]).
-///
-/// Its other caller is [`playback_url_prefix`], which is still rooted on it for every
-/// caller: an OriginEndpoint's playback URL is the same class of announced address as an
-/// ingest URL and has its own open issue, so it is deliberately left as it is here rather
-/// than changed by a fix that owns neither its replay keys nor its tests.
+/// ingest URLs of a Channel and the playback URLs of an OriginEndpoint are announced under
+/// it only when this emulator has no own address to announce in its place
+/// ([`ingest_addressing`]).
 pub fn media_hostname(region: &str) -> String {
     let account_label = stable_label(&[::emulator_server::emulator_account_id(), region]);
     format!("{account_label}.mediapackage.{region}.amazonaws.com")
 }
 
-/// The playback path every URL of ONE OriginEndpoint sits under: the egress host for this
-/// account and Region, the egress path, then the endpoint's own path label.
+/// The playback path every URL of ONE OriginEndpoint sits under: the origin the endpoint
+/// is announced under, the egress path, then the endpoint's own path label.
 ///
 /// The single statement of that rule. The endpoint's own `url` and the `url` of each child
 /// manifest inside its CMAF package are this prefix plus their own tail, so they always
 /// sit under one playback path.
-pub fn playback_url_prefix(region: &str, channel_id: &str, endpoint_id: &str) -> String {
-    let hostname = media_hostname(region);
+///
+/// `origin` is the scheme and authority this endpoint's playback URLs are announced under
+/// ([`announced_media_origin`]), carried on the record that stores it
+/// ([`OriginEndpointRecord::playback_origin`]), so the address a viewer is handed is one
+/// this emulator answers the playback plane on ([`data_plane`]).
+pub fn playback_url_prefix(
+    origin: &str,
+    region: &str,
+    channel_id: &str,
+    endpoint_id: &str,
+) -> String {
     let endpoint_label = endpoint_path_label(channel_id, endpoint_id, region);
-    format!(
-        "https://{hostname}{}{endpoint_label}",
-        data_plane::PLAYBACK_PATH_PREFIX
-    )
+    format!("{origin}{}{endpoint_label}", data_plane::PLAYBACK_PATH_PREFIX)
 }
 
 /// The opaque label a CHANNEL is named by in the path of every URL this service publishes
@@ -3433,13 +3448,14 @@ pub fn cmaf_manifest_path(
 /// ([`playback_url_prefix`]), then the manifest its packaging type serves under
 /// `manifest_name`.
 pub fn playback_url(
+    origin: &str,
     region: &str,
     channel_id: &str,
     endpoint_id: &str,
     manifest_name: &str,
     kind: PackagingKind,
 ) -> String {
-    let prefix = playback_url_prefix(region, channel_id, endpoint_id);
+    let prefix = playback_url_prefix(origin, region, channel_id, endpoint_id);
     let manifest = kind.manifest_path(manifest_name);
     format!("{prefix}/{manifest}")
 }
@@ -3447,13 +3463,14 @@ pub fn playback_url(
 /// The playback URL of one HLS manifest inside a CMAF package: the endpoint's own
 /// playback path ([`playback_url_prefix`]), then that child manifest's own label and name.
 pub fn cmaf_manifest_url(
+    origin: &str,
     region: &str,
     channel_id: &str,
     endpoint_id: &str,
     manifest_id: &str,
     manifest_name: &str,
 ) -> String {
-    let prefix = playback_url_prefix(region, channel_id, endpoint_id);
+    let prefix = playback_url_prefix(origin, region, channel_id, endpoint_id);
     let path = cmaf_manifest_path(channel_id, endpoint_id, region, manifest_id, manifest_name);
     format!("{prefix}/{path}")
 }
@@ -3498,6 +3515,7 @@ pub fn created_initialization_vector(region: &str, channel_id: &str, endpoint_id
 /// ([`created_initialization_vector`]).
 pub fn stored_cmaf_package(
     params: &CmafPackageCreateOrUpdateParameters,
+    origin: &str,
     region: &str,
     channel_id: &str,
     endpoint_id: &str,
@@ -3521,6 +3539,7 @@ pub fn stored_cmaf_package(
                 playlist_window_seconds: manifest.playlist_window_seconds,
                 program_date_time_interval_seconds: manifest.program_date_time_interval_seconds,
                 url: Some(cmaf_manifest_url(
+                    origin,
                     region,
                     channel_id,
                     endpoint_id,
@@ -3574,6 +3593,7 @@ pub fn rederive_cmaf_package(record: &mut OriginEndpointRecord) {
     let package = record.cmaf_package_parameters.as_ref().map(|params| {
         stored_cmaf_package(
             params,
+            &record.playback_origin,
             &record.region,
             &record.channel_id,
             &record.id,

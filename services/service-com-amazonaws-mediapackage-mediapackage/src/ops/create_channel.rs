@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // announced where it can actually be reached, and persisted with the minted
             // endpoints so every later read of the channel reports the one address the
             // create published. See `crate::state::ingest_addressing`.
-            &crate::state::announced_ingest_origin(ctx.parts(), ctx.endpoint().as_str(), &region),
+            &crate::state::announced_media_origin(ctx.parts(), ctx.endpoint().as_str(), &region),
             &region,
             &input.id,
         );

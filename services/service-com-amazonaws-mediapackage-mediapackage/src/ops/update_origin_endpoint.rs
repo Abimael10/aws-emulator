@@ -337,8 +337,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Values the SERVICE derives are re-derived from the endpoint's OWN region and
         // channel: an endpoint resolves only in the Region it was created in, so the
         // region resolved above IS the stored endpoint's, and no request can move a
-        // stored endpoint's URLs to another region.
+        // stored endpoint's URLs to another region. Its playback URLs stay ANNOUNCED where
+        // the create announced them, which is what makes the address a viewer was handed
+        // survive an update (`crate::state::ingest_addressing`).
         let channel_id = record.channel_id.clone();
+        let playback_origin = record.playback_origin.clone();
 
         // `PUT /origin_endpoints/{Id}` carries the endpoint's updatable configuration:
         // each member it binds becomes what the request sent, and one the request omits
@@ -390,7 +393,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.whitelist = input.whitelist.take().unwrap_or_default();
         // The playback URL is re-derived from the effective `ManifestName` resolved above
         // whenever it or the packaging format changes.
-        record.url = crate::state::playback_url(&region, &channel_id, &id, &manifest_name, kind);
+        record.url = crate::state::playback_url(
+            &playback_origin,
+            &region,
+            &channel_id,
+            &id,
+            &manifest_name,
+            kind,
+        );
         record.manifest_name = Some(manifest_name);
         // The children of a CMAF package are derived from that same effective
         // `ManifestName` — an unnamed child IS the endpoint's manifest name, and every

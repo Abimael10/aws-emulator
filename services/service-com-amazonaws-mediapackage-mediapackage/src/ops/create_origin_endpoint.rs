@@ -362,18 +362,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .manifest_name
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_MANIFEST_NAME.to_string());
+        // WHERE this endpoint's playback URLs are ANNOUNCED: the origin THIS request
+        // reached, so the address a viewer dials is one this emulator answers the playback
+        // plane on, and persisted on the record so every later read — and every later write
+        // that re-derives those URLs — reports the one address the create published. See
+        // `crate::state::ingest_addressing`.
+        let playback_origin =
+            crate::state::announced_media_origin(ctx.parts(), ctx.endpoint().as_str(), &region);
         let mut record = crate::state::OriginEndpointRecord {
             region: region.clone(),
             arn: crate::state::origin_endpoint_arn(&region, &input.id),
             channel_id: input.channel_id.clone(),
             description: input.description.clone(),
             url: crate::state::playback_url(
+                &playback_origin,
                 &region,
                 &input.channel_id,
                 &input.id,
                 &manifest_name,
                 kind,
             ),
+            playback_origin,
             created_at: crate::state::now_iso8601(),
             hls_package: input.hls_package.clone(),
             dash_package: input.dash_package.clone(),
