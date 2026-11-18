@@ -24,7 +24,10 @@
 
 use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 
-use crate::support::{new_engine, query, router_with, tag_value, tag_values, xml_unescape};
+use crate::support::{
+    borrowed, max_below_min_message, new_engine, p, query, router_with, tag_value, tag_values,
+    xml_unescape,
+};
 
 /// The launch source every group in this suite is created from — a launch TEMPLATE,
 /// because no account can create a launch configuration (see
@@ -96,24 +99,35 @@ fn refusal(body: &str) -> (String, String, String) {
     )
 }
 
-/// Create one group with a launch template, and assert the create succeeded.
+/// Create one group with a launch template and the bounds the recorded calls used, and
+/// assert the create succeeded.
 async fn create_group(router: &smithy_server_runtime::MultiServiceRouter, name: &str) {
-    let (status, body) = query(
-        router,
-        "CreateAutoScalingGroup",
-        &[
-            ("AutoScalingGroupName", name),
-            LAUNCH_SOURCE,
-            ("MinSize", "0"),
-            ("MaxSize", "1"),
-            ("DesiredCapacity", "0"),
-            ("AvailabilityZones.member.1", "us-west-2a"),
-        ],
-    )
-    .await;
+    create_bounded_group(router, name, (0, 1)).await;
+}
+
+/// Create one group with a launch template and the bounds given, its capacity at the
+/// minimum, and assert the create succeeded.
+///
+/// THE ONE COPY for this suite: every group here is created from a launch template, in one
+/// Availability Zone, and differs only in the bounds it is given.
+async fn create_bounded_group(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    name: &str,
+    (min_size, max_size): (i32, i32),
+) {
+    let params = vec![
+        p("AutoScalingGroupName", name),
+        p(LAUNCH_SOURCE.0, LAUNCH_SOURCE.1),
+        p("MinSize", min_size.to_string()),
+        p("MaxSize", max_size.to_string()),
+        p("DesiredCapacity", min_size.to_string()),
+        p("AvailabilityZones.member.1", "us-west-2a"),
+    ];
+    let (status, body) = query(router, "CreateAutoScalingGroup", &borrowed(&params)).await;
     assert_eq!(
         status, 200,
-        "creating {name:?}: expected HTTP 200, got {status} with {body:?}"
+        "creating {name:?} with the bounds ({min_size}, {max_size}): expected HTTP 200, got \
+         {status} with {body:?}"
     );
 }
 
@@ -247,9 +261,14 @@ async fn a_create_naming_no_launch_source_answers_the_fixed_sentence() {
     );
 }
 
-/// A request whose maximum group size is below its minimum is refused for the BOUNDS —
+/// A create whose maximum group size is below its minimum is refused for the BOUNDS —
 /// before the request is checked for a launch source at all — with the sentence that
-/// names both bounds, on every operation that sets a group's bounds.
+/// names both bounds, the maximum first.
+///
+/// The operation that CHANGES a stored group's bounds answers the same sentence; the
+/// sibling test below (`an_inverted_bound_change_names_the_bounds_it_would_have_left`)
+/// owns that path, because the bounds it names are the ones the change would leave the
+/// group with rather than two the one request carries.
 #[tokio::test]
 async fn bounds_that_cannot_describe_a_group_are_refused_for_the_bounds() {
     let router = router_with(new_engine());
@@ -277,9 +296,7 @@ async fn bounds_that_cannot_describe_a_group_are_refused_for_the_bounds() {
         )
         .await;
         let (error_type, code, message) = refusal(&body);
-        let expected = format!(
-            "Max bound, {max_size}, must be greater than or equal to min bound, {min_size}"
-        );
+        let expected = max_below_min_message(max_size, min_size);
         assert_eq!(
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} with {body:?}"
@@ -324,51 +341,198 @@ async fn bounds_that_cannot_describe_a_group_are_refused_for_the_bounds() {
         );
     }
 
-    // The same rule on the operation that CHANGES a stored group's bounds: a maximum
-    // below the minimum the group keeps is refused with the same sentence.
-    create_group(&router, "asg-bounds").await;
-    let (status, body) = query(
-        &router,
-        "UpdateAutoScalingGroup",
-        &[
-            ("AutoScalingGroupName", "asg-bounds"),
-            ("MinSize", "3"),
-            ("MaxSize", "2"),
-        ],
-    )
-    .await;
-    let (_, code, message) = refusal(&body);
-    let expected = "Max bound, 2, must be greater than or equal to min bound, 3";
-    assert_eq!(status, 400, "the inverted update: got {status} with {body:?}");
-    assert_eq!(code, "ValidationError", "the inverted update: got {body:?}");
-    assert_eq!(
-        message, expected,
-        "the inverted update: expected the message {expected:?}, got {message:?}"
-    );
-
     // The control: equal bounds are not inverted, so they are accepted and stored.
+    create_bounded_group(&router, "asg-bounds", (2, 2)).await;
+    let sizes = reported_sizes(&router, "asg-bounds").await;
+    let stored = ("2".to_string(), "2".to_string(), "2".to_string());
+    assert_eq!(
+        sizes, stored,
+        "the accepted bounds must be stored, expected {stored:?}, got {sizes:?}"
+    );
+}
+
+/// One case of the bound-relation refusal a CHANGE to a stored group's bounds answers:
+/// the sizes the group already holds, the bounds the request states (each one optional,
+/// because "a member the request omits keeps the value the group already has"), and the
+/// members the request carries beside them.
+struct InvertedUpdate {
+    case: &'static str,
+    /// `(MinSize, MaxSize)` the group is created with; its capacity starts at the minimum.
+    stored: (i32, i32),
+    requested_min: Option<i32>,
+    requested_max: Option<i32>,
+    /// Members the request carries beside the bounds, which the refusal reports nothing of.
+    beside: &'static [(&'static str, &'static str)],
+}
+
+/// The `(MinSize, MaxSize, DesiredCapacity)` a group reports back.
+async fn reported_sizes(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    name: &str,
+) -> (String, String, String) {
+    let (status, body) = query(
+        router,
+        "DescribeAutoScalingGroups",
+        &[("AutoScalingGroupNames.member.1", name)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "reading {name:?} back must succeed, got {status} with {body:?}"
+    );
+    (
+        tag_value(&body, "MinSize"),
+        tag_value(&body, "MaxSize"),
+        tag_value(&body, "DesiredCapacity"),
+    )
+}
+
+/// A change to a stored group's bounds that would leave its maximum below its minimum is
+/// refused with the sentence that names the two bounds the change WOULD HAVE LEFT the group
+/// with — the maximum first — and the group keeps the sizes it had.
+///
+/// The bounds the sentence names are the ones the update resolves: `UpdateAutoScalingGroup`
+/// models `MinSize` and `MaxSize` as optional members
+/// (`smithy_query(query="operation",operation="UpdateAutoScalingGroup")`), so a request that
+/// states only one of them is checked against the other as the group already holds it. The
+/// rows below therefore span which of the two the request states, the size of the inversion,
+/// and the members a request carries beside the bounds; the last row is the control the
+/// service must still ACCEPT.
+#[tokio::test]
+async fn an_inverted_bound_change_names_the_bounds_it_would_have_left() {
+    let router = router_with(new_engine());
+
+    let cases = [
+        InvertedUpdate {
+            case: "both bounds stated",
+            stored: (0, 1),
+            requested_min: Some(3),
+            requested_max: Some(1),
+            beside: &[],
+        },
+        InvertedUpdate {
+            case: "only the minimum stated, the maximum the group keeps",
+            stored: (0, 1),
+            requested_min: Some(2),
+            requested_max: None,
+            beside: &[],
+        },
+        InvertedUpdate {
+            case: "only the maximum stated, the minimum the group keeps",
+            stored: (4, 8),
+            requested_min: None,
+            requested_max: Some(3),
+            beside: &[],
+        },
+        InvertedUpdate {
+            case: "the smallest inversion",
+            stored: (0, 5),
+            requested_min: Some(1),
+            requested_max: Some(0),
+            beside: &[],
+        },
+        InvertedUpdate {
+            case: "an inversion away from zero",
+            stored: (0, 1),
+            requested_min: Some(10),
+            requested_max: Some(9),
+            beside: &[],
+        },
+        InvertedUpdate {
+            case: "the widest inversion a request can state",
+            stored: (0, 1),
+            requested_min: Some(i32::MAX),
+            requested_max: Some(0),
+            beside: &[],
+        },
+        InvertedUpdate {
+            case: "a desired capacity that misses the stated bounds as well",
+            stored: (0, 1),
+            requested_min: Some(3),
+            requested_max: Some(1),
+            beside: &[("DesiredCapacity", "7")],
+        },
+        InvertedUpdate {
+            case: "members of its own beside the bounds",
+            stored: (0, 1),
+            requested_min: Some(2),
+            requested_max: Some(1),
+            beside: &[
+                ("HealthCheckType", "ELB"),
+                ("HealthCheckGracePeriod", "300"),
+                ("NewInstancesProtectedFromScaleIn", "true"),
+            ],
+        },
+    ];
+
+    for (index, row) in cases.iter().enumerate() {
+        let case = row.case;
+        let name = format!("asg-inverted-change-{index}");
+        create_bounded_group(&router, &name, row.stored).await;
+
+        let mut params = vec![p("AutoScalingGroupName", name.as_str())];
+        if let Some(min_size) = row.requested_min {
+            params.push(p("MinSize", min_size.to_string()));
+        }
+        if let Some(max_size) = row.requested_max {
+            params.push(p("MaxSize", max_size.to_string()));
+        }
+        params.extend(row.beside.iter().map(|(key, value)| p(key, *value)));
+        let (status, body) = query(&router, "UpdateAutoScalingGroup", &borrowed(&params)).await;
+
+        // The bounds the update would have left the group with: the stated one, else the
+        // one the group already holds.
+        let min_size = row.requested_min.unwrap_or(row.stored.0);
+        let max_size = row.requested_max.unwrap_or(row.stored.1);
+        let expected = max_below_min_message(max_size, min_size);
+        let (error_type, code, message) = refusal(&body);
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body:?}"
+        );
+        assert_eq!(
+            (error_type.as_str(), code.as_str()),
+            ("Sender", "ValidationError"),
+            "case {case:?}: expected a Sender ValidationError, got {body:?}"
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
+        );
+
+        // A refused change stores nothing: the group reports the sizes it was created with.
+        let sizes = reported_sizes(&router, &name).await;
+        let kept = (
+            row.stored.0.to_string(),
+            row.stored.1.to_string(),
+            row.stored.0.to_string(),
+        );
+        assert_eq!(
+            sizes, kept,
+            "case {case:?}: the refused change must leave the sizes alone, expected {kept:?}, \
+             got {sizes:?}"
+        );
+    }
+
+    // The control: a change whose maximum is NOT below the minimum it leaves the group with
+    // is accepted and stored, so the refusals above cannot pass by refusing every change.
+    let name = "asg-widened-bounds";
+    create_bounded_group(&router, name, (0, 1)).await;
     let (status, body) = query(
         &router,
         "UpdateAutoScalingGroup",
-        &[
-            ("AutoScalingGroupName", "asg-bounds"),
-            ("MinSize", "2"),
-            ("MaxSize", "2"),
-        ],
+        &[("AutoScalingGroupName", name), ("MaxSize", "4")],
     )
     .await;
-    assert_eq!(status, 200, "equal bounds must be accepted, got {body:?}");
-    let (status, body) = query(
-        &router,
-        "DescribeAutoScalingGroups",
-        &[("AutoScalingGroupNames.member.1", "asg-bounds")],
-    )
-    .await;
-    assert_eq!(status, 200, "the read-back must succeed, got {body:?}");
     assert_eq!(
-        tag_value(&body, "MaxSize"),
-        "2",
-        "the accepted bound must be stored, got {body:?}"
+        status, 200,
+        "widening the maximum must be accepted, got {status} with {body:?}"
+    );
+    let sizes = reported_sizes(&router, name).await;
+    let expected = ("0".to_string(), "4".to_string(), "0".to_string());
+    assert_eq!(
+        sizes, expected,
+        "the accepted change must be stored, expected {expected:?}, got {sizes:?}"
     );
 }
 

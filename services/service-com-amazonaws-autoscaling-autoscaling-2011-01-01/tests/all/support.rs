@@ -504,6 +504,20 @@ pub fn xml_unescape(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// The whole message the service refuses a request whose maximum group size is below its
+/// minimum with: fixed text apart from the two bounds, and the MAXIMUM is named first.
+///
+/// THE ONE COPY for this crate's tests, written out here rather than taken from the
+/// service's own builder — a test that re-used the implementation's literal would assert
+/// nothing. Generic over how a suite spells the bounds, because one states them as the
+/// integers it sends and another as the request parameters it builds.
+pub fn max_below_min_message(
+    max_size: impl ::std::fmt::Display,
+    min_size: impl ::std::fmt::Display,
+) -> String {
+    format!("Max bound, {max_size}, must be greater than or equal to min bound, {min_size}")
+}
+
 /// The text of the first `<tag>…</tag>`, or `""` when the member is absent.
 pub fn tag_value(xml: &str, tag: &str) -> String {
     tag_values(xml, tag).first().cloned().unwrap_or_default()

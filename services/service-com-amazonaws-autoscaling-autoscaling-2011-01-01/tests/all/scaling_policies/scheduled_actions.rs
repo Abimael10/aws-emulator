@@ -38,7 +38,8 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{
-    borrowed, new_engine, p, query, router_with, tag_value, tag_values, xml_unescape, REGION,
+    borrowed, max_below_min_message, new_engine, p, query, router_with, tag_value, tag_values,
+    xml_unescape, REGION,
 };
 
 /// The launch source every group in this suite is created from — a launch TEMPLATE, because
@@ -91,11 +92,6 @@ fn desired_capacity_message(desired_capacity: i32, min_size: i32, max_size: i32)
         "Desired capacity:{desired_capacity} must be between the specified min \
          size:{min_size} and max size:{max_size}"
     )
-}
-
-/// The same for inverted bounds.
-fn max_below_min_message(max_size: i32, min_size: i32) -> String {
-    format!("Max bound, {max_size}, must be greater than or equal to min bound, {min_size}")
 }
 
 /// The whole message `PutScheduledUpdateGroupAction` and `DescribeScheduledActions` refuse a
