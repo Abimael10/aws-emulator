@@ -312,7 +312,12 @@ pub(crate) async fn next_request(
 
 /// Every request that reaches the provider inside the quiet window — for a row asserting
 /// that none is owed.
-async fn requests_inside_the_quiet_window(
+///
+/// `pub(crate)` for the sibling suite
+/// [`super::cloudformation_custom_resource_update_asks_each_changed_resource`], whose negative
+/// half is the same question about the resources an operation did NOT change: one spelling of
+/// "nothing further is owed" keeps the two from disagreeing about what quiet means.
+pub(crate) async fn requests_inside_the_quiet_window(
     router: &MultiServiceRouter,
     provider: &mut Provider,
 ) -> Vec<Value> {

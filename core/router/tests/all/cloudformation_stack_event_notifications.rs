@@ -32,8 +32,12 @@ const REGION: &str = "us-west-2";
 
 /// How many times a leg polls the stack before giving up, and how long it waits between
 /// polls: a stack's transition is clock-owed, and a READ is what makes it due.
+///
+/// The phases of this suite that assert nothing arrives spend the whole count, so it stays as
+/// small as the suite's positive phases allow; a reader of the same stream that only ever waits
+/// for something to ARRIVE sets its own, more generous deadline.
 const POLLS: usize = 60;
-const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The template every row deploys: one wait-condition handle (a resource no service of this
 /// emulator has to be asked about) and an output that reads the stack's own topics through
@@ -42,7 +46,13 @@ const TEMPLATE: &str = r#"{"Resources":{"Marker":{"Type":"AWS::CloudFormation::W
     "Outputs":{"NotificationArns":{"Value":{"Fn::Join":[",",{"Ref":"AWS::NotificationARNs"}]}}}}"#;
 
 /// Call one CloudFormation operation over its awsQuery wire.
-async fn cloudformation(
+///
+/// `pub(crate)`, with the readers below it, because the sibling suite
+/// [`super::cloudformation_update_stack_notification_topics_in_force`] reads the same stream
+/// for the operations this one does not cover: one spelling of the wire and of the
+/// poll-and-drain keeps the two from drifting on the encoding of a member or on what counts as
+/// delivered.
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
@@ -74,7 +84,7 @@ async fn cloudformation(
 }
 
 /// One CloudFormation call that must answer 200.
-async fn cfn_ok(
+pub(crate) async fn cfn_ok(
     router: &MultiServiceRouter,
     case: &str,
     action: &str,
@@ -119,7 +129,11 @@ async fn sqs(router: &MultiServiceRouter, case: &str, operation: &str, body: &Va
 /// SNS delivers to a queue inside its own JSON envelope, whose `Message` is that body.
 ///
 /// Deleted as it is handed over, so a later leg reads only what arrived since.
-async fn drain_bodies(router: &MultiServiceRouter, case: &str, url: &str) -> Vec<String> {
+pub(crate) async fn drain_bodies(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+) -> Vec<String> {
     let received = sqs(
         router,
         case,
@@ -153,7 +167,11 @@ async fn drain_bodies(router: &MultiServiceRouter, case: &str, url: &str) -> Vec
 
 /// Poll the stack until it leaves every `*_IN_PROGRESS` status, and answer the status it
 /// settled in with the body that reported it.
-async fn settled(router: &MultiServiceRouter, case: &str, stack: &str) -> (String, String) {
+async fn settled(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+) -> (String, String) {
     let mut last = (String::new(), String::new());
     for _ in 0..POLLS {
         let body = cfn_ok(router, case, "DescribeStacks", &[("StackName", stack)]).await;
@@ -171,7 +189,11 @@ async fn settled(router: &MultiServiceRouter, case: &str, stack: &str) -> (Strin
 }
 
 /// Every `EventId` the stack's event stream reports.
-async fn event_ids(router: &MultiServiceRouter, case: &str, stack: &str) -> Vec<String> {
+pub(crate) async fn event_ids(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+) -> Vec<String> {
     let body = cfn_ok(router, case, "DescribeStackEvents", &[("StackName", stack)]).await;
     elements(&body, "EventId")
 }
@@ -179,7 +201,7 @@ async fn event_ids(router: &MultiServiceRouter, case: &str, stack: &str) -> Vec<
 /// The `Key='value'` body of one notification as the FIELDS a subscriber reads it as, in the
 /// order the body states them — which is part of the contract: the body is parsed
 /// positionally as much as by key.
-fn notification_fields(body: &str) -> Vec<(String, String)> {
+pub(crate) fn notification_fields(body: &str) -> Vec<(String, String)> {
     body.lines()
         .filter_map(|line| line.split_once("='"))
         .map(|(key, value)| {
@@ -193,7 +215,7 @@ fn notification_fields(body: &str) -> Vec<(String, String)> {
 
 /// The value one notification body states for `key`, or `None` for a body carrying no such
 /// line at all.
-fn field_of(fields: &[(String, String)], key: &str) -> Option<String> {
+pub(crate) fn field_of(fields: &[(String, String)], key: &str) -> Option<String> {
     fields
         .iter()
         .find(|(name, _)| name == key)
@@ -245,7 +267,11 @@ async fn delivered_fields(
 }
 
 /// The `NotificationARNs` `DescribeStacks` reports for one stack.
-async fn reported_topics(router: &MultiServiceRouter, case: &str, stack: &str) -> Vec<String> {
+pub(crate) async fn reported_topics(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+) -> Vec<String> {
     let body = cfn_ok(router, case, "DescribeStacks", &[("StackName", stack)]).await;
     assert!(
         !members_of(&body).is_empty(),
@@ -479,7 +505,7 @@ const NOTIFICATION_FIELD_ORDER: [&str; 14] = [
 
 /// The resource type an event about the STACK itself carries, which is the event a body
 /// states `PrincipalId` on.
-const STACK_RESOURCE_TYPE: &str = "AWS::CloudFormation::Stack";
+pub(crate) const STACK_RESOURCE_TYPE: &str = "AWS::CloudFormation::Stack";
 
 /// The keys the body of ONE event's notification carries, in order: [`NOTIFICATION_FIELD_ORDER`]
 /// without `PhysicalResourceId` for an event that names no physical resource, and without
