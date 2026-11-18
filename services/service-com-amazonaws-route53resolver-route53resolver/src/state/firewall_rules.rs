@@ -380,51 +380,76 @@ pub fn firewall_rule_settings_fault(
     }
 
     // "`BlockResponse` … This setting is required if the rule action setting is
-    // BLOCK", and each `BlockOverride*` member "is required if the
-    // BlockResponse setting is OVERRIDE". A block option the rule requires and
-    // the request left out is not a block option the service can act on, so it
-    // is refused as one that is not valid
+    // BLOCK". A rule that blocks without saying how it blocks states no block
+    // option the service can act on, so it is refused as one that is not valid
     // ([`firewall_rule_block_option_not_valid`]).
     if settings.action == FIREWALL_RULE_ACTION_BLOCK && settings.block_response.is_none() {
         return Some(firewall_rule_block_option_not_valid(
             BLOCK_OPTION_BLOCK_RESPONSE,
         ));
     }
-    if settings.block_response == Some(FIREWALL_RULE_BLOCK_RESPONSE_OVERRIDE) {
-        let missing = [
-            (
-                BLOCK_OPTION_BLOCK_OVERRIDE_DOMAIN,
-                settings.block_override_domain.is_none(),
-            ),
-            (
-                BLOCK_OPTION_BLOCK_OVERRIDE_DNS_TYPE,
-                settings.block_override_dns_type.is_none(),
-            ),
-            (
-                BLOCK_OPTION_BLOCK_OVERRIDE_TTL,
-                settings.block_override_ttl.is_none(),
-            ),
-        ]
-        .into_iter()
-        .find_map(|(member, absent)| absent.then_some(member));
-        if let Some(member) = missing {
-            return Some(firewall_rule_block_option_not_valid(member));
-        }
+    // Each `BlockOverride*` member "is required if the BlockResponse setting is
+    // OVERRIDE", and the three are ONE requirement the service reports under its
+    // own code ([`firewall_rule_override_incomplete`]) — a different fault from a
+    // block option the service does not admit.
+    if settings.block_response == Some(FIREWALL_RULE_BLOCK_RESPONSE_OVERRIDE)
+        && (settings.block_override_domain.is_none()
+            || settings.block_override_dns_type.is_none()
+            || settings.block_override_ttl.is_none())
+    {
+        return Some(firewall_rule_override_incomplete());
     }
 
     None
 }
 
-/// The block options a DNS Firewall rule carries, named as the model spells
-/// them (`smithy_query(query="shape",shape="CreateFirewallRuleRequest")`).
+/// The Route 53 Resolver service error code for a rule write that asks for an
+/// override response without stating all three settings an override is made of.
 ///
-/// They are the members [`FirewallRuleBlockOptions`] holds, carried as constants
-/// because a refusal that names one states it in the service's own spelling
-/// ([`block_option_name`]) rather than in the model's.
+/// Carried for the same reason as
+/// [`RSLVR_CODE_FIREWALL_RULE_BLOCK_OPTION_NOT_VALID`]: the HTTP status (400)
+/// and the `ValidationException` shape name together do not say which
+/// requirement of a rule write was broken, and the model states no message text.
+/// It is what tells this unmet conditional requirement apart from a block option
+/// the service does not admit.
+pub const RSLVR_CODE_FIREWALL_RULE_OVERRIDE_INCOMPLETE: &str = "RSLVR-02013";
+
+/// The `ValidationException` a rule write is refused with when it asks for an
+/// override response and leaves out any of the three settings an override
+/// consists of.
+///
+/// `BlockOverrideDomain`, `BlockOverrideDnsType` and `BlockOverrideTtl` are each
+/// documented "This setting is required if the BlockResponse setting is
+/// OVERRIDE"
+/// (`smithy_query(query="doc",shape="CreateFirewallRuleRequest",member="BlockOverrideDomain")`),
+/// a conditional requirement the model cannot express. The service reports the
+/// three as ONE requirement: the sentence names all three settings and the
+/// `BlockResponse` value that requires them, and is otherwise ENTIRELY fixed
+/// text — it does not name which of the three the request left out, so a write
+/// missing one and a write missing all three are refused alike.
+pub fn firewall_rule_override_incomplete() -> ValidationException {
+    ValidationException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_FIREWALL_RULE_OVERRIDE_INCOMPLETE,
+            &format!(
+                "You must specify an override DNS type, an override domain, and an \
+                 override Ttl when you are using {FIREWALL_RULE_BLOCK_RESPONSE_OVERRIDE}"
+            ),
+        )),
+    }
+}
+
+/// The block option a DNS Firewall rule that blocks must carry, named as the
+/// model spells it
+/// (`smithy_query(query="shape",shape="CreateFirewallRuleRequest")`).
+///
+/// It is the member [`FirewallRuleBlockOptions`] holds that every blocking rule
+/// needs, carried as a constant because the refusal that names it states it in
+/// the service's own spelling ([`block_option_name`]) rather than in the
+/// model's. The three `BlockOverride*` members are named by no refusal: the
+/// requirement that binds them is reported as one sentence naming all three
+/// ([`firewall_rule_override_incomplete`]).
 pub const BLOCK_OPTION_BLOCK_RESPONSE: &str = "BlockResponse";
-pub const BLOCK_OPTION_BLOCK_OVERRIDE_DOMAIN: &str = "BlockOverrideDomain";
-pub const BLOCK_OPTION_BLOCK_OVERRIDE_DNS_TYPE: &str = "BlockOverrideDnsType";
-pub const BLOCK_OPTION_BLOCK_OVERRIDE_TTL: &str = "BlockOverrideTtl";
 
 /// How the service NAMES one block option in a refusal: the modelled member
 /// name read as words — every word upper case, separated by a single space — so
