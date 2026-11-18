@@ -37,11 +37,13 @@
 //! published wording this crate does not have can be served with: the identity is what a
 //! client joins on, and it is what the recorded table fixes.
 //!
-//! The opaque 25-character identifier inside a catalog ARN is assigned by Amazon Web
-//! Services and is derivable from nothing in the request, yet it is part of the entry's
-//! published identity: the library is account-independent, so one ARN names the domain or
-//! objective for every caller, in every partition and on every run. An entry whose
-//! published identifier is recorded in [`PUBLISHED_CATALOG_IDENTIFIERS`] is therefore
+//! The opaque identifier inside a catalog ARN — around 25 characters of the `[0-9a-z]`
+//! the modeled ARN patterns allow, and not every entry's is the same length — is
+//! assigned by Amazon Web Services and is derivable from nothing in the request, yet it
+//! is part of the entry's published identity: the library is account-independent, so one
+//! ARN names the domain or objective for every caller, in every partition and on every
+//! run. An entry whose published identifier is recorded in
+//! [`PUBLISHED_CATALOG_IDENTIFIERS`] is therefore
 //! served under it; for an entry that table does not name, this emulator mints one
 //! deterministically from the entry's `slug` (see `super::catalog_id`): stable across
 //! processes and runs, in the character class the modeled `DomainArn` / `ObjectiveArn` /
@@ -82,12 +84,12 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
     (
         "asset-management",
         "Asset management",
-        "Controls that inventory Amazon Web Services resources and keep that inventory current.",
+        "This control domain focuses on asset management and the systematic tracking and maintenance of physical or digital assets throughout their lifecycle, including acquisition, utilization, and disposal. This reduces risks related to accidents, malfunctions, and other issues that may cause damage to property or harm to people.",
         &[
             (
                 "asset-inventory-management",
                 "Asset inventory management",
-                "Discover and record the resources an account holds.",
+                "This control objective focuses on maintaining an accurate and up-to-date inventory of assets, including hardware, software, and data, to protect organization investments from harm or loss.",
                 &[
                     // This entry keeps the slug it has always carried — the slug is
                     // internal, it is what several published controls name as the common
@@ -138,7 +140,7 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
             (
                 "asset-classification",
                 "Asset classification",
-                "Classify each asset by the sensitivity of the data it holds or the service it provides.",
+                "This control objective focuses on classifying assets based on their value, sensitivity, and criticality to the organization to manage investment risk and unauthorized access to assets and information.",
                 &[
                     (
                         "asset-valuation",
@@ -184,6 +186,40 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                     ),
                 ],
             ),
+            // The catalog publishes the lifecycle of an asset as an OBJECTIVE of its own,
+            // beside inventory, classification and maintenance (its published ARN is
+            // recorded in PUBLISHED_CATALOG_IDENTIFIERS below), met by the common controls
+            // that govern an asset at each stage it passes through. Its published wording
+            // is not recorded here, so — like the entries beside it whose wording this
+            // crate does not have — its description is the library's subject written in
+            // this table's own terser voice, not the library's paragraph.
+            (
+                "asset-lifecycle-management",
+                "Asset lifecycle management",
+                "Manage each asset through the stages of its lifecycle, from acquisition and deployment to reuse, retirement and disposal.",
+                &[
+                    // The common controls published under this objective are not recorded
+                    // here either: these three are its subject written in this table's own
+                    // voice, and they carry the minted fallback identifier every unrecorded
+                    // entry does, so that the walk down from the objective resolves at all
+                    // (see the module header).
+                    (
+                        "asset-acquisition-authorization",
+                        "Asset acquisition authorization",
+                        "Authorize and record the acquisition of an asset before it enters the environment, and record it in the inventory as it does.",
+                    ),
+                    (
+                        "asset-deployment-baseline",
+                        "Asset deployment baseline",
+                        "Bring an asset into service against the configuration baseline defined for its kind, and record the baseline it was deployed against.",
+                    ),
+                    (
+                        "asset-reuse-and-disposal-sanitization",
+                        "Asset reuse and disposal sanitization",
+                        "Remove the data an asset holds before it is reused or disposed of, and record what was removed and how.",
+                    ),
+                ],
+            ),
             (
                 "asset-handling",
                 "Asset handling",
@@ -211,7 +247,7 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
     (
         "business-continuity-and-recovery",
         "Business continuity and recovery",
-        "Controls that keep workloads available, and restore them after a disruption.",
+        "This control domain focuses on planning and preparation of procedures and resources to ensure the continued operation of critical business functions in the event of a disruption, and to facilitate the recovery of normal operations afterwards.",
         &[
             (
                 "crisis-and-emergency-management",
@@ -404,7 +440,7 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
     (
         "identity-and-access-management",
         "Identity and access management",
-        "Controls that govern who can reach Amazon Web Services resources, and what they may do with them.",
+        "This control domain focuses on identity and access management (IAM) policies and technologies used to control and manage access to digital resources, systems, and data based on the identity and roles of users and devices.",
         &[
             (
                 "manage-access",
@@ -1264,6 +1300,11 @@ const PUBLISHED_CATALOG_IDENTIFIERS: &[(&str, &str, &str)] = &[
     ),
     (OBJECTIVE, "asset-classification", "90gifwthorhxhxq7m0rtss98u"),
     (OBJECTIVE, "asset-maintenance", "3frxxgl64u9kzttiuheywykf7"),
+    (
+        OBJECTIVE,
+        "asset-lifecycle-management",
+        "5ve4jodybrg8wnky75fp50sbf",
+    ),
     (OBJECTIVE, "change-management", "14qj3s9axkdma059lhktc14dx"),
     // The common controls published under the `asset-inventory-management` objective.
     (
