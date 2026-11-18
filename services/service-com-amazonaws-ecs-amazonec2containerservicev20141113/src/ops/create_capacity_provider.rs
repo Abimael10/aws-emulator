@@ -234,22 +234,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can create capacity providers for Amazon ECS Managed Instances and EC2
         // instances": a provider is built on EXACTLY one of the two, since each describes
-        // the whole of where its capacity comes from.
-        let message = match (
+        // the whole of where its capacity comes from
+        // ([`crate::state::capacity_provider_configuration_violation`], shared with the
+        // update of a provider, which takes the same pair).
+        if let Some(message) = crate::state::capacity_provider_configuration_violation(
             input.auto_scaling_group_provider.is_some(),
             input.managed_instances_provider.is_some(),
         ) {
-            (false, false) => Some(
-                "either autoScalingGroupProvider or managedInstancesProvider must be \
-                 specified",
-            ),
-            (true, true) => Some(
-                "autoScalingGroupProvider and managedInstancesProvider must not both be \
-                 specified",
-            ),
-            _ => None,
-        };
-        if let Some(message) = message {
             return Err(
                 CreateCapacityProviderErrorModeled::InvalidParameterException(
                     InvalidParameterException {
@@ -514,6 +505,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             active_due_at: stands_up_capacity.then(|| now + crate::state::TRANSITION_SPAN),
             // Nothing has deleted a provider this call is creating.
             delete_due_at: None,
+            // Nothing has updated it either.
+            update_due_at: None,
             cluster: cluster_name,
             auto_scaling_group_provider,
             // `CapacityProvider$type` names the class of capacity the provider binds onto:

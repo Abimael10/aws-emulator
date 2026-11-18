@@ -234,15 +234,22 @@ pub fn missing_failure(arn: &str) -> Failure {
 pub fn capacity_provider_missing_failure(reference: &str) -> Failure {
     Failure {
         arn: Some(reference.to_string()),
-        reason: Some(CAPACITY_PROVIDER_MISSING_FAILURE_REASON.to_string()),
+        reason: Some(CAPACITY_PROVIDER_MISSING_MESSAGE.to_string()),
         detail: None,
     }
 }
 
-/// `Failure$reason` for a capacity-provider identifier that names nothing: the whole
-/// sentence, which states both halves of the rule — the identifier is a name or an ARN,
-/// and no provider of the account answers to this one.
-pub const CAPACITY_PROVIDER_MISSING_FAILURE_REASON: &str =
+/// The whole sentence a capacity-provider identifier that names nothing earns, which states
+/// both halves of the rule — the identifier is a name or an ARN, and no provider of the
+/// account answers to this one.
+///
+/// Carried in the two places that condition is reported, so the two cannot drift apart: as
+/// the `Failure$reason` of a batch read that resolves the identifier beside its results
+/// (`DescribeCapacityProviders`), and as the `ClientException$message` of an operation whose
+/// TARGET is that provider and which therefore has nowhere to report it but the error
+/// channel (`UpdateCapacityProvider`). Fixed text either way: the identifier the caller sent
+/// is in the value it sent.
+pub const CAPACITY_PROVIDER_MISSING_MESSAGE: &str =
     "The specified capacity provider does not exist. Specify a valid name or ARN and try \
      again.";
 
@@ -2197,6 +2204,9 @@ pub fn managed_capacity_provider(name: &str, region: &str) -> Option<CapacityPro
         active_due_at: None,
         // Nothing deletes a provider Amazon ECS manages, so none has a delete in flight.
         delete_due_at: None,
+        // And none carries a caller's configuration to update, so none has an update in
+        // flight either.
+        update_due_at: None,
         cluster: None,
         auto_scaling_group_provider: None,
         managed_instances_provider: None,

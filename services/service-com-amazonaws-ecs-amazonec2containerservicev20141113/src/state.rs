@@ -401,6 +401,12 @@ pub use capacity_provider_deletion::*;
 mod capacity_provider_scaling;
 pub use capacity_provider_scaling::*;
 
+/// MODIFYING a capacity provider: which configuration an update may carry for the provider
+/// it names, what each member of it leaves in place, and the `updateStatus` an accepted
+/// update is in flight under.
+mod capacity_provider_update;
+pub use capacity_provider_update::*;
+
 /// ECS MANAGED SCALING: the capacity Amazon ECS itself acquires, by raising the desired
 /// capacity of the Auto Scaling group of a provider whose scaling it manages, for a cluster
 /// holding tasks it cannot place.
@@ -3148,6 +3154,11 @@ pub struct CapacityProviderRecord {
     /// after which its delete is [`CAPACITY_PROVIDER_DELETE_COMPLETE`]. `None` for a
     /// provider nothing has deleted. Cleared when it is materialised, so it happens once.
     pub delete_due_at: Option<SystemTime>,
+    /// When the change an accepted `UpdateCapacityProvider` asked Amazon ECS to apply to
+    /// the capacity behind this provider falls due, after which its update is
+    /// [`CAPACITY_PROVIDER_UPDATE_COMPLETE`]. `None` for a provider nothing has updated.
+    /// Cleared when it is materialised, so it happens once.
+    pub update_due_at: Option<SystemTime>,
     /// `CapacityProvider$cluster`: the cluster a MANAGED-INSTANCES provider is scoped to
     /// ("Managed instances capacity providers are cluster-scoped"). `None` for an Auto
     /// Scaling group provider, which the account holds rather than one cluster.

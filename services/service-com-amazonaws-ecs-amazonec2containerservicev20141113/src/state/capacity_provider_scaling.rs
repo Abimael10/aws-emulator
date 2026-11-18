@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The scaling configuration an AUTO SCALING GROUP capacity provider is stored with: the
-//! managed-scaling members Amazon ECS fills in for a create that names none, and the
-//! managed-draining option it turns on for it.
+//! managed-scaling members Amazon ECS fills in for a create that names none, the
+//! managed-draining option it turns on for it, and the termination-protection setting it
+//! leaves off.
 //!
 //! `AutoScalingGroupProvider` is the binding onto a caller's own Auto Scaling group, and
 //! every member of it that the request leaves out has a value Amazon ECS applies for it —
@@ -50,6 +51,14 @@ pub const MANAGED_SCALING_APPROACH_SCALING_POLICY: &str = "SCALING_POLICY";
 /// group capacity provider" for a provider created without the option, which is the value
 /// the recorded providers of such creates report.
 pub const MANAGED_DRAINING_ENABLED: &str = "ENABLED";
+
+/// `AutoScalingGroupProvider$managedTerminationProtection` when the request names none —
+/// that member's own doc, "The default is off", in the spelling the
+/// `ManagedTerminationProtection` value set gives it (`smithy_query` query="shape"
+/// shape="ManagedTerminationProtection"). The setting is in force for every provider over a
+/// caller's group, off being a setting like any other, so a client reading the configuration
+/// back is told which of the two it is rather than nothing at all.
+pub const MANAGED_TERMINATION_PROTECTION_DISABLED: &str = "DISABLED";
 
 /// The `managedScaling` block a provider is STORED with: every number the request left out
 /// filled in with the default its own member documents, and `status` left as the request
@@ -114,19 +123,20 @@ pub const MANAGED_SCALING_STEP_SIZE_MESSAGE: &str =
      try again.";
 
 /// The `autoScalingGroupProvider` a capacity provider is STORED with: the binding the
-/// request carried, with the managed-scaling block and the managed-draining option Amazon
-/// ECS applies to it filled in ([`stored_managed_scaling`],
-/// [`MANAGED_DRAINING_ENABLED`]).
-///
-/// `managedTerminationProtection` is left alone: a provider created without it has none in
-/// force, and the member is only reported once a request turns it on.
+/// request carried, with the managed-scaling block, the managed-draining option and the
+/// managed-termination-protection setting Amazon ECS applies to it filled in
+/// ([`stored_managed_scaling`], [`MANAGED_DRAINING_ENABLED`],
+/// [`MANAGED_TERMINATION_PROTECTION_DISABLED`]).
 pub fn stored_auto_scaling_group_provider(
     requested: &AutoScalingGroupProvider,
 ) -> AutoScalingGroupProvider {
     AutoScalingGroupProvider {
         auto_scaling_group_arn: requested.auto_scaling_group_arn.clone(),
         managed_scaling: Some(stored_managed_scaling(requested.managed_scaling.as_ref())),
-        managed_termination_protection: requested.managed_termination_protection.clone(),
+        managed_termination_protection: requested
+            .managed_termination_protection
+            .clone()
+            .or_else(|| Some(MANAGED_TERMINATION_PROTECTION_DISABLED.to_string())),
         managed_draining: requested
             .managed_draining
             .clone()

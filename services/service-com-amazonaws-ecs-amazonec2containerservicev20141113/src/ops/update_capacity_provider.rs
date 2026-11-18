@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCapacityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCapacityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCapacityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies the parameters of a capacity provider and reports it. A provider is a NAMED
+//! binding onto the capacity that runs tasks, and an update changes how Amazon ECS drives
+//! that capacity — never which capacity it is: the request carries one of the two
+//! configurations a provider is built on, with no member for the Auto Scaling group behind
+//! it, so what this writes onto the stored record is the configuration every later
+//! `DescribeCapacityProviders` reads back, with applying it to the capacity itself left in
+//! flight for the clock.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +160,232 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCapacityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCapacityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCapacityProvider"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateCapacityProviderErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // `InstanceLaunchTemplateUpdate$monitoring` is judged HERE rather than at the
+        // framework boundary, for the reason the member's own `skip_validation` in
+        // `src/ops/types/` states: the option is accepted in the lower-case spelling its
+        // documentation publishes as well as in the spelling the modelled set lists, which
+        // case-sensitive equality cannot express. The modelled set is still what it is
+        // checked against ([`crate::state::managed_instances_monitoring_option`]), and the
+        // option is stored in that set's own spelling. This stands FIRST, where the boundary
+        // walk would have refused it, so a value outside the set is what the request is
+        // refused for whatever else it names.
+        let monitoring = match input
+            .managed_instances_provider
+            .as_ref()
+            .and_then(|provider| provider.instance_launch_template.monitoring.as_deref())
+        {
+            Some(requested) => match crate::state::managed_instances_monitoring_option(requested) {
+                Ok(option) => Some(option),
+                Err(message) => {
+                    return Err(
+                        UpdateCapacityProviderErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(message),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        // A provider is built on exactly one of the two configurations, so an update carries
+        // exactly one of them: neither asks for no change at all, and both describe two
+        // providers ([`crate::state::capacity_provider_configuration_violation`], the same
+        // rule the create of a provider is held to).
+        if let Some(message) = crate::state::capacity_provider_configuration_violation(
+            input.auto_scaling_group_provider.is_some(),
+            input.managed_instances_provider.is_some(),
+        ) {
+            return Err(
+                UpdateCapacityProviderErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `managedScaling` is a RANGE: its minimum scaling step size is the floor and its
+        // maximum the ceiling of one scale-out step, so a block whose minimum is above its
+        // maximum describes no step at all — judged on the values the request carried, each
+        // one it left out standing at the default its own member documents, and BEFORE the
+        // request is weighed against what the account already holds
+        // ([`crate::state::managed_scaling_step_size_violation`], which every operation
+        // taking a `managedScaling` block asks).
+        if let Some(message) = crate::state::managed_scaling_step_size_violation(
+            input
+                .auto_scaling_group_provider
+                .as_ref()
+                .and_then(|provider| provider.managed_scaling.as_ref()),
+        ) {
+            return Err(
+                UpdateCapacityProviderErrorModeled::ClientException(ClientException {
+                    message: Some(message.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // An ARN is a WHOLE identifier, Region and account included, so both segments are
+        // checked, for both identifiers the request carries, before either is resolved
+        // ([`crate::state::request_arn_violation`]).
+        if let Some(message) = crate::state::request_arn_violation(
+            ctx,
+            [input.cluster.as_deref(), Some(input.name.as_str())]
+                .into_iter()
+                .flatten(),
+        ) {
+            return Err(
+                UpdateCapacityProviderErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The name of the capacity provider to update", which the store holds the provider
+        // under — resolved the way every lookup of a provider in this service resolves one,
+        // so a value spelled as the provider's ARN names the same provider its short name
+        // does.
+        let name = crate::state::capacity_provider_name_from_reference(&input.name);
+        // The `cluster` member names "the cluster that contains the capacity provider to
+        // update", by short name or ARN — and names NO cluster when the request omits it,
+        // since an Auto Scaling group provider belongs to the account rather than to one
+        // cluster.
+        let cluster_name = input
+            .cluster
+            .as_deref()
+            .map(|reference| crate::state::cluster_name_from_reference(Some(reference)));
+
+        let mut guard = state.lock();
+        let now = ::std::time::SystemTime::now();
+        guard.advance_clock(now);
+
+        // A deleted cluster is not one this operation may act in ("The cluster has been
+        // deleted"), so a tombstone is refused under the same error code a name that never
+        // existed earns — with the sentence that says it is still there, inactive.
+        if let Some(cluster_name) = cluster_name.as_deref() {
+            if !guard.has_active_cluster(cluster_name) {
+                return Err(
+                    UpdateCapacityProviderErrorModeled::ClusterNotFoundException(
+                        ClusterNotFoundException {
+                            message: Some(crate::state::cluster_refusal_message(
+                                guard.clusters.get(cluster_name),
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A name that resolves to no LIVE provider of this account names nothing to update:
+        // the providers Amazon ECS manages for every account carry no configuration of the
+        // caller's and are resolved rather than stored, and a retired provider is a
+        // tombstone no update can bring back. Amazon ECS answers an identifier it cannot
+        // RESOLVE in `ClientException` — "it might be specifying an identifier that isn't
+        // valid" — keeping `InvalidParameterException` for a parameter value it will not
+        // accept, so a client branching on the code can tell "no such provider" from "bad
+        // request". The sentence is the one every report of this condition carries
+        // ([`crate::state::CAPACITY_PROVIDER_MISSING_MESSAGE`]), which a batch read reports
+        // as a `Failure$reason` because it has a channel for it and this operation reports
+        // as its error because it has none.
+        let Some(stored) = guard
+            .capacity_providers
+            .get_mut(&name)
+            .filter(|provider| provider.status != crate::state::CAPACITY_PROVIDER_INACTIVE)
+        else {
+            return Err(UpdateCapacityProviderErrorModeled::ClientException(
+                ClientException {
+                    message: Some(crate::state::CAPACITY_PROVIDER_MISSING_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `UpdateCapacityProvider$cluster`: "Managed instances capacity providers are
+        // cluster-scoped and can only be updated within their associated cluster" — so a
+        // provider scoped to a cluster is updated THROUGH that cluster, and a request that
+        // names another one, or none at all, is not the update of this provider.
+        if stored
+            .cluster
+            .as_deref()
+            .is_some_and(|scope| cluster_name.as_deref() != Some(scope))
+        {
+            return Err(
+                UpdateCapacityProviderErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::CLUSTER_SCOPED_CAPACITY_PROVIDER_UPDATE_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The configuration the update carries has to be the one the provider is BUILT on:
+        // the other class's configuration describes nothing about this provider, since a
+        // provider binds onto exactly one class of capacity, so such a request is refused
+        // for the parameter it carried with nothing written. Which of the two the request
+        // names was narrowed to exactly one above.
+        if let Some(update) = input.auto_scaling_group_provider.as_ref() {
+            let Some(binding) = stored.auto_scaling_group_provider.as_ref() else {
+                return Err(
+                    UpdateCapacityProviderErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                crate::state::CAPACITY_PROVIDER_CONFIGURATION_CLASS_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let updated = crate::state::updated_auto_scaling_group_provider(binding, update);
+            stored.auto_scaling_group_provider = Some(updated);
+        } else if let Some(update) = input.managed_instances_provider.as_ref() {
+            let Some(configuration) = stored.managed_instances_provider.as_ref() else {
+                return Err(
+                    UpdateCapacityProviderErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                crate::state::CAPACITY_PROVIDER_CONFIGURATION_CLASS_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let updated =
+                crate::state::updated_managed_instances_provider(configuration, update, monitoring);
+            stored.managed_instances_provider = Some(updated);
+        }
+
+        // The configuration is stored, and applying it to the capacity behind the provider
+        // is the update left in flight for the clock to finish
+        // ([`crate::state::CapacityProviderRecord::begin_update`]) — "These changes only
+        // apply to new Amazon ECS Managed Instances, or EC2 instances, not existing ones".
+        stored.begin_update(now);
+
+        // `UpdateCapacityProvider` has no `include` member to narrow the response with, so
+        // the provider it acted on is reported with the tags it holds.
+        Ok(UpdateCapacityProviderOutput {
+            capacity_provider: Some(stored.view(true)),
+        })
     }
 }

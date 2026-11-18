@@ -38,7 +38,17 @@ pub struct UpdateManagedInstancesProviderConfiguration {
     pub auto_repair_configuration: Option<AutoRepairConfiguration>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ecs#InstanceLaunchTemplateUpdate")]
+// `skip_validation = ["monitoring"]`, for the reason the create-side shape
+// (`InstanceLaunchTemplate` in `shared_types`) carries it: this member's own documentation
+// publishes the two monitoring categories in lower case, and Amazon ECS serves a request
+// that spells the option that way, so the modelled value set cannot be enforced as
+// case-sensitive equality at the boundary. The set is still enforced, by the handler that
+// stores the updated template (`crate::state::managed_instances_monitoring_option`), which
+// also stores the option in the spelling the set lists.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ecs#InstanceLaunchTemplateUpdate",
+    skip_validation = ["monitoring"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct InstanceLaunchTemplateUpdate {
     pub ec2_instance_profile_arn: Option<String>,

@@ -121,7 +121,7 @@ struct Row {
     /// The two options beside managed scaling: what the provider must report, which is the
     /// value the declaration states, or the one Amazon ECS applies for a declaration that
     /// states none (`managedDraining` is turned on for such a provider, while
-    /// `managedTerminationProtection` stays off and unreported).
+    /// `managedTerminationProtection` stays off).
     managed_termination_protection: Option<&'static str>,
     managed_draining: Option<&'static str>,
     /// The tags the provider must carry.
@@ -182,7 +182,7 @@ const ROWS: &[Row] = &[
         declared_name: None,
         managed_scaling_status: Some("DISABLED"),
         managed_scaling: &[],
-        managed_termination_protection: None,
+        managed_termination_protection: Some("DISABLED"),
         managed_draining: Some("DISABLED"),
         tags: &[],
     },
@@ -242,7 +242,7 @@ const ROWS: &[Row] = &[
         declared_name: Some("cfn-cp-unmanaged"),
         managed_scaling_status: None,
         managed_scaling: &[],
-        managed_termination_protection: None,
+        managed_termination_protection: Some("DISABLED"),
         managed_draining: Some("ENABLED"),
         tags: &[("Fleet", "unmanaged"), ("Owner", "platform")],
     },

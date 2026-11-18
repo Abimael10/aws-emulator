@@ -116,8 +116,10 @@ impl CapacityProviderRecord {
         self.update_status = Some(CAPACITY_PROVIDER_DELETE_IN_PROGRESS.to_string());
         // A provider whose own capacity Amazon ECS was still standing up stops standing it
         // up: the create this instant would have landed is not owed to a provider that is
-        // being released.
+        // being released. Neither is the end of an update of that capacity, for the same
+        // reason — the release is what is in flight for the provider from here on.
         self.active_due_at = None;
+        self.update_due_at = None;
         self.delete_due_at = Some(now + TRANSITION_SPAN);
     }
 }

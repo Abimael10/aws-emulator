@@ -48,6 +48,19 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         Some(CAPACITY_PROVIDER_DELETE_COMPLETE.to_string());
                 }
             }
+            // And the change an accepted update asked Amazon ECS to apply to the capacity
+            // behind the provider: once it is due the update has been applied, whether or
+            // not anybody called to look, so the provider reports it complete. Last of the
+            // three, because an update accepted while a create was still standing the
+            // provider's capacity up is the later of the two and is what the provider is
+            // then reporting.
+            if let Some(due) = provider.update_due_at {
+                if due <= now {
+                    provider.update_due_at = None;
+                    provider.update_status =
+                        Some(CAPACITY_PROVIDER_UPDATE_COMPLETE.to_string());
+                }
+            }
         }
         for task in self.tasks.values_mut() {
             // The elastic network interface an `awsvpc` task was allocated is created and
