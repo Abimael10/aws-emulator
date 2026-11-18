@@ -14,25 +14,37 @@
 //! with an access error that names nothing — the mistake surfaces nowhere near the call that
 //! made it.
 //!
-//! The services this is about are the ones whose roles are assumed under ANOTHER service's
-//! principal ([`UNASSUMABLE_SERVICE_PRINCIPALS`]): a managed database engine delivered on the
-//! Amazon RDS platform is addressed under its own endpoint domain, but a role it acts through
-//! is assumed as [`RDS_SERVICE_PRINCIPAL`], which is the principal that engine's own
-//! documentation tells a client to write. Nothing else about a `Service` value is judged here:
-//! which FORMS the policy language admits under a principal type is the shared reading beside
-//! this one (`::service_common::iam_policy_principals`), and a value in none of them is the
-//! caller's own data, stored as it was written.
+//! The services this is about are the ones whose roles AWS assumes under a DIFFERENT name
+//! than the one the client wrote, in either of the two ways a client gets that name wrong:
 //!
-//! A name this catalog does not carry is a principal IAM has nothing against here: the
-//! catalog says which services cannot assume a role, never which services exist. The reading
-//! is therefore deliberately UNDER-INCLUSIVE — a value naming no AWS service at all is stored
-//! as written, which is the crate's own rule for a `Service` value
+//! * the service is addressed under its own endpoint domain but assumes its roles under
+//!   ANOTHER service's principal ([`UNASSUMABLE_SERVICE_PRINCIPALS`]): a managed database
+//!   engine delivered on the Amazon RDS platform acts through a role assumed as
+//!   [`RDS_SERVICE_PRINCIPAL`], which is the principal that engine's own documentation tells a
+//!   client to write;
+//! * the service's principal is published WITHOUT a Region ([`REGIONLESS_SERVICE_PRINCIPALS`])
+//!   and the client regionalized it — an easy mistake, since the service's ENDPOINT does carry
+//!   the Region — so `<service>.<region>.amazonaws.com` names a principal AWS publishes
+//!   nowhere while `<service>.amazonaws.com` names one
+//!   ([`regionless_service_principal`]).
+//!
+//! Nothing else about a `Service` value is judged here: which FORMS the policy language admits
+//! under a principal type is the shared reading beside this one
+//! (`::service_common::iam_policy_principals`), asked of a trust document by the clause above
+//! this one ([`super::unreadable_trust_policy_principal`]), and a value in a type's forms that
+//! neither catalog carries is the caller's own data, stored as it was written.
+//!
+//! A name neither catalog carries is a principal IAM has nothing against here: they say which
+//! names cannot assume a role, never which services exist. The reading is therefore
+//! deliberately UNDER-INCLUSIVE — a value naming no AWS service at all is stored as written,
+//! which is the crate's own rule for a `Service` value
 //! ([`super::stored_trust_policy`], whose reads report whatever the caller wrote) — and what
 //! would make it complete is a registry of the service principals AWS publishes, feature and
 //! regional sub-principals included (`monitoring.`, `ecs-tasks.`, `batchoperations.s3.`,
 //! `logs.<region>.`), which nothing in this tree holds: resolving against a short list of
 //! them would refuse trust policies AWS accepts. Until such a registry exists here, a service
-//! whose roles are documented as assumed under another principal is filed below.
+//! whose roles are documented as assumed under another principal, and one whose principal is
+//! documented without a Region, are filed below.
 //!
 //! The reading is shared by every operation that WRITES the member — `CreateRole`,
 //! `UpdateAssumeRolePolicy`, and `AcquireRole`, which renders a trust policy from a role
@@ -112,8 +124,81 @@ pub const UNASSUMABLE_SERVICE_PRINCIPALS: &[UnassumableServicePrincipal] = &[
     UnassumableServicePrincipal::new("neptune.amazonaws.com", RDS_SERVICE_PRINCIPAL),
 ];
 
+/// The DNS zone a service principal is published under — the first of the endpoint zones this
+/// tree lists (`::service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`), which is
+/// the one every principal named below is published in. A name under another partition's zone
+/// is a principal this reading says nothing about, exactly as a name no row carries is.
+const SERVICE_PRINCIPAL_DNS_SUFFIX: &str = ".amazonaws.com";
+
+/// The service principals AWS publishes WITHOUT a Region — the services AWS names as
+/// `<service>.amazonaws.com` wherever the resource is, so the REGIONALIZED spelling
+/// `<service>.<region>.amazonaws.com` of the same service resolves to no principal at all
+/// ([`regionless_service_principal`]).
+///
+/// SOURCE: the page of each service's own documentation that WRITES the principal — the
+/// "identity and access management" or service-role page that states the trust policy of a role
+/// that service assumes, or the key- or resource-policy page that states how a policy grants it.
+/// Every one of them writes the name below with no Region in it, whichever Region the resource
+/// is in. A client that regionalizes such a name (an easy mistake, since the service's ENDPOINT
+/// does carry the Region) names a principal AWS publishes nowhere.
+///
+/// A service this list does not carry is a service this reading has nothing against: some
+/// services DO publish a regional sub-principal for the roles they assume
+/// (`logs.<region>.amazonaws.com` is the published principal of CloudWatch Logs), and nothing
+/// in this tree holds the registry of service principals AWS publishes that would say which —
+/// so, exactly like [`UNASSUMABLE_SERVICE_PRINCIPALS`] beside it, the reading is deliberately
+/// UNDER-INCLUSIVE: a regionalized name of a service no row carries is stored as written
+/// rather than refused, because refusing it would refuse trust policies AWS accepts.
+///
+/// Sorted by principal, which is also the lookup key.
+pub const REGIONLESS_SERVICE_PRINCIPALS: &[&str] = &[
+    // Amazon API Gateway: the role it assumes to push logs or call an integration is created
+    // with `apigateway.amazonaws.com`.
+    "apigateway.amazonaws.com",
+    // AWS CloudFormation: a service role a stack is given names
+    // `cloudformation.amazonaws.com`.
+    "cloudformation.amazonaws.com",
+    // Amazon DynamoDB: the principal a key policy or a resource policy names the table service
+    // by, published without a Region (the REGIONALIZED spelling of the same service appears in
+    // AWS's documentation only as a `kms:ViaService` condition VALUE, which is no principal and
+    // is not read here).
+    "dynamodb.amazonaws.com",
+    // Amazon EC2, the principal of every instance profile's role — the one the model's own
+    // `CreateRole` example writes.
+    "ec2.amazonaws.com",
+    // Amazon ECS: a task execution role and the ECS service role name `ecs.amazonaws.com` and
+    // `ecs-tasks.amazonaws.com`, neither of them regionalized.
+    "ecs-tasks.amazonaws.com",
+    "ecs.amazonaws.com",
+    // Amazon EventBridge: a rule's role names `events.amazonaws.com`.
+    "events.amazonaws.com",
+    // AWS Glue: a crawler's or job's role names `glue.amazonaws.com`.
+    "glue.amazonaws.com",
+    // AWS Key Management Service: the principal a resource policy grants to KMS names — "AWS
+    // KMS" in the key-policy and grant pages — published without a Region.
+    "kms.amazonaws.com",
+    // AWS Lambda, the principal of every function's execution role.
+    "lambda.amazonaws.com",
+    // Amazon RDS — the principal every engine of that platform assumes its roles under
+    // ([`RDS_SERVICE_PRINCIPAL`]), published without a Region.
+    RDS_SERVICE_PRINCIPAL,
+    // Amazon S3: a replication role and a batch-operations role name `s3.amazonaws.com`.
+    "s3.amazonaws.com",
+    // Amazon SNS: the principal of the role a topic logs delivery status through.
+    "sns.amazonaws.com",
+    // Amazon SQS: the principal a key policy or a bucket policy names the queue service by,
+    // published without a Region.
+    "sqs.amazonaws.com",
+];
+
 /// The principal the service named by `principal` assumes its roles under instead, or `None`
 /// when nothing says that name resolves to no role assumption.
+///
+/// Two readings, one answer: the service that is addressed under its own name but assumes its
+/// roles under another service's ([`UNASSUMABLE_SERVICE_PRINCIPALS`]), and the service whose
+/// principal AWS publishes without a Region, named here with one
+/// ([`regionless_service_principal`]). Both are the same mistake — a name that resolves to no
+/// role-assuming principal — and both point the client at the name that does.
 ///
 /// Matched without regard to ASCII case, the way every service principal in this crate is
 /// ([`super::published_service_linked_role_name`]): a service principal is a DNS-style name,
@@ -124,6 +209,57 @@ pub fn assumed_under_another_principal(principal: &str) -> Option<&'static str> 
         .iter()
         .find(|entry| entry.principal.eq_ignore_ascii_case(principal))
         .map(|entry| entry.assumed_under)
+        .or_else(|| regionless_service_principal(principal))
+}
+
+/// The Region-less principal of the service a REGIONALIZED service name addresses, when that
+/// service's role-assuming principal is one AWS publishes without a Region
+/// ([`REGIONLESS_SERVICE_PRINCIPALS`]), and `None` for every other value.
+///
+/// `None` therefore covers a name that carries no Region at all (the published form, which is
+/// what this reading points a client at), a name whose middle label is no Region code — a
+/// FEATURE sub-principal such as `<namespace>.application-autoscaling.amazonaws.com` is
+/// written exactly like a regionalized one and is a published principal — and a service no row
+/// carries.
+#[must_use]
+pub fn regionless_service_principal(principal: &str) -> Option<&'static str> {
+    // A service principal is a DNS-style name, so the comparison is case-insensitive: the
+    // whole value is folded once and the Region code and the zone are read off the folded
+    // form.
+    let folded = principal.to_ascii_lowercase();
+    let labels = folded.strip_suffix(SERVICE_PRINCIPAL_DNS_SUFFIX)?;
+    let (service, region) = labels.rsplit_once('.')?;
+    if service.is_empty() || !is_region_code(region) {
+        return None;
+    }
+    let published = format!("{service}{SERVICE_PRINCIPAL_DNS_SUFFIX}");
+    REGIONLESS_SERVICE_PRINCIPALS
+        .iter()
+        .copied()
+        .find(|named| *named == published)
+}
+
+/// Whether `label` is shaped like an AWS Region code: lowercase hyphen-joined words ending in
+/// a number, at least three groups long — `us-east-1`, `ap-southeast-4`, `us-gov-west-1`.
+///
+/// This is what tells a Region label apart from the other labels a service principal is
+/// written with: a feature sub-principal's label (`application-autoscaling`, `s3`) is no
+/// Region, so the name it sits in is not a regionalized one.
+fn is_region_code(label: &str) -> bool {
+    if label.len() > ::service_common::arn::MAX_REGION_LENGTH {
+        return false;
+    }
+    // The last hyphen group is the Region's number and every group before it is a word,
+    // walked without collecting the caller-supplied label.
+    let Some((words, number)) = label.rsplit_once('-') else {
+        return false;
+    };
+    words.split('-').count() >= 2
+        && !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && words
+            .split('-')
+            .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()))
 }
 
 /// The first service principal `document` names that IAM resolves no role assumption for, as
@@ -408,6 +544,181 @@ mod tests {
                 "the catalog must ascend by principal, got {:?} before {:?}",
                 pair[0].principal,
                 pair[1].principal
+            );
+        }
+    }
+
+    /// RULE: a service whose role-assuming principal AWS publishes without a Region resolves
+    /// to nothing when a document regionalizes it, and the principal that service's roles ARE
+    /// assumed under is the published, Region-less name.
+    #[test]
+    fn a_regionalized_spelling_of_a_regionless_principal_resolves_to_the_published_one() {
+        // The rows differ along what the rule generalises over: which catalog entry is named
+        // (none of them the one the cited request carried), the Region named (several
+        // geographies, a three-word Region name, the longest published Region label), the
+        // casing, and the ways a name only LOOKS regionalized.
+        let rows: [(&str, String, Option<&str>); 17] = [
+            (
+                "the published principal itself, which carries no Region",
+                "lambda.amazonaws.com".to_string(),
+                None,
+            ),
+            (
+                "a service principal no row carries, regionalized — some services publish one",
+                "logs.eu-west-1.amazonaws.com".to_string(),
+                None,
+            ),
+            (
+                "a FEATURE sub-principal, written like a regionalized name",
+                "dynamodb.application-autoscaling.amazonaws.com".to_string(),
+                None,
+            ),
+            (
+                "a feature sub-principal of a service a row carries",
+                "replication.dynamodb.amazonaws.com".to_string(),
+                None,
+            ),
+            (
+                "a middle label whose last group is no number",
+                "s3.batchoperations.amazonaws.com".to_string(),
+                None,
+            ),
+            (
+                "a middle label of two groups only",
+                "sns.east-1.amazonaws.com".to_string(),
+                None,
+            ),
+            (
+                "a name in another partition's zone, which this reading says nothing about",
+                "sns.cn-north-1.amazonaws.com.cn".to_string(),
+                None,
+            ),
+            (
+                "a value that is no DNS name at all",
+                "210987654321".to_string(),
+                None,
+            ),
+            (
+                "a regionalized Amazon EC2 principal",
+                "ec2.us-east-1.amazonaws.com".to_string(),
+                Some("ec2.amazonaws.com"),
+            ),
+            (
+                "a regionalized AWS Lambda principal, in another geography",
+                "lambda.ap-southeast-2.amazonaws.com".to_string(),
+                Some("lambda.amazonaws.com"),
+            ),
+            (
+                "a regionalized Amazon SQS principal, in a three-word Region",
+                "sqs.us-gov-west-1.amazonaws.com".to_string(),
+                Some("sqs.amazonaws.com"),
+            ),
+            (
+                "a regionalized Amazon RDS principal",
+                format!("rds.eu-central-1{SERVICE_PRINCIPAL_DNS_SUFFIX}"),
+                Some(RDS_SERVICE_PRINCIPAL),
+            ),
+            (
+                "a regionalized Amazon S3 principal, written in another casing",
+                "S3.US-WEST-2.AmazonAWS.com".to_string(),
+                Some("s3.amazonaws.com"),
+            ),
+            (
+                "a regionalized principal whose service label carries a hyphen",
+                "ecs-tasks.eu-west-3.amazonaws.com".to_string(),
+                Some("ecs-tasks.amazonaws.com"),
+            ),
+            (
+                "the cited service, regionalized",
+                "sns.us-east-1.amazonaws.com".to_string(),
+                Some("sns.amazonaws.com"),
+            ),
+            (
+                // The published bound on a Region label
+                // (`::service_common::arn::MAX_REGION_LENGTH`): a label AT it is a Region, so
+                // the name is a regionalized one.
+                "a middle label as long as a Region label may be",
+                format!(
+                    "sns.ap-{}-1{SERVICE_PRINCIPAL_DNS_SUFFIX}",
+                    "s".repeat(::service_common::arn::MAX_REGION_LENGTH - 5)
+                ),
+                Some("sns.amazonaws.com"),
+            ),
+            (
+                // One past that bound: a longer middle label is no Region of any AWS endpoint,
+                // so the name is not a regionalized one.
+                "a middle label one character past the Region-label bound",
+                format!(
+                    "sns.ap-{}-1{SERVICE_PRINCIPAL_DNS_SUFFIX}",
+                    "s".repeat(::service_common::arn::MAX_REGION_LENGTH - 4)
+                ),
+                None,
+            ),
+        ];
+
+        for (case, principal, expected) in rows {
+            let found = assumed_under_another_principal(&principal);
+            assert_eq!(
+                found, expected,
+                "case {case:?}: expected {expected:?}, got {found:?} for {principal}"
+            );
+            // The whole document is read the same way, so the refusal names the value exactly
+            // as the request wrote it.
+            let document = trust(&format!("\"{principal}\""));
+            let named = unassumable_service_principal(&document);
+            assert_eq!(
+                named.as_deref(),
+                expected.map(|_| principal.as_str()),
+                "case {case:?}: expected the document to report {principal:?} for {expected:?}, \
+                 got {named:?}"
+            );
+        }
+    }
+
+    /// RULE: every Region-less row is a principal a role CAN be assumed under — a client that
+    /// follows the refusal and drops the Region reaches a document this reading accepts — the
+    /// Region-less zone is one the tree publishes endpoints in, and the catalog is strictly
+    /// ascending, so a service is filed once.
+    #[test]
+    fn each_regionless_row_is_itself_a_principal_a_role_can_be_assumed_under() {
+        assert!(
+            ::service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES
+                .contains(&SERVICE_PRINCIPAL_DNS_SUFFIX),
+            "expected {SERVICE_PRINCIPAL_DNS_SUFFIX:?} to be one of the endpoint zones the tree \
+             lists, got {:?}",
+            ::service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES
+        );
+
+        for published in REGIONLESS_SERVICE_PRINCIPALS {
+            assert!(
+                published.ends_with(SERVICE_PRINCIPAL_DNS_SUFFIX),
+                "case {published:?}: a published service principal sits in the zone AWS \
+                 publishes them under"
+            );
+            assert!(
+                assumed_under_another_principal(published).is_none(),
+                "case {published:?}: the published principal must itself be assumable, got {:?}",
+                assumed_under_another_principal(published)
+            );
+            // A document naming the published principal is stored, and the regionalized
+            // spelling of the SAME service is refused and pointed back at it.
+            let regionalized = published.replace(
+                SERVICE_PRINCIPAL_DNS_SUFFIX,
+                &format!(".us-east-1{SERVICE_PRINCIPAL_DNS_SUFFIX}"),
+            );
+            assert_eq!(
+                assumed_under_another_principal(&regionalized),
+                Some(*published),
+                "case {published:?}: the regionalized spelling {regionalized:?} must point at it"
+            );
+        }
+
+        for pair in REGIONLESS_SERVICE_PRINCIPALS.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "the catalog must ascend by principal, got {:?} before {:?}",
+                pair[0],
+                pair[1]
             );
         }
     }

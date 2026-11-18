@@ -81,6 +81,7 @@ jsonc-parser = "0.26"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+automod = { workspace = true }
 hex = { workspace = true }
 # Generates the real certificates and key pairs the server-certificate tests feed the
 # service, independently of the DER this crate reads.

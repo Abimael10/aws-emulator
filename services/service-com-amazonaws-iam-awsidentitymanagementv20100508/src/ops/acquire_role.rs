@@ -488,6 +488,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The rendered document's principals are read against the FORMS their principal types
+        // admit, the same way every writer of this member reads them
+        // (`crate::state::unreadable_trust_policy_principal`): a template whose principal comes
+        // from the request can place a value under a type that admits nothing like it, and a
+        // role carrying such a trust policy could never be assumed by anybody.
+        if let Some((principal_type, principal)) = assume_role_policy_document
+            .as_deref()
+            .and_then(crate::state::unreadable_trust_policy_principal)
+        {
+            return Err(AcquireRoleErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(crate::state::invalid_policy_principal(
+                        principal_type,
+                        &principal,
+                    )),
+                },
+            )
+            .into());
+        }
         // The rendered document's service principals are resolved the same way every writer of
         // this member resolves them (`crate::state::unassumable_service_principal`): a
         // template whose principal comes from the request can name a service that assumes its

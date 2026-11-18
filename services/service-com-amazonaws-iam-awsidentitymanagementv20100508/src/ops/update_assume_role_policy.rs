@@ -271,6 +271,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The principals the document names are then read against the FORMS their principal
+        // types admit: a value outside them names nobody, so the replacement would state a
+        // trust nothing could exercise. The rule is the shared one every writer of this member
+        // applies (`crate::state::unreadable_trust_policy_principal`), and a refused update
+        // leaves the document the role already held.
+        if let Some((principal_type, principal)) =
+            crate::state::unreadable_trust_policy_principal(&input.policy_document)
+        {
+            return Err(
+                UpdateAssumeRolePolicyErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException {
+                        message: Some(crate::state::invalid_policy_principal(
+                            principal_type,
+                            &principal,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The service principals the document names are then RESOLVED: a service that assumes
         // its roles under another service's principal has none to resolve, so the replacement
         // would state a trust nothing could exercise. The rule is the shared one every writer

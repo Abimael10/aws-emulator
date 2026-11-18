@@ -229,6 +229,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A trust policy's statements name the parties the role trusts, and the policy language
+        // keys each of them by the TYPE of party it is — so a value outside the forms its type
+        // admits names nobody at all and the document states a trust nothing could exercise.
+        // The rule is the shared one every writer of this member applies
+        // (`crate::state::unreadable_trust_policy_principal`, over the tree's one reading of a
+        // resource-based policy's principal forms), the sentence is IAM's own naming the TYPE
+        // and the value as the request wrote it, and nothing is stored.
+        if let Some((principal_type, principal)) =
+            crate::state::unreadable_trust_policy_principal(&input.assume_role_policy_document)
+        {
+            return Err(CreateRoleErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(crate::state::invalid_policy_principal(
+                        principal_type,
+                        &principal,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // A trust policy does not merely CARRY principals, it names the ones the role trusts,
         // so IAM resolves each SERVICE it names: a service that assumes its roles under
         // another service's principal has none to resolve here, and the document states a

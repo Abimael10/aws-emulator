@@ -21,7 +21,14 @@
 //! another), where the principal sits (alone, in a one-element list, in a list of several,
 //! beside principals of other types, under the complement `NotPrincipal`), the spacing of the
 //! submitted document, and the values the rule does not touch (an ARN, a wildcard, a service
-//! principal, a figure that is not an account id, an account id under another element).
+//! principal, a figure named where no principal is, an account id under another element).
+//!
+//! A figure that is NO account id cannot be named as an `AWS` principal at all — a value
+//! outside the forms its principal type admits names nobody, which the form clause every
+//! writer of this member applies refuses before anything is stored
+//! (`state::unreadable_trust_policy_principal`, asserted end to end in
+//! `tests/all/trust_policy_service_principals.rs`) — so the rows below name such a figure
+//! where no principal is named and assert it is stored untouched.
 //!
 //! The awsQuery harness (router, call, element, elements) is the one `tests/all/user_lifecycle.rs`
 //! owns and every suite in this crate shares.
@@ -145,19 +152,25 @@ fn rows() -> Vec<Row> {
             ),
         },
         Row {
-            // An account id is twelve digits; a figure of any other length names no account,
-            // so it is stored as it was written.
-            case: "figures one digit either side of an account id",
-            submitted: trust(r#"{"AWS":["21098765432","2109876543210"]}"#),
-            stored: trust(r#"{"AWS":["21098765432","2109876543210"]}"#),
+            // An account id is twelve digits; the account-root spelling is about the figures
+            // that ARE one, so figures one digit either side of that width — named here in a
+            // condition value, the slot of a trust policy whose content is the caller's — are
+            // stored exactly as they were written.
+            case: "figures one digit either side of an account id, named where no principal is",
+            submitted: format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{OTHER_ACCOUNT}"}},"Action":"sts:AssumeRole","Condition":{{"StringEquals":{{"sts:ExternalId":["21098765432","2109876543210"]}}}}}}]}}"#
+            ),
+            stored: format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{other_root}"}},"Action":"sts:AssumeRole","Condition":{{"StringEquals":{{"sts:ExternalId":["21098765432","2109876543210"]}}}}}}]}}"#
+            ),
         },
         Row {
             case: "an account id under another element is not a principal",
             submitted: format!(
-                r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{OTHER_ACCOUNT}","Effect":"Allow","Principal":{{"Service":"{OTHER_ACCOUNT}"}},"Action":"sts:AssumeRole"}}]}}"#
+                r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{OTHER_ACCOUNT}","Effect":"Allow","Principal":{{"Service":"lambda.amazonaws.com"}},"Action":"sts:AssumeRole"}}]}}"#
             ),
             stored: format!(
-                r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{OTHER_ACCOUNT}","Effect":"Allow","Principal":{{"Service":"{OTHER_ACCOUNT}"}},"Action":"sts:AssumeRole"}}]}}"#
+                r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{OTHER_ACCOUNT}","Effect":"Allow","Principal":{{"Service":"lambda.amazonaws.com"}},"Action":"sts:AssumeRole"}}]}}"#
             ),
         },
     ]

@@ -14938,6 +14938,7 @@ dependencies = [
 name = "service-com-amazonaws-iam-awsidentitymanagementv20100508"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
