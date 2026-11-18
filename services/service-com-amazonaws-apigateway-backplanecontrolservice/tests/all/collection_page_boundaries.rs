@@ -11,11 +11,10 @@
 //!
 //! The rules asserted here, each over a SET of inputs rather than one call:
 //!
-//! * a collection that holds no element reports NO page member — the success envelope
-//!   alone, with no cursor and no echoed page size beside it — across every
-//!   listing of this service whose own recorded answer leaves the member out (the
-//!   deployments collection's does not: it is asserted by
-//!   `crate::deployment_collection`, which owns that collection's own answer);
+//! * a collection that holds no element reports its page member as the EMPTY list — with
+//!   no cursor and no echoed page size beside it — across every listing of this service,
+//!   the deployments collection included (asserted by `crate::deployment_collection`,
+//!   which owns that collection's own answer);
 //! * a limited page of an API's documentation parts holds the parts at the first
 //!   ADDRESSES the request's filters select, and reports the address of the part it
 //!   carries on at as its cursor, so the part a page reports and the cursor beside it
@@ -73,7 +72,7 @@ fn reported_addresses(body: &Value, case: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn a_collection_that_holds_no_element_reports_no_page_member() {
+async fn a_collection_that_holds_no_element_reports_the_empty_page_member() {
     let gateway = Gateway::new();
     // A record each of the API-scoped and domain-name-scoped collections hangs off; both
     // are created with none of the collections below.
@@ -86,8 +85,7 @@ async fn a_collection_that_holds_no_element_reports_no_page_member() {
     // is the envelope rather than one listing's handler. Left out: the collections an
     // account or an API is CREATED holding (a REST API's models and gateway responses, the
     // SDK-type catalog), which never hold nothing, and the DEPLOYMENTS collection, whose
-    // own recorded answer carries the member as an empty list
-    // (`crate::deployment_collection`).
+    // empty answer `crate::deployment_collection` asserts.
     let rows: Vec<(&str, String)> = vec![
         ("GetApiKeys", "/apikeys".to_string()),
         ("GetUsagePlans", "/usageplans".to_string()),
@@ -120,9 +118,9 @@ async fn a_collection_that_holds_no_element_reports_no_page_member() {
         let answer = listed(&gateway, uri, case).await;
         assert_eq!(
             answer.body,
-            json!({}),
-            "case {case}: expected no page member for a collection that holds no element, \
-             got {:?}",
+            json!({ "item": [] }),
+            "case {case}: expected the empty page member for a collection that holds no \
+             element, got {:?}",
             answer.body
         );
         assert!(
@@ -148,9 +146,9 @@ async fn a_collection_that_holds_no_element_reports_no_page_member() {
         let answer = listed(&empty, uri, case).await;
         assert_eq!(
             answer.body,
-            json!({}),
-            "case {case}: expected no page member for a collection that holds no element, \
-             got {:?}",
+            json!({ "item": [] }),
+            "case {case}: expected the empty page member for a collection that holds no \
+             element, got {:?}",
             answer.body
         );
     }

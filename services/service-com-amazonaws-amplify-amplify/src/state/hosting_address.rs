@@ -10,10 +10,9 @@
 //! told both composes `https://<displayName>.<defaultDomain>/` — the deployed page, the
 //! branch's basic-authorization challenge, or the redirect a rule states.
 //!
-//! The member is the DOMAIN an app's sites are published under, and it is the
-//! address THIS emulator is reached at ([`announced_default_domain`]): a domain a response
-//! announces is an address a client is told to fetch, so it has to lead back to this process
-//! rather than to a zone nothing here answers for.
+//! The member is the DOMAIN an app's sites are published under: the app's own id under the
+//! Amplify hosting zone ([`announced_default_domain`]), a name derived from the app's record
+//! rather than from the request that created it.
 //!
 //! The member is a DOMAIN, so the value is an address and nothing else: no scheme, no path.
 //! What that address cannot carry — which app, and which of its branches — is carried in the
@@ -31,26 +30,32 @@
 //! prefixing a branch's label to the announced domain ([`hosted_branch_host`]), read in one
 //! normal form ([`hosted_site_host`]) because a
 //! host is the same host however its port, its userinfo, its trailing root dot or its case
-//! are written — and the PATH that names the app and the branch for an app announced on this
-//! emulator's own endpoint ([`hosted_site_path`], read back by [`addressed_hosted_site`]).
+//! are written — and the PATH that names the app and the branch for a client that resolves
+//! nothing but this emulator's own endpoint ([`hosted_site_path`], read back by
+//! [`addressed_hosted_site`]).
 
-/// The default domain an app's hosting is ANNOUNCED under: the address THIS emulator is
-/// reached at, read off the base URL `ctx.endpoint()` reports ("the base URL a later request
-/// addresses… Callers send normally signed requests to it") through the shared data-plane
-/// reading ([`::service_common::data_plane_addressing::emulator_endpoint_authority`]).
+/// The default domain an app's hosting is ANNOUNCED under: the app's own id under the
+/// Amplify hosting zone, `<appId>.amplifyapp.com`.
 ///
-/// A domain a response announces is an address a client is told to FETCH, so it has to lead
-/// back to this emulator: a value under a zone this process does not answer for resolves
-/// somewhere else or nowhere at all. The value is the authority alone — `host[:port]`, no
-/// scheme and no path — because `App$defaultDomain` is a DOMAIN, and what such an address
-/// cannot carry (which app, and which of its branches) is carried in the PATH this plane
-/// serves a site under ([`hosted_site_path`]).
+/// `App$defaultDomain` is a DNS name of the app — a client composes one of its sites'
+/// addresses by prefixing a branch's label to it — so it is derived from the app's own
+/// record and from nothing about the request that created it: the value is the same
+/// whichever endpoint a client was configured with, and every later read of the app reports
+/// it unchanged.
 ///
-/// Resolved ONCE, by the create, and persisted as the app's `defaultDomain`, so every later
-/// read of that app reports the same string whatever it is addressed at.
-pub fn announced_default_domain(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
-    ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx)
+/// The value is the name alone — no scheme and no path — and what such an address cannot
+/// carry (which app, and which of its branches) is carried in the PATH this plane ALSO
+/// serves a site under ([`hosted_site_path`]), which is how a client that resolves nothing
+/// but this emulator's own endpoint reaches the site.
+///
+/// Resolved ONCE, by the create, and persisted as the app's `defaultDomain`.
+pub fn announced_default_domain(app_id: &str) -> String {
+    format!("{app_id}.{AMPLIFY_HOSTING_ZONE}")
 }
+
+/// The zone Amplify publishes an app's hosting under, which every app's default domain is
+/// one label of: the suffix of `<appId>.amplifyapp.com`.
+const AMPLIFY_HOSTING_ZONE: &str = "amplifyapp.com";
 
 /// The segment that names THIS plane under the reserved data-plane marker, ahead of the
 /// app's own id: `/_aws/amplify/<appId>`.

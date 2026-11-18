@@ -95,14 +95,14 @@ async fn get_base_path_mappings_pages_through_creation_order_on_position_and_lim
     let domain_name = "collection.example.com";
     created_domain(&gateway, domain_name, json!({})).await;
 
-    // A domain name that carries no mapping reports NO page member rather than a refusal
-    // or an empty one: the success envelope alone is the whole answer a client reads, on
-    // this collection as on every other one of this service.
+    // A domain name that carries no mapping reports its page member as the EMPTY list
+    // rather than a refusal or no member at all, on this collection as on every other one
+    // of this service.
     let empty = page_of(&gateway, domain_name, "", "the empty collection").await;
     assert_eq!(
         empty.get("item"),
-        None,
-        "case the empty collection: expected no page member, got {empty:?}"
+        Some(&json!([])),
+        "case the empty collection: expected the empty page member, got {empty:?}"
     );
     assert_eq!(
         listed_base_paths(&empty, "the empty collection"),

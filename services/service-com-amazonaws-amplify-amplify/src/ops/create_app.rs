@@ -288,12 +288,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             app_arn: ::emulator_server::emulator_arn("amplify", &region, &format!("apps/{app_id}")),
             // `defaultDomain` is the domain the app's hosting is published under — a
             // client composes the site's address from it and a branch's display name — so
-            // it is an address that has to lead back to THIS emulator: the base this
-            // process is reached at (`crate::state::announced_default_domain`, beside
-            // which the path a client reaches those sites under is spelled). Resolved once
-            // here and reported unchanged by every later read. The member is @required and
-            // never empty.
-            default_domain: crate::state::announced_default_domain(ctx),
+            // it is a DNS name of the APP: its own id under the Amplify hosting zone
+            // (`crate::state::announced_default_domain`, beside which the path a client
+            // configured with this emulator's endpoint reaches those sites under is
+            // spelled). Resolved once here and reported unchanged by every later read. The
+            // member is @required and never empty.
+            default_domain: crate::state::announced_default_domain(&app_id),
             app_id,
             name: input.name,
             // `tags` is echoed exactly as the request set it: the create response

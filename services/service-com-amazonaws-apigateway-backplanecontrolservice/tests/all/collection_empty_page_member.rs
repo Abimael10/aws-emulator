@@ -8,10 +8,10 @@
 //! sees, not what a handler returns. [`Gateway`], `create_api` and `string_member` are
 //! this crate's one wire-test harness, reused from `rest_api_lifecycle`.
 //!
-//! The rule, asserted over a SET of inputs rather than one call: a listing reports "the
-//! current page of elements from this collection" exactly when that page holds an element —
-//! a page that holds nothing is a success carrying NO collection member, which is the answer
-//! the recorded contract carries for a listing whose page came out empty.
+//! The rule, asserted over a SET of inputs rather than one call: a listing always reports
+//! "the current page of elements from this collection", so a page that holds nothing is a
+//! success carrying that member as the EMPTY list — a client counts the page it was served
+//! rather than branching on a member that is not there.
 //!
 //! The rows span the collections of this service a caller fills and empties again,
 //! crossed with the two ways a page comes to hold nothing while the listing still
@@ -24,7 +24,8 @@
 //! listing of this suite's table that publishes a filter. `collection_page_boundaries`
 //! covers the third way, a collection that never held an element, and
 //! `collection_page_envelope` the fourth, the window past the last element of a
-//! collection that does hold elements.
+//! collection that does hold elements. The last test here reads EVERY paginated listing of
+//! this service once, so no collection is left out of the rule.
 
 use serde_json::{json, Value};
 
@@ -244,17 +245,9 @@ async fn listed(gateway: &Gateway, uri: &str, case: &str) -> Value {
     answer.body
 }
 
-/// Assert `body` reports a page of `count` element(s): the member carries them when
-/// `count` is non-zero, and is ABSENT when the page holds nothing.
+/// Assert `body` reports a page of `count` element(s): the member is always there, and
+/// carries exactly that many elements — the empty list for a page that holds nothing.
 fn assert_page_of(body: &Value, count: usize, case: &str) {
-    if count == 0 {
-        assert_eq!(
-            body.get("item"),
-            None,
-            "case {case}: a page that holds nothing reports no page member, got {body:?}"
-        );
-        return;
-    }
     let items = body
         .get("item")
         .unwrap_or_else(|| panic!("case {case}: expected the page member, got {body:?}"));
@@ -269,13 +262,13 @@ fn assert_page_of(body: &Value, count: usize, case: &str) {
 }
 
 #[tokio::test]
-async fn a_collection_emptied_of_its_last_element_reports_no_page_member() {
+async fn a_collection_emptied_of_its_last_element_reports_the_empty_page_member() {
     for collection in EMPTIED {
         let gateway = Gateway::new();
         let row = stand_up(&gateway, collection).await;
 
-        // The one element it holds is on the page, which the emptied listing no longer
-        // reports at all.
+        // The one element it holds is on the page, which the emptied listing reports as
+        // the empty list.
         let case = format!("{collection}(one element)");
         let held = listed(&gateway, &row.listing, &case).await;
         assert_page_of(&held, 1, &case);
@@ -300,7 +293,7 @@ async fn a_collection_emptied_of_its_last_element_reports_no_page_member() {
 }
 
 #[tokio::test]
-async fn a_listing_narrowed_to_no_element_reports_no_page_member() {
+async fn a_listing_narrowed_to_no_element_reports_the_empty_page_member() {
     for collection in COLLECTIONS {
         let gateway = Gateway::new();
         let row = stand_up(&gateway, collection).await;
@@ -327,5 +320,121 @@ async fn a_listing_narrowed_to_no_element_reports_no_page_member() {
         let case = format!("{collection}(unnarrowed after {narrowing})");
         let held = listed(&gateway, &row.listing, &case).await;
         assert_page_of(&held, 1, &case);
+    }
+}
+
+#[tokio::test]
+async fn every_paginated_listing_of_this_service_reports_its_page_as_a_list() {
+    // The rule holds for EVERY listing of this service, so the rows below are all of them,
+    // read on one emulator holding one API, one usage plan and one domain name and nothing
+    // else — which is how the rows differ along what the rule generalises over: a
+    // collection nothing has been created in yet (most of them), one an API is created
+    // already holding (its root resource, its two default models) and one holding the
+    // element this emulator was stood up with (the API, the plan, the domain name).
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "page-member-api").await;
+    let plan = created(
+        &gateway,
+        "/usageplans",
+        json!({ "name": "page-member-plan" }),
+        "CreateUsagePlan",
+    )
+    .await;
+    let plan_id = string_member(&plan, "id", "CreateUsagePlan");
+    let domain_name = "page-member.example.com";
+    crate::domain_name_collection::created_domain(&gateway, domain_name, json!({})).await;
+
+    // The third column is how many elements the row's collection holds on that emulator:
+    // `Some(n)` where the count is exact — nothing was created in it (0), the API was
+    // created holding it (its root resource, its two default models) or this emulator was
+    // stood up with the one element (the API, the plan, the domain name) — and `None` for
+    // the two catalogs the service publishes rather than a caller filling, which are
+    // asserted non-empty because their contents are their own suites' rule.
+    let rows: Vec<(&str, String, Option<usize>)> = vec![
+        ("GetRestApis", "/restapis".to_string(), Some(1)),
+        ("GetApiKeys", "/apikeys".to_string(), Some(0)),
+        ("GetUsagePlans", "/usageplans".to_string(), Some(1)),
+        (
+            "GetUsagePlanKeys",
+            format!("/usageplans/{plan_id}/keys"),
+            Some(0),
+        ),
+        ("GetVpcLinks", "/vpclinks".to_string(), Some(0)),
+        (
+            "GetClientCertificates",
+            "/clientcertificates".to_string(),
+            Some(0),
+        ),
+        ("GetDomainNames", "/domainnames".to_string(), Some(1)),
+        (
+            "GetDomainNameAccessAssociations",
+            "/domainnameaccessassociations".to_string(),
+            Some(0),
+        ),
+        (
+            "GetBasePathMappings",
+            format!("/domainnames/{domain_name}/basepathmappings"),
+            Some(0),
+        ),
+        (
+            "GetAuthorizers",
+            format!("/restapis/{api}/authorizers"),
+            Some(0),
+        ),
+        (
+            "GetRequestValidators",
+            format!("/restapis/{api}/requestvalidators"),
+            Some(0),
+        ),
+        (
+            "GetDocumentationParts",
+            format!("/restapis/{api}/documentation/parts"),
+            Some(0),
+        ),
+        (
+            "GetDocumentationVersions",
+            format!("/restapis/{api}/documentation/versions"),
+            Some(0),
+        ),
+        (
+            "GetDeployments",
+            format!("/restapis/{api}/deployments"),
+            Some(0),
+        ),
+        ("GetStages", format!("/restapis/{api}/stages"), Some(0)),
+        (
+            "GetResources",
+            format!("/restapis/{api}/resources"),
+            Some(1),
+        ),
+        ("GetModels", format!("/restapis/{api}/models"), Some(2)),
+        (
+            "GetGatewayResponses",
+            format!("/restapis/{api}/gatewayresponses"),
+            None,
+        ),
+        ("GetSdkTypes", "/sdktypes".to_string(), None),
+    ];
+
+    for (case, uri, held) in &rows {
+        let body = listed(&gateway, uri, case).await;
+        let reported = body
+            .get("item")
+            .unwrap_or_else(|| panic!("case {case}: expected the page member, got {body:?}"));
+        let elements = reported
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case}: the page member must be a list, got {reported:?}"));
+        match held {
+            Some(count) => assert_eq!(
+                elements.len(),
+                *count,
+                "case {case}: expected a page of {count} element(s), got {elements:?}"
+            ),
+            None => assert!(
+                !elements.is_empty(),
+                "case {case}: the catalog this service publishes is never empty, got \
+                 {elements:?}"
+            ),
+        }
     }
 }

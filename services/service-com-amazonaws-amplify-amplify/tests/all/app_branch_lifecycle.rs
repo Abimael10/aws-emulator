@@ -36,20 +36,16 @@ const SIGNED_FOR_AMPLIFY: &str = "AWS4-HMAC-SHA256 \
 pub(crate) const ACCOUNT_ID: &str = "000000000000";
 pub(crate) const REGION: &str = "us-east-1";
 
-/// The domain an app announces its hosting under: the authority of the base URL this
-/// emulator is reached at, which is what `App$defaultDomain` carries.
+/// The domain an app announces its hosting under: the app's own id under the Amplify
+/// hosting zone, which is what `App$defaultDomain` carries.
 ///
-/// A suite drives the service IN PROCESS, on no socket, so the base the framework reports is
-/// its unserved one (`smithy_server_runtime::UNSERVED_URL_BASE`) — the same value
-/// `ctx.endpoint()` answers a handler; a served emulator reports the `host:port` it answers
-/// on there and announces that instead. Either way the announced domain is this emulator's
-/// own address, which is the rule under test.
+/// Written here independently of the service, so a suite pins the announced name and not
+/// the code that composes it.
 ///
 /// `pub(crate)` so the sibling suites that assert the announced domain and compose a site's
-/// address from it read the one value rather than each spelling it.
-pub(crate) fn announced_domain() -> String {
-    service_common::data_plane_addressing::url_authority(smithy_server_runtime::UNSERVED_URL_BASE)
-        .to_string()
+/// address from it read the one spelling rather than each writing it.
+pub(crate) fn announced_domain(app_id: &str) -> String {
+    format!("{app_id}.amplifyapp.com")
 }
 
 /// One response, reduced to what a client branches on.
@@ -542,9 +538,9 @@ async fn create_app_mints_and_persists_a_record_get_app_reads_back_field_for_fie
         );
         assert_eq!(
             string_member(&app, "defaultDomain"),
-            announced_domain(),
-            "case {label:?}: defaultDomain must be the address this emulator is reached at, \
-             got {:?}",
+            announced_domain(&app_id),
+            "case {label:?}: defaultDomain must be the app's own id under the Amplify \
+             hosting zone, got {:?}",
             app.get("defaultDomain")
         );
         assert_eq!(

@@ -13,12 +13,10 @@
 //! API.
 //!
 //! The rule, asserted over a TABLE of collections rather than one listing: a paginated
-//! collection of this service writes its page member — `item` on the wire — exactly when
-//! that page holds an element, so a collection emptied of its last element answers with the
-//! success envelope and NO page member, on every collection whose own recorded answer leaves
-//! that member out. The DEPLOYMENTS collection's does not — it carries the member as an empty
-//! list — so its emptied answer is asserted by `crate::deployment_collection`, which owns
-//! that collection.
+//! collection of this service always writes its page member — `item` on the wire — so a
+//! collection emptied of its last element answers with that member as the EMPTY list, and
+//! with neither a cursor nor a page-size echo beside it. The DEPLOYMENTS collection is
+//! asserted the same way by `crate::deployment_collection`, which owns it.
 //!
 //! Each row reaches the empty collection by DELETING the one element it created, not by
 //! never creating one, so what is asserted is the answer a collection makes once it is
@@ -36,8 +34,7 @@ use crate::vpc_links::{create_vpc_link, target_arn};
 /// Every collection this suite empties, named by the operation that lists it. Two of
 /// them — `GetDocumentationVersions` and `GetVpcLinks` — are API-scoped and account-level
 /// respectively; `GetBasePathMappings` hangs off a domain name. The deployments collection
-/// is not among them: its own recorded answer carries the page member as an empty list, so
-/// `crate::deployment_collection` asserts its emptied answer instead.
+/// is not among them: `crate::deployment_collection` asserts its emptied answer instead.
 const COLLECTIONS: &[&str] = &[
     "GetRestApis",
     "GetApiKeys",
@@ -180,7 +177,7 @@ async fn emptied(gateway: &Gateway, collection: &str) -> String {
 }
 
 #[tokio::test]
-async fn an_emptied_collection_reports_no_page_member_and_nothing_beside_it() {
+async fn an_emptied_collection_reports_the_empty_page_member_and_nothing_beside_it() {
     for collection in COLLECTIONS {
         let gateway = Gateway::new();
         let uri = emptied(&gateway, collection).await;
@@ -192,13 +189,13 @@ async fn an_emptied_collection_reports_no_page_member_and_nothing_beside_it() {
             "case {case}: expected 200, got {} with {:?}",
             answer.status, answer.body
         );
-        // No page member, and nothing beside it: the page an emptied collection reports
-        // holds no element, so the member is absent, it carries on at no cursor and it
-        // echoes no page size.
+        // The page member, carrying nothing, and nothing beside it: the page an emptied
+        // collection reports holds no element, so the member is the empty list, it carries
+        // on at no cursor and it echoes no page size.
         assert_eq!(
             answer.body,
-            json!({}),
-            "case {case}: expected the success envelope alone, got {:?}",
+            json!({ "item": [] }),
+            "case {case}: expected the empty page member alone, got {:?}",
             answer.body
         );
     }
@@ -227,8 +224,8 @@ async fn an_emptied_collection_asked_for_a_page_size_reports_the_same_answer() {
             );
             assert_eq!(
                 answer.body,
-                json!({}),
-                "case {case}: expected the same success envelope, got {:?}",
+                json!({ "item": [] }),
+                "case {case}: expected the same empty page member, got {:?}",
                 answer.body
             );
         }

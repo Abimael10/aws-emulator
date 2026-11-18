@@ -10,15 +10,16 @@
 //! The rule under test: `App$defaultDomain` is "the default domain for the Amplify app"
 //! (`smithy_query(query="doc",shape="App",member="defaultDomain")`) and
 //! `Branch$displayName` "is used as the default domain prefix"
-//! (`(shape="Branch",member="displayName")`), so the member is the domain a client composes
-//! its site's address from — and it is the address THIS emulator is reached at, because a
-//! domain a response announces is one a client is told to fetch.
+//! (`(shape="Branch",member="displayName")`), so the member is the DNS domain a client
+//! composes its site's address from — the app's OWN id under the Amplify hosting zone,
+//! derived from the app's record and from nothing about the request that created it.
 //!
-//! So the value is an address and nothing else — no scheme, no path — resolved ONCE when the
-//! app is created, identical for every endpoint a client of this emulator is configured
-//! with, and a `GET` of `<displayName>.<defaultDomain>` is answered by the site that branch
-//! deployed. A client that resolves nothing but one local endpoint cannot dial a branch label
-//! under it, so the same site is ALSO served under the path that names the app and the branch.
+//! So the value is a domain name and nothing else — no scheme, no path, no port — resolved
+//! ONCE when the app is created, identical for every endpoint a client of this emulator is
+//! configured with, and a `GET` of `<displayName>.<defaultDomain>` is answered by the site
+//! that branch deployed. A client that resolves nothing but one local endpoint cannot dial a
+//! branch label under it, so the same site is ALSO served under the path that names the app
+//! and the branch.
 //!
 //! The table below spans the class that rule generalises over: every spelling of the
 //! emulator's own endpoint a client is configured with (the IPv4 loopback address, the
@@ -91,13 +92,13 @@ async fn read_app(emulator: &Emulator, endpoint: &str, app_id: &str) -> Value {
     reply.member("app")
 }
 
-/// Rule: an app's default domain is the address this emulator is reached at, whatever
+/// Rule: an app's default domain is its own id under the Amplify hosting zone, whatever
 /// endpoint the create was addressed at, and the site of a branch of that app is served at
 /// the address a client composes from it — host-style, with the branch's label ahead of that
 /// domain, and under the path that names the app and the branch for a client that resolves
 /// only this emulator's own endpoint.
 #[tokio::test]
-async fn an_app_announces_the_address_this_emulator_is_reached_at_whatever_endpoint_it_was_created_at(
+async fn an_app_announces_its_own_id_under_the_hosting_zone_whatever_endpoint_it_was_created_at(
 ) {
     for row in rows() {
         let case = row.case;
@@ -118,22 +119,32 @@ async fn an_app_announces_the_address_this_emulator_is_reached_at_whatever_endpo
         let app_id = string_member(&app, "appId");
         let reported = string_member(&app, "defaultDomain");
 
-        let expected = announced_domain();
+        let expected = announced_domain(&app_id);
         assert_eq!(
             reported, expected,
-            "case {case:?}: expected the emulator's own address {expected:?}, got {reported:?}"
+            "case {case:?}: expected the app's own domain {expected:?}, got {reported:?}"
         );
-        // The announced value is an ADDRESS and nothing else: a name a branch label can be
-        // prefixed to, carrying no scheme and no path.
+        // The announced value is a DOMAIN NAME and nothing else: a name a branch label can
+        // be prefixed to, carrying no scheme, no path and no port — and it names the app,
+        // so a client holding the two members knows which site it is addressing.
         assert!(
-            !reported.contains('/'),
-            "case {case:?}: a domain carries no scheme and no path, got {reported:?}"
+            reported.starts_with(&format!("{app_id}.")),
+            "case {case:?}: the domain must begin with the app's id {app_id:?}, got \
+             {reported:?}"
         );
         assert!(
-            reported.chars().all(|byte| byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || "-.:[]".contains(byte)),
-            "case {case:?}: the domain must be a host address, got {reported:?}"
+            !reported.contains('/') && !reported.contains(':'),
+            "case {case:?}: a domain carries no scheme, no path and no port, got {reported:?}"
+        );
+        assert!(
+            reported.split('.').count() >= 2
+                && reported.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.chars().all(|byte| {
+                            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == '-'
+                        })
+                }),
+            "case {case:?}: the domain must be a dotted DNS name, got {reported:?}"
         );
 
         // The same value is reported by every reader, and by one addressed somewhere
@@ -233,5 +244,67 @@ async fn an_app_announces_the_address_this_emulator_is_reached_at_whatever_endpo
                  answer this site's document"
             );
         }
+    }
+}
+
+/// Rule: the announced domain is a function of the APP, so every app of one emulator
+/// announces its own distinct name, and each name carries that app's id as its first label.
+///
+/// The rows differ along what the rule generalises over — how many apps one emulator holds
+/// and the names they were created with (a plain name, one carrying digits and hyphens, one
+/// repeated so two apps differ in nothing a request stated) — because the domain follows the
+/// app's minted id and nothing a request carried.
+#[tokio::test]
+async fn every_app_announces_its_own_id_and_two_apps_never_announce_the_same_domain() {
+    let names: &[&str] = &[
+        "hosting-plain",
+        "hosting-2nd-app-9",
+        "hosting-plain",
+        "hosting-plain",
+    ];
+    let emulator = Emulator::new();
+    let mut announced: Vec<(String, String)> = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let case = format!("app {index} named {name:?}");
+        let created = emulator
+            .call_at(
+                "127.0.0.1:44285",
+                "POST",
+                "/apps",
+                Some(&json!({ "name": name })),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: expected HTTP 200 from CreateApp, got {created:?}"
+        );
+        let app = created.member("app");
+        let app_id = string_member(&app, "appId");
+        let reported = string_member(&app, "defaultDomain");
+        assert_eq!(
+            reported,
+            announced_domain(&app_id),
+            "case {case}: expected the app's own id under the hosting zone, got {reported:?}"
+        );
+        assert!(
+            announced
+                .iter()
+                .all(|(_, other): &(String, String)| other != &reported),
+            "case {case}: {reported:?} was already announced by another app, got \
+             {announced:?}"
+        );
+        announced.push((app_id, reported));
+    }
+
+    // Every one of them is still reported, unchanged, by a later read: the domain is the
+    // app's own record rather than anything about the reading request.
+    for (app_id, reported) in &announced {
+        let read_back = read_app(&emulator, &format!("amplify.{REGION}.amazonaws.com"), app_id)
+            .await;
+        assert_eq!(
+            &string_member(&read_back, "defaultDomain"),
+            reported,
+            "case app {app_id}: a later read must report the same domain, got {read_back:?}"
+        );
     }
 }
