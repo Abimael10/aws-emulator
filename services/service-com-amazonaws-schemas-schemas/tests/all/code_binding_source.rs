@@ -29,6 +29,7 @@
 //! `restJson1` request through `MultiServiceRouter::dispatch`, on the harness in
 //! [`crate::registry_schema_lifecycle`].
 
+use std::collections::BTreeSet;
 use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
 
@@ -229,15 +230,27 @@ async fn source(emulator: &Emulator, uri: &str, case: &str) -> Answer {
 }
 
 /// The package a schema's generated files live in, below the language's source root:
-/// the one root every binding shares and the schema name's own alphanumeric runs,
-/// lower-cased (`src/ops/get_code_binding_source.rs`, `package_segments`).
+/// the one root every binding shares and the schema name's own NAMESPACE segments,
+/// lower-cased, cut at the `.` and `@` that separate an event source's parts from its
+/// event type and with every other character no identifier carries sanitized to `_`
+/// inside its own segment (`src/ops/get_code_binding_source.rs`, `package_segments`).
 pub(crate) fn package_path(schema: &str) -> String {
     let mut segments = vec!["schema".to_string()];
     segments.extend(
         schema
-            .split(|character: char| !character.is_alphanumeric())
+            .split(['.', '@'])
             .filter(|part| !part.is_empty())
-            .map(str::to_lowercase),
+            .map(|part| {
+                part.chars()
+                    .map(|character| {
+                        if character.is_alphanumeric() || character == '_' {
+                            character.to_ascii_lowercase()
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect::<String>()
+            }),
     );
     segments.join("/")
 }
@@ -435,12 +448,12 @@ fn source_cases() -> Vec<SourceCase> {
             language: "Java8",
             files: &[
                 "pom.xml",
-                "src/main/java/schema/shipment/events/ShipmentEvents.java",
-                "src/main/java/schema/shipment/events/ShippingAddress.java",
-                "src/main/java/schema/shipment/events/Marshaller.java",
+                "src/main/java/schema/shipment_events/ShipmentEvents.java",
+                "src/main/java/schema/shipment_events/ShippingAddress.java",
+                "src/main/java/schema/shipment_events/Marshaller.java",
             ],
             declarations: &[
-                "package schema.shipment.events;",
+                "package schema.shipment_events;",
                 "public class ShipmentEvents {",
                 "private ShippingAddress shippingAddress;",
                 "private java.time.OffsetDateTime deliveredAt;",
@@ -456,10 +469,10 @@ fn source_cases() -> Vec<SourceCase> {
             files: &[
                 "package.json",
                 "tsconfig.json",
-                "src/schema/shipment/events/ShipmentEvents.ts",
-                "src/schema/shipment/events/ShippingAddress.ts",
-                "src/schema/shipment/events/index.ts",
-                "src/schema/shipment/events/Marshaller.ts",
+                "src/schema/shipment_events/ShipmentEvents.ts",
+                "src/schema/shipment_events/ShippingAddress.ts",
+                "src/schema/shipment_events/index.ts",
+                "src/schema/shipment_events/Marshaller.ts",
             ],
             declarations: &[
                 "import { ShippingAddress } from \"./ShippingAddress\";",
@@ -478,12 +491,11 @@ fn source_cases() -> Vec<SourceCase> {
             files: &[
                 "setup.py",
                 "requirements.txt",
-                "src/schema/shipment/events/shipment_events.py",
-                "src/schema/shipment/events/shipping_address.py",
+                "src/schema/shipment_events/shipment_events.py",
+                "src/schema/shipment_events/shipping_address.py",
                 "src/schema/__init__.py",
-                "src/schema/shipment/__init__.py",
-                "src/schema/shipment/events/__init__.py",
-                "src/schema/shipment/events/marshaller.py",
+                "src/schema/shipment_events/__init__.py",
+                "src/schema/shipment_events/marshaller.py",
             ],
             declarations: &[
                 "from .shipping_address import ShippingAddress",
@@ -501,12 +513,12 @@ fn source_cases() -> Vec<SourceCase> {
             language: "Go1",
             files: &[
                 "go.mod",
-                "schema/shipment/events/shipment_events.go",
-                "schema/shipment/events/shipping_address.go",
-                "schema/shipment/events/marshaller.go",
+                "schema/shipment_events/shipment_events.go",
+                "schema/shipment_events/shipping_address.go",
+                "schema/shipment_events/marshaller.go",
             ],
             declarations: &[
-                "package events",
+                "package shipment_events",
                 "type ShipmentEvents struct {",
                 "ShippingAddress ShippingAddress `json:\"shippingAddress\"`",
                 "DeliveredAt time.Time `json:\"deliveredAt,omitempty\"`",
@@ -749,7 +761,7 @@ async fn the_marshalling_carries_what_the_document_says_about_each_member() {
         (
             "shipment-events",
             "Python36",
-            "src/schema/shipment/events/marshaller.py",
+            "src/schema/shipment_events/marshaller.py",
             &[
                 "\"shipping_address\": (\"shippingAddress\", ShippingAddress, False),",
                 "\"delivered_at\": (\"deliveredAt\", datetime, False),",
@@ -758,7 +770,7 @@ async fn the_marshalling_carries_what_the_document_says_about_each_member() {
         (
             "shipment-events",
             "Java8",
-            "src/main/java/schema/shipment/events/ShipmentEvents.java",
+            "src/main/java/schema/shipment_events/ShipmentEvents.java",
             &[
                 // Java reads a member by the name the document gives it.
                 "@JsonProperty(\"shippingAddress\")",
@@ -1213,4 +1225,254 @@ async fn a_service_owned_schema_generates_its_own_package() {
         "case {case:?}: generating source must leave the published schema alone, got {:?}",
         after.body
     );
+}
+
+/// The document every row of [`package_name_cases`] is created with: one named schema
+/// declaring members, so each generated package holds exactly one declaration and a row
+/// is about WHERE that declaration sits rather than what it says.
+const EVENT_DOCUMENT: &str = r##"{
+  "openapi": "3.0.0",
+  "info": {"title": "Event", "version": "1.0.0"},
+  "paths": {},
+  "components": {"schemas": {
+    "Event": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {"id": {"type": "string"}, "at": {"type": "string", "format": "date-time"}}
+    }
+  }}
+}"##;
+
+/// The type [`EVENT_DOCUMENT`] declares, which is the one declaration each row's package
+/// carries.
+const EVENT_TYPE: &str = "Event";
+
+/// How long a generation is given to produce source before a row gives up. Generous: the
+/// service fixes the due instant at the put and nothing here races it, so this only has
+/// to outlast a loaded host.
+const GENERATION_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often the source is asked for again while a generation is still in progress.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// One schema name, and the package below the language's source root that the files
+/// generated for it must live in.
+struct PackageNameCase {
+    case: &'static str,
+    schema: &'static str,
+    /// The package, as `/`-joined segments — the whole expectation of the row, written
+    /// out rather than computed, so the row states the mapping instead of restating it.
+    package: &'static str,
+}
+
+/// The table: one row per shape a schema name's characters can take, so the rows differ
+/// along WHICH separators the name carries, HOW MANY of them it carries, where they
+/// fall, and the case of the letters around them. `.` and `@` are the separators the
+/// service's own schema names carry between an event source's parts and its event type
+/// (the `SchemaName` character set, `crate::state::SCHEMA_NAME`), and they are the only
+/// ones that open a new package segment.
+fn package_name_cases() -> Vec<PackageNameCase> {
+    vec![
+        PackageNameCase {
+            case: "no separator at all",
+            schema: "plain",
+            package: "schema/plain",
+        },
+        PackageNameCase {
+            case: "the catalogue's own form: dots and an at-sign",
+            schema: "aws.s3@ObjectCreated",
+            package: "schema/aws/s3/objectcreated",
+        },
+        PackageNameCase {
+            case: "hyphens only",
+            schema: "sim2real-schemas-sch-01ab",
+            package: "schema/sim2real_schemas_sch_01ab",
+        },
+        PackageNameCase {
+            case: "underscores only",
+            schema: "order_placed_v1",
+            package: "schema/order_placed_v1",
+        },
+        PackageNameCase {
+            case: "a hyphen inside a dotted level",
+            schema: "order.placed-v2",
+            package: "schema/order/placed_v2",
+        },
+        PackageNameCase {
+            case: "mixed case around every separator",
+            schema: "Mixed-CASE.Name@Event",
+            package: "schema/mixed_case/name/event",
+        },
+        // The two rows that differ only in WHERE their one hyphen falls: distinct names
+        // must be distinct packages, or one binding's files would overwrite the other's.
+        PackageNameCase {
+            case: "the hyphen before the dot",
+            schema: "a-b.c",
+            package: "schema/a_b/c",
+        },
+        PackageNameCase {
+            case: "the hyphen after the dot",
+            schema: "a.b-c",
+            package: "schema/a/b_c",
+        },
+    ]
+}
+
+/// Ask for a binding's source until the generation has produced it, the way a caller
+/// does: look again until the source is served or a generous deadline passes.
+async fn source_once_generated(emulator: &Emulator, uri: &str, case: &str) -> Answer {
+    let deadline = Instant::now() + GENERATION_DEADLINE;
+    loop {
+        let answer = emulator.call_payload("GET", uri).await;
+        if answer.status == 200 {
+            return answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the generated source must be served once generation completes, \
+             last answer {} {:?}",
+            answer.status,
+            answer.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// How `language` declares the package its files belong to, for the package
+/// `segments` — the one line a generated file must carry where that language names its
+/// package in the source (`src/ops/get_code_binding_source.rs`, `java_source` /
+/// `go_source`); the other two name it by the directory alone.
+fn package_declaration(language: &str, segments: &[&str]) -> Option<String> {
+    match language {
+        "Java8" => Some(format!("package {};", segments.join("."))),
+        "Go1" => Some(format!(
+            "package {}",
+            segments.last().expect("a package has a last segment")
+        )),
+        "TypeScript3" | "Python36" => None,
+        other => panic!("no package declaration known for language {other:?}"),
+    }
+}
+
+/// RULE: a schema name's levels are its own namespace levels — the `.` and `@` the
+/// service's schema names separate an event source's parts and its event type with — so
+/// the package a binding's files live in carries ONE segment per level, with every
+/// character an identifier of the generated language cannot hold sanitized to `_` inside
+/// the segment it sits in rather than cutting a new one. Two names that differ only in
+/// where their separators fall are therefore two packages.
+#[tokio::test]
+async fn the_package_takes_one_segment_per_level_of_the_schema_name() {
+    let emulator = Emulator::new();
+    create_registry(&emulator, REGISTRY).await;
+    let cases = package_name_cases();
+
+    // No two names of the table share a package, which is what keeps one schema's
+    // binding from being unpacked over another's.
+    let packages: BTreeSet<&str> = cases.iter().map(|case| case.package).collect();
+    assert_eq!(
+        packages.len(),
+        cases.len(),
+        "distinct schema names must be distinct packages, got {packages:?}"
+    );
+
+    for case in &cases {
+        let created = emulator
+            .call(
+                "POST",
+                &schema_uri(REGISTRY, case.schema),
+                Some(json!({ "Content": EVENT_DOCUMENT, "Type": "OpenApi3" })),
+            )
+            .await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: expected 201 from CreateSchema, got {} {:?}",
+            case.case, created.status, created.body
+        );
+    }
+    // Every binding is started before any source is read, so the generations run
+    // together instead of one span after another.
+    for case in &cases {
+        for language in CODE_BINDING_LANGUAGES {
+            let put = emulator
+                .call(
+                    "POST",
+                    &binding_uri(REGISTRY, case.schema, language, None),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                put.status, 202,
+                "case {:?}/{language}: expected 202 from PutCodeBinding, got {} {:?}",
+                case.case, put.status, put.body
+            );
+        }
+    }
+
+    for case in &cases {
+        let segments: Vec<&str> = case.package.split('/').collect();
+        for language in CODE_BINDING_LANGUAGES {
+            let label = format!("{}/{language}", case.case);
+            let answer = source_once_generated(
+                &emulator,
+                &source_uri(REGISTRY, case.schema, language, None),
+                &label,
+            )
+            .await;
+            let entries = archive_entries(&label, &answer);
+            let paths: Vec<String> = entries.iter().map(|(path, _)| path.clone()).collect();
+
+            // The declaration of the document's one type sits in the schema's package,
+            // and so does every file the package itself carries.
+            let declarations = declaration_paths(language, case.schema, &paths);
+            assert_eq!(
+                declarations.len(),
+                1,
+                "case {label:?}: one declaration for {EVENT_TYPE:?}, got {paths:?}"
+            );
+            let root = match *language {
+                "Java8" => "src/main/java/",
+                "TypeScript3" | "Python36" => "src/",
+                "Go1" => "",
+                other => panic!("no source root known for language {other:?}"),
+            };
+            let extension = language_extension(language);
+            let expected = format!("{root}{}/", case.package);
+            assert!(
+                declarations[0].starts_with(&expected)
+                    && declarations[0].ends_with(&format!(".{extension}")),
+                "case {label:?}: expected the declaration in {expected:?}, got {:?}",
+                declarations[0]
+            );
+            for entry in package_entries(language, case.schema) {
+                assert!(
+                    paths.contains(&entry),
+                    "case {label:?}: the package must carry {entry:?}, got {paths:?}"
+                );
+            }
+            // And the package the source itself declares is that same package, so the
+            // import a client writes is the directory the class was unpacked into.
+            if let Some(declared) = package_declaration(language, &segments) {
+                let (_, text) = entries
+                    .iter()
+                    .find(|(path, _)| path == &declarations[0])
+                    .expect("the declaration just listed");
+                assert!(
+                    text.contains(&declared),
+                    "case {label:?}: the generated source must declare {declared:?}, got {text}"
+                );
+            }
+        }
+    }
+}
+
+/// The extension a generated file of `language` carries
+/// (`src/ops/get_code_binding_source.rs`, `Target::extension`).
+fn language_extension(language: &str) -> &'static str {
+    match language {
+        "Java8" => "java",
+        "TypeScript3" => "ts",
+        "Python36" => "py",
+        "Go1" => "go",
+        other => panic!("no extension known for language {other:?}"),
+    }
 }

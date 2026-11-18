@@ -863,21 +863,48 @@ fn resolve(
 }
 
 /// The package a schema's generated files live in, below [`PACKAGE_ROOT`]: the schema
-/// name's own segments, lower-cased, so a schema published for one event source lands
-/// in that source's package.
+/// name's own namespace segments, lower-cased, so a schema published for one event
+/// source lands in that source's package.
 ///
-/// A schema name's segments are the runs of letters and digits in it — the service
-/// admits `.`, `@`, `-` and `_` in a name (`crate::state::validate_names`), none of
-/// which a package or directory name of these languages carries.
+/// A schema name is cut into segments at its NAMESPACE separators only
+/// ([`NAMESPACE_SEPARATORS`]): the service admits `.`, `@`, `-` and `_` in a name
+/// (`crate::state::validate_names`), and of those only the two that separate an event
+/// source from its event type stand for a level of the name. Every other character an
+/// identifier of these languages cannot hold is sanitized in place by
+/// [`package_segment`], so a name's remaining separators stay inside the one segment
+/// they belong to — two names that differ only in where their separators fall are two
+/// packages, rather than one package both their bindings would be unpacked into.
 fn package_segments(schema_name: &str) -> Vec<String> {
     let mut segments = vec![PACKAGE_ROOT.to_string()];
     segments.extend(
         schema_name
-            .split(|character: char| !character.is_alphanumeric())
+            .split(NAMESPACE_SEPARATORS)
             .filter(|part| !part.is_empty())
-            .map(str::to_lowercase),
+            .map(package_segment),
     );
     segments
+}
+
+/// The separators a schema name carries between the levels of its own namespace: the
+/// `.` between an event source's parts and the `@` between that source and its event
+/// type, which is how the published catalogue's own names are written
+/// (`crate::state::SCHEMA_NAME`). Each one opens a new package segment.
+const NAMESPACE_SEPARATORS: [char; 2] = ['.', '@'];
+
+/// One package segment: `part` lower-cased, with every character an identifier of these
+/// languages cannot hold replaced IN PLACE by `_` — the one character such an
+/// identifier does carry — so the segment holds the whole of the name's level rather
+/// than only a run of it.
+fn package_segment(part: &str) -> String {
+    let mut segment = String::with_capacity(part.len());
+    for character in part.chars() {
+        if character.is_alphanumeric() || character == '_' {
+            segment.extend(character.to_lowercase());
+        } else {
+            segment.push('_');
+        }
+    }
+    segment
 }
 
 /// One generated source file: where it sits in the archive, and its text.
@@ -1429,8 +1456,18 @@ fn distinct_members(target: Target, members: &[Member]) -> Vec<Member> {
 
 /// The artifact a generated package is published as: the schema's own name in the
 /// lower-case, hyphen-joined form every language below names a package by.
-fn artifact_name(package: &[String]) -> String {
-    let named: Vec<&str> = package.iter().skip(1).map(String::as_str).collect();
+///
+/// Taken from the schema NAME rather than from its package ([`package_segments`]),
+/// because an artifact name is no identifier: every build below admits `-` in it, so a
+/// name's separators are joined by one rather than sanitized into the segment they sit
+/// in. A name holding no letter or digit at all names no artifact, which leaves the one
+/// root every binding shares.
+fn artifact_name(schema_name: &str) -> String {
+    let named: Vec<String> = schema_name
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_lowercase)
+        .collect();
     if named.is_empty() {
         PACKAGE_ROOT.to_string()
     } else {
@@ -1442,7 +1479,7 @@ fn artifact_name(package: &[String]) -> String {
 /// as, and the one library its support source needs. At the archive root, which is
 /// where each of these builds looks for it.
 fn build_files(target: Target, schema_name: &str, package: &[String]) -> Vec<SourceFile> {
-    let artifact = artifact_name(package);
+    let artifact = artifact_name(schema_name);
     match target {
         Target::Java8 => vec![SourceFile {
             path: "pom.xml".to_string(),
@@ -2222,14 +2259,30 @@ mod tests {
         );
     }
 
-    /// The package is the schema name's segments below the one root every binding
-    /// shares.
+    /// The package is the schema name's namespace segments below the one root every
+    /// binding shares: a name is cut at `.` and `@` only, and every other character no
+    /// identifier carries is sanitized inside the segment it sits in.
     #[test]
     fn the_package_is_named_for_the_schema() {
         for (schema, expected) in [
-            ("aws.s3@ObjectCreated", vec!["schema", "aws", "s3", "objectcreated"]),
-            ("order.placed_v1", vec!["schema", "order", "placed", "v1"]),
+            // The catalogue's own form: the event source's parts and its event type.
+            (
+                "aws.s3@ObjectCreated",
+                vec!["schema", "aws", "s3", "objectcreated"],
+            ),
+            // A hyphen and an underscore are not separators: they belong to the one
+            // segment they sit in, as `_`.
+            ("order.placed_v1", vec!["schema", "order", "placed_v1"]),
+            ("order-placed", vec!["schema", "order_placed"]),
+            (
+                "sim2real-schemas-sch-01ab",
+                vec!["schema", "sim2real_schemas_sch_01ab"],
+            ),
             ("demo", vec!["schema", "demo"]),
+            // A run of separators is still one boundary, and a name that is nothing but
+            // separators names no segment at all.
+            ("a..b", vec!["schema", "a", "b"]),
+            ("..", vec!["schema"]),
         ] {
             let segments = package_segments(schema);
             assert_eq!(
