@@ -7,13 +7,14 @@
 //! resource the query matches, in ARN order, paged by this service's shared page-size
 //! and token rules.
 //!
-//! The resources a region records are the groups stored there — a group ARN names a
-//! resource of type `AWS::ResourceGroups::Group`
+//! The resources a region holds are the account's TAGGED resources, whatever service
+//! owns them ([`crate::state::inventory`]) — a queue, a key, a table, each with the
+//! tags its owning service holds for it — beside the groups stored there (a group ARN
+//! names a resource of type `AWS::ResourceGroups::Group`
 //! ([`crate::state::resource_type_of_arn`]), and the tags this service reports for a
-//! group are the tags it is matched on — and every resource ARN recorded as a static
+//! group are the tags it is matched on) and every resource ARN recorded as a static
 //! membership of one of those groups, whose type is likewise derived from its ARN.
-//! Nothing else is searchable: this service stores no resources of its own beyond
-//! those, so a query matches what the store holds rather than a fabricated catalog.
+//! Nothing is fabricated: a query matches the resources the emulator really holds.
 //!
 //! A `TAG_FILTERS_1_0` query selects the resources whose type its
 //! `ResourceTypeFilters` admits and whose tags satisfy every one of its
@@ -221,6 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stopped at, scoped to THIS query in THIS region: a token minted for another
         // query names no resume point among the resources this one matches.
         let listing = listing_of(&query);
+        // The account's own resources, which the query is resolved against. Read
+        // BEFORE this service's store is locked, so the stores of the services that
+        // own those resources and this one are never locked in two orders.
+        let inventory = crate::state::inventory::tagged_resources(&*self.engine, &region);
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => match crate::state::decode_page_token(&region, &listing, token) {
@@ -240,7 +245,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // membership of this service is resolved by, so a search and a group's own
         // listing select the same resources for the same query.
         let (matched, query_errors) =
-            crate::state::run_resource_query(&store, &region, &query).map_err(bad_request)?;
+            crate::state::run_resource_query(&store, &region, &query, &inventory)
+                .map_err(bad_request)?;
         drop(store);
         let mut matched: Vec<ResourceIdentifier> = matched
             .into_iter()

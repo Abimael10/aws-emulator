@@ -9,12 +9,13 @@
 //!
 //! A group's membership comes from its DEFINITION: a group created with a
 //! `ResourceQuery` holds the resources that query selects NOW, so the stored query is
-//! RUN over the resources the service records in the group's region
-//! ([`crate::state::run_resource_query`]) — a `TAG_FILTERS_1_0` query selecting by
-//! resource type and tags, and a `CLOUDFORMATION_STACK_1_0` query naming a stack this
-//! service records none of, which is reported in `QueryErrors` beside no resource. A
-//! group created without a query holds the memberships `GroupResources` recorded
-//! against it, minus any removed.
+//! RUN over the resources of the group's region ([`crate::state::run_resource_query`])
+//! — the account's TAGGED resources, whatever service owns them
+//! ([`crate::state::inventory`]), beside the groups this service records and their
+//! memberships. A `TAG_FILTERS_1_0` query selects by resource type and tags; a
+//! `CLOUDFORMATION_STACK_1_0` query names a stack this service records none of, which
+//! is reported in `QueryErrors` beside no resource. A group created without a query
+//! holds the memberships `GroupResources` recorded against it, minus any removed.
 //!
 //! A `resource-type` filter is judged against the resource types the addressed
 //! group's stored query admits before any page is computed: a value that query does
@@ -244,6 +245,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A group lives in the region whose endpoint created it, so the request's
+        // own region is where the identifier is resolved: a group of another region
+        // answers no listing here.
+        let region = crate::state::request_region(ctx.parts());
+        // The account's own resources, which a stored query resolves its membership
+        // out of. Read BEFORE this service's store is locked, so the stores of the
+        // services that own those resources and this one are never locked in two
+        // orders — which is also why it is read for every request rather than only
+        // for a group that turns out to hold a query: whether it does is known only
+        // from this store, and resolving that first would mean locking this store,
+        // dropping it and resolving the group a second time. The read walks
+        // in-memory state the account already holds and copies no resource a query
+        // does not select.
+        let inventory = crate::state::inventory::tagged_resources(&*self.engine, &region);
+
         let store = state.lock();
         let not_found = || {
             ListGroupResourcesError::from(ListGroupResourcesErrorModeled::NotFoundException(
@@ -252,10 +268,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         };
-        // A group lives in the region whose endpoint created it, so the request's
-        // own region is where the identifier is resolved: a group of another region
-        // answers no listing here.
-        let region = crate::state::request_region(ctx.parts());
         let key = store.lookup(&region, identifier).ok_or_else(not_found)?;
         let group = store.groups.get(&key).ok_or_else(not_found)?;
 
@@ -308,7 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A stored query cannot fail to define a membership: the one place a
             // query is accepted refuses such a document, so the refusal here is
             // unreachable for a group this store holds.
-            Some(query) => crate::state::run_resource_query(&store, &key.region, query)
+            Some(query) => crate::state::run_resource_query(&store, &key.region, query, &inventory)
                 .map_err(bad_request)?,
             // A group with no query holds exactly the memberships recorded against
             // it by `GroupResources`, minus any `UngroupResources` removed.

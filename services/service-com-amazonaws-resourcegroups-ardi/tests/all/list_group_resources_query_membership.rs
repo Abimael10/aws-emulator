@@ -764,3 +764,412 @@ async fn the_fixture_group_arns_are_the_minted_ones() {
         );
     }
 }
+
+/// `ListGroupResources` over a group whose query selects resources of the ACCOUNT
+/// rather than records of this service.
+///
+/// The rule under test: the membership of a query-defined group is DERIVED by
+/// running its stored `ResourceQuery` over the account's resources in the group's
+/// region — which is why the operation names the resource-tagging read among its
+/// required permissions ("resource-groups:ListGroupResources … tag:GetResources",
+/// `smithy_query(query="doc",shape="ListGroupResources")`) — so a resource the
+/// account holds tags for and whose type and tags the query admits is a member for
+/// as long as it carries them, each reported with the type its ARN names, and a
+/// request's own `resource-type` filter narrows that derived set rather than
+/// replacing it.
+///
+/// The resources here are tagged through the account's own tagging API over the one
+/// engine both services share, so no second copy of a tag set is involved. The
+/// sibling `core/router/tests/all/resource_groups_tag_query_derives_membership.rs`
+/// pins the same rule for resources another service OWNS (a queue, a key).
+mod derived_from_the_accounts_resources {
+    use serde_json::{json, Value};
+
+    use super::{arns_of, identifiers_of, LIST};
+    use crate::resource_group_lifecycle::Emulator;
+    use crate::ungroup_resources::sorted;
+
+    /// The `X-Amz-Target` prefix the tagging API's awsJson wire names its
+    /// operations under, and the JSON version that wire carries.
+    const TAGGING_TARGET: &str = "ResourceGroupsTaggingAPI_20170126";
+    const TAGGING_JSON_VERSION: &str = "1.1";
+
+    /// The one filter name `ListGroupResources` accepts
+    /// (`smithy_query(query="shape",shape="ResourceFilterName")`).
+    const RESOURCE_TYPE_FILTER: &str = "resource-type";
+
+    /// The FIXED text a `resource-type` filter the addressed group's query does not
+    /// admit is refused with, before the values that failed the validation
+    /// (`smithy_query(query="doc",shape="ListGroupResourcesInput",member="Filters")`).
+    const INCOMPATIBLE_FILTERS_MESSAGE: &str = "Filters not valid: The resource types specified \
+         as filters in the request are incompatible with the group query:";
+
+    /// The tagged resources of the account every case below runs over, spanning the
+    /// ARN forms the modelled `ResourceArn` admits (`type/id`, `type:id`) and four
+    /// CloudFormation-style types from four services.
+    const INSTANCE: &str = "arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0";
+    const VOLUME: &str = "arn:aws:ec2:us-east-1:000000000000:volume/vol-0123456789abcdef0";
+    const ALARM: &str = "arn:aws:cloudwatch:us-east-1:000000000000:alarm/derived-probe";
+    const LOG_GROUP: &str = "arn:aws:logs:us-east-1:000000000000:log-group:/derived/probe";
+
+    /// The types those ARNs name, from the AWS CloudFormation resource and property
+    /// types reference — the vocabulary `ResourceIdentifier$ResourceType` is
+    /// documented in (`smithy_query(query="shape",shape="ResourceIdentifier")`).
+    const INSTANCE_TYPE: &str = "AWS::EC2::Instance";
+    const VOLUME_TYPE: &str = "AWS::EC2::Volume";
+    const ALARM_TYPE: &str = "AWS::CloudWatch::Alarm";
+    const LOG_GROUP_TYPE: &str = "AWS::Logs::LogGroup";
+
+    /// A supported type nothing in the account below is.
+    const TABLE_TYPE: &str = "AWS::DynamoDB::Table";
+
+    /// The group each case defines with the query under test.
+    const PROBE: &str = "derived-probe";
+
+    /// The emulator every case runs against: this service and the account's tagging
+    /// API over ONE engine (the shared harness's
+    /// [`Emulator::with_tagging_api`]), with the four resources above tagged.
+    struct Account {
+        emulator: Emulator,
+    }
+
+    impl Account {
+        /// An emulator whose account holds the four tagged resources above.
+        async fn new() -> Self {
+            let account = Self {
+                emulator: Emulator::with_tagging_api(),
+            };
+            for (arns, tags) in [
+                (
+                    vec![INSTANCE, LOG_GROUP],
+                    json!({ "marker": "probe", "Stage": "Test" }),
+                ),
+                (vec![VOLUME, ALARM], json!({ "marker": "other" })),
+            ] {
+                let answered = account
+                    .tag("TagResources", &json!({ "ResourceARNList": arns, "Tags": tags }))
+                    .await;
+                assert_eq!(
+                    answered["FailedResourcesMap"],
+                    json!({}),
+                    "case the fixtures: tagging {arns:?} must fail for none, got {answered}",
+                );
+            }
+            account
+        }
+
+        /// One tagging-API operation, which must answer the modelled 200.
+        async fn tag(&self, operation: &str, body: &Value) -> Value {
+            let target = format!("{TAGGING_TARGET}.{operation}");
+            let (status, parsed) = self
+                .emulator
+                .call_target("tagging", &target, TAGGING_JSON_VERSION, body)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {operation}: expected HTTP 200 from the tagging API, got {status} \
+                 with {parsed}"
+            );
+            parsed
+        }
+
+        /// One Resource Groups operation, as its status and parsed body.
+        async fn call(&self, path: &str, body: &Value) -> (u16, Value) {
+            self.emulator.call(path, body).await
+        }
+
+        /// One Resource Groups operation, which must answer the modelled 200.
+        async fn ok(&self, case: &str, path: &str, body: &Value) -> Value {
+            let (status, parsed) = self.call(path, body).await;
+            assert_eq!(
+                status, 200,
+                "case {case}: expected HTTP 200 from POST {path}, got {status} with {parsed}"
+            );
+            parsed
+        }
+
+        /// Define [`PROBE`] by the tag query `document`.
+        async fn probe(&self, document: &Value) {
+            self.ok(
+                "the probe group",
+                "/groups",
+                &json!({
+                    "Name": PROBE,
+                    "ResourceQuery": {
+                        "Type": "TAG_FILTERS_1_0",
+                        "Query": document.to_string(),
+                    }
+                }),
+            )
+            .await;
+        }
+
+        /// The ARNs [`PROBE`]'s membership listing reports, narrowed by `filters`
+        /// when the case gives any.
+        async fn listed(&self, case: &str, filters: &[&str]) -> Vec<String> {
+            let mut request = json!({ "Group": PROBE });
+            if !filters.is_empty() {
+                request["Filters"] =
+                    json!([{ "Name": RESOURCE_TYPE_FILTER, "Values": filters.to_vec() }]);
+            }
+            let page = self.ok(case, LIST, &request).await;
+            arns_of(case, &page)
+        }
+    }
+
+    /// A group defined by a tag query lists the resources of the ACCOUNT its query
+    /// selects — over a table of whole query documents whose rows differ in how many
+    /// tag keys the query names, how many values one key carries, a key named with no
+    /// value, which types it admits and how many, a supported type nothing is, and the
+    /// case of a tag value.
+    #[tokio::test]
+    async fn a_tag_query_group_lists_the_accounts_resources_the_query_selects() {
+        // (the query document, the ARNs it must select)
+        let rows: Vec<(Value, Vec<String>)> = vec![
+            (
+                json!({
+                    "ResourceTypeFilters": [INSTANCE_TYPE],
+                    "TagFilters": [{ "Key": "marker", "Values": ["probe"] }]
+                }),
+                vec![INSTANCE.to_string()],
+            ),
+            (
+                json!({ "TagFilters": [{ "Key": "marker", "Values": ["probe"] }] }),
+                sorted([INSTANCE, LOG_GROUP]),
+            ),
+            (
+                json!({ "TagFilters": [{ "Key": "marker", "Values": ["probe", "other"] }] }),
+                sorted([INSTANCE, LOG_GROUP, VOLUME, ALARM]),
+            ),
+            (
+                json!({
+                    "TagFilters": [
+                        { "Key": "marker", "Values": ["probe"] },
+                        { "Key": "Stage", "Values": ["Test"] }
+                    ]
+                }),
+                sorted([INSTANCE, LOG_GROUP]),
+            ),
+            (
+                json!({ "TagFilters": [{ "Key": "Stage" }] }),
+                sorted([INSTANCE, LOG_GROUP]),
+            ),
+            (
+                json!({
+                    "ResourceTypeFilters": [VOLUME_TYPE, ALARM_TYPE],
+                    "TagFilters": [{ "Key": "marker" }]
+                }),
+                sorted([VOLUME, ALARM]),
+            ),
+            (
+                json!({
+                    "ResourceTypeFilters": [LOG_GROUP_TYPE],
+                    "TagFilters": [{ "Key": "marker" }]
+                }),
+                vec![LOG_GROUP.to_string()],
+            ),
+            (
+                json!({
+                    "ResourceTypeFilters": [TABLE_TYPE],
+                    "TagFilters": [{ "Key": "marker" }]
+                }),
+                Vec::new(),
+            ),
+            (
+                json!({ "TagFilters": [{ "Key": "marker", "Values": ["PROBE"] }] }),
+                Vec::new(),
+            ),
+        ];
+
+        for (document, expected) in rows {
+            // Each row gets its own account, so the group a row defines is the only
+            // group among the resources its query runs over.
+            let account = Account::new().await;
+            account.probe(&document).await;
+            let case = document.to_string();
+            let answered = account.listed(&case, &[]).await;
+            assert_eq!(
+                answered, expected,
+                "case {case}: expected the derived membership {expected:?}, got {answered:?}",
+            );
+            // Listing REPORTS: the membership is the same on the next read.
+            let again = account.listed(&case, &[]).await;
+            assert_eq!(
+                again, expected,
+                "case {case}: expected a second listing to answer {expected:?}, got {again:?}",
+            );
+        }
+    }
+
+    /// Every derived member carries the CloudFormation-style type its ARN names, and
+    /// a request's `resource-type` filter narrows the derived set to the types it
+    /// names, while a value the group's own query does not admit is refused
+    /// `BadRequestException` (400) with the service's fixed sentence followed by the
+    /// values that failed the validation.
+    #[tokio::test]
+    async fn a_resource_type_filter_narrows_the_derived_membership_or_is_refused() {
+        let account = Account::new().await;
+        account
+            .probe(&json!({
+                "ResourceTypeFilters": [INSTANCE_TYPE, VOLUME_TYPE, ALARM_TYPE],
+                "TagFilters": [{ "Key": "marker" }]
+            }))
+            .await;
+
+        let page = account
+            .ok("the derived types", LIST, &json!({ "Group": PROBE }))
+            .await;
+        let reported = identifiers_of("the derived types", &page);
+        let expected: Vec<(String, Option<String>)> = vec![
+            (ALARM.to_string(), Some(ALARM_TYPE.to_string())),
+            (INSTANCE.to_string(), Some(INSTANCE_TYPE.to_string())),
+            (VOLUME.to_string(), Some(VOLUME_TYPE.to_string())),
+        ];
+        assert_eq!(
+            reported, expected,
+            "case the derived types: expected {expected:?}, got {reported:?}",
+        );
+
+        // (the filter values, the ARNs they leave)
+        let rows: Vec<(Vec<&str>, Vec<String>)> = vec![
+            (vec![INSTANCE_TYPE], vec![INSTANCE.to_string()]),
+            (vec![ALARM_TYPE], vec![ALARM.to_string()]),
+            (vec![INSTANCE_TYPE, VOLUME_TYPE], sorted([INSTANCE, VOLUME])),
+            (
+                vec![INSTANCE_TYPE, VOLUME_TYPE, ALARM_TYPE],
+                sorted([INSTANCE, VOLUME, ALARM]),
+            ),
+        ];
+        for (filters, expected) in rows {
+            let case = format!("Filters={filters:?}");
+            let answered = account.listed(&case, &filters).await;
+            assert_eq!(
+                answered, expected,
+                "case {case}: expected the filter to narrow the derived membership to \
+                 {expected:?}, got {answered:?}",
+            );
+        }
+
+        for unadmitted in [vec![LOG_GROUP_TYPE], vec![TABLE_TYPE, LOG_GROUP_TYPE]] {
+            let case = format!("unadmitted Filters={unadmitted:?}");
+            let (status, body) = account
+                .call(
+                    LIST,
+                    &json!({
+                        "Group": PROBE,
+                        "Filters": [{ "Name": RESOURCE_TYPE_FILTER, "Values": unadmitted }]
+                    }),
+                )
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case}: expected HTTP 400, got {status} with {body}",
+            );
+            let expected = format!("{INCOMPATIBLE_FILTERS_MESSAGE} {}", unadmitted.join(", "));
+            assert_eq!(
+                body["Message"].as_str(),
+                Some(expected.as_str()),
+                "case {case}: expected the message {expected:?}, got {body}",
+            );
+        }
+    }
+
+    /// The membership is DERIVED, not recorded: a resource that stops carrying the
+    /// tags the query selects on stops being a member, and carrying them again makes
+    /// it one — with nothing in this service to keep in step.
+    #[tokio::test]
+    async fn a_derived_membership_follows_the_accounts_tags() {
+        let account = Account::new().await;
+        account
+            .probe(&json!({
+                "ResourceTypeFilters": [INSTANCE_TYPE],
+                "TagFilters": [{ "Key": "marker", "Values": ["probe"] }]
+            }))
+            .await;
+        let answered = account.listed("tagged", &[]).await;
+        assert_eq!(
+            answered,
+            vec![INSTANCE.to_string()],
+            "case tagged: expected the tagged resource, got {answered:?}",
+        );
+
+        account
+            .tag(
+                "UntagResources",
+                &json!({ "ResourceARNList": [INSTANCE], "TagKeys": ["marker"] }),
+            )
+            .await;
+        let answered = account.listed("untagged", &[]).await;
+        assert_eq!(
+            answered,
+            Vec::<String>::new(),
+            "case untagged: a resource that no longer carries the tag is no longer a \
+             member, got {answered:?}",
+        );
+
+        account
+            .tag(
+                "TagResources",
+                &json!({ "ResourceARNList": [INSTANCE], "Tags": { "marker": "probe" } }),
+            )
+            .await;
+        let answered = account.listed("re-tagged", &[]).await;
+        assert_eq!(
+            answered,
+            vec![INSTANCE.to_string()],
+            "case re-tagged: expected the resource to be a member again, got {answered:?}",
+        );
+    }
+
+    /// `SearchResources` runs the request's own query over the SAME resources a
+    /// group's listing resolves its membership from: one query, one resolution.
+    #[tokio::test]
+    async fn search_resources_resolves_the_same_derived_set() {
+        for document in [
+            json!({ "TagFilters": [{ "Key": "marker", "Values": ["probe"] }] }),
+            json!({
+                "ResourceTypeFilters": [VOLUME_TYPE],
+                "TagFilters": [{ "Key": "marker" }]
+            }),
+            json!({ "TagFilters": [{ "Key": "marker", "Values": ["none"] }] }),
+        ] {
+            // The group is defined by the same document, so the two answers are
+            // comparable; it carries no tag of its own, so it is not a match itself.
+            let account = Account::new().await;
+            account.probe(&document).await;
+            let case = document.to_string();
+            let listed = account.listed(&case, &[]).await;
+
+            let page = account
+                .ok(
+                    &case,
+                    "/resources/search",
+                    &json!({
+                        "ResourceQuery": {
+                            "Type": "TAG_FILTERS_1_0",
+                            "Query": document.to_string(),
+                        }
+                    }),
+                )
+                .await;
+            let found: Vec<String> = page["ResourceIdentifiers"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case}: expected ResourceIdentifiers, got {page}"))
+                .iter()
+                .map(|identifier| {
+                    identifier["ResourceArn"]
+                        .as_str()
+                        .unwrap_or_else(|| {
+                            panic!("case {case}: expected a ResourceArn, got {identifier}")
+                        })
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(
+                found, listed,
+                "case {case}: expected SearchResources to answer the membership listing's \
+                 {listed:?}, got {found:?}",
+            );
+        }
+    }
+}

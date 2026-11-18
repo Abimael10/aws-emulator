@@ -45,6 +45,17 @@ pub(crate) struct Emulator {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
+        Self::carrying_tagging_api(false)
+    }
+
+    /// An emulator carrying this service AND the account's resource-tagging API over
+    /// the SAME engine — the arrangement `core/router` builds — for a suite whose
+    /// subject is a resource of the ACCOUNT rather than a record of this service.
+    pub(crate) fn with_tagging_api() -> Self {
+        Self::carrying_tagging_api(true)
+    }
+
+    fn carrying_tagging_api(with_tagging_api: bool) -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = smithy_server_runtime::MultiServiceRouter::new();
         // These tests sign nothing, so request authentication is off; the
@@ -52,6 +63,12 @@ impl Emulator {
         // and region.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        if with_tagging_api {
+            router.register_service(
+                service_com_amazonaws_resourcegroupstaggingapi_resourcegroupstaggingapi_20170126
+                    ::EmulatedService::new(Arc::clone(&engine)),
+            );
+        }
         Self { router, engine }
     }
 
@@ -158,6 +175,47 @@ impl Emulator {
     /// Call `path`, requiring a 200, and return the body.
     pub(crate) async fn ok(&self, path: &str, body: &Value) -> Value {
         self.ok_in("us-east-1", path, body).await
+    }
+
+    /// Dispatch one `X-Amz-Target` RPC to `signing_name` in `us-east-1`, for an
+    /// operation of ANOTHER service registered beside this one, whose wire is not
+    /// this service's restJson1 ([`Emulator::with_tagging_api`]). Returns the status
+    /// and the parsed body.
+    pub(crate) async fn call_target(
+        &self,
+        signing_name: &str,
+        target: &str,
+        json_version: &str,
+        body: &Value,
+    ) -> (u16, Value) {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential=AKIDEXAMPLE/20240101/us-east-1/{signing_name}/aws4_request, \
+                     SignedHeaders=host, Signature=deadbeef"
+                ),
+            )
+            .header("content-type", format!("application/x-amz-json-{json_version}"))
+            .header("x-amz-target", target)
+            .body(bytes::Bytes::from(body.to_string()))
+            .expect("valid request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or_else(|error| {
+                panic!(
+                    "{target} answered {status} with a body that is not JSON ({error}): {:?}",
+                    String::from_utf8_lossy(response.body()),
+                )
+            })
+        };
+        (status, parsed)
     }
 }
 

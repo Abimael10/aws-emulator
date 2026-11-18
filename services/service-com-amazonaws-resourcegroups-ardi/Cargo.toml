@@ -32,6 +32,11 @@ ulid = "1"
 # which this crate matches with the same regex engine the request boundary
 # compiles a modelled pattern with rather than re-deciding the categories itself.
 regex = "1.13"
+# The account's view of its TAGGED resources, which a `TAG_FILTERS_1_0` query
+# resolves a group's membership out of — the view `ListGroupResources` names
+# `tag:GetResources` among its required permissions for. Reached through the
+# shared engine. See `src/state/inventory.rs`.
+service-com-amazonaws-resourcegroupstaggingapi-resourcegroupstaggingapi-20170126 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

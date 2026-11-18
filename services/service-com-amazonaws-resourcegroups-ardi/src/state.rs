@@ -7,8 +7,9 @@
 //! `ListGroups`, `GroupResources`,
 //! `UngroupResources`, `ListGroupResources`, `ListGroupingStatuses`, `UpdateGroup`,
 //! `SearchResources` and
-//! `DeleteGroup` all read and write the same records. Those records are also the
-//! only resources this service knows of, so `SearchResources` runs a query over the
+//! `DeleteGroup` all read and write the same records. A query, though, resolves
+//! over the account's resources rather than over this service's own: the tagged
+//! resources of every service the emulator holds ([`inventory`]) beside the
 //! groups of a region and the memberships recorded in them. The map is a
 //! [`BTreeMap`] keyed by [`GroupKey`] — the region the group was created in and its
 //! name — because this service is REGIONAL: a group belongs to the region whose
@@ -34,6 +35,10 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
+
+pub mod inventory;
+
+pub use inventory::TaggedResource;
 
 use crate::ops::types::{
     AccountSettings, FailedResource, Group, GroupConfiguration, GroupConfigurationItem,
@@ -192,32 +197,49 @@ impl ComAmazonawsResourcegroupsArdiState {
     /// query's limit admits ([`ResourceQueryRecord::resource_type_limit`]) and
     /// whose tags satisfy every one of its filters, in ARN order and once each.
     ///
-    /// Every resource of a region is one of two kinds, and a query runs over both:
+    /// A query runs over every resource of the region the emulator can resolve,
+    /// which is of three kinds:
     ///
+    /// * every TAGGED resource of the account, each with the tags the service
+    ///   that owns it holds for it (`inventory`, read through
+    ///   [`inventory::tagged_resources`]) — a queue, a key, a table: the
+    ///   resources a tag query is about;
     /// * each group stored in the region, whose own ARN names a resource
     ///   ([`resource_type_of_arn`]) and whose stored tags are the tags this
     ///   service reports for it (`GetTags`);
     /// * every resource ARN recorded as a static membership of one of those
-    ///   groups, whose tags this service does not record — so only a query that
+    ///   groups, whose tags this service does not record — so, unless the
+    ///   account's own view of that resource carries them, only a query that
     ///   matches on resource type alone selects one.
     ///
-    /// Nothing else is matchable: this service records no other resource, so a
-    /// query runs over what the store holds rather than over a fabricated
-    /// catalog. The matches are keyed by ARN, so a resource several groups record
-    /// is one resource. One run is bounded by what the store holds
-    /// ([`MAX_GROUPS`] groups of at most [`MAX_MEMBERS_PER_GROUP`] memberships)
-    /// and allocates nothing for a resource the query does not select.
+    /// The matches are keyed by ARN, so a resource the account's view and a
+    /// group's memberships both name is one resource, reported with the tags its
+    /// owning service holds. One run is bounded by the account's tagged
+    /// resources plus what this store holds ([`MAX_GROUPS`] groups of at most
+    /// [`MAX_MEMBERS_PER_GROUP`] memberships) and allocates nothing for a
+    /// resource the query does not select.
     pub fn resources_matching(
         &self,
         region: &str,
         limit: Option<&[String]>,
         filters: &[QueryTagFilter],
+        inventory: &[TaggedResource],
     ) -> Vec<MemberRecord> {
         // A membership's tags are not recorded, and a tag filter is satisfied
         // only by carrying its key, so a query that filters on any tag selects no
         // membership at all. That is decided once here rather than per membership.
         let memberships_can_match = filters.is_empty();
         let mut matched: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for resource in inventory {
+            let resource_type = resource_type_of_arn(&resource.resource_arn);
+            if query_admits_type(resource_type, limit) && carries_query_tags(&resource.tags, filters)
+            {
+                matched.insert(
+                    resource.resource_arn.clone(),
+                    resource_type.map(str::to_string),
+                );
+            }
+        }
         for group in self.groups_in(region) {
             let group_type = resource_type_of_arn(&group.group_arn);
             if query_admits_type(group_type, limit) && carries_query_tags(&group.tags, filters) {
@@ -649,9 +671,13 @@ pub const STACK_NOT_EXISTING_QUERY_ERROR: &str = "CLOUDFORMATION_STACK_NOT_EXIST
 /// group's own membership listing and a search over the recorded resources
 /// resolve one the same way:
 ///
-/// * a tag query selects the recorded resources whose type its
+/// * a tag query selects the resources of the account whose type its
 ///   [`RESOURCE_TYPE_FILTERS_ELEMENT`] admits and whose tags satisfy every one of
-///   its [`TAG_FILTERS_ELEMENT`] entries ([`ComAmazonawsResourcegroupsArdiState::resources_matching`]);
+///   its [`TAG_FILTERS_ELEMENT`] entries
+///   ([`ComAmazonawsResourcegroupsArdiState::resources_matching`]), which is what
+///   `inventory` — the account's tagged resources, read through
+///   [`inventory::tagged_resources`] before this store was locked — is resolved
+///   against beside this store's own records;
 /// * a [`STACK_QUERY_TYPE`] query names ONE CloudFormation stack, and this
 ///   service records no stack and no stack's members, so no stack of the account
 ///   answers it: that is the condition [`STACK_NOT_EXISTING_QUERY_ERROR`] names,
@@ -666,6 +692,7 @@ pub fn run_resource_query(
     store: &ComAmazonawsResourcegroupsArdiState,
     region: &str,
     query: &ResourceQueryRecord,
+    inventory: &[TaggedResource],
 ) -> Result<(Vec<MemberRecord>, Vec<QueryError>), String> {
     let document = query_document(&query.query)?;
     if query.query_type == STACK_QUERY_TYPE {
@@ -683,8 +710,8 @@ pub fn run_resource_query(
     let filters = tag_filters(&document)?;
     let limit = query.resource_type_limit();
     Ok((
-        store.resources_matching(region, limit.as_deref(), &filters),
-        // A tag query runs over the recorded resources with nothing left to
+        store.resources_matching(region, limit.as_deref(), &filters, inventory),
+        // A tag query runs over the account's resources with nothing left to
         // report: every error code the model declares is about a stack.
         Vec::new(),
     ))
