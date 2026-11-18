@@ -42,7 +42,10 @@ fn create_body(desired_state: Option<&str>) -> Value {
 }
 
 /// One lifecycle call on an existing pipe, named by the operation the case drives.
-async fn drive(router: &MultiServiceRouter, name: &str, operation: &str) -> Reply {
+///
+/// `pub(crate)` because `tests/all/pipe_listing_state_reason.rs` drives the states of the
+/// pipes it lists through the SAME request path rather than a copy of it.
+pub(crate) async fn drive(router: &MultiServiceRouter, name: &str, operation: &str) -> Reply {
     match operation {
         "StartPipe" => {
             call(

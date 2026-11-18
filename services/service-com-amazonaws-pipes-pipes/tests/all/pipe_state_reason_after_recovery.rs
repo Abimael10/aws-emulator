@@ -30,7 +30,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::pipe_bring_up::{create_pipe, delete_queue, every_call, settled};
 use crate::pipe_data_plane::given_queue;
 use crate::pipe_lifecycle::{call, describe, list, Reply, REGION};
-use crate::pipe_listing_state_reason::{assert_reason, reason_for, Reason, PAGE_BUDGET};
+use crate::pipe_listing_state_reason::{
+    assert_reason, paged_walk, reason_for, Reason, MIN_LIMIT,
+};
 use crate::pipe_metrics::{emulator, given_role_stating, withdraw_from_role};
 use crate::pipe_state_reason::listed_reasons;
 
@@ -467,28 +469,7 @@ async fn a_later_lifecycle_call_replaces_the_reason_the_failed_move_left() {
 
     // And a paged walk at the smallest limit: the member is on the entry of EVERY page, and
     // the pages together are the whole fixture in name order.
-    let mut walked: Vec<(String, Option<String>)> = Vec::new();
-    let mut query = "?Limit=1".to_string();
-    for page in 1..=PAGE_BUDGET {
-        let listed = list(&router, &query).await;
-        assert_eq!(
-            listed.status, 200,
-            "case \"page-{page}\": ListPipes answered {} {}",
-            listed.status, listed.body
-        );
-        let entries = listed_reasons(&listed);
-        assert_eq!(
-            entries.len(),
-            1,
-            "case \"page-{page}\": expected one entry on a Limit=1 page, got {listed:?}"
-        );
-        walked.extend(entries);
-        let token = listed.string("NextToken");
-        if token.is_empty() {
-            break;
-        }
-        query = format!("?Limit=1&NextToken={token}");
-    }
+    let walked = paged_walk(&router, "paged-walk", MIN_LIMIT).await;
     assert_eq!(
         names_of_entries(&walked),
         expected_names(&fixture, &every_case),
