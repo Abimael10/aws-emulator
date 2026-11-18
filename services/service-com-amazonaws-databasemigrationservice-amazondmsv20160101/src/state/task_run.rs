@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime};
 use ::smithy_server_runtime::EmbeddedEmulator;
 
 use super::{
-    ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State, EndpointRecord,
+    tstamp, ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State, EndpointRecord,
     ReplicationTaskRecord, DEFAULT_REGION, TASK_RUNNING, TASK_STOPPED, TRANSITION_DELAY,
 };
 use crate::ops::types::{ReplicationTaskStats, TableStatistics};
@@ -312,13 +312,13 @@ impl ReplicationTaskRecord {
                 .unwrap_or_default(),
             )
             .unwrap_or(i32::MAX),
-            fresh_start_date: run.fresh.then(|| run.started.into()),
-            start_date: Some(run.started.into()),
-            stop_date: run.stopped.map(Into::into),
-            full_load_start_date: load.map(|load| load.started.into()),
+            fresh_start_date: run.fresh.then(|| tstamp(run.started)),
+            start_date: Some(tstamp(run.started)),
+            stop_date: run.stopped.map(tstamp),
+            full_load_start_date: load.map(|load| tstamp(load.started)),
             full_load_finish_date: load
                 .filter(|load| load.finished)
-                .map(|load| load.finish_due.into()),
+                .map(|load| tstamp(load.finish_due)),
         })
     }
 
@@ -340,14 +340,14 @@ impl ReplicationTaskRecord {
                 table_name: Some(table.table_name.clone()),
                 full_load_rows: table.rows,
                 full_load_error_rows: table.errored_rows,
-                full_load_start_time: table.present_at_source.then(|| load.started.into()),
+                full_load_start_time: table.present_at_source.then(|| tstamp(load.started)),
                 full_load_end_time: (table.present_at_source && load.finished)
-                    .then(|| load.finish_due.into()),
+                    .then(|| tstamp(load.finish_due)),
                 full_load_reloaded: table.present_at_source.then_some(reloaded),
                 last_update_time: Some(if load.finished {
-                    load.finish_due.into()
+                    tstamp(load.finish_due)
                 } else {
-                    load.started.into()
+                    tstamp(load.started)
                 }),
                 table_state: Some(table_state(table, load).to_string()),
                 ..TableStatistics::default()

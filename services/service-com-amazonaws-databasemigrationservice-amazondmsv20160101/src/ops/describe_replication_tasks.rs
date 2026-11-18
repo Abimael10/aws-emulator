@@ -172,6 +172,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|record| matches_filters(record, &filters))
             .collect();
 
+        // A filtered describe that narrows to nothing is a replication task DMS could not
+        // find, not an empty answer: it raises the one error this operation models rather
+        // than reporting an empty list, which is how a client polling its teardown learns
+        // the task it deleted is gone. An UNFILTERED describe reports what the account
+        // holds, which may legitimately be nothing.
+        if !filters.is_empty() && matching.is_empty() {
+            return Err(
+                DescribeReplicationTasksErrorModeled::ResourceNotFoundFault(
+                    ResourceNotFoundFault {
+                        message: Some(NO_MATCH_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let (page, marker) = crate::state::paginate(
             &matching,
             input.marker.as_ref(),
@@ -191,6 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// What DMS says when the `Filters` a request carried match no replication task. Fixed
+/// text for this error class, named after the resource list this operation reports, with
+/// no variable part: the request's filter values are not quoted back.
+const NO_MATCH_MESSAGE: &str = "No ReplicationTasks found matching provided filters";
 
 /// The filter names the `Filters` member doc publishes: "Valid filter names:
 /// replication-task-arn | replication-task-id | migration-type | endpoint-arn |

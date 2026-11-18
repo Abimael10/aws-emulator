@@ -222,6 +222,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // `ReplicationTaskSettings` is optional, and a document that carries it may name
+        // only some of the settings: DMS resolves what the request left unsaid against its
+        // service defaults HERE, at create time, and the task reports the resolved document
+        // from then on.
+        let replication_task_settings =
+            crate::state::resolve_task_settings(input.replication_task_settings.as_deref())
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
@@ -318,7 +326,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             replication_instance_arn: input.replication_instance_arn,
             migration_type: input.migration_type,
             table_mappings: input.table_mappings,
-            replication_task_settings: input.replication_task_settings,
+            replication_task_settings: Some(replication_task_settings),
             task_data: input.task_data,
             status: crate::state::TASK_CREATING.to_string(),
             stop_reason: None,

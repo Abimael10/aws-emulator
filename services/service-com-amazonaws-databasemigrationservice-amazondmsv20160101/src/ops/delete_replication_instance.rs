@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteReplicationInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteReplicationInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteReplicationInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: takes the replication instance an ARN names out of the account — the
+//! instance moves to the transient `deleting` status whose removal the clock owes, and the
+//! identifier it held is free again once that removal is applied. An instance a migration
+//! task still names is refused, as is one that is not provisioned. The notes below are the
+//! scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
 //!
@@ -137,20 +133,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteReplicationInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteReplicationInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteReplicationInstance"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(invalid_state(
+                "the dms emulator is mounted on an engine that holds no state for it".to_string(),
+            ));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "You must delete any migration tasks that are associated with the replication
+        // instance before you can delete it": a task the account still holds names the
+        // instance it runs on by ARN, so an instance any task names stays. Read before the
+        // instance is taken mutably, oldest task first, so the refusal names the first task
+        // that holds it.
+        let referencing = store
+            .ordered_tasks()
+            .into_iter()
+            .find(|task| task.replication_instance_arn == input.replication_instance_arn)
+            .map(|task| task.arn.clone());
+
+        let Some(instance) = store
+            .replication_instances
+            .get_mut(&input.replication_instance_arn)
+        else {
+            return Err(
+                DeleteReplicationInstanceErrorModeled::ResourceNotFoundFault(
+                    ResourceNotFoundFault {
+                        message: Some(format!(
+                            "ReplicationInstanceArn {} does not name a replication instance \
+                             in this account",
+                            input.replication_instance_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        if let Some(task_arn) = referencing {
+            return Err(invalid_state(format!(
+                "replication instance {} is used by replication task {task_arn}, and any \
+                 migration tasks associated with the replication instance must be deleted \
+                 before you can delete it",
+                instance.arn
+            )));
+        }
+
+        // An instance that is still provisioning cannot be taken out of the account yet,
+        // and one already on its way out cannot be deleted a second time: what it is owed
+        // is its removal.
+        if instance.status != crate::state::INSTANCE_AVAILABLE {
+            return Err(invalid_state(format!(
+                "replication instance {} is {} and cannot be deleted in that status",
+                instance.arn, instance.status
+            )));
+        }
+
+        instance.status = crate::state::INSTANCE_DELETING.to_string();
+        // `deleting` is not terminal: the instance is owed removal, which is also what
+        // frees the `ReplicationInstanceIdentifier` it holds, so a caller that reads
+        // straight after the delete still sees the instance leaving.
+        instance.pending = Some(crate::state::Pending::after(
+            now,
+            crate::state::Owed::Removal,
+        ));
+
+        // "The replication instance that was deleted", through the one projection every
+        // operation that answers with an instance goes through: the record is read back
+        // out of the store, with the subnet group it was placed in resolved the way a
+        // describe resolves it.
+        let replication_instance = store
+            .replication_instances
+            .get(&input.replication_instance_arn)
+            .map(|record| record.to_shape(&store.replication_subnet_groups));
+
+        Ok(DeleteReplicationInstanceOutput {
+            replication_instance,
+        })
     }
+}
+
+/// The error this operation models for a resource that cannot be used for a database
+/// migration in the state it is in. The DMS model declares no server-side fault, so the
+/// unreachable "no store" branch uses it too rather than a 501, which would claim the
+/// operation is unimplemented.
+fn invalid_state(message: String) -> DeleteReplicationInstanceError {
+    DeleteReplicationInstanceErrorModeled::InvalidResourceStateFault(InvalidResourceStateFault {
+        message: Some(message),
+    })
+    .into()
 }

@@ -15,8 +15,9 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_databasemigrationservice_amazondmsv20160101::state::{
-    ENDPOINT_ACTIVE, ENDPOINT_DELETING, INSTANCE_AVAILABLE, MAX_RECORDS_MAX, MAX_RECORDS_MIN,
-    RESOURCE_IDENTIFIER_MAX_LEN, TRANSITION_DELAY,
+    ENDPOINT_ACTIVE, ENDPOINT_DELETING, INSTANCE_AVAILABLE, INSTANCE_DELETING, LOG_COMPONENTS,
+    LOG_SEVERITY_DEFAULT, MAX_RECORDS_MAX, MAX_RECORDS_MIN, RESOURCE_IDENTIFIER_MAX_LEN,
+    TRANSITION_DELAY,
 };
 use service_com_amazonaws_databasemigrationservice_amazondmsv20160101::EmulatedService;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
@@ -505,7 +506,6 @@ async fn migration_task_slice_is_read_back_from_state() {
         ("ReplicationInstanceArn", instance_arn.clone()),
         ("MigrationType", "full-load-and-cdc".to_string()),
         ("TableMappings", table_mappings()),
-        ("ReplicationTaskSettings", settings.clone()),
         ("Status", "ready".to_string()),
     ] {
         assert_eq!(
@@ -515,6 +515,20 @@ async fn migration_task_slice_is_read_back_from_state() {
              {described_tasks}"
         );
     }
+
+    // The settings the task runs with are the caller's resolved against the service
+    // defaults: the member it named is its own, and the defaults it never mentioned are
+    // there to read. The whole rule is `task_settings_are_resolved_against_the_defaults`.
+    let reported_settings = settings_document(&described_tasks, "/ReplicationTasks/0");
+    assert_eq!(
+        (
+            reported_settings.pointer("/TargetMetadata/SupportLobs").cloned(),
+            reported_settings.pointer("/TargetMetadata/LobMaxSize").cloned(),
+        ),
+        (Some(Value::from(true)), Some(Value::from(32))),
+        "case \"describe tasks\": expected the caller's setting over the defaults, got \
+         {reported_settings}"
+    );
 
     // `WithoutSettings` drops the settings and nothing else.
     let without_settings = emulator
@@ -1413,6 +1427,9 @@ async fn every_documented_filter_narrows_the_describe() {
         let no_match_message = match operation {
             "DescribeReplicationInstances" => Some("No instances found matching provided filters"),
             "DescribeEndpoints" => Some("No Endpoints found matching provided filters"),
+            "DescribeReplicationTasks" => {
+                Some("No ReplicationTasks found matching provided filters")
+            }
             _ => None,
         };
         if expected.is_empty() {
@@ -1695,26 +1712,24 @@ async fn poll_until_instance_available(emulator: &Emulator, case: &str, arn: &st
     }
 }
 
-/// Poll `DescribeReplicationTasks` until the task `arn` names has left the account.
-async fn poll_until_task_is_gone(emulator: &Emulator, case: &str, arn: &str) {
+/// Poll `DescribeReplicationTasks` until the task `arn` names has left the account, and
+/// report the refusal that says so.
+///
+/// A describe narrowed to a task the account no longer holds matches nothing, which this
+/// operation answers with the one error it models rather than an empty list.
+async fn poll_until_task_is_gone(emulator: &Emulator, case: &str, arn: &str) -> Value {
     let deadline = Instant::now() + POLL_BUDGET;
     loop {
-        let described = emulator
-            .ok(
-                case,
+        let (status, described) = emulator
+            .call(
                 "DescribeReplicationTasks",
                 &json!({
                     "Filters": [{ "Name": "replication-task-arn", "Values": [arn] }],
                 }),
             )
             .await;
-        let remaining = described
-            .pointer("/ReplicationTasks")
-            .and_then(Value::as_array)
-            .map(Vec::len)
-            .unwrap_or_default();
-        if remaining == 0 {
-            return;
+        if status == 400 {
+            return described;
         }
         assert!(
             Instant::now() < deadline,
@@ -2068,6 +2083,858 @@ async fn an_endpoint_a_replication_task_names_is_not_deleted_until_the_task_is_g
             error_code(&refused),
             "ResourceNotFoundFault",
             "case {case:?}: expected the {end} endpoint to leave the account, got {refused}"
+        );
+    }
+}
+
+// ---- ReplicationTaskSettings, and the defaults a task runs with --------------------
+//
+// RULE: `ReplicationTaskSettings` is optional and may name only some settings, so DMS
+// resolves what a create did not say against its service defaults at create time and
+// reports the RESOLVED document on every `ReplicationTask` it answers with afterwards —
+// which is what makes reading a task's settings back the way to discover the logging,
+// error behaviour and buffering it runs with, and what keeps a settings round trip from
+// wiping the defaults.
+//
+// The rows span what the rule generalises over: no settings at all, one member of one
+// section, several sections at once, a whole section replaced, a member no default
+// publishes, and a document that names no setting at all.
+
+/// The settings document the task at `pointer` reports, parsed.
+///
+/// `ReplicationTaskSettings` travels as a JSON `String`, so what a client does with it is
+/// parse it — a member that is absent, or text that is not a document, fails the case here
+/// the same way it fails that client.
+fn settings_document(response: &Value, pointer: &str) -> Value {
+    let settings = response.pointer(&format!("{pointer}/ReplicationTaskSettings"));
+    let settings = settings
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected a ReplicationTaskSettings member, got {response}"));
+    serde_json::from_str(settings)
+        .unwrap_or_else(|error| panic!("expected a readable settings document: {error}"))
+}
+
+/// One settings-resolution case: what the create supplies, and what the task must then
+/// report.
+struct SettingsCase {
+    /// What the case is, named in every assertion of it.
+    case: &'static str,
+    /// The `ReplicationTaskSettings` the create carries, if any.
+    supplied: Option<Value>,
+    /// Members the reported document must carry, as a JSON pointer and the value.
+    reported: &'static [(&'static str, &'static str)],
+}
+
+/// Every case, each with the members it pins in the document the task reports.
+///
+/// The expected values are written as JSON text so one table can carry booleans, numbers
+/// and strings; `reported` is read through `serde_json`.
+fn settings_cases() -> Vec<SettingsCase> {
+    vec![
+        SettingsCase {
+            case: "no settings at all",
+            supplied: None,
+            reported: &[
+                ("/Logging/EnableLogging", "false"),
+                ("/Logging/CloudWatchLogGroup", "null"),
+                ("/StreamBufferSettings/StreamBufferCount", "3"),
+                ("/ErrorBehavior/DataErrorPolicy", "\"LOG_ERROR\""),
+                ("/FullLoadSettings/TargetTablePrepMode", "\"DO_NOTHING\""),
+                ("/TargetMetadata/LobMaxSize", "32"),
+                ("/ChangeProcessingTuning/MemoryKeepTime", "60"),
+                ("/PostProcessingRules", "null"),
+            ],
+        },
+        SettingsCase {
+            case: "one member of one section",
+            supplied: Some(json!({ "TargetMetadata": { "LobMaxSize": 64 } })),
+            reported: &[
+                // The member the caller named is the caller's ...
+                ("/TargetMetadata/LobMaxSize", "64"),
+                // ... and every other member of that section keeps its default.
+                ("/TargetMetadata/SupportLobs", "true"),
+                ("/TargetMetadata/LobChunkSize", "64"),
+                ("/Logging/EnableLogging", "false"),
+            ],
+        },
+        SettingsCase {
+            case: "several sections at once",
+            supplied: Some(json!({
+                "Logging": { "EnableLogging": true },
+                "ErrorBehavior": { "FailOnNoTablesCaptured": false },
+            })),
+            reported: &[
+                ("/Logging/EnableLogging", "true"),
+                ("/Logging/EnableLogContext", "false"),
+                ("/ErrorBehavior/FailOnNoTablesCaptured", "false"),
+                ("/ErrorBehavior/DataErrorPolicy", "\"LOG_ERROR\""),
+                ("/StreamBufferSettings/StreamBufferSizeInMB", "8"),
+            ],
+        },
+        SettingsCase {
+            case: "a whole section replaced",
+            supplied: Some(json!({
+                "StreamBufferSettings": {
+                    "StreamBufferCount": 5,
+                    "StreamBufferSizeInMB": 16,
+                    "CtrlStreamBufferSizeInMB": 10,
+                },
+            })),
+            reported: &[
+                ("/StreamBufferSettings/StreamBufferCount", "5"),
+                ("/StreamBufferSettings/StreamBufferSizeInMB", "16"),
+                ("/StreamBufferSettings/CtrlStreamBufferSizeInMB", "10"),
+                ("/ControlTablesSettings/HistoryTimeslotInMinutes", "5"),
+            ],
+        },
+        SettingsCase {
+            case: "a member no default publishes",
+            supplied: Some(json!({ "BeforeImageSettings": { "ColumnFilter": "pk-only" } })),
+            reported: &[
+                ("/BeforeImageSettings/ColumnFilter", "\"pk-only\""),
+                ("/TargetMetadata/TargetSchema", "\"\""),
+            ],
+        },
+    ]
+}
+
+/// A created task reports the settings it RUNS with: the caller's document resolved
+/// against the service defaults, on every operation that answers with the task.
+#[tokio::test]
+async fn task_settings_are_resolved_against_the_service_defaults() {
+    let emulator = Emulator::new();
+    let instance_arn = emulator.available_instance("settings-rep").await;
+    let source_arn = emulator.endpoint("settings-src", "source", "mysql").await;
+    let target_arn = emulator.endpoint("settings-tgt", "target", "postgres").await;
+
+    for (index, case_row) in settings_cases().into_iter().enumerate() {
+        let case = case_row.case;
+        let identifier = format!("settings-task-{index}");
+        let mut body = json!({
+            "ReplicationTaskIdentifier": identifier,
+            "SourceEndpointArn": source_arn,
+            "TargetEndpointArn": target_arn,
+            "ReplicationInstanceArn": instance_arn,
+            "MigrationType": "full-load",
+            "TableMappings": table_mappings(),
+        });
+        if let Some(supplied) = &case_row.supplied {
+            body["ReplicationTaskSettings"] = Value::from(supplied.to_string());
+        }
+
+        // The create reports the resolved document, and so does a describe of the task it
+        // created: one record, one projection.
+        let created = emulator.ok(case, "CreateReplicationTask", &body).await;
+        let task_arn = text(&created, "/ReplicationTask/ReplicationTaskArn");
+        let described = emulator
+            .ok(
+                case,
+                "DescribeReplicationTasks",
+                &json!({
+                    "Filters": [{ "Name": "replication-task-arn", "Values": [task_arn] }],
+                }),
+            )
+            .await;
+
+        for (reader, reported) in [
+            ("CreateReplicationTask", settings_document(&created, "/ReplicationTask")),
+            (
+                "DescribeReplicationTasks",
+                settings_document(&described, "/ReplicationTasks/0"),
+            ),
+        ] {
+            for (pointer, expected) in case_row.reported {
+                let expected: Value =
+                    serde_json::from_str(expected).expect("the expected value is JSON");
+                assert_eq!(
+                    reported.pointer(pointer).cloned().unwrap_or(Value::Null),
+                    expected,
+                    "case {case:?} on {reader}: expected {pointer} to be {expected}, got \
+                     {reported}"
+                );
+            }
+            // Every log component DMS logs is in the document, so a caller can read the
+            // severity each one runs at.
+            let components: Vec<String> = reported
+                .pointer("/Logging/LogComponents")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| text(entry, "/Id"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                components,
+                LOG_COMPONENTS
+                    .iter()
+                    .map(|id| (*id).to_string())
+                    .collect::<Vec<String>>(),
+                "case {case:?} on {reader}: expected one entry per log component, got \
+                 {reported}"
+            );
+            for entry in reported
+                .pointer("/Logging/LogComponents")
+                .and_then(Value::as_array)
+                .unwrap_or(&Vec::new())
+            {
+                assert_eq!(
+                    text(entry, "/Severity"),
+                    LOG_SEVERITY_DEFAULT,
+                    "case {case:?} on {reader}: expected the default severity, got {entry}"
+                );
+            }
+        }
+
+        // The task carries its resolved settings through its whole life: a start and the
+        // delete that ends it answer with the same document.
+        wait_for_transition();
+        let started = emulator
+            .ok(
+                case,
+                "StartReplicationTask",
+                &json!({
+                    "ReplicationTaskArn": task_arn,
+                    "StartReplicationTaskType": "start-replication",
+                }),
+            )
+            .await;
+        assert_eq!(
+            settings_document(&started, "/ReplicationTask"),
+            settings_document(&created, "/ReplicationTask"),
+            "case {case:?}: a start must report the settings the task was created with, got \
+             {started}"
+        );
+
+        // `WithoutSettings` is the one way the member is left out.
+        let without = emulator
+            .ok(
+                case,
+                "DescribeReplicationTasks",
+                &json!({
+                    "Filters": [{ "Name": "replication-task-arn", "Values": [task_arn] }],
+                    "WithoutSettings": true,
+                }),
+            )
+            .await;
+        assert!(
+            without
+                .pointer("/ReplicationTasks/0/ReplicationTaskSettings")
+                .is_none(),
+            "case {case:?}: WithoutSettings must drop the document, got {without}"
+        );
+    }
+}
+
+/// Settings that are not a document of settings at all name nothing to resolve, so the
+/// create is refused rather than storing the text the caller sent.
+#[tokio::test]
+async fn settings_that_name_no_setting_are_refused() {
+    let emulator = Emulator::new();
+    let instance_arn = emulator.available_instance("bad-settings-rep").await;
+    let source_arn = emulator.endpoint("bad-settings-src", "source", "mysql").await;
+    let target_arn = emulator
+        .endpoint("bad-settings-tgt", "target", "postgres")
+        .await;
+
+    for (index, (case, supplied)) in [
+        ("text that is not a document", "not a settings document"),
+        ("a truncated document", "{\"Logging\":"),
+        ("a list of settings", "[{\"Logging\":{}}]"),
+        ("a bare number", "7"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, response) = emulator
+            .call(
+                "CreateReplicationTask",
+                &json!({
+                    "ReplicationTaskIdentifier": format!("bad-settings-{index}"),
+                    "SourceEndpointArn": source_arn,
+                    "TargetEndpointArn": target_arn,
+                    "ReplicationInstanceArn": instance_arn,
+                    "MigrationType": "full-load",
+                    "TableMappings": table_mappings(),
+                    "ReplicationTaskSettings": supplied,
+                }),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&response).contains("ValidationException")),
+            (400, true),
+            "case {case:?}: expected the create to be refused, got {status} {response}"
+        );
+    }
+}
+
+// ---- DeleteReplicationInstance, and what a deleted instance leaves behind -----------
+//
+// RULE: a delete takes the replication instance it names out of the account — the instance
+// moves to the transient `deleting` status whose removal the clock owes, and once that
+// removal is applied the account no longer holds it: a describe narrowed to the instance
+// raises the one error `DescribeReplicationInstances` models, a second delete is refused as
+// an ARN that names nothing, and the `ReplicationInstanceIdentifier` it carried is free
+// again. An instance a migration task still names is not deleted at all: "You must delete
+// any migration tasks that are associated with the replication instance before you can
+// delete it".
+
+/// A `Filters` request narrowing a describe to one replication instance ARN.
+fn by_instance_arn(arn: &str) -> Value {
+    json!({ "Filters": [{ "Name": "replication-instance-arn", "Values": [arn] }] })
+}
+
+/// Poll `DescribeReplicationInstances` narrowed by `request` until it is refused because
+/// nothing matches, and report the refusal body.
+async fn poll_until_no_instance_matches(emulator: &Emulator, case: &str, request: &Value) -> Value {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let (status, response) = emulator
+            .call("DescribeReplicationInstances", request)
+            .await;
+        if status == 400 {
+            return response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the deleted replication instance never left the account, {response}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Push every removal the store still owes a replication instance an hour out, so a case
+/// about the `deleting` state a delete creates reads that state.
+///
+/// This writes only the due instant the emulator itself stores; the removal is still
+/// applied by the store's own settling on the next request, exactly as in production.
+fn hold_instance_removals(engine: &engine::InMemoryEngine) {
+    let store = engine.state::<
+        service_com_amazonaws_databasemigrationservice_amazondmsv20160101::ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State,
+    >();
+    let mut store = store.lock();
+    let held = SystemTime::now() + HELD_FOR;
+    for instance in store.replication_instances.values_mut() {
+        if let Some(pending) = instance.pending.as_mut() {
+            pending.due = held;
+        }
+    }
+}
+
+/// A delete takes the replication instance it names out of the account and frees its
+/// identifier, while every other instance the account holds stays where it was.
+#[tokio::test]
+async fn a_deleted_replication_instance_leaves_the_account_and_releases_its_identifier() {
+    let emulator = Emulator::new();
+
+    // An instance no case deletes: a delete removes the instance it names, not the store.
+    let bystander_arn = emulator.available_instance("kept-instance").await;
+
+    // The rows span the instance classes a create accepts and both ways the ARN's resource
+    // id is arrived at — the rule is the same for every instance the account holds.
+    let cases: &[(&str, &str, Option<&str>)] = &[
+        ("a minted resource id", "dms.t3.medium", None),
+        ("a supplied resource id", "dms.c5.large", Some("REUSEDINSTANCEID")),
+        ("another instance class", "dms.r5.large", None),
+    ];
+
+    for (index, (case, instance_class, resource_identifier)) in cases.iter().enumerate() {
+        let identifier = format!("reused-instance-{index}");
+        let mut body = json!({
+            "ReplicationInstanceIdentifier": identifier,
+            "ReplicationInstanceClass": instance_class,
+        });
+        if let Some(resource_identifier) = resource_identifier {
+            body["ResourceIdentifier"] = Value::from(*resource_identifier);
+        }
+        let created = emulator
+            .ok(case, "CreateReplicationInstance", &body)
+            .await;
+        let first_arn = text(&created, "/ReplicationInstance/ReplicationInstanceArn");
+        poll_until_instance_available(&emulator, case, &first_arn).await;
+
+        // ---- the delete itself -------------------------------------------------------
+        let deleted = emulator
+            .ok(
+                case,
+                "DeleteReplicationInstance",
+                &json!({ "ReplicationInstanceArn": first_arn }),
+            )
+            .await;
+        assert_eq!(
+            (
+                text(&deleted, "/ReplicationInstance/ReplicationInstanceArn"),
+                text(&deleted, "/ReplicationInstance/ReplicationInstanceStatus"),
+            ),
+            (first_arn.clone(), INSTANCE_DELETING.to_string()),
+            "case {case:?}: expected the deleted instance to come back deleting, got {deleted}"
+        );
+
+        // ---- and the removal the clock owes ------------------------------------------
+        let refused = poll_until_no_instance_matches(
+            &emulator,
+            case,
+            &by_instance_arn(&first_arn),
+        )
+        .await;
+        assert_eq!(
+            (
+                error_code(&refused),
+                text(&refused, "/message").as_str()
+            ),
+            (
+                "ResourceNotFoundFault".to_string(),
+                "No instances found matching provided filters"
+            ),
+            "case {case:?}: expected the instance to leave the account, got {refused}"
+        );
+
+        // Deleting the same ARN twice finds nothing at all.
+        let (status, response) = emulator
+            .call(
+                "DeleteReplicationInstance",
+                &json!({ "ReplicationInstanceArn": first_arn }),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&response).contains("ResourceNotFoundFault")),
+            (400, true),
+            "case {case:?}: expected the second delete to find nothing, got {status} {response}"
+        );
+
+        // The identifier is free again, and the new instance is its own resource.
+        let recreated = emulator
+            .ok(case, "CreateReplicationInstance", &body)
+            .await;
+        let second_arn = text(&recreated, "/ReplicationInstance/ReplicationInstanceArn");
+        assert_eq!(
+            resource_identifier.is_some(),
+            first_arn == second_arn,
+            "case {case:?}: a minted resource id must differ and a supplied one must not, \
+             got {first_arn} then {second_arn}"
+        );
+        poll_until_instance_available(&emulator, case, &second_arn).await;
+    }
+
+    // Every case above left the bystander where it was.
+    let bystander = emulator
+        .ok(
+            "bystander",
+            "DescribeReplicationInstances",
+            &by_instance_arn(&bystander_arn),
+        )
+        .await;
+    assert_eq!(
+        column(&bystander, "/ReplicationInstances", "ReplicationInstanceStatus"),
+        vec![INSTANCE_AVAILABLE.to_string()],
+        "case \"bystander\": expected the instance no case deleted to stay available, got \
+         {bystander}"
+    );
+}
+
+/// The span between the delete and the removal it owes is observable: the instance reads
+/// `deleting`, a second delete is refused in that status, and the identifier is still
+/// taken — the delete is not a change the caller cannot see.
+#[tokio::test]
+async fn a_deleting_replication_instance_is_still_held_until_its_removal_falls_due() {
+    let case = "an instance inside its deleting span";
+    let emulator = Emulator::new();
+    let arn = emulator.available_instance("leaving-instance").await;
+
+    emulator
+        .ok(
+            case,
+            "DeleteReplicationInstance",
+            &json!({ "ReplicationInstanceArn": arn }),
+        )
+        .await;
+    // Hold the removal the store owes, so the case reads the state the delete created
+    // rather than whichever side of the span the host happened to land on.
+    hold_instance_removals(emulator.engine());
+
+    let described = emulator
+        .ok(
+            case,
+            "DescribeReplicationInstances",
+            &by_instance_arn(&arn),
+        )
+        .await;
+    assert_eq!(
+        column(
+            &described,
+            "/ReplicationInstances",
+            "ReplicationInstanceStatus"
+        ),
+        vec![INSTANCE_DELETING.to_string()],
+        "case {case:?}: expected the instance to read as leaving, got {described}"
+    );
+
+    let (status, refused) = emulator
+        .call(
+            "DeleteReplicationInstance",
+            &json!({ "ReplicationInstanceArn": arn }),
+        )
+        .await;
+    let message = text(&refused, "/message");
+    assert_eq!(
+        (
+            status,
+            error_code(&refused).contains("InvalidResourceStateFault"),
+            message.contains(&arn) && message.contains(INSTANCE_DELETING),
+        ),
+        (400, true, true),
+        "case {case:?}: expected a delete of an instance already leaving to be refused in the \
+         state it is in, naming the instance and that status, got {status} {refused}"
+    );
+
+    let (taken_status, taken) = emulator
+        .call(
+            "CreateReplicationInstance",
+            &json!({
+                "ReplicationInstanceIdentifier": "leaving-instance",
+                "ReplicationInstanceClass": "dms.t3.medium",
+            }),
+        )
+        .await;
+    assert_eq!(
+        (
+            taken_status,
+            error_code(&taken).contains("ResourceAlreadyExistsFault")
+        ),
+        (400, true),
+        "case {case:?}: expected the identifier of an instance that has not left yet to still \
+         be in use, got {taken_status} {taken}"
+    );
+}
+
+/// An instance that has not finished provisioning cannot be deleted yet: a delete is
+/// refused in the state the instance is in.
+#[tokio::test]
+async fn a_creating_replication_instance_cannot_be_deleted_yet() {
+    let case = "an instance still provisioning";
+    let emulator = Emulator::new();
+    let created = emulator
+        .ok(
+            case,
+            "CreateReplicationInstance",
+            &json!({
+                "ReplicationInstanceIdentifier": "provisioning-instance",
+                "ReplicationInstanceClass": "dms.t3.medium",
+            }),
+        )
+        .await;
+    let arn = text(&created, "/ReplicationInstance/ReplicationInstanceArn");
+
+    let (status, refused) = emulator
+        .call(
+            "DeleteReplicationInstance",
+            &json!({ "ReplicationInstanceArn": arn }),
+        )
+        .await;
+    let message = text(&refused, "/message");
+    assert_eq!(
+        (
+            status,
+            error_code(&refused).contains("InvalidResourceStateFault"),
+            message.contains(&arn),
+        ),
+        (400, true, true),
+        "case {case:?}: expected the delete to be refused while the instance is creating, got \
+         {status} {refused}"
+    );
+
+    // Once it has finished provisioning the same delete is accepted.
+    poll_until_instance_available(&emulator, case, &arn).await;
+    emulator
+        .ok(
+            case,
+            "DeleteReplicationInstance",
+            &json!({ "ReplicationInstanceArn": arn }),
+        )
+        .await;
+}
+
+/// An ARN that names no replication instance is refused as a resource that could not be
+/// found, whatever shape the ARN has.
+#[tokio::test]
+async fn deleting_an_instance_arn_that_names_nothing_is_refused_as_not_found() {
+    let emulator = Emulator::new();
+    let live = emulator.available_instance("live-instance").await;
+
+    for (case, arn) in [
+        (
+            "a resource id nobody created",
+            format!("arn:aws:dms:{REGION}:{ACCOUNT}:rep:NOSUCHINSTANCERESOURCEID"),
+        ),
+        (
+            "the same instance in another region",
+            live.replace(REGION, "eu-west-1"),
+        ),
+        ("an ARN of another resource type", live.replace(":rep:", ":task:")),
+        ("text that is not an ARN", "not-an-arn".to_string()),
+    ] {
+        let (status, refused) = emulator
+            .call(
+                "DeleteReplicationInstance",
+                &json!({ "ReplicationInstanceArn": arn }),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&refused).contains("ResourceNotFoundFault")),
+            (400, true),
+            "case {case:?}: expected 400 ResourceNotFoundFault for {arn:?}, got {status} \
+             {refused}"
+        );
+    }
+}
+
+/// "You must delete any migration tasks that are associated with the replication instance
+/// before you can delete it": an instance a task runs on stays, and goes once the task has
+/// left the account.
+#[tokio::test]
+async fn an_instance_a_replication_task_runs_on_is_not_deleted_until_the_task_is_gone() {
+    let case = "an instance carrying a task";
+    let emulator = Emulator::new();
+    let instance_arn = emulator.available_instance("carrying-rep").await;
+    let source_arn = emulator.endpoint("carrying-src", "source", "mysql").await;
+    let target_arn = emulator
+        .endpoint("carrying-tgt", "target", "postgres")
+        .await;
+    let task = emulator
+        .ok(
+            case,
+            "CreateReplicationTask",
+            &json!({
+                "ReplicationTaskIdentifier": "carried-task",
+                "SourceEndpointArn": source_arn,
+                "TargetEndpointArn": target_arn,
+                "ReplicationInstanceArn": instance_arn,
+                "MigrationType": "cdc",
+                "TableMappings": table_mappings(),
+            }),
+        )
+        .await;
+    let task_arn = text(&task, "/ReplicationTask/ReplicationTaskArn");
+
+    let (status, response) = emulator
+        .call(
+            "DeleteReplicationInstance",
+            &json!({ "ReplicationInstanceArn": instance_arn }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&response).contains("InvalidResourceStateFault")),
+        (400, true),
+        "case {case:?}: expected the delete to be refused while a task names the instance, \
+         got {status} {response}"
+    );
+    assert!(
+        text(&response, "/message").contains(&task_arn),
+        "case {case:?}: expected the refusal to name the task that holds the instance, got \
+         {response}"
+    );
+
+    // The refused delete left the instance as it was.
+    let still_there = emulator
+        .ok(
+            case,
+            "DescribeReplicationInstances",
+            &by_instance_arn(&instance_arn),
+        )
+        .await;
+    assert_eq!(
+        column(
+            &still_there,
+            "/ReplicationInstances",
+            "ReplicationInstanceStatus"
+        ),
+        vec![INSTANCE_AVAILABLE.to_string()],
+        "case {case:?}: expected the refused delete to leave the instance available, got \
+         {still_there}"
+    );
+
+    // Once the task has left the account, the instance it ran on can go.
+    wait_for_transition();
+    emulator
+        .ok(
+            case,
+            "DeleteReplicationTask",
+            &json!({ "ReplicationTaskArn": task_arn }),
+        )
+        .await;
+    let gone = poll_until_task_is_gone(&emulator, case, &task_arn).await;
+    assert_eq!(
+        (error_code(&gone), text(&gone, "/message").as_str()),
+        (
+            "ResourceNotFoundFault".to_string(),
+            "No ReplicationTasks found matching provided filters"
+        ),
+        "case {case:?}: expected the describe to be refused once the task is gone, got {gone}"
+    );
+
+    emulator
+        .ok(
+            case,
+            "DeleteReplicationInstance",
+            &json!({ "ReplicationInstanceArn": instance_arn }),
+        )
+        .await;
+    let refused =
+        poll_until_no_instance_matches(&emulator, case, &by_instance_arn(&instance_arn)).await;
+    assert_eq!(
+        error_code(&refused),
+        "ResourceNotFoundFault",
+        "case {case:?}: expected the instance to leave the account, got {refused}"
+    );
+}
+
+// ---- the precision every reported date carries --------------------------------------
+//
+// RULE: a date a DMS response carries travels as epoch seconds at MILLISECOND precision,
+// whatever resolution the clock behind it has — so a client that reads one back gets a
+// timestamp of the same shape on every operation and every member, instead of the host
+// clock's sub-millisecond digits.
+//
+// The rows span the resources and the members the rule generalises over: an instance's
+// create time, a task's creation and start dates, and the dates of the run a start puts
+// the task on.
+
+/// How far a reported timestamp may sit from a whole millisecond and still count as one.
+///
+/// Scaled to milliseconds a current epoch-seconds value is around 1.8e12, where the
+/// spacing of a 64-bit float is under a thousandth, so this tolerance absorbs the
+/// representation while a value carrying microseconds misses a whole millisecond by far
+/// more than it.
+const MILLISECOND_TOLERANCE: f64 = 0.01;
+
+/// Whether the epoch-seconds timestamp at `pointer` carries no more precision than the
+/// milliseconds a DMS date is reported at. Fails the case when there is no timestamp
+/// there at all: an absent date is not a date of the right shape.
+fn is_millisecond_precision(value: &Value, pointer: &str) -> (bool, f64) {
+    let seconds = value
+        .pointer(pointer)
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| panic!("expected an epoch-seconds timestamp at {pointer}, got {value}"));
+    let millis = seconds * 1000.0;
+    ((millis - millis.round()).abs() < MILLISECOND_TOLERANCE, seconds)
+}
+
+/// Every date this service reports is an epoch-seconds value at millisecond precision.
+#[tokio::test]
+async fn every_reported_date_carries_millisecond_precision() {
+    let case = "reported dates";
+    let emulator = Emulator::new();
+
+    let created_instance = emulator
+        .ok(
+            case,
+            "CreateReplicationInstance",
+            &json!({
+                "ReplicationInstanceIdentifier": "precision-rep",
+                "ReplicationInstanceClass": "dms.t3.medium",
+            }),
+        )
+        .await;
+    let instance_arn = text(&created_instance, "/ReplicationInstance/ReplicationInstanceArn");
+    poll_until_instance_available(&emulator, case, &instance_arn).await;
+    let described_instance = emulator
+        .ok(
+            case,
+            "DescribeReplicationInstances",
+            &by_instance_arn(&instance_arn),
+        )
+        .await;
+
+    let source_arn = emulator.endpoint("precision-src", "source", "mysql").await;
+    let target_arn = emulator
+        .endpoint("precision-tgt", "target", "postgres")
+        .await;
+    let created_task = emulator
+        .ok(
+            case,
+            "CreateReplicationTask",
+            &json!({
+                "ReplicationTaskIdentifier": "precision-task",
+                "SourceEndpointArn": source_arn,
+                "TargetEndpointArn": target_arn,
+                "ReplicationInstanceArn": instance_arn,
+                "MigrationType": "cdc",
+                "TableMappings": table_mappings(),
+            }),
+        )
+        .await;
+    let task_arn = text(&created_task, "/ReplicationTask/ReplicationTaskArn");
+    wait_for_transition();
+    let started_task = emulator
+        .ok(
+            case,
+            "StartReplicationTask",
+            &json!({
+                "ReplicationTaskArn": task_arn,
+                "StartReplicationTaskType": "start-replication",
+            }),
+        )
+        .await;
+    let described_task = emulator
+        .ok(
+            case,
+            "DescribeReplicationTasks",
+            &json!({
+                "Filters": [{ "Name": "replication-task-arn", "Values": [task_arn] }],
+            }),
+        )
+        .await;
+
+    let rows: &[(&str, &Value, &str)] = &[
+        (
+            "CreateReplicationInstance",
+            &created_instance,
+            "/ReplicationInstance/InstanceCreateTime",
+        ),
+        (
+            "DescribeReplicationInstances",
+            &described_instance,
+            "/ReplicationInstances/0/InstanceCreateTime",
+        ),
+        (
+            "CreateReplicationTask",
+            &created_task,
+            "/ReplicationTask/ReplicationTaskCreationDate",
+        ),
+        (
+            "StartReplicationTask",
+            &started_task,
+            "/ReplicationTask/ReplicationTaskStartDate",
+        ),
+        (
+            "DescribeReplicationTasks",
+            &described_task,
+            "/ReplicationTasks/0/ReplicationTaskCreationDate",
+        ),
+        (
+            "DescribeReplicationTasks",
+            &described_task,
+            "/ReplicationTasks/0/ReplicationTaskStartDate",
+        ),
+        (
+            "DescribeReplicationTasks",
+            &described_task,
+            "/ReplicationTasks/0/ReplicationTaskStats/StartDate",
+        ),
+        (
+            "DescribeReplicationTasks",
+            &described_task,
+            "/ReplicationTasks/0/ReplicationTaskStats/FreshStartDate",
+        ),
+    ];
+
+    for (operation, response, pointer) in rows {
+        let (whole_millis, seconds) = is_millisecond_precision(response, pointer);
+        assert!(
+            whole_millis,
+            "case {operation} {pointer}: expected a timestamp at millisecond precision, got \
+             {seconds}"
         );
     }
 }

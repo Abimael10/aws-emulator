@@ -17,7 +17,14 @@
 /// task with no phase after it arrives at.
 pub mod task_run;
 
+/// The task-settings document a replication task runs with: the service defaults, and a
+/// caller's own settings resolved against them.
+pub mod task_settings;
+
 pub use task_run::{advance_task_runs, TaskRun};
+pub use task_settings::{
+    default_task_settings, resolve_task_settings, LOG_COMPONENTS, LOG_SEVERITY_DEFAULT,
+};
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -39,6 +46,12 @@ use crate::ops::types::{
 pub const INSTANCE_CREATING: &str = "creating";
 /// A replication instance that finished provisioning.
 pub const INSTANCE_AVAILABLE: &str = "available";
+/// The status a replication instance `DeleteReplicationInstance` has accepted carries
+/// while it is on its way out of the account: the record is owed removal
+/// ([`Owed::Removal`]), so a caller that reads straight after the delete still sees the
+/// instance leaving. One of the values the `ReplicationInstance$ReplicationInstanceStatus`
+/// doc publishes.
+pub const INSTANCE_DELETING: &str = "deleting";
 
 /// The status an endpoint carries once it is usable. DMS creates an endpoint ready —
 /// it provisions nothing — so this is the status every create reports.
@@ -552,7 +565,7 @@ impl ReplicationInstanceRecord {
             replication_instance_class: Some(self.instance_class.clone()),
             replication_instance_status: Some(self.status.clone()),
             allocated_storage: self.allocated_storage,
-            instance_create_time: Some(::aws_smithy_types::DateTime::from(self.create_time)),
+            instance_create_time: Some(tstamp(self.create_time)),
             vpc_security_groups: Some(
                 self.vpc_security_group_ids
                     .iter()
@@ -912,7 +925,10 @@ pub struct ReplicationTaskRecord {
     pub migration_type: String,
     /// The table mappings the caller supplied.
     pub table_mappings: String,
-    /// The task settings the caller supplied, if any.
+    /// The settings the task runs with: the caller's `ReplicationTaskSettings` resolved
+    /// against the service defaults when the task was created
+    /// ([`resolve_task_settings`]), which is the document every operation that answers
+    /// with this task reports.
     pub replication_task_settings: Option<String>,
     /// Supplemental task data the caller supplied, if any.
     pub task_data: Option<String>,
@@ -963,12 +979,8 @@ impl ReplicationTaskRecord {
             status: Some(self.status.clone()),
             last_failure_message: self.last_failure_message.clone(),
             stop_reason: self.stop_reason.clone(),
-            replication_task_creation_date: Some(::aws_smithy_types::DateTime::from(
-                self.creation_date,
-            )),
-            replication_task_start_date: self
-                .start_date
-                .map(::aws_smithy_types::DateTime::from),
+            replication_task_creation_date: Some(tstamp(self.creation_date)),
+            replication_task_start_date: self.start_date.map(tstamp),
             cdc_start_position: self.cdc_start_position.clone(),
             cdc_stop_position: self.cdc_stop_position.clone(),
             // A recovery checkpoint is produced by a CDC operation that has read
@@ -1020,6 +1032,32 @@ impl ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State {
     /// was owed at `now` whether or not anybody called, so applying it here is what
     /// makes a read and a later read agree.
     pub fn settle(&mut self, now: SystemTime) {
+        // A replication instance whose `deleting` span has elapsed leaves the store, and
+        // the `ReplicationInstanceIdentifier` it held becomes free for a new instance: an
+        // identifier is unique only among the instances the account HOLDS.
+        let removed: Vec<(String, String)> = self
+            .replication_instances
+            .values()
+            .filter(|instance| {
+                instance
+                    .pending
+                    .is_some_and(|pending| now >= pending.due && pending.owed == Owed::Removal)
+            })
+            .map(|instance| (instance.arn.clone(), instance.identifier.clone()))
+            .collect();
+        for (arn, identifier) in removed {
+            self.replication_instances.remove(&arn);
+            // Only while the identifier still points at the instance that is leaving: a
+            // create that has already taken the identifier owns the entry.
+            if self
+                .instance_arn_by_identifier
+                .get(&identifier)
+                .is_some_and(|held| *held == arn)
+            {
+                self.instance_arn_by_identifier.remove(&identifier);
+            }
+        }
+
         for instance in self.replication_instances.values_mut() {
             if let Some(pending) = instance.pending {
                 if now >= pending.due {
@@ -1175,6 +1213,20 @@ impl ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State {
         }
         id
     }
+}
+
+/// A stored instant as the modelled `TStamp`, at the precision this service reports a
+/// timestamp at.
+///
+/// Every date a DMS response carries travels as epoch seconds with MILLISECOND precision —
+/// the resolution an AWS timestamp has on this wire — so an instant read off the host clock
+/// is truncated to it HERE, in the one place the records are projected through, rather than
+/// reported with the clock's own sub-millisecond digits.
+pub fn tstamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    let since_epoch = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    ::aws_smithy_types::DateTime::from_millis(
+        i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX),
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
