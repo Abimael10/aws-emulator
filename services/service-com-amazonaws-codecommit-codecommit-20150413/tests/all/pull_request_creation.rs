@@ -17,6 +17,17 @@
 //! the default branch, the description's presence and emptiness, how far the two
 //! branches have diverged, how many targets and repositories a request names, and
 //! each reference that names no branch — rather than one recorded request.
+//!
+//! Part of that rule is WHICH condition `SourceAndDestinationAreSameException` is
+//! raised for: the two references resolving to ONE branch, whichever spellings they
+//! use. What the two branches' tips hold is no part of it, so two differently named
+//! branches open a pull request even where both point at the same commit — the
+//! "branch off the default branch, open the pull request, then push" order a review
+//! workflow starts with. The sibling `merge_strategy_and_resolution_rules` suite
+//! states that same boundary from the merge side and owns the refusal's wording;
+//! what the tables here add is the whole stored record at one tip — each reference,
+//! each tip, the base the two share — the read that answers it back, and the created
+//! id among the repository's OPEN pull requests.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -1057,6 +1068,232 @@ async fn a_malformed_member_is_refused_with_the_error_codecommit_names_for_it() 
         assert_eq!(
             code, expected,
             "case {label:?}: expected {expected}, got {code}"
+        );
+    }
+}
+
+/// One row of the "two references, one commit" table: the references a request
+/// names, and the branches they resolve to.
+struct OneTip<'a> {
+    label: &'a str,
+    /// Branches to create at the shared tip beside the `main` and `feature` the
+    /// fixture already holds there, so a row can name a pair in which neither side
+    /// is the repository's default branch.
+    extra_branches: &'a [&'a str],
+    /// The `sourceReference` the request names, and the `destinationReference`
+    /// (`None` leaves the member out, so the destination is the default branch).
+    source: &'a str,
+    destination: Option<&'a str>,
+    /// The fully qualified references the stored record must report.
+    expected_source_reference: &'a str,
+    expected_destination_reference: &'a str,
+}
+
+#[tokio::test]
+async fn two_differently_named_branches_at_one_commit_open_a_pull_request() {
+    // `SourceAndDestinationAreSameException` is modelled for ONE condition — "The
+    // source branch and destination branch for the pull request are the same. You
+    // must specify different branches for the source and destination"
+    // (`smithy_query(query="shape",shape="SourceAndDestinationAreSameException")`) —
+    // so what the refusal turns on is the BRANCH each reference resolves to, never
+    // the commits those branches point at. Every branch in each fixture below sits
+    // at the one commit; the rows differ along which pair of distinct branches the
+    // request names (the default branch as the destination, as the source, or
+    // neither side), the form each reference takes, and whether the destination is
+    // named at all.
+    let rows = vec![
+        OneTip {
+            label: "short names, the default branch as the destination",
+            extra_branches: &[],
+            source: "feature",
+            destination: Some("main"),
+            expected_source_reference: "refs/heads/feature",
+            expected_destination_reference: "refs/heads/main",
+        },
+        OneTip {
+            label: "fully qualified on both sides",
+            extra_branches: &[],
+            source: "refs/heads/feature",
+            destination: Some("refs/heads/main"),
+            expected_source_reference: "refs/heads/feature",
+            expected_destination_reference: "refs/heads/main",
+        },
+        OneTip {
+            label: "the destination left to the default branch",
+            extra_branches: &[],
+            source: "feature",
+            destination: None,
+            expected_source_reference: "refs/heads/feature",
+            expected_destination_reference: "refs/heads/main",
+        },
+        OneTip {
+            label: "the default branch as the source",
+            extra_branches: &[],
+            source: "main",
+            destination: Some("feature"),
+            expected_source_reference: "refs/heads/main",
+            expected_destination_reference: "refs/heads/feature",
+        },
+        OneTip {
+            label: "neither side is the default branch",
+            extra_branches: &["release", "hotfix"],
+            source: "hotfix",
+            destination: Some("release"),
+            expected_source_reference: "refs/heads/hotfix",
+            expected_destination_reference: "refs/heads/release",
+        },
+        OneTip {
+            label: "one side qualified, the other named",
+            extra_branches: &["release"],
+            source: "refs/heads/release",
+            destination: Some("feature"),
+            expected_source_reference: "refs/heads/release",
+            expected_destination_reference: "refs/heads/feature",
+        },
+    ];
+
+    for row in rows {
+        let label = row.label;
+        // `main` took the first commit and `feature` was branched from it, with
+        // neither side moved since: both references hold that one commit.
+        let built = diverged(REPOSITORY, 0, 0).await;
+        let router = &built.router;
+        let tip = built.base_commit.clone();
+        assert_eq!(
+            built.main_commit, tip,
+            "case {label:?}: the fixture's default branch must hold the base commit, got {}",
+            built.main_commit
+        );
+        assert_eq!(
+            built.feature_commit, tip,
+            "case {label:?}: the fixture's second branch must hold the base commit, got {}",
+            built.feature_commit
+        );
+        for branch in row.extra_branches {
+            ok(
+                router,
+                "CreateBranch",
+                &json!({
+                    "repositoryName": REPOSITORY,
+                    "branchName": branch,
+                    "commitId": tip,
+                }),
+            )
+            .await;
+        }
+
+        let created = ok(
+            router,
+            "CreatePullRequest",
+            &create_body(
+                REPOSITORY,
+                "Open the pull request before any commit",
+                None,
+                row.source,
+                row.destination,
+            ),
+        )
+        .await;
+        let pull_request = pull_request_of(&created, label);
+        let id = string_at(&created, "/pullRequest/pullRequestId");
+        assert_eq!(
+            pull_request.get("pullRequestStatus").and_then(Value::as_str),
+            Some(STATUS_OPEN),
+            "case {label:?}: two different branches must open a pull request, got {pull_request}"
+        );
+
+        // The stored target names the two branches the request named, and every
+        // commit on it is that one commit: each tip, and the base the two histories
+        // share, which for one commit is itself.
+        let target = target_of(&pull_request, label);
+        assert_eq!(
+            target.get("sourceReference").and_then(Value::as_str),
+            Some(row.expected_source_reference),
+            "case {label:?}: expected a qualified sourceReference, got {target}"
+        );
+        assert_eq!(
+            target.get("destinationReference").and_then(Value::as_str),
+            Some(row.expected_destination_reference),
+            "case {label:?}: expected a qualified destinationReference, got {target}"
+        );
+        for member in ["sourceCommit", "destinationCommit", "mergeBase"] {
+            assert_eq!(
+                target.get(member).and_then(Value::as_str),
+                Some(tip.as_str()),
+                "case {label:?}: {member} must be the one commit both branches hold, got {target}"
+            );
+        }
+
+        // The round trip, and the created id as an OPEN pull request of the
+        // repository: the pull request a review workflow goes on to address.
+        let read = ok(router, "GetPullRequest", &json!({ "pullRequestId": id })).await;
+        assert_eq!(
+            pull_request_of(&read, label),
+            pull_request,
+            "case {label:?}: the reader must answer the pull request the create persisted"
+        );
+        let listed = ok(
+            router,
+            "ListPullRequests",
+            &json!({ "repositoryName": REPOSITORY, "pullRequestStatus": STATUS_OPEN }),
+        )
+        .await;
+        let listed_ids: Vec<&str> = listed
+            .pointer("/pullRequestIds")
+            .and_then(Value::as_array)
+            .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            listed_ids,
+            vec![id.as_str()],
+            "case {label:?}: the created pull request must be the repository's one open pull \
+             request, got {listed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_branch_named_twice_at_one_commit_is_still_refused_and_persists_nothing() {
+    // The other side of the same rule: the refusal is on the two references
+    // resolving to ONE branch, so it stands at a shared tip exactly as it does
+    // anywhere else. Rows differ along how the two references name one branch.
+    let spellings = [
+        ("the same name twice", "feature", "feature"),
+        ("the same branch spelled two ways", "refs/heads/main", "main"),
+        (
+            "the same branch qualified on both sides",
+            "refs/heads/feature",
+            "refs/heads/feature",
+        ),
+    ];
+
+    for (label, source, destination) in spellings {
+        let built = diverged(REPOSITORY, 0, 0).await;
+        let router = &built.router;
+        let code = error(
+            router,
+            "CreatePullRequest",
+            &create_body(REPOSITORY, "t", None, source, Some(destination)),
+            400,
+        )
+        .await;
+        assert_eq!(
+            code, "SourceAndDestinationAreSameException",
+            "case {label:?}: expected SourceAndDestinationAreSameException, got {code}"
+        );
+        let listed = ok(
+            router,
+            "ListPullRequests",
+            &json!({ "repositoryName": REPOSITORY }),
+        )
+        .await;
+        assert_eq!(
+            listed
+                .pointer("/pullRequestIds")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "case {label:?}: a refused request must persist no pull request, got {listed}"
         );
     }
 }
