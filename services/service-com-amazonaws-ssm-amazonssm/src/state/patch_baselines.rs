@@ -3,7 +3,8 @@
 //! The patch baselines this service holds, and which one is the DEFAULT for an operating
 //! system.
 //!
-//! `CreatePatchBaseline` mints a baseline the account owns and
+//! `CreatePatchBaseline` mints a baseline the account owns, `DeletePatchBaseline` removes
+//! one ([`super::ComAmazonawsSsmAmazonssmState::remove_patch_baseline`]) and
 //! `RegisterDefaultPatchBaseline` records one as the default for the operating system
 //! that baseline applies to; `GetDefaultPatchBaseline` reports what is recorded. All of
 //! them reach the one store below
@@ -806,6 +807,38 @@ impl ComAmazonawsSsmAmazonssmState {
     pub fn insert_patch_baseline(&mut self, record: PatchBaselineRecord) {
         let key = (record.region.clone(), record.baseline_id.clone());
         self.patch_baselines.insert(key, record);
+    }
+
+    /// Remove the patch baseline `baseline_id` names in `region`, returning the record
+    /// that was held there, or `None` when that Region held none under that id.
+    ///
+    /// What `DeletePatchBaseline` persists: the record is gone, so every later read that
+    /// resolves a baseline id — a report of the baseline itself, of the patches it makes
+    /// effective, a write of it, a register of it as a default, a listing — finds nothing
+    /// under that id and reports it absent, rather than one reader still serving a
+    /// baseline another reader no longer holds.
+    ///
+    /// A recorded default that NAMED the removed baseline goes with it, in either spelling
+    /// a register may have recorded it under: nothing holds that baseline any more, so the
+    /// default of its operating system is the one Systems Manager predefines again
+    /// ([`Self::default_patch_baseline`]). Only the Region the delete reached is touched —
+    /// a baseline is reached through the endpoint of one Region — so a baseline of another
+    /// Region, and that Region's defaults, are left exactly as they were.
+    pub fn remove_patch_baseline(
+        &mut self,
+        region: &str,
+        baseline_id: &str,
+    ) -> Option<PatchBaselineRecord> {
+        let removed = self
+            .patch_baselines
+            .remove(&(region.to_string(), baseline_id.to_string()))?;
+        let arn = removed.arn();
+        self.default_patch_baselines
+            .retain(|(held_region, _), reference| {
+                held_region != region
+                    || (reference.as_str() != baseline_id && reference.as_str() != arn)
+            });
+        Some(removed)
     }
 
     /// Whether this store can take another patch baseline ([`MAX_PATCH_BASELINES`]).

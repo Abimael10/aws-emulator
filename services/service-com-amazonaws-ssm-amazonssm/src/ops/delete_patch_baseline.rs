@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePatchBaseline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePatchBaseline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Remove one patch baseline — the half of this service's patch baseline slice that makes a
+//! deletion observable. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePatchBaseline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The baseline the request names is removed from the one store in
+//! [`crate::state::patch_baselines`]
+//! ([`crate::state::ComAmazonawsSsmAmazonssmState::remove_patch_baseline`]), so every later
+//! read that resolves a baseline id — `GetPatchBaseline`, `UpdatePatchBaseline`,
+//! `DescribeEffectivePatchesForPatchBaseline`, `RegisterDefaultPatchBaseline`,
+//! `DescribePatchBaselines` — finds nothing under that id and reports the baseline absent.
+//! The `BaselineId` the request carries resolves the way every "id or ARN" member of this
+//! service does: a baseline the account created in this endpoint's Region, named by its own
+//! id or by its full ARN, or one Systems Manager predefined
+//! ([`crate::state::patch_baselines::PREDEFINED_BASELINES`]).
+//!
+//! This operation's modelled error set carries NO refusal for an id that reaches no record
+//! of the account's — unlike `GetPatchBaseline` and `UpdatePatchBaseline`, which model
+//! `DoesNotExistException`, and unlike the baseline reads, which model `InvalidResourceId`.
+//! So a delete reports "the ID of the deleted patch baseline" for the id it was given
+//! whether or not this endpoint still held a record under it — the way this service's other
+//! delete of a record addressed by a server-minted id does
+//! ([`crate::ops::delete_maintenance_window`]) — which also makes a repeated delete of one
+//! baseline report the same thing the first one did. A baseline Systems Manager predefines
+//! is Patch Manager's own rather than the account's, so this endpoint holds no record of one
+//! to remove and a later read still reports it: it never stopped existing.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +154,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePatchBaseline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePatchBaselineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePatchBaseline"))
+        // `BaselineId` is required and its length and pattern are modelled constraints the
+        // centralized walk has already refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeletePatchBaselineErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the patch baseline store is unavailable".to_string()),
+            })
+        })?;
+
+        // A baseline lives in the Region its endpoint names, which is the signed credential
+        // scope's — so the baseline is removed from that Region's records and from no
+        // other's.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // "Error returned if an attempt is made to delete a patch baseline that is
+        // registered for a patch group" (`ResourceInUseException`): a patch group is
+        // registered with a baseline by `RegisterPatchBaselineForPatchGroup`, and this
+        // service holds no such registration, so no baseline it holds is in use by one and
+        // nothing is refused for that reason.
+        let resolved = store.resolve_patch_baseline(&region, &input.baseline_id);
+        let deleted = match resolved {
+            // A baseline this endpoint resolves: the record the account created under that
+            // id is removed, together with any default registration that named it, so a
+            // later read of the id reports no baseline and the default of its operating
+            // system is the predefined one again. A baseline Systems Manager predefines
+            // resolves here too and no record of it is held, so nothing is removed for one.
+            Some(resolved) => {
+                store.remove_patch_baseline(&region, &resolved.baseline_id);
+                // How this service NAMES the baseline: its own id for one the account
+                // created, and the full ARN for one Systems Manager predefined.
+                resolved.reference
+            }
+            // A value that reaches no baseline at this endpoint — one already deleted, an
+            // ARN of another service, account or Region. Nothing is held under it, so
+            // nothing is removed and the id the request named is what is reported back.
+            None => input.baseline_id,
+        };
+
+        // "The ID of the deleted patch baseline."
+        Ok(DeletePatchBaselineOutput {
+            baseline_id: Some(deleted),
+        })
     }
 }
