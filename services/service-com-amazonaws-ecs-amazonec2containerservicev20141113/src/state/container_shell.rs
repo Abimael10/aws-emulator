@@ -1907,7 +1907,7 @@ impl ContainerShell {
             },
         };
         let written = match filter.perform(&label, &input) {
-            Ok(written) => written,
+            Ok(performed) => performed,
             // An input the utility cannot compute over: what it writes about it goes to
             // standard error, and nothing is written to standard output.
             Err(refusal) => {
@@ -1915,11 +1915,16 @@ impl ContainerShell {
                 return EXIT_FAILURE;
             }
         };
-        if self.write_stdout(&written, redirections).await {
-            EXIT_SUCCESS
-        } else {
-            EXIT_FAILURE
+        if !self.write_stdout(&written.written, redirections).await {
+            return EXIT_FAILURE;
         }
+        // The status of a utility that reports a SELECTION is that selection
+        // (`posix_shell_text_filters::Selection`): a `grep` of this container's filesystem
+        // that selected nothing answers the status an `if` around it branches on.
+        if written.selected == Some(false) {
+            return EXIT_FAILURE;
+        }
+        EXIT_SUCCESS
     }
 
     /// `word` with its expansions resolved, or `None` when it carries an expansion this

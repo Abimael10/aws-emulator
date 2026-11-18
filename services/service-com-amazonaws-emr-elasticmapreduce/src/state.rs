@@ -203,6 +203,12 @@ pub use bootstrap_actions::*;
 mod bootstrap_run;
 pub use bootstrap_run::*;
 
+/// What ONE NODE of a cluster is, as a bootstrap action running on it sees it — its own
+/// instance metadata service and the file Amazon EMR publishes its role in — split out and
+/// re-exported the same way.
+mod bootstrap_nodes;
+pub use bootstrap_nodes::*;
+
 /// WHERE a caller-supplied shell program of this crate is performed — the thread, the claim
 /// and the permit one gets, shared by the step-command and bootstrap paths — split out and
 /// re-exported the same way.
@@ -3052,10 +3058,18 @@ impl ClusterRecord {
     /// `KeepJobFlowAliveWhenNoSteps` parameter is set to TRUE, the cluster transitions to
     /// the `WAITING` state rather than shutting down after the steps have completed"
     /// (`RunJobFlow` doc), so a cluster that is ready is one of `RUNNING`/`WAITING` and the
-    /// instant it became ready is when its queue started moving. A cluster still coming up
-    /// has that instant in the FUTURE — its queued steps stay `PENDING` until then, which
-    /// is why the due instant is answered rather than nothing — and one that is shutting
-    /// down or gone runs nothing more.
+    /// instant it became ready is when its queue started moving. One that is shutting down or
+    /// gone runs nothing more.
+    ///
+    /// A cluster still COMING UP has not become ready, so its queue has not started: the
+    /// instant is answered only while every other gate on readiness is already met — the
+    /// bootstrap actions its launch carried have all run and succeeded
+    /// ([`Self::bootstrap_actions_have_run`]) — and is then still in the future, so its queued
+    /// steps stay `PENDING` until it passes. A cluster held short of ready by an action that
+    /// has not answered hands the queue NOTHING: the phase's own instant has passed by then,
+    /// and starting a step from it would be running a step on a cluster that never reported
+    /// itself ready — which is also what makes the shutdown of such a cluster CANCEL its steps
+    /// (they never ran) rather than interrupt them ([`StepRecord::stop_with_cluster`]).
     fn steps_runnable_from(&self) -> Option<SystemTime> {
         match self.status.state.as_str() {
             cluster_state::RUNNING | cluster_state::WAITING => self
@@ -3063,7 +3077,10 @@ impl ClusterRecord {
                 .ready_date_time
                 .or(self.status.ready_due_at)
                 .or(Some(self.status.creation_date_time)),
-            cluster_state::STARTING | cluster_state::BOOTSTRAPPING => self.status.ready_due_at,
+            cluster_state::STARTING | cluster_state::BOOTSTRAPPING => self
+                .status
+                .ready_due_at
+                .filter(|_| self.bootstrap_actions_have_run()),
             _ => None,
         }
     }

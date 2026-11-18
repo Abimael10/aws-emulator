@@ -236,6 +236,11 @@ bytes = { workspace = true }
 # from the maintained parser this workspace already reads cron expressions with rather than a
 # grammar written here.
 cron = "0.15"
+# `posix_shell_text_filters`: the regular expressions the `grep` utility of a shell session
+# MATCHES with, from the maintained engine this workspace already matches caller-supplied
+# patterns with (its linear-time matcher, so a pattern a caller wrote cannot cost the host
+# more than the input it is run over) rather than a matcher written here.
+regex = "1.13"
 
 [dev-dependencies]
 # `acm_certificate_termination`'s own cases load REAL certificate material, minted by the

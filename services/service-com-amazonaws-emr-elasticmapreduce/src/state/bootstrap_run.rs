@@ -16,30 +16,45 @@
 //! `RUNNING`/`WAITING` and a step of it can run. A cluster whose launch carried none is owed
 //! nothing here and comes up as it always did.
 //!
+//! The actions run on the cluster NODES, so each one is performed ONCE ON EVERY NODE the launch
+//! provisioned (primary, core and task alike), as a program of that node: what it reads of the
+//! node it runs on, and what the run leaves behind, are that node's ([`super::bootstrap_nodes`]).
+//! A script that writes one object per node therefore leaves as many objects as the cluster has
+//! nodes, and the cluster is ready only once every node has answered for every action.
+//!
 //! The outcome is the script's own: a script that exited zero is a bootstrap action that
 //! succeeded, and one that exited anything else takes the CLUSTER down — it reaches
 //! `TERMINATED_WITH_ERRORS` through `TERMINATING`, carrying the modelled
 //! `BOOTSTRAP_FAILURE` reason ([`ClusterRecord::begin_bootstrap_failure`]) — rather than
 //! leaving the cluster to come up as though the action had run. No later action of that
-//! cluster runs: the nodes the actions were running on are going away.
+//! cluster runs: the nodes the actions were running on are going away. The two outcomes that
+//! fail a cluster are exactly the two Amazon EMR words a reason for
+//! ([`BootstrapActionRun::failed`]): a script that really exited non-zero, and one whose object
+//! the node could not fetch.
 //!
 //! # What a script reaches
 //!
 //! The SAME bounded session a `command-runner.jar` step's command line reaches
 //! ([`::service_common::posix_shell_session`], whose catalog of session-local utilities and
-//! whose bounds are stated there), with the AWS CLI's Amazon S3 transfers as the one program
-//! its environment provides ([`super::step_command_transfers`]) — really made against this
-//! emulator's own object store, signed as the role the cluster's Amazon EC2 instances obtain
-//! from their instance profile ([`super::instance_profile_credentials`]), which is the
-//! credential a bootstrap action runs with. A script is performed as a SCRIPT rather than as
-//! one command line, so the session is given its own working tree
-//! ([`ShellSession::with_file_utilities`]) and with it the grammar's control flow and the file
-//! utilities a script is written in. That tree is session-local memory, keyed by the path the
-//! script named and bounded by that session: no host file, directory or path is opened,
-//! created or read. NO host command, process or shell is started here or anywhere this calls,
-//! and a command the session provides no program for answers the status a shell gives a
-//! command it could not find — which is a non-zero status, so such a script fails its cluster
-//! rather than being reported as a script that ran.
+//! whose bounds are stated there), with two programs its environment provides: the NODE's own
+//! instance metadata client ([`super::bootstrap_nodes`]) and the AWS CLI's Amazon S3 transfers
+//! ([`super::step_command_transfers`]) — really made against this emulator's own object store,
+//! signed as the role the cluster's Amazon EC2 instances obtain from their instance profile
+//! ([`super::instance_profile_credentials`]), which is the credential a bootstrap action runs
+//! with. A script is performed as a SCRIPT rather than as one command line, so the session is
+//! given its own working tree ([`ShellSession::with_file_utilities`]) and with it the grammar's
+//! control flow and the file utilities a script is written in, and the file Amazon EMR
+//! publishes the node's role in ([`INSTANCE_INFO_PATH`]) is seeded into that tree. The tree is
+//! session-local memory, keyed by the path the script named and bounded by that session: no
+//! host file, directory or path is opened, created or read. NO host command, process or shell
+//! is started here or anywhere this calls, and a command the session provides no program for
+//! answers the status a shell gives a command it could not find.
+//!
+//! A script the session performed NOTHING of is reported as exactly that
+//! ([`BootstrapActionAnswer::NotPerformed`]) and fails no cluster: nothing ran, so there is no
+//! status the script exited with and no failure of the script to blame. Such a cluster stays
+//! short of ready — it reports neither a success for a script nothing performed nor a
+//! `BOOTSTRAP_FAILURE` Amazon EMR has no wording for.
 //!
 //! "A list of command line arguments to pass to the bootstrap action script"
 //! (`ScriptBootstrapActionConfig$Args` doc) is persisted and reported by
@@ -52,19 +67,20 @@
 //! An action is owed its run from the instant its cluster entered `BOOTSTRAPPING` — the phase
 //! the clock owes a launch ([`ClusterRecord::advance_to`]) — and the run is performed by the
 //! next operation that reports that cluster, with no store guard held, exactly as a step's
-//! command is ([`super::command_step_run`]). A cluster whose actions have not all run does not
-//! become ready ([`ClusterRecord::bootstrap_actions_have_run`]): its bootstrap actions run
-//! "before Hadoop starts on the cluster nodes", so it stays `BOOTSTRAPPING` until each has
-//! answered rather than reporting itself ready for a script nothing has performed.
+//! command is ([`super::command_step_run`]). A cluster whose actions have not all run on all of
+//! its nodes does not become ready ([`ClusterRecord::bootstrap_actions_have_run`]): its
+//! bootstrap actions run "before Hadoop starts on the cluster nodes", so it stays
+//! `BOOTSTRAPPING` until each has answered rather than reporting itself ready for a script
+//! nothing has performed.
 //!
-//! Where one runs — the thread, the claim that keeps one action performed once however many
-//! callers report its cluster, and the permit — is [`super::performed_programs`]'s. What ONE
-//! call spends is bounded here ([`MAX_BOOTSTRAP_ACTIONS_RUN_PER_CALL`],
-//! [`BOOTSTRAP_CALL_CEILING`]); an action whose turn did not come stays owed its run and the
-//! next call performs it.
+//! Where one runs — the thread, the claim that keeps one run of one action on one node
+//! performed once however many callers report its cluster, and the permit — is
+//! [`super::performed_programs`]'s. What ONE call spends is bounded here
+//! ([`MAX_BOOTSTRAP_ACTION_RUNS_PER_CALL`], [`BOOTSTRAP_CALL_CEILING`]); a run whose turn did
+//! not come stays owed and the next call performs it.
 
 use ::service_common::posix_shell_session::{
-    EnvironmentPrograms, SessionConfig, ShellSession,
+    layered, EnvironmentPrograms, SessionConfig, ShellSession,
 };
 
 use super::*;
@@ -77,14 +93,15 @@ use super::*;
 /// no session can read.
 pub const MAX_BOOTSTRAP_SCRIPT_BYTES: usize = 256 * 1024;
 
-/// How many bootstrap actions ONE call performs, leaving the rest to the next call that
+/// How many bootstrap-action RUNS one call performs, leaving the rest to the next call that
 /// reports the cluster.
 ///
-/// CHOSEN to be the ceiling Amazon EMR puts on one cluster's actions — "you can specify up to
+/// CHOSEN as the ceiling Amazon EMR puts on one cluster's actions — "you can specify up to
 /// 16 bootstrap actions per cluster" (Amazon EMR Management Guide, "Create bootstrap actions to
 /// install additional software") — so a cluster whose launch carried the most actions it may
-/// settles in one call rather than needing a second.
-pub const MAX_BOOTSTRAP_ACTIONS_RUN_PER_CALL: usize = 16;
+/// settles its first node's actions in one call; the runs owed on its other nodes stay owed to
+/// the next call.
+pub const MAX_BOOTSTRAP_ACTION_RUNS_PER_CALL: usize = 16;
 
 /// How long ONE call spends performing owed bootstrap actions before it leaves the rest to the
 /// next call.
@@ -99,7 +116,7 @@ pub const BOOTSTRAP_CALL_CEILING: Duration = Duration::from_secs(8);
 /// ([`performed_on_its_own_thread`]).
 const BOOTSTRAP_THREAD_NAME: &str = "emr-bootstrap-action";
 
-/// What ONE bootstrap action of a cluster came to.
+/// What ONE bootstrap action of a cluster came to, on ONE of its nodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapActionAnswer {
     /// The script RAN: the status it exited with, which is what the action came to.
@@ -108,11 +125,12 @@ pub enum BootstrapActionAnswer {
     /// run; the detail is what the object store answered about it.
     Unfetched(String),
     /// The session performed nothing of the script at all, so nothing is known about what it
-    /// would have come to.
+    /// would have come to — neither a success nor a status the script exited with.
     NotPerformed,
 }
 
-/// One bootstrap action this cluster has ANSWERED for, kept in launch order.
+/// One bootstrap action this cluster has ANSWERED for on one of its nodes, kept in the order
+/// the runs were answered for.
 #[derive(Debug, Clone)]
 pub struct BootstrapActionRun {
     /// Which action of the launch's list this is, counted from one — the number Amazon EMR
@@ -120,20 +138,43 @@ pub struct BootstrapActionRun {
     pub position: usize,
     /// Where its script was fetched from, as the launch wrote it.
     pub path: String,
+    /// WHICH NODE it ran on ([`BootstrapNode::key`]): an action runs once on every node the
+    /// launch provisioned, so a run is of one action on one node.
+    pub node: String,
     /// What it came to.
     pub answer: BootstrapActionAnswer,
 }
 
 impl BootstrapActionRun {
-    /// Whether this action succeeded: its script ran and exited zero, which is what lets the
+    /// Whether this run succeeded: its script ran and exited zero, which is what lets the
     /// cluster go on coming up.
     #[must_use]
     pub fn succeeded(&self) -> bool {
         self.answer == BootstrapActionAnswer::Exited(0)
     }
 
+    /// Whether this run FAILED THE CLUSTER: the script really ran and exited non-zero, or the
+    /// node could not fetch the object the action names. Those are the two outcomes Amazon EMR
+    /// words a `BOOTSTRAP_FAILURE` for.
+    ///
+    /// A run the session performed nothing of is neither: nothing ran, so there is no status to
+    /// report and no failure of the script to blame — such a cluster is owed no shutdown here
+    /// ([`BootstrapActionAnswer::NotPerformed`]).
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        match &self.answer {
+            BootstrapActionAnswer::Exited(status) => *status != 0,
+            BootstrapActionAnswer::Unfetched(_) => true,
+            BootstrapActionAnswer::NotPerformed => false,
+        }
+    }
+
     /// `ClusterStateChangeReason$Message` for the shutdown this action brings, naming the node
     /// it ran on where the cluster holds one.
+    ///
+    /// Called only for a run that FAILED the cluster ([`Self::failed`]), which is why there is
+    /// no wording here for a script nothing performed: Amazon EMR has no message for that
+    /// outcome, because it has no such outcome.
     #[must_use]
     pub fn failure_message(&self, instance_id: Option<&str>) -> String {
         let position = self.position;
@@ -159,69 +200,109 @@ impl BootstrapActionRun {
                     "Failed attempting to download bootstrap action {position} file from S3"
                 ),
             },
-            // This emulator's own, as the step path words a submission it performed nothing
-            // of: never a status nothing produced.
-            BootstrapActionAnswer::NotPerformed => format!(
-                "Bootstrap action {position} did not run: this emulator performed nothing of \
-                 its script."
-            ),
+            // Never published: such a run fails no cluster ([`Self::failed`]).
+            BootstrapActionAnswer::NotPerformed => String::new(),
         }
     }
 }
 
-/// One bootstrap action this service owes a run.
+/// One bootstrap action this service owes a run, on one node.
 #[derive(Debug, Clone)]
 struct BootstrapActionPlan {
     /// Its position in the launch's list, counted from one.
     position: usize,
     /// The Amazon S3 location of its script, as the launch wrote it.
     path: String,
+    /// The node it is owed its run on.
+    node: BootstrapNode,
 }
 
 impl ClusterRecord {
-    /// Every bootstrap action of this cluster that is owed a run, in launch order.
+    /// Every bootstrap action of this cluster that is owed a run, in launch order: at most one
+    /// per node, since a node runs its actions in launch order and one at a time.
     ///
     /// A cluster owes them only while it is BOOTSTRAPPING — before that its capacity is not up
-    /// and after it the phase is over — and only while every action answered so far succeeded:
-    /// one that failed is taking the cluster down, so the actions behind it never run.
-    fn owed_bootstrap_actions(&self) -> Vec<BootstrapActionPlan> {
+    /// and after it the phase is over — and only while every run answered so far succeeded: one
+    /// that failed is taking the cluster down, so the actions behind it never run, and one the
+    /// session performed nothing of is an answer no later run of the same script changes.
+    fn owed_bootstrap_actions(&self, region: &str) -> Vec<BootstrapActionPlan> {
         if self.status.state != cluster_state::BOOTSTRAPPING {
             return Vec::new();
         }
         if self.bootstrap_runs.iter().any(|run| !run.succeeded()) {
             return Vec::new();
         }
-        self.bootstrap_actions
-            .iter()
-            .enumerate()
-            .skip(self.bootstrap_runs.len())
-            .map(|(index, config)| BootstrapActionPlan {
-                position: index + 1,
-                path: config.script_bootstrap_action.path.clone(),
-            })
-            .collect()
+        let mut owed: Vec<BootstrapActionPlan> = Vec::new();
+        for node in self.bootstrap_nodes(region) {
+            let key = node.key();
+            // The first action this node has not answered for yet: the ones before it have
+            // succeeded on this node, so this is the one whose turn it is here.
+            let next = self
+                .bootstrap_actions
+                .iter()
+                .enumerate()
+                .find(|(index, _)| !self.answered_bootstrap_run(index + 1, &key));
+            if let Some((index, config)) = next {
+                owed.push(BootstrapActionPlan {
+                    position: index + 1,
+                    path: config.script_bootstrap_action.path.clone(),
+                    node,
+                });
+            }
+        }
+        owed
     }
 
-    /// Whether every bootstrap action this cluster's launch carried has run and succeeded,
-    /// which is what lets the cluster report itself ready.
+    /// Whether the action at `position` has already been answered for on the node `node`
+    /// names, which is what keeps one action performed once per node.
+    fn answered_bootstrap_run(&self, position: usize, node: &str) -> bool {
+        self.bootstrap_runs
+            .iter()
+            .any(|run| run.position == position && run.node == node)
+    }
+
+    /// Whether every bootstrap action this cluster's launch carried has run and succeeded ON
+    /// EVERY NODE of it, which is what lets the cluster report itself ready.
+    ///
+    /// The actions run "before Hadoop starts on the cluster nodes"
+    /// (`RunJobFlow$BootstrapActions` doc) — on the nodes, so a node that has not answered for
+    /// one of them holds the cluster in its bootstrap phase exactly as an unanswered action
+    /// does.
     #[must_use]
     pub fn bootstrap_actions_have_run(&self) -> bool {
-        self.bootstrap_runs.len() >= self.bootstrap_actions.len()
-            && self.bootstrap_runs.iter().all(BootstrapActionRun::succeeded)
+        if self.bootstrap_actions.is_empty() {
+            return true;
+        }
+        if self.bootstrap_runs.iter().any(|run| !run.succeeded()) {
+            return false;
+        }
+        self.bootstrap_node_keys().iter().all(|key| {
+            (1..=self.bootstrap_actions.len())
+                .all(|position| self.answered_bootstrap_run(position, key))
+        })
     }
 
-    /// The action that FAILED, once one has.
+    /// The run that FAILED the cluster, once one has ([`BootstrapActionRun::failed`]).
     fn failed_bootstrap_action(&self) -> Option<&BootstrapActionRun> {
-        self.bootstrap_runs.iter().find(|run| !run.succeeded())
+        self.bootstrap_runs.iter().find(|run| run.failed())
     }
 
-    /// Record what one bootstrap action came to.
+    /// Record what one bootstrap action came to on one node.
     ///
-    /// Takes the answer only for the action whose turn it IS — the one after every action
-    /// already answered for — so a run another call recorded in the window this one's guard was
-    /// released is not recorded twice and no action is answered for out of order.
+    /// Takes the answer only for a run of that action on that node which is not already
+    /// recorded, and only once every action BEFORE it has succeeded there — so a run another
+    /// call recorded in the window this one's guard was released is not recorded twice, and no
+    /// action of a node is answered for out of order.
     pub(crate) fn record_bootstrap_action_run(&mut self, run: BootstrapActionRun) {
-        if run.position == self.bootstrap_runs.len() + 1 {
+        if self.answered_bootstrap_run(run.position, &run.node) {
+            return;
+        }
+        let in_order = (1..run.position).all(|position| {
+            self.bootstrap_runs
+                .iter()
+                .any(|held| held.position == position && held.node == run.node && held.succeeded())
+        });
+        if in_order {
             self.bootstrap_runs.push(run);
         }
     }
@@ -331,63 +412,91 @@ pub async fn run_due_bootstrap_actions<Eng: Send + Sync + 'static>(
     let Some(state) = service_state(engine) else {
         return;
     };
-    let (owed, job_flow_role): (Vec<BootstrapActionPlan>, String) = {
+    let job_flow_role: Option<String> = {
         let mut store = state.lock();
         // The phases the clock owes are applied first, so a cluster whose capacity is up is
         // BOOTSTRAPPING and its actions are among the owed ones.
-        match store.cluster_mut(cluster_id, now) {
-            Some(cluster) => (
-                cluster.owed_bootstrap_actions(),
-                cluster.job_flow_role.clone().unwrap_or_default(),
-            ),
-            None => (Vec::new(), String::new()),
-        }
+        store
+            .cluster_mut(cluster_id, now)
+            .filter(|cluster| !cluster.owed_bootstrap_actions(region).is_empty())
+            .map(|cluster| cluster.job_flow_role.clone().unwrap_or_default())
     };
-    if owed.is_empty() {
+    let Some(job_flow_role) = job_flow_role else {
         return;
-    }
+    };
     // What the cluster's Amazon EC2 instances obtain from their instance profile, resolved once
     // for this call: the credential a bootstrap action's own calls present, which is nothing at
     // all where that profile carries no role those instances may assume.
     let credentials = cluster_step_credentials(ctx, region, &job_flow_role).await;
-    // What this CALL may spend performing them: a further action is started only while a whole
-    // one still fits, so the rest stay owed to the next call.
+    // What this CALL may spend performing them: a further run is started only while a whole one
+    // still fits, so the rest stay owed to the next call.
     let started = ::std::time::Instant::now();
-    for plan in owed.into_iter().take(MAX_BOOTSTRAP_ACTIONS_RUN_PER_CALL) {
-        if started.elapsed().saturating_add(TRANSFER_BUDGET) > BOOTSTRAP_CALL_CEILING {
+    let mut spent = 0_usize;
+    // The actions of one node run in launch order, so each pass takes the run whose turn it is
+    // on every node and the next pass takes the action behind it.
+    loop {
+        let owed: Vec<BootstrapActionPlan> = {
+            let mut store = state.lock();
+            match store.cluster_mut(cluster_id, now) {
+                Some(cluster) => cluster.owed_bootstrap_actions(region),
+                None => Vec::new(),
+            }
+        };
+        if owed.is_empty() {
             return;
         }
-        // One action is performed at a time, so an action another call is still performing —
-        // including one that call has already given up waiting for — is not performed a second
-        // time: a script's transfers are real effects on the object store.
-        let Some(claim) = claimed_program(&format!("{cluster_id}/bootstrap/{}", plan.position))
-        else {
-            continue;
-        };
-        let answer =
-            performed_bootstrap_action(engine, ctx, region, &plan, &credentials, claim).await;
-        let Some(answer) = answer else {
-            // Nothing answered: the action stays owed its run, so a later call performs it
-            // rather than this one recording an answer nothing produced.
-            continue;
-        };
-        let failed = answer != BootstrapActionAnswer::Exited(0);
-        {
-            let mut store = state.lock();
-            if let Some(cluster) = store.clusters.get_mut(cluster_id) {
-                cluster.record_bootstrap_action_run(BootstrapActionRun {
-                    position: plan.position,
-                    path: plan.path.clone(),
-                    answer,
-                });
-                // The cluster can now reach what that answer leads to — ready once every
-                // action has succeeded, or the shutdown a failure brings.
-                cluster.advance_to(now);
+        // Whether this pass PERFORMED any of them: a pass that performed none — every owed run
+        // is being performed by another call that holds its claim — leaves them to that call
+        // rather than asking for the same set again.
+        let mut performed_any = false;
+        for plan in owed {
+            if spent >= MAX_BOOTSTRAP_ACTION_RUNS_PER_CALL
+                || started.elapsed().saturating_add(TRANSFER_BUDGET) > BOOTSTRAP_CALL_CEILING
+            {
+                return;
+            }
+            // One run is performed at a time, so a run another call is still performing —
+            // including one that call has already given up waiting for — is not performed a
+            // second time: a script's transfers are real effects on the object store.
+            let node = plan.node.key();
+            let Some(claim) = claimed_program(&format!(
+                "{cluster_id}/bootstrap/{}/{node}",
+                plan.position
+            )) else {
+                continue;
+            };
+            spent = spent.saturating_add(1);
+            performed_any = true;
+            let answer =
+                performed_bootstrap_action(engine, ctx, region, &plan, &credentials, claim).await;
+            let Some(answer) = answer else {
+                // Nothing answered: the run stays owed, so a later call performs it rather than
+                // this one recording an answer nothing produced.
+                continue;
+            };
+            let settled = answer != BootstrapActionAnswer::Exited(0);
+            {
+                let mut store = state.lock();
+                if let Some(cluster) = store.clusters.get_mut(cluster_id) {
+                    cluster.record_bootstrap_action_run(BootstrapActionRun {
+                        position: plan.position,
+                        path: plan.path.clone(),
+                        node,
+                        answer,
+                    });
+                    // The cluster can now reach what that answer leads to — ready once every
+                    // action has succeeded on every node, or the shutdown a failure brings.
+                    cluster.advance_to(now);
+                }
+            }
+            if settled {
+                // Either the cluster is going down — the nodes the actions behind this one
+                // would have run on are going away with it — or nothing was performed, and no
+                // later run of the same script changes that answer.
+                return;
             }
         }
-        if failed {
-            // The cluster is going down: the nodes the actions behind this one would have run
-            // on are going away with it.
+        if !performed_any {
             return;
         }
     }
@@ -409,18 +518,19 @@ async fn performed_bootstrap_action<Eng: Send + Sync + 'static>(
         // is a failure of the action itself.
         Err(detail) => return Some(BootstrapActionAnswer::Unfetched(detail)),
     };
-    // The CLI this script's environment provides, built per action so each gets its own
-    // transfer budget, and presenting on every call it makes what the cluster's instances
-    // obtained from their instance profile.
+    // The CLI this script's environment provides, built per run so each gets its own transfer
+    // budget, and presenting on every call it makes what the cluster's instances obtained from
+    // their instance profile.
+    let node = plan.node.clone();
     let cli = step_object_cli(
         engine,
         ctx,
         region,
         credentials,
-        &format!("bootstrap-{}", plan.position),
+        &format!("bootstrap-{}-{}", plan.position, node.key()),
     );
     performed_on_its_own_thread(BOOTSTRAP_THREAD_NAME, TRANSFER_BUDGET, claim, move || {
-        performed_script(&script, cli)
+        performed_script(&script, &node, cli)
     })
     .await
 }
@@ -469,30 +579,45 @@ async fn read_bootstrap_script(
     String::from_utf8(body.to_vec()).map_err(|_| "the script is not text".to_string())
 }
 
-/// What the session came to for `script`.
+/// What the session came to for `script`, performed as a program OF `node`.
 ///
-/// The session holds the parse, the allow-list of session-local utilities and the one
-/// environment program this module's header states, and nothing else: no process is started
-/// here. It is given no variables either — a bootstrap action is handed no environment of this
-/// service's or of the host's — and the credential the CLI's own calls are signed with is held
-/// by that program rather than by the session. The one status that is not an answer about the
-/// script is the one a shell gives a utility it could not find, which is what the session
-/// answers for a script it performed nothing of — unless the script ENDED the session itself,
-/// which is a status it really asked for.
-fn performed_script(script: &str, cli: Option<StepObjectCli>) -> BootstrapActionAnswer {
+/// The session holds the parse, the allow-list of session-local utilities, the two environment
+/// programs this module's header states, and nothing else: no process is started here. It is
+/// given no variables — a bootstrap action is handed no environment of this service's or of the
+/// host's — and the credential the CLI's own calls are signed with is held by that program
+/// rather than by the session. What makes the run the NODE's is what is seeded into it: the
+/// node's metadata client, and the file Amazon EMR publishes the node's role in
+/// ([`super::bootstrap_nodes`]).
+///
+/// The one status that is not an answer about the script is the one a shell gives a utility it
+/// could not find, which is what the session answers for a script it performed nothing of —
+/// unless the script ENDED the session itself, which is a status it really asked for. Such a
+/// run is reported as performed by nothing ([`BootstrapActionAnswer::NotPerformed`]), never as
+/// a status the script exited with: nothing ran, so there is no status.
+fn performed_script(
+    script: &str,
+    node: &BootstrapNode,
+    cli: Option<StepObjectCli>,
+) -> BootstrapActionAnswer {
     // A script is written against storage, so the session is given a working tree of its own:
     // its redirections leave files the CLI then carries, and the grammar's control flow and the
     // file utilities a script uses are commands it performs.
     let config = SessionConfig::default();
-    let mut session = match cli {
-        Some(cli) => ShellSession::with_programs(
-            BTreeMap::new(),
-            config,
+    // The programs of the NODE the script runs on — its metadata client — beside the CLI its
+    // environment provides, asked in that order, so the node's own program answers for a name
+    // they would both carry.
+    let programs: Box<dyn EnvironmentPrograms> = match cli {
+        Some(cli) => layered(
+            node.node_programs(),
             Box::new(cli) as Box<dyn EnvironmentPrograms>,
         ),
-        None => ShellSession::new(BTreeMap::new(), config),
-    }
-    .with_file_utilities();
+        None => node.node_programs(),
+    };
+    let mut session =
+        ShellSession::with_programs(BTreeMap::new(), config, programs).with_file_utilities();
+    // The file every Amazon EMR bootstrap action reads its node's role from, published to the
+    // node before its actions run.
+    session.put_file(INSTANCE_INFO_PATH, &node.instance_info());
     let status = session.run(script);
     if status == config.statuses.could_not_run && session.exit_status().is_none() {
         return BootstrapActionAnswer::NotPerformed;

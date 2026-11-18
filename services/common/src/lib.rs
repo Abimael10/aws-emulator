@@ -576,6 +576,10 @@ pub mod posix_shell_arithmetic;
 /// ONE input (a digest, a count, a selection) — so what a pipeline of them comes to follows
 /// from the bytes that went in.
 pub mod posix_shell_text_filters;
+/// The INSTANCE METADATA SERVICE an emulated node publishes to the programs inside it, and the
+/// HTTP client those programs read it with — one statement of that wire for every service that
+/// holds such a node.
+pub mod instance_metadata_service;
 /// The FILES a bounded shell session works over: the seam a session reaches them through, the
 /// utilities that read and change them (`cat`, `ls`, `mkdir`, `touch`, `rm`, `sync`), the
 /// `test` questions about a file, and the redirections of the three standard streams — written

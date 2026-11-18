@@ -29,6 +29,15 @@
 //!   input, which "ignores" the line breaks an encoding wrote and, under `-i`, every other
 //!   character outside the Base64 alphabet. Input that is no Base64 encoding at all is the
 //!   utility's own [`BASE64_INVALID_INPUT`] failure.
+//! * `grep [OPTION…] PATTERN [FILE]` — "print lines that match patterns": the lines of its
+//!   input the pattern matches, inverted by `-v`, counted by `-c`, numbered by `-n`, reduced
+//!   to the matching part by `-o`, written nowhere at all by `-q`, and matched without regard
+//!   to case by `-i`. Its STATUS is the selection it made — "the exit status is 0 if a line is
+//!   selected, 1 if no lines were selected" ([`Selection::selected`]) — which is what an
+//!   `if grep …` of a program branches on. The pattern is matched by the maintained
+//!   regular-expression engine rather than by anything written here: as a BASIC expression by
+//!   default, as an EXTENDED one under `-E` ("interpret PATTERNS as extended regular
+//!   expressions") and as a literal string under `-F` ("interpret PATTERNS as fixed strings").
 //!
 //! The option spellings and the output forms above are each utility's own, from the GNU
 //! coreutils manual (`wc`, `cut`, `head`, `sha2 utilities`, `base64`) — which is what the images
@@ -42,7 +51,13 @@
 //!   read, so that form is not performed rather than written in a width of this module's
 //!   choosing;
 //! * several file operands at once are not performed either: `wc` then writes a `total` line,
-//!   `head` writes a header per file, and both pad — none of which follows from one input;
+//!   `head` writes a header per file, `grep` prefixes every line with the file it came from,
+//!   and all of them pad — none of which follows from one input;
+//! * a `grep` whose BASIC pattern carries one of the escapes a basic expression gives its own
+//!   meaning (`\(`, `\)`, `\{`, `\}`, `\|`, `\+`, `\?`) is not performed, rather than matched
+//!   as though that escape meant what an extended expression means by it; nor is one asking
+//!   for the lines AROUND a match, for the files rather than the lines, or for a walk of a
+//!   directory, none of which follows from one input either;
 //! * every other utility, option and operand form answers as a command the session could not
 //!   run ([`Filter::read`] answering `None`), which is the fail-closed default the session's
 //!   own catalog keeps.
@@ -60,7 +75,12 @@ use ::sha2::Digest;
 
 /// The utilities this module performs, as the names a command line invokes them by. A session
 /// hands a command whose name is one of these to [`Filter::read`].
-pub const TEXT_FILTER_COMMANDS: &[&str] = &["wc", "cut", "head", "sha256sum", "sha512sum", "base64"];
+pub const TEXT_FILTER_COMMANDS: &[&str] =
+    &["wc", "cut", "head", "sha256sum", "sha512sum", "base64", GREP_COMMAND];
+
+/// The utility of [`TEXT_FILTER_COMMANDS`] whose STATUS is the selection it made, which is
+/// the one a program's `if` branches on.
+const GREP_COMMAND: &str = "grep";
 
 /// Which count a `wc` invocation asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +131,29 @@ struct Base64Work {
     wrap: usize,
 }
 
+/// What one `grep` invocation selects, and how it writes it.
+///
+/// The pattern is held as the SOURCE the regular-expression engine reads, translated once out
+/// of the expression flavour the invocation asked for ([`grep_pattern`]); it is compiled when
+/// the invocation is performed, over the input it was handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrepWork {
+    /// The pattern, in the syntax the engine reads.
+    pattern: String,
+    /// `-i`/`--ignore-case`: "ignore case distinctions in patterns and data".
+    ignore_case: bool,
+    /// `-v`/`--invert-match`: "select non-matching lines".
+    invert: bool,
+    /// `-c`/`--count`: "print only a count of selected lines per FILE".
+    count: bool,
+    /// `-q`/`--quiet`/`--silent`: "suppress all normal output", leaving only the status.
+    quiet: bool,
+    /// `-o`/`--only-matching`: "print only the matched (non-empty) parts of a matching line".
+    only_matching: bool,
+    /// `-n`/`--line-number`: "print line number with output lines".
+    line_number: bool,
+}
+
 /// The work one invocation of a text filter performs over ONE input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Work {
@@ -124,6 +167,30 @@ enum Work {
     Digest(Digester),
     /// `base64`, encoding or decoding.
     Base64(Base64Work),
+    /// `grep`, selecting the lines its pattern matches.
+    Grep(GrepWork),
+}
+
+/// What one invocation of a filter came to: what it writes to standard output, and the
+/// SELECTION its status follows from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    /// What the utility writes to standard output, which may be nothing at all.
+    pub written: String,
+    /// Whether the utility SELECTED anything, for the utility whose status says so: "the exit
+    /// status is 0 if a line is selected, 1 if no lines were selected" (`grep`). `None` for
+    /// every utility whose status is success whenever it could compute at all.
+    pub selected: Option<bool>,
+}
+
+impl Selection {
+    /// A utility that wrote `written` and whose status does not report a selection.
+    fn wrote(written: String) -> Self {
+        Self {
+            written,
+            selected: None,
+        }
+    }
 }
 
 /// One invocation of a text filter: the work it performs, and the file it reads when it names
@@ -186,6 +253,11 @@ impl Filter {
             }
             operands.push(argument.clone());
         }
+        // `grep` reads its OWN operands: the first of them is the pattern unless an option
+        // carried one, and the file comes after it.
+        if name == GREP_COMMAND {
+            return grep_filter(&options, &operands);
+        }
         // ONE input at a time: several files make an output this module does not write (see the
         // module docs), and `-` is the spelling for the standard input it would read anyway.
         let file = match operands.len() {
@@ -215,27 +287,29 @@ impl Filter {
     }
 
     /// What this invocation writes to standard output for `input`, which was read from
-    /// `label` — the file's own name, or [`STANDARD_INPUT_LABEL`] for standard input.
+    /// `label` — the file's own name, or [`STANDARD_INPUT_LABEL`] for standard input — beside
+    /// the selection its status follows from ([`Selection`]).
     ///
     /// `Err` is what the utility writes to standard ERROR for an input it cannot compute over,
     /// which is a failed invocation rather than one that wrote nothing.
-    pub fn perform(&self, label: &str, input: &str) -> Result<String, String> {
+    pub fn perform(&self, label: &str, input: &str) -> Result<Selection, String> {
         Ok(match &self.work {
             Work::Count(count) => {
                 let counted = counted(*count, input);
                 // The count alone for standard input; the count and the file's name for a file
                 // operand, which is the form the utility writes for one.
-                match self.file.as_deref() {
+                Selection::wrote(match self.file.as_deref() {
                     Some(_) => format!("{counted} {label}\n"),
                     None => format!("{counted}\n"),
-                }
+                })
             }
-            Work::Cut(portion) => cut_lines(portion, input),
-            Work::Head(lines) => head_of(*lines, input),
+            Work::Cut(portion) => Selection::wrote(cut_lines(portion, input)),
+            Work::Head(lines) => Selection::wrote(head_of(*lines, input)),
             Work::Digest(digester) => {
-                format!("{}  {label}\n", digest_of(*digester, input))
+                Selection::wrote(format!("{}  {label}\n", digest_of(*digester, input)))
             }
-            Work::Base64(work) => base64_performed(*work, input)?,
+            Work::Base64(work) => Selection::wrote(base64_performed(*work, input)?),
+            Work::Grep(work) => grep_performed(work, input)?,
         })
     }
 }
@@ -250,6 +324,9 @@ fn value_taking_options(name: &str) -> &'static [&'static str] {
         "head" => &["-n"],
         // `base64`'s wrapping width.
         "base64" => &["-w", "--wrap"],
+        // `grep`'s pattern, for the invocation that names it with an option rather than as its
+        // first operand.
+        GREP_COMMAND => &["-e", "--regexp"],
         // `wc`'s counts and the checksum utilities take none.
         _ => &[],
     }
@@ -437,6 +514,238 @@ fn base64_decoded(work: Base64Work, input: &str) -> Result<String, String> {
 /// reads and what `-i` keeps of its input (RFC 4648 table 1 and the `=` pad).
 fn is_base64_alphabet(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
+}
+
+/// The flavour of regular expression a `grep` invocation's pattern is written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flavour {
+    /// The default: "interpret PATTERNS as basic regular expressions".
+    Basic,
+    /// `-E`: "interpret PATTERNS as extended regular expressions".
+    Extended,
+    /// `-F`: "interpret PATTERNS as fixed strings".
+    Fixed,
+}
+
+/// The characters a BASIC regular expression gives no special meaning to, and which the
+/// engine's own syntax does: a basic pattern that carries one carries it as a literal, so it is
+/// escaped before the engine reads it.
+const LITERAL_IN_BASIC: [char; 7] = ['+', '?', '|', '(', ')', '{', '}'];
+
+/// The escapes a BASIC regular expression gives ITS OWN meaning to, which is the opposite of
+/// what the engine reads them as. A pattern carrying one is not performed (see the module
+/// docs) rather than matched as something else.
+const BASIC_ESCAPES: [&str; 7] = [r"\(", r"\)", r"\{", r"\}", r"\|", r"\+", r"\?"];
+
+/// The `grep` invocation `options` and `operands` state, or `None` for an option, operand or
+/// combination this module does not perform (see the module docs).
+///
+/// The pattern is the one an option named (`-e PATTERN`, `--regexp=PATTERN`), or the FIRST
+/// operand when no option named one — which is how the utility's own usage reads it — and the
+/// one file operand after it is the input.
+fn grep_filter(options: &[String], operands: &[String]) -> Option<Filter> {
+    let mut work = GrepWork {
+        pattern: String::new(),
+        ignore_case: false,
+        invert: false,
+        count: false,
+        quiet: false,
+        only_matching: false,
+        line_number: false,
+    };
+    let mut flavour = Flavour::Basic;
+    let mut written: Option<String> = None;
+    for option in options {
+        if let Some(pattern) = long_pattern(option) {
+            // ONE pattern: several of them select out of one input in a way this module does
+            // not write.
+            if written.replace(pattern.to_string()).is_some() {
+                return None;
+            }
+            continue;
+        }
+        if let Some(name) = option.strip_prefix("--") {
+            match name {
+                "ignore-case" => work.ignore_case = true,
+                "invert-match" => work.invert = true,
+                "count" => work.count = true,
+                "quiet" | "silent" => work.quiet = true,
+                "only-matching" => work.only_matching = true,
+                "line-number" => work.line_number = true,
+                "extended-regexp" => flavour = Flavour::Extended,
+                "fixed-strings" => flavour = Flavour::Fixed,
+                "basic-regexp" => flavour = Flavour::Basic,
+                _ => return None,
+            }
+            continue;
+        }
+        // Several valueless flags written as one word, as `-qv` is.
+        for flag in option.strip_prefix('-')?.chars() {
+            match flag {
+                'i' => work.ignore_case = true,
+                'v' => work.invert = true,
+                'c' => work.count = true,
+                'q' => work.quiet = true,
+                'o' => work.only_matching = true,
+                'n' => work.line_number = true,
+                'E' => flavour = Flavour::Extended,
+                'F' => flavour = Flavour::Fixed,
+                'G' => flavour = Flavour::Basic,
+                _ => return None,
+            }
+        }
+    }
+    // "print only the matched parts of a matching line" has nothing to write for a line that
+    // was selected because it did NOT match, so the two together are not a form the utility
+    // performs.
+    if work.only_matching && work.invert {
+        return None;
+    }
+    let mut operands = operands.iter();
+    let pattern = match written {
+        Some(pattern) => pattern,
+        None => operands.next()?.clone(),
+    };
+    work.pattern = grep_pattern(&pattern, flavour)?;
+    let file = operands
+        .next()
+        .filter(|operand| operand.as_str() != STANDARD_INPUT_LABEL)
+        .cloned();
+    // ONE input at a time, like every other utility here.
+    if operands.next().is_some() {
+        return None;
+    }
+    // A pattern the engine cannot read is an invocation this module performs nothing of,
+    // rather than one that selects nothing.
+    grep_expression(&work)?;
+    Some(Filter {
+        work: Work::Grep(work),
+        file,
+    })
+}
+
+/// The pattern a LONG option named, in either spelling the utility takes it in — and the one a
+/// `-e` carried, which [`Filter::read`] has already glued to the option.
+fn long_pattern(option: &str) -> Option<&str> {
+    if let Some(pattern) = option.strip_prefix("--regexp=") {
+        return Some(pattern);
+    }
+    if option.starts_with("--") {
+        return None;
+    }
+    non_empty(option.strip_prefix("-e"))
+}
+
+/// `written` as the pattern source the engine reads, for the flavour the invocation asked for,
+/// or `None` for a pattern this module does not perform.
+///
+/// A FIXED string is escaped whole, so every character of it matches itself. An EXTENDED
+/// expression is what the engine reads already. A BASIC one differs from it in exactly the
+/// characters above: the ones it holds as literals are escaped ([`LITERAL_IN_BASIC`]), and one
+/// carrying an escape whose meaning the two disagree on is not performed ([`BASIC_ESCAPES`]).
+fn grep_pattern(written: &str, flavour: Flavour) -> Option<String> {
+    match flavour {
+        Flavour::Fixed => Some(::regex::escape(written)),
+        Flavour::Extended => Some(written.to_string()),
+        Flavour::Basic => {
+            if BASIC_ESCAPES
+                .iter()
+                .any(|escape| written.contains(escape))
+            {
+                return None;
+            }
+            let mut source = String::with_capacity(written.len());
+            let mut characters = written.chars();
+            while let Some(character) = characters.next() {
+                // An escape a basic expression and the engine agree on (`\.`, `\*`, `\\`) is
+                // carried through as written, with the character it escapes.
+                if character == '\\' {
+                    source.push(character);
+                    if let Some(escaped) = characters.next() {
+                        source.push(escaped);
+                    }
+                    continue;
+                }
+                if LITERAL_IN_BASIC.contains(&character) {
+                    source.push('\\');
+                }
+                source.push(character);
+            }
+            Some(source)
+        }
+    }
+}
+
+/// How large a compiled expression one `grep` pattern may produce, and how large the matcher's
+/// own cache may grow for it.
+///
+/// CHOSEN, not a `grep` limit: the pattern is caller-supplied text, so what COMPILING one may
+/// cost this process is bounded here rather than by the pattern's own length — a pattern past
+/// it is one this module does not perform. The matching side needs no bound of its own: the
+/// engine matches in time linear in the input, and the input is a session's file or stream,
+/// bounded by that session ([`crate::posix_shell_session`]).
+const MAX_PATTERN_BYTES: usize = 64 * 1024;
+
+/// The expression `work`'s pattern compiles to, and `None` when the engine cannot read it or it
+/// compiles past [`MAX_PATTERN_BYTES`].
+fn grep_expression(work: &GrepWork) -> Option<::regex::Regex> {
+    ::regex::RegexBuilder::new(&work.pattern)
+        .case_insensitive(work.ignore_case)
+        .size_limit(MAX_PATTERN_BYTES)
+        .dfa_size_limit(MAX_PATTERN_BYTES)
+        .build()
+        .ok()
+}
+
+/// What a `grep` invocation writes for `input`, and the selection its status follows from.
+///
+/// "Print lines that match patterns": a line is SELECTED when the pattern matches it, or — for
+/// `-v` — when it does not, and what is written is the selected lines themselves, their count
+/// (`-c`), the matching parts alone (`-o`), each prefixed by its line number (`-n`), or nothing
+/// at all (`-q`). The status is the selection, whatever was written.
+fn grep_performed(work: &GrepWork, input: &str) -> Result<Selection, String> {
+    let expression = grep_expression(work).ok_or_else(|| {
+        format!(
+            "{GREP_COMMAND}: {}: Invalid regular expression",
+            work.pattern
+        )
+    })?;
+    let mut written = String::new();
+    let mut selected = 0_usize;
+    for (index, line) in lines_of(input).iter().enumerate() {
+        if expression.is_match(line) == work.invert {
+            continue;
+        }
+        selected = selected.saturating_add(1);
+        if work.quiet || work.count {
+            continue;
+        }
+        let number = index.saturating_add(1);
+        if work.only_matching {
+            // "print only the matched (non-empty) parts of a matching line, with each such
+            // part on a separate output line".
+            for found in expression.find_iter(line).filter(|found| !found.is_empty()) {
+                if work.line_number {
+                    written.push_str(&format!("{number}:"));
+                }
+                written.push_str(found.as_str());
+                written.push('\n');
+            }
+            continue;
+        }
+        if work.line_number {
+            written.push_str(&format!("{number}:"));
+        }
+        written.push_str(line);
+        written.push('\n');
+    }
+    if work.count && !work.quiet {
+        written = format!("{selected}\n");
+    }
+    Ok(Selection {
+        written,
+        selected: Some(selected > 0),
+    })
 }
 
 /// The positions one `cut` list names, as the ranges it is written with.
@@ -867,7 +1176,7 @@ mod tests {
                 panic!("case {case:?}: expected an output, got the refusal {refusal:?}")
             });
             assert_eq!(
-                written, expected,
+                written.written, expected,
                 "case {case:?}: expected {expected:?}, got {written:?}"
             );
         }
@@ -976,12 +1285,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("case {case:?}: expected a performed encode"));
             let encoded = encoder
                 .perform(STANDARD_INPUT_LABEL, input)
-                .unwrap_or_else(|refusal| panic!("case {case:?}: expected an encoding, got {refusal:?}"));
+                .unwrap_or_else(|refusal| panic!("case {case:?}: expected an encoding, got {refusal:?}"))
+                .written;
             let decoder = Filter::read("base64", &words(&["-d"]))
                 .unwrap_or_else(|| panic!("case {case:?}: expected a performed decode"));
             let decoded = decoder
                 .perform(STANDARD_INPUT_LABEL, &encoded)
-                .unwrap_or_else(|refusal| panic!("case {case:?}: expected a decoding, got {refusal:?}"));
+                .unwrap_or_else(|refusal| panic!("case {case:?}: expected a decoding, got {refusal:?}"))
+                .written;
             assert_eq!(
                 decoded, input,
                 "case {case:?}: expected {input:?} back from {encoded:?}, got {decoded:?}"
@@ -1028,6 +1339,200 @@ mod tests {
             assert_eq!(
                 file, expected,
                 "case {case:?}: expected {expected:?}, got {file:?}"
+            );
+        }
+    }
+
+    /// The text a `grep` case is run over: lines that differ in case, in what they hold after
+    /// the colon, and in the spacing a JSON document writes around one.
+    const SELECTED_FROM: &str = "\"isMaster\": true\n\
+                                 \"instanceId\": \"i-0a1b2c3d\"\n\
+                                 ISMASTER keyword\n\
+                                 \"isMaster\":false\n\
+                                 a+b literal\n";
+
+    /// RULE: `grep` writes the lines of its ONE input the pattern selects, in the form its
+    /// options ask for, and its STATUS is the selection it made — zero when a line was
+    /// selected, one when none was.
+    ///
+    /// The rows differ along what the rule generalises over: which option selects or writes
+    /// (none, `-q`, `-c`, `-v`, `-i`, `-o`, `-n`), the flavour the pattern is read in (basic,
+    /// `-E`, `-F`), where the pattern comes from (the first operand, `-e`, `--regexp=`),
+    /// whether anything matched at all, and the input the lines come from.
+    #[test]
+    fn grep_selects_the_lines_its_pattern_matches() {
+        // (case, arguments, input, what is written, whether a line was selected)
+        let rows: Vec<(&str, Vec<String>, &str, &str, bool)> = vec![
+            (
+                // The idiom the Amazon EMR documentation reads a node's role with.
+                "a basic pattern whose `*` quantifies the space before a value",
+                words(&["-q", "\"isMaster\": *true"]),
+                SELECTED_FROM,
+                "",
+                true,
+            ),
+            (
+                "the same pattern over a document that holds the other value",
+                words(&["-q", "\"isMaster\": *true"]),
+                "\"isMaster\": false\n",
+                "",
+                false,
+            ),
+            (
+                "a pattern selecting two lines, written as they were read",
+                words(&["isMaster"]),
+                SELECTED_FROM,
+                "\"isMaster\": true\n\"isMaster\":false\n",
+                true,
+            ),
+            (
+                "-c counts the selected lines instead of writing them",
+                words(&["-c", "isMaster"]),
+                SELECTED_FROM,
+                "2\n",
+                true,
+            ),
+            (
+                "-c of a pattern nothing matches counts none",
+                words(&["-c", "isWorker"]),
+                SELECTED_FROM,
+                "0\n",
+                false,
+            ),
+            (
+                "-v selects the lines the pattern does not match",
+                words(&["-v", "isMaster"]),
+                "\"isMaster\": true\nkept\n",
+                "kept\n",
+                true,
+            ),
+            (
+                "-i matches without regard to case",
+                words(&["-i", "ismaster"]),
+                SELECTED_FROM,
+                "\"isMaster\": true\nISMASTER keyword\n\"isMaster\":false\n",
+                true,
+            ),
+            (
+                "-o writes only the part that matched",
+                words(&["-o", "\"i[a-zA-Z]*\""]),
+                "\"instanceId\": \"i-0a1b2c3d\"\n",
+                "\"instanceId\"\n",
+                true,
+            ),
+            (
+                "-n prefixes each selected line with its number",
+                words(&["-n", "isMaster"]),
+                SELECTED_FROM,
+                "1:\"isMaster\": true\n4:\"isMaster\":false\n",
+                true,
+            ),
+            (
+                // `(` and `|` are literal in a basic expression and special in an extended
+                // one, which is the whole difference the flavour makes.
+                "-E reads the pattern as an extended expression",
+                words(&["-E", "(isMaster|instanceId)"]),
+                "\"instanceId\": \"i-1\"\n",
+                "\"instanceId\": \"i-1\"\n",
+                true,
+            ),
+            (
+                "a basic pattern holds `+` as a literal",
+                words(&["a+b"]),
+                SELECTED_FROM,
+                "a+b literal\n",
+                true,
+            ),
+            (
+                "-F holds every character of the pattern as a literal",
+                words(&["-F", "\"isMaster\": true"]),
+                SELECTED_FROM,
+                "\"isMaster\": true\n",
+                true,
+            ),
+            (
+                "-F of a pattern whose metacharacters match nothing literally",
+                words(&["-F", "is.*Master"]),
+                SELECTED_FROM,
+                "",
+                false,
+            ),
+            (
+                "the pattern named by -e rather than by the first operand",
+                words(&["-e", "instanceId"]),
+                SELECTED_FROM,
+                "\"instanceId\": \"i-0a1b2c3d\"\n",
+                true,
+            ),
+            (
+                "the pattern named by --regexp=",
+                words(&["--regexp=instanceId"]),
+                SELECTED_FROM,
+                "\"instanceId\": \"i-0a1b2c3d\"\n",
+                true,
+            ),
+            (
+                "an empty input selects nothing",
+                words(&["isMaster"]),
+                "",
+                "",
+                false,
+            ),
+            (
+                "a last line with no newline is still a line",
+                words(&["isMaster"]),
+                "\"isMaster\": true",
+                "\"isMaster\": true\n",
+                true,
+            ),
+        ];
+        for (case, arguments, input, expected, selected) in rows {
+            let filter = Filter::read("grep", &arguments).unwrap_or_else(|| {
+                panic!("case {case:?}: expected grep {arguments:?} to be a performed form")
+            });
+            let performed = filter
+                .perform(STANDARD_INPUT_LABEL, input)
+                .unwrap_or_else(|refusal| {
+                    panic!("case {case:?}: expected an output, got the refusal {refusal:?}")
+                });
+            assert_eq!(
+                performed.written, expected,
+                "case {case:?}: expected {expected:?} written, got {performed:?}"
+            );
+            assert_eq!(
+                performed.selected,
+                Some(selected),
+                "case {case:?}: expected the selection {selected:?}, got {performed:?}"
+            );
+        }
+    }
+
+    /// RULE's fail-closed half: a `grep` form whose output or whose MEANING does not follow
+    /// from one input and one engine-readable pattern is not performed at all.
+    #[test]
+    fn a_grep_form_outside_the_catalog_is_not_performed() {
+        // (case, the arguments)
+        let rows: Vec<(&str, Vec<String>)> = vec![
+            ("no pattern at all", words(&[])),
+            (
+                "a basic pattern carrying an escape the flavours disagree on",
+                words(&[r"\(isMaster\)"]),
+            ),
+            ("-o and -v together", words(&["-o", "-v", "isMaster"])),
+            ("two file operands", words(&["isMaster", "one", "two"])),
+            ("an option it has none of", words(&["-r", "isMaster"])),
+            ("the lines around a match", words(&["-A2", "isMaster"])),
+            ("the files rather than the lines", words(&["-l", "isMaster"])),
+            ("a cluster carrying an option it has none of", words(&["-qr", "isMaster"])),
+            ("two patterns", words(&["-e", "one", "-e", "two"])),
+            ("an extended pattern the engine cannot read", words(&["-E", "("])),
+            ("a pattern option whose value was never written", words(&["-e"])),
+        ];
+        for (case, arguments) in rows {
+            let read = Filter::read("grep", &arguments);
+            assert!(
+                read.is_none(),
+                "case {case:?}: expected grep {arguments:?} not to be performed, got {read:?}"
             );
         }
     }

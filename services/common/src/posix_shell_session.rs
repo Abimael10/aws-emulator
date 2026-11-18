@@ -2194,7 +2194,7 @@ impl ShellSession {
             },
         };
         let written = match filter.perform(&label, &input) {
-            Ok(written) => written,
+            Ok(performed) => performed,
             // An input the utility cannot compute over: what it writes about it goes to
             // standard error, and nothing is written to standard output.
             Err(refusal) => {
@@ -2202,11 +2202,17 @@ impl ShellSession {
                 return self.config.statuses.failure;
             }
         };
-        if self.write_stdout(&written, redirections) {
-            self.config.statuses.success
-        } else {
-            self.config.statuses.failure
+        if !self.write_stdout(&written.written, redirections) {
+            return self.config.statuses.failure;
         }
+        // The status of a utility that reports a SELECTION is that selection
+        // ([`super::posix_shell_text_filters::Selection`]), which is what an `if` around such
+        // a command branches on; every other one answers success for an input it computed
+        // over.
+        if written.selected == Some(false) {
+            return self.config.statuses.failure;
+        }
+        self.config.statuses.success
     }
 
     /// `sleep`: the time the program asked to take, added to what this session has slept

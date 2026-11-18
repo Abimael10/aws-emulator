@@ -97,6 +97,11 @@ const S3_SCHEME: &str = "s3://";
 /// command line carrying it is one this program performs; `mv` and `rm` take no such operand.
 const STREAM_OPERAND: &str = "-";
 
+/// The one OPTION these commands take here: "`--region` (string) — the region to use. Overrides
+/// config/env settings." (AWS CLI reference.) A command naming it makes its calls in that
+/// Region, which is the whole of what the option does to a transfer.
+const REGION_OPTION: &str = "--region";
+
 /// The status a command answers when its transfer was made: "0 -- Command was successful.
 /// There were no errors thrown by either the CLI or by the service the request was made to."
 /// (AWS CLI return codes.)
@@ -284,19 +289,31 @@ enum Requested {
     Remove { target: S3Object },
 }
 
+/// One invocation of the CLI: the transfer it asks for, and the Region its calls are made in
+/// where the command line named one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Invocation {
+    /// What the command line asks the CLI to do.
+    performed: Requested,
+    /// `--region`: "the region to use. Overrides config/env settings" (AWS CLI reference), so
+    /// a command naming one makes its calls in that Region rather than in the one the request
+    /// that performs the step or the bootstrap action was addressed to.
+    region: Option<String>,
+}
+
 /// What the command line `arguments` asks of the CLI, or `None` for every invocation this
 /// program performs nothing of.
 ///
-/// It performs `aws s3 cp|mv|rm` over the operands those commands take, and nothing else: an
-/// invocation naming another command group or another command of this one, carrying an OPTION
-/// (every option of these commands — a recursive transfer, another Region, a filter — changes
-/// what the command does, so a line carrying one is not this invocation), carrying the wrong
-/// number of operands, naming no object at all, or asking for a transfer with no end in the
-/// object store is one this program answers nothing for.
+/// It performs `aws s3 cp|mv|rm` over the operands those commands take, under the CLI's own
+/// `--region` option and nothing else: an invocation naming another command group or another
+/// command of this one, carrying any OTHER option (every option of these commands — a recursive
+/// transfer, a filter, an ACL — changes what the command does, so a line carrying one is not
+/// this invocation), carrying the wrong number of operands, naming no object at all, or asking
+/// for a transfer with no end in the object store is one this program answers nothing for.
 ///
 /// [`STREAM_OPERAND`] is an operand rather than an option, and `cp` is the one command that
 /// takes it: a `mv` or an `rm` written with it is an invocation of theirs that does not exist.
-fn requested(arguments: &[String]) -> Option<Requested> {
+fn requested(arguments: &[String]) -> Option<Invocation> {
     let mut words = arguments.iter();
     if words.next()?.as_str() != S3_COMMAND_GROUP {
         return None;
@@ -305,21 +322,34 @@ fn requested(arguments: &[String]) -> Option<Requested> {
     if !PERFORMED_S3_COMMANDS.contains(&command) {
         return None;
     }
-    let operands: Vec<&String> = words.collect();
+    // The one option these commands take here, read in both spellings the CLI takes it in
+    // (`--region REGION`, `--region=REGION`); everything else is an operand.
+    let mut region: Option<String> = None;
+    let mut operands: Vec<&String> = Vec::new();
+    while let Some(word) = words.next() {
+        match word.strip_prefix(REGION_OPTION) {
+            Some("") => region = Some(words.next()?.clone()),
+            Some(named) => region = Some(named.strip_prefix('=')?.to_string()),
+            None => operands.push(word),
+        }
+    }
+    if region.as_deref().is_some_and(str::is_empty) {
+        return None;
+    }
     if operands
         .iter()
         .any(|operand| operand.starts_with('-') && operand.as_str() != STREAM_OPERAND)
     {
         return None;
     }
-    match command {
+    let performed = match command {
         "rm" => {
             let [target] = operands[..] else {
                 return None;
             };
-            Some(Requested::Remove {
+            Requested::Remove {
                 target: addressed_object(target)?,
-            })
+            }
         }
         // `cp` and `mv` take the two ends, at least one of which is in the object store: a
         // transfer between two local paths reaches no store, so it is not a transfer this
@@ -341,13 +371,14 @@ fn requested(arguments: &[String]) -> Option<Requested> {
             {
                 return None;
             }
-            Some(Requested::Carry {
+            Requested::Carry {
                 from,
                 to,
                 taking_source_away,
-            })
+            }
         }
-    }
+    };
+    Some(Invocation { performed, region })
 }
 
 impl EnvironmentPrograms for StepObjectCli {
@@ -379,8 +410,18 @@ impl EnvironmentPrograms for StepObjectCli {
         if name != OBJECT_CLI_PROGRAM {
             return None;
         }
-        let requested = requested(arguments)?;
-        Some(self.performed(&requested, standard_input, files))
+        let invocation = requested(arguments)?;
+        // A command line that named a Region makes its calls in THAT Region: the client this
+        // command uses is this one with the Region the option named, and every bound it carries
+        // — the budget, the credential — is still this command's own.
+        let cli = match invocation.region {
+            Some(region) => ::std::borrow::Cow::Owned(Self {
+                region,
+                ..self.clone()
+            }),
+            None => ::std::borrow::Cow::Borrowed(self),
+        };
+        Some(cli.performed(&invocation.performed, standard_input, files))
     }
 }
 
@@ -806,7 +847,88 @@ mod tests {
         for (case, line, expected) in rows {
             let asked = requested(&words(line));
             assert_eq!(
-                asked, expected,
+                asked.as_ref().map(|invocation| invocation.performed.clone()),
+                expected,
+                "case {case:?}: expected {expected:?}, got {asked:?}"
+            );
+            assert!(
+                asked
+                    .as_ref()
+                    .is_none_or(|invocation| invocation.region.is_none()),
+                "case {case:?}: a line naming no Region asks for none, got {asked:?}"
+            );
+        }
+    }
+
+    /// RULE's option half: "`--region` (string) — the region to use" is the one option these
+    /// commands take, read in either spelling the CLI takes it in, and every OTHER option is
+    /// still a form this program performs nothing of.
+    ///
+    /// The rows differ along where the option stands, which command carries it, how its value
+    /// is written, and the ways it can fail to be that option at all.
+    #[test]
+    fn the_region_option_names_where_the_calls_are_made() {
+        // (case, the arguments after `aws`, the Region the invocation asks its calls to be made
+        // in — `None` for a line this program performs nothing of)
+        let rows: Vec<(&str, &str, Option<Option<&str>>)> = vec![
+            (
+                "the option's value as the next word",
+                "s3 cp /tmp/a s3://reports/a --region us-west-2",
+                Some(Some("us-west-2")),
+            ),
+            (
+                "the option's value joined to it",
+                "s3 cp /tmp/a s3://reports/a --region=eu-central-1",
+                Some(Some("eu-central-1")),
+            ),
+            (
+                "the option before the operands",
+                "s3 cp --region us-east-2 /tmp/a s3://reports/a",
+                Some(Some("us-east-2")),
+            ),
+            (
+                "a removal naming a Region",
+                "s3 rm s3://reports/a --region ap-south-1",
+                Some(Some("ap-south-1")),
+            ),
+            (
+                "a download to the command's own stream naming a Region",
+                "s3 cp s3://reports/a - --region us-west-1",
+                Some(Some("us-west-1")),
+            ),
+            (
+                "no option at all",
+                "s3 cp /tmp/a s3://reports/a",
+                Some(None),
+            ),
+            (
+                "the option with no value",
+                "s3 cp /tmp/a s3://reports/a --region",
+                None,
+            ),
+            (
+                "the option with an empty value",
+                "s3 cp /tmp/a s3://reports/a --region=",
+                None,
+            ),
+            (
+                "an option that only begins like it",
+                "s3 cp /tmp/a s3://reports/a --region-name us-west-2",
+                None,
+            ),
+            (
+                "another option beside it",
+                "s3 cp /tmp/a s3://reports/a --region us-west-2 --quiet",
+                None,
+            ),
+        ];
+        for (case, line, expected) in rows {
+            let asked = requested(&words(line));
+            let region = asked
+                .as_ref()
+                .map(|invocation| invocation.region.as_deref());
+            assert_eq!(
+                region, expected,
                 "case {case:?}: expected {expected:?}, got {asked:?}"
             );
         }
