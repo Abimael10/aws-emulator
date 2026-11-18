@@ -381,9 +381,28 @@ pub struct PublishedDocument {
     /// A `DocumentType` value (`crate::ops::types::DOCUMENT_TYPE_VALUES`).
     pub document_type: &'static str,
     /// The document's body, in [`DEFAULT_DOCUMENT_FORMAT`]. Everything a read reports
-    /// beyond the name and the type is derived from it by the one content reader
-    /// ([`parse_document_content`]), exactly as it is for a document a caller created.
+    /// beyond the name, the type and the publication date is derived from it by the one
+    /// content reader ([`parse_document_content`]), exactly as it is for a document a
+    /// caller created.
     pub content: &'static str,
+    /// When Amazon published this document, in MILLISECONDS since the Unix epoch.
+    ///
+    /// `CreatedDate` is "the date the document was created"
+    /// (`DocumentVersionInfo$CreatedDate`, `DocumentDescription$CreatedDate`), and nobody
+    /// in this account created a published document: Amazon did, once, before any account
+    /// read it. So the date is a FACT OF THE CATALOGUE carried here as data rather than a
+    /// clock reading taken when this store came into being — identical in every account,
+    /// Region and run of the emulator, and unchanged by a restart. Milliseconds, because
+    /// that is the precision Systems Manager reports a document date at.
+    pub created_date_millis: u64,
+}
+
+impl PublishedDocument {
+    /// The instant this document was published, as the stored record and every projection
+    /// of it carry it ([`PublishedDocument::created_date_millis`]).
+    pub fn created_date(&self) -> SystemTime {
+        ::std::time::UNIX_EPOCH + ::std::time::Duration::from_millis(self.created_date_millis)
+    }
 }
 
 /// The body of the runbook that configures versioning on an S3 bucket.
@@ -717,10 +736,19 @@ pub(super) const UPDATE_SSM_AGENT: &str = r#"{
 /// The names and document types are the ones the AWS Systems Manager User Guide
 /// publishes — the "Systems Manager Automation runbook reference" for the `AWS-*`
 /// Automation runbooks (the runbooks a Config remediation configuration names as its
-/// target) and the "Systems Manager command document" reference for the `AWS-*` command
+/// target), the "Systems Manager command document" reference for the `AWS-*` command
+/// documents and the "Session document schema" for the `AWS-Start*Session` session
 /// documents. Each body declares the parameters that reference documents for its
 /// document, so a read derives its description, schema version, parameters and platform
 /// types from the body rather than restating them here.
+///
+/// Each entry also carries WHEN Amazon published it
+/// ([`PublishedDocument::created_date_millis`]), because `CreatedDate` is a fact of the
+/// catalogue rather than a reading of this store's clock: the documents the recorded
+/// catalogue of a real account (corpus `simparity-wire-aws-v1`) pins a date for carry that
+/// date, and the rest carry this emulator's stand-in for their publication date — chosen
+/// once, like the bodies — so that every account, Region and run of the emulator reports
+/// one document's date identically.
 ///
 /// Every name here starts with one of the prefixes [`RESERVED_DOCUMENT_NAME_PREFIXES`]
 /// reserves, which is why no `CreateDocument` can collide with one.
@@ -729,53 +757,239 @@ pub const PUBLISHED_DOCUMENTS: &[PublishedDocument] = &[
         name: "AWS-ConfigureS3BucketVersioning",
         document_type: "Automation",
         content: CONFIGURE_S3_BUCKET_VERSIONING,
+        created_date_millis: 1_545_264_000_000,
     },
     PublishedDocument {
         name: "AWS-ConfigureS3BucketPublicAccessBlock",
         document_type: "Automation",
         content: CONFIGURE_S3_BUCKET_PUBLIC_ACCESS_BLOCK,
+        created_date_millis: 1_549_152_000_000,
     },
     PublishedDocument {
         name: "AWS-DisableS3BucketPublicReadWrite",
         document_type: "Automation",
         content: DISABLE_S3_BUCKET_PUBLIC_READ_WRITE,
+        created_date_millis: 1_547_510_400_000,
     },
     PublishedDocument {
         name: "AWS-EnableS3BucketEncryption",
         document_type: "Automation",
         content: ENABLE_S3_BUCKET_ENCRYPTION,
+        created_date_millis: 1_551_398_400_000,
     },
     PublishedDocument {
         name: "AWS-PublishSNSNotification",
         document_type: "Automation",
         content: PUBLISH_SNS_NOTIFICATION,
+        created_date_millis: 1_554_076_800_000,
     },
     PublishedDocument {
         name: "AWS-RunShellScript",
         document_type: "Command",
         content: RUN_SHELL_SCRIPT,
+        created_date_millis: 1_503_695_717_821,
     },
     PublishedDocument {
         name: "AWS-RunPowerShellScript",
         document_type: "Command",
         content: RUN_POWER_SHELL_SCRIPT,
+        created_date_millis: 1_503_695_741_940,
     },
     PublishedDocument {
         name: "AWS-UpdateSSMAgent",
         document_type: "Command",
         content: UPDATE_SSM_AGENT,
+        created_date_millis: 1_622_567_950_979,
     },
     PublishedDocument {
         name: inventory::GATHER_SOFTWARE_INVENTORY_DOCUMENT,
         document_type: DOCUMENT_TYPE_POLICY,
         content: inventory::GATHER_SOFTWARE_INVENTORY,
+        created_date_millis: 1_564_011_832_472,
     },
     PublishedDocument {
         name: patch_runs::RUN_PATCH_BASELINE_DOCUMENT,
         document_type: "Command",
         content: patch_runs::RUN_PATCH_BASELINE,
+        created_date_millis: 1_786_631_569_844,
+    },
+    // The rest of the Command documents Systems Manager publishes: what Run Command,
+    // Distributor, State Manager and the patch and update workflows name. The recorded
+    // catalogue pins the date of `AWS-ConfigureAWSPackage`; the dates below it are the
+    // stand-ins this file's header describes.
+    PublishedDocument {
+        name: "AWS-ConfigureAWSPackage",
+        document_type: "Command",
+        content: published_command_documents::CONFIGURE_AWS_PACKAGE,
+        created_date_millis: 1_706_038_480_989,
+    },
+    PublishedDocument {
+        name: "AWS-InstallApplication",
+        document_type: "Command",
+        content: published_command_documents::INSTALL_APPLICATION,
+        created_date_millis: 1_503_695_753_117,
+    },
+    PublishedDocument {
+        name: "AWS-InstallPowerShellModule",
+        document_type: "Command",
+        content: published_command_documents::INSTALL_POWER_SHELL_MODULE,
+        created_date_millis: 1_503_695_761_438,
+    },
+    PublishedDocument {
+        name: "AWS-InstallWindowsUpdates",
+        document_type: "Command",
+        content: published_command_documents::INSTALL_WINDOWS_UPDATES,
+        created_date_millis: 1_503_695_769_206,
+    },
+    PublishedDocument {
+        name: "AWS-FindWindowsUpdates",
+        document_type: "Command",
+        content: published_command_documents::FIND_WINDOWS_UPDATES,
+        created_date_millis: 1_503_695_776_925,
+    },
+    PublishedDocument {
+        name: "AWS-RunRemoteScript",
+        document_type: "Command",
+        content: published_command_documents::RUN_REMOTE_SCRIPT,
+        created_date_millis: 1_503_695_784_612,
+    },
+    PublishedDocument {
+        name: "AWS-RunDocument",
+        document_type: "Command",
+        content: published_command_documents::RUN_DOCUMENT,
+        created_date_millis: 1_503_695_792_309,
+    },
+    PublishedDocument {
+        name: "AWS-RefreshAssociation",
+        document_type: "Command",
+        content: published_command_documents::REFRESH_ASSOCIATION,
+        created_date_millis: 1_503_695_800_174,
+    },
+    PublishedDocument {
+        name: "AWS-JoinDirectoryServiceDomain",
+        document_type: "Command",
+        content: published_command_documents::JOIN_DIRECTORY_SERVICE_DOMAIN,
+        created_date_millis: 1_503_695_808_461,
+    },
+    PublishedDocument {
+        name: "AWS-ApplyAnsiblePlaybooks",
+        document_type: "Command",
+        content: published_command_documents::APPLY_ANSIBLE_PLAYBOOKS,
+        created_date_millis: 1_563_822_104_358,
+    },
+    PublishedDocument {
+        name: "AWS-ConfigureCloudWatch",
+        document_type: "Command",
+        content: published_command_documents::CONFIGURE_CLOUD_WATCH,
+        created_date_millis: 1_503_695_816_733,
+    },
+    PublishedDocument {
+        name: "AWS-RunInspecChecks",
+        document_type: "Command",
+        content: published_command_documents::RUN_INSPEC_CHECKS,
+        created_date_millis: 1_551_308_281_476,
+    },
+    // The Session documents Session Manager starts a session with, each at a stand-in
+    // publication date.
+    PublishedDocument {
+        name: "AWS-StartSSHSession",
+        document_type: DOCUMENT_TYPE_SESSION,
+        content: published_command_documents::START_SSH_SESSION,
+        created_date_millis: 1_555_361_827_515,
+    },
+    PublishedDocument {
+        name: "AWS-StartPortForwardingSession",
+        document_type: DOCUMENT_TYPE_SESSION,
+        content: published_command_documents::START_PORT_FORWARDING_SESSION,
+        created_date_millis: 1_566_497_019_264,
+    },
+    PublishedDocument {
+        name: "AWS-StartPortForwardingSessionToRemoteHost",
+        document_type: DOCUMENT_TYPE_SESSION,
+        content: published_command_documents::START_PORT_FORWARDING_SESSION_TO_REMOTE_HOST,
+        created_date_millis: 1_629_741_532_908,
+    },
+    PublishedDocument {
+        name: "AWS-StartInteractiveCommand",
+        document_type: DOCUMENT_TYPE_SESSION,
+        content: published_command_documents::START_INTERACTIVE_COMMAND,
+        created_date_millis: 1_641_332_078_651,
+    },
+    PublishedDocument {
+        name: "AWS-StartNonInteractiveCommand",
+        document_type: DOCUMENT_TYPE_SESSION,
+        content: published_command_documents::START_NON_INTERACTIVE_COMMAND,
+        created_date_millis: 1_641_332_086_774,
+    },
+    // The Automation runbooks that act on an Amazon EC2 instance or its volumes, each at a
+    // stand-in publication date.
+    PublishedDocument {
+        name: "AWS-StartEC2Instance",
+        document_type: "Automation",
+        content: published_automation_runbooks::START_EC2_INSTANCE,
+        created_date_millis: 1_514_908_801_332,
+    },
+    PublishedDocument {
+        name: "AWS-StopEC2Instance",
+        document_type: "Automation",
+        content: published_automation_runbooks::STOP_EC2_INSTANCE,
+        created_date_millis: 1_514_908_809_447,
+    },
+    PublishedDocument {
+        name: "AWS-RestartEC2Instance",
+        document_type: "Automation",
+        content: published_automation_runbooks::RESTART_EC2_INSTANCE,
+        created_date_millis: 1_514_908_817_519,
+    },
+    PublishedDocument {
+        name: "AWS-TerminateEC2Instance",
+        document_type: "Automation",
+        content: published_automation_runbooks::TERMINATE_EC2_INSTANCE,
+        created_date_millis: 1_514_908_825_638,
+    },
+    PublishedDocument {
+        name: "AWS-CreateImage",
+        document_type: "Automation",
+        content: published_automation_runbooks::CREATE_IMAGE,
+        created_date_millis: 1_514_908_833_712,
+    },
+    PublishedDocument {
+        name: "AWS-CreateSnapshot",
+        document_type: "Automation",
+        content: published_automation_runbooks::CREATE_SNAPSHOT,
+        created_date_millis: 1_514_908_841_805,
+    },
+    PublishedDocument {
+        name: "AWS-DeleteSnapshot",
+        document_type: "Automation",
+        content: published_automation_runbooks::DELETE_SNAPSHOT,
+        created_date_millis: 1_514_908_849_923,
+    },
+    PublishedDocument {
+        name: "AWS-UpdateLinuxAmi",
+        document_type: "Automation",
+        content: published_automation_runbooks::UPDATE_LINUX_AMI,
+        created_date_millis: 1_514_908_858_046,
+    },
+    PublishedDocument {
+        name: "AWS-PatchInstanceWithRollback",
+        document_type: "Automation",
+        content: published_automation_runbooks::PATCH_INSTANCE_WITH_ROLLBACK,
+        created_date_millis: 1_514_908_866_117,
+    },
+    PublishedDocument {
+        name: "AWS-ResizeInstance",
+        document_type: "Automation",
+        content: published_automation_runbooks::RESIZE_INSTANCE,
+        created_date_millis: 1_514_908_874_238,
     },
 ];
+
+/// The `DocumentType` of a document that OPENS A SESSION on a managed node rather than
+/// running a command on it (from the modelled enum,
+/// `crate::ops::types::DOCUMENT_TYPE_VALUES`): the type of the session documents Session
+/// Manager starts a session with.
+pub const DOCUMENT_TYPE_SESSION: &str = "Session";
 
 /// The `DocumentType` of a document that tells the agent on a managed node WHAT TO COLLECT
 /// rather than what to run (from the modelled enum,

@@ -53,21 +53,62 @@ const OTHER_REGION: &str = "eu-central-1";
 const PLATFORM_TYPES: &[&str] = &["Windows", "Linux", "MacOS"];
 
 /// The published `Automation` runbooks, in name order. Checked below to partition the
-/// catalogue with [`PUBLISHED_COMMANDS`], so a new entry has to be given its place here.
+/// catalogue with [`PUBLISHED_COMMANDS`], [`PUBLISHED_POLICIES`] and
+/// [`PUBLISHED_SESSIONS`], so a new entry has to be given its place here.
 const PUBLISHED_AUTOMATIONS: &[&str] = &[
     "AWS-ConfigureS3BucketPublicAccessBlock",
     "AWS-ConfigureS3BucketVersioning",
+    "AWS-CreateImage",
+    "AWS-CreateSnapshot",
+    "AWS-DeleteSnapshot",
     "AWS-DisableS3BucketPublicReadWrite",
     "AWS-EnableS3BucketEncryption",
+    "AWS-PatchInstanceWithRollback",
     "AWS-PublishSNSNotification",
+    "AWS-ResizeInstance",
+    "AWS-RestartEC2Instance",
+    "AWS-StartEC2Instance",
+    "AWS-StopEC2Instance",
+    "AWS-TerminateEC2Instance",
+    "AWS-UpdateLinuxAmi",
 ];
 
 /// The published `Command` documents, in name order.
 const PUBLISHED_COMMANDS: &[&str] = &[
+    "AWS-ApplyAnsiblePlaybooks",
+    "AWS-ConfigureAWSPackage",
+    "AWS-ConfigureCloudWatch",
+    "AWS-FindWindowsUpdates",
+    "AWS-InstallApplication",
+    "AWS-InstallPowerShellModule",
+    "AWS-InstallWindowsUpdates",
+    "AWS-JoinDirectoryServiceDomain",
+    "AWS-RefreshAssociation",
+    "AWS-RunDocument",
+    "AWS-RunInspecChecks",
     "AWS-RunPatchBaseline",
     "AWS-RunPowerShellScript",
+    "AWS-RunRemoteScript",
     "AWS-RunShellScript",
     "AWS-UpdateSSMAgent",
+];
+
+/// The published `Session` documents, in name order: what Session Manager opens a session
+/// with.
+const PUBLISHED_SESSIONS: &[&str] = &[
+    "AWS-StartInteractiveCommand",
+    "AWS-StartNonInteractiveCommand",
+    "AWS-StartPortForwardingSession",
+    "AWS-StartPortForwardingSessionToRemoteHost",
+    "AWS-StartSSHSession",
+];
+
+/// The published `Command` documents whose steps restrict them to the Unix-like
+/// platforms, so they are the ones a `PlatformTypes` filter for `Windows` leaves out.
+const PUBLISHED_COMMANDS_WITHOUT_WINDOWS: &[&str] = &[
+    "AWS-ApplyAnsiblePlaybooks",
+    "AWS-RunInspecChecks",
+    "AWS-RunShellScript",
 ];
 
 /// The published `Policy` documents, in name order: the inventory policy document a client
@@ -648,13 +689,17 @@ async fn filters_narrow_the_listing_by_one_attribute() {
         assert!(
             PUBLISHED_AUTOMATIONS.contains(&entry.name)
                 || PUBLISHED_COMMANDS.contains(&entry.name)
-                || PUBLISHED_POLICIES.contains(&entry.name),
+                || PUBLISHED_POLICIES.contains(&entry.name)
+                || PUBLISHED_SESSIONS.contains(&entry.name),
             "the expectations must carry published document {}",
             entry.name
         );
     }
     assert_eq!(
-        PUBLISHED_AUTOMATIONS.len() + PUBLISHED_COMMANDS.len() + PUBLISHED_POLICIES.len(),
+        PUBLISHED_AUTOMATIONS.len()
+            + PUBLISHED_COMMANDS.len()
+            + PUBLISHED_POLICIES.len()
+            + PUBLISHED_SESSIONS.len(),
         CATALOGUE.len(),
         "the expectations must name only documents the service publishes"
     );
@@ -672,21 +717,22 @@ async fn filters_narrow_the_listing_by_one_attribute() {
         .copied()
         .chain(["EchoOnLinux", "EchoOnWindows"])
         .collect();
-    // A document is compatible with Windows when its body's preconditions do not restrict
-    // it to another platform: the two Windows documents, everything that restricts itself
-    // to no platform, and nothing whose steps are Linux-only or that carries no tree.
+    // A document is compatible with Windows when its body's preconditions and its steps'
+    // plugins do not restrict it to another platform: everything that restricts itself to
+    // no platform, the Windows-only documents, and nothing whose steps are Unix-only or
+    // that carries no tree.
     let windows: Vec<&str> = PUBLISHED_AUTOMATIONS
         .iter()
         .copied()
         .chain(PUBLISHED_POLICIES.iter().copied())
-        .chain([
-            "AWS-RunPatchBaseline",
-            "AWS-RunPowerShellScript",
-            "AWS-UpdateSSMAgent",
-            "ApproveNodeAccess",
-            "EchoOnWindows",
-            "RemediateBucket",
-        ])
+        .chain(PUBLISHED_SESSIONS.iter().copied())
+        .chain(
+            PUBLISHED_COMMANDS
+                .iter()
+                .copied()
+                .filter(|name| !PUBLISHED_COMMANDS_WITHOUT_WINDOWS.contains(name)),
+        )
+        .chain(["ApproveNodeAccess", "EchoOnWindows", "RemediateBucket"])
         .collect();
 
     let cases: Vec<(&str, Value, Vec<String>)> = vec![
@@ -729,8 +775,11 @@ async fn filters_narrow_the_listing_by_one_attribute() {
             "a prefix of the published catalogue",
             json!({ "Filters": [{ "Key": "Name", "Values": ["AWS-Run"] }] }),
             sorted(&[
+                "AWS-RunDocument",
+                "AWS-RunInspecChecks",
                 "AWS-RunPatchBaseline",
                 "AWS-RunPowerShellScript",
+                "AWS-RunRemoteScript",
                 "AWS-RunShellScript",
             ]),
         ),
@@ -755,8 +804,13 @@ async fn filters_narrow_the_listing_by_one_attribute() {
             sorted(&["ApproveNodeAccess", "CalendarEntry"]),
         ),
         (
-            "a document type nothing holds names nothing",
+            "the published Session documents are the documents of that type",
             json!({ "Filters": [{ "Key": "DocumentType", "Values": ["Session"] }] }),
+            sorted(PUBLISHED_SESSIONS),
+        ),
+        (
+            "a document type nothing holds names nothing",
+            json!({ "Filters": [{ "Key": "DocumentType", "Values": ["Package"] }] }),
             Vec::new(),
         ),
         (

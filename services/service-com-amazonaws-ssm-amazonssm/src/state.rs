@@ -40,8 +40,9 @@
 //!
 //! A document a caller created is not the only one an account holds: Systems Manager
 //! also PUBLISHES a catalogue of its own documents ([`PUBLISHED_DOCUMENTS`]) in every
-//! account and Region, which resolve by name without anybody creating them and are
-//! owned by Amazon. A read goes through [`ComAmazonawsSsmAmazonssmState::resolve_document`],
+//! account and Region, which resolve by name without anybody creating them, are
+//! owned by Amazon and are dated by the day Amazon published each of them. A read goes
+//! through [`ComAmazonawsSsmAmazonssmState::resolve_document`],
 //! which answers with the created document of that name or, failing that, the published
 //! one — derived from the catalogue's body by the same content reader, so a published
 //! document reports nothing a created one would not. `ListDocuments` reports exactly the
@@ -423,6 +424,14 @@ pub use node_filters::*;
 /// `crate::state::<name>`.
 mod documents;
 pub use documents::*;
+
+/// The bodies of the Command and Session documents the published catalogue carries
+/// ([`PUBLISHED_DOCUMENTS`]).
+pub mod published_command_documents;
+
+/// The bodies of the Automation runbooks the published catalogue carries
+/// ([`PUBLISHED_DOCUMENTS`]).
+pub mod published_automation_runbooks;
 
 use service_settings::ServiceSettingRecord;
 
@@ -2484,11 +2493,13 @@ impl ComAmazonawsSsmAmazonssmState {
     /// `region`'s endpoint, or `None` when the catalogue holds none of that name.
     ///
     /// Built from the catalogue's own body, so everything the read reports beyond the
-    /// name and the type — the schema version, the description, the parameters, the
-    /// platform types, the hash — is derived by the one content reader that reads a
-    /// created document's content. A published document is already registered, so it is
-    /// `Active` with no transition owed, and it is owned by Amazon rather than by the
-    /// account reading it.
+    /// name, the type and the publication date — the schema version, the description, the
+    /// parameters, the platform types, the hash — is derived by the one content reader
+    /// that reads a created document's content. A published document is already
+    /// registered, so it is `Active` with no transition owed, it is owned by Amazon rather
+    /// than by the account reading it, and it is dated by the catalogue's own publication
+    /// date ([`PublishedDocument::created_date`]) rather than by this store's beginning:
+    /// nobody here created it.
     pub fn published_document_record(&self, region: &str, name: &str) -> Option<DocumentRecord> {
         let (published, parsed, hash) = published_document_projection(name)?;
         Some(DocumentRecord {
@@ -2515,7 +2526,7 @@ impl ComAmazonawsSsmAmazonssmState {
                 parsed: parsed.clone(),
                 requires: None,
                 attachment_names: Vec::new(),
-                created_date: self.created_at,
+                created_date: published.created_date(),
                 status: DOCUMENT_STATUS_ACTIVE.to_string(),
                 active_due: None,
             }],

@@ -26,9 +26,10 @@
 //! (`arn:aws:iam::aws:policy/…`), whether IAM holds the identity and the policy at all, and
 //! — in the second table — which execution type takes the definition back off. The last two
 //! tests carry the same rule onto the other two action types, whose work AWS Organizations
-//! and Systems Manager own: there the owning service cannot perform that work in this
-//! emulator yet, so what each asserts is the emulator's own refusal path rather than the
-//! outcome AWS produces — each says so, and names the gap.
+//! and Systems Manager own: Organizations cannot perform its work in this emulator yet, so
+//! what that test asserts is the emulator's own refusal path rather than the outcome AWS
+//! produces, and it names the gap; the Systems Manager table asserts both sides — the sub
+//! type whose runbook Systems Manager publishes and the one whose runbook it does not.
 
 use std::sync::Arc;
 
@@ -794,36 +795,46 @@ async fn reverting_or_re_arming_an_executed_action_takes_its_policy_back_off() {
 /// action runs the document its `ActionSubType` names, in the Region the definition names,
 /// through Systems Manager itself.
 ///
-/// What this asserts is the EMULATOR's refusal path, not the outcome AWS produces: on AWS
-/// such an approval stops the instances and settles at `EXECUTION_SUCCESS`, while this
-/// emulator's Systems Manager publishes no `AWS-Stop…` Automation runbook for either sub type
-/// (`crate::state::PUBLISHED_DOCUMENTS` of the Systems Manager crate), so it answers that the
-/// document does not exist. Nothing stopped any instance, so the honest report is the
-/// failure, and when that gap in Systems Manager closes the same action settles at
-/// `EXECUTION_SUCCESS` with nothing in this crate changing.
+/// So the settled status follows what that service did with the run: Systems Manager
+/// publishes `AWS-StopEC2Instance` (`crate::state::PUBLISHED_DOCUMENTS` of the Systems
+/// Manager crate), so the automation for `STOP_EC2_INSTANCES` starts there and the action
+/// settles at `EXECUTION_SUCCESS`; it publishes no `AWS-StopRdsInstance` yet, so that sub
+/// type's document does not exist, nothing ran for it, and the honest report is the failure
+/// — when that gap in Systems Manager closes the same action settles at `EXECUTION_SUCCESS`
+/// with nothing in this crate changing.
+///
+/// What the success says is that Systems Manager ACCEPTED the run of the document: the
+/// action's work is starting it (`applied_definition::run_ssm_document` sends
+/// `StartAutomationExecution` and reports that answer), and how far the automation then
+/// gets with the instances it names is that execution's own status in Systems Manager, not
+/// this action's.
 #[tokio::test]
-async fn an_action_whose_document_systems_manager_does_not_hold_does_not_complete() {
+async fn an_action_settles_at_what_systems_manager_did_with_its_document() {
     let account_id = caller_account();
     // The whole modelled `ActionSubType` catalog, each with the instance ids its documented
-    // `InstanceIds` member carries ("the EC2 and RDS instance IDs") and a Region to run in.
-    let rows: [(&str, &str, &[&str]); 3] = [
+    // `InstanceIds` member carries ("the EC2 and RDS instance IDs"), a Region to run in, and
+    // the status the run of its document settles the action at.
+    let rows: [(&str, &str, &[&str], &str); 3] = [
         (
             "stopping one EC2 instance",
             "STOP_EC2_INSTANCES",
             &["i-1234567890abcdef0"],
+            ACTION_STATUS_EXECUTION_SUCCESS,
         ),
         (
             "stopping two EC2 instances in another Region",
             "STOP_EC2_INSTANCES",
             &["i-1234567890abcdef0", "i-0fedcba0987654321"],
+            ACTION_STATUS_EXECUTION_SUCCESS,
         ),
         (
-            "stopping one RDS instance",
+            "stopping one RDS instance, whose document Systems Manager does not publish",
             "STOP_RDS_INSTANCES",
             &["i-abcdef1234567890f"],
+            ACTION_STATUS_EXECUTION_FAILURE,
         ),
     ];
-    for (case, sub_type, instance_ids) in rows {
+    for (case, sub_type, instance_ids, expected) in rows {
         let (router, engine) = ssm_emulator();
         let region = if case.contains("another Region") {
             "eu-west-2"
@@ -862,9 +873,8 @@ async fn an_action_whose_document_systems_manager_does_not_hold_does_not_complet
         make_settle_due(&engine, &account_id, budget_name, &action_id);
         let settled = read_status(&router, &account_id, budget_name, &action_id).await;
         assert_eq!(
-            settled, ACTION_STATUS_EXECUTION_FAILURE,
-            "case {case:?}: expected the execution to settle at EXECUTION_FAILURE, \
-             got {settled:?}"
+            settled, expected,
+            "case {case:?}: expected the execution to settle at {expected}, got {settled:?}"
         );
     }
 }
