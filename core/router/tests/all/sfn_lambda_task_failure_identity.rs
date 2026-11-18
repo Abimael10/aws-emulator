@@ -9,9 +9,9 @@
 //! `Resource` named the function (the answer is the task's own), and as the document the
 //! integration read out of the SDK response where the `Resource` named the optimized
 //! `lambda:invoke` integration. An access-denied refusal of the invocation is reported
-//! instead only where the documents in force on the execution role REFUSE the call, and
-//! the store can refuse it only on a document it holds: a role it holds no identity-based
-//! document for shows nothing about what that role may do, so the call is made. And a
+//! instead wherever no document in force on the execution role ALLOWS the call, which
+//! includes a role of this account carrying no identity-based document at all: a grant has
+//! to come from a document, so such a role allows nothing. And a
 //! redriven attempt resumes the step the last attempt stopped at without entering it
 //! again, so the first event it writes for that step names the PRESERVED event that
 //! entered it as its `previousEventId`.
@@ -662,7 +662,7 @@ async fn a_failed_lambda_tasks_failure_identity_is_the_runs_own() {
     )
     .await;
 
-    the_role_gate_refuses_a_task_only_on_a_document_the_store_holds(&router, &raiser).await;
+    a_task_is_made_only_where_a_document_in_force_allows_it(&router, &raiser).await;
     a_failed_invocations_cause_is_the_document_the_run_answered(
         &router, &raiser, &sleeper, &granting,
     )
@@ -671,10 +671,11 @@ async fn a_failed_lambda_tasks_failure_identity_is_the_runs_own() {
         .await;
 }
 
-/// The store can refuse a task's call only on a document it HOLDS: a role whose
-/// identity-based documents it holds none of shows nothing about what the role may do, so
-/// the call is made and the task closes on the run's own failure.
-async fn the_role_gate_refuses_a_task_only_on_a_document_the_store_holds(
+/// A task's call is made only where a document in force on its role ALLOWS it: a role
+/// whose documents say nothing about the invocation, and a role of this account carrying no
+/// identity-based document at all, both refuse it, and only a grant lets the call be made
+/// and the task close on the run's own failure.
+async fn a_task_is_made_only_where_a_document_in_force_allows_it(
     router: &MultiServiceRouter,
     raiser: &str,
 ) {
@@ -696,9 +697,9 @@ async fn the_role_gate_refuses_a_task_only_on_a_document_the_store_holds(
             made: false,
         },
         RoleRow {
-            case: "a role the account holds no identity-based document for",
+            case: "a role the account holds that carries no identity-based document at all",
             statements: None,
-            made: true,
+            made: false,
         },
     ];
 

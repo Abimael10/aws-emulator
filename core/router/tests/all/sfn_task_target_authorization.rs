@@ -256,7 +256,16 @@ pub(crate) fn string(body: &Value, name: &str) -> String {
 }
 
 /// One awsQuery call to IAM, requiring a 200, answered with the XML body.
-async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, String)]) -> String {
+///
+/// `pub(crate)` for the same reason the rest of this harness is: `all/
+/// sfn_execution_role_documents_in_force.rs` provisions what a role carries through IAM's
+/// own create, attach and detach calls, and `tests/all.rs` is one crate root, so the one
+/// IAM caller lives here.
+pub(crate) async fn iam(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, String)],
+) -> String {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -284,7 +293,10 @@ async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, String)
 
 /// The trust document a Step Functions execution role carries, which is what lets that
 /// service act as it.
-fn trust_document() -> Value {
+///
+/// `pub(crate)` for the reason [`iam`] is: every role a suite here creates for a state
+/// machine is trusted the same way, whatever its PERMISSIONS then are.
+pub(crate) fn trust_document() -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{

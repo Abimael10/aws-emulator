@@ -54,16 +54,14 @@
 //! nothing about the role and lets the call be made: an engine carrying no IAM store,
 //! a `roleArn` the store holds no role for (it may belong to another account), a role
 //! carrying an attachment whose document this account does not hold — an AWS-managed
-//! policy might be the very one that carries the grant — a role this store holds NO
-//! identity-based document for at all, since there is no document to read a grant out
-//! of and none to read a deny out of either (this store holds only what its own
-//! handlers were asked to write, so a role whose permissions were provisioned outside
-//! it is held exactly like one that has none), and a call no
+//! policy might be the very one that carries the grant — and a call no
 //! [`super::integration::TARGET_RESOURCES`] entry names the target resource of, since
 //! an access request cannot be formed without the resource it is about. What the
 //! documents DO state is decided in IAM's own order: an explicit `Deny` refuses, a
 //! grant allows, and policies that state nothing about the call withhold it, because
-//! the documents in force on a role are the authority on what it may do.
+//! the documents in force on a role are the authority on what it may do — and so is
+//! the absence of any: a role of this account carrying no identity-based document
+//! grants nothing, which is the implicit deny every identity starts from.
 //!
 //! ## Assuming the role at all
 //!
@@ -682,23 +680,15 @@ fn withheld(
     // quotas on how many policies one role carries, so this walk is bounded by the
     // store rather than by a number of its own.
     let policies = iam.principal_policies(role_arn)?;
-    // A role the store holds no readable identity-based document for at all is a role
-    // whose permissions this emulator cannot see: there is no document to read a grant
-    // out of and none to read a deny out of either, which shows nothing about the call.
-    // This store holds what its own handlers were asked to write, so a role whose
-    // permissions were provisioned outside it is held exactly like one that carries
-    // none — and a refusal here would assert the absence of a document rather than read
-    // one. A document that IS held and says nothing about the call is a different case:
-    // that one refuses, below.
-    if policies.documents.is_empty() {
-        return None;
-    }
     let request = iam::Request::new(action, resource, &[]);
     let stated = iam::identity_decision(&policies.documents, &request);
-    // An attachment whose document this account does not hold is a grant this
-    // emulator cannot read, so it cannot be the basis of a refusal — but it cannot
-    // overturn one either: an explicit `Deny` in a document that IS held wins over
-    // every grant, including one whose content is unknown here.
+    // Whether the documents in force grant the call at all. Nothing stated is IAM's
+    // implicit deny, so a role carrying NO identity-based document grants nothing: a
+    // grant has to come from a document, which is how IAM's own gate over this same
+    // store reads the identity it holds. An attachment whose document this account does
+    // not hold is the one grant this emulator cannot read, so it cannot be the basis of
+    // a refusal — but it cannot overturn one either: an explicit `Deny` in a document
+    // that IS held wins over every grant, including one whose content is unknown here.
     let granted = iam::is_allowed(stated, Decision::NotStated)
         || (stated != Decision::Denied && !policies.uncarried.is_empty());
     // "A permissions boundary sets the maximum permissions that an identity-based
