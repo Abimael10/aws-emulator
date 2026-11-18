@@ -43,16 +43,16 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::harness::{given_queue, received_messages, rpc, Emulator, REGION};
 
 /// The `source` every event below is matched on.
-const SOURCE: &str = "aws.cloudwatch";
+pub(crate) const SOURCE: &str = "aws.cloudwatch";
 
 /// The `detail-type` of an alarm configuration change, spelled out here rather than imported
 /// from the service crate, so a wrong constant in the implementation cannot make this suite
 /// pass.
-const DETAIL_TYPE: &str = "CloudWatch Alarm Configuration Change";
+pub(crate) const DETAIL_TYPE: &str = "CloudWatch Alarm Configuration Change";
 
 /// The three `detail.operation` values a write reports.
-const CREATE: &str = "create";
-const UPDATE: &str = "update";
+pub(crate) const CREATE: &str = "create";
+pub(crate) const UPDATE: &str = "update";
 const DELETE: &str = "delete";
 
 /// The service principal EventBridge delivers to an SQS target as, which the queue's own policy
@@ -69,15 +69,15 @@ const PERIOD: i64 = 60;
 /// How long this suite waits for work the clock owes — the asynchronous publication of an event
 /// and its delivery to a target — before giving up on it. Generous on purpose: nothing here is
 /// asserted about how fast the host runs, only about what eventually arrives.
-const WORK_WAIT: Duration = Duration::from_secs(60);
+pub(crate) const WORK_WAIT: Duration = Duration::from_secs(60);
 
 /// How often it looks while waiting.
-const LOOK_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const LOOK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// CloudWatch, EventBridge and Amazon SQS over ONE shared engine, as `core/router/src/lib.rs`
 /// mounts them: the event CloudWatch publishes reaches EventBridge's own handler, which matches
 /// it against this account's rules and delivers it to the queue this suite reads.
-fn emulator_with_a_bus() -> Emulator {
+pub(crate) fn emulator_with_a_bus() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -99,7 +99,12 @@ fn emulator_with_a_bus() -> Emulator {
 ///
 /// EventBridge serves `awsJson1_1` where this service serves `awsJson1_0`, so the call is made
 /// here rather than through the shared RPC helper: the content type is part of the wire.
-async fn eventbridge(emulator: &Emulator, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn eventbridge(
+    emulator: &Emulator,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -132,7 +137,7 @@ async fn eventbridge(emulator: &Emulator, case: &str, operation: &str, body: &Va
 }
 
 /// One CloudWatch call that must answer 200.
-async fn monitoring(emulator: &Emulator, operation: &str, body: &Value) -> Value {
+pub(crate) async fn monitoring(emulator: &Emulator, operation: &str, body: &Value) -> Value {
     rpc(
         emulator,
         "monitoring",
@@ -146,7 +151,7 @@ async fn monitoring(emulator: &Emulator, operation: &str, body: &Value) -> Value
 /// A queue a rule can target: its url, with its own policy allowing EventBridge the send — the
 /// grant AWS documents for a queue a rule delivers to, and what a queue needs to receive
 /// anything at all.
-async fn given_target_queue(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn given_target_queue(emulator: &Emulator, name: &str) -> String {
     let (url, arn) = given_queue(emulator, name).await;
     rpc(
         emulator,
@@ -173,7 +178,7 @@ async fn given_target_queue(emulator: &Emulator, name: &str) -> String {
 }
 
 /// The ARN of the queue at `url`, as that service reports it.
-async fn queue_arn_of(emulator: &Emulator, url: &str) -> String {
+pub(crate) async fn queue_arn_of(emulator: &Emulator, url: &str) -> String {
     let attributes = rpc(
         emulator,
         "sqs",
@@ -241,7 +246,7 @@ async fn given_rule_for_alarms(
 /// Take whatever has been delivered to the queue at `url` and add it to `held`, parsed out of
 /// the message bodies — accumulated across looks, because a received message is invisible to
 /// the next look.
-async fn collect(emulator: &Emulator, url: &str, held: &mut Vec<Value>) {
+pub(crate) async fn collect(emulator: &Emulator, url: &str, held: &mut Vec<Value>) {
     for message in received_messages(emulator, url).await {
         let body = message["Body"].as_str().unwrap_or_default();
         if let Ok(parsed) = serde_json::from_str::<Value>(body) {
@@ -288,7 +293,7 @@ fn metric_alarm(name: &str, patch: &Value) -> Value {
 }
 
 /// The ARN the alarm `name` of kind `kind` reports.
-async fn alarm_arn(emulator: &Emulator, case: &str, kind: &str, name: &str) -> String {
+pub(crate) async fn alarm_arn(emulator: &Emulator, case: &str, kind: &str, name: &str) -> String {
     let described = monitoring(
         emulator,
         "DescribeAlarms",
@@ -308,7 +313,7 @@ async fn alarm_arn(emulator: &Emulator, case: &str, kind: &str, name: &str) -> S
 
 /// Assert the envelope of one delivered event: what it is, which alarm it is about, which
 /// operation it reports, and that it names the alarm's own ARN.
-fn assert_envelope(case: &str, event: &Value, alarm: &str, arn: &str, operation: &str) {
+pub(crate) fn assert_envelope(case: &str, event: &Value, alarm: &str, arn: &str, operation: &str) {
     for (member, pointer, expected) in [
         ("the event's source", "/source", json!(SOURCE)),
         ("the event's detail-type", "/detail-type", json!(DETAIL_TYPE)),
