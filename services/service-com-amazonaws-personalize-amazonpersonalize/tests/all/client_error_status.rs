@@ -84,31 +84,10 @@ async fn every_modelled_client_error_is_served_with_the_json_client_status() {
     let absent_dataset =
         format!("arn:aws:personalize:{REGION}:{ACCOUNT}:dataset/absent-status/INTERACTIONS");
 
-    // A group whose create has not completed yet: a dataset created against it is refused
-    // as in-use. Asserted here, on the call right after the create, rather than as a table
-    // row, so the assertion never races the create span.
-    let (status, body) = emulator
-        .call("CreateDatasetGroup", json!({"name": "status-pending-dsg"}))
-        .await;
-    assert_eq!(
-        status, 200,
-        "case {setup:?}: expected CreateDatasetGroup to answer 200, got {status} {body:?}"
-    );
-    let pending_group = body["datasetGroupArn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {setup:?}: expected a datasetGroupArn, got {body:?}"))
-        .to_string();
-    assert_client_error(
-        &emulator,
-        "a dataset against a group whose create has not completed",
-        "CreateDataset",
-        json!({
-            "name": "too-early", "datasetType": "Items",
-            "schemaArn": schema, "datasetGroupArn": pending_group,
-        }),
-        "ResourceInUseException",
-    )
-    .await;
+    // Nothing here has to wait for a create span: every create of this service finishes
+    // its own work before it answers, so each row's resource is already in its terminal
+    // status. `ResourceInUseException` is raised by the two deletes a live reference
+    // blocks, in the table below.
 
     let rows: Vec<Row> = vec![
         // Not found, over all three resource kinds and both readers and deletes. The

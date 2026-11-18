@@ -233,8 +233,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 filter_expression: input.filter_expression.clone(),
                 creation_date_time: now,
                 last_updated_date_time: now,
-                // A filter is "CREATE PENDING > CREATE IN_PROGRESS > ACTIVE"
-                // (`Filter$status`), and cannot be ready before its dataset group is.
+                // The filter's own creation work is this insert, so its terminal status is
+                // due the instant this create answers (`crate::state::CREATE_SPAN`), and
+                // never before its dataset group is due.
                 active_at: due_after(now, group_active_at),
                 tags: input.tags.clone().unwrap_or_default(),
             },

@@ -22,9 +22,10 @@
 //!   create collides on an ARN that is already present;
 //! * "[o]nly one event tracker can be associated with a dataset group", so a second
 //!   create naming a group that already has one collides as well;
-//! * a create answers before the tracker is ready — "CREATE PENDING > CREATE IN_PROGRESS
-//!   > ACTIVE" — so the status a read reports is a function of the stored due instant and
-//!   the clock ([`crate::state::creation_status`]) and no read writes anything.
+//! * the status a read reports is a function of the stored due instant and the clock
+//!   ([`crate::state::creation_status`]) and no read writes anything; the create does the
+//!   tracker's own work before it answers, so that instant is the create's own
+//!   ([`crate::state::CREATE_SPAN`]).
 
 use std::time::SystemTime;
 

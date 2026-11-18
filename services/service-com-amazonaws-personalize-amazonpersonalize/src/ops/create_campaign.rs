@@ -8,10 +8,11 @@
 //! `GetRecommendations` / `GetPersonalizedRanking` / `GetActionRecommendations` serve a
 //! campaign a client created over the wire.
 //!
-//! Both records carry the SAME due instant: a campaign is "CREATE PENDING > CREATE
-//! IN_PROGRESS > ACTIVE" (`Campaign$status`), the inference plane serves it only once it
-//! is ACTIVE, and a campaign deploying a version that is still training becomes ACTIVE
-//! only after that version does.
+//! Both records carry the SAME due instant: the inference plane serves a campaign only
+//! once it is ACTIVE, the deployment work above is done before this create answers, so
+//! that instant is the create's own (`crate::state::CREATE_SPAN`), and a campaign
+//! deploying a version that is still training becomes ACTIVE only after that version
+//! does.
 //!
 //! ## Shape of an operation
 //!

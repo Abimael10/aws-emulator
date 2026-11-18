@@ -241,9 +241,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain: input.domain.clone(),
             creation_date_time: now,
             last_updated_date_time: now,
-            // The group is NOT created ready: the documented progression is "CREATE
-            // PENDING > CREATE IN_PROGRESS > ACTIVE", and `DescribeDatasetGroup` derives
-            // which of those the clock has made due from this instant.
+            // The group's own creation work is this insert, so its terminal status is
+            // due the instant this create answers; `DescribeDatasetGroup` derives the
+            // status from this instant (`crate::state::CREATE_SPAN`).
             active_at: active_at(now),
             tags: input.tags.clone().unwrap_or_default(),
         };

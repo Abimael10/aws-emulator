@@ -314,9 +314,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 training_type: MANUAL_TRAINING_TYPE.to_string(),
                 creation_date_time: now,
                 last_updated_date_time: now,
-                // Training completes after the solution it belongs to does, so a
-                // version created while the solution is still pending is never ACTIVE
-                // before its solution.
+                // The training run above has already happened, so the version's terminal
+                // status — `ACTIVE`, or `CREATE FAILED` with the reason training recorded
+                // — is due at this instant (`crate::state::CREATE_SPAN`), and never before
+                // the solution it belongs to is due.
                 active_at: due_after(now, solution_active_at),
                 failure_reason,
                 trained,

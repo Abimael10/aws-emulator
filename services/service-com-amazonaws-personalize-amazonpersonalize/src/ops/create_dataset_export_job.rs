@@ -288,9 +288,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 kms_key_arn: input.job_output.s3_data_destination.kms_key_arn,
                 creation_date_time: now,
                 last_updated_date_time: now,
-                // An export of a dataset whose own create is still pending completes
-                // after that create does, so the job is never ACTIVE before the dataset
-                // it exported.
+                // The export has already written its object, so the job's terminal status
+                // — `ACTIVE`, or `CREATE FAILED` with the reason above — is due at this
+                // instant (`crate::state::CREATE_SPAN`), and never before the dataset it
+                // exported is due.
                 active_at: due_after(now, dataset_active_at),
                 failure_reason,
                 tags: input.tags.unwrap_or_default(),

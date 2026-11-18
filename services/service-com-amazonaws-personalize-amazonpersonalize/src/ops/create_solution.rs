@@ -326,9 +326,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 solution_config: input.solution_config.clone(),
                 creation_date_time: now,
                 last_updated_date_time: now,
-                // A solution is not created ready: "CREATE PENDING > CREATE IN_PROGRESS
-                // > ACTIVE" (`Solution$status`), and it cannot be ready before the
-                // dataset group whose data it trains on is.
+                // The solution's own creation work is this insert, so its terminal status
+                // is due the instant this create answers (`crate::state::CREATE_SPAN`) —
+                // but never before the dataset group whose data it trains on is due.
                 active_at: due_after(now, group_active_at),
                 versions_created: 0,
                 tags: input.tags.clone().unwrap_or_default(),

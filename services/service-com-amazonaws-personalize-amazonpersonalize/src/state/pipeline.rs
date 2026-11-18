@@ -15,10 +15,11 @@
 //! * a resource is addressed by an ARN minted from its own identity (its name, or its
 //!   solution and version ordinal), so a duplicate create collides on an ARN that is
 //!   already present;
-//! * a create answers before its work is complete, and the status a `Describe*` reports
-//!   is a function of the stored due instant and the clock
-//!   ([`crate::state::terminal_status`]) — a read reports a transition the clock has
-//!   already made due and writes nothing;
+//! * a create does its own work before it answers, so the status a `Describe*` reports is
+//!   a function of the stored due instant and the clock
+//!   ([`crate::state::terminal_status`]) and that instant is the create's own
+//!   ([`crate::state::CREATE_SPAN`]): a read reports a transition the clock has already
+//!   made due and writes nothing;
 //! * a stage that depends on an earlier one becomes ready only once that one is
 //!   ([`due_after`]), so a campaign is never served before the solution version it
 //!   deploys has finished training;
@@ -235,8 +236,11 @@ pub fn filter_arn(region: &str, name: &str) -> String {
 ///
 /// A campaign deploys a solution version and a solution version is trained on a
 /// solution's dataset group, so a stage created while the stage below it is still
-/// pending takes its own span AFTER that one completes: a composite resource reaches its
-/// terminal status only once what it depends on has.
+/// pending takes its own span ([`crate::state::CREATE_SPAN`]) AFTER that one completes: a
+/// composite resource reaches its terminal status only once what it depends on has. A
+/// stage created once the stage below it is already complete — which is every stage of a
+/// pipeline this emulator provisioned, since each create finishes its own work before it
+/// answers — is due at its own create instant.
 pub fn due_after(created_at: SystemTime, dependency: SystemTime) -> SystemTime {
     active_at(created_at.max(dependency))
 }

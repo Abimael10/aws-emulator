@@ -192,9 +192,10 @@ impl Pipeline {
     /// Poll `operation` until the resource it reports leaves the transient statuses, and
     /// return that resource.
     ///
-    /// Every status seen on the way has to be one of the documented transient ones, so a
-    /// resource that is reported ready immediately — which Amazon Personalize never does
-    /// for these — would fail the case.
+    /// A create of this emulator finishes its own work before it answers, so the first
+    /// read is already terminal and this returns on its first iteration; the loop is what
+    /// keeps the suite honest about a stage that is genuinely still outstanding, and it
+    /// waits for the CONDITION rather than for a span.
     async fn await_terminal(
         &self,
         operation: &str,
@@ -243,6 +244,23 @@ impl Pipeline {
             "case {case:?}: expected {operation} to report ACTIVE, got {resource}"
         );
         resource
+    }
+
+    /// Call `operation` EXACTLY ONCE and return the resource it reports.
+    ///
+    /// No poll loop and no wait: this is the one read a client issues straight after a
+    /// create, which is what the create-status rule is about.
+    async fn describe_once(
+        &self,
+        operation: &str,
+        arn_member: &str,
+        resource_member: &str,
+        arn: &str,
+        case: &str,
+    ) -> Value {
+        self.control_ok(operation, &json!({arn_member: arn}), case)
+            .await[resource_member]
+            .clone()
     }
 
     /// Create a schema and a dataset of `dataset_type` in `group`, import `csv` into it
@@ -1697,24 +1715,17 @@ async fn a_campaign_is_served_only_once_its_create_is_complete() {
         .to_string();
     let request = json!({"campaignArn": campaign, "userId": "user-1"});
 
-    // While the create is still in progress the inference plane refuses the campaign
-    // with the same refusal it gives one that was never created.
+    // The campaign's deployment is complete when its create answers, so the first
+    // DescribeCampaign reports it ACTIVE and the inference plane serves it at once.
     let described = emulator
         .control_ok("DescribeCampaign", &json!({"campaignArn": campaign}), case)
         .await["campaign"]
         .clone();
-    if TRANSIENT_STATUSES.contains(&described["status"].as_str().unwrap_or("")) {
-        let (status, body) = emulator.inference(RECOMMENDATIONS, &request).await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: expected a campaign still being created to be refused, got \
-             {status} {body}"
-        );
-        assert!(
-            error_message(&body).contains("does not exist or is not active yet"),
-            "case {case:?}: expected the not-active-yet refusal, got {body}"
-        );
-    }
+    assert_eq!(
+        described["status"].as_str().unwrap_or(""),
+        "ACTIVE",
+        "case {case:?}: expected the first DescribeCampaign to report ACTIVE, got {described}"
+    );
 
     // Once ACTIVE, the same request is served.
     emulator
@@ -1742,5 +1753,391 @@ async fn a_campaign_is_served_only_once_its_create_is_complete() {
         error_code(&body),
         "ResourceAlreadyExistsException",
         "case {case:?}: expected ResourceAlreadyExistsException, got {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A create's own work is finished before that create answers
+// ---------------------------------------------------------------------------
+
+/// The statuses a create's own work can END in. Source: the model's own documentation for
+/// every create of this service — "CREATE PENDING > CREATE IN_PROGRESS > ACTIVE -or-
+/// CREATE FAILED".
+const TERMINAL_STATUSES: &[&str] = &["ACTIVE", "CREATE FAILED"];
+
+/// Assert the resource `operation` reported, as the FIRST read after its create, is in the
+/// terminal status `expected`.
+fn assert_first_read(case: &str, operation: &str, described: &Value, expected: &str) {
+    let reported = described["status"].as_str().unwrap_or("");
+    assert!(
+        TERMINAL_STATUSES.contains(&reported),
+        "case {case:?}: the first {operation} after the create must report a terminal status, \
+         one of {TERMINAL_STATUSES:?}, got {described}"
+    );
+    assert_eq!(
+        reported, expected,
+        "case {case:?}: expected the first {operation} after the create to report \
+         {expected:?}, got {described}"
+    );
+}
+
+/// Create a resource with `operation` and return the ARN it answers in `arn_member`.
+async fn created(emulator: &Pipeline, operation: &str, body: &Value, arn_member: &str, case: &str) -> String {
+    emulator.control_ok(operation, body, case).await[arn_member]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected {operation} to answer an {arn_member}"))
+        .to_string()
+}
+
+/// Every provisioning stage is in its terminal status for the FIRST `Describe*` that
+/// follows its create, so a client's poll loop exits on its first iteration and the
+/// campaign at the end of the pipeline serves inference straight away.
+///
+/// The rows span the recipe families the pipeline can be provisioned with — which decides
+/// the datasets imported and the inference route the campaign is served by — and the
+/// recorded case the issue cited (a personalized-ranking round trip) is one row among
+/// them. NOTHING in this case polls: each create is followed by exactly one read.
+#[tokio::test]
+async fn every_stage_is_terminal_for_the_first_describe_after_its_create() {
+    let cases = [
+        RecipeCase {
+            case: "personalized ranking",
+            recipe: RANKING_RECIPE,
+            served: PERSONALIZE_RANKING,
+            actions: false,
+        },
+        RecipeCase {
+            case: "user personalization",
+            recipe: USER_RECIPE,
+            served: RECOMMENDATIONS,
+            actions: false,
+        },
+        RecipeCase {
+            case: "related items",
+            recipe: RELATED_RECIPE,
+            served: RECOMMENDATIONS,
+            actions: false,
+        },
+        RecipeCase {
+            case: "personalized actions",
+            recipe: ACTIONS_RECIPE,
+            served: ACTION_RECOMMENDATIONS,
+            actions: true,
+        },
+    ];
+
+    for (index, row) in cases.iter().enumerate() {
+        let emulator = Pipeline::new();
+        let case = row.case;
+        let suffix = format!("first-read-{index}");
+
+        // The dataset group.
+        let group = created(
+            &emulator,
+            "CreateDatasetGroup",
+            &json!({"name": format!("group-{suffix}")}),
+            "datasetGroupArn",
+            case,
+        )
+        .await;
+        let described = emulator
+            .describe_once(
+                "DescribeDatasetGroup",
+                "datasetGroupArn",
+                "datasetGroup",
+                &group,
+                case,
+            )
+            .await;
+        assert_first_read(case, "DescribeDatasetGroup", &described, "ACTIVE");
+        // A listing derives its summary's status the same way, so it agrees.
+        let listed = emulator.control_ok("ListDatasetGroups", &json!({}), case).await;
+        let summary = listed["datasetGroups"]
+            .as_array()
+            .and_then(|groups| {
+                groups
+                    .iter()
+                    .find(|entry| entry["datasetGroupArn"].as_str() == Some(group.as_str()))
+            })
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_first_read(case, "ListDatasetGroups", &summary, "ACTIVE");
+
+        // Each dataset of the pipeline, and the bulk import that fills it. The create of
+        // the dataset is itself proof the group was ACTIVE: "you must wait until the
+        // status of the dataset group is ACTIVE before adding a dataset to the group".
+        let datasets = if row.actions {
+            vec![action_interactions_fixture(CATALOG_ACTIONS)]
+        } else {
+            vec![interactions_fixture(CATALOG_ITEMS)]
+        };
+        for fixture in &datasets {
+            let schema = created(
+                &emulator,
+                "CreateSchema",
+                &json!({
+                    "name": format!("{}-{suffix}", fixture.dataset_type),
+                    "schema": avro_schema(fixture.dataset_type, fixture.columns),
+                }),
+                "schemaArn",
+                case,
+            )
+            .await;
+            let dataset = created(
+                &emulator,
+                "CreateDataset",
+                &json!({
+                    "name": format!("{}-{suffix}", fixture.dataset_type),
+                    "datasetGroupArn": group,
+                    "datasetType": fixture.dataset_type,
+                    "schemaArn": schema,
+                }),
+                "datasetArn",
+                case,
+            )
+            .await;
+            let described = emulator
+                .describe_once("DescribeDataset", "datasetArn", "dataset", &dataset, case)
+                .await;
+            assert_first_read(case, "DescribeDataset", &described, "ACTIVE");
+
+            let key = format!("{suffix}/{}.csv", fixture.dataset_type);
+            emulator.upload(&key, &fixture.csv).await;
+            let job = emulator
+                .start_import(
+                    case,
+                    &suffix,
+                    &dataset,
+                    &format!("s3://{BUCKET}/{key}"),
+                    None,
+                )
+                .await;
+            let described = emulator
+                .describe_once(
+                    "DescribeDatasetImportJob",
+                    "datasetImportJobArn",
+                    "datasetImportJob",
+                    &job,
+                    case,
+                )
+                .await;
+            assert_first_read(case, "DescribeDatasetImportJob", &described, "ACTIVE");
+        }
+
+        // An event tracker and a filter belong to the same group and follow the same rule.
+        let tracker = created(
+            &emulator,
+            "CreateEventTracker",
+            &json!({"name": format!("tracker-{suffix}"), "datasetGroupArn": group}),
+            "eventTrackerArn",
+            case,
+        )
+        .await;
+        let described = emulator
+            .describe_once(
+                "DescribeEventTracker",
+                "eventTrackerArn",
+                "eventTracker",
+                &tracker,
+                case,
+            )
+            .await;
+        assert_first_read(case, "DescribeEventTracker", &described, "ACTIVE");
+
+        let filter = created(
+            &emulator,
+            "CreateFilter",
+            &json!({
+                "name": format!("filter-{suffix}"),
+                "datasetGroupArn": group,
+                "filterExpression": "EXCLUDE ItemID WHERE Items.GENRE IN (\"Comedy\")",
+            }),
+            "filterArn",
+            case,
+        )
+        .await;
+        let described = emulator
+            .describe_once("DescribeFilter", "filterArn", "filter", &filter, case)
+            .await;
+        assert_first_read(case, "DescribeFilter", &described, "ACTIVE");
+
+        // The solution and the version trained from it.
+        let solution = created(
+            &emulator,
+            "CreateSolution",
+            &json!({
+                "name": format!("solution-{suffix}"),
+                "datasetGroupArn": group,
+                "recipeArn": row.recipe,
+            }),
+            "solutionArn",
+            case,
+        )
+        .await;
+        let described = emulator
+            .describe_once("DescribeSolution", "solutionArn", "solution", &solution, case)
+            .await;
+        assert_first_read(case, "DescribeSolution", &described, "ACTIVE");
+
+        let version = created(
+            &emulator,
+            "CreateSolutionVersion",
+            &json!({"solutionArn": solution}),
+            "solutionVersionArn",
+            case,
+        )
+        .await;
+        let described = emulator
+            .describe_once(
+                "DescribeSolutionVersion",
+                "solutionVersionArn",
+                "solutionVersion",
+                &version,
+                case,
+            )
+            .await;
+        assert_first_read(case, "DescribeSolutionVersion", &described, "ACTIVE");
+
+        // The campaign, and the inference it makes reachable — read and called with no
+        // poll interval anywhere between the create and the request.
+        let campaign = created(
+            &emulator,
+            "CreateCampaign",
+            &json!({"name": format!("campaign-{suffix}"), "solutionVersionArn": version}),
+            "campaignArn",
+            case,
+        )
+        .await;
+        let described = emulator
+            .describe_once("DescribeCampaign", "campaignArn", "campaign", &campaign, case)
+            .await;
+        assert_first_read(case, "DescribeCampaign", &described, "ACTIVE");
+
+        let known: Vec<String> = if row.actions {
+            (1..=CATALOG_ACTIONS).map(action_id).collect()
+        } else {
+            (1..=CATALOG_ITEMS).map(item_id).collect()
+        };
+        let response = emulator
+            .inference_ok(row.served, &request_for(row.served, &campaign, &known), case)
+            .await;
+        let (member, id_member) = list_of(row.served);
+        assert!(
+            !ids(&response, member, id_member).is_empty(),
+            "case {case:?}: expected {} to serve the campaign created a moment ago, got \
+             {response}",
+            row.served
+        );
+        assert_recommendation_id(case, &response);
+    }
+}
+
+/// A stage whose own work did NOT succeed is in the OTHER terminal status for that first
+/// read: `CREATE FAILED`, carrying the reason the work recorded. The status is the
+/// outcome of the work, not a constant.
+#[tokio::test]
+async fn a_stage_whose_work_failed_reports_create_failed_to_the_first_describe() {
+    let emulator = Pipeline::new();
+    let case = "work that could not be carried out";
+    let suffix = "first-read-failed";
+
+    let group = created(
+        &emulator,
+        "CreateDatasetGroup",
+        &json!({"name": format!("group-{suffix}")}),
+        "datasetGroupArn",
+        case,
+    )
+    .await;
+    let schema = created(
+        &emulator,
+        "CreateSchema",
+        &json!({
+            "name": format!("Interactions-{suffix}"),
+            "schema": avro_schema("Interactions", &["USER_ID", "ITEM_ID", "TIMESTAMP", "EVENT_TYPE"]),
+        }),
+        "schemaArn",
+        case,
+    )
+    .await;
+    let dataset = created(
+        &emulator,
+        "CreateDataset",
+        &json!({
+            "name": format!("Interactions-{suffix}"),
+            "datasetGroupArn": group,
+            "datasetType": "Interactions",
+            "schemaArn": schema,
+        }),
+        "datasetArn",
+        case,
+    )
+    .await;
+
+    // The bucket exists and holds another object; the location the job names does not.
+    emulator
+        .upload(&format!("{suffix}/other.csv"), "ITEM_ID\n")
+        .await;
+    let location = format!("s3://{BUCKET}/{suffix}/not-there.csv");
+    let job = emulator
+        .start_import(case, suffix, &dataset, &location, None)
+        .await;
+    let described = emulator
+        .describe_once(
+            "DescribeDatasetImportJob",
+            "datasetImportJobArn",
+            "datasetImportJob",
+            &job,
+            case,
+        )
+        .await;
+    assert_first_read(case, "DescribeDatasetImportJob", &described, "CREATE FAILED");
+    assert!(
+        described["failureReason"]
+            .as_str()
+            .unwrap_or("")
+            .contains(&location),
+        "case {case:?}: the failure must name the location it could not read, got {described}"
+    );
+
+    // Nothing was imported, so the training run has nothing to fit: the version's first
+    // read reports the failure the run recorded.
+    let solution = created(
+        &emulator,
+        "CreateSolution",
+        &json!({
+            "name": format!("solution-{suffix}"),
+            "datasetGroupArn": group,
+            "recipeArn": USER_RECIPE,
+        }),
+        "solutionArn",
+        case,
+    )
+    .await;
+    let version = created(
+        &emulator,
+        "CreateSolutionVersion",
+        &json!({"solutionArn": solution}),
+        "solutionVersionArn",
+        case,
+    )
+    .await;
+    let described = emulator
+        .describe_once(
+            "DescribeSolutionVersion",
+            "solutionVersionArn",
+            "solutionVersion",
+            &version,
+            case,
+        )
+        .await;
+    assert_first_read(case, "DescribeSolutionVersion", &described, "CREATE FAILED");
+    assert!(
+        described["failureReason"]
+            .as_str()
+            .unwrap_or("")
+            .contains(&group),
+        "case {case:?}: the failure must name the dataset group it found no data in, got \
+         {described}"
     );
 }

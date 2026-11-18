@@ -355,22 +355,40 @@ pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// progressions ("CREATE PENDING > CREATE IN_PROGRESS > ACTIVE -or- CREATE FAILED").
 pub const STATUS_CREATE_FAILED: &str = "CREATE FAILED";
 
-/// How long after a create this emulator takes to report the new resource `ACTIVE`.
+/// How long after a create this emulator withholds the new resource's terminal status:
+/// no time at all, because the create has already done that resource's work.
 ///
-/// Personalize does NOT return a new dataset group or dataset ready: the model documents
-/// the progression "CREATE PENDING > CREATE IN_PROGRESS > ACTIVE" and that "you must wait
-/// until the status of the dataset group is ACTIVE before adding a dataset to the group",
-/// so a caller has to poll `Describe*`. This span is the EMULATOR's own choice — AWS
-/// documents no duration for it — short enough not to slow a client down and long enough
-/// that a caller acting straight after the create still observes the transient states.
-pub const CREATE_SPAN: Duration = Duration::from_millis(500);
+/// Every provisioning stage here is carried out IN PROCESS, inside the create that starts
+/// it and before that create answers: a dataset group, a dataset, an event tracker, a
+/// filter and a solution are minted and stored, a dataset import job reads the object and
+/// stores its rows, a dataset export job writes its object, a solution version is trained
+/// on the records its dataset group holds, and a campaign copies that trained catalog into
+/// the inference registry. The outcome — success, or failure with the reason the work
+/// recorded — is therefore already decided and already persisted when the create returns,
+/// and nothing about the resource is left for a later instant to settle.
+///
+/// Amazon Personalize documents the progression "CREATE PENDING > CREATE IN_PROGRESS >
+/// ACTIVE" and that "you must wait until the status of the dataset group is ACTIVE before
+/// adding a dataset to the group", but documents no DURATION for it. A wall-clock span of
+/// this emulator's own choosing would then be the only reason a finished stage reported a
+/// transient status, and a client written against AWS cadences can only discover the
+/// change by sleeping its next poll interval — one AWS-sized interval per stage, for work
+/// that is already complete. So the terminal status falls due at the instant the create
+/// answers: the FIRST `Describe*` after a create reports `ACTIVE`, or `CREATE FAILED` with
+/// the reason, and each poll loop of a provisioning pipeline exits on its first iteration.
+///
+/// The derivation is unchanged and stays a pure function of the stored due instant
+/// ([`creation_status`]), so a stage whose work really is outstanding — one chained behind
+/// a stage that is not due yet ([`pipeline::due_after`]) — still reports the documented
+/// transient statuses until it is due.
+pub const CREATE_SPAN: Duration = Duration::ZERO;
 
-/// The instant a resource created now becomes `ACTIVE`.
+/// The instant a resource created at `created_at` is due its terminal status.
 pub fn active_at(created_at: SystemTime) -> SystemTime {
     created_at + CREATE_SPAN
 }
 
-/// The status of a resource the clock owes `ACTIVE` at `active_at`.
+/// The status of a resource whose terminal status falls due at `active_at`.
 ///
 /// A pure function of the stored due instant and the current time: a read reports the
 /// transition the clock has already made due and writes nothing, so two callers reading at
@@ -380,8 +398,11 @@ pub fn creation_status(active_at: SystemTime) -> &'static str {
     if now >= active_at {
         return STATUS_ACTIVE;
     }
-    // The progression has two transient states; the second half of the span is
-    // `CREATE IN_PROGRESS`.
+    // Not due yet, so this resource's completion is still outstanding and the documented
+    // progression's transient states are what a read reports: `CREATE IN_PROGRESS` once
+    // the second half of the span it waits out has begun, `CREATE PENDING` before that.
+    // With a zero [`CREATE_SPAN`] that second half is empty, and a resource is only ever
+    // not-due because the stage it depends on is not ([`pipeline::due_after`]).
     match active_at.checked_sub(CREATE_SPAN / 2) {
         Some(in_progress_at) if now >= in_progress_at => STATUS_CREATE_IN_PROGRESS,
         _ => STATUS_CREATE_PENDING,

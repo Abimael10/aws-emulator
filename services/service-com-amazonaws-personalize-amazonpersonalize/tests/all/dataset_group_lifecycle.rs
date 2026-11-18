@@ -25,9 +25,9 @@ pub(crate) const REGION: &str = "us-east-1";
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 pub(crate) const ACCOUNT: &str = "000000000000";
 
-/// The statuses a dataset group or dataset reports before its create completes. Source:
-/// the model's own documentation for `CreateDatasetGroup` — "CREATE PENDING > CREATE
-/// IN_PROGRESS > ACTIVE".
+/// The statuses a dataset group or dataset reports while its create is outstanding.
+/// Source: the model's own documentation for `CreateDatasetGroup` — "CREATE PENDING >
+/// CREATE IN_PROGRESS > ACTIVE".
 const NON_TERMINAL_CREATE_STATUSES: &[&str] = &["CREATE PENDING", "CREATE IN_PROGRESS"];
 
 /// How long a case waits for a create to complete before calling it stuck. Far above the
@@ -126,9 +126,10 @@ async fn assert_fails(
 
 /// Poll `operation` until the resource it reports is `ACTIVE`, and return that resource.
 ///
-/// A freshly created dataset group or dataset is NOT ready — the model documents the
-/// progression "CREATE PENDING > CREATE IN_PROGRESS > ACTIVE" — so every status seen on
-/// the way has to be one of the documented transient ones.
+/// A create of this emulator finishes its own work before it answers, so the first read is
+/// already `ACTIVE` and this returns on its first iteration; any status seen before then
+/// still has to be one of the documented transient ones, and the wait is for the
+/// CONDITION rather than for a span.
 pub(crate) async fn await_active(
     emulator: &Emulator,
     operation: &str,
@@ -717,8 +718,8 @@ async fn a_dataset_group_is_created_pending_becomes_active_and_is_deleted() {
             "case {case:?}: expected the stored domain echoed back, got {body:?}"
         );
 
-        // The create does not hand back a ready group: the first Describe still sees a
-        // transient status.
+        // The group's creation work is done when the create answers, so the FIRST
+        // Describe after it already reports the terminal status.
         let (status, body) = emulator
             .call_with_arn("DescribeDatasetGroup", "datasetGroupArn", &expected_arn)
             .await;
@@ -727,10 +728,10 @@ async fn a_dataset_group_is_created_pending_becomes_active_and_is_deleted() {
             "case {case:?}: expected DescribeDatasetGroup to answer 200, got {status} {body:?}"
         );
         let reported = body["datasetGroup"]["status"].as_str().unwrap_or_default();
-        assert!(
-            NON_TERMINAL_CREATE_STATUSES.contains(&reported),
-            "case {case:?}: expected a create still in one of \
-             {NON_TERMINAL_CREATE_STATUSES:?} immediately after the create, got {body:?}"
+        assert_eq!(
+            reported, "ACTIVE",
+            "case {case:?}: expected the first Describe after the create to report ACTIVE, \
+             got {body:?}"
         );
 
         let group = await_active(
@@ -1150,38 +1151,6 @@ async fn create_dataset_refuses_an_unknown_reference_an_unknown_type_and_a_pendi
         );
     }
 
-    // "You must wait until the status of the dataset group is ACTIVE before adding a
-    // dataset to the group": a group whose create is still pending refuses one.
-    let (status, body) = emulator
-        .call("CreateDatasetGroup", json!({"name": "pending-dsg"}))
-        .await;
-    assert_eq!(
-        status, 200,
-        "case \"a pending group\": expected CreateDatasetGroup to answer 200, got \
-         {status} {body:?}"
-    );
-    let pending_arn = body["datasetGroupArn"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let (status, body) = emulator
-        .call(
-            "CreateDataset",
-            json!({
-                "name": "too-early", "datasetType": "Interactions",
-                "schemaArn": schema_arn, "datasetGroupArn": pending_arn,
-            }),
-        )
-        .await;
-    assert_eq!(
-        status, 400,
-        "case \"a pending group\": expected HTTP 400, got {status} {body:?}"
-    );
-    assert!(
-        error_code(&body).contains("ResourceInUseException"),
-        "case \"a pending group\": expected ResourceInUseException, got {body:?}"
-    );
-
     // Nothing the refusals touched was stored.
     let listed = list_all(&emulator, "ListDatasets", "datasets", None, None).await;
     assert!(
@@ -1189,29 +1158,48 @@ async fn create_dataset_refuses_an_unknown_reference_an_unknown_type_and_a_pendi
         "case \"after every refusal\": expected no datasets, got {listed:?}"
     );
 
-    // Once the group reaches ACTIVE the same request succeeds, so the refusal was about
-    // the status and nothing else.
-    await_active(
-        &emulator,
-        "DescribeDatasetGroup",
-        "datasetGroupArn",
-        "datasetGroup",
-        &pending_arn,
-        "a pending group",
-    )
-    .await;
+    // "You must wait until the status of the dataset group is ACTIVE before adding a
+    // dataset to the group": a group's creation work is finished when its create answers,
+    // so the group IS ACTIVE for the read that follows and the dataset create right
+    // behind it is accepted — nothing has to be waited out.
+    let (status, body) = emulator
+        .call("CreateDatasetGroup", json!({"name": "straight-away-dsg"}))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"a group used straight away\": expected CreateDatasetGroup to answer 200, got \
+         {status} {body:?}"
+    );
+    let fresh_arn = body["datasetGroupArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let (status, body) = emulator
+        .call_with_arn("DescribeDatasetGroup", "datasetGroupArn", &fresh_arn)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"a group used straight away\": expected DescribeDatasetGroup to answer 200, \
+         got {status} {body:?}"
+    );
+    assert_eq!(
+        body["datasetGroup"]["status"].as_str().unwrap_or_default(),
+        "ACTIVE",
+        "case \"a group used straight away\": expected the first Describe to report ACTIVE, \
+         got {body:?}"
+    );
     let (status, body) = emulator
         .call(
             "CreateDataset",
             json!({
-                "name": "not-too-early", "datasetType": "Interactions",
-                "schemaArn": schema_arn, "datasetGroupArn": pending_arn,
+                "name": "straight-away", "datasetType": "Interactions",
+                "schemaArn": schema_arn, "datasetGroupArn": fresh_arn,
             }),
         )
         .await;
     assert_eq!(
         status, 200,
-        "case \"an active group\": expected HTTP 200, got {status} {body:?}"
+        "case \"a group used straight away\": expected HTTP 200, got {status} {body:?}"
     );
 }
 

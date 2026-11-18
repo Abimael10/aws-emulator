@@ -265,9 +265,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 dataset_group_arn: input.dataset_group_arn.clone(),
                 creation_date_time: now,
                 last_updated_date_time: now,
-                // The tracker is NOT created ready: "CREATE PENDING > CREATE IN_PROGRESS >
-                // ACTIVE", and `DescribeEventTracker` derives which of those the clock has
-                // made due from this instant.
+                // The tracker's own creation work — minting its tracking id and
+                // registering it with the ingestion data plane — is done before this
+                // create answers, so its terminal status is due at this instant, which is
+                // what `DescribeEventTracker` derives the status from
+                // (`crate::state::CREATE_SPAN`).
                 active_at: active_at(now),
                 tags: input.tags.clone().unwrap_or_default(),
             },

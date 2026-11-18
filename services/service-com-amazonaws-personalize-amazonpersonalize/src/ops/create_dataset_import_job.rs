@@ -321,9 +321,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 imported_rows,
                 creation_date_time: now,
                 last_updated_date_time: now,
-                // An import into a dataset whose own create is still pending completes
-                // after that create does, so the job is never ACTIVE before the dataset
-                // it imported into.
+                // The import itself has already run and its rows are already stored, so
+                // the job's terminal status — `ACTIVE`, or `CREATE FAILED` with the reason
+                // above — is due at this instant (`crate::state::CREATE_SPAN`), and never
+                // before the dataset it imported into is due.
                 active_at: due_after(now, dataset_active_at),
                 failure_reason,
                 tags: input.tags.unwrap_or_default(),
