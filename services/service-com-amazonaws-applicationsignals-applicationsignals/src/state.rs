@@ -861,10 +861,9 @@ pub fn slo_not_found(region: &str, id: &str) -> ResourceNotFoundException {
 /// The predicate [`slo_arn_sentence`] states about an SLO this service does not hold.
 const SLO_DOES_NOT_EXIST: &str = "does not exist";
 
-/// The ONE sentence this service refuses a create whose identifier is already taken with:
-/// fixed text alone, naming NO identifier — the conflict is about the identifier the request
-/// itself carried, so the refusal states the class of the collision rather than an ARN.
-pub const SLO_IDENTIFIER_TAKEN: &str = "A resource with the same identifier already exists";
+/// The predicate [`slo_arn_sentence`] states about an SLO this service ALREADY holds: the
+/// other half of the one sentence it words a refusal about one particular SLO in.
+const SLO_ALREADY_EXISTS: &str = "already exists";
 
 /// The ONE sentence this service words a refusal ABOUT ONE PARTICULAR SLO IT CANNOT RESOLVE
 /// with: the resource's capitalised type name ([`SLO_RESOURCE_TYPE`]), the ARN that addresses
@@ -986,15 +985,19 @@ pub fn tagged_resource_type(resource_arn: &str) -> &'static str {
 }
 
 /// The modelled `ConflictException` a create is refused with when the SLO name it sent is
-/// already stored: [`SLO_IDENTIFIER_TAKEN`], this error class's own fixed sentence.
+/// already stored: this service's one sentence about ONE PARTICULAR SLO
+/// ([`slo_arn_sentence`]), stating the ARN of the objective that holds the name and the
+/// predicate that it already exists.
 ///
-/// It names NOTHING of the request and nothing of the stored record — a caller that sent an
-/// identifier is told that identifier is taken — so every refused create reads one identical
-/// message, sequential or racing, and a client cannot learn an ARN of another Region's
-/// resource from it.
-pub fn slo_already_exists() -> ConflictException {
+/// The refusal is ABOUT the stored objective — it is the resource the create collided with,
+/// and the only thing the modelled shape can say, since `ConflictException` carries nothing
+/// but `Message` — so `arn` is read off that record rather than re-derived from the request:
+/// one template, whose single variable part is the ARN the store already holds. The same
+/// template with the other predicate is what a read of an SLO this service does not hold is
+/// refused with ([`slo_not_found`]), so one sentence serves both ways a name can be wrong.
+pub fn slo_already_exists(arn: &str) -> ConflictException {
     ConflictException {
-        message: SLO_IDENTIFIER_TAKEN.to_string(),
+        message: slo_arn_sentence(arn, SLO_ALREADY_EXISTS),
     }
 }
 
