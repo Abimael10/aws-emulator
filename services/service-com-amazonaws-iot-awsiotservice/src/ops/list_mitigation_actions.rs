@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMitigationActions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMitigationActions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMitigationActions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +67,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The page size a `ListMitigationActions` request that names no `maxResults` gets.
+///
+/// `ListMitigationActions$maxResults` documents it: "The maximum number of results to
+/// return at one time. The default is 25."
+const DEFAULT_MITIGATION_ACTION_PAGE_SIZE: i32 = 25;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -147,18 +144,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMitigationActions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMitigationActionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMitigationActions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMitigationActionsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+        let _ = ctx;
+
+        let store = state.lock();
+        // The registry IS the store keyed by action name, so the listing is that order:
+        // `@paginated`, and a page boundary is only meaningful over a stable one.
+        // `actionType` "limit[s] the result to mitigation actions with a specific action
+        // type", and an action's type is read out of its stored parameters
+        // ([`crate::state::RegisteredMitigationAction::action_type`]), so the filter
+        // selects on the same value `DescribeMitigationAction` reports.
+        let names: Vec<String> = store
+            .mitigation_actions
+            .values()
+            .filter(|action| {
+                input
+                    .action_type
+                    .as_deref()
+                    .is_none_or(|action_type| action.action_type() == Some(action_type))
+            })
+            .map(|action| action.action_name.clone())
+            .collect();
+
+        // One page of that order, resumed after the position the caller's own token names
+        // ([`crate::state::page_of`]) — the same paging every other `@paginated` listing
+        // of this service uses, so a token is read one way. The filter is part of the
+        // token's scope, so a token issued for one `actionType` does not resume another
+        // listing from the middle.
+        let scope = format!(
+            "mitigation-actions:{}",
+            input.action_type.as_deref().unwrap_or_default()
+        );
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let Some(resume_after) = crate::state::decode_page_marker(token, &scope) else {
+                    return Err(ListMitigationActionsErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(
+                                "nextToken is not a token this listing issued".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                Some(resume_after)
+            }
+        };
+        // `maxResults` is "The maximum number of results to return at one time. The
+        // default is 25", which is the page size a request that names none gets; the clamp
+        // keeps a named one inside the modelled `MaxResults` range (1..250) without
+        // depending on a validation performed outside this module.
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_MITIGATION_ACTION_PAGE_SIZE, |max_results| {
+                max_results.clamp(1, crate::state::MAX_LIST_PAGE_SIZE)
+            }) as usize;
+        let (page, next_token) =
+            crate::state::page_of(names, &scope, resume_after.as_deref(), page_size);
+
+        // Each entry is projected from the stored record, so what a listing reports and
+        // what `DescribeMitigationAction` reports cannot drift.
+        Ok(ListMitigationActionsOutput {
+            action_identifiers: Some(
+                page.into_iter()
+                    .filter_map(|action_name| {
+                        store
+                            .mitigation_actions
+                            .get(&action_name)
+                            .map(crate::state::RegisteredMitigationAction::to_identifier)
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

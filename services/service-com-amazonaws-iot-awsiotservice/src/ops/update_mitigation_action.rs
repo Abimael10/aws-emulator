@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMitigationAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMitigationAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMitigationAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +140,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMitigationAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMitigationActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMitigationAction"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateMitigationActionErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+        let _ = ctx;
+
+        // `actionParams` is optional here, and when it is present it is subject to the
+        // same rule the create reads it under: it defines exactly ONE type of change
+        // ([`crate::state::action_types_defined`]), since "each mitigation action can
+        // apply only one type of change". Checked BEFORE the record is touched, so a
+        // refused update writes nothing.
+        if let Some(action_params) = input.action_params.as_ref() {
+            let defined = crate::state::action_types_defined(action_params);
+            if defined.len() != 1 {
+                return Err(UpdateMitigationActionErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::one_action_type_message(&defined)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A name the account holds no action under is the modelled
+        // `ResourceNotFoundException` (HTTP 404): this operation updates a record, and
+        // never creates one — "You cannot change the name by using UpdateMitigationAction.
+        // Instead, you must delete and recreate the mitigation action with the new name".
+        // The write path words the miss as the resource it could not resolve
+        // ([`crate::state::unresolved_mitigation_action_message`]), which is not how the
+        // readers word it.
+        let Some(action) = store.mitigation_actions.get_mut(&input.action_name) else {
+            return Err(
+                UpdateMitigationActionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::unresolved_mitigation_action_message(
+                            &input.action_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The members the request carried replace what the record holds and the ones it
+        // left absent keep their stored values; the identity minted on create — the id and
+        // the ARN — is what this call reports back, so an update renames nothing.
+        action.apply_update(input.role_arn, input.action_params, now);
+        Ok(UpdateMitigationActionOutput {
+            action_arn: Some(action.action_arn.clone()),
+            action_id: Some(action.action_id.clone()),
+        })
     }
 }

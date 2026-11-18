@@ -1093,6 +1093,17 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// [`job_templates::MAX_JOB_TEMPLATES`] is the ceiling `CreateJobTemplate` refuses
     /// past.
     pub job_templates: BTreeMap<String, RegisteredJobTemplate>,
+    /// Every DEVICE DEFENDER MITIGATION ACTION that exists, keyed by `actionName`.
+    ///
+    /// The name is the action's identity — the model binds it as the `@httpLabel` of
+    /// `/mitigationactions/actions/{actionName}` on every single-action operation — so a
+    /// `BTreeMap` keyed by name is the store itself, ordered for the same reason the
+    /// fleet metrics are: `ListMitigationActions` is `@paginated`.
+    ///
+    /// A caller grows this store, so it is bounded:
+    /// [`mitigation_actions::MAX_MITIGATION_ACTIONS`] is the ceiling
+    /// `CreateMitigationAction` refuses past.
+    pub mitigation_actions: BTreeMap<String, RegisteredMitigationAction>,
     /// The AWS-MANAGED JOB TEMPLATE catalog: the published templates a job can be
     /// created from, keyed by `templateName`.
     ///
@@ -3320,10 +3331,10 @@ pub use not_found::{
 pub mod already_exists;
 pub use already_exists::{
     existing_certificate_message, existing_certificate_provider_message, existing_command_message,
-    existing_job_message, existing_job_template_message, existing_package_message,
-    existing_policy_message,
-    existing_role_alias_message, existing_thing_group_message, existing_thing_message,
-    existing_thing_type_message, existing_topic_rule_message,
+    existing_job_message, existing_job_template_message, existing_mitigation_action_message,
+    existing_package_message, existing_policy_message, existing_role_alias_message,
+    existing_thing_group_message, existing_thing_message, existing_thing_type_message,
+    existing_topic_rule_message,
 };
 
 // What an AWS-MANAGED JOB TEMPLATE is — the published catalog `ListManagedJobTemplates`
@@ -3506,6 +3517,17 @@ pub mod command_deletion;
 pub use command_deletion::{
     pending_deletion_message, purge_due_command_deletions, CommandDeleted, CommandDeletion,
     COMMAND_DELETION_TIMEOUT,
+};
+
+// What a DEVICE DEFENDER MITIGATION ACTION is — the record one holds and the ONE type of
+// change its parameters define — lives in `state/mitigation_actions.rs`, beside the audit
+// configuration and the audit tasks whose findings such an action is applied to. Its names
+// are re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod mitigation_actions;
+pub use mitigation_actions::{
+    action_types_defined, missing_mitigation_action_message, mitigation_action_arn,
+    one_action_type_message, unresolved_mitigation_action_message, RegisteredMitigationAction,
+    MAX_MITIGATION_ACTIONS, MAX_MITIGATION_ACTION_TAGS,
 };
 
 // Whether the software bill of materials an association names is one the service can READ

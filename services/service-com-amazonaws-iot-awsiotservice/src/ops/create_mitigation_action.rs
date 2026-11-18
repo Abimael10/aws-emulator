@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMitigationAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMitigationAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMitigationAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +145,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMitigationAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMitigationActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMitigationAction"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateMitigationActionErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // "Each mitigation action can apply only one type of change", and
+        // `MitigationActionParams` carries one optional member per type, so parameters
+        // that define no type, or more than one, define no action: the modelled
+        // `InvalidRequestException` (HTTP 400), worded with this family's own sentence
+        // ([`crate::state::one_action_type_message`]) so every writer of an action states
+        // that rule the same way. The action's TYPE is then read back out of the stored
+        // parameters rather than recorded beside them.
+        let defined = crate::state::action_types_defined(&input.action_params);
+        if defined.len() != 1 {
+            return Err(CreateMitigationActionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::one_action_type_message(&defined)),
+                },
+            )
+            .into());
+        }
+
+        // `Tag$Key` is `@required` and keys a resource's tag set, so the last value given
+        // for a key is the one the resource carries, and how MANY tags one request may
+        // carry is bounded for the reason every other store's tag ceiling exists.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_MITIGATION_ACTION_TAGS {
+            return Err(CreateMitigationActionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "a mitigation action may carry at most {} tags; this request carries {}",
+                        crate::state::MAX_MITIGATION_ACTION_TAGS,
+                        requested_tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, Option<String>> = requested_tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let mut store = state.lock();
+
+        // The name is the action's identity, so a name already taken is a conflict:
+        // `ResourceAlreadyExistsException` (HTTP 409), worded with this family's own
+        // already-exists sentence ([`crate::state::existing_mitigation_action_message`])
+        // rather than one phrased here, and reporting the record that holds the name.
+        if let Some(existing) = store.mitigation_actions.get(&input.action_name) {
+            return Err(
+                CreateMitigationActionErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(crate::state::existing_mitigation_action_message(
+                            &existing.action_name,
+                        )),
+                        resource_id: Some(existing.action_id.clone()),
+                        resource_arn: Some(existing.action_arn.clone()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Past the ceiling nothing is written and the create is refused with the modelled
+        // `LimitExceededException`, rather than growing the store without bound.
+        if store.mitigation_actions.len() >= crate::state::MAX_MITIGATION_ACTIONS {
+            return Err(CreateMitigationActionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the maximum of {} mitigation actions is already reached",
+                        crate::state::MAX_MITIGATION_ACTIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let action_arn = crate::state::mitigation_action_arn(&region, &input.action_name);
+        let action = crate::state::RegisteredMitigationAction::new(
+            input.action_name,
+            crate::state::fresh_uuid(),
+            action_arn,
+            input.role_arn,
+            input.action_params,
+            tags,
+            now,
+        );
+
+        // The response is built from the record that is about to be persisted, so what
+        // this call reports and what the next `DescribeMitigationAction` reads are one
+        // value, not two that could drift.
+        let output = CreateMitigationActionOutput {
+            action_arn: Some(action.action_arn.clone()),
+            action_id: Some(action.action_id.clone()),
+        };
+        store
+            .mitigation_actions
+            .insert(action.action_name.clone(), action);
+        Ok(output)
     }
 }

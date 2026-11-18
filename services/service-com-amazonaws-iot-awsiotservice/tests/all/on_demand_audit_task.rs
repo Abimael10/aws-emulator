@@ -39,6 +39,16 @@ use service_com_amazonaws_iot_awsiotservice::state::{
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// `CreateMitigationAction` and the operations that read, update and delete one: the
+/// ACTIONS an audit's findings are mitigated with, which are the other half of this
+/// crate's Device Defender coverage — an audit is what produces the findings a mitigation
+/// action is applied to, so the two are read against one emulator's rules. The `#[path]` is
+/// what keeps it a child of THIS suite rather than a second suite beside it: this crate's
+/// `tests/all.rs` declares the suites directly under `tests/all/`, and a module of a
+/// `#[path]`-declared file resolves next to that file unless it says otherwise.
+#[path = "on_demand_audit_task/mitigation_actions.rs"]
+mod mitigation_actions;
+
 /// The region every request in this suite is signed for. An audit is account-wide, so no
 /// assertion depends on it.
 const REGION: &str = "eu-west-2";

@@ -147,6 +147,13 @@ pub fn existing_certificate_message(certificate_id: &str) -> String {
     format!("Certificate already exists (certificateId: {certificate_id})")
 }
 
+/// How this service refuses a `CreateMitigationAction` under a name the account already
+/// holds a mitigation action under: the policy family's by-name form, with this family's
+/// own noun.
+pub fn existing_mitigation_action_message(action_name: &str) -> String {
+    name_already_exists("MitigationAction", action_name)
+}
+
 /// How this service refuses a `CreatePackage` under a name the catalog already holds.
 ///
 /// This family reports a duplicate REQUEST rather than an existing resource — the create
