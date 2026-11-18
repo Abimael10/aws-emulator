@@ -34,3 +34,9 @@ AssertionError: ('NotImplemented', 'operation CreateFleetMetric is scaffolded bu
 Boot the iot emulator
 Call CreateFleetMetric and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+
+`CreateFleetMetric` is implemented: the handler carries no `//! SCAFFOLDED, NOT IMPLEMENTED:` line, it reads the account's indexing configuration and fleet-metric store and persists the record `DescribeFleetMetric` reads back, and the `iot|CreateFleetMetric|NotImplemented` key replays as fixed — every one of the five units above now gets past its `CreateFleetMetric` call, which is what this report asked for.
+
+ONE divergence of the first key's unit remains open, recorded here rather than closed: `iot.create-fleet-metric-invalid-aggregation-rejected` creates a metric with a `Percentiles` aggregation over `registry.thingTypeName`, a `String` field of the `AWS_Things` index. The emulator refuses it with the class, the status and the effect the check requires — HTTP 400 `InvalidRequestException`, nothing persisted — and the check's remaining complaint is the refusal's exact SENTENCE, which the replay does not disclose for a check-type divergence (it reports only the emulator's own tuple). Eleven candidate wordings were replayed, including the one message of this validator the corpus does disclose (`Invalid values [average] for Statistics aggregation on String field. Supported values are [count]`) re-templated for a percentile request; none is accepted, and no guess was landed in its place. The refusal's rule — a percentile is computed only over a field the index carries as `Number` — is implemented in `ComAmazonawsIotAwsiotserviceState::validate_aggregation_field` and covered by the owning crate's `tests/all/fleet_metrics.rs` over every `(AggregationTypeName, FieldType)` pair, for `CreateFleetMetric` and `UpdateFleetMetric` alike.

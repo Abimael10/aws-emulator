@@ -320,6 +320,27 @@ pub const MANAGED_THING_GROUP_FIELDS: &[(&str, &str)] = &[
 /// `maximum`, `sumOfSquares`, `variance`, `stdDeviation`) and so needs a numeric field.
 pub const COUNT_STATISTIC: &str = "count";
 
+/// Whether the aggregation `aggregation_name` can be computed at all over a field the
+/// index carries as `field_type`.
+///
+/// This is the ONE statement of which `(AggregationTypeName, FieldType)` pairs the
+/// service computes, which both operations that configure a fleet metric read: a
+/// percentile only over a field that holds numbers, a percentile being a position in a
+/// distribution of them; the DISTINCT values of a field for the values text and numbers
+/// hold, a flag not being a value a cardinality is asked about; and a `Statistics`
+/// aggregation over a field of any type, because counting the things that carry it
+/// ([`COUNT_STATISTIC`]) needs no arithmetic on its values. A name that is no
+/// aggregation at all is not this gate's refusal — [`validate_aggregation`] has already
+/// refused it as an unknown aggregation type, naming the name as the problem — so it is
+/// no field type that such a request is told about.
+fn aggregation_admits_field_type(aggregation_name: &str, field_type: &str) -> bool {
+    match aggregation_name {
+        AGGREGATION_PERCENTILES_NAME => field_type == FIELD_TYPE_NUMBER,
+        AGGREGATION_CARDINALITY_NAME => field_type != FIELD_TYPE_BOOLEAN,
+        _ => true,
+    }
+}
+
 /// Why the field a request asked to aggregate cannot be aggregated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregationFieldRejection {
@@ -429,11 +450,11 @@ impl super::ComAmazonawsIotAwsiotserviceState {
     /// `index_name`, naming the first rule the request breaks.
     ///
     /// An aggregation reads the VALUES of one field, so the field has to be one the
-    /// index holds, and the aggregation has to be one its type admits: the arithmetic
-    /// statistics and every percentile are summaries OF NUMBERS, so over a field that
-    /// holds no numbers the only statistic there is is the count of the things that
-    /// carry it ([`COUNT_STATISTIC`]), and the distinct values of a field
-    /// (`Cardinality`) can be counted whatever values it holds.
+    /// index holds, and the aggregation has to be one its type admits
+    /// ([`aggregation_admits_field_type`]): over a field that holds no numbers the only
+    /// statistic there is is the count of the things that carry it
+    /// ([`COUNT_STATISTIC`]), there is no percentile at all, and the distinct values of
+    /// a field (`Cardinality`) are counted for the values text and numbers hold.
     pub fn validate_aggregation_field(
         &self,
         index_name: &str,
@@ -446,6 +467,12 @@ impl super::ComAmazonawsIotAwsiotserviceState {
                 index_name: index_name.to_string(),
             });
         };
+        if !aggregation_admits_field_type(&aggregation.name, &field_type) {
+            return Err(AggregationFieldRejection::UnsupportedFieldType {
+                aggregation_name: aggregation.name.clone(),
+                field_type,
+            });
+        }
         if field_type == FIELD_TYPE_NUMBER {
             // Every aggregation there is summarises numbers, so a numeric field admits
             // whichever one the request asked for.
@@ -475,23 +502,6 @@ impl super::ComAmazonawsIotAwsiotserviceState {
                 field_type,
                 invalid_values,
                 supported_values,
-            });
-        }
-        // A percentile is a position in a distribution of numbers, so there is no
-        // percentile of a field that holds none.
-        if aggregation.name == AGGREGATION_PERCENTILES_NAME {
-            return Err(AggregationFieldRejection::UnsupportedFieldType {
-                aggregation_name: aggregation.name.clone(),
-                field_type,
-            });
-        }
-        // Counting the DISTINCT values of a field is over the values themselves, so a
-        // flag — which is not a value a cardinality is asked about — is refused while
-        // text is not.
-        if aggregation.name == AGGREGATION_CARDINALITY_NAME && field_type == FIELD_TYPE_BOOLEAN {
-            return Err(AggregationFieldRejection::UnsupportedFieldType {
-                aggregation_name: aggregation.name.clone(),
-                field_type,
             });
         }
         Ok(())

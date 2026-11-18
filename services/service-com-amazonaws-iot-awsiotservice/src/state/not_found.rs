@@ -22,6 +22,15 @@
 //! that family's sentence, so a describe, a delete and an update of the same resource
 //! cannot word the same miss three ways — which is the whole reason these sentences live
 //! here rather than in each handler.
+//!
+//! ONE family is SPLIT, because the service itself words its halves differently, and a
+//! split one is stated here too so both halves stay in this one place: the FLEET METRIC
+//! family, whose read states the registry families' account-qualified sentence
+//! ([`missing_fleet_metric_message`]) while its write states the name alone
+//! ([`fleet_metric_write_not_found_message`]) — `FleetMetric <metricName> doesn't exist`,
+//! which is what `UpdateFleetMetric` answers. A family is split here only on that
+//! evidence, never to let a handler phrase a miss its own way: a handler names the half
+//! it answers with and words nothing itself.
 
 /// The sentence a REGISTRY family states a missing resource with: the resource noun, the
 /// account the call was made for, `:`, the name the request asked about, and a
@@ -54,13 +63,22 @@ pub fn missing_thing_group_message(thing_group_name: &str) -> String {
 }
 
 /// How this service states that a `metricName` names no fleet metric this account
-/// holds — for a reader of one and for a writer of one.
+/// holds to a READ of one (`DescribeFleetMetric`, and the tag plane's lookup of one).
 ///
 /// A fleet metric is a REGISTRY resource of this account like a thing or a thing
-/// group, so the miss is stated the same way: the family noun, the account the record
-/// would belong to and the name the request asked about.
+/// group, so a read states the miss the same way: the family noun, the account the
+/// record would belong to and the name the request asked about. A WRITE of one states
+/// it in its own wording ([`fleet_metric_write_not_found_message`]).
 pub fn missing_fleet_metric_message(metric_name: &str) -> String {
     registry_not_found("FleetMetric", metric_name)
+}
+
+/// How this service states that a `metricName` names no fleet metric this account holds
+/// to a WRITE of one (`UpdateFleetMetric`): the name the request asked about and this
+/// family's clause for a record that is not there, with the account NOT named — the
+/// other half of [`missing_fleet_metric_message`].
+pub fn fleet_metric_write_not_found_message(metric_name: &str) -> String {
+    format!("FleetMetric {metric_name} doesn't exist")
 }
 
 /// How this service states that a `thingTypeName` names no thing type this account holds

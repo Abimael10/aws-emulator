@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(existing) = store.fleet_metrics.get(&input.metric_name) else {
             return Err(UpdateFleetMetricErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::missing_fleet_metric_message(
+                    message: Some(crate::state::not_found::fleet_metric_write_not_found_message(
                         &input.metric_name,
                     )),
                 },
@@ -348,7 +348,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(metric) = store.fleet_metrics.get_mut(&input.metric_name) else {
             return Err(UpdateFleetMetricErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::missing_fleet_metric_message(
+                    message: Some(crate::state::not_found::fleet_metric_write_not_found_message(
                         &input.metric_name,
                     )),
                 },

@@ -21,6 +21,9 @@
 //! * a created metric is read back member for member, at version 1, with an
 //!   `arn:aws:iot:<region>:<account>:fleetmetric/<metricName>` scoped to the region
 //!   the call was signed for;
+//! * a `metricName` the account holds no metric under is refused
+//!   `ResourceNotFoundException` (404) by every operation addressing one metric, each
+//!   in that operation's own wording;
 //! * a delete is checked against `expectedVersion` and is idempotent, because the
 //!   operation models no not-found at all.
 //!
@@ -92,6 +95,14 @@ impl Emulator {
 
     async fn describe_metric(&self, metric_name: &str) -> Reply {
         self.dispatch("GET", &format!("/fleet-metric/{metric_name}"), None)
+            .await
+    }
+
+    /// `UpdateFleetMetric` — `PATCH /fleet-metric/{metricName}`
+    /// (`smithy_query(query="operation",operation="UpdateFleetMetric")`), whose
+    /// `indexName` is `@required`.
+    async fn update_metric(&self, metric_name: &str, body: &Value) -> Reply {
+        self.dispatch("PATCH", &format!("/fleet-metric/{metric_name}"), Some(body))
             .await
     }
 
@@ -399,6 +410,422 @@ struct Refused {
     case: &'static str,
     body: Value,
     message: Option<String>,
+}
+
+/// What a `(aggregation, field)` pair draws from the gate.
+enum Outcome {
+    /// The service computes the pair: the call is served and the record reports it.
+    Served,
+    /// The service refuses the pair: 400 `InvalidRequestException` and nothing written.
+    /// The sentence is asserted only where the service's own wording for that refusal
+    /// is known — the `Statistics` values refusal — so a row does not pin a wording
+    /// this emulator has not established.
+    Refused(Option<String>),
+}
+
+/// One (aggregation, field) pair the gate is read over: a label, the aggregation the
+/// request asks for, the field it names, and what the pair draws.
+struct Pair {
+    case: &'static str,
+    aggregation: Value,
+    aggregation_field: &'static str,
+    outcome: Outcome,
+}
+
+/// Every `(AggregationTypeName, FieldType)` pair, which is what the gate generalises
+/// over: each aggregation the model declares
+/// (`smithy_query(query="shape",shape="AggregationTypeName")`) against each field type
+/// it declares (`smithy_query(query="shape",shape="FieldType")`: `Number`, `String`,
+/// `Boolean`), read over a managed field of the index and over a custom field the
+/// account declared.
+fn aggregation_field_pairs() -> Vec<Pair> {
+    // A pair the field's type does not admit at all: the class, the status and the
+    // empty store are the assertion, because the sentence this service states for it
+    // is not one the recordings disclose.
+    let unsupported_pair = || Outcome::Refused(None);
+    let arithmetic_on = |field_type: &str| {
+        Outcome::Refused(Some(format!(
+            "Invalid values [average] for Statistics aggregation on {field_type} field. Supported \
+             values are [count]"
+        )))
+    };
+    vec![
+        // The count of the things that carry a field needs no arithmetic on its values,
+        // so it is computed whatever the field holds.
+        Pair {
+            case: "the count statistic over a numeric field",
+            aggregation: json!({ "name": "Statistics", "values": ["count"] }),
+            aggregation_field: "registry.version",
+            outcome: Outcome::Served,
+        },
+        Pair {
+            case: "the count statistic over a textual field",
+            aggregation: json!({ "name": "Statistics", "values": ["count"] }),
+            aggregation_field: STRING_CUSTOM_FIELD,
+            outcome: Outcome::Served,
+        },
+        Pair {
+            case: "the count statistic over a flag field",
+            aggregation: json!({ "name": "Statistics", "values": ["count"] }),
+            aggregation_field: "connectivity.connected",
+            outcome: Outcome::Served,
+        },
+        // An arithmetic summary is over numbers.
+        Pair {
+            case: "an arithmetic statistic over a numeric field",
+            aggregation: json!({ "name": "Statistics", "values": ["average"] }),
+            aggregation_field: NUMBER_CUSTOM_FIELD,
+            outcome: Outcome::Served,
+        },
+        Pair {
+            case: "an arithmetic statistic over a textual field",
+            aggregation: json!({ "name": "Statistics", "values": ["average"] }),
+            aggregation_field: "thingName",
+            outcome: arithmetic_on("String"),
+        },
+        Pair {
+            case: "an arithmetic statistic over a flag field",
+            aggregation: json!({ "name": "Statistics", "values": ["average"] }),
+            aggregation_field: "connectivity.connected",
+            outcome: arithmetic_on("Boolean"),
+        },
+        // A percentile is a position in a distribution of numbers.
+        Pair {
+            case: "percentiles over a managed numeric field",
+            aggregation: json!({ "name": "Percentiles", "values": ["50", "90", "99"] }),
+            aggregation_field: "connectivity.timestamp",
+            outcome: Outcome::Served,
+        },
+        Pair {
+            case: "percentiles over a managed textual field",
+            aggregation: json!({ "name": "Percentiles", "values": ["50", "90", "99"] }),
+            aggregation_field: "registry.thingTypeName",
+            outcome: unsupported_pair(),
+        },
+        Pair {
+            case: "percentiles over a declared textual custom field",
+            aggregation: json!({ "name": "Percentiles", "values": ["25"] }),
+            aggregation_field: STRING_CUSTOM_FIELD,
+            outcome: unsupported_pair(),
+        },
+        Pair {
+            case: "percentiles over a managed flag field",
+            aggregation: json!({ "name": "Percentiles", "values": ["50"] }),
+            aggregation_field: "connectivity.connected",
+            outcome: unsupported_pair(),
+        },
+        // Counting the distinct values of a field is over the values themselves.
+        Pair {
+            case: "cardinality over a numeric field",
+            aggregation: json!({ "name": "Cardinality" }),
+            aggregation_field: NUMBER_CUSTOM_FIELD,
+            outcome: Outcome::Served,
+        },
+        Pair {
+            case: "cardinality over a managed textual field",
+            aggregation: json!({ "name": "Cardinality" }),
+            aggregation_field: "registry.thingTypeName",
+            outcome: Outcome::Served,
+        },
+        Pair {
+            case: "cardinality over a flag field",
+            aggregation: json!({ "name": "Cardinality" }),
+            aggregation_field: "connectivity.connected",
+            outcome: unsupported_pair(),
+        },
+    ]
+}
+
+/// RULE: an aggregation is computed only over a field whose type admits it — every
+/// arithmetic summary and every percentile is of NUMBERS, the count of the things
+/// carrying a field needs no arithmetic on its values, and a cardinality counts values
+/// a flag does not have — so a pair outside that is refused `InvalidRequestException`
+/// (400) and nothing is created.
+#[tokio::test]
+async fn an_aggregation_is_computed_only_over_a_field_type_that_admits_it() {
+    let emulator = Emulator::with_active_index().await;
+
+    for (index, pair) in aggregation_field_pairs().iter().enumerate() {
+        let metric_name = format!("pair-{index}");
+        let body = json!({
+            "queryString": "thingName:*",
+            "aggregationType": pair.aggregation,
+            "aggregationField": pair.aggregation_field,
+            "period": 300,
+        });
+        let reply = emulator.create_metric(&metric_name, &body).await;
+        match &pair.outcome {
+            Outcome::Served => {
+                assert_eq!(
+                    reply.status,
+                    200,
+                    "case {:?}: expected the create to be served, got {} body {}",
+                    pair.case,
+                    reply.status,
+                    reply.text()
+                );
+                let described = emulator.describe_metric(&metric_name).await;
+                assert_eq!(
+                    described.json()["aggregationField"],
+                    json!(pair.aggregation_field),
+                    "case {:?}: the read must report the field created, got {}",
+                    pair.case,
+                    described.text()
+                );
+                assert_eq!(
+                    described.json()["aggregationType"]["name"],
+                    pair.aggregation["name"],
+                    "case {:?}: the read must report the aggregation created, got {}",
+                    pair.case,
+                    described.text()
+                );
+                let asked_values = pair.aggregation["values"].clone();
+                assert_eq!(
+                    described.json()["aggregationType"]["values"],
+                    if asked_values.is_null() {
+                        json!([])
+                    } else {
+                        asked_values
+                    },
+                    "case {:?}: the read must report the values created, got {}",
+                    pair.case,
+                    described.text()
+                );
+            }
+            Outcome::Refused(refusal) => {
+                assert_eq!(
+                    reply.status,
+                    400,
+                    "case {:?}: expected 400, got {} body {}",
+                    pair.case,
+                    reply.status,
+                    reply.text()
+                );
+                assert_eq!(
+                    reply.error_code(),
+                    "InvalidRequestException",
+                    "case {:?}: got {}",
+                    pair.case,
+                    reply.text()
+                );
+                if let Some(refusal) = refusal {
+                    assert_eq!(
+                        &reply.error_message(),
+                        refusal,
+                        "case {:?}: expected the refusal to state the rule, got {}",
+                        pair.case,
+                        reply.text()
+                    );
+                }
+                assert_eq!(
+                    emulator.describe_metric(&metric_name).await.status,
+                    404,
+                    "case {:?}: a refused create must leave no metric behind",
+                    pair.case
+                );
+            }
+        }
+    }
+}
+
+/// RULE (the same one, read by the other operation that configures a metric): an
+/// `UpdateFleetMetric` may only move a metric to a pair the service computes, so every
+/// row of the table holds for the update as well, and a refused update leaves the
+/// configuration the last write recorded.
+#[tokio::test]
+async fn an_update_moves_a_metric_only_to_a_pair_that_admits_it() {
+    let emulator = Emulator::with_active_index().await;
+
+    // What every row starts from: a pair the service computes, so what the row proves
+    // is its own pair and not the state it began in.
+    let baseline = json!({
+        "queryString": "thingName:*",
+        "aggregationType": { "name": "Statistics", "values": ["count"] },
+        "aggregationField": "thingName",
+        "period": 60,
+    });
+
+    for (index, pair) in aggregation_field_pairs().iter().enumerate() {
+        let metric_name = format!("updated-pair-{index}");
+        assert_eq!(
+            emulator.create_metric(&metric_name, &baseline).await.status,
+            200,
+            "case {:?}: the metric an update case moves must be creatable",
+            pair.case
+        );
+        let update = json!({
+            "indexName": THING_INDEX_NAME,
+            "aggregationType": pair.aggregation,
+            "aggregationField": pair.aggregation_field,
+        });
+        let reply = emulator.update_metric(&metric_name, &update).await;
+        let described = emulator.describe_metric(&metric_name).await;
+        match &pair.outcome {
+            Outcome::Served => {
+                assert_eq!(
+                    reply.status,
+                    200,
+                    "case {:?}: expected the update to be served, got {} body {}",
+                    pair.case,
+                    reply.status,
+                    reply.text()
+                );
+                assert_eq!(
+                    described.json()["aggregationField"],
+                    json!(pair.aggregation_field),
+                    "case {:?}: the read must report the field updated to, got {}",
+                    pair.case,
+                    described.text()
+                );
+                assert_eq!(
+                    described.json()["aggregationType"]["name"],
+                    pair.aggregation["name"],
+                    "case {:?}: the read must report the aggregation updated to, got {}",
+                    pair.case,
+                    described.text()
+                );
+            }
+            Outcome::Refused(refusal) => {
+                assert_eq!(
+                    reply.status,
+                    400,
+                    "case {:?}: expected 400, got {} body {}",
+                    pair.case,
+                    reply.status,
+                    reply.text()
+                );
+                assert_eq!(
+                    reply.error_code(),
+                    "InvalidRequestException",
+                    "case {:?}: got {}",
+                    pair.case,
+                    reply.text()
+                );
+                if let Some(refusal) = refusal {
+                    assert_eq!(
+                        &reply.error_message(),
+                        refusal,
+                        "case {:?}: the update must state the rule the create states, got {}",
+                        pair.case,
+                        reply.text()
+                    );
+                }
+                assert_eq!(
+                    described.json()["aggregationField"],
+                    json!("thingName"),
+                    "case {:?}: a refused update must leave the stored field as it was, got {}",
+                    pair.case,
+                    described.text()
+                );
+                assert_eq!(
+                    described.json()["version"],
+                    json!(1),
+                    "case {:?}: a refused update must not move the record on, got {}",
+                    pair.case,
+                    described.text()
+                );
+            }
+        }
+    }
+}
+
+/// RULE: a `metricName` the account holds no metric under is refused
+/// `ResourceNotFoundException` (404) by every operation that addresses one metric, each
+/// in its own wording — the READ states the account the record would belong to and the
+/// name asked about, the WRITE states the name alone — and the same name is served once
+/// the metric exists.
+#[tokio::test]
+async fn a_metric_the_account_does_not_hold_is_refused_in_each_wording() {
+    let emulator = Emulator::with_active_index().await;
+
+    // `FleetMetricName` is len 1..128 pattern ^[a-zA-Z0-9_\-\.]+$
+    // (`smithy_query(query="operation",operation="DescribeFleetMetric")`), so the names
+    // differ in form and in length over what the pattern admits.
+    let names = [
+        "a",
+        "metric.with.dots",
+        "metric_with_underscores",
+        "Metric-With-Hyphens-01",
+        "0123456789",
+    ];
+    let body = json!({
+        "queryString": "thingName:*",
+        "aggregationType": { "name": "Cardinality" },
+        "aggregationField": STRING_CUSTOM_FIELD,
+        "period": 60,
+        "indexName": THING_INDEX_NAME,
+    });
+
+    for name in names {
+        let read_wording = format!("FleetMetric {ACCOUNT_ID}:{name} not found.");
+        let write_wording = format!("FleetMetric {name} doesn't exist");
+
+        for (operation, reply, expected) in [
+            (
+                "DescribeFleetMetric",
+                emulator.describe_metric(name).await,
+                read_wording.clone(),
+            ),
+            (
+                "UpdateFleetMetric",
+                emulator.update_metric(name, &body).await,
+                write_wording.clone(),
+            ),
+        ] {
+            assert_eq!(
+                reply.status,
+                404,
+                "case {operation} on {name:?}: expected 404, got {} body {}",
+                reply.status,
+                reply.text()
+            );
+            assert_eq!(
+                reply.error_code(),
+                "ResourceNotFoundException",
+                "case {operation} on {name:?}: got {}",
+                reply.text()
+            );
+            assert_eq!(
+                reply.error_message(),
+                expected,
+                "case {operation} on {name:?}: expected {expected:?}, got {}",
+                reply.text()
+            );
+        }
+
+        // The record the name addresses is what the refusal was about: created, both
+        // calls are served, and deleting it brings each wording back.
+        assert_eq!(
+            emulator.create_metric(name, &body).await.status,
+            200,
+            "case {name:?}: the metric must be creatable"
+        );
+        assert_eq!(
+            emulator.describe_metric(name).await.status,
+            200,
+            "case {name:?}: the read must be served once the metric exists"
+        );
+        assert_eq!(
+            emulator.update_metric(name, &body).await.status,
+            200,
+            "case {name:?}: the write must be served once the metric exists"
+        );
+        assert_eq!(
+            emulator.delete_metric(name, None).await.status,
+            200,
+            "case {name:?}: the metric must be deletable"
+        );
+        assert_eq!(
+            emulator.describe_metric(name).await.error_message(),
+            read_wording,
+            "case {name:?}: the read states the miss again once the metric is gone"
+        );
+        assert_eq!(
+            emulator.update_metric(name, &body).await.error_message(),
+            write_wording,
+            "case {name:?}: the write states the miss again once the metric is gone"
+        );
+    }
 }
 
 /// RULE: an aggregation the service cannot compute over the field it names is refused
