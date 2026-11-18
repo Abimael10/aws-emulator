@@ -296,6 +296,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // `AuthToken` is the password a client authenticates to the engine with,
+        // and this operation documents the same password constraints as every
+        // other writer of one, so it goes through the same check
+        // (`crate::state::auth_token_refusal`): a token outside them is refused
+        // before the cluster's password is touched.
+        if let Some(message) = input
+            .auth_token
+            .as_deref()
+            .and_then(crate::state::auth_token_refusal)
+        {
+            return Err(ModifyCacheClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // Every VPC security group the request names has to be one the account
         // HAS: the group is what guards network access to this cluster, so an
         // identifier that names none could never guard it. Which security groups

@@ -78,10 +78,23 @@ pub const AUTH_TOKEN_MIN_LEN: usize = 16;
 /// See [`AUTH_TOKEN_MIN_LEN`].
 pub const AUTH_TOKEN_MAX_LEN: usize = 128;
 
-/// The printable special characters an `AuthToken` may carry: "The only
-/// permitted printable special characters are !, &, #, $, ^, <, >, and -. Other
-/// printable special characters cannot be used in the AUTH token."
-pub const AUTH_TOKEN_SPECIAL_CHARACTERS: [char; 8] = ['!', '&', '#', '$', '^', '<', '>', '-'];
+/// The printable characters an `AuthToken` may NOT carry: "Cannot contain any of
+/// the following characters: '/', '\"', or '@', '%'"
+/// (`smithy_query(query="doc", shape="ModifyReplicationGroupMessage",
+/// member="AuthToken")`, the same password the create takes).
+///
+/// The member's older wording names an allow-list of eight printable specials
+/// instead (`smithy_query(query="doc",
+/// shape="CreateReplicationGroupMessage", member="AuthToken")`); the two state
+/// one password rule, and this is the half of it the service enforces — a
+/// password drawn from the URL-safe base64 alphabet, `_` included, is a password
+/// ElastiCache accepts, while one carrying a character out of this list is not.
+pub const AUTH_TOKEN_RESERVED_CHARACTERS: [char; 4] = ['/', '"', '@', '%'];
+
+/// The inclusive range "Must be only printable ASCII characters" names: the
+/// space through `~` (0x20..=0x7E). A token carrying a control character, or any
+/// character outside ASCII at all, is not printable ASCII.
+pub const AUTH_TOKEN_PRINTABLE_ASCII: ::std::ops::RangeInclusive<char> = ' '..='~';
 
 /// The node-type family data tiering requires, from `DataTieringEnabled`: "Data
 /// tiering is only supported for replication groups using the r6gd node type.
@@ -192,18 +205,24 @@ pub fn normalize_replication_group_engine(engine: &str) -> Result<String, String
 }
 
 /// `None` when `token` satisfies every documented `AuthToken` constraint, else
-/// the sentence the request is refused with: "Must be only printable ASCII
-/// characters. Must be at least 16 characters and no more than 128 characters in
-/// length. The only permitted printable special characters are !, &, #, $, ^, <,
-/// >, and -."
+/// the sentence the request is refused with: a password is "only printable ASCII
+/// characters", "at least 16 characters and no more than 128 characters in
+/// length", and "[c]annot contain any of the following characters: '/', '\"', or
+/// '@', '%'" — see [`AUTH_TOKEN_RESERVED_CHARACTERS`]. Every other printable
+/// ASCII character is one a password may be drawn from, so a random URL-safe
+/// secret is a token this service takes.
 ///
 /// The constraints are several, and ElastiCache answers ONE sentence for all of
 /// them — `Invalid AuthToken provided.` — so a token that is too short, too long
 /// or carries a character the engine's password alphabet excludes is refused the
-/// same way.
+/// same way. The same rule holds wherever the API takes a cache's password
+/// (`CreateReplicationGroup`, `ModifyReplicationGroup`, `CreateCacheCluster` and
+/// `ModifyCacheCluster` all document these constraints), so every writer of one
+/// comes through here.
 pub fn auth_token_refusal(token: &str) -> Option<String> {
     let permitted = |character: char| {
-        character.is_ascii_alphanumeric() || AUTH_TOKEN_SPECIAL_CHARACTERS.contains(&character)
+        AUTH_TOKEN_PRINTABLE_ASCII.contains(&character)
+            && !AUTH_TOKEN_RESERVED_CHARACTERS.contains(&character)
     };
     if !(AUTH_TOKEN_MIN_LEN..=AUTH_TOKEN_MAX_LEN).contains(&token.chars().count())
         || !token.chars().all(permitted)

@@ -5,9 +5,8 @@
 //! `AuthToken` is the password a client authenticates to the engine with, and the API states
 //! two rules about it: it "can be specified only on replication groups where
 //! TransitEncryptionEnabled is true", and the password itself "must be only printable ASCII
-//! characters", "at least 16 characters and no more than 128 characters in length", with
-//! "the only permitted printable special characters" being `!`, `&`, `#`, `$`, `^`, `<`, `>`
-//! and `-`.
+//! characters", "at least 16 characters and no more than 128 characters in length", and
+//! "[c]annot contain any of the following characters: '/', '\"', or '@', '%'".
 //!
 //! ElastiCache answers each rule with ONE sentence, both as the modelled
 //! `InvalidParameterValueException` (`awsQueryError` code `InvalidParameterValue`, HTTP 400):
@@ -17,12 +16,12 @@
 //! * a token that is not a password the engine accepts — `Invalid AuthToken provided.`,
 //!   whichever of the password constraints it breaks.
 //!
-//! The rows span the constraints a token can break (too short, too long, a character outside
-//! the permitted alphabet) and both writers of a replication group's password
+//! The rows span the constraints a token can break (too short, too long, a character the
+//! password rule reserves) and both writers of a replication group's password
 //! (`CreateReplicationGroup` and `ModifyReplicationGroup`), with a VALID token on an
 //! encrypted group as the control: the refusals are about the token and nothing else.
 
-use crate::harness::{params, Emulator, Reply, PAST_TRANSITION};
+use crate::harness::{params, poll_until, Emulator, Reply, REGION};
 
 /// The `awsQuery` error code both refusals carry, from the model:
 /// `InvalidParameterValueException` has `awsQueryError` code `InvalidParameterValue` with
@@ -36,13 +35,13 @@ const GOOD_TOKEN: &str = "aVeryLongPassword1";
 /// Tokens that break one documented constraint each, with the case name.
 ///
 /// The length bounds are the documented 16 and 128, so one row is a character short of the
-/// minimum and one a character past the maximum; the last carries a special character the
-/// permitted set excludes (`*`).
+/// minimum and one a character past the maximum; the last carries one of the characters the
+/// password rule reserves (`'/'`, `'"'`, `'@'`, `'%'`).
 const BAD_TOKENS: [(&str, &str); 4] = [
     ("one short of the minimum", "aPassword123456"),
     ("far shorter than the minimum", "short"),
     ("one past the maximum", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-    ("a character outside the permitted set", "has*a*star*in*it*"),
+    ("a character the password rule reserves", "has@an@at@sign12"),
 ];
 
 /// Assert `reply` is the modelled refusal carrying `message`.
@@ -65,6 +64,21 @@ fn assert_refused(case: &str, reply: &Reply, message: &str) {
         "case {case}: expected {message:?}, got {:?}",
         reply.error_message()
     );
+}
+
+/// Look again until the group `id` reports the status a settled group has, so the modify
+/// rows below are answered about the token and not about a group still being created.
+async fn settled(emulator: &Emulator, id: &str) {
+    poll_until(
+        emulator,
+        REGION,
+        id,
+        "the group reaching available",
+        "DescribeReplicationGroups",
+        &params(&[("ReplicationGroupId", id)]),
+        |reply| reply.text("ReplicationGroup/Status") == Some("available"),
+    )
+    .await;
 }
 
 /// One `CreateReplicationGroup` with the pairs a row sends.
@@ -99,7 +113,9 @@ async fn a_token_the_engine_would_not_accept_is_refused_with_one_sentence() {
         "a valid token on an encrypted group must be accepted, got {} {}",
         accepted.status, accepted.body
     );
-    std::thread::sleep(PAST_TRANSITION);
+    // The modify rows need the group settled, so this waits for the status the clock owes
+    // rather than for a span of time.
+    settled(&emulator, "token-rg").await;
 
     for (index, (case, token)) in BAD_TOKENS.iter().enumerate() {
         let refused = create(
@@ -180,7 +196,7 @@ async fn a_token_without_encryption_in_transit_is_refused_with_the_other_sentenc
         "the modify row needs its group, got {} {}",
         created.status, created.body
     );
-    std::thread::sleep(PAST_TRANSITION);
+    settled(&emulator, "plain-rg").await;
     let refused = emulator
         .call(
             "ModifyReplicationGroup",

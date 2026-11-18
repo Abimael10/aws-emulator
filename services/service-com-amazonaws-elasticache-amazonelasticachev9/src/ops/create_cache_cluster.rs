@@ -341,6 +341,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // `AuthToken` is the password a client authenticates to the engine with,
+        // and this operation documents the same password constraints as every
+        // other writer of one, so it goes through the same check
+        // (`crate::state::auth_token_refusal`): a token outside them is refused
+        // here, before anything is stored, rather than becoming a password no
+        // client could ever have used.
+        if let Some(message) = input
+            .auth_token
+            .as_deref()
+            .and_then(crate::state::auth_token_refusal)
+        {
+            return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let engine = match crate::state::normalize_engine(
             input
                 .engine

@@ -955,10 +955,10 @@ async fn a_create_this_service_cannot_satisfy_is_refused_with_its_modelled_error
             "InvalidParameterValue",
         ),
         (
-            "an auth token with a forbidden special character",
+            "an auth token with a character the password rule reserves",
             &[
                 ("TransitEncryptionEnabled", "true"),
-                ("AuthToken", "has*a*star*in*it*"),
+                ("AuthToken", "has@an@at@sign12"),
             ],
             400,
             "InvalidParameterValue",
