@@ -25,7 +25,10 @@
 //!    publish, packument and tarball, with the control plane describing what was stored;
 //! 4. two domains holding a repository of the SAME name, whose announced endpoints stay
 //!    distinct and each serve their own repository;
-//! 5. the pypi index, served at its own announced URL.
+//! 5. the pypi index, served at its own announced URL;
+//! 6. the documented flow end to end — `GetAuthorizationToken`, then a package manager
+//!    pointed at the announced URL — for every authorization period a token may be minted
+//!    for, and for the periods that mint none.
 
 use serde_json::Value;
 use smithy_server_runtime::{MultiServiceRouter, UNSERVED_URL_BASE};
@@ -47,6 +50,27 @@ use crate::npm_registry_endpoint::{publish_document, registry, tarball_bytes, to
 /// The base a served emulator in these cases reports, with the loopback address and port a
 /// data port is published at.
 const SERVED_BASE: &str = "https://127.0.0.1:9297";
+
+/// The published minimum and maximum of the authorization period a token may be minted
+/// for: "Valid values are 0 and any number between 900 (15 minutes) and 43200 (12 hours)"
+/// (`GetAuthorizationTokenRequest$durationSeconds`, which also carries the modelled
+/// `@range` ceiling 43200).
+const MIN_DURATION_SECONDS: i64 = 900;
+const MAX_DURATION_SECONDS: i64 = 43_200;
+
+/// `GetAuthorizationToken` for `domain`, with the authorization period sent only when
+/// named — the whole answer, because the cases below assert both a mint and a refusal.
+async fn token_answer(
+    router: &MultiServiceRouter,
+    domain: &str,
+    duration_seconds: Option<i64>,
+) -> Answer {
+    let mut uri = format!("/v1/authorization-token?domain={domain}");
+    if let Some(duration) = duration_seconds {
+        uri.push_str(&format!("&duration={duration}"));
+    }
+    call(router, "POST", &uri, None).await
+}
 
 /// `GetRepositoryEndpoint`, sent to `host` — the address the client reached this emulator
 /// at, which is what the announced URL has to lead back to.
@@ -564,4 +588,140 @@ async fn a_python_client_pointed_at_the_announced_endpoint_reads_the_index() {
         unauthenticated.status, 401,
         "case \"the index with no credential\": expected 401, got {unauthenticated:?}"
     );
+}
+
+/// CASE 6: the flow AWS documents for a package manager — `GetAuthorizationToken`, then
+/// point npm at `repositoryEndpoint` — is walkable here, for every authorization period a
+/// token may be minted for: the announced URL's authority is one this emulator answers on,
+/// the token authenticates the registry's write-authorization route there, and a publish
+/// carrying it lands in the repository the URL names. A period outside the accepted set
+/// mints no token, so nothing is published with one.
+///
+/// The rows span what the rule generalises over: the authorization period asked for — none,
+/// the caller-credential value, the published minimum, a value inside the interval and the
+/// published maximum — and, on the refusal side, the smallest value there is and the one
+/// just below the published minimum.
+#[tokio::test]
+async fn a_token_minted_for_any_accepted_period_authenticates_the_announced_endpoint() {
+    let router = emulator_served_at(SERVED_BASE);
+    let domain = "token-announced";
+    let repository = "releases";
+    given_repository(&router, domain, repository).await;
+
+    let url = announced_endpoint(&router, domain, repository, "npm").await;
+    let (host, endpoint) = dialable(&url);
+    // The announced authority is one this emulator answers on, which is what makes the rest
+    // of this flow reachable at all: a client handed a name AWS publishes never arrives.
+    assert_eq!(
+        host,
+        SERVED_BASE.trim_start_matches("https://"),
+        "case \"the announced authority\": expected the address this emulator is served at, \
+         got {url:?}"
+    );
+
+    // (case, the authorization period asked for, the package published with its token)
+    let rows: [(&str, Option<i64>, &str); 5] = [
+        ("no durationSeconds", None, "default-period"),
+        ("the caller-credential value", Some(0), "zero-period"),
+        (
+            "the published minimum",
+            Some(MIN_DURATION_SECONDS),
+            "minimum-period",
+        ),
+        ("an hour", Some(3_600), "one-hour-period"),
+        (
+            "the published maximum",
+            Some(MAX_DURATION_SECONDS),
+            "maximum-period",
+        ),
+    ];
+
+    for (case, duration, package) in rows {
+        let minted = token_answer(&router, domain, duration).await;
+        assert_eq!(
+            minted.status, 200,
+            "case {case:?}: expected GetAuthorizationToken 200, got {minted:?}"
+        );
+        let token = minted
+            .body
+            .get("authorizationToken")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !token.is_empty(),
+            "case {case:?}: expected a minted token, got {minted:?}"
+        );
+
+        // The write-authorization route an npm client checks before publishing, at the
+        // announced URL and nowhere else.
+        let ping = registry(
+            &router,
+            "GET",
+            &host,
+            &format!("{endpoint}-/ping?write=true"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            ping.status, 200,
+            "case {case:?}: expected 200 from the write-authorization route at {url:?}, got \
+             {ping:?}"
+        );
+
+        // And what that route reports is backed: the same token publishes, and the control
+        // plane holds the version the publish stored.
+        let published = registry(
+            &router,
+            "PUT",
+            &host,
+            &format!("{endpoint}{package}"),
+            Some(&token),
+            Some(publish_document(package, package, &["1.0.0"])),
+        )
+        .await;
+        assert_eq!(
+            published.status, 200,
+            "case {case:?}: expected the publish at {url:?} to answer 200, got {published:?}"
+        );
+        let described = call(
+            &router,
+            "GET",
+            &format!(
+                "/v1/package/version?domain={domain}&repository={repository}&format=npm\
+                 &package={package}&version=1.0.0"
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(
+            described.status, 200,
+            "case {case:?}: expected DescribePackageVersion 200 for what the publish stored, \
+             got {described:?}"
+        );
+    }
+
+    // The other side of the rule: a period the accepted set does not hold mints no token at
+    // all, in the service's own sentence, so no client ever reaches the endpoint with one.
+    for duration in [1_i64, MIN_DURATION_SECONDS - 1] {
+        let refused = token_answer(&router, domain, Some(duration)).await;
+        assert_eq!(
+            (refused.status, refused.code()),
+            (400, "ValidationException".to_string()),
+            "case refused {duration}: expected a 400 ValidationException, got {refused:?}"
+        );
+        assert_eq!(
+            refused.message(),
+            format!(
+                "Invalid durationSeconds value of {duration}: value must be 0 or between \
+                 {MIN_DURATION_SECONDS} and {MAX_DURATION_SECONDS} (inclusive)."
+            ),
+            "case refused {duration}: expected the service's own sentence, got {refused:?}"
+        );
+        assert!(
+            refused.body.get("authorizationToken").is_none(),
+            "case refused {duration}: a refusal must carry no token, got {refused:?}"
+        );
+    }
 }
