@@ -92,4 +92,28 @@ impl ComAmazonawsEc2Amazonec2State {
         let family = burstable_instance_family(instance_type)?;
         Some(requested.unwrap_or_else(|| self.default_cpu_credits_for(region, family)))
     }
+
+    /// Put the credit option the instance `instance_id` runs under at `cpu_credits`, and
+    /// answer the option it REPORTS from then on — `None` when this store holds no instance
+    /// under that id.
+    ///
+    /// The one writer of [`InstanceRecord::cpu_credits`] after a launch: "modifies the credit
+    /// option for CPU usage" (`ModifyInstanceCreditSpecification`) moves the option of the
+    /// instance itself, which is why it is held on the record rather than re-read from the
+    /// family's default per request. `cpu_credits` is a `&'static str` so only a documented
+    /// option can reach an instance ([`cpu_credits_value`] is what turns a request's word into
+    /// one), never the request's own text, and the answer is read back OUT of the record
+    /// through the one projection every reader of it takes
+    /// ([`instance_cpu_credits`]), so a writer reports exactly what a later
+    /// `DescribeInstanceCreditSpecifications` will. Idempotent: setting an instance to the
+    /// option it already holds changes nothing and answers the same option.
+    pub fn set_instance_cpu_credits(
+        &mut self,
+        instance_id: &str,
+        cpu_credits: &'static str,
+    ) -> Option<&'static str> {
+        let instance = self.instances.get_mut(instance_id)?;
+        instance.cpu_credits = Some(cpu_credits);
+        Some(instance_cpu_credits(instance))
+    }
 }

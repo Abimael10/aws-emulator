@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyInstanceCreditSpecification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyInstanceCreditSpecification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Moves the credit option for CPU usage of the instances the request names onto the option
+//! each entry asks for, writing it on the instance itself
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::set_instance_cpu_credits`]), which is what
+//! `DescribeInstanceCreditSpecifications` reports from then on.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyInstanceCreditSpecification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Modifies the credit option for CPU usage on a running or stopped burstable performance
+//! instance. The credit options are standard and unlimited": each entry of the batch is
+//! judged on its own and reported either in the SUCCESSFUL set or in the UNSUCCESSFUL one
+//! with the cause — "information about the instances whose credit option for CPU usage was
+//! not modified" — so one instance this call cannot move does not refuse the instances beside
+//! it. What the unsuccessful set reports is a fact of the INSTANCE: one whose state admits no
+//! modification (`IncorrectInstanceState`), and one that has no such option to move
+//! (`InstanceCreditSpecification.NotSupported`) — an instance that is not of a burstable
+//! performance type, or one on a Dedicated Host being asked for `unlimited`, since "T3
+//! instances with `host` tenancy do not support the `unlimited` CPU credit option"
+//! (`InstanceCreditSpecificationRequest$CpuCredits`).
+//!
+//! A fault of the REQUEST refuses the whole call instead, and writes nothing: an instance id
+//! this service cannot read is `InvalidInstanceID.Malformed`, and one that names no instance
+//! this call can act on — nothing stored under it, an instance of another Region, or one that
+//! has reached `terminated` — is `InvalidInstanceID.NotFound` naming every such id in one
+//! sentence ("the instance IDs … do not exist or have been terminated"), rather than reported
+//! against one entry: the recorded contract of this operation refuses a batch that names such
+//! an id, so the whole list is resolved before any entry of it is served. A `CpuCredits`
+//! outside the documented pair is a request fault too — the item error-code catalog declares
+//! no code for one — so it refuses the call through the one refusal this service words a bad
+//! `CpuCredits` with ([`crate::state::invalid_cpu_credits`]).
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +161,295 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyInstanceCreditSpecification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyInstanceCreditSpecificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            burstable_instance_family, cpu_credits_value, instance_family_of,
+            instance_family_refusal_message, instance_id_reads_as_one, instance_region,
+            invalid_cpu_credits, request_region, require_service_state, InstanceStateName,
+            CPU_CREDITS_UNLIMITED, MAX_RESOURCE_IDS,
+        };
+
+        // EC2 is a REGIONAL service, reached through a regional endpoint: the instances this
+        // call can move are the ones of the Region the request was signed for, so an id that
+        // names an instance of another Region names no instance here.
+        let region = request_region(ctx.parts());
+
+        // `InstanceCreditSpecifications` is `@required` but `clientOptional`: the boundary
+        // validator refuses a request that OMITS the list, and this is this operation's own
+        // answer for one that arrives EMPTY, which the model cannot express — the operation
+        // modifies the instances it names, and one that names none has nothing to modify. The
+        // parameter is named the way the request spells it on the wire
+        // (`InstanceCreditSpecification.N`, the member's `xmlName`), as the batches beside it
+        // name theirs.
+        if input.instance_credit_specifications.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter InstanceCreditSpecification",
+            ));
+        }
+        // The model declares no `@length` on the list, so this is the only place the batch
+        // size can be bounded — the same ceiling every other caller-chosen instance list in
+        // this crate is held to, charged before any per-instance work is done.
+        if input.instance_credit_specifications.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceCreditSpecification carries {} entries, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                input.instance_credit_specifications.len()
+            )));
+        }
+
+        // "The credit option for CPU usage of the instance. Valid values: `standard` |
+        // `unlimited`" (`InstanceCreditSpecificationRequest$CpuCredits`). The member is a
+        // plain `String` in the model with no enum behind it, so a handler is the only place
+        // that pair can be enforced — and a value outside it, an entry carrying none
+        // included, is a fault of the REQUEST: the item error-code catalog declares no code
+        // for one, so the whole call is refused through the ONE refusal this service words a
+        // `CpuCredits` outside the pair with, and nothing is written. What is carried onward
+        // is the catalog's own word, never the request's text.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyInstanceCreditSpecification"))
+        // An instance the batch names more than once is moved ONCE, by the first entry that
+        // names it: one instance gets one answer however many times a batch names it, and
+        // applying a repeat would report a move from a state no caller ever saw.
+        let mut requested: Vec<(String, &'static str)> = Vec::new();
+        let mut named: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for specification in &input.instance_credit_specifications {
+            let cpu_credits = cpu_credits_value(
+                specification.cpu_credits.as_deref().unwrap_or_default(),
+            )
+            .ok_or_else(invalid_cpu_credits)?;
+            if !named.insert(specification.instance_id.as_str()) {
+                continue;
+            }
+            requested.push((specification.instance_id.clone(), cpu_credits));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Which state an instance is in is a fact of where the clock stands, so every move it
+        // already owed is materialised before one is read: the state each entry is judged
+        // against is the one the instance is in now, not the one it was left in.
+        store.materialize_due_transitions();
+
+        // EVERY id the batch names is resolved BEFORE any entry of it is served, and an id
+        // that names no instance this call can act on refuses the WHOLE call rather than one
+        // entry of it: such an id is a fault of the request, so a batch naming one of them
+        // moves none of the instances beside it. The refusal names every id at fault in ONE
+        // sentence ([`unresolvable_instance_ids_message`]), which is why they are collected
+        // here instead of refused one at a time.
+        //
+        // An id is resolved through the WEAKER of the two readings of an instance id
+        // ([`crate::state::instance_id_reads_as_one`]): a value outside both published forms
+        // is no instance id at all and is malformed, and every value INSIDE one of them is
+        // looked up, so an id EC2 can read but has issued no instance for names an instance
+        // that is not there rather than an id that cannot be read. Which reading an operation
+        // takes is a fact of that operation, recorded by its caller; this operation's own
+        // recorded contract answers `InvalidInstanceID.NotFound` for the all-zero short-form
+        // placeholder — a value in exactly that gap — which is the reading
+        // `ModifyInstanceMaintenanceOptions` beside it was recorded taking too.
+        let mut absent: Vec<&str> = Vec::new();
+        let mut resolved: Vec<(&str, &'static str)> = Vec::new();
+        for (instance_id, cpu_credits) in &requested {
+            if !instance_id_reads_as_one(instance_id) {
+                return Err(Scaffolded::instance_id_is_malformed(instance_id));
+            }
+            match store.instances.get(instance_id.as_str()) {
+                // "The instance IDs … do not exist or have been terminated": an id this
+                // account holds no instance under, one whose instance belongs to ANOTHER
+                // Region — EC2 is reached through a regional endpoint, so such an id names no
+                // instance here — and one whose instance has reached `terminated` are the same
+                // answer, which is what that sentence states in so many words. An instance
+                // still on its WAY there is reported by the unsuccessful set below: a describe
+                // still answers it, so it exists, and what refuses the modification is the
+                // state it is in.
+                None => absent.push(instance_id),
+                Some(instance) if instance_region(instance) != region => absent.push(instance_id),
+                Some(instance) if instance.state == InstanceStateName::Terminated => {
+                    absent.push(instance_id);
+                }
+                Some(_) => resolved.push((instance_id, *cpu_credits)),
+            }
+        }
+        if !absent.is_empty() {
+            return Err(Scaffolded::service_error(
+                INVALID_INSTANCE_ID_NOT_FOUND,
+                400,
+                unresolvable_instance_ids_message(&absent),
+            ));
+        }
+
+        // What is left is a fact of the INSTANCE rather than of the request, which is what the
+        // unsuccessful set reports: "information about the instances whose credit option for
+        // CPU usage was not modified", each judged on its own so one instance this call cannot
+        // move does not refuse the instances beside it. The code is the one this service
+        // answers that same cause with elsewhere, so a client reads one code and one sentence
+        // per cause whether it arrives as an error or as an unsuccessful item.
+        let mut unsuccessful: Vec<UnsuccessfulInstanceCreditSpecificationItem> = Vec::new();
+        let mut movable: Vec<(String, &'static str)> = Vec::new();
+        for (instance_id, cpu_credits) in &resolved {
+            let Some(instance) = store.instances.get(*instance_id) else {
+                return Err(Scaffolded::internal_error(format!(
+                    "the instance '{instance_id}' this call resolved is no longer stored"
+                )));
+            };
+            let cause = if instance.state == InstanceStateName::ShuttingDown {
+                // "Modifies the credit option for CPU usage on a RUNNING OR STOPPED burstable
+                // performance instance": an instance on its way to `terminated` has no credit
+                // option left to move, while `pending` and `stopping` are transient states on
+                // their way to exactly `running` and `stopped`, so this service's own
+                // lifecycle spans never refuse a modify.
+                Some(Scaffolded::incorrect_instance_state(instance_id, "modified"))
+            } else {
+                match burstable_instance_family(&instance.instance_type) {
+                    // Only a burstable performance instance has a credit option at all, so an
+                    // instance of any other type has none to modify. Worded through the
+                    // sentence this service answers a family that supports no credit option
+                    // with, with the family read off the stored instance.
+                    None => Some(not_supported(instance_family_refusal_message(
+                        instance_family_of(&instance.instance_type),
+                    ))),
+                    // "T3 instances with `host` tenancy do not support the `unlimited` CPU
+                    // credit option" (`InstanceCreditSpecificationRequest$CpuCredits`): an
+                    // instance on a Dedicated Host cannot take that option, whichever
+                    // burstable family it belongs to.
+                    Some(_)
+                        if instance.detail.tenancy == TENANCY_HOST
+                            && *cpu_credits == CPU_CREDITS_UNLIMITED =>
+                    {
+                        Some(not_supported(HOST_TENANCY_UNLIMITED_MESSAGE))
+                    }
+                    Some(_) => None,
+                }
+            };
+            match cause {
+                Some(refusal) => unsuccessful.push(UnsuccessfulInstanceCreditSpecificationItem {
+                    instance_id: Some((*instance_id).to_string()),
+                    error: Some(reported_cause(refusal)?),
+                }),
+                None => movable.push(((*instance_id).to_string(), *cpu_credits)),
+            }
+        }
+
+        // DryRun sits AFTER every entry has been judged and BEFORE the first write: "if you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`),
+        // so a request that would have been refused is refused with that reason instead, and
+        // one that would have succeeded leaves every instance's option exactly where it was.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "A unique, case-sensitive token that you provide to ensure idempotency of your
+        // modification request" (`$ClientToken`): this call ASSIGNS the option each instance
+        // runs under, so replaying the same request re-asserts exactly the same option and
+        // answers exactly the same sets — nothing is stored against the token, and no retry
+        // can move an instance twice.
+        let mut successful: Vec<SuccessfulInstanceCreditSpecificationItem> = Vec::new();
+        for (instance_id, cpu_credits) in &movable {
+            // The option is read back OUT of the record just written, through the one
+            // projection every reader of an instance's option takes
+            // ([`crate::state::instance_cpu_credits`]), so the caller is told about instances
+            // a later `DescribeInstanceCreditSpecifications` reports under the new option
+            // rather than about ids this handler merely listed.
+            let stored = store
+                .set_instance_cpu_credits(instance_id, cpu_credits)
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "the instance '{instance_id}' this call judged modifiable is no \
+                         longer stored"
+                    ))
+                })?;
+            if stored != *cpu_credits {
+                return Err(Scaffolded::internal_error(format!(
+                    "the credit option written onto the instance '{instance_id}' could not \
+                     be read back"
+                )));
+            }
+            successful.push(SuccessfulInstanceCreditSpecificationItem {
+                instance_id: Some(instance_id.clone()),
+            });
+        }
+
+        // Both sets are reported even when one of them is empty: the answer states what
+        // happened to every instance the request named, so a caller reads the set it expects
+        // rather than an absent member it has to interpret.
+        Ok(ModifyInstanceCreditSpecificationOutput {
+            successful_instance_credit_specifications: Some(successful),
+            unsuccessful_instance_credit_specifications: Some(unsuccessful),
+        })
+    }
+}
+
+/// The `Tenancy` enum's `host` member — an instance running on a Dedicated Host, as the
+/// generated catalog of that type spells it (`crate::ops::types::TENANCY_VALUES`).
+const TENANCY_HOST: &str = "host";
+
+/// The code EC2 answers for an instance id that names no instance this call can act on:
+/// `InvalidInstanceID.NotFound`, the code the model's own
+/// `UnsuccessfulInstanceCreditSpecificationErrorCode` names for an absent instance and the
+/// code this service answers one with everywhere else.
+const INVALID_INSTANCE_ID_NOT_FOUND: &str = "InvalidInstanceID.NotFound";
+
+/// How EC2 states the instance ids one call named that it could not act on: every id at
+/// fault in one sentence, then that they are gone and what to do about it.
+///
+/// A BATCH wording, unlike the per-resource sentences the operations that resolve ONE named
+/// instance answer: this operation resolves the whole list before it serves any entry of it,
+/// and its recorded contract words that refusal naming every id at fault, in the order the
+/// request named them. The fixed text is AWS's; the only variable part is the ids, taken from
+/// the request.
+fn unresolvable_instance_ids_message(instance_ids: &[&str]) -> String {
+    format!(
+        "The instance IDs {} do not exist or have been terminated. Change the IDs and try \
+         again.",
+        instance_ids.join(", ")
+    )
+}
+
+/// How EC2 states that the credit option asked for is not one the instance can run under:
+/// `InstanceCreditSpecification.NotSupported`, one of the four codes the model's own
+/// `UnsuccessfulInstanceCreditSpecificationErrorCode` declares for an item of the
+/// unsuccessful set.
+const INSTANCE_CREDIT_SPECIFICATION_NOT_SUPPORTED: &str = "InstanceCreditSpecification.NotSupported";
+
+/// The sentence an instance on a Dedicated Host is refused `unlimited` with: "T3 instances
+/// with `host` tenancy do not support the `unlimited` CPU credit option"
+/// (`InstanceCreditSpecificationRequest$CpuCredits`).
+///
+/// A fixed sentence, as that documentation words the rule, quoting nothing of the request:
+/// what is wrong is the pairing of the tenancy with the option, not any value the caller
+/// chose.
+const HOST_TENANCY_UNLIMITED_MESSAGE: &str =
+    "T3 instances with host tenancy do not support the unlimited CPU credit option.";
+
+/// The refusal an instance that cannot run the requested option is reported with, carried
+/// through the error channel so an item's code and sentence come from one place.
+fn not_supported(message: impl Into<String>) -> ModifyInstanceCreditSpecificationError {
+    crate::scaffolded::Scaffolded::service_error(
+        INSTANCE_CREDIT_SPECIFICATION_NOT_SUPPORTED,
+        400,
+        message,
+    )
+}
+
+/// The modelled item error for the refusal `refusal`: its code and its sentence, so an
+/// unsuccessful item reports a cause in exactly the words this service refuses that cause
+/// with elsewhere.
+///
+/// Every cause this operation reports per item is one of this service's own coded refusals
+/// ([`crate::scaffolded::ServiceError`]), which is the only variant that carries a wire code
+/// to report; anything else is a failure of the call rather than of one instance, and is
+/// handed back to the caller as such.
+fn reported_cause(
+    refusal: ModifyInstanceCreditSpecificationError,
+) -> Result<
+    UnsuccessfulInstanceCreditSpecificationItemError,
+    ModifyInstanceCreditSpecificationError,
+> {
+    match refusal {
+        crate::scaffolded::Scaffolded::ServiceError(error) => {
+            Ok(UnsuccessfulInstanceCreditSpecificationItemError {
+                code: Some(error.code.to_string()),
+                message: Some(error.message),
+            })
+        }
+        other => Err(other),
     }
 }
