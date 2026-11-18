@@ -233,6 +233,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::service_owned::requesting_owner(&*self.engine, ctx);
         let now = ::std::time::SystemTime::now();
 
+        // Whether the secret this call names is one under the MANAGED ROTATION of the service
+        // that owns it, and how that service performs it
+        // ([`crate::state::managed_rotation`]). Resolved before anything is decided, because
+        // it is what makes a caller's rotation of a secret it does not own a call this service
+        // serves — by handing the rotation to that service — rather than one it refuses.
+        let managed = {
+            let mut store = state.lock();
+            store.expire_due(now);
+            store.settle_replicas_due(now);
+            store
+                .view(&region, &input.secret_id)
+                .and_then(|view| {
+                    crate::state::managed_rotation::managed_rotation(
+                        &*self.engine,
+                        &view.content.arn,
+                        view.content.owning_service.as_deref(),
+                    )
+                })
+        };
+
         // What this call is refused for, and what the rotation it starts will be driven
         // with, decided under the store's guard; asking the rotation function's own policy
         // whether this service may invoke it is a call to Lambda, which cannot be made
@@ -241,8 +261,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             store.expire_due(now);
             store.settle_replicas_due(now);
-            plan(&mut store, &region, &input, requesting_owner.as_ref())?
+            plan(
+                &mut store,
+                &region,
+                &input,
+                requesting_owner.as_ref(),
+                managed.is_some(),
+            )?
         };
+
+        // A secret under managed rotation is rotated BY the service that manages it: there is
+        // no rotation function here to invoke and no rotation configuration of this service's
+        // to apply, so the whole of this call is asking that service for the rotation.
+        if let Some(rotation) = &managed {
+            return self
+                .hand_over_rotation(ctx, &region, &input, &planned, rotation.as_ref(), now)
+                .await;
+        }
 
         // "You also need lambda:InvokeFunction permissions on the rotation function": a
         // rotation this service cannot invoke the function for is one that cannot be
@@ -267,7 +302,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusals are decided again against what the store holds NOW: a concurrent
         // delete, or a rotation another call started in the meantime, refuses this one
         // rather than overwriting what it did.
-        let planned = plan(&mut store, &region, &input, requesting_owner.as_ref())?;
+        let planned = plan(
+            &mut store,
+            &region,
+            &input,
+            requesting_owner.as_ref(),
+            managed.is_some(),
+        )?;
         let Some(secret) = store.get_mut(&region, &input.secret_id) else {
             return Err(RotateSecretErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -340,6 +381,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The whole of a `RotateSecret` call on a secret under the MANAGED ROTATION of the service
+/// that owns it: ask that service to rotate the credential, then report the secret and the
+/// version its rotation left current.
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RotateSecret<Eng> {
+    /// Hand the rotation to the service that manages the secret, and answer with what that
+    /// rotation left.
+    ///
+    /// Nothing of this service's own rotation configuration is written: such a secret has no
+    /// rotation function to invoke ("For secrets that use managed rotation, omit this field",
+    /// `RotateSecretRequest$RotationLambdaARN`) and its schedule belongs to the managing
+    /// service, so what this call changes is the CREDENTIAL — which that service changes, by
+    /// writing the secret it owns. The stamp this service keeps is the one it owes for a
+    /// rotation that has completed, `LastRotatedDate`.
+    ///
+    /// A call that asks NOT to rotate now (`RotateImmediately` false) asks that service for
+    /// nothing: the schedule it would set is not this service's to set, so the secret is left
+    /// exactly as it was and the version it already holds is reported.
+    ///
+    /// The owning service is asked with NO store guard held: it writes the secret through this
+    /// service's own operations while it rotates.
+    async fn hand_over_rotation(
+        &self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        input: &RotateSecretInput,
+        planned: &Planned,
+        rotation: &dyn ::service_common::managed_secret_rotations::ManagedRotation,
+        now: ::std::time::SystemTime,
+    ) -> Result<RotateSecretOutput, RotateSecretError> {
+        if planned.rotate_immediately {
+            rotation
+                .rotate(ctx.callback())
+                .await
+                .map_err(rotation_not_performed)?;
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let Some(secret) = store.get_mut(region, &input.secret_id) else {
+            return Err(RotateSecretErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        if planned.rotate_immediately {
+            secret.finish_rotation(now);
+        }
+        Ok(RotateSecretOutput {
+            arn: Some(secret.arn.clone()),
+            name: Some(secret.name.clone()),
+            // "The ID of the new version of the secret": the version the managing service's
+            // rotation staked the new credential on, which is the one holding the current
+            // value now that the rotation has completed.
+            version_id: secret
+                .version_with_stage(crate::state::STAGE_CURRENT)
+                .map(|version| version.version_id.clone()),
+        })
+    }
+}
+
 /// What a `RotateSecret` call resolved to: the secret it rotates, the version the rotation
 /// will create, and the function that rotation drives.
 struct Planned {
@@ -371,6 +473,7 @@ fn plan(
     region: &str,
     input: &RotateSecretInput,
     requesting_owner: Option<&crate::state::service_owned::OwningService>,
+    under_managed_rotation: bool,
 ) -> Result<Planned, RotateSecretError> {
     // "A unique identifier for the new version of the secret. ... If you use
     // the Amazon Web Services CLI or one of the Amazon Web Services SDKs to
@@ -427,9 +530,18 @@ fn plan(
         secret.owning_service.as_deref(),
         requesting_owner,
     ) {
-        return Err(invalid_request(
-            crate::state::service_owned::managed_by_another_service_message(owner),
-        ));
+        // A secret under that service's MANAGED ROTATION is the one thing about it a caller
+        // still asks Secrets Manager for: there is no rotation function of the caller's, the
+        // managing service performs the rotation, and this call is how it is asked for. So a
+        // call that asks for nothing BUT the rotation is served and handed over
+        // ([`crate::state::managed_rotation`]), while one that would CONFIGURE rotation on
+        // the secret — name a function, a schedule or an external rotation role — is asking
+        // to change the secret, which is the owning service's to change.
+        if !under_managed_rotation || configures_rotation(input) {
+            return Err(invalid_request(
+                crate::state::service_owned::managed_by_another_service_message(owner),
+            ));
+        }
     }
     // "For secrets that use a Lambda rotation function to rotate, the ARN of
     // the Lambda rotation function. For secrets that use managed rotation,
@@ -461,6 +573,10 @@ fn plan(
         && role_arn.is_none()
         && secret.rotation_lambda_arn.is_none()
         && secret.external_rotation_role_arn.is_none()
+        // "For secrets that use managed rotation, omit this field": such a secret has no
+        // rotation function BY DESIGN — the service that owns it performs the rotation — so
+        // naming none for it is not "rotation enabled on a secret that has no function".
+        && !under_managed_rotation
     {
         return Err(invalid_request(crate::state::NO_ROTATION_FUNCTION_MESSAGE));
     }
@@ -498,6 +614,31 @@ fn plan(
     })
 }
 
+/// Whether this call would CONFIGURE rotation for the secret, rather than only ask for a
+/// rotation of it: "If you include the configuration parameters, the operation sets the
+/// values for the secret and then immediately starts a rotation. If you don't include the
+/// configuration parameters, the operation starts a rotation with the values already stored
+/// in the secret" (`RotateSecret`, this service's Smithy model).
+///
+/// The configuration parameters are the rotation function, the schedule, and the external
+/// rotation a partner-held secret is rotated through; an empty value for either ARN names
+/// nothing (both are modelled with a minimum length of 0).
+fn configures_rotation(input: &RotateSecretInput) -> bool {
+    input
+        .rotation_lambda_arn
+        .as_deref()
+        .is_some_and(|arn| !arn.is_empty())
+        || input.rotation_rules.is_some()
+        || input
+            .external_secret_rotation_metadata
+            .as_ref()
+            .is_some_and(|items| !items.is_empty())
+        || input
+            .external_secret_rotation_role_arn
+            .as_deref()
+            .is_some_and(|arn| !arn.is_empty())
+}
+
 /// `InvalidParameterException` for a parameter value this operation refuses:
 /// "The parameter name or value is invalid."
 fn invalid_parameter(message: String) -> RotateSecretError {
@@ -513,6 +654,19 @@ fn invalid_parameter(message: String) -> RotateSecretError {
 fn invalid_request(message: impl Into<String>) -> RotateSecretError {
     RotateSecretErrorModeled::InvalidRequestException(InvalidRequestException {
         message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled server error for a rotation the MANAGING service did not perform: this
+/// emulator could not hand the rotation to the service that owns the secret, or that service
+/// refused it.
+///
+/// It is a server-side fault, never anything the request carried: the request asked for the
+/// one thing such a secret is rotated by, and the credential is unchanged.
+fn rotation_not_performed(message: String) -> RotateSecretError {
+    RotateSecretErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some(message),
     })
     .into()
 }

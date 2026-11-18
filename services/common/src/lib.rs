@@ -715,6 +715,10 @@ pub mod sensitive_members;
 /// is in flight, read by the service that has to authorize that call and cannot read the
 /// caller's store.
 pub mod service_principal_calls;
+/// The secrets whose ROTATION another Amazon Web Services service manages — recorded by the
+/// service that created and owns the secret, read by Secrets Manager, which cannot see that
+/// service's resources and so can only ask it for the rotation of a credential it manages.
+pub mod managed_secret_rotations;
 pub mod shared_path;
 /// How AWS Signer states a refusal of an input member a request supplied nothing for, for
 /// the two service crates that are two views of that one endpoint.

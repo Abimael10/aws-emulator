@@ -284,8 +284,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             engine: &instance_engine,
                             // A tenant database's master user is a user of the DB INSTANCE
                             // that holds it, so the instance is the resource the secret
-                            // belongs to.
-                            owner: crate::state::ManagedSecretOwner::db_instance(
+                            // belongs to — and the request that rotates the tenant
+                            // database's own password names the tenant database too, which
+                            // is why this is not the instance's own secret.
+                            owner: crate::state::ManagedSecretOwner::tenant_database(
                                 &crate::state::db_instance_arn(&region, &identifier),
                             ),
                             kms_key_id: input.master_user_secret_kms_key_id.as_deref(),

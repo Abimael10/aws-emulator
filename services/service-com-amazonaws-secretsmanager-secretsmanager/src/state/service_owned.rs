@@ -110,9 +110,28 @@ pub fn refusing_owner<'a>(
     (!by_the_owner).then_some(owner)
 }
 
-/// The character AWS joins a service's id to the rest of a service-owned secret's name
-/// with: `rds!db-…`, `events!connection/…`.
+/// The tag SECRETS MANAGER itself applies to a secret an Amazon Web Services service created
+/// and manages, naming that service.
 ///
+/// The key is in the namespace AWS reserves for its own tags ([`super::RESERVED_TAG_PREFIX`])
+/// and in THIS service's own part of it, so it is not the creating service's to send and not a
+/// caller's to write: it is the tag form of the `OwningService` such a secret reports, which is
+/// what a tag-scoped policy, an audit or a cost report written for service-linked secrets
+/// matches on.
+pub const OWNING_SERVICE_TAG: &str = "aws:secretsmanager:owningService";
+
+/// That tag for the service whose id is `service_id`, for the create of a secret that service
+/// owns to carry.
+#[must_use]
+pub fn owning_service_tag(service_id: &str) -> super::StoredTag {
+    super::StoredTag {
+        key: Some(OWNING_SERVICE_TAG.to_string()),
+        value: Some(service_id.to_string()),
+    }
+}
+
+/// The character AWS joins a service's id to the rest of a service-owned secret's name
+/// with: `rds!db-…`, `events!connection/…`.///
 /// It is deliberately NOT one of the characters a secret name may carry
 /// ([`super::SECRET_NAME_EXTRA_CHARS`]), which is what reserves the whole namespace: a
 /// caller's `CreateSecret` cannot name a secret in this form at all.

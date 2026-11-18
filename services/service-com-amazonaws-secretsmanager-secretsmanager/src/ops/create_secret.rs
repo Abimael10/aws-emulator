@@ -595,6 +595,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // principal made this create, for a secret that service manages.
         secret.owning_service = owner.as_ref().map(|owner| owner.service_id.clone());
         secret.tags = tags.iter().map(crate::state::StoredTag::from_modeled).collect();
+        // The tag naming that service is applied by SECRETS MANAGER, not by the
+        // service creating the secret: the key is in this service's own part of
+        // the namespace AWS reserves for its tags, so it is written here for
+        // every secret a service principal creates, beside the tags that service
+        // applied itself
+        // ([`crate::state::service_owned::OWNING_SERVICE_TAG`]).
+        if let Some(owner) = owner.as_ref() {
+            secret.tags.retain(|tag| {
+                tag.key.as_deref() != Some(crate::state::service_owned::OWNING_SERVICE_TAG)
+            });
+            secret
+                .tags
+                .push(crate::state::service_owned::owning_service_tag(
+                    &owner.service_id,
+                ));
+        }
 
         if let Some(sealed) = sealed {
             secret.put_version(

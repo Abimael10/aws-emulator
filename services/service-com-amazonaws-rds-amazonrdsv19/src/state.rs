@@ -321,6 +321,10 @@ mod api_plane_address;
 // record a resource stores for it, and the minting a request that turns
 // `ManageMasterUserPassword` on depends on.
 mod managed_master_secret;
+// How that same secret is rotated when the rotation is asked of SECRETS MANAGER rather than
+// of this service: the record this service writes for each secret it manages, naming the
+// request that rotates that resource's master user password.
+mod managed_secret_rotation;
 // The KMS key an encrypted resource's storage is reported under: the one the request named,
 // or the account's default key for this service where it named none.
 mod storage_encryption_key;
@@ -352,6 +356,7 @@ pub use api_plane_address::*;
 pub use data_api_endpoint::*;
 pub use instances::*;
 pub use managed_master_secret::*;
+pub use managed_secret_rotation::*;
 pub use storage_encryption_key::*;
 pub use service_principal_call::*;
 pub use master_user_credentials::*;

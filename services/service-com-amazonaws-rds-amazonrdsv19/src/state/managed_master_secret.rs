@@ -168,6 +168,23 @@ pub const PRIMARY_DB_INSTANCE_ARN_TAG: &str = "aws:rds:primaryDBInstanceArn";
 /// cluster's `DBClusterArn`.
 pub const PRIMARY_DB_CLUSTER_ARN_TAG: &str = "aws:rds:primaryDBClusterArn";
 
+/// WHICH KIND of resource a managed secret holds the master user password of.
+///
+/// The kind decides two things the secret itself does not say: the AWS-applied tag key
+/// naming the resource ([`ManagedSecretOwner::tag_key`]), and which request of this service
+/// rotates that password ([`super::managed_secret_rotation`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedSecretResource {
+    /// A DB instance, whose own `ModifyDBInstance` rotates its master user password.
+    DbInstance,
+    /// A DB cluster, whose own `ModifyDBCluster` rotates its master user password.
+    DbCluster,
+    /// A TENANT DATABASE of a DB instance: its master user is a user of that INSTANCE, so
+    /// the secret belongs to the instance, and the request that rotates the tenant
+    /// database's password names the tenant database as well as the instance.
+    TenantDatabase,
+}
+
 /// The resource a managed secret belongs to, as the secret itself reports it: the
 /// AWS-applied tag naming that resource's ARN.
 #[derive(Debug, Clone, Copy)]
@@ -176,16 +193,18 @@ pub struct ManagedSecretOwner<'a> {
     pub tag_key: &'static str,
     /// That resource's ARN, which is the tag's value.
     pub arn: &'a str,
+    /// The kind of resource whose master user password the secret holds.
+    pub resource: ManagedSecretResource,
 }
 
 impl<'a> ManagedSecretOwner<'a> {
-    /// The secret of the DB INSTANCE `arn` names — also the owner of the secret of a
-    /// TENANT DATABASE of that instance, whose master user is a user of that instance.
+    /// The secret of the DB INSTANCE `arn` names.
     #[must_use]
     pub fn db_instance(arn: &'a str) -> Self {
         Self {
             tag_key: PRIMARY_DB_INSTANCE_ARN_TAG,
             arn,
+            resource: ManagedSecretResource::DbInstance,
         }
     }
 
@@ -195,6 +214,18 @@ impl<'a> ManagedSecretOwner<'a> {
         Self {
             tag_key: PRIMARY_DB_CLUSTER_ARN_TAG,
             arn,
+            resource: ManagedSecretResource::DbCluster,
+        }
+    }
+
+    /// The secret of a TENANT DATABASE of the DB INSTANCE `arn` names: the instance owns it,
+    /// so it carries the instance's own tag, and it is the instance's ARN the tag names.
+    #[must_use]
+    pub fn tenant_database(arn: &'a str) -> Self {
+        Self {
+            tag_key: PRIMARY_DB_INSTANCE_ARN_TAG,
+            arn,
+            resource: ManagedSecretResource::TenantDatabase,
         }
     }
 }
@@ -293,6 +324,19 @@ pub async fn mint_master_user_secret<Eng: Send + Sync + 'static>(
         );
     };
     let kms_key_id = encrypting_key_id(ctx, region, asked.kms_key_id).await;
+    // The secret is one RDS MANAGES, so its rotation is RDS's own: the request that rotates
+    // this resource's master user password is recorded under the secret's ARN, which is how a
+    // caller's rotation of it in Secrets Manager is handed back to this service
+    // ([`super::managed_secret_rotation`]).
+    if let Some(rotations) =
+        ::service_common::managed_secret_rotations::ManagedRotations::of(engine)
+    {
+        if let Some(rotation) =
+            super::managed_secret_rotation::master_user_secret_rotation(region, &asked.owner)
+        {
+            rotations.managing(&secret_arn, rotation);
+        }
+    }
     Ok(MintedMasterSecret {
         secret: ManagedMasterSecret::minted(secret_arn, kms_key_id),
         password,
@@ -379,6 +423,15 @@ pub async fn release_master_user_secret<Eng: Send + Sync + 'static>(
                 ::aws_smithy_types::error::display::DisplayErrorContext(&error)
             )
         })?;
+    // The secret is gone, so this service rotates nothing for it any more: the record naming
+    // the request that rotated it is forgotten with it, and a caller's rotation of a secret
+    // nothing manages is answered as one of an unmanaged secret
+    // ([`super::managed_secret_rotation`]).
+    if let Some(rotations) =
+        ::service_common::managed_secret_rotations::ManagedRotations::of(engine)
+    {
+        rotations.released(secret_arn);
+    }
     Ok(())
 }
 

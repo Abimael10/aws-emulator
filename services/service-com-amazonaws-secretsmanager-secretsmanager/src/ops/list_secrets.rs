@@ -254,7 +254,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|view| crate::state::encode_next_token(&view.secret.name));
 
         Ok(ListSecretsOutput {
-            secret_list: Some(page.into_iter().map(entry_for).collect()),
+            secret_list: Some(
+                page.into_iter()
+                    .map(|view| {
+                        // The secret's rotation view, the same reading `DescribeSecret`
+                        // reports: its own where a call configured one, else the schedule
+                        // the service that manages the secret publishes
+                        // ([`crate::state::managed_rotation`]).
+                        let rotation = crate::state::managed_rotation::rotation_view(
+                            &*self.engine,
+                            view.content,
+                        );
+                        entry_for(view, &rotation)
+                    })
+                    .collect(),
+            ),
             next_token,
         })
     }
@@ -264,7 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// per-Region state from the record this Region holds, and everything the secret
 /// CONTAINS from the record that holds it — which for a replica is the primary it
 /// tracks (the same projection `DescribeSecret` reports).
-fn entry_for(view: crate::state::SecretView<'_>) -> SecretListEntry {
+fn entry_for(
+    view: crate::state::SecretView<'_>,
+    rotation: &crate::state::managed_rotation::RotationView,
+) -> SecretListEntry {
     let crate::state::SecretView { secret, content } = view;
     SecretListEntry {
         arn: Some(secret.arn.clone()),
@@ -273,17 +290,21 @@ fn entry_for(view: crate::state::SecretView<'_>) -> SecretListEntry {
         description: content.description.clone(),
         kms_key_id: secret.kms_key_id.clone(),
         // Reported exactly as `DescribeSecret` reports it: only for a secret rotation
-        // has been configured for, and omitted for one it never was.
-        rotation_enabled: content.rotation_enabled,
+        // has been configured for — by a `RotateSecret` call, or by the service that
+        // manages the secret's own rotation — and omitted for one it never was.
+        rotation_enabled: rotation.enabled,
         // The rotation configuration `RotateSecret` persisted, the same way
         // `DescribeSecret` projects it. `LastRotatedDate` stays absent until a
         // rotation completes.
         rotation_lambda_arn: content.rotation_lambda_arn.clone(),
-        rotation_rules: content.rotation_rules_out(),
+        rotation_rules: rotation
+            .rules
+            .as_ref()
+            .map(crate::state::StoredRotationRules::to_modeled),
         external_secret_rotation_metadata: content.external_rotation_metadata_out(),
         external_secret_rotation_role_arn: content.external_rotation_role_arn.clone(),
-        last_rotated_date: content.last_rotated_date.map(crate::state::timestamp),
-        next_rotation_date: content.next_rotation_date.map(crate::state::timestamp),
+        last_rotated_date: rotation.last_rotated.map(crate::state::timestamp),
+        next_rotation_date: rotation.next_rotation.map(crate::state::timestamp),
         last_changed_date: Some(crate::state::timestamp(content.last_changed_date)),
         last_accessed_date: secret.last_accessed_date.map(crate::state::timestamp),
         deleted_date: secret.deleted_date.map(crate::state::timestamp),

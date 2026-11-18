@@ -247,6 +247,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that holds it, which for a replica is the primary it tracks.
         let secret = view.secret;
         let content = view.content;
+        // What this secret's rotation view is: its own where a `RotateSecret` call configured
+        // one, else the schedule the service that MANAGES the secret publishes
+        // ([`crate::state::managed_rotation`]).
+        let rotation = crate::state::managed_rotation::rotation_view(&*self.engine, content);
 
         Ok(DescribeSecretOutput {
             arn: Some(secret.arn.clone()),
@@ -258,17 +262,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // member has no default, so it is reported only for a secret rotation
             // has been configured for, and omitted — like the rest of the rotation
             // view — for one it never was.
-            rotation_enabled: content.rotation_enabled,
+            rotation_enabled: rotation.enabled,
             // The rotation configuration `RotateSecret` persisted, and the
             // schedule's next due instant computed from it. `LastRotatedDate` is
             // "the last date and time that this secret was modified in any way"
             // by a COMPLETED rotation, so it stays absent until one completes.
             rotation_lambda_arn: content.rotation_lambda_arn.clone(),
-            rotation_rules: content.rotation_rules_out(),
+            rotation_rules: rotation
+                .rules
+                .as_ref()
+                .map(crate::state::StoredRotationRules::to_modeled),
             external_secret_rotation_metadata: content.external_rotation_metadata_out(),
             external_secret_rotation_role_arn: content.external_rotation_role_arn.clone(),
-            last_rotated_date: content.last_rotated_date.map(crate::state::timestamp),
-            next_rotation_date: content.next_rotation_date.map(crate::state::timestamp),
+            last_rotated_date: rotation.last_rotated.map(crate::state::timestamp),
+            next_rotation_date: rotation.next_rotation.map(crate::state::timestamp),
             last_changed_date: Some(crate::state::timestamp(content.last_changed_date)),
             // "The date that the secret was last accessed in the Region": the
             // Region this request is addressed to, so a replica reports its own.
