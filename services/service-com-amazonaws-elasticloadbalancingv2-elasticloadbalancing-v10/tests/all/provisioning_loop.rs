@@ -814,17 +814,16 @@ async fn load_balancer_identity_follows_name_scheme_and_type() {
         );
         seen_ids.push(id.clone());
 
-        // What each load balancer publishes as its `DNSName`: a Network or Gateway Load
-        // Balancer has no traffic this emulator serves, so it keeps the host Elastic Load
+        // What each load balancer publishes as its `DNSName`: a Gateway Load Balancer's
+        // `GENEVE` listeners carry no traffic of this kind, so it keeps the host Elastic Load
         // Balancing's own zone gives it (the ARN's own id, the `elb` label ahead of the
-        // Region, its scheme stated nowhere), an INTERNAL Application Load Balancer — whose
-        // nodes carry only private addresses, so its client sits inside this emulator — keeps
-        // the host that zone gives IT (the reserved `internal-` prefix ahead of its name, and
-        // an id minted for the host alone), and an internet-facing one publishes the address
-        // of the socket this emulator opened for it — an address a client can dial. The whole
-        // table of forms is `load_balancer_dns_name_form.rs`.
+        // Region, its scheme stated nowhere), an INTERNAL load balancer — whose nodes carry
+        // only private addresses, so its client sits inside this emulator — keeps the host
+        // that zone gives IT, and an internet-facing Application or Network Load Balancer
+        // publishes the address of the socket this emulator opened for it — an address a
+        // client can dial. The whole table of forms is `load_balancer_dns_name_form.rs`.
         let dns_name = reply.text("DNSName").unwrap_or_default();
-        if lb_type != "application" {
+        if lb_type == "gateway" || (lb_type == "network" && scheme == "internal") {
             let host = format!("{name}-{id}.elb.{REGION}.amazonaws.com");
             assert_eq!(
                 dns_name, host,

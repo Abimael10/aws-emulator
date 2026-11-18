@@ -10,11 +10,18 @@
 //! Elastic Load Balancing's own zone resolves to nothing on the machine this emulator runs
 //! on, so a load balancer that published one published an address no client could reach,
 //! and the one thing an HTTPS listener exists for (serving TLS under the certificate the
-//! account gave it) was unreachable. So each Application Load Balancer gets a listener of
-//! the EMULATOR's own, opened through the core
+//! account gave it) was unreachable. So each load balancer whose listeners carry a client's
+//! own traffic — an Application Load Balancer's, which answer the request, and a Network Load
+//! Balancer's, which hand the connection to what their target group selects — gets a listener
+//! of the EMULATOR's own, opened through the core
 //! (`engine.listeners().tcp_plaintext(..)`, which owns the socket, the bind interface, the
 //! port range and the connection caps), and publishes the `host:port` that listener answers
 //! on ([`crate::state::LoadBalancerEndpoint`]).
+//!
+//! WHICH of its listeners a connection reaches is decided by what the client opened with and
+//! by the load balancer's own family ([`cleartext_protocols`]): a connection in the clear
+//! reaches an `HTTP` listener of the Application family and a `TCP` one of the Network family,
+//! and a TLS connection the listener that terminates TLS (`HTTPS`, `TLS`).
 //!
 //! # What this address serves, and under which certificate
 //!
@@ -100,9 +107,19 @@ use crate::state::ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State
 /// model alone keeps the forwarded leg's claimant the plane it is meant for.
 const SERVICE_ENDPOINT: &str = "elasticloadbalancingv2.amazonaws.com";
 
-/// The `ProtocolEnum` value of an Application Load Balancer listener that terminates no
-/// TLS, and so is the one a connection in the clear reaches.
-const CLEARTEXT_PROTOCOL: &str = "HTTP";
+/// The `ProtocolEnum` values a connection IN THE CLEAR reaches, per FAMILY: an Application
+/// Load Balancer's `HTTP` listener, which terminates no TLS and answers the client's own
+/// request, and a Network Load Balancer's `TCP` and `TCP_UDP` listeners, which carry a stream
+/// in the clear and hand it to what their target group selects (its `TLS` listener terminates
+/// TLS, so a TLS connection reaches that one). A Gateway Load Balancer's `GENEVE` listeners
+/// carry no connection of this kind at all.
+fn cleartext_protocols(family: crate::state::LoadBalancerFamily) -> &'static [&'static str] {
+    match family {
+        crate::state::LoadBalancerFamily::Application => &["HTTP"],
+        crate::state::LoadBalancerFamily::Network => &["TCP", "TCP_UDP"],
+        crate::state::LoadBalancerFamily::Gateway => &[],
+    }
+}
 
 /// How many request BODIES this service reads at once across every load balancer's socket:
 /// the core's own HTTP in-flight cap, one permit per request, taken before a byte of a body
@@ -468,12 +485,15 @@ impl ListenerSocket {
                     // A connection in the clear is served by a listener that terminates no
                     // TLS, and a TLS connection by one that does — which is the bracket the
                     // model puts on a listener's certificates and security policy
-                    // ([`crate::state::terminates_tls`]). An Application Load Balancer's
-                    // listeners carry `HTTP` or `HTTPS`, so a listener in the clear is an
-                    // HTTP one.
+                    // ([`crate::state::terminates_tls`]). WHICH protocols carry a connection
+                    // in the clear is the load balancer's own family's
+                    // ([`cleartext_protocols`]): an Application Load Balancer's `HTTP`
+                    // listener, and a Network Load Balancer's `TCP` one.
                     match tls {
                         true => crate::state::terminates_tls(listener.protocol.as_deref()),
-                        false => listener.protocol.as_deref() == Some(CLEARTEXT_PROTOCOL),
+                        false => listener.protocol.as_deref().is_some_and(|protocol| {
+                            cleartext_protocols(record.family()).contains(&protocol)
+                        }),
                     }
                 })
                 .collect();

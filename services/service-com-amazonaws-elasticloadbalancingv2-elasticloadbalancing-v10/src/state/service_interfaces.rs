@@ -4,8 +4,10 @@
 //!
 //! A load balancer is reached at an ADDRESS inside the VPC it is placed in: Elastic Load
 //! Balancing puts one service-managed elastic network interface in each subnet the load
-//! balancer is attached to, takes a private address of that subnet for it, and those
-//! interfaces are ordinary describable EC2 network interfaces — the model itself carries the
+//! balancer is attached to, takes a private address of that subnet for it — and, for a load
+//! balancer whose nodes carry public addresses, an Amazon-assigned public address beside it
+//! ([`place_in_subnets`]) — and those interfaces are ordinary describable EC2 network
+//! interfaces — the model itself carries the
 //! `NetworkInterfaceType` values a load balancer's interface is of
 //! (`smithy_query(query="shape",shape="NetworkInterfaceType")`: `load_balancer`,
 //! `network_load_balancer`) and marks one a service created and manages through
@@ -159,6 +161,13 @@ fn place_in_subnets(
 ) -> Vec<String> {
     let interface_type = interface_type(&record.lb_type);
     let description = interface_description(record);
+    // Whether this load balancer's NODES carry public addresses, which is the one reading of
+    // that scheme rule ([`super::internet_facing_placement::placement_needs_internet_gateway`],
+    // which refuses such a placement in a VPC whose public addresses route nowhere).
+    let public_nodes = super::internet_facing_placement::placement_needs_internet_gateway(
+        record.family(),
+        &record.scheme,
+    );
     // The groups the load balancer carries govern traffic to its network interfaces
     // (`CreateLoadBalancer$SecurityGroups`), so they are the groups of those interfaces.
     let groups: Vec<ec2_types::GroupIdentifier> = record
@@ -211,7 +220,20 @@ fn place_in_subnets(
             ..Default::default()
         };
         match store.insert_network_interface(spec) {
-            Some(network_interface_id) => placed.push(network_interface_id),
+            Some(network_interface_id) => {
+                // "The nodes of an Internet-facing load balancer have public IP addresses"
+                // (`CreateLoadBalancerInput$Scheme`), and a node IS one of these interfaces —
+                // so each interface of such a load balancer holds an Amazon-assigned public
+                // address beside its private one, taken through EC2's own one place a public
+                // IPv4 address of the account comes from. An internal load balancer's nodes
+                // "have only private IP addresses", so theirs hold none, and a Gateway Load
+                // Balancer carries no scheme at all.
+                if public_nodes {
+                    let _assigned =
+                        store.assign_amazon_public_ipv4(&network_interface_id, &record.region);
+                }
+                placed.push(network_interface_id);
+            }
             None => {
                 // The inventory holds no more interfaces, so the address this one would
                 // have held goes back to the subnet it came out of.

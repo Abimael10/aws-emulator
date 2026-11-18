@@ -506,15 +506,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot be its client would be worse than a name. A create this request goes on to
         // refuse drops the handle, which closes the port again.
         //
-        // That is the Application family — the one whose listeners answer the client's own
-        // request — and, of it, the load balancers whose nodes carry PUBLIC addresses: "the
-        // nodes of an internal load balancer have only private IP addresses … internal load
-        // balancers can route requests only from clients with access to the VPC for the load
-        // balancer" (`Scheme`), and the client with that access is the one INSIDE this
-        // emulator, which is where the name its own zone gives it resolves
-        // ([`crate::state::load_balancer_dns_name`]).
+        // That is every family whose listeners carry the traffic a client on this machine
+        // sends — the Application family, whose listeners answer the client's own request,
+        // and the Network family, whose listeners hand the connection they accept to what
+        // their target group selects — and, of those, the load balancers whose nodes carry
+        // PUBLIC addresses: "the nodes of an internal load balancer have only private IP
+        // addresses … internal load balancers can route requests only from clients with
+        // access to the VPC for the load balancer" (`Scheme`), and the client with that
+        // access is the one INSIDE this emulator, which is where the name its own zone gives
+        // it resolves ([`crate::state::load_balancer_dns_name`]). A Gateway Load Balancer's
+        // `GENEVE` listeners carry no request of this kind at all, so it keeps the name.
         let endpoint = match family {
             crate::state::LoadBalancerFamily::Application
+            | crate::state::LoadBalancerFamily::Network
                 if candidate.scheme != crate::state::INTERNAL_SCHEME =>
             {
                 crate::state::open_load_balancer_endpoint(&*self.engine, ctx.callback().clone())

@@ -5,25 +5,28 @@
 //! One rule: the value is the address a client that honours it reaches the load balancer
 //! AT, and the FAMILY and the SCHEME decide what that is:
 //!
-//! * an INTERNET-FACING Application Load Balancer — the load balancer a client on this
-//!   machine dials DIRECTLY, because its listeners answer the client's own request and its
-//!   "nodes … have public IP addresses" — publishes the `host:port` of the socket the
-//!   emulator opened for it, an address that client can dial;
+//! * an INTERNET-FACING Application or Network Load Balancer — the load balancer a client on
+//!   this machine dials DIRECTLY, because its listeners carry that client's own traffic (an
+//!   Application Load Balancer's answer its request, a Network Load Balancer's hand the
+//!   connection to what its target group selects) and its "nodes … have public IP
+//!   addresses" — publishes the `host:port` of the socket the emulator opened for it, an
+//!   address that client can dial;
 //! * an INTERNAL Application Load Balancer, whose nodes "have only private IP addresses" and
 //!   which "can route requests only from clients with access to the VPC", gets no socket of
 //!   its own: its client sits inside this emulator, so it keeps the host Elastic Load
 //!   Balancing's own zone gives it,
 //!   `internal-<name>-<decimal id>.<region>.elb.amazonaws.com`, whose reserved `internal-`
 //!   prefix is the one no caller may begin a load balancer name with;
-//! * a Network or Gateway Load Balancer gets no socket either, so it keeps the host
+//! * an INTERNAL Network Load Balancer and a Gateway Load Balancer of either scheme get no
+//!   socket either, so each keeps the host
 //!   Elastic Load Balancing's own zone gives it:
 //!   `<name>-<hexadecimal id>.elb.<region>.amazonaws.com`
 //!   (`my-network-load-balancer-1234567890abcdef.elb.us-west-2.amazonaws.com`), whose id
-//!   is the very one its ARN carries, and whose host states its scheme nowhere. A Network
-//!   Load Balancer's traffic IS served on that name — a listener of its hands the connection
-//!   to what its target group names (`network_load_balancer_pass_on.rs`) — and the client of
-//!   an internal one sits inside this emulator (an API Gateway private integration, for
-//!   one), which is where that name resolves; a port published for a client that cannot be
+//!   is the very one its ARN carries, and whose host states its scheme nowhere. Such a load
+//!   balancer's traffic IS served on that name — a Network Load Balancer's listener hands the
+//!   connection to what its target group names (`network_load_balancer_pass_on.rs`) — and the
+//!   client of an internal one sits inside this emulator (an API Gateway private integration,
+//!   for one), which is where that name resolves; a port published for a client that cannot be
 //!   its client would be worse than a name.
 //!
 //! The rows span what the rule generalises over: every family the model's
@@ -159,18 +162,18 @@ impl Published {
         match (row.lb_type, row.scheme) {
             // The load balancer a client on this machine dials directly answers on a socket
             // of its own, and publishes that socket's address.
-            ("application", scheme) if scheme != INTERNAL_SCHEME => Self::Dialable,
-            // An internal one of that family carries only private addresses, so it keeps the
-            // host its own zone gives it — the reserved prefix ahead of its name, and a
-            // decimal id minted for the host alone.
+            ("application" | "network", scheme) if scheme != INTERNAL_SCHEME => Self::Dialable,
+            // An internal Application Load Balancer carries only private addresses, so it
+            // keeps the host its own zone gives it — the reserved prefix ahead of its name,
+            // and a decimal id minted for the host alone.
             ("application", _) => Self::Zone {
                 head: format!("{RESERVED_LOAD_BALANCER_NAME_PREFIX}{}-", row.name),
                 tail: format!(".{region}.elb.amazonaws.com"),
                 digits: APPLICATION_DNS_ID_DIGITS as usize,
                 id: ZoneId::MintedDecimal,
             },
-            // A Network or Gateway Load Balancer's host states its scheme nowhere, whatever
-            // the scheme is.
+            // An internal Network Load Balancer's host, and a Gateway Load Balancer's,
+            // state the scheme nowhere.
             _ => Self::Zone {
                 head: format!("{}-", row.name),
                 tail: format!(".elb.{region}.amazonaws.com"),

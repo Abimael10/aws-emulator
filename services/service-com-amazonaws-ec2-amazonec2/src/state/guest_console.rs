@@ -252,8 +252,8 @@ pub struct GuestBoot {
     pub runtime: super::guest_services::GuestRuntime,
 }
 
-/// What boot number `number` of `machine`'s guest writes to the console, and the files it
-/// leaves behind.
+/// What boot number `number` of `machine`'s guest writes to the console, the files it leaves
+/// behind and what it leaves RUNNING.
 ///
 /// `files` are the ones the machine's storage already held (what earlier boots wrote),
 /// `program` is what the instance's user data gives the guest to run, `runtime` is the state
@@ -569,8 +569,8 @@ fn guest_machine_id(machine: &GuestMachine) -> String {
     format!("{first}{second}")
 }
 
-/// Perform the guest's own program for boot number `number`, answering what it wrote and the
-/// files it left on the machine's storage.
+/// Perform the guest's own program for boot number `number`, answering what it wrote, the
+/// files it left on the machine's storage and what it left RUNNING on the machine.
 ///
 /// The program runs in the shared bounded shell session, in a tree holding exactly this
 /// machine's storage, the values the kernel publishes to its guest and its two devices —
