@@ -11344,6 +11344,7 @@ dependencies = [
 name = "service-com-amazonaws-cloudformation-cloudformation"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-credential-types",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",

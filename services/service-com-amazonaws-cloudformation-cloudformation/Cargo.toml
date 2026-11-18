@@ -113,6 +113,9 @@ shell-words = "1.1"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` from the single `all` test target's root
+# (`tests/all/main.rs`), so a new suite is a new file and nothing lists it.
+automod = { workspace = true }
 # URL-form-encodes the request bodies this crate's integration tests send (the encoder
 # behind the `url` crate), so no test suite hand-rolls a percent-encoder.
 form_urlencoded = "1"

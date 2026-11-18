@@ -11,8 +11,9 @@
 //! such an identifier ([`repoint_identity`]).
 //!
 //! It lives in its own file beside the walk that drives it so neither grows past the length a
-//! change to this repository may touch; [`Minted`] is the pair the walk collects, and
-//! [`retokenised`] the one place a stand-in may be matched inside a longer value.
+//! change to this repository may touch; [`Minted`] is the pair the walk collects, [`pairs_for`]
+//! decides WHICH of those pairs one declaration may be re-pointed with, and [`retokenised`] is
+//! the one place a stand-in may be matched inside a longer value.
 
 use super::*;
 
@@ -24,8 +25,52 @@ use super::*;
 /// property of it, never a hundred levels inside one.
 pub(super) const MAX_REPOINTED_NESTING: usize = 64;
 
+/// The minted pairs that may re-point the declaration of `logical_id`.
+///
+/// The rule: a value another declaration STATES is that declaration's own, so adopting an
+/// identifier an owning service minted may only change the values a REFERENCE to that
+/// resource put there. Which pairs those are follows from what the stand-in IS:
+///
+/// * a stand-in CloudFormation itself COMPUTED ([`Minted::composed`]) carries a digest drawn
+///   from the stack id and the logical id, so no declaration states one by accident: such a
+///   pair applies wherever its value turns up, which is how a name composed out of another
+///   resource's identifier is brought into step with it;
+/// * a stand-in that is the NAME the declaration asked for is a value ANY declaration may
+///   state — the stack name a bucket is named after, which the user pool of the same stack was
+///   also created under — so it applies only in the declarations that REFERENCE that resource.
+///   `dependencies` is what records that: a `Ref`, an `Fn::GetAtt` or an `Fn::Sub` variable
+///   naming a resource is exactly what the relation is built from
+///   ([`crate::state::template::direct_dependencies`]), so a resource absent from it reads
+///   nothing of the minted resource and every value of its own stands as written.
+///
+/// Without the second rule such a bucket is created under the identifier Amazon Cognito
+/// minted for the pool, and the policy of that bucket is written for a bucket that does not
+/// exist.
+pub(super) fn pairs_for(
+    logical_id: &str,
+    dependencies: &Dependencies,
+    minted: &[Minted],
+) -> Vec<Minted> {
+    if minted.is_empty() {
+        return Vec::new();
+    }
+    let referenced = dependencies.get(logical_id);
+    minted
+        .iter()
+        .filter(|minted| {
+            minted.composed
+                || referenced.is_some_and(|referenced| referenced.contains(&minted.of))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Re-point every reference inside one property document from the stand-in identifier a
 /// resource was given before its create to the identifier its owning service MINTED.
+///
+/// `minted` is the set this document may be re-pointed with ([`pairs_for`]), not every pair
+/// the walk has collected: a declaration that reads nothing of a resource states its own
+/// values, whatever another resource's stand-in happens to be.
 ///
 /// The rule: a reference to a resource resolves to the identifier that resource really has,
 /// and for a type whose identity its owning service assigns
@@ -133,6 +178,9 @@ pub(super) fn states_value(properties: &Value, value: &str, depth: usize) -> boo
 /// naming rules had computed for the same resource ([`repoint_references`]).
 #[derive(Debug, Clone)]
 pub(super) struct Minted {
+    /// The LOGICAL ID of the resource whose identifier this is, which is what says whose
+    /// declarations may be re-pointed with it ([`pairs_for`]).
+    pub(super) of: String,
     /// What a reference to the resource was resolved to before its create.
     pub(super) stand_in: String,
     /// What that reference has to carry now.

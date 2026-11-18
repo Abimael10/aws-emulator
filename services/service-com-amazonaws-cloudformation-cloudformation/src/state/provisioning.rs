@@ -144,7 +144,10 @@
 //! group named `/aws/<service>/<kind>/<the api id of an api in the same template>` — is the
 //! same case one level in: the identity the naming rules took from that name carries the
 //! stand-in too, so it is re-pointed with the declaration ([`repoint_identity`]) and the
-//! resource is created under the name every reader of that dependency builds. A LATER
+//! resource is created under the name every reader of that dependency builds. Only the
+//! declarations that READ the minted resource are re-pointed with its pair where the stand-in
+//! is the NAME the declaration asked for ([`pairs_for`]), since that is a value any other
+//! declaration may state as its own. A LATER
 //! deployment resolves its declarations against the identifiers the
 //! stack already has ([`super::StoredStack::deploy_template`]), which is what makes a
 //! re-deploy of the same template read as unchanged.
@@ -2126,8 +2129,13 @@ pub async fn reconcile(
         // identifier its service knows the dependency by — and so the comparison below
         // reads an UNCHANGED declaration as unchanged. Both documents the resolution left
         // are re-pointed, since both name that dependency.
-        repoint_references(&mut resource.properties, &minted);
-        repoint_references(&mut deployed_properties, &minted);
+        //
+        // Only with the pairs of the resources this one READS ([`pairs_for`]): a value that
+        // merely coincides with another resource's stand-in is the value this declaration
+        // itself asked for.
+        let pairs = pairs_for(&resource.logical_id, &stack.dependencies, &minted);
+        repoint_references(&mut resource.properties, &pairs);
+        repoint_references(&mut deployed_properties, &pairs);
         // ...and so is the resource's OWN IDENTITY, for a type whose physical id is the NAME
         // its declaration states. A name the template COMPOSES out of a dependency's
         // identifier (`/aws/<service>/<kind>/${Api.ApiId}`) was computed before that
@@ -2137,7 +2145,7 @@ pub async fn reconcile(
         // the same dependency builds, so a group created under the stand-in is one a child
         // resolved later (a resource withheld behind a dependency still coming up, an output,
         // a client's own call) addresses in vain.
-        repoint_identity(&mut resource, &minted);
+        repoint_identity(&mut resource, &pairs);
         // A resource the walk could not carry out holds back every resource that DEPENDS on
         // it: what such a declaration reads is the resource that failed, so there is nothing
         // its owning service could be asked for, and CloudFormation records no transition for
@@ -2947,6 +2955,7 @@ pub async fn reconcile(
                 ::std::mem::replace(&mut resource.physical_resource_id, published.clone());
             if !computed.is_empty() && computed != published {
                 minted.push(Minted {
+                    of: resource.logical_id.clone(),
                     // The stand-in is an identifier CloudFormation COMPUTED — a handle
                     // declares no name of its own — so a longer value carrying it carries it
                     // because a reference to this handle put it there ([`Minted::composed`]).
@@ -3035,6 +3044,7 @@ pub async fn reconcile(
                 // as for an attribute the naming rules left empty below.
                 if !computed.is_empty() && resource.physical_resource_id != computed {
                     minted.push(Minted {
+                        of: resource.logical_id.clone(),
                         // The stand-in is an identifier CloudFormation COMPUTED whenever it
                         // is not the name the declaration itself asked for, so a longer
                         // value carrying it carries it because a reference to this resource
@@ -3068,6 +3078,7 @@ pub async fn reconcile(
                     }
                     if !stand_in.is_empty() && assigned != stand_in {
                         minted.push(Minted {
+                            of: resource.logical_id.clone(),
                             stand_in: stand_in.clone(),
                             assigned: assigned.clone(),
                             // An attribute's stand-in is matched inside a longer value for
@@ -3219,7 +3230,8 @@ pub async fn reconcile(
     // exists in its owning service and keeps the record that says so, so the stack's
     // deletion still deletes it.
     for mut resource in declared {
-        repoint_references(&mut resource.properties, &minted);
+        let pairs = pairs_for(&resource.logical_id, &stack.dependencies, &minted);
+        repoint_references(&mut resource.properties, &pairs);
         if let Some(existing) = previous
             .iter()
             .find(|existing| already_deployed(existing) && is_same_resource(existing, &resource))
