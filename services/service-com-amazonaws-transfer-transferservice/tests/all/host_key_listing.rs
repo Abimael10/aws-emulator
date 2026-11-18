@@ -19,9 +19,10 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    generated_host_key, host_key_algorithm, is_modelled_host_key_id, member_of, Emulator, ACCOUNT,
-    REGION,
+    generated_host_key, generated_public_key, generated_rsa_host_key_pems, host_key_algorithm,
+    is_modelled_host_key_id, member_of, pem_armour, Emulator, ACCOUNT, REGION,
 };
+use crate::service_stated_refusals::INVALID_HOST_KEY_FORMAT;
 
 /// The algorithm names `ListedHostKey.Type` documents: "the encryption algorithm that
 /// is used for the host key. The Type parameter is specified by using one of the
@@ -592,4 +593,318 @@ async fn a_next_token_this_service_never_issued_is_refused() {
         "case \"last page\": expected no NextToken once the listing is exhausted, \
          got {second_page}"
     );
+}
+
+/// The PEM label of a PKCS#1 RSA private key (`ssh-keygen -t rsa -m PEM`).
+const LABEL_RSA_PRIVATE_KEY: &str = "RSA PRIVATE KEY";
+
+/// The PEM label of a SEC1 EC private key (`ssh-keygen -t ecdsa -m PEM`).
+const LABEL_EC_PRIVATE_KEY: &str = "EC PRIVATE KEY";
+
+/// The PEM label of a PKCS#8 private key (`ssh-keygen -m PKCS8`).
+const LABEL_PRIVATE_KEY: &str = "PRIVATE KEY";
+
+/// The `rsaEncryption` identifier a PKCS#8 container names an RSA key with (RFC 8017).
+const OID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
+
+/// The `id-ecPublicKey` identifier a PKCS#8 container names an EC key with (RFC 5480).
+const OID_EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
+
+/// The SSH public key of the RSA key a PKCS#1 `RSAPrivateKey` holds: an RSA key's public
+/// half IS its modulus and public exponent.
+fn rsa_key_data(pkcs1_der: &[u8]) -> ssh_key::public::KeyData {
+    let rsa = pkcs1::RsaPrivateKey::try_from(pkcs1_der).expect("the PKCS#1 RSA key");
+    ssh_key::public::KeyData::Rsa(ssh_key::public::RsaPublicKey {
+        e: ssh_key::Mpint::from_positive_bytes(rsa.public_exponent.as_bytes())
+            .expect("the exponent"),
+        n: ssh_key::Mpint::from_positive_bytes(rsa.modulus.as_bytes()).expect("the modulus"),
+    })
+}
+
+/// The SSH public key of the EC key a SEC1 `ECPrivateKey` holds: an ECDSA key's public
+/// half is its named curve and its uncompressed point, and the curve is what decides
+/// which `ecdsa-sha2-nistp*` algorithm the key is.
+fn ecdsa_key_data(sec1_der: &[u8]) -> ssh_key::public::KeyData {
+    let ec = sec1::EcPrivateKey::try_from(sec1_der).expect("the SEC1 EC key");
+    ssh_key::public::KeyData::Ecdsa(
+        ssh_key::public::EcdsaPublicKey::from_sec1_bytes(ec.public_key.expect("the public point"))
+            .expect("the ECDSA public key"),
+    )
+}
+
+/// The SSH algorithm name of the key a PEM private-key container holds, derived HERE
+/// from that key's own numbers with the OpenSSH key-format crate — so a row's
+/// expectation comes from the key material the row supplies rather than from the code
+/// under test.
+fn pem_key_algorithm(material: &str) -> String {
+    let (label, der) = pkcs1::pem::decode_vec(material.as_bytes()).expect("the PEM container");
+    let key_data = match label {
+        LABEL_RSA_PRIVATE_KEY => rsa_key_data(&der),
+        LABEL_EC_PRIVATE_KEY => ecdsa_key_data(&der),
+        LABEL_PRIVATE_KEY => {
+            let info = pkcs8::PrivateKeyInfo::try_from(der.as_slice()).expect("the PKCS#8 key");
+            match info.algorithm.oid.to_string().as_str() {
+                OID_RSA_ENCRYPTION => rsa_key_data(info.private_key),
+                OID_EC_PUBLIC_KEY => ecdsa_key_data(info.private_key),
+                other => panic!("this suite supplies no PKCS#8 key of algorithm {other}"),
+            }
+        }
+        other => panic!("this suite writes no {other} container"),
+    };
+    ssh_key::PublicKey::new(key_data, "")
+        .algorithm()
+        .as_str()
+        .to_string()
+}
+
+/// One generated key pair, in the container a caller sends it in, with the algorithm
+/// that key IS.
+struct Material {
+    case: &'static str,
+    /// The private key material, as `HostKeyBody` carries it.
+    body: String,
+    /// The SSH algorithm name of the key inside it, computed from the key itself.
+    algorithm: String,
+}
+
+/// The key classes this suite imports: the three `ImportHostKey`'s `HostKeyBody`
+/// documents ("Transfer Family accepts RSA, ECDSA, and ED25519 keys"), over two RSA keys
+/// that differ in their modulus, two ECDSA curves and two of the containers the
+/// documented generation commands write — so the rows differ in the key's class, its
+/// numbers and the container it arrives in. Every key is generated here, so no row
+/// pastes key material in.
+fn generated_materials() -> Vec<Material> {
+    let (first_rsa_pkcs1, _) = generated_rsa_host_key_pems();
+    // A SECOND RSA key pair, so the two RSA rows are different keys: the same key twice
+    // on one server is one record, not two.
+    let (_, second_rsa_pkcs8) = generated_rsa_host_key_pems();
+    let p256 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("an ECDSA P-256 key pair")
+        .serialize_der();
+    let p384 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)
+        .expect("an ECDSA P-384 key pair")
+        .serialize_der();
+    // A PKCS#8 EC key's `privateKey` octets ARE the SEC1 structure, so the same P-384
+    // key in the SEC1 container is that inner DER under the SEC1 label.
+    let p384_sec1 = pem_armour(
+        LABEL_EC_PRIVATE_KEY,
+        pkcs8::PrivateKeyInfo::try_from(p384.as_slice())
+            .expect("the PKCS#8 key")
+            .private_key,
+    );
+    let p256_pkcs8 = pem_armour(LABEL_PRIVATE_KEY, p256.as_slice());
+    let (openssh_ed25519, _) = generated_host_key();
+
+    vec![
+        Material {
+            case: "an RSA 2048 key in the PKCS#1 PEM container",
+            algorithm: pem_key_algorithm(&first_rsa_pkcs1),
+            body: first_rsa_pkcs1,
+        },
+        Material {
+            case: "another RSA 2048 key in the PKCS#8 PEM container",
+            algorithm: pem_key_algorithm(&second_rsa_pkcs8),
+            body: second_rsa_pkcs8,
+        },
+        Material {
+            case: "an ECDSA P-256 key in the PKCS#8 PEM container",
+            algorithm: pem_key_algorithm(&p256_pkcs8),
+            body: p256_pkcs8,
+        },
+        Material {
+            case: "an ECDSA P-384 key in the SEC1 PEM container",
+            algorithm: pem_key_algorithm(&p384_sec1),
+            body: p384_sec1,
+        },
+        Material {
+            case: "an Ed25519 key in the OpenSSH container",
+            algorithm: host_key_algorithm(&openssh_ed25519),
+            body: openssh_ed25519,
+        },
+    ]
+}
+
+/// RULE: `Type` is "the encryption algorithm that is used for the host key", drawn from
+/// the documented value set — a property of the key MATERIAL the record holds, not of
+/// the operation — so each listed key names the algorithm of its own key, keys of
+/// different classes on one server list under different `Type`s, and the value a key
+/// lists under never changes while that key is stored.
+///
+/// The rows differ along what the rule generalises over: the key's class (RSA, ECDSA,
+/// Ed25519), its own numbers (two RSA keys, two ECDSA curves) and the container it
+/// arrived in — including `ecdsa-sha2-nistp256` and `ecdsa-sha2-nistp384`, which no
+/// `ssh-rsa`/`ssh-ed25519` row would catch.
+#[tokio::test]
+async fn the_listed_type_is_the_algorithm_of_each_keys_own_material() {
+    let emulator = Emulator::new();
+    let server_id = emulator.create_server(json!({})).await;
+
+    let mut imported: Vec<(&str, String, String)> = Vec::new();
+    for material in generated_materials() {
+        let host_key_id = import_host_key(
+            &emulator,
+            material.case,
+            json!({"ServerId": &server_id, "HostKeyBody": &material.body}),
+        )
+        .await;
+        assert!(
+            DOCUMENTED_HOST_KEY_TYPES.contains(&material.algorithm.as_str()),
+            "case {:?}: expected the generated key to be one of the documented types \
+             {DOCUMENTED_HOST_KEY_TYPES:?}, got {:?}",
+            material.case,
+            material.algorithm
+        );
+
+        // The listing names THIS key's algorithm...
+        let keys = walk_host_keys(&emulator, &server_id, None).await;
+        let entry = listed(material.case, &keys, &host_key_id);
+        assert_eq!(
+            member_of(&entry, "Type").as_str(),
+            Some(material.algorithm.as_str()),
+            "case {:?}: expected the imported key's own algorithm {:?}, got {entry}",
+            material.case,
+            material.algorithm
+        );
+        // ...and so does the other projection of the same record.
+        let described =
+            described_host_key(&emulator, material.case, &server_id, &host_key_id).await;
+        assert_eq!(
+            member_of(&described, "Type").as_str(),
+            Some(material.algorithm.as_str()),
+            "case {:?}: expected DescribeHostKey to report the same algorithm {:?}, \
+             got {described}",
+            material.case,
+            material.algorithm
+        );
+
+        imported.push((material.case, host_key_id, material.algorithm));
+    }
+
+    // Every key still names its OWN algorithm once the server holds all of them: an
+    // import describes the key it carried and rewrites no other record.
+    let keys = walk_host_keys(&emulator, &server_id, None).await;
+    for (case, host_key_id, algorithm) in &imported {
+        let entry = listed(case, &keys, host_key_id);
+        assert_eq!(
+            member_of(&entry, "Type").as_str(),
+            Some(algorithm.as_str()),
+            "case {case:?}: expected {host_key_id} to keep reporting {algorithm:?} beside \
+             the server's other keys, got {entry}"
+        );
+    }
+
+    // Keys of different classes on ONE server list under different `Type`s, which no
+    // constant could answer.
+    let mut distinct: Vec<&str> = imported
+        .iter()
+        .map(|(_, _, algorithm)| algorithm.as_str())
+        .collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        4,
+        "expected the four algorithms the rows generate (RSA, both ECDSA curves, \
+         Ed25519) to be reported distinctly, got {distinct:?}"
+    );
+}
+
+/// RULE: a write the service REFUSES changes nothing a reader reports — so an
+/// `ImportHostKey` refused for material the service cannot read leaves every stored host
+/// key listed exactly as it was, each still under its own algorithm.
+///
+/// The rows differ along the way the material is not a private key the service reads:
+/// a PUBLIC key, a readable container whose payload is not that structure, a label no
+/// reader implements, text in no container at all, and the empty body the modelled
+/// `len 0..4096` admits. Each reports the ONE condition it failed on — the key's format
+/// could not be read — so every row's whole `Message` is the service's fixed text for
+/// that condition, naming neither the member nor an expected encoding.
+#[tokio::test]
+async fn an_import_the_service_refuses_leaves_the_listing_unchanged() {
+    let emulator = Emulator::new();
+    let server_id = emulator.create_server(json!({})).await;
+
+    // Two keys of DIFFERENT classes, so the listing the refusals must not disturb
+    // carries more than one `Type`.
+    let (rsa_pkcs1, _) = generated_rsa_host_key_pems();
+    let (ed25519, _) = generated_host_key();
+    for (case, body) in [
+        ("the RSA key", &rsa_pkcs1),
+        ("the Ed25519 key", &ed25519),
+    ] {
+        import_host_key(
+            &emulator,
+            case,
+            json!({"ServerId": &server_id, "HostKeyBody": body}),
+        )
+        .await;
+    }
+
+    let before = walk_host_keys(&emulator, &server_id, None).await;
+    let types_before: Vec<Option<String>> = before
+        .iter()
+        .map(|entry| member_of(entry, "Type").as_str().map(str::to_string))
+        .collect();
+    assert!(
+        types_before.len() >= 3,
+        "expected the server's own key and the two imported ones listed, got {before:?}"
+    );
+
+    let unreadable: Vec<(&str, String)> = vec![
+        ("a public key where a private one belongs", generated_public_key()),
+        (
+            "a readable label whose payload is not that structure",
+            pem_armour(LABEL_RSA_PRIVATE_KEY, b"not a key at all"),
+        ),
+        (
+            "a PEM label the service reads no key from",
+            pem_armour("DSA PRIVATE KEY", b"not a key at all"),
+        ),
+        ("no container at all", "ssh-rsa AAAAB3NzaC1".to_string()),
+        ("the empty body", String::new()),
+    ];
+
+    for (case, body) in unreadable {
+        let refused = emulator
+            .call(
+                "ImportHostKey",
+                json!({"ServerId": &server_id, "HostKeyBody": &body}),
+            )
+            .await;
+        assert_eq!(
+            (refused.status, refused.error_code().as_str()),
+            (400, "InvalidRequestException"),
+            "case {case:?}: expected 400 InvalidRequestException, got {} with body {}",
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.get("Message").as_str(),
+            Some(INVALID_HOST_KEY_FORMAT),
+            "case {case:?}: expected the service's fixed text for unreadable key material, \
+             got {}",
+            refused.body
+        );
+        assert!(
+            refused.get("HostKeyId").is_null(),
+            "case {case:?}: expected a refusal to mint no id, got {}",
+            refused.body
+        );
+
+        let after = walk_host_keys(&emulator, &server_id, None).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: expected the refused import to leave every stored host key \
+             listed as it was, got {after:?} against {before:?}"
+        );
+        let types_after: Vec<Option<String>> = after
+            .iter()
+            .map(|entry| member_of(entry, "Type").as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            types_after, types_before,
+            "case {case:?}: expected every listed key to keep its own algorithm, got \
+             {types_after:?} against {types_before:?}"
+        );
+    }
 }

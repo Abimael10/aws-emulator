@@ -236,8 +236,10 @@ fn connector_id(kind: &str, answer: &Answer) -> String {
 // 3. Host key material the service cannot read
 // ---------------------------------------------------------------------------
 
-/// The text the service states for that condition.
-const INVALID_HOST_KEY_FORMAT: &str = "Invalid host key format";
+/// The text the service states for that condition. `pub(crate)` because another suite
+/// pins the same sentence on refusals of its own rows ([`crate::host_key_listing`]), and
+/// one text the service states belongs in one place.
+pub(crate) const INVALID_HOST_KEY_FORMAT: &str = "Invalid host key format";
 
 /// RULE: an `ImportHostKey` whose `HostKeyBody` the service cannot read as a private key
 /// is refused with the service's fixed text — which names neither the member nor any

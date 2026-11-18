@@ -902,8 +902,10 @@ pub(crate) fn generated_rsa_host_key_pems() -> (String, String) {
     )
 }
 
-/// PEM armour around `der`, written by the crate that implements the container.
-fn pem_armour(label: &str, der: &[u8]) -> String {
+/// PEM armour around `der`, written by the crate that implements the container — the
+/// ONE place a suite of this crate writes a PEM container, so the same key in the same
+/// label is the same text whichever suite sends it.
+pub(crate) fn pem_armour(label: &str, der: &[u8]) -> String {
     pkcs1::pem::encode_string(label, pkcs1::pem::LineEnding::LF, der).expect("the PEM")
 }
 
