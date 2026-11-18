@@ -341,6 +341,26 @@ impl<E> Scaffolded<E> {
         )
     }
 
+    /// `InvalidInstanceID.NotFound` (HTTP 400), in the wording that ENDS THE SENTENCE: "The
+    /// instance ID '<id>' does not exist."
+    ///
+    /// The same code as [`Self::invalid_instance_id_not_found`] in a different wording, and a
+    /// second named constructor rather than a literal at a call site so both wordings are
+    /// visible here. EC2's per-operation validators do not agree about the full stop, and
+    /// which one an operation answers is a fact of that operation, recorded by its caller:
+    /// `crate::ops::describe_instance_image_metadata` is recorded answering this sentence for
+    /// an instance id the account holds no instance under, while the describes and batches
+    /// that answer [`Self::invalid_instance_id_not_found`] are recorded without the stop. So
+    /// an operation words the refusal through the one it was recorded answering, and neither
+    /// wording is generalised to the other's operations.
+    pub fn instance_id_does_not_exist(instance_id: &str) -> Self {
+        Self::service_error(
+            "InvalidInstanceID.NotFound",
+            400,
+            format!("The instance ID '{instance_id}' does not exist."),
+        )
+    }
+
     /// `InvalidInstanceID.Malformed` (HTTP 400), in the wording of the operations whose own
     /// validator says an instance id "is malformed".
     ///

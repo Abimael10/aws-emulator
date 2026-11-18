@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceImageMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceImageMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceImageMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports, for every instance [`crate::state`] holds IN THE REGION the request
+//! was signed for, the instance's own identity, placement, state and tags beside the
+//! metadata of the AMI it was launched from, narrowed by `InstanceIds` and `Filters` and
+//! paged by `MaxResults`/`NextToken`.
+//!
+//! The AMI's metadata is read off the image store WITHOUT the visibility test
+//! `DescribeImages` applies, because this operation "describes the AMI that was used to
+//! launch an instance, even if the AMI is deprecated, deregistered, made private (no longer
+//! public or shared with your account), or not allowed": what an instance reports about its
+//! image cannot depend on whether the caller could still describe or launch that image.
+//!
+//! EC2 is a regional service reached through a regional endpoint, so an instance of another
+//! Region is invisible here: it is no candidate for a filter, and an `InstanceIds` entry
+//! naming one does not resolve.
+//!
+//! It also materialises any instance transition the CLOCK already owed before reporting:
+//! each one was due at this instant whether or not anybody called, and nothing else here
+//! writes.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +177,364 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceImageMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceImageMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
+            MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, PageTokenRule,
+            decode_page_token, instance_region, invalid_pagination_token,
+            matches_every_filter, page_from_cursor, request_region,
+            require_decoded_instance_record_fully_worded, require_service_state,
+        };
+
+        // EC2 is a REGIONAL service: the instances this report covers are the ones of the
+        // Region the caller is asking in, so the Region this request was signed for is what
+        // the store is read through below.
+        let region = request_region(ctx.parts());
+
+        // "The instance IDs" (`InstanceIds`): every entry is resolved against the store
+        // below, so the list is capped the way every other EC2 request's id list is, before
+        // any work proportional to it is done.
+        let requested_ids: &[String] = input.instance_ids.as_deref().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // Matching cost is filters x values x value length x stored instances, and the model
+        // bounds none of them, so every request-controlled factor is capped HERE, before any
+        // work proportional to it is done and before the store is locked; their PRODUCT is
+        // charged to one [`MatchBudget`] below, which is the bound the per-factor caps
+        // cannot give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // instance would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here rather than per
+        // candidate.
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token returned from a previous paginated request" (`NextToken`): anything
+        // else is refused rather than read as an id, and refused against the store's
+        // contents nowhere, so whether a bogus token is caught never depends on what the
+        // account holds.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // A move the clock already owed an instance of this store fell due whether or not
+        // anybody called, so those moves are applied before this report is built; nothing
+        // else here writes, so two calls made after the same instant report the same set.
+        store.materialize_due_transitions();
+
+        // "If you specify an instance ID that is not valid, an instance that doesn't exist,
+        // or an instance that you do not own, an error … is returned": an id this request
+        // names is resolved through the one place this crate asks those questions of an
+        // instance id, with the NOT-FOUND half worded the way this operation's own recorded
+        // refusal words it ([`Scaffolded::instance_id_does_not_exist`], which ends the
+        // sentence with a full stop where the describes beside it do not). An instance of
+        // ANOTHER Region names no instance here, EC2 being reached through a regional
+        // endpoint.
+        for instance_id in requested_ids {
+            let instance = require_decoded_instance_record_fully_worded(
+                &store,
+                instance_id,
+                Scaffolded::invalid_instance_id_malformed,
+                Scaffolded::instance_id_does_not_exist,
+            )?;
+            if instance_region(instance) != region {
+                return Err(Scaffolded::instance_id_does_not_exist(instance_id));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named instance
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that
+        // would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // A set, so narrowing by `InstanceIds` costs one lookup per stored instance rather
+        // than a scan of the requested list, and a repeated id cannot multiply the work.
+        let wanted: ::std::collections::HashSet<&str> =
+            requested_ids.iter().map(String::as_str).collect();
+
+        // "If you do not specify instance IDs or filters, the output includes information
+        // for all instances": the Region's instances, narrowed to those the request named,
+        // every filter then having to hold ("If you specify multiple filters, the filters
+        // are joined with an AND" — `Filter`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceImageMetadata"))
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored instances,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them, which is also what bounds how long this holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<InstanceImageMetadata> = Vec::new();
+        for instance in store.instances.values() {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the record's own id, so an instance the request
+            // did not name costs no projection and no comparison at all.
+            if !wanted.is_empty() && !wanted.contains(instance.instance_id.as_str()) {
+                continue;
+            }
+            if instance_region(instance) != region {
+                continue;
+            }
+            // Filtered on the very report the page carries, so a filter can never select on
+            // something the answer does not show.
+            let view = instance_image_metadata(&store, instance);
+            if matches_every_filter(&selectors, &mut budget, &|name| filter_values(&view, name)) {
+                selected.push(view);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `InstanceId` order, which the cursor below names a position in: an
+        // instance id is the zero-padded hex of a counter that only grows, so id order is
+        // launch order. The sort establishes the invariant the cursor depends on at the
+        // point of use rather than inheriting it from the container the store happens to
+        // hold its instances in.
+        selected.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+
+        // "The maximum number of items to return for this request … Default: 1000"
+        // (`MaxResults`), whose modelled `@range` of 1..1000 is refused before this handler
+        // runs: a request that names no page size gets that documented maximum rather than
+        // the whole store, so the `NextToken` path behaves the same either way.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        // "This value is null when there are no more items to return" (`NextToken`): a token
+        // only while a further instance follows the page, through the one definition of EC2
+        // paging this crate has.
+        let (page, next_token) = page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            PageTokenRule::WhenAnotherItemFollows,
+            |metadata| metadata.instance_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(DescribeInstanceImageMetadataOutput {
+            instance_image_metadata: Some(page.to_vec()),
+            next_token,
+        })
     }
 }
+
+/// The modelled `InstanceImageMetadata` for one stored instance: what the instance itself
+/// reports, beside the metadata of the AMI it was launched from.
+///
+/// Every member is DERIVED from what the store holds — the instance's own record, the
+/// reservation that minted it and the image store — so this report, `DescribeInstances` and
+/// `DescribeImages` cannot disagree about one instance or one image.
+fn instance_image_metadata(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    instance: &crate::state::InstanceRecord,
+) -> InstanceImageMetadata {
+    InstanceImageMetadata {
+        instance_id: Some(instance.instance_id.clone()),
+        instance_type: Some(instance.instance_type.clone()),
+        launch_time: Some(crate::state::system_time_to_date_time(instance.launch_time)),
+        availability_zone: Some(instance.placement_az.clone()),
+        // "The ID of the Availability Zone" (`$ZoneId`): the id of the zone the instance's
+        // own placement names, through this crate's ONE name -> id lookup, so this report
+        // and `DescribeAvailabilityZones` cannot disagree about one zone.
+        zone_id: crate::state::zone_id_for_zone_name(&instance.placement_az),
+        state: Some(instance.state.view()),
+        // The account that owns the INSTANCE (`$OwnerId`, the wire's `instanceOwnerId`):
+        // the owner of the reservation the launch minted, read off that reservation rather
+        // than copied onto the instance, so this report and `DescribeInstances` cannot
+        // disagree about who owns it.
+        owner_id: store
+            .reservations
+            .get(&instance.reservation_id)
+            .map(|reservation| reservation.owner_id.clone()),
+        tags: Some(crate::state::tag_list(&instance.tags)),
+        // The AMI the instance was launched from, whatever has become of it since; an
+        // instance whose launch path recorded no image id has none to describe.
+        image_metadata: instance
+            .image_id
+            .as_deref()
+            .map(|image_id| image_metadata(store, image_id)),
+        operator: Some(crate::state::unmanaged_operator()),
+    }
+}
+
+/// The modelled `ImageMetadata` for the AMI `image_id` names.
+///
+/// Read off the stored image WITHOUT the visibility test `DescribeImages` applies: this
+/// operation describes the AMI an instance was launched from "even if the AMI is deprecated,
+/// deregistered, made private … or not allowed". An id the store holds no image under is
+/// reported as the id alone, the instance's own record being what knows which AMI launched
+/// it, so the AMI is still named rather than left out.
+fn image_metadata(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    image_id: &str,
+) -> ImageMetadata {
+    let Some(image) = store.images.get(image_id) else {
+        return ImageMetadata {
+            image_id: Some(image_id.to_string()),
+            ..ImageMetadata::default()
+        };
+    };
+    ImageMetadata {
+        image_id: image.image_id.clone(),
+        name: image.name.clone(),
+        // `ImageMetadata$OwnerId` is the wire's `imageOwnerId`: the account that owns the
+        // IMAGE, a different member from the instance owner beside it.
+        owner_id: image.owner_id.clone(),
+        state: image.state.clone(),
+        image_owner_alias: image.image_owner_alias.clone(),
+        creation_date: image.creation_date.clone(),
+        deprecation_time: image.deprecation_time.clone(),
+        image_allowed: image.image_allowed,
+        is_public: image.public,
+        image_watermarks: image.image_watermarks.clone(),
+    }
+}
+
+/// The filter names this operation documents, from
+/// `DescribeInstanceImageMetadataRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeInstanceImageMetadataRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// The tag family is resolved by [`crate::state::is_tag_filter_name`] rather than listed
+/// here: `tag:<key>` has a variable part, and that family is answered over any resource
+/// that carries tags whether or not an operation's own `Filters` member enumerates every
+/// member of it. Every entry here must be answered by [`filter_values`].
+const INSTANCE_IMAGE_METADATA_FILTERS: [&str; 9] = [
+    "availability-zone",
+    "image-allowed",
+    "instance-id",
+    "instance-state-name",
+    "instance-type",
+    "launch-time",
+    "owner-alias",
+    "owner-id",
+    "zone-id",
+];
+
+/// Is `name` a filter this operation documents? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no
+/// tag, so it is as undocumented as any other misspelling.
+fn is_documented_filter(name: &str) -> bool {
+    crate::state::is_tag_filter_name(name) || INSTANCE_IMAGE_METADATA_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against one reported row — the per-operation
+/// half of [`crate::state::matches_every_filter`], which holds the AND/OR evaluation every
+/// filtered describe of this crate shares.
+///
+/// A filter naming an attribute this row does not carry compares against NO values, so it
+/// selects nothing: the answer for `owner-alias` on an instance launched from an image
+/// nobody publishes under one, and for `tag:<key>` on an instance carrying no tag of that
+/// key. `name` is one of [`INSTANCE_IMAGE_METADATA_FILTERS`] or one of the tag family.
+///
+/// `owner-alias` and `owner-id` read the IMAGE's owner: the aliases the member documents
+/// (`amazon` | `aws-marketplace` | `aws-backup-vault`) are image-owner aliases, "defined in
+/// an Amazon-maintained list", and the instance's own owner is the calling account.
+fn filter_values<'a>(
+    metadata: &'a InstanceImageMetadata,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    /// One optional string as the values a filter compares against.
+    fn text(value: Option<&str>) -> Vec<Cow<'_, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    }
+
+    /// A boolean attribute as a filter value: a client sends it the way the wire renders
+    /// it, `true` or `false`. A row whose flag is not set carries no value for the filter
+    /// to match, like any other absent attribute.
+    fn flag(value: Option<bool>) -> Vec<Cow<'static, str>> {
+        value
+            .map(|flag| Cow::Borrowed(if flag { "true" } else { "false" }))
+            .into_iter()
+            .collect()
+    }
+
+    // The tag family, off the very tags the row reports, through the one place this crate
+    // answers it.
+    if let Some(values) =
+        crate::state::tag_filter_values(name, metadata.tags.as_deref().unwrap_or_default())
+    {
+        return values;
+    }
+    let image = metadata.image_metadata.as_ref();
+    match name {
+        "availability-zone" => text(metadata.availability_zone.as_deref()),
+        "zone-id" => text(metadata.zone_id.as_deref()),
+        "instance-id" => text(metadata.instance_id.as_deref()),
+        "instance-state-name" => text(
+            metadata
+                .state
+                .as_ref()
+                .and_then(|state| state.name.as_deref()),
+        ),
+        "instance-type" => text(metadata.instance_type.as_deref()),
+        // "The time when the instance was launched, in the ISO 8601 format in the UTC time
+        // zone": the rendering every describe of this crate filters a timestamp on.
+        "launch-time" => crate::state::filter_timestamp_values(metadata.launch_time),
+        "image-allowed" => flag(image.and_then(|image| image.image_allowed)),
+        "owner-alias" => text(image.and_then(|image| image.image_owner_alias.as_deref())),
+        "owner-id" => text(image.and_then(|image| image.owner_id.as_deref())),
+        // Unreachable: `is_documented_filter` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+

@@ -415,12 +415,36 @@ pub fn require_decoded_instance_record_worded<'store, E>(
     instance_id: &str,
     malformed: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
+    require_decoded_instance_record_fully_worded(
+        store,
+        instance_id,
+        malformed,
+        crate::scaffolded::Scaffolded::invalid_instance_id_not_found,
+    )
+}
+
+/// [`require_decoded_instance_record_worded`] with the NOT-FOUND half worded by `not_found`
+/// as well.
+///
+/// The same reason the malformed half takes its sentence from the caller: EC2's
+/// per-operation validators do not agree about how they WORD an instance id that resolves to
+/// nothing either — the two sentences are [`crate::scaffolded::Scaffolded`]'s
+/// `invalid_instance_id_not_found` and `instance_id_does_not_exist`, which differ in the full
+/// stop — and which one an operation answers is a fact of that operation, recorded by its
+/// caller. `DescribeInstanceImageMetadata` is recorded answering the second. The RULE both
+/// halves follow stays here once, so no operation re-spells it to change a sentence.
+pub fn require_decoded_instance_record_fully_worded<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+    malformed: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
+    not_found: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
+) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
     if long_form_identifier(instance_id)
         .is_some_and(|identifier| identifier > u128::from(store.next_instance))
     {
         return Err(malformed(instance_id));
     }
-    require_instance_record_worded(store, instance_id, malformed)
+    require_instance_record_fully_worded(store, instance_id, malformed, not_found)
 }
 
 /// The stored instance `instance_id` names, refusing an id this service cannot resolve
@@ -461,6 +485,26 @@ pub fn require_instance_record_worded<'store, E>(
     instance_id: &str,
     malformed: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
+    require_instance_record_fully_worded(
+        store,
+        instance_id,
+        malformed,
+        crate::scaffolded::Scaffolded::invalid_instance_id_not_found,
+    )
+}
+
+/// [`require_instance_record_worded`] with the NOT-FOUND half worded by `not_found` as well
+/// — see [`require_decoded_instance_record_fully_worded`] for why that sentence is the
+/// caller's to choose. The RULE lives here once: an id outside the form EC2 issues, and a
+/// long-form id whose identifier this service spent on another kind of resource, are
+/// malformed before any lookup; anything else that resolves to no instance is the not-found
+/// half.
+pub fn require_instance_record_fully_worded<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+    malformed: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
+    not_found: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
+) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
     if !instance_id_is_well_formed(instance_id) {
         return Err(malformed(instance_id));
     }
@@ -472,7 +516,7 @@ pub fn require_instance_record_worded<'store, E>(
         if store.instance_id_identifies_another_resource(instance_id) {
             malformed(instance_id)
         } else {
-            crate::scaffolded::Scaffolded::invalid_instance_id_not_found(instance_id)
+            not_found(instance_id)
         }
     })
 }
