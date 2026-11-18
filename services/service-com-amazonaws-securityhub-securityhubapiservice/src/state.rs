@@ -959,7 +959,7 @@ pub struct StandardControlSet {
 const ACM_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "ACM.1",
     title: "Imported and ACM-issued certificates should be renewed after a specified time period",
-    description: "This control checks whether an AWS Certificate Manager (ACM) certificate is renewed within the specified time period. The control fails if the certificate expires within 30 days.",
+    description: "This control checks whether an AWS Certificate Manager (ACM) certificate is renewed within the specified time period. It checks both imported certificates and certificates provided by ACM. The control fails if the certificate isn't renewed within the specified time period. Unless you provide a custom parameter value for the renewal period, Security Hub uses a default value of 30 days.",
     severity_rating: "MEDIUM",
     related_requirements: &[],
 };
@@ -967,7 +967,7 @@ const ACM_1: StandardsControlDefinition = StandardsControlDefinition {
 const CLOUDTRAIL_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "CloudTrail.1",
     title: "CloudTrail should be enabled and configured with at least one multi-Region trail that includes read and write management events",
-    description: "This control checks whether an AWS CloudTrail trail is enabled in the account, and whether at least one trail is a multi-Region trail that records both read and write management events.",
+    description: "This control checks whether an AWS CloudTrail trail is enabled in your account and whether at least one trail is a multi-Region trail that records both read and write management events. The control fails if no trail is enabled, or if no enabled trail is a multi-Region trail that records read and write management events.",
     severity_rating: "HIGH",
     related_requirements: &[],
 };
@@ -975,7 +975,7 @@ const CLOUDTRAIL_1: StandardsControlDefinition = StandardsControlDefinition {
 const CLOUDTRAIL_2: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "CloudTrail.2",
     title: "CloudTrail should have encryption at-rest enabled",
-    description: "This control checks whether an AWS CloudTrail trail is configured to encrypt its log files at rest with an AWS KMS key.",
+    description: "This control checks whether an AWS CloudTrail trail is configured to use server-side encryption with an AWS KMS key. The control fails if the KmsKeyId field of the trail is empty. Server-side encryption with an AWS KMS key adds a layer of protection to the sensitive information a trail's log files carry.",
     severity_rating: "MEDIUM",
     related_requirements: &[],
 };
@@ -983,7 +983,7 @@ const CLOUDTRAIL_2: StandardsControlDefinition = StandardsControlDefinition {
 const CLOUDWATCH_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "CloudWatch.1",
     title: "A log metric filter and alarm should exist for usage of the \"root\" user",
-    description: "This control checks whether a CloudWatch Logs metric filter and alarm exist for use of the root user, so that use of the account's most privileged credentials is noticed.",
+    description: "This control checks whether a CloudWatch Logs metric filter and an alarm on that filter exist for use of the root user. The control fails if the account has no log group receiving the management events of a multi-Region CloudTrail trail with such a metric filter and alarm. Monitoring use of the root user lets you detect use of the account's most privileged credentials.",
     severity_rating: "LOW",
     related_requirements: &[],
 };
@@ -991,7 +991,7 @@ const CLOUDWATCH_1: StandardsControlDefinition = StandardsControlDefinition {
 const CONFIG_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "Config.1",
     title: "AWS Config should be enabled and use the service-linked role for resource recording",
-    description: "This control checks whether AWS Config is enabled in the account and Region, records all resources, and uses the service-linked role for recording.",
+    description: "This control checks whether the AWS Config configuration recorder is enabled in your account and Region, records all resources, and uses the service-linked role for recording. The control fails if AWS Config isn't enabled, if the recorder doesn't record all resources, or if it records with a role other than the service-linked role.",
     severity_rating: "MEDIUM",
     related_requirements: &[],
 };
@@ -999,7 +999,7 @@ const CONFIG_1: StandardsControlDefinition = StandardsControlDefinition {
 const EC2_2: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "EC2.2",
     title: "VPC default security groups should not allow inbound or outbound traffic",
-    description: "This control checks whether the default security group of a VPC allows inbound or outbound traffic. The control fails if the security group allows any inbound or outbound traffic.",
+    description: "This control checks whether the default security group of a VPC allows inbound or outbound traffic. The control fails if the default security group has one or more inbound or outbound rules. The rules of a default security group apply to every resource associated with it, so leaving them in place grants those resources traffic they were never configured for.",
     severity_rating: "MEDIUM",
     related_requirements: &[],
 };
@@ -1007,7 +1007,7 @@ const EC2_2: StandardsControlDefinition = StandardsControlDefinition {
 const EC2_13: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "EC2.13",
     title: "Security groups should not allow ingress from 0.0.0.0/0 or ::/0 to port 22",
-    description: "This control checks whether a security group allows unrestricted incoming traffic to port 22 from any IPv4 or IPv6 address.",
+    description: "This control checks whether a security group allows unrestricted incoming traffic to port 22 from the IPv4 address 0.0.0.0/0 or the IPv6 address ::/0. The control fails if the security group allows ingress to port 22 from either of those addresses.",
     severity_rating: "HIGH",
     related_requirements: &[],
 };
@@ -1015,7 +1015,7 @@ const EC2_13: StandardsControlDefinition = StandardsControlDefinition {
 const EC2_52: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "EC2.52",
     title: "EC2 transit gateways should be tagged",
-    description: "This control checks whether an Amazon EC2 transit gateway carries the tag keys the control's parameters name. The control fails if the transit gateway carries none of them.",
+    description: "This control checks whether an Amazon EC2 transit gateway has tags with the specific keys defined in the parameter requiredTagKeys. The control fails if the transit gateway doesn't have any tag keys or if it doesn't have all the keys specified in the parameter requiredTagKeys. If the parameter requiredTagKeys isn't provided, the control only checks for the existence of a tag key and fails if the transit gateway isn't tagged with any key.",
     severity_rating: "LOW",
     related_requirements: &[],
 };
@@ -1023,7 +1023,7 @@ const EC2_52: StandardsControlDefinition = StandardsControlDefinition {
 const ECS_13: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "ECS.13",
     title: "ECS services should be tagged",
-    description: "This control checks whether an Amazon ECS service carries the tag keys the control's parameters name. The control fails if the service carries none of them.",
+    description: "This control checks whether an Amazon ECS service has tags with the specific keys defined in the parameter requiredTagKeys. The control fails if the service doesn't have any tag keys or if it doesn't have all the keys specified in the parameter requiredTagKeys. If the parameter requiredTagKeys isn't provided, the control only checks for the existence of a tag key and fails if the service isn't tagged with any key.",
     severity_rating: "LOW",
     related_requirements: &[],
 };
@@ -1031,7 +1031,7 @@ const ECS_13: StandardsControlDefinition = StandardsControlDefinition {
 const GUARDDUTY_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "GuardDuty.1",
     title: "GuardDuty should be enabled",
-    description: "This control checks whether Amazon GuardDuty is enabled in the account and Region.",
+    description: "This control checks whether Amazon GuardDuty is enabled in your account and Region. The control fails if GuardDuty isn't enabled. GuardDuty analyzes the account's management events, network traffic and DNS queries to detect unexpected and potentially unauthorized activity.",
     severity_rating: "HIGH",
     related_requirements: &[],
 };
@@ -1039,7 +1039,7 @@ const GUARDDUTY_1: StandardsControlDefinition = StandardsControlDefinition {
 const IAM_4: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "IAM.4",
     title: "IAM root user access key should not exist",
-    description: "This control checks whether the root user of the account has an access key. The control fails if an access key exists for the root user.",
+    description: "This control checks whether the root user of your account has an access key. The control fails if an access key exists for the root user. An access key gives programmatic access to every resource in the account, so removing the root user's access keys limits what a compromise of those keys can reach.",
     severity_rating: "CRITICAL",
     related_requirements: &[],
 };
@@ -1047,7 +1047,7 @@ const IAM_4: StandardsControlDefinition = StandardsControlDefinition {
 const KMS_4: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "KMS.4",
     title: "AWS KMS key rotation should be enabled",
-    description: "This control checks whether automatic key rotation is enabled for a customer managed AWS KMS key.",
+    description: "This control checks whether automatic key rotation is enabled for a customer managed AWS KMS key. The control fails if automatic key rotation is disabled for the key. Rotating a key's cryptographic material limits the amount of data that one key version protects.",
     severity_rating: "MEDIUM",
     related_requirements: &[],
 };
@@ -1055,7 +1055,7 @@ const KMS_4: StandardsControlDefinition = StandardsControlDefinition {
 const S3_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "S3.1",
     title: "S3 general purpose buckets should have block public access settings enabled",
-    description: "This control checks whether the account-level Amazon S3 block public access settings are enabled. The control fails if any of the settings are turned off.",
+    description: "This control checks whether the account-level Amazon S3 block public access settings are enabled. The control fails if any of the BlockPublicAcls, BlockPublicPolicy, IgnorePublicAcls and RestrictPublicBuckets settings is set to false.",
     severity_rating: "MEDIUM",
     related_requirements: &[],
 };
@@ -1063,7 +1063,7 @@ const S3_1: StandardsControlDefinition = StandardsControlDefinition {
 const S3_5: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "S3.5",
     title: "S3 general purpose buckets should require requests to use SSL",
-    description: "This control checks whether an Amazon S3 bucket policy denies requests that are not made over SSL.",
+    description: "This control checks whether an Amazon S3 general purpose bucket has a policy that requires requests to use SSL. The control fails if the bucket policy doesn't deny requests whose aws:SecureTransport condition key is false.",
     severity_rating: "MEDIUM",
     related_requirements: &[],
 };
@@ -1071,7 +1071,7 @@ const S3_5: StandardsControlDefinition = StandardsControlDefinition {
 const BEDROCK_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "Bedrock.1",
     title: "Amazon Bedrock model invocation logging should be enabled",
-    description: "This control checks whether model invocation logging is enabled for Amazon Bedrock in the account and Region, so that the prompts and responses of model invocations are recorded.",
+    description: "This control checks whether model invocation logging is enabled for Amazon Bedrock in your account and Region, and whether the invocation logs are delivered to at least one destination. The control fails if model invocation logging is disabled, or if it is enabled with neither an Amazon S3 bucket nor a CloudWatch Logs log group as a destination.",
     severity_rating: "MEDIUM",
     related_requirements: &[],
 };
@@ -1079,7 +1079,7 @@ const BEDROCK_1: StandardsControlDefinition = StandardsControlDefinition {
 const SAGEMAKER_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "SageMaker.1",
     title: "Amazon SageMaker AI notebook instances should not have direct internet access",
-    description: "This control checks whether direct internet access is disabled for an Amazon SageMaker AI notebook instance.",
+    description: "This control checks whether direct internet access is disabled for an Amazon SageMaker AI notebook instance. The control fails if the DirectInternetAccess field of the notebook instance is enabled. With direct internet access disabled, a notebook instance reaches the internet only through the VPC it is launched in.",
     severity_rating: "HIGH",
     related_requirements: &[],
 };
@@ -1087,7 +1087,7 @@ const SAGEMAKER_1: StandardsControlDefinition = StandardsControlDefinition {
 const SAGEMAKER_2: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "SageMaker.2",
     title: "SageMaker AI notebook instances should be launched in a custom VPC",
-    description: "This control checks whether an Amazon SageMaker AI notebook instance is launched in a custom VPC rather than in the service-managed one.",
+    description: "This control checks whether an Amazon SageMaker AI notebook instance is launched in a custom virtual private cloud (VPC). The control fails if the notebook instance isn't configured with a subnet of a custom VPC, in which case it runs in the service-managed VPC instead.",
     severity_rating: "HIGH",
     related_requirements: &[],
 };
@@ -1095,7 +1095,7 @@ const SAGEMAKER_2: StandardsControlDefinition = StandardsControlDefinition {
 const SAGEMAKER_3: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "SageMaker.3",
     title: "Users should not have root access to SageMaker AI notebook instances",
-    description: "This control checks whether root access is disabled for the users of an Amazon SageMaker AI notebook instance.",
+    description: "This control checks whether root access is disabled for the users of an Amazon SageMaker AI notebook instance. The control fails if the RootAccess field of the notebook instance is enabled, which lets the notebook's users run commands with administrator privileges.",
     severity_rating: "HIGH",
     related_requirements: &[],
 };
@@ -1106,7 +1106,7 @@ const SAGEMAKER_3: StandardsControlDefinition = StandardsControlDefinition {
 const AZURE_STORAGE_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "AzureStorage.1",
     title: "Azure storage accounts should not allow public blob access",
-    description: "This control checks whether an Azure storage account allows anonymous public read access to its blob containers.",
+    description: "This control checks whether an Azure storage account allows anonymous public read access to its blob containers. The control fails if public blob access is enabled for the storage account, which lets a caller read a container's blobs without credentials.",
     severity_rating: "MEDIUM",
     related_requirements: &[],
 };
@@ -1114,7 +1114,7 @@ const AZURE_STORAGE_1: StandardsControlDefinition = StandardsControlDefinition {
 const AZURE_SQL_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "AzureSQL.1",
     title: "Azure SQL servers should have auditing enabled",
-    description: "This control checks whether auditing is enabled for an Azure SQL server, so that the statements run against its databases are recorded.",
+    description: "This control checks whether auditing is enabled for an Azure SQL server. The control fails if the server's auditing setting is disabled, in which case the statements run against its databases are not recorded.",
     severity_rating: "MEDIUM",
     related_requirements: &[],
 };
@@ -1122,7 +1122,7 @@ const AZURE_SQL_1: StandardsControlDefinition = StandardsControlDefinition {
 const AZURE_VM_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "AzureVirtualMachine.1",
     title: "Azure virtual machines should have disk encryption enabled",
-    description: "This control checks whether the attached disks of an Azure virtual machine are encrypted.",
+    description: "This control checks whether the operating system and data disks attached to an Azure virtual machine are encrypted. The control fails if any disk attached to the virtual machine is not encrypted.",
     severity_rating: "HIGH",
     related_requirements: &[],
 };
@@ -1130,7 +1130,7 @@ const AZURE_VM_1: StandardsControlDefinition = StandardsControlDefinition {
 const AZURE_KEY_VAULT_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "AzureKeyVault.1",
     title: "Azure key vaults should have purge protection enabled",
-    description: "This control checks whether purge protection is enabled for an Azure key vault, so that a deleted vault or key cannot be purged before its retention period ends.",
+    description: "This control checks whether purge protection is enabled for an Azure key vault. The control fails if purge protection is disabled for the vault, in which case a soft-deleted vault or key can be purged before its retention period ends.",
     severity_rating: "MEDIUM",
     related_requirements: &[],
 };
@@ -1446,7 +1446,15 @@ pub fn standards_control_arn(
 
 /// `StandardsControl$RemediationUrl`: "A link to remediation information for the
 /// control in the Security Hub CSPM user documentation" — the console deep link the
-/// user guide publishes for a control, which carries the control's own id.
+/// user guide publishes for a control of a standard, which carries the control's own
+/// id and so is the one remediation link a control id does determine.
+///
+/// This is NOT the link a `SecurityControlDefinition` reports: that member is "a link
+/// to Security Hub CSPM documentation that explains how to remediate a failed finding
+/// for a security control" (`smithy_query(query="doc",
+/// shape="SecurityControlDefinition", member="RemediationUrl")`), a page catalogued per
+/// control in [`SecurityControlCatalogEntry::remediation_url`] rather than addressed by
+/// id.
 pub fn standards_control_remediation_url(control_id: &str) -> String {
     format!("https://docs.aws.amazon.com/console/securityhub/{control_id}/remediation")
 }

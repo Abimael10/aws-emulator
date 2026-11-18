@@ -161,11 +161,10 @@ fn catalog_entry(security_control_id: &str) -> &'static SecurityControlCatalogEn
         .expect("a published control id")
 }
 
-/// Walk every page of `query` and return the concatenated `SecurityControlId`s,
-/// asserting that no page exceeds `page_size` and that only the final page omits
-/// `NextToken`.
-async fn page_through(harness: &Harness, query: &str, page_size: usize) -> Vec<String> {
-    let mut seen: Vec<String> = Vec::new();
+/// Walk every page of `query` and return the concatenated definitions, asserting that
+/// no page exceeds `page_size` and that only the final page omits `NextToken`.
+async fn page_through_definitions(harness: &Harness, query: &str, page_size: usize) -> Vec<Value> {
+    let mut seen: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
     let mut pages = 0usize;
     loop {
@@ -181,7 +180,7 @@ async fn page_through(harness: &Harness, query: &str, page_size: usize) -> Vec<S
             status, 200,
             "query {full:?}: expected 200, got {status} with {body}"
         );
-        let page = returned_ids(&body);
+        let page = returned_definitions(&body);
         assert!(
             page.len() <= page_size,
             "query {full:?}: a page must hold at most {page_size}, got {}",
@@ -199,6 +198,21 @@ async fn page_through(harness: &Harness, query: &str, page_size: usize) -> Vec<S
         }
     }
     seen
+}
+
+/// Walk every page of `query` and return the concatenated `SecurityControlId`s, under
+/// the guarantees [`page_through_definitions`] asserts — one paging walk for both reads.
+async fn page_through(harness: &Harness, query: &str, page_size: usize) -> Vec<String> {
+    page_through_definitions(harness, query, page_size)
+        .await
+        .iter()
+        .map(|definition| {
+            definition["SecurityControlId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
 }
 
 /// RULE: `ListSecurityControlDefinitions` reports the security controls the service
@@ -243,8 +257,8 @@ async fn the_published_security_control_catalog_is_reported_in_full() {
             );
             assert_eq!(
                 reported["RemediationUrl"].as_str(),
-                Some(standards_control_remediation_url(id).as_str()),
-                "control {id}: a remediation link must carry the control's own id, got {reported}"
+                Some(entry.remediation_url),
+                "control {id}: a remediation link is the one the catalog records for the control, got {reported}"
             );
             assert_eq!(
                 reported["SeverityRating"].as_str(),
@@ -681,16 +695,18 @@ async fn out_of_range_and_unresolvable_inputs_are_refused() {
     );
 }
 
-/// RULE: a control that supports custom parameters reports `Parameters` as a
-/// customizable property and one `ParameterDefinitions` entry per parameter, carrying
-/// that parameter's description and the options a custom value must satisfy; a control
-/// that supports none reports an EMPTY `CustomizableProperties` and no
-/// `ParameterDefinitions` at all.
+/// RULE: a listed control definition names the properties the control can be customized
+/// in — `Parameters` for a control the catalog defines parameters for, an empty array
+/// for one it defines none for ("An empty array is returned for controls that don't
+/// support custom properties") — and carries no `ParameterDefinitions` member at all:
+/// a listed element reports WHICH properties are customizable, while the definitions of
+/// a control's parameters belong to a read of that one control, as the recorded catalog
+/// responses of this service show.
 ///
 /// The case list is the whole published catalog, so both the customizable controls and
 /// the ones that support nothing are covered, whichever side a control is on.
 #[tokio::test]
-async fn customizable_controls_report_their_parameter_definitions() {
+async fn a_listed_definition_names_its_customizable_properties_without_their_definitions() {
     let harness = Harness::new("eu-west-2");
     let (status, body) = harness.list("MaxResults=100").await;
     assert_eq!(status, 200, "expected 200, got {status} with {body}");
@@ -711,41 +727,84 @@ async fn customizable_controls_report_their_parameter_definitions() {
                 properties.is_empty(),
                 "control {id}: a control with no custom property reports an empty array, got {reported}"
             );
+        } else {
+            customizable_seen += 1;
+            assert_eq!(
+                properties,
+                vec![Value::String(
+                    SECURITY_CONTROL_PROPERTY_VALUES[0].to_string()
+                )],
+                "control {id}: a customizable control reports its one customizable property, got {reported}"
+            );
+        }
+        assert!(
+            reported.get("ParameterDefinitions").is_none(),
+            "control {id}: a listed definition carries no ParameterDefinitions member, got {reported}"
+        );
+    }
+    assert!(
+        customizable_seen > 0 && plain_seen > 0,
+        "the catalog must cover both customizable ({customizable_seen}) and plain ({plain_seen}) controls"
+    );
+
+    // The parameters a control publishes are the ones named for it, not a catalog-wide
+    // set: a customizable control and a plain one differ in the response.
+    let tagging = catalog_entry("EC2.52");
+    assert!(
+        !tagging.parameters.is_empty(),
+        "a tagging control is customizable"
+    );
+    assert!(
+        catalog_entry("IAM.4").parameters.is_empty(),
+        "a control the reference publishes no parameter for carries none"
+    );
+}
+
+/// RULE: the definition of ONE control carries one `ParameterDefinitions` entry per
+/// parameter the catalog defines for that control, each with that parameter's
+/// description and the exact options a custom value must satisfy, while a control the
+/// catalog defines no parameter for carries no `ParameterDefinitions` at all ("This
+/// object is excluded for a control that doesn't support custom parameters").
+///
+/// The case list is the whole published catalog, so every parameter type the catalog
+/// uses is exercised on both sides of the rule, down to each option's value.
+#[tokio::test]
+async fn the_definition_of_one_control_carries_the_definitions_of_its_parameters() {
+    let harness = Harness::new("eu-west-2");
+    for entry in SECURITY_CONTROL_CATALOG.iter() {
+        let id = entry.control.control_id;
+        let (status, body) = harness.definition(id).await;
+        assert_eq!(
+            status, 200,
+            "control {id}: expected 200, got {status} with {body}"
+        );
+        let reported = &body["SecurityControlDefinition"];
+        if entry.parameters.is_empty() {
             assert!(
                 reported.get("ParameterDefinitions").is_none(),
-                "control {id}: ParameterDefinitions is excluded for a control without parameters, got {reported}"
+                "control {id}: a control with no parameter carries no definitions, got {body}"
             );
             continue;
         }
-
-        customizable_seen += 1;
-        assert_eq!(
-            properties,
-            vec![Value::String(
-                SECURITY_CONTROL_PROPERTY_VALUES[0].to_string()
-            )],
-            "control {id}: a customizable control reports its one customizable property, got {reported}"
-        );
         let definitions = reported["ParameterDefinitions"]
             .as_object()
-            .unwrap_or_else(|| panic!("control {id}: ParameterDefinitions must be a map"))
-            .clone();
+            .unwrap_or_else(|| panic!("control {id}: ParameterDefinitions must be a map"));
         assert_eq!(
             definitions.len(),
             entry.parameters.len(),
-            "control {id}: expected one entry per parameter, got {reported}"
+            "control {id}: expected one entry per parameter, got {body}"
         );
         for parameter in entry.parameters {
-            let reported_parameter = definitions
-                .get(parameter.name)
-                .unwrap_or_else(|| panic!("control {id}: parameter {} must be reported", parameter.name));
+            let defined = definitions.get(parameter.name).unwrap_or_else(|| {
+                panic!("control {id}: parameter {} must be defined", parameter.name)
+            });
             assert_eq!(
-                reported_parameter["Description"].as_str(),
+                defined["Description"].as_str(),
                 Some(parameter.description),
-                "control {id}: unexpected description for {}, got {reported_parameter}",
+                "control {id}: unexpected description for {}, got {defined}",
                 parameter.name
             );
-            let options = &reported_parameter["ConfigurationOptions"];
+            let options = &defined["ConfigurationOptions"];
             match parameter.configuration {
                 ParameterConfiguration::Integer {
                     default_value,
@@ -775,21 +834,17 @@ async fn customizable_controls_report_their_parameter_definitions() {
                 } => {
                     let list = &options["StringList"];
                     assert_eq!(
-                        list["MaxItems"].as_i64(),
-                        Some(i64::from(max_items)),
-                        "control {id}: unexpected MaxItems for {}, got {options}",
-                        parameter.name
-                    );
-                    assert_eq!(
-                        list["Re2Expression"].as_str(),
-                        Some(re2_expression),
-                        "control {id}: unexpected Re2Expression for {}, got {options}",
-                        parameter.name
-                    );
-                    assert_eq!(
-                        list["ExpressionDescription"].as_str(),
-                        Some(expression_description),
-                        "control {id}: unexpected ExpressionDescription for {}, got {options}",
+                        (
+                            list["MaxItems"].as_i64(),
+                            list["Re2Expression"].as_str(),
+                            list["ExpressionDescription"].as_str(),
+                        ),
+                        (
+                            Some(i64::from(max_items)),
+                            Some(re2_expression),
+                            Some(expression_description),
+                        ),
+                        "control {id}: unexpected string-list options for {}, got {options}",
                         parameter.name
                     );
                     assert!(
@@ -800,22 +855,6 @@ async fn customizable_controls_report_their_parameter_definitions() {
             }
         }
     }
-    assert!(
-        customizable_seen > 0 && plain_seen > 0,
-        "the catalog must cover both customizable ({customizable_seen}) and plain ({plain_seen}) controls"
-    );
-
-    // The parameters a control publishes are the ones named for it, not a catalog-wide
-    // set: a customizable control and a plain one differ in the response.
-    let tagging = catalog_entry("EC2.52");
-    assert!(
-        !tagging.parameters.is_empty(),
-        "a tagging control is customizable"
-    );
-    assert!(
-        catalog_entry("IAM.4").parameters.is_empty(),
-        "a control the reference publishes no parameter for carries none"
-    );
 }
 
 /// RULE: the control catalog is the service's own published metadata, so it is served
@@ -873,13 +912,88 @@ async fn the_catalog_is_served_whatever_the_account_has_enabled() {
     }
 }
 
+/// RULE: every per-control field of a reported `SecurityControlDefinition` — including
+/// its `RemediationUrl`, "a link to Security Hub CSPM documentation that explains how
+/// to remediate a failed finding for a security control" — is the value the catalog
+/// records for that control, never a value computed from the control's id, so two
+/// controls are reported with the metadata each of them publishes.
+///
+/// The table spans the selections a caller can ask the catalog through — no filter,
+/// each provider, one standard's subset, and a run of page sizes down to one control
+/// per page — because a per-control value cannot depend on how the list was requested.
+#[tokio::test]
+async fn every_definition_field_is_the_value_the_catalog_records_for_that_control() {
+    let region = "us-west-2";
+    let harness = Harness::subscribed(region).await;
+    let standard = STANDARDS_CATALOG
+        .iter()
+        .find(|candidate| !standard_controls(candidate).is_empty())
+        .expect("a published standard with controls");
+
+    // (case, query, page size)
+    let cases: Vec<(String, String, usize)> = vec![
+        ("no filter".to_string(), String::new(), 100),
+        ("provider AWS".to_string(), "Providers=AWS".to_string(), 100),
+        (
+            "provider Azure".to_string(),
+            "Providers=Azure".to_string(),
+            100,
+        ),
+        (
+            format!("standard {}/{}", standard.slug, standard.version),
+            format!("StandardsArn={}", standard_arn(region, standard)),
+            100,
+        ),
+        ("one control per page".to_string(), String::new(), 1),
+        ("three controls per page".to_string(), String::new(), 3),
+    ];
+
+    for (case, query, page_size) in &cases {
+        let reported = page_through_definitions(&harness, query, *page_size).await;
+        assert!(
+            !reported.is_empty(),
+            "case {case:?}: expected at least one definition, got none"
+        );
+        for definition in &reported {
+            let id = definition["SecurityControlId"].as_str().unwrap_or_default();
+            let entry = catalog_entry(id);
+            assert_eq!(
+                definition["Title"].as_str(),
+                Some(entry.control.title),
+                "case {case:?}/{id}: expected the catalogued Title, got {definition}"
+            );
+            assert_eq!(
+                definition["Description"].as_str(),
+                Some(entry.control.description),
+                "case {case:?}/{id}: expected the catalogued Description, got {definition}"
+            );
+            assert_eq!(
+                definition["RemediationUrl"].as_str(),
+                Some(entry.remediation_url),
+                "case {case:?}/{id}: expected the catalogued RemediationUrl, got {definition}"
+            );
+            assert_eq!(
+                definition["SeverityRating"].as_str(),
+                Some(entry.control.severity_rating),
+                "case {case:?}/{id}: expected the catalogued SeverityRating, got {definition}"
+            );
+            assert_eq!(
+                definition["Provider"].as_str(),
+                Some(entry.provider),
+                "case {case:?}/{id}: expected the catalogued Provider, got {definition}"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GetSecurityControlDefinition — the single-control read of the same catalog
 // ---------------------------------------------------------------------------
 
 /// RULE: `GetSecurityControlDefinition` answers with the published definition of the
-/// one control its `SecurityControlId` names — byte for byte the definition the listing
-/// reports for that control, since both reads render the same catalog entry.
+/// one control its `SecurityControlId` names — the definition the listing reports for
+/// that control, plus the definitions of the parameters a listed element leaves out,
+/// since both reads render the same catalog entry.
 ///
 /// The case list is the WHOLE published catalog, so every control is asked for
 /// individually: AWS and Azure providers, customizable controls and controls that
@@ -905,9 +1019,17 @@ async fn one_control_definition_is_reported_exactly_as_the_listing_reports_it() 
             let reported = body["SecurityControlDefinition"].clone();
             let from_listing = entry_for(&listed, id)
                 .unwrap_or_else(|| panic!("control {id}: the listing must report it"));
+            // The one difference between the two reads: a listed element names the
+            // properties a control can be customized in, the single read also carries
+            // the definitions of its parameters.
+            let mut as_listed = reported.clone();
+            as_listed
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("control {id}: a definition is an object"))
+                .remove("ParameterDefinitions");
             assert_eq!(
-                reported, from_listing,
-                "control {id} in {region:?}: the single read must report the same definition as the listing, got {body}"
+                as_listed, from_listing,
+                "control {id} in {region:?}: the single read must report the listed definition and its parameters, got {body}"
             );
             assert_eq!(
                 reported["SecurityControlId"].as_str(),
@@ -926,16 +1048,18 @@ async fn one_control_definition_is_reported_exactly_as_the_listing_reports_it() 
             );
             assert_eq!(
                 reported["RemediationUrl"].as_str(),
-                Some(standards_control_remediation_url(id).as_str()),
-                "control {id} in {region:?}: a remediation link carries the control's own id, got {body}"
+                Some(entry.remediation_url),
+                "control {id} in {region:?}: a remediation link is the one the catalog records for the control, got {body}"
             );
             // Independently of the shared renderer: a remediation link is an HTTPS
-            // documentation address carrying this control's own id, so a renderer
-            // change that broke both reads identically still fails here.
+            // documentation address catalogued for this control rather than the console
+            // deep link its id spells out, so a renderer change that broke both reads
+            // identically still fails here.
             let remediation = reported["RemediationUrl"].as_str().unwrap_or_default();
             assert!(
-                remediation.starts_with("https://") && remediation.contains(id),
-                "control {id} in {region:?}: expected an https link naming {id}, got {remediation:?}"
+                remediation.starts_with("https://")
+                    && remediation != standards_control_remediation_url(id),
+                "control {id} in {region:?}: expected the catalogued https link, got {remediation:?}"
             );
             assert_eq!(
                 reported["SeverityRating"].as_str(),
@@ -963,6 +1087,123 @@ async fn one_control_definition_is_reported_exactly_as_the_listing_reports_it() 
             );
         }
     }
+}
+
+/// RULE: a control's remediation link is documentation catalogued for that one control,
+/// so no rule turns a `SecurityControlId` into it: the link of a control is not the
+/// console deep link its id spells out, carries no occurrence of the id at all, and two
+/// controls that evaluate the same service still link to their own pages.
+#[tokio::test]
+async fn a_remediation_link_is_catalogued_documentation_not_a_form_of_the_control_id() {
+    let harness = Harness::new("eu-west-1");
+    let reported = page_through_definitions(&harness, "", 100).await;
+    assert_eq!(
+        reported.len(),
+        SECURITY_CONTROL_CATALOG.len(),
+        "the whole catalog must be reported, got {} entries",
+        reported.len()
+    );
+
+    let mut link_parents: Vec<String> = Vec::new();
+    for definition in &reported {
+        let id = definition["SecurityControlId"].as_str().unwrap_or_default();
+        let link = definition["RemediationUrl"].as_str().unwrap_or_default();
+        // `RemediationUrl` targets `NonEmptyString`, `@pattern("\\S")`.
+        assert!(
+            !link.is_empty() && !link.chars().any(char::is_whitespace),
+            "control {id}: a remediation link is a non-blank string without whitespace, got {link:?}"
+        );
+        assert!(
+            link.starts_with("https://"),
+            "control {id}: a remediation link is an absolute https documentation URL, got {link:?}"
+        );
+        assert_ne!(
+            link,
+            standards_control_remediation_url(id),
+            "control {id}: the link must be catalogued documentation, not the console deep link its id spells out, got {link:?}"
+        );
+        assert!(
+            !link.contains(id),
+            "control {id}: a catalogued link carries no occurrence of the control id, got {link:?}"
+        );
+        let parent = link.rsplit_once('/').map_or(link, |(parent, _)| parent);
+        link_parents.push(parent.to_string());
+    }
+    link_parents.sort();
+    link_parents.dedup();
+    assert!(
+        link_parents.len() > 1,
+        "the catalogued links must name more than one documentation location, got {link_parents:?}"
+    );
+
+    // Controls of one service, catalogued with their own pages: a per-control value, so
+    // neither the control id nor the service it evaluates fixes the link or the text.
+    for (left, right) in [
+        ("CloudTrail.1", "CloudTrail.2"),
+        ("S3.1", "S3.5"),
+        ("SageMaker.1", "SageMaker.3"),
+    ] {
+        let left_entry = catalog_entry(left);
+        let right_entry = catalog_entry(right);
+        assert_ne!(
+            left_entry.remediation_url, right_entry.remediation_url,
+            "controls {left} and {right} must carry their own remediation links, got {:?}",
+            left_entry.remediation_url
+        );
+        assert_ne!(
+            left_entry.control.description, right_entry.control.description,
+            "controls {left} and {right} must carry their own descriptions, got {:?}",
+            left_entry.control.description
+        );
+    }
+}
+
+/// RULE: a control's `Description` is the text the catalog publishes for that control —
+/// what the control checks and when it fails — reported in full rather than summarized,
+/// and it names one control only, so no two controls share it.
+#[tokio::test]
+async fn a_description_is_the_published_text_of_that_one_control() {
+    let harness = Harness::new("ap-northeast-1");
+    let reported = page_through_definitions(&harness, "", 100).await;
+
+    let mut descriptions: Vec<&str> = Vec::new();
+    for definition in &reported {
+        let id = definition["SecurityControlId"].as_str().unwrap_or_default();
+        let entry = catalog_entry(id);
+        let described = definition["Description"].as_str().unwrap_or_default();
+        assert_eq!(
+            described, entry.control.description,
+            "control {id}: expected the catalogued Description, got {described:?}"
+        );
+        // The published form of a control's description: the check it performs, then
+        // the condition under which it fails (`smithy_query(query="doc",
+        // shape="SecurityControlDefinition", member="Description")` — "This typically
+        // summarizes how Security Hub CSPM evaluates the control and the conditions
+        // under which it produces a failed finding").
+        assert!(
+            described.starts_with("This control checks whether "),
+            "control {id}: a description states what the control checks, got {described:?}"
+        );
+        assert!(
+            described.contains("control fails if"),
+            "control {id}: a description states when the control fails, got {described:?}"
+        );
+        assert_ne!(
+            described,
+            definition["Title"].as_str().unwrap_or_default(),
+            "control {id}: a description is not a restatement of the title, got {described:?}"
+        );
+        descriptions.push(entry.control.description);
+    }
+    let reported_count = descriptions.len();
+    descriptions.sort_unstable();
+    descriptions.dedup();
+    assert_eq!(
+        descriptions.len(),
+        reported_count,
+        "each control publishes its own description; {} of {reported_count} are distinct",
+        descriptions.len()
+    );
 }
 
 /// RULE: a control that supports custom parameters reports, in a single read, the same

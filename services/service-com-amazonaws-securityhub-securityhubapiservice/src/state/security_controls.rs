@@ -16,6 +16,13 @@
 //! The published metadata is service metadata, identical for every caller, so nothing
 //! here is per account, per hub or per request; only the Region a request was signed
 //! for decides whether a control is available in it.
+//!
+//! Every field a control's definition reports is CATALOGUED here, per control: its
+//! title, the full text of its published description, the documentation link that
+//! explains how to remediate a failed finding for it, its severity and its customizable
+//! parameters. None of them is computed from the control's id — two controls of one
+//! service state different checks and are fixed on different documentation pages, so
+//! only a per-control value can report either faithfully.
 
 use std::collections::HashMap;
 
@@ -93,6 +100,17 @@ pub struct SecurityControlCatalogEntry {
     /// shared with the standards that carry the control, so a control cannot be
     /// described differently by the two reads.
     pub control: StandardsControlDefinition,
+    /// `SecurityControlDefinition$RemediationUrl`: "A link to Security Hub CSPM
+    /// documentation that explains how to remediate a failed finding for a security
+    /// control" (`smithy_query(query="doc", shape="SecurityControlDefinition",
+    /// member="RemediationUrl")`).
+    ///
+    /// A catalogued value per control, not a form derived from the control's id: the
+    /// controls reference links each control to the page documenting how to fix what
+    /// that control checks — the evaluated service's own user guide where the fix is
+    /// made there, the Security Hub CSPM user guide otherwise — so the link differs from
+    /// control to control even within one service.
+    pub remediation_url: &'static str,
     /// A `SecurityControlsProvider` value: "The cloud provider whose resources the
     /// security control evaluates" (`smithy_query(query="doc",
     /// shape="SecurityControlDefinition", member="Provider")`).
@@ -150,111 +168,133 @@ const REQUIRED_TAG_KEYS_PARAMETERS: [PublishedControlParameter; 1] = [PublishedC
 pub const SECURITY_CONTROL_CATALOG: [SecurityControlCatalogEntry; 22] = [
     SecurityControlCatalogEntry {
         control: ACM_1,
+        remediation_url: "https://docs.aws.amazon.com/acm/latest/userguide/email-renewal-validation.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &ACM_1_PARAMETERS,
     },
     SecurityControlCatalogEntry {
         control: AZURE_KEY_VAULT_1,
+        remediation_url: "https://docs.aws.amazon.com/securityhub/latest/userguide/azure-key-vault-controls.html",
         provider: SECURITY_CONTROLS_PROVIDER_AZURE,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: AZURE_SQL_1,
+        remediation_url: "https://docs.aws.amazon.com/securityhub/latest/userguide/azure-sql-controls.html",
         provider: SECURITY_CONTROLS_PROVIDER_AZURE,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: AZURE_STORAGE_1,
+        remediation_url: "https://docs.aws.amazon.com/securityhub/latest/userguide/azure-storage-controls.html",
         provider: SECURITY_CONTROLS_PROVIDER_AZURE,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: AZURE_VM_1,
+        remediation_url: "https://docs.aws.amazon.com/securityhub/latest/userguide/azure-virtual-machine-controls.html",
         provider: SECURITY_CONTROLS_PROVIDER_AZURE,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: BEDROCK_1,
+        remediation_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: CLOUDTRAIL_1,
+        remediation_url: "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-create-and-update-a-trail.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: CLOUDTRAIL_2,
+        remediation_url: "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/encrypting-cloudtrail-log-files-with-aws-kms.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: CLOUDWATCH_1,
+        remediation_url: "https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CreateMetricFilterProcedure.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: CONFIG_1,
+        remediation_url: "https://docs.aws.amazon.com/config/latest/developerguide/gs-console.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: EC2_13,
+        remediation_url: "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: EC2_2,
+        remediation_url: "https://docs.aws.amazon.com/vpc/latest/userguide/default-security-group.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: EC2_52,
+        remediation_url: "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Tags.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &REQUIRED_TAG_KEYS_PARAMETERS,
     },
     SecurityControlCatalogEntry {
         control: ECS_13,
+        remediation_url: "https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-using-tags.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &REQUIRED_TAG_KEYS_PARAMETERS,
     },
     SecurityControlCatalogEntry {
         control: GUARDDUTY_1,
+        remediation_url: "https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_settingup.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: IAM_4,
+        remediation_url: "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_root-user.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: KMS_4,
+        remediation_url: "https://docs.aws.amazon.com/kms/latest/developerguide/rotate-keys.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: S3_1,
+        remediation_url: "https://docs.aws.amazon.com/AmazonS3/latest/userguide/configuring-block-public-access-account.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: S3_5,
+        remediation_url: "https://docs.aws.amazon.com/AmazonS3/latest/userguide/example-bucket-policies.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: SAGEMAKER_1,
+        remediation_url: "https://docs.aws.amazon.com/sagemaker/latest/dg/appendix-notebook-and-internet-access.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: SAGEMAKER_2,
+        remediation_url: "https://docs.aws.amazon.com/sagemaker/latest/dg/infrastructure-give-access.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
     SecurityControlCatalogEntry {
         control: SAGEMAKER_3,
+        remediation_url: "https://docs.aws.amazon.com/sagemaker/latest/dg/nbi-root-access.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &[],
     },
@@ -319,9 +359,9 @@ fn parameter_definition_view(parameter: &PublishedControlParameter) -> Parameter
     }
 }
 
-/// One published control as the modelled `SecurityControlDefinition` every operation
-/// that reports a control definition answers with, so two reads of the same control
-/// cannot describe it differently.
+/// One published control as the modelled `SecurityControlDefinition` a read of ONE
+/// control answers with: the control's catalogued metadata, including the definitions of
+/// the parameters it can be customized with.
 ///
 /// A control that supports no custom property reports an EMPTY `CustomizableProperties`
 /// ("An empty array is returned for controls that don't support custom properties")
@@ -337,9 +377,9 @@ pub fn security_control_definition_view(
         security_control_id: entry.control.control_id.to_string(),
         title: entry.control.title.to_string(),
         description: entry.control.description.to_string(),
-        // A control's remediation link carries the control's own id, the same form a
-        // standards control reports, so the two reads link to the same page.
-        remediation_url: standards_control_remediation_url(entry.control.control_id),
+        // Read from the control's own catalog row: the link the controls reference
+        // publishes for this control, which no rule derives from the control's id.
+        remediation_url: entry.remediation_url.to_string(),
         severity_rating: entry.control.severity_rating.to_string(),
         current_region_availability: REGION_AVAILABILITY_AVAILABLE.to_string(),
         customizable_properties: Some(if customizable {
@@ -360,5 +400,24 @@ pub fn security_control_definition_view(
                 .collect::<HashMap<String, ParameterDefinition>>()
         }),
         provider: Some(entry.provider.to_string()),
+    }
+}
+
+/// One published control as a LIST of control definitions reports it: the same
+/// catalogued metadata as [`security_control_definition_view`], with the parameter
+/// definitions left out.
+///
+/// A listed element names the properties the control can be customized in
+/// (`CustomizableProperties`) but not the definitions of its parameters — those belong
+/// to a read of the one control a caller is about to customize, which is where Security
+/// Hub CSPM reports them. A listed element of a control that publishes parameters
+/// therefore carries no `ParameterDefinitions` member, as the recorded catalog
+/// responses of this service show.
+pub fn security_control_definition_list_view(
+    entry: &SecurityControlCatalogEntry,
+) -> SecurityControlDefinition {
+    SecurityControlDefinition {
+        parameter_definitions: None,
+        ..security_control_definition_view(entry)
     }
 }

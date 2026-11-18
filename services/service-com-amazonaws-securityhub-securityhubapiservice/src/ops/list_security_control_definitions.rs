@@ -11,6 +11,10 @@
 //! client makes to discover what it can enable and customize (see
 //! [`crate::state::not_subscribed_message`]).
 //!
+//! A listed element names the properties a control can be customized in, not the
+//! definitions of its parameters: those belong to a read of the one control a caller is
+//! about to customize (see [`crate::state::security_control_definition_list_view`]).
+//!
 //! ---
 //!
 //! # Modeled contract for `ListSecurityControlDefinitions`
@@ -212,9 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::standard_applies_security_control(definition, entry)
                 })
             })
-            // The one definition of how a control definition is reported, shared with
-            // every other operation that answers with a `SecurityControlDefinition`.
-            .map(crate::state::security_control_definition_view)
+            // The one definition of how a control definition is reported in a LIST of
+            // them, shared with every other operation that answers with a page of
+            // `SecurityControlDefinition`s.
+            .map(crate::state::security_control_definition_list_view)
             .collect();
 
         // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary

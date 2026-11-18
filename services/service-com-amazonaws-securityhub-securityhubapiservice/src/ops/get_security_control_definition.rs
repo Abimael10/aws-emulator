@@ -3,10 +3,12 @@
 //! @op GetSecurityControlDefinition
 //! Reports the definition of ONE security control: the standard-agnostic entry
 //! `crate::state`'s security-control catalog publishes under the `SecurityControlId`
-//! the request names, rendered by the same
-//! [`crate::state::security_control_definition_view`] every operation that answers
-//! with a `SecurityControlDefinition` uses, so a single read and a listing cannot
-//! describe a control differently.
+//! the request names, rendered by
+//! [`crate::state::security_control_definition_view`], so a single read and a listing
+//! cannot describe a control differently — with the one difference a listing makes,
+//! which names the properties a control can be customized in while this read also
+//! carries the definitions of its parameters
+//! ([`crate::state::security_control_definition_list_view`]).
 //!
 //! The catalog is the service's own published metadata, identical for every caller and
 //! unchanged by what an account customized, so this operation reads no account state
