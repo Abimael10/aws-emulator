@@ -32,13 +32,15 @@ use super::application_mode_and_maintenance_window::token_of;
 use super::harness::{call, create_body, describe, error_code, router};
 
 /// The applications the chain is driven against: both kinds this API creates, each with the
-/// runtime a later step of the chain moves it to.
+/// runtime a later step of the chain moves it to — which for a Studio notebook is the
+/// generation it already runs on, the only one this API puts a notebook on
+/// (`modeled_client_errors.rs` asserts the withdrawn generations are refused).
 ///
 /// Columns: (case, the runtime it is created on, the runtime the chain's last step moves it
 /// to).
 const CHAINS: [(&str, &str, &str); 2] = [
     ("flink", "FLINK-1_15", "FLINK-1_20"),
-    ("notebook", "ZEPPELIN-FLINK-2_0", "ZEPPELIN-FLINK-3_0"),
+    ("notebook", "ZEPPELIN-FLINK-3_0", "ZEPPELIN-FLINK-3_0"),
 ];
 
 /// Where the described Flink configuration lives in an `ApplicationDetail`.

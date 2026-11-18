@@ -23,11 +23,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::types::RUNTIME_ENVIRONMENT_VALUES;
 use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::state::DEFAULT_SNAPSHOT_MODE;
 
-use super::harness::{call, create_body, describe, router};
-
-/// The `RuntimeEnvironment` family this API no longer creates applications for, so no row
-/// drives a create with one (`application_version_reads.rs` covers reading one).
-const SQL_FAMILY: &str = "SQL-";
+use super::harness::{call, create_body, creates_applications_on, describe, router};
 
 /// The `RuntimeEnvironment` family a Studio notebook runs on
 /// (`smithy_query(query="shape",shape="RuntimeEnvironment")`: `ZEPPELIN-FLINK-<major>_<minor>`).
@@ -190,7 +186,7 @@ async fn every_described_snapshot_configuration_reports_the_mode_in_force() {
     let router = router();
     for runtime in RUNTIME_ENVIRONMENT_VALUES
         .iter()
-        .filter(|runtime| !runtime.starts_with(SQL_FAMILY))
+        .filter(|runtime| creates_applications_on(runtime))
     {
         let notebook = runtime.starts_with(NOTEBOOK_FAMILY);
         for (index, (configured, configuration, flink_snapshots, notebook_snapshots)) in
@@ -253,7 +249,7 @@ async fn the_mode_is_reported_however_the_application_mode_was_decided() {
         ),
         (
             "a notebook runtime naming no mode",
-            "ZEPPELIN-FLINK-1_0",
+            "ZEPPELIN-FLINK-3_0",
             None,
             false,
         ),

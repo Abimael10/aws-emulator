@@ -77,7 +77,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "logs.notebook-three",
-            runtime: "ZEPPELIN-FLINK-2_0",
+            runtime: "ZEPPELIN-FLINK-3_0",
             address: Address::VersionId,
             streams: vec![
                 stream("logs.notebook-three", "a"),
@@ -548,18 +548,15 @@ async fn a_change_not_addressed_to_the_version_in_force_is_refused_and_writes_no
 /// whether or not it carried the token in force, and nothing is written.
 ///
 /// The rows span the class the rule covers: both of the operations that share the
-/// version-addressing rule plus `UpdateApplication`, two Zeppelin runtime versions against a
-/// streaming runtime, and both ways of naming no version ID (nothing at all, and the token in
-/// force). The streaming rows are the control: there the token DOES address the version, and
-/// a request naming neither member is refused with the either-or sentence instead.
+/// version-addressing rule plus `UpdateApplication`, the Zeppelin runtime this API creates a
+/// notebook on against a streaming runtime, and both ways of naming no version ID (nothing at
+/// all, and the token in force). The streaming rows are the control: there the token DOES
+/// address the version, and a request naming neither member is refused with the either-or
+/// sentence instead.
 #[tokio::test]
 async fn a_notebook_change_that_names_no_version_id_is_refused() {
     // (runtime, what the refusal names the application's runtime as)
-    let applications = [
-        ("ZEPPELIN-FLINK-3_0", true),
-        ("ZEPPELIN-FLINK-2_0", true),
-        ("FLINK-1_20", false),
-    ];
+    let applications = [("ZEPPELIN-FLINK-3_0", true), ("FLINK-1_20", false)];
     for (runtime, is_notebook) in applications {
         for address in ["nothing", "the token in force"] {
             for (operation, request) in [

@@ -32,7 +32,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::types::RUNTIME_ENVIRONMENT_VALUES;
 use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::state;
 
-use super::harness::{call, create, describe, error_code, error_message, router_on};
+use super::harness::{
+    call, create, creates_applications_on, describe, error_code, error_message, router_on,
+};
 
 /// The runtime every application a case does not vary the family of runs on.
 const FLINK_RUNTIME: &str = "FLINK-1_20";
@@ -55,18 +57,18 @@ fn emulator() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
 
 /// Store an application under `name` running on `runtime`.
 ///
-/// `CreateApplication` no longer provisions the retired SQL runtime family, so for that
-/// family the application is created through the real create path and its stored
-/// `RuntimeEnvironment` re-stamped in the store — which is what an application created
-/// before that family was retired looks like, and what a reader of its versions decides
-/// against.
+/// `CreateApplication` no longer provisions the retired SQL runtime family or a withdrawn
+/// generation of the Studio-notebook family, so for one of those the application is created
+/// through the real create path and its stored `RuntimeEnvironment` re-stamped in the store —
+/// which is what an application created before its runtime was retired looks like, and what a
+/// reader of its versions decides against.
 async fn application_on(
     engine: &Arc<engine::InMemoryEngine>,
     router: &MultiServiceRouter,
     name: &str,
     runtime: &str,
 ) {
-    if !runtime.starts_with("SQL-") {
+    if creates_applications_on(runtime) {
         create(router, name, runtime).await;
         return;
     }

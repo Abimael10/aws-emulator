@@ -20,15 +20,14 @@ use super::harness::{
 /// Every `RuntimeEnvironment` an application can be created on, as the model spells them
 /// (`smithy_query(query="shape",shape="RuntimeEnvironment")`), paired with the mode an
 /// application on it runs in: `INTERACTIVE` for the Studio-notebook (Zeppelin) family and
-/// `STREAMING` for every streaming one. The retired SQL family is refused at create
-/// (`modeled_client_errors.rs` asserts that), so no application exists on it.
-const RUNTIME_MODES: [(&str, &str); 13] = [
+/// `STREAMING` for every streaming one. The retired SQL family is refused at create, as are
+/// the withdrawn generations of the notebook family (`modeled_client_errors.rs` asserts
+/// both), so no application exists on either.
+const RUNTIME_MODES: [(&str, &str); 11] = [
     ("FLINK-1_6", "STREAMING"),
     ("FLINK-1_8", "STREAMING"),
-    ("ZEPPELIN-FLINK-1_0", "INTERACTIVE"),
     ("FLINK-1_11", "STREAMING"),
     ("FLINK-1_13", "STREAMING"),
-    ("ZEPPELIN-FLINK-2_0", "INTERACTIVE"),
     ("FLINK-1_15", "STREAMING"),
     ("ZEPPELIN-FLINK-3_0", "INTERACTIVE"),
     ("FLINK-1_18", "STREAMING"),

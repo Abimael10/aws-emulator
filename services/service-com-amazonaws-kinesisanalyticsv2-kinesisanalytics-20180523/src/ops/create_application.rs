@@ -213,6 +213,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Which GENERATION of a runtime this API still creates applications on is the
+        // service's own rule too: a Studio notebook runs the Zeppelin/Flink pair its runtime
+        // generation names and this API offers the current pair only, so a create naming a
+        // withdrawn generation is refused with the deprecation message
+        // (`crate::state::deprecated_runtime_refusal`) rather than storing an application that
+        // could not run. Judged BEFORE the mode below, because what is withdrawn is the
+        // runtime itself: the refusal is the same whether or not the request named a mode.
+        if let Some(message) = crate::state::deprecated_runtime_refusal(&input.runtime_environment)
+        {
+            return Err(CreateApplicationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // Which KIND of application this create makes — a Managed Service for Apache Flink
         // application or a Studio notebook — follows from the runtime it names, and the two
         // run in different `ApplicationMode`s, so a create naming the other kind's mode is

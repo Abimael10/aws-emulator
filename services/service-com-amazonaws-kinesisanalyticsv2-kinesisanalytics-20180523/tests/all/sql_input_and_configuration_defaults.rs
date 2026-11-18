@@ -27,7 +27,10 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::types::RUNTIME_ENVIRONMENT_VALUES;
 use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::state;
 
-use super::harness::{call, create, create_body, describe, error_code, error_message, router, router_on};
+use super::harness::{
+    call, create, create_body, creates_applications_on, describe, error_code, error_message,
+    router, router_on,
+};
 
 // ---------------------------------------------------------------------------
 // The streaming sources a request can carry
@@ -142,10 +145,10 @@ fn stored_inputs(detail: &Value) -> Value {
 /// the refusal is inert: the application keeps its version and stores no input description.
 ///
 /// The table is every runtime the model declares that this API still creates applications
-/// for — read from the generated `RUNTIME_ENVIRONMENT_VALUES`
-/// (`src/ops/types/shared_types.rs`, which the model's `RuntimeEnvironment` shape
-/// generates), so a runtime the issue never cited is covered — crossed with the forms an
-/// `Input` takes.
+/// on — the `Created` rows of the harness's runtime table, which is held to the generated
+/// `RUNTIME_ENVIRONMENT_VALUES` (`src/ops/types/shared_types.rs`, which the model's
+/// `RuntimeEnvironment` shape generates), so a runtime the issue never cited is covered —
+/// crossed with the forms an `Input` takes.
 #[tokio::test]
 async fn adding_a_streaming_source_to_a_non_sql_application_is_refused() {
     let router = router();
@@ -153,7 +156,7 @@ async fn adding_a_streaming_source_to_a_non_sql_application_is_refused() {
 
     for runtime in RUNTIME_ENVIRONMENT_VALUES
         .iter()
-        .filter(|runtime| !state::is_sql_runtime(runtime))
+        .filter(|runtime| creates_applications_on(runtime))
     {
         let name = format!("no-sql-{}", runtime.replace(['-', '_'], "."));
         create(&router, &name, runtime).await;

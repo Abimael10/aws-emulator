@@ -56,7 +56,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "zeppelin-notebook".to_string(),
-            runtime: "ZEPPELIN-FLINK-2_0",
+            runtime: "ZEPPELIN-FLINK-3_0",
             with_configuration: false,
         },
         Case {

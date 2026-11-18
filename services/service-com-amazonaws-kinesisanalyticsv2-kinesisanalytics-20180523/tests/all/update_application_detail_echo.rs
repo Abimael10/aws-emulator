@@ -21,7 +21,9 @@ use super::harness::{call, create_body, describe, router};
 /// and one whose named mode is NOT the one its runtime implies.
 ///
 /// Columns: (case, `RuntimeEnvironment`, the mode the create names, the mode the
-/// application runs in, the runtime a later update moves it to).
+/// application runs in, the runtime a later update moves it to — which for a Studio notebook
+/// is the generation it already runs on, the only one this API puts a notebook on, as
+/// `modeled_client_errors.rs` asserts).
 const CASES: [(&str, &str, Option<&str>, &str, &str); 5] = [
     (
         "streaming-implied",
@@ -42,11 +44,11 @@ const CASES: [(&str, &str, Option<&str>, &str, &str); 5] = [
         "ZEPPELIN-FLINK-3_0",
         None,
         "INTERACTIVE",
-        "ZEPPELIN-FLINK-2_0",
+        "ZEPPELIN-FLINK-3_0",
     ),
     (
         "notebook-named",
-        "ZEPPELIN-FLINK-2_0",
+        "ZEPPELIN-FLINK-3_0",
         Some("INTERACTIVE"),
         "INTERACTIVE",
         "ZEPPELIN-FLINK-3_0",

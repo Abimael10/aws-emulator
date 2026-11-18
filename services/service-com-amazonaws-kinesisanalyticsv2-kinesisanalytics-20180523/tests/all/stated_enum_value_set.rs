@@ -28,7 +28,10 @@ use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::typ
     METRICS_LEVEL_VALUES, RUNTIME_ENVIRONMENT_VALUES,
 };
 
-use super::harness::{call, create_body, describe, error_code, error_message, router};
+use super::harness::{
+    call, create_body, creates_applications_on, describe, error_code, error_message, router,
+    runtime_outcome, RuntimeOutcome,
+};
 
 /// The admissible set a refusal NAMES for `RuntimeEnvironment` — the runtime families this
 /// service enumerates for the member: the SQL runtime, the Flink runtimes through 1_15 and
@@ -514,10 +517,11 @@ fn the_named_set_belongs_to_one_enum_of_the_model_and_names_only_values_it_decla
 }
 
 /// What a refusal NAMES does not narrow what the boundary ACCEPTS: a create naming any
-/// runtime the model declares is taken — stored and read back under that runtime — including
-/// the later Flink releases the stated set leaves out. The retired SQL family is the one
-/// exception, and it is refused by the handler with its modelled
-/// `UnsupportedOperationException` rather than as an invalid value.
+/// runtime the model declares is taken by the boundary validator — stored and read back under
+/// that runtime, including the later Flink releases the stated set leaves out — and a runtime
+/// the handler itself turns away (the retired SQL family, a withdrawn generation of the
+/// Studio-notebook family) is turned away with that handler's own modelled error rather than
+/// as an invalid value.
 #[tokio::test]
 async fn a_runtime_the_stated_set_leaves_out_is_still_accepted() {
     let router = router();
@@ -527,12 +531,20 @@ async fn a_runtime_the_stated_set_leaves_out_is_still_accepted() {
         let name = format!("probe-{runtime}");
         let (status, body) = call(&router, "CreateApplication", &create_body(&name, runtime)).await;
 
-        if runtime.starts_with("SQL-") {
+        if !creates_applications_on(runtime) {
+            // A handler refusal, not a boundary one: the value is in the enum, so the
+            // validator took it and the handler's own modelled error says what the service
+            // decided about the runtime.
+            let expected = match runtime_outcome(runtime) {
+                RuntimeOutcome::SqlFamilyRetired => "UnsupportedOperationException",
+                RuntimeOutcome::Deprecated => "InvalidArgumentException",
+                RuntimeOutcome::Created => unreachable!("a created runtime is not refused"),
+            };
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (400, "UnsupportedOperationException"),
-                "case {runtime:?}: expected the retired SQL family to be refused as \
-                 unsupported, got {status} {body}"
+                (400, expected),
+                "case {runtime:?}: expected the handler's modelled refusal {expected}, got \
+                 {status} {body}"
             );
             continue;
         }

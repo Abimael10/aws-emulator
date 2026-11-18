@@ -14,8 +14,11 @@
 //!
 //! * a value outside a modelled enumerated type is refused by the boundary validator with
 //!   HTTP 400 `ValidationException`, naming the member and its value set;
-//! * `CreateApplication` provisions only the runtimes this API still creates applications
-//!   for, and refuses the retired SQL runtime family with `UnsupportedOperationException`;
+//! * `CreateApplication` provisions only the runtime GENERATIONS this API still creates
+//!   applications on: it refuses the retired SQL runtime family with
+//!   `UnsupportedOperationException`, and a withdrawn generation of the Studio-notebook
+//!   family with `InvalidArgumentException` and the deprecation sentence, whatever the
+//!   request names around it — as does an update that would move an application onto one;
 //! * an operation that looks an application up by name reports a miss with the error code
 //!   its own model declares for that path — `ResourceNotFoundException` for the readers,
 //!   `InvalidArgumentException` for `CreateApplicationSnapshot` — and never as a 5xx;
@@ -37,9 +40,11 @@ use serde_json::{json, Value};
 use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::types::RUNTIME_ENVIRONMENT_VALUES;
 
 // The wire plumbing lives in `tests/all/harness.rs`, shared with the lifecycle suite, so
-// both read one response envelope.
+// both read one response envelope. The runtime table is plumbing too: every suite that picks
+// the runtime of a case reads from it which runtimes this API creates an application on.
 use super::harness::{
-    call, create_body, error_code, error_message, router, ACCOUNT, SETTLE_WAIT,
+    call, create_body, current_notebook_runtime, error_code, error_message, notebook_runtimes,
+    router, runtimes_with, RuntimeOutcome, ACCOUNT, RUNTIME_OUTCOMES, SETTLE_WAIT,
 };
 use super::stated_enum_value_set::NAMED_RUNTIME_ENVIRONMENT_VALUES;
 
@@ -130,38 +135,261 @@ fn is_sql(runtime: &str) -> bool {
     runtime.starts_with("SQL-")
 }
 
-/// `CreateApplication` refuses the SQL runtime family with HTTP 400
-/// `UnsupportedOperationException` and a `Message`, and creates an application for every
-/// other runtime the enum declares.
-///
-/// The table is the WHOLE enum, read from the generated
-/// `RUNTIME_ENVIRONMENT_VALUES` (`src/ops/types/shared_types.rs`, which the model's
-/// `RuntimeEnvironment` shape generates), so a runtime the issue never cited is covered
-/// and a value added to the model later joins the table on its own.
+/// Every runtime [`RUNTIME_OUTCOMES`] marks withdrawn.
+fn deprecated_runtimes() -> Vec<&'static str> {
+    runtimes_with(RuntimeOutcome::Deprecated)
+}
+
+/// How the service words a request naming a withdrawn runtime generation: fixed text apart
+/// from the runtime identifier, which is the `RuntimeEnvironment` the request named.
+fn deprecation_message(runtime: &str) -> String {
+    format!(
+        "Runtime {runtime} is deprecated. Please choose a valid version from: \
+         https://docs.aws.amazon.com/managed-flink/latest/apiv2/API_CreateApplication.html\
+         #APIReference-CreateApplication-request-RuntimeEnvironment"
+    )
+}
+
+/// Assert `answered` is the deprecation refusal of `runtime` under HTTP 400.
+fn assert_deprecation_refusal(case: &str, runtime: &str, status: u16, answered: &Value) {
+    assert_eq!(
+        (status, error_code(answered).as_str()),
+        (400, "InvalidArgumentException"),
+        "case {case}: expected HTTP 400 InvalidArgumentException, got {status} {answered}"
+    );
+    assert_eq!(
+        error_message(answered),
+        deprecation_message(runtime),
+        "case {case}: expected the deprecation sentence, got {answered}"
+    );
+}
+
+/// Assert no application is stored under `name`.
+async fn assert_nothing_stored(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    name: &str,
+) {
+    let (status, described) = call(
+        router,
+        "DescribeApplication",
+        &json!({"ApplicationName": name}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&described).as_str()),
+        (400, "ResourceNotFoundException"),
+        "case {case}: a refused call stores nothing, got {status} {described}"
+    );
+    assert_eq!(
+        error_message(&described),
+        format!("Application '{name}' does not exist."),
+        "case {case}: expected the miss to name the application, got {described}"
+    );
+}
+
+/// The table above is held to the model: it names exactly the members the
+/// `RuntimeEnvironment` enum declares (the generated `RUNTIME_ENVIRONMENT_VALUES` in
+/// `src/ops/types/shared_types.rs`), so every generation the API admits a request for is
+/// judged by one of its rows.
 #[tokio::test]
-async fn create_refuses_the_sql_runtime_family_and_creates_every_other_runtime() {
-    let router = router();
-    for runtime in RUNTIME_ENVIRONMENT_VALUES {
+async fn the_runtime_table_names_every_runtime_the_model_declares() {
+    let mut tabled: Vec<&str> = RUNTIME_OUTCOMES.iter().map(|(runtime, _)| *runtime).collect();
+    tabled.sort_unstable();
+    let mut declared: Vec<&str> = RUNTIME_ENVIRONMENT_VALUES.to_vec();
+    declared.sort_unstable();
+    assert_eq!(
+        tabled, declared,
+        "case table: expected the table to name every declared runtime, got {tabled:?} \
+         against {declared:?}"
+    );
+}
+
+/// `CreateApplication` creates an application for a runtime generation this API still puts
+/// one on, and refuses one it does not: a Studio notebook runs the Zeppelin/Flink pair its
+/// generation names and this API offers the current pair only, so an earlier generation of
+/// that family is refused with HTTP 400 `InvalidArgumentException` and the deprecation
+/// sentence, while the retired SQL family keeps its own `UnsupportedOperationException`. A
+/// served create is readable back on the runtime it named; a refused one stores nothing.
+///
+/// The table is the WHOLE enum, held to the generated `RUNTIME_ENVIRONMENT_VALUES` by
+/// [`the_runtime_table_names_every_runtime_the_model_declares`], so a runtime the issue never
+/// cited is covered and a value added to the model later has to be classified.
+#[tokio::test]
+async fn create_serves_only_a_runtime_generation_this_api_still_supports() {
+    for (runtime, outcome) in RUNTIME_OUTCOMES {
+        // One engine per row, so "nothing was stored" is checked against a store only this
+        // row wrote to.
+        let router = router();
         let name = format!("app-{}", runtime.replace(['-', '_'], "."));
         let (status, body) = call(&router, "CreateApplication", &create_body(&name, runtime)).await;
-        if is_sql(runtime) {
+
+        match outcome {
+            RuntimeOutcome::SqlFamilyRetired => {
+                assert!(
+                    is_sql(runtime),
+                    "case {runtime:?}: only the SQL family earns the retired-family refusal"
+                );
+                assert_eq!(
+                    status, 400,
+                    "case {runtime:?}: expected HTTP 400 for a SQL application, got {status} \
+                     {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "UnsupportedOperationException",
+                    "case {runtime:?}: expected UnsupportedOperationException, got {body}"
+                );
+                assert_eq!(
+                    error_message(&body),
+                    "CreateApplication is not supported for SQL applications in this Region. You \
+                     can use KDA Studio to build streaming applications with Flink SQL.",
+                    "case {runtime:?}: expected the unsupported-runtime message, got {body}"
+                );
+                assert_nothing_stored(&router, runtime, &name).await;
+            }
+            RuntimeOutcome::Deprecated => {
+                assert_deprecation_refusal(runtime, runtime, status, &body);
+                assert_nothing_stored(&router, runtime, &name).await;
+            }
+            RuntimeOutcome::Created => {
+                assert_eq!(
+                    status, 200,
+                    "case {runtime:?}: expected the application to be created, got {status} \
+                     {body}"
+                );
+                let (status, described) = call(
+                    &router,
+                    "DescribeApplication",
+                    &json!({"ApplicationName": name}),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {runtime:?}: DescribeApplication got {status} {described}"
+                );
+                let detail = &described["ApplicationDetail"];
+                assert_eq!(
+                    (
+                        detail["RuntimeEnvironment"].as_str(),
+                        detail["ApplicationStatus"].as_str()
+                    ),
+                    (Some(runtime), Some("READY")),
+                    "case {runtime:?}: expected the stored application to run READY on the \
+                     runtime it was created on, got {detail}"
+                );
+            }
+        }
+    }
+}
+
+/// What the deprecation refusal is about is the runtime GENERATION, so it holds whatever the
+/// request names around it: every `ApplicationMode` a create can carry — none at all, the
+/// mode a notebook runs in, and the mode of the other kind of application — and
+/// configurations of different shapes all draw the same sentence, and none of them creates
+/// anything.
+///
+/// The mode rows matter on their own: a mode a runtime does not run is refused by a rule of
+/// its own, and the withdrawal of the generation is decided FIRST, so a client is told what
+/// is actually wrong with its request rather than being pointed at the mode.
+#[tokio::test]
+async fn a_deprecated_runtime_is_refused_whatever_the_request_names_around_it() {
+    // (case, the members the create carries besides its name and its runtime)
+    let shapes: [(&str, Value); 5] = [
+        ("no mode", json!({})),
+        (
+            "the interactive mode",
+            json!({"ApplicationMode": "INTERACTIVE"}),
+        ),
+        (
+            "the streaming mode",
+            json!({"ApplicationMode": "STREAMING"}),
+        ),
+        (
+            "a note as its code",
+            json!({
+                "ApplicationMode": "INTERACTIVE",
+                "ApplicationConfiguration": {
+                    "ApplicationCodeConfiguration": {
+                        "CodeContentType": "PLAINTEXT",
+                        "CodeContent": {"TextContent": r#"{"id": "2A94M5J1Z", "name": "orders"}"#},
+                    },
+                },
+            }),
+        ),
+        (
+            "program text as its code, and tags",
+            json!({
+                "ApplicationConfiguration": {
+                    "ApplicationCodeConfiguration": {
+                        "CodeContentType": "PLAINTEXT",
+                        "CodeContent": {"TextContent": "%flink.ssql\nSELECT 1"},
+                    },
+                },
+                "Tags": [{"Key": "team", "Value": "analytics"}],
+            }),
+        ),
+    ];
+
+    for runtime in deprecated_runtimes() {
+        for (shape, extra) in &shapes {
+            let router = router();
+            let name = "mode-independent";
+            let case = format!("{runtime}/{shape}");
+            let mut body = json!({
+                "ApplicationName": name,
+                "RuntimeEnvironment": runtime,
+                "ServiceExecutionRole": "arn:aws:iam::000000000000:role/kda-service-role",
+            });
+            for (member, value) in extra
+                .as_object()
+                .expect("each row's members are a JSON object")
+            {
+                body[member] = value.clone();
+            }
+
+            let (status, answered) = call(&router, "CreateApplication", &body).await;
+            assert_deprecation_refusal(&case, runtime, status, &answered);
+            assert_nothing_stored(&router, &case, name).await;
+        }
+    }
+}
+
+/// An update is the other way a request could put an application on a withdrawn generation,
+/// so it is held to the same rule: one naming a deprecated `RuntimeEnvironmentUpdate` is
+/// refused with the same sentence and the application keeps the runtime and the version it
+/// had, while an update naming no runtime is served whatever generation the application runs
+/// on.
+#[tokio::test]
+async fn an_update_that_moves_an_application_onto_a_deprecated_runtime_is_refused() {
+    for stored_runtime in [current_notebook_runtime(), "FLINK-1_20"] {
+        for target in deprecated_runtimes() {
+            let router = router();
+            let name = "update-target";
+            let case = format!("{stored_runtime} -> {target}");
+            let (status, created) = call(
+                &router,
+                "CreateApplication",
+                &create_body(name, stored_runtime),
+            )
+            .await;
             assert_eq!(
-                status, 400,
-                "case {runtime:?}: expected HTTP 400 for a SQL application, got {status} {body}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "UnsupportedOperationException",
-                "case {runtime:?}: expected UnsupportedOperationException, got {body}"
-            );
-            assert_eq!(
-                error_message(&body),
-                "CreateApplication is not supported for SQL applications in this Region. You \
-                 can use KDA Studio to build streaming applications with Flink SQL.",
-                "case {runtime:?}: expected the unsupported-runtime message, got {body}"
+                status, 200,
+                "case {case}: CreateApplication got {status} {created}"
             );
 
-            // A refused create stores nothing: the reader still reports a miss.
+            let (status, answered) = call(
+                &router,
+                "UpdateApplication",
+                &json!({
+                    "ApplicationName": name,
+                    "CurrentApplicationVersionId": 1,
+                    "RuntimeEnvironmentUpdate": target,
+                }),
+            )
+            .await;
+            assert_deprecation_refusal(&case, target, status, &answered);
+
             let (status, described) = call(
                 &router,
                 "DescribeApplication",
@@ -169,21 +397,61 @@ async fn create_refuses_the_sql_runtime_family_and_creates_every_other_runtime()
             )
             .await;
             assert_eq!(
-                (status, error_code(&described).as_str()),
-                (400, "ResourceNotFoundException"),
-                "case {runtime:?}: a refused create must store nothing, got {status} {described}"
+                status, 200,
+                "case {case}: DescribeApplication got {status} {described}"
             );
-            continue;
+            let detail = &described["ApplicationDetail"];
+            assert_eq!(
+                (
+                    detail["RuntimeEnvironment"].as_str(),
+                    detail["ApplicationVersionId"].as_i64()
+                ),
+                (Some(stored_runtime), Some(1)),
+                "case {case}: a refused update leaves the runtime and the version as they \
+                 were, got {detail}"
+            );
         }
 
+        // The control: an update naming no runtime is served, so what the rule refuses is the
+        // runtime a request NAMES rather than every update of the application.
+        let router = router();
+        let name = "untouched-runtime";
+        let (status, created) = call(
+            &router,
+            "CreateApplication",
+            &create_body(name, stored_runtime),
+        )
+        .await;
         assert_eq!(
             status, 200,
-            "case {runtime:?}: expected the application to be created, got {status} {body}"
+            "case {stored_runtime}/control: CreateApplication got {status} {created}"
         );
+        let (status, updated) = call(
+            &router,
+            "UpdateApplication",
+            &json!({
+                "ApplicationName": name,
+                "CurrentApplicationVersionId": 1,
+                "ApplicationConfigurationUpdate": {
+                    "ApplicationSnapshotConfigurationUpdate": {"SnapshotsEnabledUpdate": true},
+                },
+            }),
+        )
+        .await;
         assert_eq!(
-            body["ApplicationDetail"]["RuntimeEnvironment"].as_str(),
-            Some(*runtime),
-            "case {runtime:?}: expected the stored runtime environment, got {body}"
+            status, 200,
+            "case {stored_runtime}/control: expected the update to be served, got {status} \
+             {updated}"
+        );
+        let detail = &updated["ApplicationDetail"];
+        assert_eq!(
+            (
+                detail["RuntimeEnvironment"].as_str(),
+                detail["ApplicationVersionId"].as_i64()
+            ),
+            (Some(stored_runtime), Some(2)),
+            "case {stored_runtime}/control: expected the served update to advance the version \
+             on the same runtime, got {detail}"
         );
     }
 }
@@ -813,15 +1081,10 @@ async fn every_modelled_client_error_travels_with_the_client_error_status() {
 // ---------------------------------------------------------------------------
 // A Studio notebook's inline code, and the operations its runtime does not keep
 // ---------------------------------------------------------------------------
-
-/// The `RuntimeEnvironment` family a Studio notebook runs on, as the enum spells it
-/// (`smithy_query(query="shape",shape="RuntimeEnvironment")`: `ZEPPELIN-FLINK-<major>_<minor>`),
-/// and every version of it the enum admits — so a rule about the family is driven on each.
-const NOTEBOOK_RUNTIMES: [&str; 3] = [
-    "ZEPPELIN-FLINK-1_0",
-    "ZEPPELIN-FLINK-2_0",
-    "ZEPPELIN-FLINK-3_0",
-];
+//
+// The Studio-notebook runtimes a rule below is driven on come from
+// `harness::notebook_runtimes`: the generations of the `ZEPPELIN-FLINK-` family this API
+// still creates a notebook on, since no notebook exists on a withdrawn one.
 
 /// What the service answers inline Studio code that is not a Zeppelin note: fixed text, so
 /// the sentence is asserted whole.
@@ -901,11 +1164,13 @@ fn described_text_content(detail: &Value) -> Option<&str> {
 /// it is.
 #[tokio::test]
 async fn a_studio_notebooks_inline_code_has_to_be_a_zeppelin_note() {
+    let notebooks = notebook_runtimes();
     for (index, (case, text, is_note)) in CODE_ROWS.iter().enumerate() {
         // One engine per row, so "nothing was stored" is checked against a store only this
-        // row wrote to; the notebook runtime cycles through every version of the family.
+        // row wrote to; the notebook runtime cycles through every generation of the family
+        // this API still creates a notebook on.
         let router = router();
-        let runtime = NOTEBOOK_RUNTIMES[index % NOTEBOOK_RUNTIMES.len()];
+        let runtime = notebooks[index % notebooks.len()];
         let name = format!("note-probe-{index}");
         let mut body = create_body(&name, runtime);
         body["ApplicationConfiguration"] = code_configuration(text);
@@ -1031,7 +1296,7 @@ async fn an_update_that_writes_inline_code_is_held_to_the_rule_of_the_runtime_it
         ),
         (
             "a notebook given program text",
-            "ZEPPELIN-FLINK-2_0",
+            "ZEPPELIN-FLINK-3_0",
             json!({"ApplicationConfigurationUpdate": {
                 "ApplicationCodeConfigurationUpdate": {
                     "CodeContentUpdate": {"TextContentUpdate": paragraph}
@@ -1041,7 +1306,7 @@ async fn an_update_that_writes_inline_code_is_held_to_the_rule_of_the_runtime_it
         ),
         (
             "a notebook whose update writes no code at all",
-            "ZEPPELIN-FLINK-1_0",
+            "ZEPPELIN-FLINK-3_0",
             json!({"ApplicationConfigurationUpdate": {
                 "EnvironmentPropertyUpdates": {"PropertyGroups": [
                     {"PropertyGroupId": "producer", "PropertyMap": {"topic": "orders"}}
@@ -1146,7 +1411,7 @@ async fn an_update_that_writes_inline_code_is_held_to_the_rule_of_the_runtime_it
 /// version and status do not move.
 #[tokio::test]
 async fn snapshot_and_rollback_are_unsupported_for_a_studio_notebooks_runtime() {
-    for runtime in NOTEBOOK_RUNTIMES {
+    for runtime in notebook_runtimes() {
         let router = router();
         let name = format!("studio-{}", runtime.to_lowercase().replace('_', "-"));
         let (status, created) = call(&router, "CreateApplication", &create_body(&name, runtime))

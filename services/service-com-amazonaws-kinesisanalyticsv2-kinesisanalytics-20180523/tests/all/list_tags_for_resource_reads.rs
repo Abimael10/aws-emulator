@@ -42,10 +42,11 @@ async fn assign(router: &MultiServiceRouter, case: &str, name: &str, tags: &[(&s
 /// Store an application of runtime family `runtime` under `name`, carrying the single tag
 /// `at-create` with `tag_value`, and assert the create stored it.
 ///
-/// `CreateApplication` no longer provisions the retired SQL runtime family, so for a family
-/// the create refuses the application is created through the real create path and its stored
-/// `RuntimeEnvironment` is re-stamped in the store — which is what an application created
-/// before that family was retired looks like to every reader, the same route
+/// `CreateApplication` no longer provisions the retired SQL runtime family, nor a withdrawn
+/// generation of the Studio-notebook family, so for a runtime the create refuses the
+/// application is created through the real create path and its stored `RuntimeEnvironment` is
+/// re-stamped in the store — which is what an application created before that runtime was
+/// retired looks like to every reader, the same route
 /// `sql_input_and_configuration_defaults.rs` takes.
 async fn store_tagged_application(
     engine: &Arc<engine::InMemoryEngine>,

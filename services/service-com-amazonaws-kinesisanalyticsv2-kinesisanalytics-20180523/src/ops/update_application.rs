@@ -279,6 +279,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The runtime this update MOVES the application onto has to be a generation the
+        // service still puts an application on — the same rule the create is held to
+        // (`crate::state::deprecated_runtime_refusal`) — so neither route lands an application
+        // on a withdrawn generation. Only an update that NAMES a runtime is judged: one that
+        // names none leaves the application on the runtime it already runs, whatever its
+        // generation. Refused before anything is written, so the stored runtime and version
+        // stay as they were.
+        if let Some(message) = input
+            .runtime_environment_update
+            .as_deref()
+            .and_then(crate::state::deprecated_runtime_refusal)
+        {
+            return Err(UpdateApplicationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // The inline code the application will run once this update lands has to be code the
         // runtime it then runs on RUNS — a Studio notebook's is a Zeppelin note
         // (`crate::state::zeppelin_note_refusal`), the same rule the create is held to — so

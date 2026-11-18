@@ -25,7 +25,9 @@
 //! to a stored configuration ([`Application::apply_configuration_update`]), the version a
 //! change is addressed to ([`addressed_version_refusal`]), the mode an
 //! application runs in when its create named none ([`default_application_mode`]) and whether
-//! the mode a create named is one its runtime runs ([`application_mode_refusal`]), the
+//! the mode a create named is one its runtime runs ([`application_mode_refusal`]), whether
+//! the runtime generation a request names is one this service still puts an application on
+//! ([`deprecated_runtime_refusal`]), the
 //! maintenance window every application carries
 //! ([`Application::maintenance_configuration`]), the resolution of a Studio notebook's
 //! catalog against the Glue Data Catalog ([`catalog_database_refusal`]), the resolution of
@@ -1909,6 +1911,75 @@ pub fn application_mode_refusal(runtime_environment: &str, mode: Option<&str>) -
     let running_in = mode.unwrap_or(APPLICATION_MODE_STREAMING);
     (running_in != applicable)
         .then(|| inapplicable_application_mode_message(mode, runtime_environment))
+}
+
+/// The page this service points a caller at when it refuses the runtime a request named:
+/// `CreateApplication`'s `RuntimeEnvironment` in the API reference, the list of the versions
+/// the API still creates applications on.
+const RUNTIME_ENVIRONMENT_REFERENCE: &str = "https://docs.aws.amazon.com/managed-flink/latest\
+                                             /apiv2/API_CreateApplication.html\
+                                             #APIReference-CreateApplication-request-\
+                                             RuntimeEnvironment";
+
+/// How this service words a request that would put an application on a runtime generation it
+/// no longer supports: the runtime identifier is the `RuntimeEnvironment` the REQUEST named,
+/// and the rest — the sentence and the page it points at — is fixed text.
+pub fn deprecated_runtime_message(runtime: &str) -> String {
+    format!(
+        "Runtime {runtime} is deprecated. Please choose a valid version from: \
+         {RUNTIME_ENVIRONMENT_REFERENCE}"
+    )
+}
+
+/// The GENERATION a `RuntimeEnvironment` value names, as `(major, minor)` — the version that
+/// closes the value (`FLINK-1_20` → `(1, 20)`, `ZEPPELIN-FLINK-3_0` → `(3, 0)`) — or `None`
+/// for a value that carries none.
+///
+/// Every member of the enum spells its version as `<family>-<major>_<minor>`
+/// (`smithy_query(query="shape",shape="RuntimeEnvironment")`), so the generation is read off
+/// the value rather than matched against a list of spelled-out members: a member the enum
+/// gains later is read the same way.
+fn runtime_generation(runtime: &str) -> Option<(u32, u32)> {
+    let version = runtime.rsplit('-').next()?;
+    let (major, minor) = version.split_once('_')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// The generation of the Studio-notebook runtime family this API creates notebooks on: the
+/// NEWEST generation of that family the `RuntimeEnvironment` enum carries.
+///
+/// A Studio notebook runs the Apache Zeppelin and Apache Flink pair its runtime generation
+/// names, and this API offers one such pair at a time — the current one — so the generations
+/// before it are withdrawn as each new one ships ([`deprecated_runtime_refusal`]). Derived
+/// from the enum, so the current generation follows the model rather than being spelled out
+/// here beside it.
+fn current_notebook_generation() -> Option<(u32, u32)> {
+    crate::ops::types::RUNTIME_ENVIRONMENT_VALUES
+        .iter()
+        .filter(|runtime| is_notebook_runtime(runtime))
+        .filter_map(|runtime| runtime_generation(runtime))
+        .max()
+}
+
+/// The refusal a request naming `runtime` earns because the service no longer puts an
+/// application on that runtime generation, or `None` when the generation is one it still does.
+///
+/// A Studio notebook is created on the CURRENT generation of its runtime family only
+/// ([`current_notebook_generation`]); an earlier generation of that family is deprecated, and a
+/// request naming one is refused with [`deprecated_runtime_message`] instead of being served —
+/// whatever else the request carries, since what is withdrawn is the runtime and not the
+/// configuration around it. Every generation of the streaming Flink family the enum carries is
+/// one this API still creates applications on, so nothing in that family is refused here, and
+/// the retired SQL family has a refusal of its own ([`is_sql_runtime`]).
+///
+/// One rule for the create that puts an application on a runtime and the update that moves it
+/// onto another, so neither route lands an application on a withdrawn generation. An
+/// application ALREADY stored on one keeps being read, described and run: the rule is about the
+/// runtime a request NAMES.
+pub fn deprecated_runtime_refusal(runtime: &str) -> Option<String> {
+    let generation = runtime_generation(runtime).filter(|_| is_notebook_runtime(runtime))?;
+    let current = current_notebook_generation()?;
+    (generation < current).then(|| deprecated_runtime_message(runtime))
 }
 
 /// The two members a Zeppelin note is identified by, as the note object spells them: Apache

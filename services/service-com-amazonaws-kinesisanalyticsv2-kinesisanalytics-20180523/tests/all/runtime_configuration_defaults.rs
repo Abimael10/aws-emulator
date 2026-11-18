@@ -26,15 +26,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::types::RUNTIME_ENVIRONMENT_VALUES;
 
-use super::harness::{call, create_body, describe, router};
+use super::harness::{call, create_body, creates_applications_on, describe, router};
 
 /// The `RuntimeEnvironment` family a Studio notebook runs on, as the enum spells it
 /// (`smithy_query(query="shape",shape="RuntimeEnvironment")`: `ZEPPELIN-FLINK-<major>_<minor>`).
 const NOTEBOOK_FAMILY: &str = "ZEPPELIN-";
-
-/// The `RuntimeEnvironment` family of a SQL application, which this API no longer creates
-/// applications for, so no row drives a create with one.
-const SQL_FAMILY: &str = "SQL-";
 
 /// What the two switches must report for an application of `runtime` created with no
 /// configuration naming them: on for a Managed Service for Apache Flink application, off
@@ -142,15 +138,15 @@ async fn update_unrelated_configuration(
     updated["ApplicationDetail"].clone()
 }
 
-/// Every runtime the enum admits a create for, described with the defaults its kind of
-/// application runs under — on create, on describe, and on an update that names neither
-/// switch.
+/// Every runtime this API still creates an application on, described with the defaults its
+/// kind of application runs under — on create, on describe, and on an update that names
+/// neither switch.
 #[tokio::test]
 async fn each_runtime_is_described_with_the_defaults_its_kind_of_application_runs() {
     let router = router();
     for runtime in RUNTIME_ENVIRONMENT_VALUES
         .iter()
-        .filter(|runtime| !runtime.starts_with(SQL_FAMILY))
+        .filter(|runtime| creates_applications_on(runtime))
     {
         let case = format!("{runtime} with no configuration at all");
         let name = format!("defaults-{}", runtime.to_lowercase());
@@ -239,7 +235,7 @@ async fn the_mode_the_application_runs_in_decides_the_defaults() {
         ),
         (
             "a notebook runtime naming no mode",
-            "ZEPPELIN-FLINK-1_0",
+            "ZEPPELIN-FLINK-3_0",
             None,
             "INTERACTIVE",
             false,
@@ -279,7 +275,7 @@ async fn a_request_that_switches_a_feature_on_is_reported_as_given() {
         ),
         (
             "a notebook with a CUSTOM checkpoint configuration that enables checkpointing",
-            "ZEPPELIN-FLINK-2_0",
+            "ZEPPELIN-FLINK-3_0",
             json!({
                 "FlinkApplicationConfiguration": {
                     "CheckpointConfiguration": {
@@ -316,8 +312,11 @@ async fn a_request_that_switches_a_feature_on_is_reported_as_given() {
     ];
 
     let router = router();
-    for (case, runtime, configuration, checkpointing, snapshots) in rows {
-        let name = format!("explicit-{}", runtime.to_lowercase());
+    for (index, (case, runtime, configuration, checkpointing, snapshots)) in
+        rows.into_iter().enumerate()
+    {
+        // The index keys the name, so two rows on one runtime are two applications.
+        let name = format!("explicit-{}-{index}", runtime.to_lowercase());
         let created =
             create_with(&router, case, &name, runtime, None, Some(configuration)).await;
         assert_eq!(
@@ -403,7 +402,7 @@ async fn each_runtime_is_described_with_the_autoscaling_its_kind_of_application_
     let router = router();
     for runtime in RUNTIME_ENVIRONMENT_VALUES
         .iter()
-        .filter(|runtime| !runtime.starts_with(SQL_FAMILY))
+        .filter(|runtime| creates_applications_on(runtime))
     {
         let case = format!("{runtime} with no parallelism configuration");
         let name = format!("autoscaling-{}", runtime.to_lowercase());
@@ -463,13 +462,13 @@ async fn a_request_that_names_autoscaling_is_reported_as_given() {
         ),
         (
             "a notebook with a CUSTOM configuration that names only the parallelism",
-            "ZEPPELIN-FLINK-2_0",
+            "ZEPPELIN-FLINK-3_0",
             json!({"ConfigurationType": "CUSTOM", "Parallelism": 2}),
             false,
         ),
         (
             "a notebook whose DEFAULT configuration asks for autoscaling",
-            "ZEPPELIN-FLINK-1_0",
+            "ZEPPELIN-FLINK-3_0",
             json!({"ConfigurationType": "DEFAULT", "AutoScalingEnabled": true}),
             false,
         ),

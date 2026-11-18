@@ -644,13 +644,13 @@ async fn version_reads_are_supported_only_for_the_flink_runtime_family() {
     // (the RuntimeEnvironment, whether its versions can be read) — one row per family the
     // `RuntimeEnvironment` enum carries
     // (`smithy_query(query="shape",shape="RuntimeEnvironment")`): the plain `FLINK-`
-    // applications and the `ZEPPELIN-FLINK-` Studio notebooks.
-    let cases: [(&str, bool); 6] = [
+    // applications and the `ZEPPELIN-FLINK-` Studio notebooks, in the generations this API
+    // still creates an application on (`modeled_client_errors.rs` asserts that a withdrawn
+    // one is refused at create, so no application exists on it).
+    let cases: [(&str, bool); 4] = [
         ("FLINK-1_15", true),
         ("FLINK-1_20", true),
         ("FLINK-2_3", true),
-        ("ZEPPELIN-FLINK-1_0", false),
-        ("ZEPPELIN-FLINK-2_0", false),
         ("ZEPPELIN-FLINK-3_0", false),
     ];
 
