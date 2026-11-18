@@ -18,6 +18,11 @@
 //! 3. A dependency-ordering refusal states the remediation: deleting a namespace a
 //!    workgroup is attached to answers `ConflictException` whose message names THAT
 //!    workgroup as the thing to delete first.
+//! 4. A snapshot is deleted BY NAME: `DeleteSnapshot` removes the record its
+//!    `snapshotName` addresses and answers with that snapshot as `DELETED`, so every
+//!    reader of a snapshot then refuses the name — with this service's one sentence for
+//!    a snapshot that resolves to nothing — the listing of its namespace no longer
+//!    carries it, and the name is free to be taken again.
 //!
 //! The harness (emulator, signed call, error-code reader, create helpers) is shared with
 //! `namespace_workgroup_lifecycle`, which owns it.
@@ -848,6 +853,299 @@ async fn deleting_a_namespace_with_a_workgroup_attached_names_that_workgroup() {
             status, 200,
             "case {namespace}: DeleteNamespace once the compute is gone got {status} \
              with {body}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4 — a snapshot is DELETED by name, and then nothing reports it.
+//
+// `DeleteSnapshot` removes the snapshot its `snapshotName` addresses and answers
+// with that snapshot as `DELETED`; from then on the name resolves to nothing, so
+// every reader of a snapshot refuses it and the name is free to be taken again.
+// A name that resolves to nothing is refused with the 404
+// `ResourceNotFoundException` and its one fixed sentence.
+// ---------------------------------------------------------------------------
+
+/// The refusal every operation that addresses a snapshot by name owes for a name
+/// that resolves to nothing — the service's own sentence, with the name asked for
+/// and the account whose snapshots were searched.
+fn snapshot_not_found(name: &str) -> String {
+    format!(
+        "The snapshot {name} was not found. Please Check whether the snapshot exists and is \
+         owned by or shared with account {ACCOUNT}."
+    )
+}
+
+/// One row of the deletion table: the Region the snapshots live in, the retention
+/// the deleted snapshot was created with, and whether the delete comes while the
+/// snapshot is still `CREATING` or after it has settled into `AVAILABLE`.
+#[derive(Debug, Clone, Copy)]
+struct DeletionCase {
+    region: &'static str,
+    namespace: &'static str,
+    workgroup: &'static str,
+    /// The snapshot this row deletes.
+    deleted: &'static str,
+    /// A second snapshot of the same namespace, which the delete must leave alone.
+    kept: &'static str,
+    retention: Option<i32>,
+    /// Whether the row waits for the create's own transition to fall due first.
+    settled: bool,
+}
+
+#[tokio::test]
+async fn a_deleted_snapshot_is_gone_from_every_reader_and_frees_its_name() {
+    // The rows differ along what the rule generalises over: the Region the
+    // snapshot was taken in, its retention period (named, absent, and the
+    // "retain indefinitely" sentinel), and whether it is deleted while still
+    // CREATING or once the clock has settled it into AVAILABLE.
+    let cases = [
+        DeletionCase {
+            region: "us-east-1",
+            namespace: "del-ns-oneday",
+            workgroup: "del-wg-oneday",
+            deleted: "del-snap-oneday",
+            kept: "del-snap-oneday-kept",
+            retention: Some(1),
+            settled: true,
+        },
+        DeletionCase {
+            region: "eu-west-2",
+            namespace: "del-ns-default",
+            workgroup: "del-wg-default",
+            deleted: "del-snap-default",
+            kept: "del-snap-default-kept",
+            retention: None,
+            settled: false,
+        },
+        DeletionCase {
+            region: "ap-southeast-2",
+            namespace: "del-ns-forever",
+            workgroup: "del-wg-forever",
+            deleted: "del-snap-forever",
+            kept: "del-snap-forever-kept",
+            retention: Some(-1),
+            settled: false,
+        },
+    ];
+
+    let router = emulator();
+    for case in cases {
+        let (status, body) = call_in(
+            &router,
+            case.region,
+            "CreateNamespace",
+            json!({ "namespaceName": case.namespace, "adminUsername": "admin" }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateNamespace got {status} with {body}"
+        );
+        let (status, body) = call_in(
+            &router,
+            case.region,
+            "CreateWorkgroup",
+            json!({ "workgroupName": case.workgroup, "namespaceName": case.namespace }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateWorkgroup got {status} with {body}"
+        );
+
+        // Two snapshots of the one namespace: the row deletes one of them, so
+        // what the delete leaves behind is observable.
+        for name in [case.deleted, case.kept] {
+            let mut request = json!({
+                "namespaceName": case.namespace,
+                "snapshotName": name,
+            });
+            if let Some(retention) = case.retention {
+                request["retentionPeriod"] = json!(retention);
+            }
+            let (status, body) = call_in(&router, case.region, "CreateSnapshot", request).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: CreateSnapshot {name} got {status} with {body}"
+            );
+        }
+
+        // A row that deletes a SETTLED snapshot polls the read the clock settles,
+        // so what it waits for is the transition and not a span of time.
+        if case.settled {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let (_, body) = call_in(
+                    &router,
+                    case.region,
+                    "GetSnapshot",
+                    json!({ "snapshotName": case.deleted }),
+                )
+                .await;
+                if at(&body, "snapshot.status") == &json!("AVAILABLE") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "case {case:?}: the snapshot never settled into AVAILABLE, got {body}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        // The snapshot as it stands, so the delete's own answer can be compared
+        // against the record it removed.
+        let (status, before) = call_in(
+            &router,
+            case.region,
+            "GetSnapshot",
+            json!({ "snapshotName": case.deleted }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetSnapshot before the delete got {status} with {before}"
+        );
+        let stored = before["snapshot"].clone();
+
+        let (status, body) = call_in(
+            &router,
+            case.region,
+            "DeleteSnapshot",
+            json!({ "snapshotName": case.deleted }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeleteSnapshot got {status} with {body}"
+        );
+        let deleted = body["snapshot"].clone();
+        assert_eq!(
+            deleted["status"],
+            json!("DELETED"),
+            "case {case:?}: the deleted snapshot is reported DELETED, got {body}"
+        );
+        // Everything else is the record that was removed, bar that status.
+        let mut expected = stored.clone();
+        expected["status"] = json!("DELETED");
+        assert_eq!(
+            deleted, expected,
+            "case {case:?}: the answer is the snapshot that was deleted, got {body}"
+        );
+
+        // From here the name resolves to nothing: the readers refuse it with the
+        // service's own sentence, and the one that was kept is untouched.
+        for key in [
+            json!({ "snapshotName": case.deleted }),
+            json!({ "snapshotArn": stored["snapshotArn"].clone() }),
+        ] {
+            let (status, body) = call_in(&router, case.region, "GetSnapshot", key.clone()).await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (404, "ResourceNotFoundException"),
+                "case {case:?}: GetSnapshot({key}) after the delete got {status} with {body}"
+            );
+        }
+        let (_, body) = call_in(
+            &router,
+            case.region,
+            "GetSnapshot",
+            json!({ "snapshotName": case.deleted }),
+        )
+        .await;
+        assert_eq!(
+            body["message"],
+            json!(snapshot_not_found(case.deleted)),
+            "case {case:?}: the refusal carries the service's own sentence, got {body}"
+        );
+
+        let (status, body) = call_in(
+            &router,
+            case.region,
+            "ListSnapshots",
+            json!({ "namespaceName": case.namespace }),
+        )
+        .await;
+        let listed: Vec<&Value> = body["snapshots"]
+            .as_array()
+            .map(|snapshots| snapshots.iter().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            (status, listed.len()),
+            (200, 1),
+            "case {case:?}: the listing carries only the snapshot that was kept, got {body}"
+        );
+        assert_eq!(
+            listed[0]["snapshotName"],
+            json!(case.kept),
+            "case {case:?}: the snapshot that was not deleted survives, got {body}"
+        );
+
+        // And the name is free again: a snapshot may be taken under it.
+        let (status, body) = call_in(
+            &router,
+            case.region,
+            "CreateSnapshot",
+            json!({ "namespaceName": case.namespace, "snapshotName": case.deleted }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the deleted name is free to be taken again, got {status} \
+             with {body}"
+        );
+        assert_ne!(
+            body["snapshot"]["snapshotArn"], stored["snapshotArn"],
+            "case {case:?}: the snapshot taken under the freed name is a new resource, \
+             got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_snapshot_that_resolves_to_nothing_is_refused_by_name() {
+    let router = emulator();
+    create_namespace(&router, "redelete-ns").await;
+    create_workgroup(&router, "redelete-wg", "redelete-ns").await;
+    let (status, _) = call(
+        &router,
+        "CreateSnapshot",
+        json!({ "namespaceName": "redelete-ns", "snapshotName": "redelete-snap" }),
+    )
+    .await;
+    assert_eq!(status, 200, "the snapshot to delete must be created first");
+
+    let (status, body) = call(
+        &router,
+        "DeleteSnapshot",
+        json!({ "snapshotName": "redelete-snap" }),
+    )
+    .await;
+    assert_eq!(status, 200, "DeleteSnapshot got {status} with {body}");
+
+    // The names that resolve to nothing: one already deleted, one never taken,
+    // and one that differs from a stored name only in case — an unquoted name is
+    // this API's identity for a snapshot, and it is matched as given.
+    for name in ["redelete-snap", "no-such-snap", "REDELETE-SNAP"] {
+        let (status, body) = call(&router, "DeleteSnapshot", json!({ "snapshotName": name })).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {name:?}: DeleteSnapshot of a name that resolves to nothing got {status} \
+             with {body}"
+        );
+        assert_eq!(
+            body["message"],
+            json!(snapshot_not_found(name)),
+            "case {name:?}: the refusal names the snapshot asked for, got {body}"
+        );
+        assert_eq!(
+            body["resourceName"],
+            json!(name),
+            "case {name:?}: the resource that could not be found travels in resourceName, \
+             got {body}"
         );
     }
 }

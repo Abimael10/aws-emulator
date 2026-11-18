@@ -23,6 +23,7 @@ use sqlparser::dialect::RedshiftSqlDialect;
 use sqlparser::parser::Parser;
 
 use super::column_metadata::{ColumnOrigin, ColumnType, DeclaredColumn};
+use super::warehouse_types;
 
 /// What a statement's text says about one of its result columns, beyond what
 /// the engine's own prepared-statement metadata carries.
@@ -249,6 +250,17 @@ fn projected_expression(expr: &Expr) -> Projected {
             },
             _ => Projected::Computed,
         },
+        // A call to the constructor of a warehouse TYPE the engine does not
+        // carry ([`warehouse_types`]) produces a value of that type, so the
+        // column it projects is declared that type — the same resolution a
+        // cast to it goes through, because the dialect reader re-spells such a
+        // cast as exactly this call.
+        Expr::Function(function) => {
+            match warehouse_types::type_named(&function.name.to_string()) {
+                Some(type_name) => Projected::Cast(ColumnType::from_declared(type_name)),
+                None => Projected::Computed,
+            }
+        }
         Expr::Nested(inner) => projected_expression(inner),
         _ => Projected::Computed,
     }

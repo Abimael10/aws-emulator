@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default();
             return Err(GetSnapshotErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("no snapshot named {identifier}"),
+                    message: crate::state::snapshot_not_found(&identifier),
                     resource_name: Some(identifier),
                 },
             )

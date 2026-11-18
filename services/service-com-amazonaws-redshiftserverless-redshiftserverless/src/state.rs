@@ -170,11 +170,15 @@ pub const WORKGROUP_DELETING: &str = "DELETING";
 /// The `SnapshotStatus` values this slice reports
 /// (`smithy_query(query="shape", shape="SnapshotStatus")` -> AVAILABLE, CREATING,
 /// DELETED, CANCELLED, FAILED, COPYING). A snapshot this emulator takes is reported
-/// `CREATING` and settles into `AVAILABLE`; the other four belong to operations that are
-/// still scaffolded.
+/// `CREATING` and settles into `AVAILABLE`; `DeleteSnapshot` reports the snapshot it
+/// removed as `DELETED`, which is the only reader a deleted snapshot has — the record
+/// is gone from the store, so nothing else can report it. `CANCELLED`, `FAILED` and
+/// `COPYING` belong to operations that are still scaffolded.
 pub const SNAPSHOT_CREATING: &str = "CREATING";
 /// See [`SNAPSHOT_CREATING`].
 pub const SNAPSHOT_AVAILABLE: &str = "AVAILABLE";
+/// See [`SNAPSHOT_CREATING`].
+pub const SNAPSHOT_DELETED: &str = "DELETED";
 
 /// The retention period of a snapshot kept until it is deleted by hand. Redshift's manual
 /// snapshot retention uses `-1` for "retained indefinitely", and
@@ -337,6 +341,23 @@ fn arn_resource_id(arn: &str) -> &str {
 /// wrong is the resource it addressed, not the shape of its input.
 pub fn tagged_resource_not_found(arn: &str) -> String {
     format!("Resource {arn} not found.")
+}
+
+/// How this service states that a snapshot name resolves to nothing.
+///
+/// The sentence is fixed bar two slots: the `snapshotName` the request asked for, and
+/// the account whose snapshots were searched — this emulator's account
+/// ([`engine::emulator_account_id`]), which is the account every snapshot it holds is
+/// owned by (`CreateSnapshot` stores it in `Snapshot$ownerAccount`). Every operation
+/// that addresses a snapshot by name refuses a miss this way, so the sentence lives
+/// here once; the modelled `ResourceNotFoundException` keeps its own `@httpError` 404,
+/// which is the status a snapshot miss is answered with.
+pub fn snapshot_not_found(name: &str) -> String {
+    format!(
+        "The snapshot {name} was not found. Please Check whether the snapshot exists and is \
+         owned by or shared with account {}.",
+        ::engine::emulator_account_id()
+    )
 }
 
 /// The most tags one resource of this service holds.

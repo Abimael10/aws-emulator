@@ -106,6 +106,10 @@ pub mod system_tables;
 /// registered on every connection.
 pub mod functions;
 
+/// The data warehouse TYPES the engine does not carry — the geometric types and
+/// the currency type — implemented and registered on every connection.
+pub mod warehouse_types;
+
 /// The EventBridge event a statement whose submission asked for one publishes
 /// when it stops.
 pub mod statement_events;
@@ -1375,6 +1379,10 @@ impl Database {
         // any caller SQL reaches the connection so that a statement naming one
         // of them finds an implementation rather than an unknown function.
         functions::install(&connection)?;
+        // The warehouse types the engine does not carry, installed alongside
+        // them and for the same reason: a statement naming one of these types
+        // finds an implementation of it rather than an unknown function.
+        warehouse_types::install(&connection)?;
 
         Ok(Self {
             connection,

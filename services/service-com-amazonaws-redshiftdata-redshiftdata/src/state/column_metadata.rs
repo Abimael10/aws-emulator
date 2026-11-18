@@ -93,6 +93,12 @@ pub(super) const EXACT_NUMERIC_TYPE_NAMES: &[&str] = &["numeric"];
 /// than 38 of them can sit to the right of the decimal point.
 pub(super) const MAX_NUMERIC_SCALE: i32 = 38;
 
+/// The type names [`ColumnType`] reports for a CURRENCY column: the warehouse's
+/// money type, whose values are amounts of money. It is what
+/// `ColumnMetadata.isCurrency` reports, and the type this emulator implements in
+/// [`warehouse_types`].
+pub(super) const CURRENCY_TYPE_NAMES: &[&str] = &[warehouse_types::MONEY_TYPE_NAME];
+
 /// The type names [`ColumnType`] reports for a character column. Redshift
 /// compares `CHAR` and `VARCHAR` values case-sensitively, which is what
 /// `ColumnMetadata.isCaseSensitive` reports.
@@ -366,6 +372,8 @@ pub(super) fn column_metadata(
         .is_some_and(|column_type| SIGNED_TYPE_NAMES.contains(&column_type.name.as_str()));
     let case_sensitive = column_type
         .is_some_and(|column_type| CASE_SENSITIVE_TYPE_NAMES.contains(&column_type.name.as_str()));
+    let currency = column_type
+        .is_some_and(|column_type| CURRENCY_TYPE_NAMES.contains(&column_type.name.as_str()));
     ColumnMetadata {
         // "A value that indicates whether the column is nullable": 0 for a
         // column its relation declares NOT NULL. Every other column is
@@ -373,9 +381,10 @@ pub(super) fn column_metadata(
         // computes, whose expression can always produce NULL.
         nullable: i32::from(origin.is_none_or(|origin| origin.declared.nullable)),
         is_case_sensitive: case_sensitive,
-        // Redshift's supported data types carry no money type, so no column is
-        // a currency column.
-        is_currency: false,
+        // "A value that indicates whether the column contains currency
+        // values": a column of the warehouse's money type does, and no other
+        // type this emulator reports holds an amount of money.
+        is_currency: currency,
         is_signed: signed,
         // Redshift reports the column's output name as both name and label; a
         // statement that aliases a column changes both together.

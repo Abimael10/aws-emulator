@@ -14,6 +14,11 @@
 //! * a construct the engine spells differently is re-spelled ([`Translated::Run`]):
 //!   a `::` cast becomes the standard `CAST(… AS …)`, and a schema-qualified name
 //!   becomes the engine name that schema's tables are held under;
+//! * a value of a warehouse TYPE the engine does not carry — one of the
+//!   geometric types, or the currency type — is re-spelled as the call that
+//!   constructs it, whether the statement writes it as a typed literal
+//!   ([`respell_typed_literals`]) or as a cast; the implementations behind
+//!   those calls live in [`super::warehouse_types`];
 //! * a statement about the database's own CATALOGUE of schemas, which the engine
 //!   has no notion of, is applied to that catalogue instead
 //!   ([`Translated::CreateSchema`], [`Translated::DropSchema`]), and one about the
@@ -48,14 +53,15 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CastKind, Expr, Ident, ObjectName, ObjectNamePart, ObjectType, SchemaName, Statement, Visit,
-    VisitMut, Visitor, VisitorMut,
+    CastKind, DataType, Expr, Ident, ObjectName, ObjectNamePart, ObjectType, SchemaName,
+    SelectItem, SetExpr, Statement, Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::RedshiftSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
 use super::warehouse_statements::{self, WarehouseStatement};
+use super::warehouse_types;
 use super::{LockMode, LockRequest, TempRelations, TEMP_QUALIFIER};
 
 /// The schemas one database holds, by name. Ordered, so a catalogue read of it
@@ -173,6 +179,12 @@ pub fn translate(sql: &str, schemas: &SchemaSet, temp: &TempRelations<'_>) -> Tr
     // it declares is created.
     let stripped = warehouse_statements::without_storage_attributes(sql);
     let sql: &str = stripped.as_deref().unwrap_or(sql);
+    // A TYPED LITERAL of a warehouse type the engine does not carry
+    // (`box '((2,3),(9,7))'`, `money '256.78'`) is re-spelled as that type's
+    // constructor next, before the statement is parsed: see
+    // [`respell_typed_literals`] for why the pair is read off the TOKENS.
+    let respelled = respell_typed_literals(sql);
+    let sql: &str = respelled.as_deref().unwrap_or(sql);
     // Two statements of this dialect the PARSER does not model are read from the
     // token stream, because there is no parsed form of them to read; every other
     // statement below is read from the parsed statement itself, so the grammar is
@@ -198,10 +210,14 @@ pub fn translate(sql: &str, schemas: &SchemaSet, temp: &TempRelations<'_>) -> Tr
     // walk below does not read the name it creates as a reference to a relation
     // the connection already holds.
     let created = create_temp_relation(statement, temp);
+    // A projected value of a warehouse type is named after that type, which is
+    // the name the warehouse answers such a column under; it is read off the
+    // projection BEFORE the walk below re-spells it as the type's constructor.
+    let named = name_warehouse_type_columns(statement);
     let mut rewriter = Rewriter {
         schemas,
         temp: *temp,
-        changed: created.is_some(),
+        changed: created.is_some() || named,
     };
     let _walked = statement.visit(&mut rewriter);
     // A statement is re-rendered only when a rewrite CHANGED it: the parser's
@@ -249,6 +265,143 @@ fn create_temp_relation(statement: &mut Statement, temp: &TempRelations<'_>) -> 
         temp.engine_name(&relation),
     ))];
     Some(relation)
+}
+
+/// Re-spell every TYPED LITERAL of a warehouse type the engine does not carry
+/// as that type's constructor call: `money '256.78'` is the amount
+/// `money('256.78')` denotes, and `box '((2,3),(9,7))'` the rectangle
+/// `box('((2,3),(9,7))')` denotes.
+///
+/// Read off the dialect's own TOKEN stream, and for two reasons. A type name
+/// followed by a string literal is also how a column is given a quoted alias,
+/// and this dialect reserves no keyword that tells the two apart — so the
+/// grammar leaves the pair ambiguous, and the warehouse resolves it the way
+/// this does: a name that IS one of its types makes the pair a value of that
+/// type. Reading TOKENS rather than text is what keeps a type name inside a
+/// string literal, a comment or a quoted identifier part of that literal,
+/// comment or identifier; a name that is the last part of a qualified column
+/// (`t.money 'label'`) is a column of that table and is left alone.
+///
+/// `None` when the statement carries no such pair, which is when nothing is
+/// re-spelled — a statement no rewrite applies to is run exactly as submitted.
+fn respell_typed_literals(sql: &str) -> Option<String> {
+    let dialect = RedshiftSqlDialect {};
+    let tokens = Tokenizer::new(&dialect, sql).tokenize().ok()?;
+    let mut respelled = String::with_capacity(sql.len());
+    let mut changed = false;
+    let mut qualified = false;
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let names_type = match token {
+            Token::Word(word) => {
+                word.quote_style.is_none()
+                    && warehouse_types::type_named(&word.value).is_some()
+            }
+            _ => false,
+        };
+        if names_type && !qualified {
+            if let Some(next) = next_significant(&tokens, index + 1) {
+                if let Token::SingleQuotedString(_) = tokens[next] {
+                    respelled.push_str(&format!("{token}({})", tokens[next]));
+                    changed = true;
+                    index = next + 1;
+                    continue;
+                }
+            }
+        }
+        respelled.push_str(&token.to_string());
+        if !matches!(token, Token::Whitespace(_)) {
+            qualified = matches!(token, Token::Period);
+        }
+        index += 1;
+    }
+    changed.then_some(respelled)
+}
+
+/// The index of the first token at or after `from` that is not whitespace, or
+/// `None` when the statement ends in whitespace from there on.
+fn next_significant(tokens: &[Token], from: usize) -> Option<usize> {
+    (from..tokens.len()).find(|index| !matches!(tokens[*index], Token::Whitespace(_)))
+}
+
+/// Name one projection after the WAREHOUSE TYPE it produces a value of, when
+/// that projection names no column of its own, and report whether any did.
+///
+/// A value of one of these types is projected as `point(3, 4)`,
+/// `box '((2,3),(9,7))'` or `'256.78'::money`, and the warehouse answers the
+/// column under the TYPE's own name; the engine would name it after the
+/// expression's text instead, which names the statement rather than the column.
+/// A projection that already carries an alias keeps it: the caller named that
+/// column.
+fn name_warehouse_type_columns(statement: &mut Statement) -> bool {
+    let Statement::Query(query) = statement else {
+        return false;
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return false;
+    };
+    let mut named = false;
+    for item in &mut select.projection {
+        let SelectItem::UnnamedExpr(expr) = item else {
+            continue;
+        };
+        let Some(type_name) = projected_warehouse_type(expr) else {
+            continue;
+        };
+        *item = SelectItem::ExprWithAlias {
+            expr: expr.clone(),
+            alias: Ident::new(type_name),
+        };
+        named = true;
+    }
+    named
+}
+
+/// The warehouse type an expression produces a value of: a typed literal of
+/// that type, a cast to it, or a call to one of its constructors. `None` for
+/// every other expression.
+fn projected_warehouse_type(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        Expr::Cast { data_type, .. } => warehouse_type(data_type),
+        Expr::Function(function) => warehouse_types::type_named(&function.name.to_string()),
+        Expr::Nested(inner) => projected_warehouse_type(inner),
+        _ => None,
+    }
+}
+
+/// The warehouse type a data type names, when it is one the engine does not
+/// carry and this emulator implements ([`warehouse_types`]).
+fn warehouse_type(data_type: &DataType) -> Option<&'static str> {
+    warehouse_types::type_named(data_type.to_string().trim())
+}
+
+/// `<type>(<argument>)`: the call that constructs a value of a warehouse type,
+/// which is what a typed literal of that type and a cast to it are read as.
+///
+/// Built by READING the call with the same parser this module reads the
+/// statement with, so the rewritten statement is a statement the parser
+/// produced and nothing here assembles a syntax tree by hand.
+fn constructor(type_name: &str, argument: &str) -> Option<Expr> {
+    Parser::new(&RedshiftSqlDialect {})
+        .try_with_sql(&format!("{type_name}({argument})"))
+        .ok()?
+        .parse_expr()
+        .ok()
+}
+
+/// The constructor call that produces the value a typed literal or a cast of a
+/// warehouse type denotes, or `None` for every other expression — including a
+/// cast to a type the engine itself carries, which stays the engine's cast.
+fn constructed_warehouse_value(expr: &Expr) -> Option<Expr> {
+    match expr {
+        Expr::Cast {
+            data_type,
+            expr: inner,
+            ..
+        } => constructor(warehouse_type(data_type)?, &inner.to_string()),
+        _ => None,
+    }
 }
 
 /// Whether a text is one this module READS at all.
@@ -379,6 +532,18 @@ impl VisitorMut for Rewriter<'_> {
     }
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        // A value of a warehouse type the engine does not carry — a geometric
+        // type or the currency type — is constructed by the implementation
+        // registered for that type ([`warehouse_types`]), so a cast to one of
+        // those types is that constructor rather than the engine's cast. Read
+        // FIRST, for that reason. (A TYPED LITERAL of one of them was already
+        // re-spelled as the same call, before this statement was parsed: see
+        // [`respell_typed_literals`].)
+        if let Some(rewritten) = constructed_warehouse_value(expr) {
+            *expr = rewritten;
+            self.changed = true;
+            return ControlFlow::Continue(());
+        }
         match expr {
             // `<expr>::<type>` is the same cast the standard spells
             // `CAST(<expr> AS <type>)`, which is what the engine reads.
