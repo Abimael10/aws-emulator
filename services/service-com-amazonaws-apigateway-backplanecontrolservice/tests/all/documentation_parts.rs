@@ -696,10 +696,7 @@ async fn an_import_writes_one_part_per_entity_and_the_mode_decides_what_survives
             "case {case}: the first import expected 200, got {} with {:?}",
             answer.status, answer.body
         );
-        let created = answer.body["ids"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case}: expected an ids array, got {:?}", answer.body))
-            .clone();
+        let created = imported_ids(&answer, case);
         assert_eq!(
             created.len(),
             first.len(),
@@ -735,9 +732,6 @@ async fn an_import_writes_one_part_per_entity_and_the_mode_decides_what_survives
 
         // Each imported id reads back through `GetDocumentationPart`.
         for id in &created {
-            let id = id
-                .as_str()
-                .unwrap_or_else(|| panic!("case {case}: expected a string id, got {id:?}"));
             let read = get_part(&gateway, &api, id).await;
             assert_eq!(
                 read.status, 200,
@@ -794,10 +788,7 @@ async fn an_import_writes_one_part_per_entity_and_the_mode_decides_what_survives
         // An entry lands on the part that already documents its entity, so that part keeps
         // its identifier whichever mode the import ran in: a client holding the id still
         // reads the entity's documentation, now carrying the re-imported content map.
-        let first_method_id = created[1]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {case}: expected a string id, got {:?}", created[1]))
-            .to_string();
+        let first_method_id = created[1].clone();
         let read = get_part(&gateway, &api, &first_method_id).await;
         assert_eq!(
             read.status, 200,
@@ -812,10 +803,7 @@ async fn an_import_writes_one_part_per_entity_and_the_mode_decides_what_survives
         );
         // The part whose entity the second body does NOT document: `overwrite` drops it,
         // so its id names nothing; `merge` keeps it, under its own id.
-        let query_parameter_id = created[2]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {case}: expected a string id, got {:?}", created[2]))
-            .to_string();
+        let query_parameter_id = created[2].clone();
         let read = get_part(&gateway, &api, &query_parameter_id).await;
         if *overwrites {
             assert_failure(&read, 404, NOT_FOUND, case);
@@ -824,6 +812,256 @@ async fn an_import_writes_one_part_per_entity_and_the_mode_decides_what_survives
                 read.status, 200,
                 "case {case}: expected the part the body left alone to be kept, got {} with {:?}",
                 read.status, read.body
+            );
+        }
+    }
+}
+
+/// The `ids` an accepted import answered with, asserting the modelled 200.
+fn imported_ids(answer: &Answer, case: &str) -> Vec<String> {
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body["ids"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: expected an ids array, got {:?}", answer.body))
+        .iter()
+        .map(|id| {
+            id.as_str()
+                .unwrap_or_else(|| panic!("case {case}: expected a string id, got {id:?}"))
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn every_entity_type_a_part_documents_is_kept_in_the_one_collection_and_filtered_from_it() {
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "documentation-location-types").await;
+
+    // One part per entity type a documentation part can target — the whole
+    // `DocumentationPartType` catalog ([`LOCATION_FIELDS`]), each at a location that sets
+    // every member its type makes valid — so the rule is asserted over the entity types
+    // the catalog names rather than over the one a report cites.
+    let mut created: Vec<(&str, String, Value)> = Vec::new();
+    for (entity_type, valid) in LOCATION_FIELDS {
+        let case = format!("type={entity_type}");
+        let location = explicit_location(entity_type, valid);
+        let id =
+            created_part_id(&gateway, &api, location.clone(), &content_map(&case), &case).await;
+        created.push((entity_type, id, location));
+    }
+
+    // RETAINED: the API's one documentation set holds every part that was created, each
+    // under the location it was created at and with the content map it carries — a part
+    // documenting a method beside the ones documenting the API, a resource, a model and a
+    // response.
+    let listed = listed_entities(&gateway, &api, "the whole collection").await;
+    assert_eq!(
+        listed.len(),
+        created.len(),
+        "case the whole collection: expected {} parts, got {listed:?}",
+        created.len()
+    );
+    for (entity_type, _, location) in &created {
+        let case = format!("type={entity_type}");
+        let expected = (location.clone(), json!({ "description": case }));
+        assert!(
+            listed.contains(&expected),
+            "case {case}: expected the collection to hold {expected:?}, got {listed:?}"
+        );
+    }
+
+    // SELECTED: a listing narrowed to one entity type reports the part at that type and
+    // excludes the parts of every other type the API documents.
+    for (entity_type, id, _) in &created {
+        let case = format!("filter type={entity_type}");
+        let selected = listed_ids(&gateway, &api, &format!("type={entity_type}"), &case).await;
+        assert_eq!(
+            selected,
+            vec![id.clone()],
+            "case {case}: expected only the part at that type, got {selected:?}"
+        );
+    }
+
+    // And a filter on another location member selects by what the STORED location carries,
+    // whatever entity type names it: every part whose type makes the member valid carries
+    // the value these cases set ([`EXPLICIT_MEMBERS`]), and no other part does. Compared as
+    // sets, because the collection's own order is `collection_page_envelope`'s subject.
+    for member in ["path", "name"] {
+        let value = EXPLICIT_MEMBERS
+            .iter()
+            .find(|(declared, _)| *declared == member)
+            .map(|(_, value)| *value)
+            .unwrap_or_else(|| panic!("no explicit value for location.{member}"));
+        let case = format!("filter {member}={value}");
+        let query = match member {
+            // `nameQuery` is bound to the `name` query parameter, `path` to `path`.
+            "name" => format!("name={value}"),
+            other => format!("{other}={value}"),
+        };
+        let mut selected = listed_ids(&gateway, &api, &query, &case).await;
+        selected.sort();
+        let mut expected: Vec<String> = created
+            .iter()
+            .filter(|(_, _, location)| location.get(member) == Some(&json!(value)))
+            .map(|(_, id, _)| id.clone())
+            .collect();
+        expected.sort();
+        assert!(
+            !expected.is_empty(),
+            "case {case}: the collection documents no entity at that member"
+        );
+        assert_eq!(
+            selected, expected,
+            "case {case}: expected {expected:?}, got {selected:?}"
+        );
+    }
+
+    // A read leaves the collection as it was: the unfiltered listing still holds every
+    // part the filtered reads selected from.
+    let again = listed_entities(&gateway, &api, "the whole collection, read again").await;
+    assert_eq!(
+        again, listed,
+        "case the whole collection, read again: expected {listed:?}, got {again:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_merge_import_lands_on_the_part_a_create_made_for_that_entity() {
+    // Each row is the entity a create documents FIRST and an import then re-documents,
+    // beside an entity nothing documents yet — the dimension the identity rule generalises
+    // over is the location form: no member at all, a path, a path and a verb, a status
+    // code, a name.
+    let rows: &[(&str, Value, Value)] = &[
+        (
+            "the api itself",
+            json!({ "type": "API" }),
+            json!({ "type": "MODEL", "name": "Pet" }),
+        ),
+        (
+            "a resource",
+            json!({ "type": "RESOURCE", "path": "/pets" }),
+            json!({ "type": "RESOURCE", "path": "/owners" }),
+        ),
+        (
+            "a method",
+            json!({ "type": "METHOD", "path": "/pets", "method": "GET" }),
+            json!({ "type": "METHOD", "path": "/pets", "method": "POST" }),
+        ),
+        (
+            "a response",
+            json!({ "type": "RESPONSE", "path": "/pets", "method": "GET", "statusCode": "200" }),
+            json!({ "type": "RESPONSE", "path": "/pets", "method": "GET", "statusCode": "404" }),
+        ),
+        (
+            "a named entity",
+            json!({ "type": "MODEL", "name": "Pet" }),
+            json!({ "type": "AUTHORIZER", "name": "petAuth" }),
+        ),
+    ];
+    // And each row runs in every mode that KEEPS what the body does not document: the
+    // documented default and `merge` spelled out.
+    for (entity, documented, undocumented) in rows {
+        for mode in [None, Some("merge")] {
+            let case = format!("{entity} re-documented with mode {mode:?}");
+            let gateway = Gateway::new();
+            let (api, _root) = create_api(&gateway, "documentation-merge-identity").await;
+
+            // The part that already documents the entity, created through
+            // `CreateDocumentationPart`.
+            let created = created_part_id(
+                &gateway,
+                &api,
+                documented.clone(),
+                &content_map("created"),
+                &case,
+            )
+            .await;
+
+            // An import documenting that same entity LANDS ON that part: it reports the
+            // part's own identifier and the API still documents the entity once.
+            let answer = import_parts(
+                &gateway,
+                &api,
+                mode,
+                false,
+                &import_body(&[(documented.clone(), json!({ "description": "imported" }))]),
+            )
+            .await;
+            let reported = imported_ids(&answer, &case);
+            assert_eq!(
+                reported,
+                vec![created.clone()],
+                "case {case}: expected the import to report the part that already documents \
+                 the entity, got {reported:?}"
+            );
+            let stored = listed_entities(&gateway, &api, &case).await;
+            assert_eq!(
+                stored,
+                vec![(documented.clone(), json!({ "description": "imported" }))],
+                "case {case}: expected one part for the entity, got {stored:?}"
+            );
+            // Read back through the implemented reader under the id the create minted: the
+            // content map is the re-imported one, written as the service writes a map an
+            // entry declared as an object.
+            let read = get_part(&gateway, &api, &created).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case}: expected the part to keep its id, got {} with {:?}",
+                read.status, read.body
+            );
+            assert_eq!(
+                read.body["properties"].as_str(),
+                Some(imported_content_map("imported").as_str()),
+                "case {case}: expected the re-imported content map, got {:?}",
+                read.body["properties"]
+            );
+
+            // An entry for an entity the API does NOT document yet is a part of its own:
+            // a different identifier, one more part, and the first part untouched.
+            let answer = import_parts(
+                &gateway,
+                &api,
+                mode,
+                false,
+                &import_body(&[(undocumented.clone(), json!({ "description": "another" }))]),
+            )
+            .await;
+            let minted = imported_ids(&answer, &case);
+            assert_eq!(
+                minted.len(),
+                1,
+                "case {case}: expected one identifier for the one entity documented, got \
+                 {minted:?}"
+            );
+            assert_ne!(
+                minted[0], created,
+                "case {case}: expected a part of its own for an entity nothing documented, \
+                 got {minted:?}"
+            );
+            let read = get_part(&gateway, &api, &minted[0]).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case}: expected the new part to read back, got {} with {:?}",
+                read.status, read.body
+            );
+            assert_eq!(
+                read.body["location"], *undocumented,
+                "case {case}: expected the new part at {undocumented:?}, got {:?}",
+                read.body["location"]
+            );
+            let stored = listed_entities(&gateway, &api, &case).await;
+            assert_eq!(
+                stored.len(),
+                2,
+                "case {case}: expected the API to document both entities, got {stored:?}"
+            );
+            assert!(
+                stored.contains(&(documented.clone(), json!({ "description": "imported" }))),
+                "case {case}: expected the first part kept, got {stored:?}"
             );
         }
     }
