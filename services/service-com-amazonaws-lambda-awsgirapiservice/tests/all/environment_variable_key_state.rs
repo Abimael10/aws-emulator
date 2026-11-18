@@ -38,7 +38,7 @@ use crate::function_lifecycle::{
 use crate::synchronous_invoke_run::package;
 
 /// Where `CreateFunction`, `ListFunctions` and `Invoke` are bound.
-const FUNCTIONS_URI: &str = "/2015-03-31/functions";
+pub(crate) const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// The handler of every package here: it answers the value of the environment variable the
 /// function was created with, so a served invocation can only have decrypted it.
@@ -46,7 +46,7 @@ const HANDLER_SOURCE: &str =
     "import os\ndef lambda_handler(event, context):\n    return {'secret': os.environ['SECRET']}\n";
 
 /// The environment variable the handler reads, and the value it was given.
-const VARIABLE: &str = "SECRET";
+pub(crate) const VARIABLE: &str = "SECRET";
 const MARKER: &str = "env-marker-1";
 
 /// A well-formed key ARN of a key the key service holds no record of, satisfying the model's
@@ -58,7 +58,7 @@ const ABSENT_KEY: &str = "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3
 /// (`smithy_query(query="operation", operation="Invoke")`: `KMSDisabledException`,
 /// `KMSInvalidStateException`, `KMSNotFoundException`, `KMSAccessDeniedException`, each
 /// `@httpError(502)`).
-const INVOKE_DISABLED_SENTENCE: &str =
+pub(crate) const INVOKE_DISABLED_SENTENCE: &str =
     "Lambda was unable to decrypt the environment variables because the KMS key used is \
      disabled. Please check the function's KMS key settings.";
 const INVOKE_INVALID_STATE_SENTENCE: &str =
@@ -83,12 +83,12 @@ const REPORT_NOT_FOUND_SENTENCE: &str =
 /// The envelope the SDK layer that relayed the decrypt states around the key service's
 /// answer: the service it was made to, the status that service answers a refusal of the
 /// caller's own request with, that call's own request id and the attempts it took.
-const RELAY_HEAD: &str = " (Service: Kms, Status Code: 400, Request ID: ";
-const RELAY_TAIL: &str = ") (SDK Attempt Count: 1)";
+pub(crate) const RELAY_HEAD: &str = " (Service: Kms, Status Code: 400, Request ID: ";
+pub(crate) const RELAY_TAIL: &str = ") (SDK Attempt Count: 1)";
 
 /// A router carrying Lambda and the key service on ONE engine, so the key a function names is
 /// a key this account really holds.
-fn router_with_kms(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn router_with_kms(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = router_on(engine);
     router.register_service(
         service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(engine)),
@@ -97,7 +97,7 @@ fn router_with_kms(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 }
 
 /// A symmetric encryption key this account holds, answered by its ARN.
-async fn created_key(router: &MultiServiceRouter) -> String {
+pub(crate) async fn created_key(router: &MultiServiceRouter) -> String {
     let created = kms_call(router, "CreateKey", &json!({})).await;
     assert_eq!(
         created.status,
@@ -236,7 +236,7 @@ async fn invoke(router: &MultiServiceRouter, name: &str) -> Answer {
 }
 
 /// The `Message` an answer carries, whichever casing the channel that rendered it used.
-fn message_of(answer: &Answer) -> String {
+pub(crate) fn message_of(answer: &Answer) -> String {
     answer
         .string("Message")
         .or_else(|| answer.string("message"))
