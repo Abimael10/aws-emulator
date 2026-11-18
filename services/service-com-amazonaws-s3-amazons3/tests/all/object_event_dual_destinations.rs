@@ -27,7 +27,11 @@
 //! * `PutBucketNotificationConfiguration` REPLACES the whole document, so a put that omits
 //!   `EventBridgeConfiguration` makes `GetBucketNotificationConfiguration` stop reporting it
 //!   and stops the envelopes, while the destination configurations the replacement carries
-//!   keep being delivered under their own `Id`s.
+//!   keep being delivered under their own `Id`s;
+//! * and the encoding a record's key carries is REVERSIBLE: decoding the published key the
+//!   way a form value is decoded (`+` back to a space, then the percent escapes back to
+//!   their UTF-8 bytes) answers the very key S3 stored, so a consumer that decodes it reads
+//!   the object back with it.
 //!
 //! Every assertion drives real HTTP requests through a router carrying S3 beside the two
 //! services a notification travels through ([`super::object_event_notifications::Emulator`]),
@@ -41,6 +45,9 @@
 use serde_json::{json, Value};
 
 use super::object_event_notifications::{request_key, queue_arn, Answer, Emulator, REGION, XMLNS};
+// The plus-aware unquoting a consumer applies to a published key, which the listing-encoding
+// suite already owns: one decoder, not a second copy of it.
+use super::object_listing_encoding::decoded;
 use super::post_object_form_upload::{form_document, form_media_type};
 
 /// The `Id` the dual-destination configuration carries, and the one the replacement that
@@ -852,5 +859,140 @@ async fn a_signed_form_policy_is_admitted_only_under_its_own_signature() {
                 "case {case:?}: a refused upload must publish nothing, got {nothing:?}"
             );
         }
+    }
+}
+
+/// RULE: a native record's `s3.object.key` is the stored key URL ENCODED — a space as `+`
+/// and every other character outside the alphanumerics and `-`, `_`, `.` percent-escaped
+/// from its UTF-8 bytes, the key's own `/` left alone — and that encoding is reversible, so
+/// decoding it as a form value answers the stored key and a read addressed by that decoded
+/// key serves the object the record was published for.
+///
+/// The rows differ along the characters the encoding has to escape: the reserved characters
+/// a query string is built of, the `~` RFC 3986 leaves unreserved but URL encoding does not,
+/// a percent sign, multi-byte characters inside and outside the Basic Multilingual Plane,
+/// several of them at once in one key, and a key made only of the characters the encoding
+/// leaves alone.
+#[tokio::test]
+async fn a_published_record_key_is_the_reversible_encoding_of_the_stored_key() {
+    // (case, the key stored, the key the native record publishes)
+    let rows: &[(&str, &str, &str)] = &[
+        (
+            "a key carrying reserved characters, a multi-byte character and a tilde",
+            "dual path/report 2026+q3=é~.txt",
+            "dual+path/report+2026%2Bq3%3D%C3%A9%7E.txt",
+        ),
+        ("a key of tildes", "~backup~", "%7Ebackup%7E"),
+        (
+            "a tilde beside the characters a query string separates with",
+            "a~b&c?d",
+            "a%7Eb%26c%3Fd",
+        ),
+        ("a key carrying a percent sign", "100% done.txt", "100%25+done.txt"),
+        (
+            "a key of several multi-byte characters",
+            "rapport café ñ.txt",
+            "rapport+caf%C3%A9+%C3%B1.txt",
+        ),
+        (
+            "a key carrying a character outside the Basic Multilingual Plane",
+            "note 🙂.txt",
+            "note+%F0%9F%99%82.txt",
+        ),
+        (
+            "a key of only the characters the encoding leaves alone",
+            "logs/2026-q3_report.v2",
+            "logs/2026-q3_report.v2",
+        ),
+    ];
+
+    let emulator = Emulator::new();
+    let bucket = "record-key-encoding";
+    emulator.create_bucket(bucket).await;
+    let native_url = emulator.create_queue("record-key-encoding-queue").await;
+    let configured = emulator
+        .s3_xml(
+            "PUT",
+            &format!("/{bucket}?notification"),
+            &notification_document(
+                NATIVE_ONLY_ID,
+                &queue_arn("record-key-encoding-queue"),
+                false,
+            ),
+        )
+        .await;
+    assert_eq!(
+        configured.status,
+        200,
+        "configuring the queue destination must succeed, got {} with {}",
+        configured.status,
+        configured.text()
+    );
+
+    for (case, key, published) in rows {
+        put_object(&emulator, case, bucket, key).await;
+
+        // The wait is for a record ABOUT this write to arrive — NOT for one spelling its key
+        // a particular way — so a key published wrongly fails the assertion below with the
+        // spelling it really carried instead of burning the deadline. The previous row took
+        // its own record off the queue before this one wrote, so the one record this write
+        // publishes is the one that arrives here.
+        let arrived =
+            collect_until(&emulator, &native_url, |collected| !records(collected).is_empty()).await;
+        let delivered = records(&arrived);
+        assert_eq!(
+            delivered.len(),
+            1,
+            "case {case:?}: exactly one record must report the write of {key:?}, got {arrived:?}"
+        );
+        let record = delivered[0];
+        assert_eq!(
+            at(record, "/Records/0/s3/configurationId"),
+            json!(NATIVE_ONLY_ID),
+            "case {case:?}: expected the record to name the configuration that delivered it, \
+             got {record}"
+        );
+        let reported = at(record, "/Records/0/s3/object/key");
+        assert_eq!(
+            reported,
+            json!(published),
+            "case {case:?}: expected the record to publish the key as {published:?}, got \
+             {reported}"
+        );
+
+        // The encoding is reversible: decoding what the emulator REPORTED — not the row's
+        // own literal — answers the key S3 stored …
+        let decoded_key = decoded(reported.as_str().unwrap_or_else(|| {
+            panic!("case {case:?}: a record's key must be a string, got {reported}")
+        }));
+        assert_eq!(
+            decoded_key, *key,
+            "case {case:?}: expected decoding {reported} to answer the stored key {key:?}, \
+             got {decoded_key:?}"
+        );
+        // … and a read addressed by that decoded key serves the object the record reported.
+        let served = emulator
+            .send(
+                "s3",
+                "GET",
+                &format!("/{bucket}/{}", request_key(&decoded_key)),
+                &[],
+                Vec::new(),
+            )
+            .await;
+        assert_eq!(
+            served.status,
+            200,
+            "case {case:?}: reading the decoded key {decoded_key:?} must serve the object, got \
+             {} with {}",
+            served.status,
+            served.text()
+        );
+        assert_eq!(
+            served.bytes(),
+            BODY,
+            "case {case:?}: expected the decoded key to serve the written bytes, got {:?}",
+            served.text()
+        );
     }
 }
