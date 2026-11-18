@@ -37,6 +37,9 @@
 
 pub mod stacks;
 
+/// `AWS::ApiGatewayV2::Api`, the other type an owning service's own API answers for.
+pub mod apis;
+
 use ::std::time::SystemTime;
 
 use ::serde_json::Value;
@@ -124,11 +127,115 @@ pub fn backs(type_name: &str) -> bool {
     identifier_property(type_name).is_some()
 }
 
+// ---------------------------------------------------------------------------
+// What every provider of this module reads out of a resource model, and out of an answer
+// the owning service refused. One copy, because the shape of a model's value and of a
+// refused call is the REGISTRY's rather than any one type's.
+// ---------------------------------------------------------------------------
+
+/// How many pages of an owning service's own read ONE listing of this service walks.
+///
+/// That read is bounded per page and the resources of an account are bounded by the owning
+/// service's own quota, so this is the ceiling on the work one listing can drive — well
+/// above the pages that quota can fill, and a number rather than "until they run out".
+pub(super) const MAX_OWNING_PAGES: usize = 64;
+
+/// The property every type's schema carries its tag set under, as a list of
+/// `{ Key, Value }` pairs, and the two members of one of its entries.
+pub(super) const TAGS: &str = "Tags";
+pub(super) const TAG_KEY: &str = "Key";
+pub(super) const TAG_VALUE: &str = "Value";
+
+/// The text `value` carries, or why it is not the text `property` takes.
+pub(super) fn text(property: &str, value: &Value) -> Result<String, Refusal> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| Refusal::invalid(format!("{property} must be a string")))
+}
+
+/// The count `value` carries, or why it is not the number `property` takes.
+pub(super) fn count(property: &str, value: &Value) -> Result<i32, Refusal> {
+    value
+        .as_i64()
+        .and_then(|count| i32::try_from(count).ok())
+        .ok_or_else(|| Refusal::invalid(format!("{property} must be a number")))
+}
+
+/// The flag `value` carries, or why it is not the boolean `property` takes.
+pub(super) fn flag(property: &str, value: &Value) -> Result<bool, Refusal> {
+    value
+        .as_bool()
+        .ok_or_else(|| Refusal::invalid(format!("{property} must be a boolean")))
+}
+
+/// The strings `value` carries, or why it is not the list of strings `property` takes.
+pub(super) fn text_list(property: &str, value: &Value) -> Result<Vec<String>, Refusal> {
+    let Some(entries) = value.as_array() else {
+        return Err(Refusal::invalid(format!(
+            "{property} must be a list of strings"
+        )));
+    };
+    entries.iter().map(|entry| text(property, entry)).collect()
+}
+
+/// The tag entries `value` carries, in the order the list carried them — or why it is not a
+/// tag set at all.
+pub(super) fn tag_entries(value: &Value) -> Result<Vec<(String, String)>, Refusal> {
+    let Some(entries) = value.as_array() else {
+        return Err(Refusal::invalid(format!(
+            "{TAGS} must be a list of {{ {TAG_KEY}, {TAG_VALUE} }} pairs"
+        )));
+    };
+    let mut tags = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let key = entry.get(TAG_KEY).and_then(Value::as_str);
+        let tag_value = entry.get(TAG_VALUE).and_then(Value::as_str);
+        let (Some(key), Some(tag_value)) = (key, tag_value) else {
+            return Err(Refusal::invalid(format!(
+                "every {TAGS} entry must carry {TAG_KEY} and {TAG_VALUE}"
+            )));
+        };
+        tags.push((key.to_string(), tag_value.to_string()));
+    }
+    Ok(tags)
+}
+
+/// What an owning service's refused call SAID: `(the error code it named, the message it
+/// worded)`, with the client's own rendering of the error standing in for a message it did
+/// not word.
+///
+/// The one reader of a refused call's answer, because which `HandlerErrorCode` a code maps
+/// to is the TYPE's business while reading the code and the message is not.
+pub(super) fn answered_error<E>(
+    error: ::aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> (String, String)
+where
+    ::aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >: ::aws_smithy_types::error::metadata::ProvideErrorMetadata + ::std::fmt::Display,
+{
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+    let code = error.code().unwrap_or_default().to_string();
+    let detail = error
+        .message()
+        .map_or_else(|| error.to_string(), ToString::to_string);
+    (code, detail)
+}
+
 /// The property a resource of such a type carries its primary identifier in — the one the
 /// type's schema points `primaryIdentifier` at — or `None` for every other type, whose
 /// resources live in a store this emulator holds.
 pub fn identifier_property(type_name: &str) -> Option<&'static str> {
-    (type_name == stacks::TYPE_NAME).then_some(stacks::IDENTIFIER_PROPERTY)
+    match type_name {
+        stacks::TYPE_NAME => Some(stacks::IDENTIFIER_PROPERTY),
+        apis::TYPE_NAME => Some(apis::IDENTIFIER_PROPERTY),
+        _ => None,
+    }
 }
 
 /// Where the owning service's own lifecycle for one resource has got to.
@@ -168,14 +275,15 @@ impl Resolution {
         type_name: &str,
         identifier: &str,
     ) -> Self {
-        if type_name != stacks::TYPE_NAME {
+        let read = match type_name {
+            stacks::TYPE_NAME => stacks::read(ctx, region, identifier).await,
+            apis::TYPE_NAME => apis::read(ctx, region, identifier).await,
+            _ => return Self::Stored,
+        };
+        let Some(identifier_property) = identifier_property(type_name) else {
             return Self::Stored;
-        }
-        Self::Owned(
-            stacks::read(ctx, region, identifier)
-                .await
-                .map(|properties| resolved(type_name, stacks::IDENTIFIER_PROPERTY, properties)),
-        )
+        };
+        Self::Owned(read.map(|properties| resolved(type_name, identifier_property, properties)))
     }
 }
 
@@ -189,16 +297,16 @@ pub async fn page(
     after: Option<&str>,
     limit: usize,
 ) -> Option<Vec<ResolvedResource>> {
-    if type_name != stacks::TYPE_NAME {
-        return None;
-    }
+    let listed = match type_name {
+        stacks::TYPE_NAME => stacks::list(ctx, region, after, limit).await,
+        apis::TYPE_NAME => apis::list(ctx, region, after, limit).await,
+        _ => return None,
+    };
+    let identifier_property = identifier_property(type_name)?;
     Some(
-        stacks::list(ctx, region, after, limit)
-            .await
+        listed
             .into_iter()
-            .map(|(_, properties)| {
-                resolved(type_name, stacks::IDENTIFIER_PROPERTY, properties)
-            })
+            .map(|(_, properties)| resolved(type_name, identifier_property, properties))
             .collect(),
     )
 }
@@ -443,7 +551,18 @@ pub async fn settle<Eng: Send + Sync + 'static>(
     for work in owed {
         let identifier = work.identifier.clone().unwrap_or_default();
         if work.started {
-            match stacks::progress(ctx, &work.region, &identifier, &work.operation).await {
+            let progress = match work.type_name.as_str() {
+                apis::TYPE_NAME => {
+                    apis::progress(ctx, &work.region, &identifier, &work.operation).await
+                }
+                stacks::TYPE_NAME => {
+                    stacks::progress(ctx, &work.region, &identifier, &work.operation).await
+                }
+                // No owning API answers for this type, so there is no lifecycle to follow:
+                // the request fails rather than being read against another type's service.
+                other => Progress::Failed(unanswered(other)),
+            };
+            match progress {
                 // Still running: the request keeps owing the lifecycle it is following, so
                 // the next call reads it again.
                 Progress::Running => state
@@ -458,14 +577,17 @@ pub async fn settle<Eng: Send + Sync + 'static>(
             }
             continue;
         }
-        // The one type an owning API answers for, which is the only type
-        // `claim_work_owed_to_owning_services` admits ([`backs`]): a second one dispatches
-        // here on `work.type_name`.
-        let started = match work.operation.as_str() {
-            crate::state::OPERATION_DELETE => stacks::delete(ctx, &work.region, &identifier)
-                .await
-                .map(|()| identifier.clone()),
-            crate::state::OPERATION_UPDATE => stacks::update(
+        // WHICH owning service is called is the TYPE's own business, named explicitly here
+        // so a type added to [`identifier_property`] and not to this dispatch is refused
+        // rather than quietly asked of another type's service; WHAT is asked of it is the
+        // operation the request owes.
+        let started = match (work.type_name.as_str(), work.operation.as_str()) {
+            (apis::TYPE_NAME, crate::state::OPERATION_DELETE) => {
+                apis::delete(ctx, &work.region, &identifier)
+                    .await
+                    .map(|()| identifier.clone())
+            }
+            (apis::TYPE_NAME, crate::state::OPERATION_UPDATE) => apis::update(
                 ctx,
                 &work.region,
                 &identifier,
@@ -473,7 +595,28 @@ pub async fn settle<Eng: Send + Sync + 'static>(
             )
             .await
             .map(|()| identifier.clone()),
-            _ => {
+            (apis::TYPE_NAME, _) => {
+                apis::create(
+                    ctx,
+                    &work.region,
+                    &work.properties.clone().unwrap_or_default(),
+                )
+                .await
+            }
+            (stacks::TYPE_NAME, crate::state::OPERATION_DELETE) => {
+                stacks::delete(ctx, &work.region, &identifier)
+                    .await
+                    .map(|()| identifier.clone())
+            }
+            (stacks::TYPE_NAME, crate::state::OPERATION_UPDATE) => stacks::update(
+                ctx,
+                &work.region,
+                &identifier,
+                &work.properties.clone().unwrap_or_default(),
+            )
+            .await
+            .map(|()| identifier.clone()),
+            (stacks::TYPE_NAME, _) => {
                 stacks::create(
                     ctx,
                     &work.region,
@@ -481,6 +624,7 @@ pub async fn settle<Eng: Send + Sync + 'static>(
                 )
                 .await
             }
+            (other, _) => Err(unanswered(other)),
         };
         match started {
             Ok(identifier) => state
@@ -493,20 +637,35 @@ pub async fn settle<Eng: Send + Sync + 'static>(
     }
 }
 
+/// The refusal for work owed on a type NO owning API answers for: nothing here can carry it
+/// out, so the request fails naming the type rather than having another type's service asked
+/// about it. [`backs`] admits only the types the dispatch above names, so nothing reaches
+/// this today — it is what keeps a type added to [`identifier_property`] alone from being
+/// sent to the wrong service.
+fn unanswered(type_name: &str) -> Refusal {
+    Refusal::rejected(format!(
+        "no owning service of this emulator answers for resources of type {type_name}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The one type this module stands behind is the one it answers for, and the property it
-    /// names as that type's primary identifier is the type's own.
+    /// Each type this module stands behind is one it answers for, and the property it names
+    /// as that type's primary identifier is the type's own.
     #[test]
     fn only_a_type_an_owning_api_answers_for_is_backed() {
-        assert_eq!(
-            identifier_property(stacks::TYPE_NAME),
-            Some(stacks::IDENTIFIER_PROPERTY),
-            "expected {} to be answered by its owning service's own API",
-            stacks::TYPE_NAME
-        );
+        for (type_name, expected) in [
+            (stacks::TYPE_NAME, stacks::IDENTIFIER_PROPERTY),
+            (apis::TYPE_NAME, apis::IDENTIFIER_PROPERTY),
+        ] {
+            assert_eq!(
+                identifier_property(type_name),
+                Some(expected),
+                "expected {type_name} to be answered by its owning service's own API"
+            );
+        }
         for other in ["AWS::SQS::Queue", "AWS::Logs::LogGroup", "AWS::CloudFormation::Macro"] {
             assert!(
                 !backs(other),

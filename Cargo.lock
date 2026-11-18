@@ -1116,6 +1116,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-apigatewayv2"
+version = "1.125.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3263282e938cf8f24d9de56ba740dac21a6095e363f1da9116f0d2e9bef9941d"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-autoscaling"
 version = "1.144.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11290,6 +11315,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-apigatewayv2",
  "aws-sdk-cloudformation",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",

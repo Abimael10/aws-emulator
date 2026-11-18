@@ -39,7 +39,10 @@
 
 use ::serde_json::{Map, Value};
 
-use super::{Progress, Refusal};
+use super::{
+    answered_error, count, flag, tag_entries, text, text_list, Progress, Refusal, MAX_OWNING_PAGES,
+    TAGS, TAG_KEY, TAG_VALUE,
+};
 use crate::state::native::HANDLER_ERROR_INVALID_REQUEST;
 
 /// The `TypeName` this module stands behind.
@@ -74,9 +77,6 @@ const CAPABILITIES: &str = "Capabilities";
 
 /// "The Amazon SNS topic ARNs to publish stack related events."
 const NOTIFICATION_ARNS: &str = "NotificationARNs";
-
-/// The stack's tag set, as a list of `{ Key, Value }` pairs.
-const TAGS: &str = "Tags";
 
 /// "The amount of time that can pass before the stack status becomes CREATE_FAILED."
 const TIMEOUT_IN_MINUTES: &str = "TimeoutInMinutes";
@@ -113,10 +113,6 @@ const OUTPUT_KEY: &str = "OutputKey";
 const OUTPUT_VALUE: &str = "OutputValue";
 const OUTPUT_DESCRIPTION: &str = "Description";
 const OUTPUT_EXPORT_NAME: &str = "ExportName";
-
-/// The key and the value member of one entry of [`TAGS`].
-const TAG_KEY: &str = "Key";
-const TAG_VALUE: &str = "Value";
 
 /// The suffix every status CloudFormation reports while a stack operation is still running
 /// ends with (`StackStatus`: `CREATE_IN_PROGRESS`, `UPDATE_IN_PROGRESS`,
@@ -222,13 +218,6 @@ pub async fn list(
     }
     held
 }
-
-/// How many pages of the owning service's own read one listing walks.
-///
-/// That read is bounded per page and the stacks of an account are bounded by that service's
-/// own quota, so this is the ceiling on the work ONE listing of this service can drive —
-/// well above the pages that quota can fill, and a number rather than "until they run out".
-const MAX_OWNING_PAGES: usize = 64;
 
 /// Create the stack the resource model `properties` describes, in `region`, and answer the
 /// stack id CloudFormation assigned it — the primary identifier the resource then answers
@@ -713,39 +702,6 @@ impl DesiredStack {
     }
 }
 
-/// The text `value` carries, or why it is not the text `property` takes.
-fn text(property: &str, value: &Value) -> Result<String, Refusal> {
-    value
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| Refusal::invalid(format!("{property} must be a string")))
-}
-
-/// The count `value` carries, or why it is not the number `property` takes.
-fn count(property: &str, value: &Value) -> Result<i32, Refusal> {
-    value
-        .as_i64()
-        .and_then(|count| i32::try_from(count).ok())
-        .ok_or_else(|| Refusal::invalid(format!("{property} must be a number")))
-}
-
-/// The flag `value` carries, or why it is not the boolean `property` takes.
-fn flag(property: &str, value: &Value) -> Result<bool, Refusal> {
-    value
-        .as_bool()
-        .ok_or_else(|| Refusal::invalid(format!("{property} must be a boolean")))
-}
-
-/// The strings `value` carries, or why it is not the list of strings `property` takes.
-fn text_list(property: &str, value: &Value) -> Result<Vec<String>, Refusal> {
-    let Some(entries) = value.as_array() else {
-        return Err(Refusal::invalid(format!(
-            "{property} must be a list of strings"
-        )));
-    };
-    entries.iter().map(|entry| text(property, entry)).collect()
-}
-
 /// The parameters `value` carries, or why it is not the map `property` takes.
 ///
 /// This type's schema carries the stack's parameters as a map of name to value, so that is
@@ -763,28 +719,6 @@ fn parameter_map(property: &str, value: &Value) -> Result<Vec<(String, String)>,
         .collect()
 }
 
-/// The tag entries `value` carries, in the order the list carried them — or why it is not a
-/// tag set at all.
-fn tag_entries(value: &Value) -> Result<Vec<(String, String)>, Refusal> {
-    let Some(entries) = value.as_array() else {
-        return Err(Refusal::invalid(format!(
-            "{TAGS} must be a list of {{ {TAG_KEY}, {TAG_VALUE} }} pairs"
-        )));
-    };
-    let mut tags = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let key = entry.get(TAG_KEY).and_then(Value::as_str);
-        let tag_value = entry.get(TAG_VALUE).and_then(Value::as_str);
-        let (Some(key), Some(tag_value)) = (key, tag_value) else {
-            return Err(Refusal::invalid(format!(
-                "every {TAGS} entry must carry {TAG_KEY} and {TAG_VALUE}"
-            )));
-        };
-        tags.push((key.to_string(), tag_value.to_string()));
-    }
-    Ok(tags)
-}
-
 /// A call CloudFormation refused, as the refusal this service reports: the error code that
 /// service NAMED decides which handler verdict the resource operation request fails with,
 /// and the message it worded is the diagnostic, passed on rather than re-worded.
@@ -800,11 +734,7 @@ where
         ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
     >: ::aws_smithy_types::error::metadata::ProvideErrorMetadata + ::std::fmt::Display,
 {
-    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
-    let code = error.code().unwrap_or_default().to_string();
-    let detail = error
-        .message()
-        .map_or_else(|| error.to_string(), ToString::to_string);
+    let (code, detail) = answered_error(error);
     match code.as_str() {
         // "The specified stack already exists" / "a stack with the same name already
         // exists": the resource is already there, which is the create handler's own

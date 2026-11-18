@@ -1201,7 +1201,7 @@ pub(crate) async fn create_apigatewayv2_api(
         Some(&request),
     )
     .await?;
-    apigatewayv2_api_created(&answered, "CreateApi")
+    apigatewayv2_api_created(&answered, region, "CreateApi")
 }
 
 /// Import the api an `AWS::ApiGatewayV2::Api` declares a DEFINITION for, so a client that
@@ -1247,7 +1247,7 @@ pub(crate) async fn import_apigatewayv2_api(
         Some(&payload),
     )
     .await?;
-    apigatewayv2_api_created(&answered, "ImportApi")
+    apigatewayv2_api_created(&answered, region, "ImportApi")
 }
 
 /// The DEFINITION one `AWS::ApiGatewayV2::Api` declaration carries, as the query string and
@@ -1393,7 +1393,7 @@ pub(crate) async fn update_apigatewayv2_api(
             Some(&payload),
         )
         .await?;
-        return apigatewayv2_api_created(&answered, "ReimportApi").map(Some);
+        return apigatewayv2_api_created(&answered, region, "ReimportApi").map(Some);
     }
     let mut request = Map::new();
     if let Some(properties) = declared.as_object() {
@@ -1417,7 +1417,7 @@ pub(crate) async fn update_apigatewayv2_api(
         Some(&Value::Object(request)),
     )
     .await?;
-    apigatewayv2_api_created(&answered, "UpdateApi").map(Some)
+    apigatewayv2_api_created(&answered, region, "UpdateApi").map(Some)
 }
 
 /// The URI that addresses ONE api of API Gateway v2 — `/v2/apis/{ApiId}`, the binding every
@@ -1428,14 +1428,26 @@ pub(crate) fn apigatewayv2_api_uri(api_id: &str) -> String {
 }
 
 /// The api an answered create or import reports: the `ApiId` that service assigned, which
-/// is this resource's identity, and the `ApiEndpoint` it serves the api on, which is the
-/// attribute the type publishes. One spelling for both calls, which answer the same api.
-pub(crate) fn apigatewayv2_api_created(answered: &Value, operation: &str) -> Result<Created, Refusal> {
+/// is this resource's identity, the `ApiEndpoint` it serves the api on, and the ARN of that
+/// api's own invoke surface — the three values the type publishes through `Fn::GetAtt`, each
+/// built from what the call ANSWERED rather than from the stand-in the naming rules computed
+/// ([`super::super::template::published_attribute_names`]). One spelling for every call that
+/// answers an api, since they all answer the same api.
+pub(crate) fn apigatewayv2_api_created(
+    answered: &Value,
+    region: &str,
+    operation: &str,
+) -> Result<Created, Refusal> {
     let api_id = api_gateway_answered(answered, "apiId", operation)?;
     let mut attributes = BTreeMap::new();
     if let Some(endpoint) = answered.get("apiEndpoint").and_then(Value::as_str) {
         attributes.insert("ApiEndpoint".to_string(), endpoint.to_string());
     }
+    attributes.insert("ApiId".to_string(), api_id.clone());
+    attributes.insert(
+        "ExecuteApiArn".to_string(),
+        super::super::template::apigatewayv2_execute_api_arn(&api_id, region),
+    );
     Ok(Created {
         physical_resource_id: Some(api_id),
         attributes,

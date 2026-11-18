@@ -89,6 +89,39 @@ pub const DECLARED_PROPERTIES: &[DeclaredProperties] = &[
         resource_type: "AWS::S3::BucketPolicy",
         declared: &["Bucket", "PolicyDocument"],
     },
+    // `AWS::ApiGatewayV2::Api`: the api's own configuration — the `CreateApi` members the
+    // type passes straight through, the four that belong to the OpenAPI definition an api is
+    // imported from (`Body`, `BodyS3Location`, `BasePath`, `FailOnWarnings`), the `RouteKey`
+    // and `Target` of a quick-create api, the `Tags` the type publishes as a map, and the
+    // three the schema marks READ-ONLY (`ApiEndpoint`, `ApiId`, `ExecuteApiArn`) — the values
+    // API Gateway v2 computes for the api, which a declaration may carry and a deployment
+    // ignores ([`crate::state::template::READ_ONLY_PROPERTIES`]).
+    DeclaredProperties {
+        resource_type: crate::state::template::APIGATEWAYV2_API,
+        declared: &[
+            "ApiEndpoint",
+            "ApiId",
+            "ApiKeySelectionExpression",
+            "BasePath",
+            "Body",
+            "BodyS3Location",
+            "CorsConfiguration",
+            "CredentialsArn",
+            "Description",
+            "DisableExecuteApiEndpoint",
+            "DisableSchemaValidation",
+            "ExecuteApiArn",
+            "FailOnWarnings",
+            "IpAddressType",
+            "Name",
+            "ProtocolType",
+            "RouteKey",
+            "RouteSelectionExpression",
+            "Tags",
+            "Target",
+            "Version",
+        ],
+    },
     // `AWS::Logs::LogStream`: a stream is its name and the log group it lives in.
     DeclaredProperties {
         resource_type: "AWS::Logs::LogStream",

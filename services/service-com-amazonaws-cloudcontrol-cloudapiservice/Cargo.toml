@@ -52,6 +52,12 @@ service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 # over the framework's callback (`state::owning_api::stacks`). No network client feature:
 # the transport is the emulator's own.
 aws-sdk-cloudformation = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# And `AWS::ApiGatewayV2::Api`, whose create does work of its own too — it imports an
+# OpenAPI definition, with the routes and integrations that document declares — so the api is
+# created, read, patched and removed by API Gateway v2's own calls, dispatched in process
+# over the framework's callback (`state::owning_api::apis`). No network client feature: the
+# transport is the emulator's own.
+aws-sdk-apigatewayv2 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

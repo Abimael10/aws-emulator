@@ -4697,6 +4697,8 @@ mod conditions;
 mod naming_rules;
 mod resource_attributes;
 mod replacement_properties;
+mod read_only_properties;
+pub use read_only_properties::*;
 pub use replacement_properties::*;
 pub(crate) use naming_rules::*;
 pub(crate) use resource_attributes::*;

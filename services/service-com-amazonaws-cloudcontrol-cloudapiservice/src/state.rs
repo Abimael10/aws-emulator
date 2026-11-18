@@ -2058,6 +2058,9 @@ const PROPERTY_POINTER_PREFIX: &str = "/properties/";
 /// cannot change while the resource stays the same resource. That is what
 /// [`create_only_properties`] adds for every type, catalogued or not.
 const CREATE_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
+    // An api's PROTOCOL is settled when API Gateway v2 makes it: `UpdateApi` carries no
+    // member for it, so a patch that would change it asks for a different api.
+    ("AWS::ApiGatewayV2::Api", &["ProtocolType"]),
     ("AWS::CloudFormation::Stack", &["StackName"]),
     ("AWS::CloudWatch::Alarm", &["AlarmName"]),
     ("AWS::DynamoDB::Table", &["TableName", "KeySchema"]),
@@ -2119,6 +2122,7 @@ pub fn not_updatable_message(properties: &[&str]) -> String {
 /// A read-only property is one the OWNING service computes: it is part of the model every
 /// read reports, and no desired state or patch may set it ([`read_only_properties`]).
 const READ_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
+    ("AWS::ApiGatewayV2::Api", &["ApiEndpoint", "ApiId", "ExecuteApiArn"]),
     ("AWS::CloudFormation::Stack", &["StackId", "ChangeSetId", "CreationTime", "Description", "LastUpdateTime", "Outputs", "ParentId", "RootId", "StackStatus", "StackStatusReason"]),
     ("AWS::CloudWatch::Alarm", &["Arn"]),
     ("AWS::DynamoDB::Table", &["Arn", "StreamArn"]),
@@ -2186,6 +2190,22 @@ fn invalid_patch_update_message(classification: &str, properties: &[&str]) -> St
 /// to update in place: such a property can only be `add`ed
 /// ([`write_only_properties`]). A type whose schema declares none is absent from here.
 const WRITE_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
+    // `AWS::ApiGatewayV2::Api`: the OpenAPI definition an api is imported from and how that
+    // document is read, and the `RouteKey`, `Target` and `CredentialsArn` of a quick-create
+    // api — none of which `apigatewayv2:GetApi`, the call the type's read handler reads an
+    // api with, reports.
+    (
+        "AWS::ApiGatewayV2::Api",
+        &[
+            "Body",
+            "BodyS3Location",
+            "BasePath",
+            "FailOnWarnings",
+            "CredentialsArn",
+            "RouteKey",
+            "Target",
+        ],
+    ),
     // `AWS::CloudFormation::Stack`: a stack's own read reports neither the template it was
     // deployed from nor the policy document it carries, so neither is in the model a patch
     // is applied to.

@@ -384,3 +384,18 @@ pub(crate) const APIGATEWAYV2_WEBSOCKET_PROTOCOL: &str = "WEBSOCKET";
 /// `awsService.arnNamespace` (`apigateway`) rather than the `ApiGatewayV2` its resource
 /// types are spelled with.
 pub(crate) const APIGATEWAYV2_ARN_NAMESPACE: &str = "apigateway";
+
+/// The service an api's own INVOKE surface is published under, which is the namespace the
+/// ARN of that surface is built in: `execute-api`, the service an `execute-api:Invoke`
+/// permission is granted on and the one the api's default endpoint host is labelled with.
+pub(crate) const EXECUTE_API_NAMESPACE: &str = "execute-api";
+
+/// The ARN of the api's own invoke surface — `arn:aws:execute-api:{region}:{account}:
+/// {api-id}` — which is the resource an invoke of the api is authorized against and the
+/// value the type publishes as `ExecuteApiArn`.
+///
+/// Built from the api's identifier, so it names whichever api this resource turns out to
+/// be: the one API Gateway v2 minted the id of once the resource is created there.
+pub(crate) fn apigatewayv2_execute_api_arn(api_id: &str, region: &str) -> String {
+    ::emulator_server::emulator_arn(EXECUTE_API_NAMESPACE, region, api_id)
+}

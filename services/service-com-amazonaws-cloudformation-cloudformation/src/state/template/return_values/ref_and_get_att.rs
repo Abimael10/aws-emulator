@@ -617,18 +617,26 @@ pub(crate) fn return_values(
             (id, attributes)
         }
         // "Ref returns the API ID"; Fn::GetAtt: ApiEndpoint ("The default endpoint for an
-        // API"). API Gateway v2 ASSIGNS the id — a template names the api but not its
-        // identifier — so the id is of the form [`api_gateway_assigned_id`] describes and
-        // the endpoint is the `{api-id}.execute-api.{region}.amazonaws.com` host
-        // `Api$ApiEndpoint` documents, under the scheme the declared `ProtocolType`
-        // speaks. Both are REPLACED by the ones that service really minted once the
-        // resource is created there ([`super::provisioner`]), which is what
-        // [`identity_is_service_assigned`] names this type for.
+        // API"), ApiId and ExecuteApiArn — the api's own identity, the endpoint it is
+        // invoked on and the ARN of that invoke surface, every one of them a value only API
+        // Gateway v2 produces. API Gateway v2 ASSIGNS the id — a template names the api but
+        // not its identifier — so the id is of the form [`api_gateway_assigned_id`]
+        // describes, the endpoint is the `{api-id}.execute-api.{region}.amazonaws.com` host
+        // `Api$ApiEndpoint` documents under the scheme the declared `ProtocolType` speaks,
+        // and the ARN is that id's own `execute-api` resource. All three are REPLACED by the
+        // ones built from the id that service really minted once the resource is created
+        // there ([`super::provisioner`]), which is what [`identity_is_service_assigned`]
+        // names this type for.
         APIGATEWAYV2_API => {
             let id = api_gateway_assigned_id(APIGATEWAYV2_API_ID_SALT, name);
             attributes.insert(
                 "ApiEndpoint".to_string(),
                 apigatewayv2_api_endpoint(&id, region, properties, scope, budget),
+            );
+            attributes.insert("ApiId".to_string(), id.clone());
+            attributes.insert(
+                "ExecuteApiArn".to_string(),
+                apigatewayv2_execute_api_arn(&id, region),
             );
             (id, attributes)
         }

@@ -366,7 +366,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         APIGATEWAY_AUTHORIZER => &["AuthorizerId"],
         APIGATEWAY_REQUEST_VALIDATOR => &["RequestValidatorId"],
         APIGATEWAY_ACCOUNT | APIGATEWAY_USAGE_PLAN | APIGATEWAY_USAGE_PLAN_KEY => &["Id"],
-        APIGATEWAYV2_API => &["ApiEndpoint"],
+        APIGATEWAYV2_API => &["ApiEndpoint", "ApiId", "ExecuteApiArn"],
         APIGATEWAYV2_API_MAPPING => &["ApiMappingId"],
         APIGATEWAYV2_DOMAIN_NAME => &["DomainNameArn", "RegionalDomainName"],
         GUARDDUTY_DETECTOR | GUARDDUTY_IP_SET => &["Id"],
@@ -1790,6 +1790,11 @@ pub(super) fn load_balancer_type_code(
 /// `resources` is what [`provision`] produced for `template`. A declaration whose
 /// `Condition` excluded it has no record there, so each record is matched to its
 /// declaration by LOGICAL ID rather than by position.
+///
+/// A property the type's schema marks READ-ONLY is left out of that document
+/// ([`super::without_read_only`]): it is a value the owning service computes rather than a
+/// member of any call, so a declaration carrying one is deployed as though it did not — and
+/// what every reader of the resource then reports for it is that service's own value.
 pub fn resolve_properties(
     template: &Template,
     resources: &mut [StoredResource],
@@ -1804,8 +1809,10 @@ pub fn resolve_properties(
         else {
             continue;
         };
-        resource.properties =
-            resolved_value(&declared.properties, scope, 0, budget).unwrap_or(Value::Null);
+        resource.properties = super::without_read_only(
+            &resource.resource_type,
+            resolved_value(&declared.properties, scope, 0, budget).unwrap_or(Value::Null),
+        );
         // A type whose primary identifier is COMPOSITE takes its physical id from that
         // resolved document: this is the first point at which the resources the binding
         // names have resolved to the identifiers they really carry.
