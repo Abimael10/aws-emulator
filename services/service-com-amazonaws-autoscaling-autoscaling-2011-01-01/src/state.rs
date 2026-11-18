@@ -328,6 +328,13 @@ pub const LIFECYCLE_STANDBY: &str = "Standby";
 /// The `HealthStatus` of an instance the service has no failed health check for.
 pub const HEALTH_STATUS_HEALTHY: &str = "Healthy";
 
+/// The `HealthStatus` of an instance a health check of its group has found out of service.
+///
+/// The spelling `SetInstanceHealth$HealthStatus` publishes for that state: "the health status
+/// of the instance. Set to `Healthy` to have the instance remain in service. Set to
+/// `Unhealthy` to have the instance be out of service."
+pub const HEALTH_STATUS_UNHEALTHY: &str = "Unhealthy";
+
 /// How long ONE instance replacement of an instance refresh takes to come due.
 ///
 /// A replacement is a COMPOSITE of the moves this service owes an instance: the old
@@ -1904,6 +1911,10 @@ impl AutoScalingState {
         // difference between each pool's size and the size it maintains, which the clock
         // owes exactly as it owes a group's own ([`warm_pools`]).
         self.reconcile_warm_pools(engine, now);
+        // The health a group that checks its instances with `ELB` reads off the load
+        // balancer: a derived value, recomputed from what that service reports right now,
+        // after the pass above has brought this instant's instances into service.
+        self.reconcile_elb_instance_health(engine, now);
 
         for activity in &mut self.activities {
             if activity.completes_at.is_some_and(|at| at <= now) {
@@ -1917,6 +1928,74 @@ impl AutoScalingState {
         // it freed names nothing again.
         self.deleting_groups
             .retain(|_, completes_at| now < *completes_at);
+    }
+
+    /// Recompute the `HealthStatus` of the instances of every group that checks their health
+    /// with Elastic Load Balancing, from what that service reports for their registrations.
+    ///
+    /// A group whose `HealthCheckType` names `ELB` checks its instances with "Elastic Load
+    /// Balancing health checks", so the health of such an instance is DERIVED: it is
+    /// [`HEALTH_STATUS_UNHEALTHY`] exactly while the load balancer reports its target
+    /// unhealthy in a target group the group is attached to
+    /// ([`elbv2_targets::elb_unhealthy_instances`]) and [`HEALTH_STATUS_HEALTHY`] otherwise —
+    /// nothing is stored beside the instance to say so, and the value is recomputed from that
+    /// service's own verdict every time the clock is read. A group that checks its instances
+    /// any other way derives nothing here and is left exactly as it stands.
+    ///
+    /// `HealthCheckGracePeriod` is "the amount of time, in seconds, that Amazon EC2 Auto
+    /// Scaling waits before checking the health status of an EC2 instance that has come into
+    /// service and marking it unhealthy due to a failed health check", so an instance inside
+    /// that window is not marked on a failed check however the load balancer reports it; the
+    /// member's own default is [`DEFAULT_HEALTH_CHECK_GRACE_PERIOD`], and the window runs
+    /// from the instant the instance came into service ([`LIFECYCLE_TRANSITION`] after it was
+    /// launched). An instance on its way out of the group is leaving whatever its targets
+    /// report.
+    ///
+    /// A derived value the clock owes, which is why a REPORTING operation materialises it:
+    /// the load balancer's verdict is the same at a given instant whether or not anybody
+    /// called ([`Self::materialize_due`]).
+    pub fn reconcile_elb_instance_health<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        now: SystemTime,
+    ) {
+        // Read once for every group, under the other store's lock alone and with no group of
+        // this store borrowed across the write below.
+        let verdicts = elbv2_targets::elb_unhealthy_instances(engine, self.groups.values(), now);
+        for (group_name, unhealthy) in verdicts {
+            let Some(group) = self.groups.get_mut(&group_name) else {
+                continue;
+            };
+            let grace = Duration::from_secs(
+                u64::try_from(
+                    group
+                        .health_check_grace_period
+                        .unwrap_or(DEFAULT_HEALTH_CHECK_GRACE_PERIOD)
+                        .max(0),
+                )
+                .unwrap_or(0),
+            );
+            for instance in &mut group.instances {
+                // An instance on its way out of the group — terminating, or held at a
+                // termination hook — is leaving whatever its targets report, through the one
+                // reading of that ([`StoredInstance::is_leaving_group`]).
+                if instance.is_leaving_group() {
+                    continue;
+                }
+                // Checked only once the instance has come into service and the group's grace
+                // period after it has elapsed.
+                let checked_from = instance.launched_at + LIFECYCLE_TRANSITION + grace;
+                if now < checked_from {
+                    continue;
+                }
+                instance.health_status = if unhealthy.contains(&instance.instance_id) {
+                    HEALTH_STATUS_UNHEALTHY
+                } else {
+                    HEALTH_STATUS_HEALTHY
+                }
+                .to_string();
+            }
+        }
     }
 
     /// Set a group's desired capacity and move its instances to match: launch what

@@ -368,6 +368,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_group = auto_scaling_group_provider
             .as_ref()
             .map(|provider| provider.auto_scaling_group_arn.clone());
+        // Creating the provider MUTATES that group — Amazon ECS marks it as its own to
+        // manage ([`crate::state::mark_group_managed`]) — so the call needs the Auto Scaling
+        // action that write performs on it, and a caller without it is refused before
+        // anything is created.
+        if let Some(group_arn) = requested_group.as_deref() {
+            if let Some(message) =
+                crate::state::auto_scaling_tag_refusal(&*self.engine, ctx, group_arn)
+            {
+                return Err(
+                    CreateCapacityProviderErrorModeled::AccessDeniedException(
+                        AccessDeniedException {
+                            message: Some(message.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
 
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
@@ -528,6 +546,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the provider it just created is reported with the tags it was created with.
         let view = record.view(true);
         guard.capacity_providers.insert(name, record);
+        // The group the provider binds is now Amazon ECS's to manage, which is a fact about
+        // THAT group: the marker is written onto it in Amazon EC2 Auto Scaling's own store,
+        // with this service's guard released first, since that write takes the other store's
+        // lock ([`crate::state::mark_group_managed`]).
+        drop(guard);
+        if let Some(group_arn) = requested_group.as_deref() {
+            crate::state::mark_group_managed(&*self.engine, group_arn);
+        }
 
         Ok(CreateCapacityProviderOutput {
             capacity_provider: Some(view),

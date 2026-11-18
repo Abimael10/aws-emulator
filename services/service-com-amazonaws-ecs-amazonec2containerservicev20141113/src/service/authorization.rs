@@ -352,29 +352,65 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     resource: &str,
 ) -> Result<(), AccessDeniedException> {
     let action = format!("{ACTION_PREFIX}:{operation}");
+    decide(engine, ctx, &action, resource)
+        .map_err(|refused| not_authorized(&refused.principal, &action, resource, &refused.reason))
+}
+
+/// Whether IAM lets this request perform `action` — an action named IN FULL, this service's
+/// own or ANOTHER service's — on `resource`.
+///
+/// An operation that mutates another service's resource as part of its own work needs that
+/// other service's action on that resource as well, and the caller's policies are what decide
+/// it: the same documents, the same evaluation and the same `(action, resource)` reading as
+/// this service's own actions take, so one statement is read one way whichever service's
+/// action it names. The refusal's own wording belongs to the operation that asked, which is
+/// why this answers a decision rather than a sentence.
+pub fn permits_action<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    resource: &str,
+) -> bool {
+    decide(engine, ctx, action, resource).is_ok()
+}
+
+/// Who a decision refused, and which of IAM's rules withheld the grant.
+#[derive(Debug, Clone)]
+struct Refused {
+    /// The principal the request speaks for, as `sts:GetCallerIdentity` reports it.
+    principal: String,
+    /// Why the grant was withheld, as the refusal's closing clause words it.
+    reason: String,
+}
+
+/// IAM's decision about `action` on `resource` for this request: `Ok(())` for a request the
+/// policies in force permit and for every caller this gate does not bound (see the module
+/// docs), and the refusal otherwise.
+fn decide<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    resource: &str,
+) -> Result<(), Refused> {
     let caller = caller(engine, ctx);
+    let refused = |reason: String| {
+        Err(Refused {
+            principal: caller.arn.clone(),
+            reason,
+        })
+    };
     // An identity-based document states no `Principal` element, so the decision rests on the
     // action and the resource the request addressed.
-    let said = iam::identity_decision(&caller.documents, &iam::Request::new(&action, resource, &[]));
+    let said = iam::identity_decision(&caller.documents, &iam::Request::new(action, resource, &[]));
     // The decision is taken FIRST, so an explicit `Deny` in a document that CAN be read
     // refuses the request whatever else the principal carries — including a grant this
     // emulator cannot read, which only lifts the DEFAULT deny of a request no readable
     // statement allows (see the module docs).
     if said == Decision::Denied {
-        return Err(not_authorized(
-            &caller.arn,
-            &action,
-            resource,
-            iam::IDENTITY_POLICY_EXPLICIT_DENY,
-        ));
+        return refused(iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string());
     }
     if !(iam::is_allowed(said, Decision::NotStated) || caller.identity_is_unbounded()) {
-        return Err(not_authorized(
-            &caller.arn,
-            &action,
-            resource,
-            &iam::no_identity_policy_allows(&action),
-        ));
+        return refused(iam::no_identity_policy_allows(action));
     }
     // "A permissions boundary sets the maximum permissions that an identity-based policy can
     // grant" (IAM, permissions boundaries): a grant the boundary does not also allow is not a
@@ -384,16 +420,16 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     };
     let reason = match iam::identity_decision(
         ::std::slice::from_ref(boundary),
-        &iam::Request::new(&action, resource, &[]),
+        &iam::Request::new(action, resource, &[]),
     ) {
         Decision::Allowed => return Ok(()),
         // An explicit deny is a fact about the boundary document, so the refusal names it; a
         // boundary that merely states nothing withheld the grant the identity-based policies
         // gave.
         Decision::Denied => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
-        Decision::NotStated => iam::no_permissions_boundary_allows(&action),
+        Decision::NotStated => iam::no_permissions_boundary_allows(action),
     };
-    Err(not_authorized(&caller.arn, &action, resource, &reason))
+    refused(reason)
 }
 
 /// The refusal IAM states an authorization failure with — who was refused, which action, on

@@ -836,3 +836,259 @@ async fn a_target_is_healthy_only_while_a_rule_admits_the_load_balancers_check()
         );
     }
 }
+
+/// One row of the instance-health table: a group over a target group whose checks either
+/// arrive or do not, checking its instances the way the row says.
+struct InstanceHealthRow {
+    case: &'static str,
+    /// The target group and the group that registers into it, and the listener port that
+    /// makes the target group one the load balancer forwards to.
+    target_group_name: &'static str,
+    group_name: &'static str,
+    listener_port: &'static str,
+    /// `HealthCheckType` of the Auto Scaling group: whether the load balancer's verdict is
+    /// this group's instance health at all.
+    health_check_type: &'static str,
+    /// Whether the instances' own security group admits the load balancer's check, which is
+    /// what decides the verdict Elastic Load Balancing reaches.
+    admits_the_check: bool,
+    /// The `TargetHealth$State` the registration settles on.
+    target_state: &'static str,
+    /// The `Instance$HealthStatus` the group must then report for that instance.
+    instance_health: &'static str,
+}
+
+/// The rows span what the rule generalises over: the verdict the load balancer reaches
+/// (`healthy`, `unhealthy`) and whether the group takes that verdict as its instances' health
+/// at all (`ELB` against `EC2`, the type that "cannot be disabled" and reads no load
+/// balancer).
+const INSTANCE_HEALTH_ROWS: [InstanceHealthRow; 3] = [
+    InstanceHealthRow {
+        case: "an ELB-health-checked group whose instance answers the load balancer's checks",
+        target_group_name: "asgih-open",
+        group_name: "asgih-open-group",
+        listener_port: "80",
+        health_check_type: "ELB",
+        admits_the_check: true,
+        target_state: "healthy",
+        instance_health: "Healthy",
+    },
+    InstanceHealthRow {
+        case: "an ELB-health-checked group whose instance answers none of them",
+        target_group_name: "asgih-closed",
+        group_name: "asgih-closed-group",
+        listener_port: "8080",
+        health_check_type: "ELB",
+        admits_the_check: false,
+        target_state: "unhealthy",
+        instance_health: "Unhealthy",
+    },
+    InstanceHealthRow {
+        case: "an EC2-health-checked group over the same unanswered checks",
+        target_group_name: "asgih-ec2",
+        group_name: "asgih-ec2-group",
+        listener_port: "8081",
+        health_check_type: "EC2",
+        admits_the_check: false,
+        target_state: "unhealthy",
+        instance_health: "Healthy",
+    },
+];
+
+/// RULE: a group whose `HealthCheckType` names `ELB` takes the load balancer's verdict as the
+/// health of its instances — an instance whose target Elastic Load Balancing reports
+/// `unhealthy` is reported `Unhealthy` and one whose target it reports `healthy` is reported
+/// `Healthy` — while a group that checks its instances any other way reports the same
+/// unanswered target as `Healthy`. The status is DERIVED, so it follows the verdict back: a
+/// rule that lets the checks arrive again returns the instance to `Healthy`.
+#[tokio::test]
+async fn an_elb_health_checked_groups_instance_health_follows_the_load_balancers_verdict() {
+    let router = router();
+    // One network for every row: what separates the rows is the inbound rule of the security
+    // group each row's instances carry, so each flavour of group is created once and the rows
+    // that need it share it.
+    let network = seed_network(
+        &router,
+        "10.76.0.0/16",
+        &[("10.76.1.0/24", "us-east-1a"), ("10.76.2.0/24", "us-east-1b")],
+    )
+    .await;
+    let balancer_group =
+        security_group(&router, &network.vpc, "asgih-balancer", "the load balancer").await;
+    let open = security_group(&router, &network.vpc, "asgih-open", "instances that answer").await;
+    let closed =
+        security_group(&router, &network.vpc, "asgih-closed", "instances that do not").await;
+    // The open group admits the load balancer's own group on every port a row checks; the
+    // closed one admits only ITSELF, the self-reference a cluster security group carries,
+    // which admits no check from a load balancer outside the group.
+    for port in INSTANCE_HEALTH_ROWS.map(|row| row.listener_port) {
+        ec2(
+            &router,
+            "AuthorizeSecurityGroupIngress",
+            &[
+                ("GroupId", open.as_str()),
+                ("IpPermissions.1.IpProtocol", "tcp"),
+                ("IpPermissions.1.FromPort", port),
+                ("IpPermissions.1.ToPort", port),
+                ("IpPermissions.1.Groups.1.GroupId", balancer_group.as_str()),
+            ],
+        )
+        .await;
+    }
+    ec2(
+        &router,
+        "AuthorizeSecurityGroupIngress",
+        &[
+            ("GroupId", closed.as_str()),
+            ("IpPermissions.1.IpProtocol", "-1"),
+            ("IpPermissions.1.Groups.1.GroupId", closed.as_str()),
+        ],
+    )
+    .await;
+    launch_template(&router, "asgih-open-template", &[open.as_str()]).await;
+    launch_template(&router, "asgih-closed-template", &[closed.as_str()]).await;
+    let balancer = element(
+        &elbv2(
+            &router,
+            "CreateLoadBalancer",
+            &[
+                ("Name", "asgih-alb"),
+                ("Scheme", "internal"),
+                ("Subnets.member.1", network.subnets[0].0.as_str()),
+                ("Subnets.member.2", network.subnets[1].0.as_str()),
+                ("SecurityGroups.member.1", balancer_group.as_str()),
+            ],
+        )
+        .await,
+        "LoadBalancerArn",
+    );
+
+    // Every row's target group, listener and group are created FIRST, so the checks of all of
+    // them run on the one clock rather than one row's waiting for the next row's setup.
+    let mut target_groups: Vec<String> = Vec::new();
+    for row in &INSTANCE_HEALTH_ROWS {
+        let target_group = element(
+            &elbv2(
+                &router,
+                "CreateTargetGroup",
+                &[
+                    ("Name", row.target_group_name),
+                    ("Protocol", "HTTP"),
+                    ("Port", row.listener_port),
+                    ("VpcId", network.vpc.as_str()),
+                    ("TargetType", "instance"),
+                    ("HealthCheckIntervalSeconds", CHECK_INTERVAL_SECONDS),
+                    ("UnhealthyThresholdCount", CHECK_THRESHOLD),
+                    ("HealthyThresholdCount", CHECK_THRESHOLD),
+                ],
+            )
+            .await,
+            "TargetGroupArn",
+        );
+        elbv2(
+            &router,
+            "CreateListener",
+            &[
+                ("LoadBalancerArn", balancer.as_str()),
+                ("Protocol", "HTTP"),
+                ("Port", row.listener_port),
+                ("DefaultActions.member.1.Type", "forward"),
+                ("DefaultActions.member.1.TargetGroupArn", target_group.as_str()),
+            ],
+        )
+        .await;
+        let template = if row.admits_the_check {
+            "asgih-open-template"
+        } else {
+            "asgih-closed-template"
+        };
+        asg(
+            &router,
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", row.group_name),
+                ("MinSize", "1"),
+                ("MaxSize", "1"),
+                ("DesiredCapacity", "1"),
+                ("LaunchTemplate.LaunchTemplateName", template),
+                ("VPCZoneIdentifier", network.subnets[0].0.as_str()),
+                ("TargetGroupARNs.member.1", target_group.as_str()),
+                ("HealthCheckType", row.health_check_type),
+            ],
+        )
+        .await;
+        target_groups.push(target_group);
+    }
+
+    for (row, target_group) in INSTANCE_HEALTH_ROWS.iter().zip(&target_groups) {
+        // The launch, the registration and the checks are all clock-owed: the row waits for
+        // the CONDITION — the verdict it expects, with the instance health that follows it —
+        // rather than for a span.
+        let deadline = Instant::now() + DEADLINE;
+        let (reported, held) = loop {
+            let reported = target_health(&router, target_group).await;
+            let held = group_instances(&router, row.group_name).await;
+            let settled = reported.len() == 1
+                && reported[0].state == row.target_state
+                && held.len() == 1
+                && held[0].1 == row.instance_health;
+            if settled || Instant::now() >= deadline {
+                break (reported, held);
+            }
+            tokio::time::sleep(POLL).await;
+        };
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {:?}: the target group must hold exactly the group's instance, got \
+             {reported:?}",
+            row.case
+        );
+        assert_eq!(
+            reported[0].state, row.target_state,
+            "case {:?}: expected the target to settle on {}, got {reported:?}",
+            row.case, row.target_state
+        );
+        assert_eq!(
+            held,
+            vec![("InService".to_string(), row.instance_health.to_string())],
+            "case {:?}: expected the group to report its instance {} beside a {} target, got \
+             {held:?}",
+            row.case,
+            row.instance_health,
+            row.target_state
+        );
+    }
+
+    // The status is DERIVED from the verdict rather than latched: once a rule lets the
+    // load balancer's checks arrive, the target the group was reporting `Unhealthy` for
+    // returns to `Healthy` with no call to Auto Scaling in between.
+    let recovering = &INSTANCE_HEALTH_ROWS[1];
+    ec2(
+        &router,
+        "AuthorizeSecurityGroupIngress",
+        &[
+            ("GroupId", closed.as_str()),
+            ("IpPermissions.1.IpProtocol", "tcp"),
+            ("IpPermissions.1.FromPort", recovering.listener_port),
+            ("IpPermissions.1.ToPort", recovering.listener_port),
+            ("IpPermissions.1.Groups.1.GroupId", balancer_group.as_str()),
+        ],
+    )
+    .await;
+    let deadline = Instant::now() + DEADLINE;
+    let held = loop {
+        let held = group_instances(&router, recovering.group_name).await;
+        if held.len() == 1 && held[0].1 == "Healthy" || Instant::now() >= deadline {
+            break held;
+        }
+        tokio::time::sleep(POLL).await;
+    };
+    assert_eq!(
+        held,
+        vec![("InService".to_string(), "Healthy".to_string())],
+        "case {:?}: an instance whose checks arrive again must be reported Healthy, got \
+         {held:?}",
+        recovering.case
+    );
+}

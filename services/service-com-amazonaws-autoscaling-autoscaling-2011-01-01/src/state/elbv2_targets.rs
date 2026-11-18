@@ -559,6 +559,93 @@ pub fn attachment_states<Eng: Send + Sync + 'static>(
         .collect()
 }
 
+/// The instances of each group of `groups` whose Elastic Load Balancing registration that
+/// service reports UNHEALTHY, keyed by the group's name.
+///
+/// "`ELB` - Use Elastic Load Balancing health checks" (`HealthCheckType`): a group configured
+/// that way takes the verdict of the load balancer checking its instances as the health of
+/// those instances, so an instance whose target that service reports unhealthy in ANY target
+/// group the group is attached to is one the group's own health check has found out of
+/// service. The verdict itself is never computed here — it is read from the service that
+/// performs the checks ([`elbv2::target_health::TargetGroupRecord::health_of`]), exactly as
+/// [`attachment_states`] reads the healthy half of it — so the two services report one
+/// registration's health one way.
+///
+/// A group that does NOT derive its instances' health from that service (its `HealthCheckType`
+/// names only `EC2`, or it is attached to nothing) is absent from the answer rather than
+/// present with an empty set: there is no verdict of that service for its instances, so a
+/// caller has nothing to apply to them. A registration that is draining is leaving the target
+/// group and is no verdict about the instance either.
+///
+/// A READ of the other service's store, under that store's lock alone and taken ONCE for every
+/// group given — this module's header states the order — and nothing of this service is locked
+/// inside it. It writes NOTHING.
+pub fn elb_unhealthy_instances<'a, Eng: Send + Sync + 'static, I>(
+    engine: &Eng,
+    groups: I,
+    now: SystemTime,
+) -> BTreeMap<String, BTreeSet<String>>
+where
+    I: IntoIterator<Item = &'a StoredGroup>,
+{
+    // Only the groups that take their instances' health from that service, and only while
+    // they are attached to something that could report one: for every other group this reads
+    // nothing and locks nothing at all.
+    let deriving: Vec<&StoredGroup> = groups
+        .into_iter()
+        .filter(|group| elb_health_checks_enabled(group) && !attached_arns(group).is_empty())
+        .collect();
+    if deriving.is_empty() {
+        return BTreeMap::new();
+    }
+    let Some(state) = elbv2::service_state(engine) else {
+        return BTreeMap::new();
+    };
+    let store = state.lock();
+    deriving
+        .into_iter()
+        .map(|group| {
+            // Which instance of THIS group each registration stands for, named by the
+            // workload the registration carries: a registration of another group, of another
+            // emulated service's scheduler or of a `RegisterTargets` caller stands for no
+            // instance of this group and is read for nobody ([`Scope::claims`]).
+            let instances: BTreeMap<String, &str> = group
+                .active_instances()
+                .map(|instance| {
+                    (
+                        workload(&group.arn, &instance.instance_id),
+                        instance.instance_id.as_str(),
+                    )
+                })
+                .collect();
+            let mut unhealthy: BTreeSet<String> = BTreeSet::new();
+            for arn in attached_arns(group) {
+                let Some(target_group) = store.target_groups.get(arn) else {
+                    continue;
+                };
+                for target in target_group.targets.values() {
+                    if target.draining_until.is_some() {
+                        continue;
+                    }
+                    let Some(instance_id) = target
+                        .registered_for
+                        .as_deref()
+                        .and_then(|workload| instances.get(workload))
+                    else {
+                        continue;
+                    };
+                    if target_group.health_of(target, now).state.as_deref()
+                        == Some(elbv2::target_health::UNHEALTHY_STATE)
+                    {
+                        unhealthy.insert((*instance_id).to_string());
+                    }
+                }
+            }
+            (group.name.clone(), unhealthy)
+        })
+        .collect()
+}
+
 /// Bring the Elastic Load Balancing v2 target groups in line with what the group
 /// `group_name` now holds: the ONE call a write that moved that group's instances or its
 /// attachments makes for it.
