@@ -11,7 +11,7 @@
 //!    and reports the `TopK` of them most similar first: the `k` smallest scores for
 //!    `COSINE` and `EUCLIDEAN`, the `k` highest for `DOT_PRODUCT`;
 //! 2. a result carries the entry the index holds for its item — the attributes its
-//!    `Projection` stores, never the vector it finds them by — narrowed further by a
+//!    `Projection` stores, the vector it finds them by included — narrowed further by a
 //!    `ProjectionExpression`, which reports nothing for a name the index does not hold;
 //! 3. a `SearchConditionExpression` filters the scored items by the index's search schema
 //!    attributes, each PINNED by `=`, and may reference no others;
@@ -20,8 +20,8 @@
 //!    search for — one it declares no vector index for, and one whose index has not
 //!    finished building — together with a `SearchVector` that is not the index's shape,
 //!    with `ValidationException`;
-//! 5. `ConsumedCapacity` reports the index data the search read, in bytes, and only when
-//!    the request asked for it.
+//! 5. `ConsumedCapacity` reports the data the search handed back, in bytes — held to the
+//!    one-kilobyte per-request floor — and only when the request asked for it.
 //!
 //! Every test drives the operations over the wire (`POST /` with
 //! `X-Amz-Target: DynamoDB_20120810.<OperationName>`) through the same
@@ -31,7 +31,45 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::emulator::{call, describe_when_active, emulator, error_code, message, ok};
+use crate::emulator::{
+    call, describe_when_active, emulator, error_code, message, ok, ACTIVE_DEADLINE, POLL_INTERVAL,
+};
+
+/// Poll `DescribeTable` until the vector index `index` of `table` reports `ACTIVE`, the
+/// waiter loop a client runs after adding one — an index added to a table that already
+/// holds items keeps building after the table's own update has settled, so waiting for the
+/// TABLE is not waiting for the index.
+///
+/// Bounded by the shared deadline: an index that never settles fails the test naming the
+/// last status it reported rather than hanging.
+async fn index_when_active(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    table: &str,
+    index: &str,
+) {
+    let started = std::time::Instant::now();
+    let mut last = Value::Null;
+    while started.elapsed() < ACTIVE_DEADLINE {
+        let described = ok(router, "DescribeTable", json!({"TableName": table})).await;
+        last = described["Table"]["VectorIndexes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .find(|declared| declared["IndexName"] == json!(index))
+            .map(|declared| declared["IndexStatus"].clone())
+            .unwrap_or(Value::Null);
+        if last == json!("ACTIVE") {
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    panic!(
+        "case {case:?}: the index {index} never reached ACTIVE within {ACTIVE_DEADLINE:?}, last \
+         status {last}"
+    )
+}
 
 /// Wait out one transient span, so the table's `CREATING` -> `ACTIVE` transition and its
 /// indexes' are due.
@@ -310,21 +348,27 @@ async fn a_result_carries_the_attributes_the_index_projects() {
     // Rows differ along the index's `Projection` (the three `ProjectionType` values) and
     // along the `ProjectionExpression` the request narrows it with — absent, a written-out
     // name, several names, and a name reached through an `ExpressionAttributeNames` alias.
-    // The vector attribute `emb` is in NO row: a search reports the attributes the index
-    // projects, and the vector it finds them by is not one of them.
+    // The vector attribute `emb` is one of the attributes EVERY index holds — it is the
+    // attribute the index is built over — so a search that narrows nothing reports it
+    // beside the score computed from it, and one that names it in a projection gets it.
     let cases: [(&str, Value, Value, &[&str]); 8] = [
         (
             "all-index",
             Value::Null,
             Value::Null,
-            &["brand", "note", "pk", "tenant"],
+            &["brand", "emb", "note", "pk", "tenant"],
         ),
-        ("keys-index", Value::Null, Value::Null, &["pk", "tenant"]),
+        (
+            "keys-index",
+            Value::Null,
+            Value::Null,
+            &["emb", "pk", "tenant"],
+        ),
         (
             "include-index",
             Value::Null,
             Value::Null,
-            &["brand", "pk", "tenant"],
+            &["brand", "emb", "pk", "tenant"],
         ),
         ("all-index", json!("note"), Value::Null, &["note"]),
         ("all-index", json!("pk, note"), Value::Null, &["note", "pk"]),
@@ -336,9 +380,10 @@ async fn a_result_carries_the_attributes_the_index_projects() {
         ),
         // A projection that names an attribute the item does not hold reports nothing for
         // it, the way a projection over a table's items does — and so does one naming an
-        // attribute the index does not project, or the vector attribute itself.
+        // attribute the index does not project, while the vector attribute itself is held
+        // by every index and is reported.
         ("all-index", json!("absent"), Value::Null, &[]),
-        ("keys-index", json!("note, emb"), Value::Null, &[]),
+        ("keys-index", json!("note, emb"), Value::Null, &["emb"]),
     ];
     for (index, projection_expression, names, expected) in cases {
         let case = format!("{index} projecting {projection_expression}");
@@ -775,8 +820,13 @@ async fn a_search_of_a_vector_index_that_has_not_finished_building_is_refused() 
         // Once the build has finished the SAME search is served, and it reports the item the
         // index was built over — so the refusal was about the index's state and not about the
         // request.
-        describe_when_active(&router, "the index finishes building", "vector-search-building")
-            .await;
+        index_when_active(
+            &router,
+            "the index finishes building",
+            "vector-search-building",
+            &index,
+        )
+        .await;
         let served = ok(&router, "SearchVectors", body).await;
         assert_eq!(
             result_keys(&served),
@@ -879,7 +929,9 @@ async fn consumed_capacity_reports_the_index_data_the_search_read() {
             json!({
                 "pk": {"S": key},
                 "tenant": {"S": "t1"},
-                "note": {"S": "a note long enough to be worth projecting or not"},
+                // Long enough that the entries an ALL index hands back pass the per-request
+                // floor, while the ones a KEYS_ONLY index hands back stay under it.
+                "note": {"S": "n".repeat(600)},
                 "emb": {"L": embedding(&[1.0, 0.0])},
             }),
         )
@@ -933,28 +985,58 @@ async fn consumed_capacity_reports_the_index_data_the_search_read() {
         "every search over the same index must read the same bytes, got {reported:?}"
     );
 
-    // The figure is the data the INDEX holds, so the index that projects less reads less
-    // over the very same items.
-    let keys_only = ok(
-        &router,
-        "SearchVectors",
-        json!({
-            "TableName": "vector-search-capacity",
-            "IndexName": "keys-index",
-            "SearchVector": embedding(&[1.0, 0.0]),
-            "TopK": 3,
-            "ReturnConsumedCapacity": "TOTAL",
-            "SearchConditionExpression": "tenant = :t",
-            "ExpressionAttributeValues": {":t": {"S": "t1"}},
-        }),
-    )
-    .await;
-    let narrow = keys_only["ConsumedCapacity"]["VectorSearchRequestBytes"]
-        .as_f64()
-        .unwrap_or(f64::NAN);
-    assert!(
-        narrow > 0.0 && narrow < total,
-        "a KEYS_ONLY index holds less of each item than an ALL one, so it must read fewer \
-         bytes: got {narrow} against {total}"
-    );
+    // The figure is the data the search HANDED BACK, held to the one-kilobyte per-request
+    // floor, so rows that hand back less are charged less — down to that floor. The rows
+    // differ in how much the search reports: the index that projects less, and a `TopK`
+    // that asks for fewer results. What a `ProjectionExpression` does to the figure is NOT
+    // pinned here: whether narrowing a result to its key takes the charge all the way down
+    // to the floor is the one part of this meter still open, so no row asserts it either
+    // way.
+    let smaller: [(&str, Value); 2] = [
+        (
+            "a KEYS_ONLY index over the same items",
+            json!({
+                "TableName": "vector-search-capacity",
+                "IndexName": "keys-index",
+                "SearchVector": embedding(&[1.0, 0.0]),
+                "TopK": 3,
+                "ReturnConsumedCapacity": "TOTAL",
+                "SearchConditionExpression": "tenant = :t",
+                "ExpressionAttributeValues": {":t": {"S": "t1"}},
+            }),
+        ),
+        (
+            "one result instead of three",
+            json!({
+                "TableName": "vector-search-capacity",
+                "IndexName": "all-index",
+                "SearchVector": embedding(&[1.0, 0.0]),
+                "TopK": 1,
+                "ReturnConsumedCapacity": "TOTAL",
+                "SearchConditionExpression": "tenant = :t",
+                "ExpressionAttributeValues": {":t": {"S": "t1"}},
+            }),
+        ),
+    ];
+    for (case, body) in smaller {
+        let answered = ok(&router, "SearchVectors", body).await;
+        let narrow = answered["ConsumedCapacity"]["VectorSearchRequestBytes"]
+            .as_f64()
+            .unwrap_or(f64::NAN);
+        assert!(
+            narrow < total,
+            "case {case:?}: a search that hands back less is charged less than the {total} \
+             bytes the whole entries cost, got {narrow} from {answered}"
+        );
+        assert_eq!(
+            narrow, FLOOR_BYTES,
+            "case {case:?}: what it hands back is under the per-request floor, so it costs that \
+             floor, got {narrow} from {answered}"
+        );
+    }
 }
+
+/// The per-request floor a vector request is held to: "one write capacity unit represents
+/// one write per second for an item up to 1 KB in size" is the unit this service meters in,
+/// and a vector request is denominated in those bytes with that one-kilobyte minimum.
+const FLOOR_BYTES: f64 = 1024.0;

@@ -45,6 +45,16 @@ pub fn all_attributes_unprojected(index_name: &str) -> String {
     )
 }
 
+/// How a read of a table's VECTOR index is refused: a vector index is searched rather than
+/// queried or scanned — `SearchVectors` "performs a vector similarity search on a vector
+/// index" and takes its own `IndexName` — so an index of that kind answers neither of the
+/// two readers, whichever one named it. The sentence names the OPERATION that cannot read
+/// it and nothing of the index, because the refusal is about the kind of index the name
+/// resolved to.
+pub fn unsupported_index_type(operation: &str) -> String {
+    format!("{operation} operation not supported on this index type.")
+}
+
 /// The secondary index a read is served from, or `None` when it reads the table itself.
 ///
 /// Three facts of the request are settled here, in the order a reader meets them:
@@ -52,7 +62,9 @@ pub fn all_attributes_unprojected(index_name: &str) -> String {
 /// * "The name of a secondary index to [read]. This index can be any local secondary
 ///   index or global secondary index" (`Query$IndexName`): a name this table declares no
 ///   index for is the request's own mistake, stated over the name it sent
-///   ([`unknown_index_named`]);
+///   ([`unknown_index_named`]) — while a name the table does carry an index for, of a kind
+///   `operation` cannot read, is refused as the index type it is
+///   ([`unsupported_index_type`]) rather than reported absent;
 /// * a strongly consistent read of a global secondary index is refused
 ///   ([`CONSISTENT_READ_ON_GLOBAL_INDEX_MESSAGE`]);
 /// * a read of every item attribute can only be served from a global index that projects
@@ -62,6 +74,7 @@ pub fn all_attributes_unprojected(index_name: &str) -> String {
 /// request rather than to retry it.
 pub fn resolve_index<'t>(
     table: &'t Table,
+    operation: &str,
     index_name: Option<&str>,
     consistent_read: bool,
     selection: &Selection,
@@ -69,9 +82,20 @@ pub fn resolve_index<'t>(
     let Some(index_name) = index_name else {
         return Ok(None);
     };
-    let index = table
-        .secondary_index(index_name)
-        .ok_or_else(|| unknown_index_named(index_name))?;
+    let index = table.secondary_index(index_name).ok_or_else(|| {
+        // An index of this name the table DOES carry, that this reader cannot be served
+        // from, is reported as the kind of index it is: the table has it, so saying it is
+        // absent would send the caller looking for a resource that is there.
+        if table
+            .vector_indexes
+            .iter()
+            .any(|vector| vector.name == index_name)
+        {
+            RequestError::Validation(unsupported_index_type(operation))
+        } else {
+            unknown_index_named(index_name)
+        }
+    })?;
     if consistent_read && index.global {
         return Err(RequestError::Validation(
             CONSISTENT_READ_ON_GLOBAL_INDEX_MESSAGE.to_string(),

@@ -536,6 +536,11 @@ fn select_items(
         .limit
         .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0));
     let mut page_size: i64 = 0;
+    // The same bytes as this table METERS them ([`crate::state::Table::metered_item_size`]),
+    // which is what the capacity figures are computed over: the page's own 1 MB budget is
+    // about the bytes the response carries, while what a read COSTS counts a vector at the
+    // four bytes per dimension it is held as.
+    let mut metered_size: i64 = 0;
     // What the rows the plan evaluated COST, where the plan is a scan: one read unit per
     // 4 KB of EACH row, half a unit where the read is eventually consistent, and a whole
     // unit per 4 KB of each entry where the source is a secondary index — the charge a
@@ -558,6 +563,12 @@ fn select_items(
         }
         let size = held_size(item, projected.as_ref());
         page_size = page_size.saturating_add(size);
+        // What the row is BILLED for is what its source holds for it, weighed as this
+        // table meters an item ([`crate::state::Table::metered_item_size`]) — a vector at
+        // the four bytes per dimension it is held as — while the page's own budget above
+        // stays the bytes the response carries.
+        let metered = table.metered_item_size(&held_item(item, projected.as_ref()));
+        metered_size = metered_size.saturating_add(metered);
         // A plan that walks a SECONDARY INDEX is charged over what that index holds for
         // each row, in whole read units, exactly as the `Scan` of the same index is — one
         // rule for every reader that charges per row over a walk
@@ -565,7 +576,7 @@ fn select_items(
         // items takes the rate the statement asked to read them with.
         page_units += crate::state::walk_row_capacity_units(
             select.index.is_some(),
-            size,
+            metered,
             input.consistent_read.unwrap_or(false),
         );
         evaluated += 1;
@@ -614,7 +625,7 @@ fn select_items(
     // that walks the whole source is a scan, charged per row it evaluated. A plan that
     // evaluated nothing spends the one unit a read takes at least.
     let units = if partition.is_some() || evaluated == 0 {
-        crate::state::read_capacity_units(page_size, input.consistent_read.unwrap_or(false))
+        crate::state::read_capacity_units(metered_size, input.consistent_read.unwrap_or(false))
     } else {
         page_units
     };

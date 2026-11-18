@@ -583,9 +583,12 @@ fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // A key that holds no item still consumed the read it asked for, which is why
         // capacity is charged for every statement and only the ones that found an item
         // report one. "Transactional read requests require two read capacity units."
-        let units =
-            crate::state::read_capacity_units(found.as_ref().map_or(0, crate::state::item_size), true)
-                * crate::state::TRANSACTIONAL_CAPACITY_FACTOR;
+        let units = crate::state::read_capacity_units(
+            found
+                .as_ref()
+                .map_or(0, |item| table.metered_item_size(item)),
+            true,
+        ) * crate::state::TRANSACTIONAL_CAPACITY_FACTOR;
         consumed.extend(crate::state::consumed_capacity(
             requested_capacity,
             &name,

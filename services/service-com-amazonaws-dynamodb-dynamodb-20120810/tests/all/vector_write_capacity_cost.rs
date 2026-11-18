@@ -2,19 +2,27 @@
 
 //! What a write to a table carrying VECTOR INDEXES is charged for.
 //!
-//! The rule pinned here: a vector is held as 32-bit floats, four bytes per dimension, so a
-//! write of an item carrying one is METERED on that stored form rather than on the decimal
-//! text the request spelled each coordinate with — both in the figure each index reports
-//! ("VectorWriteRequestBytes", `ConsumedCapacity$VectorIndexes`, held to a one-kilobyte
-//! per-write floor, and reported under `VectorWriteRequestUnits` as well) and in the
-//! capacity the item's own write consumes (`ConsumedCapacity$CapacityUnits` and
-//! `ConsumedCapacity$Table`, one unit per kilobyte).
-//! The per-dimension cost is therefore part of what the write costs, and what it costs
-//! does not depend on how many digits a coordinate was written with.
+//! The rules pinned here:
 //!
-//! The rows differ along what the rule generalises over: the dimension count of the index
-//! the item reaches (one small enough to meter the floor and one far past it), which of
-//! the table's vector indexes the item reaches at all, and the number of digits each
+//! 1. what a vector index METERS for a write is the ENTRY it holds for the item — the
+//!    table's key, the vector attribute and whatever the index's `Projection` adds — each
+//!    attribute counted by its name and its value, with a vector counted at the four bytes
+//!    per dimension it is stored as rather than at the decimal text the request spelled it
+//!    with, and the figure held to a one-kilobyte per-write floor
+//!    ("VectorWriteRequestBytes", `ConsumedCapacity$VectorIndexes`, reported under
+//!    `VectorWriteRequestUnits` as well);
+//! 2. only the indexes a write AFFECTS are metered: one whose stored entry the write leaves
+//!    exactly as it stood is charged nothing, so a write that changes an attribute only
+//!    some of the table's indexes project is charged against those alone;
+//! 3. the capacity the item's own write consumes counts the vector the same way
+//!    (`ConsumedCapacity$CapacityUnits` and `$Table`, one unit per kilobyte), so what a
+//!    write costs never depends on how many digits a coordinate was written with;
+//! 4. the per-index figures are part of the itemisation `INDEXES` asks for: a `TOTAL`
+//!    answer carries the aggregate alone.
+//!
+//! The rows differ along what the rules generalise over: the dimension count of the index
+//! the item reaches, which of the table's vector indexes the item reaches at all, what each
+//! index projects, which attribute a rewrite changes, and the number of digits each
 //! coordinate carries (which moves the item's stored text by kilobytes while leaving the
 //! metered figures where they are).
 //!
@@ -37,8 +45,8 @@ use crate::emulator::{describe_when_active, emulator, ok};
 /// The table every row writes to.
 const TABLE: &str = "VectorWriteCost";
 
-/// The dimensions of the index whose entry is smaller than the per-write floor, so its
-/// bytes are the floor however the coordinates were spelled.
+/// The dimensions of the indexes over the attribute whose vector is smaller than the
+/// per-write floor, so their entries meter the floor however the coordinates were spelled.
 const SMALL_DIMENSIONS: usize = 4;
 
 /// The dimensions of the index whose entry is far past that floor, so its bytes grow with
@@ -62,6 +70,11 @@ const UNIT_BYTES: i64 = 1024;
 /// ("the item size that matters is the larger of the two").
 const KEY_BYTES: i64 = 2 + 2;
 
+/// The attribute the `INCLUDE` index below projects, and the one the `KEYS_ONLY` index
+/// beside it does not: long enough that an entry carrying it passes the per-write floor,
+/// so which indexes project it is visible in the figures.
+const EXTRA_BYTES: usize = 2_000;
+
 /// The two-character partition key row `row` writes under.
 fn key_of(row: usize) -> String {
     format!("k{row}")
@@ -78,33 +91,165 @@ fn vector(dimensions: usize, digits: usize) -> Value {
     )
 }
 
-/// The bytes a vector index over `attribute` with `dimensions` dimensions meters for a
-/// write of an item this test writes: four bytes per dimension, the attribute's name and
-/// the item's key, held to the one-kilobyte per-write floor.
-fn expected_index_bytes(attribute: &str, dimensions: usize) -> f64 {
+/// What one vector attribute of `dimensions` dimensions costs an entry that holds it: the
+/// attribute's name plus four bytes a dimension.
+fn vector_bytes(attribute: &str, dimensions: usize) -> i64 {
     let dimensions = i64::try_from(dimensions).expect("the dimension count fits");
     let name = i64::try_from(attribute.len()).expect("the attribute name fits");
-    let bytes = (dimensions * BYTES_PER_DIMENSION + name + KEY_BYTES).max(UNIT_BYTES);
-    bytes as f64
+    name + dimensions * BYTES_PER_DIMENSION
 }
 
-/// The capacity units the write of an item carrying `vectors` — each entry an attribute
-/// name and its dimension count — consumes: the item as the store holds it, with every
-/// vector counted at four bytes per dimension, at one unit per kilobyte.
-fn expected_units(vectors: &[(&str, usize)]) -> f64 {
-    let mut size = KEY_BYTES;
-    for (attribute, dimensions) in vectors {
-        let dimensions = i64::try_from(*dimensions).expect("the dimension count fits");
-        let name = i64::try_from(attribute.len()).expect("the attribute name fits");
-        size += name + dimensions * BYTES_PER_DIMENSION;
+/// What the `extra` attribute costs an entry that projects it: its name plus its value.
+fn extra_bytes(payload: usize) -> i64 {
+    let payload = i64::try_from(payload).expect("the payload size fits");
+    i64::try_from("extra".len()).expect("the attribute name fits") + payload
+}
+
+/// One index of the table below: the name, the vector attribute it indexes with its
+/// dimension count, and the `Projection` it holds its entries with.
+struct Index {
+    name: &'static str,
+    attribute: &'static str,
+    dimensions: usize,
+    projection: Projection,
+}
+
+/// Which of a covered item's attributes one index stores
+/// (`Projection$ProjectionType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Projection {
+    /// "ALL - All of the table attributes are projected into the index".
+    All,
+    /// "KEYS_ONLY - Only the index and primary key attributes are projected".
+    KeysOnly,
+    /// "INCLUDE - ... the attributes that are projected are those in NonKeyAttributes",
+    /// which for the table below is `extra`.
+    IncludeExtra,
+}
+
+impl Projection {
+    /// The `Projection` body a declaration carries.
+    fn body(self) -> Value {
+        match self {
+            Self::All => json!({"ProjectionType": "ALL"}),
+            Self::KeysOnly => json!({"ProjectionType": "KEYS_ONLY"}),
+            Self::IncludeExtra => {
+                json!({"ProjectionType": "INCLUDE", "NonKeyAttributes": ["extra"]})
+            }
+        }
     }
-    let units = (size / UNIT_BYTES + i64::from(size % UNIT_BYTES != 0)).max(1);
-    units as f64
 }
 
-/// Create the table the rows write to: two vector indexes over two attributes, of very
-/// different dimension counts, so one write can reach either or both.
+/// The table's indexes: two over the same small vector with different projections, and one
+/// over a far wider vector, so one write can reach any of them.
+const INDEXES: [Index; 4] = [
+    Index {
+        name: "idx-all",
+        attribute: "emb_small",
+        dimensions: SMALL_DIMENSIONS,
+        projection: Projection::All,
+    },
+    Index {
+        name: "idx-keys",
+        attribute: "emb_small",
+        dimensions: SMALL_DIMENSIONS,
+        projection: Projection::KeysOnly,
+    },
+    Index {
+        name: "idx-inc",
+        attribute: "emb_small",
+        dimensions: SMALL_DIMENSIONS,
+        projection: Projection::IncludeExtra,
+    },
+    Index {
+        name: "idx-large",
+        attribute: "emb_large",
+        dimensions: LARGE_DIMENSIONS,
+        projection: Projection::All,
+    },
+];
+
+/// The item one row writes: its key, the vector attributes it carries with their dimension
+/// counts, how many digits each coordinate is spelled with, and the size of the `extra`
+/// payload beside them (`None` for an item that carries none).
+struct Written {
+    row: usize,
+    vectors: Vec<(&'static str, usize)>,
+    digits: usize,
+    extra: Option<usize>,
+}
+
+impl Written {
+    /// The `Item` map this write carries.
+    fn item(&self) -> Value {
+        let mut item = json!({"pk": {"S": key_of(self.row)}});
+        for (attribute, dimensions) in &self.vectors {
+            item[*attribute] = json!({"L": vector(*dimensions, self.digits)});
+        }
+        if let Some(payload) = self.extra {
+            item["extra"] = json!({"S": "x".repeat(payload)});
+        }
+        item
+    }
+
+    /// Whether this item reaches `index` at all: it must carry the attribute that index
+    /// indexes.
+    fn reaches(&self, index: &Index) -> bool {
+        self.vectors
+            .iter()
+            .any(|(attribute, _)| *attribute == index.attribute)
+    }
+
+    /// The bytes `index` meters for a write of this item: the entry it holds for it — the
+    /// key, the vector attribute, and whatever its projection adds — held to the per-write
+    /// floor.
+    fn index_bytes(&self, index: &Index) -> f64 {
+        let mut bytes = KEY_BYTES + vector_bytes(index.attribute, index.dimensions);
+        if index.projection == Projection::All {
+            for (attribute, dimensions) in &self.vectors {
+                if *attribute != index.attribute {
+                    bytes += vector_bytes(attribute, *dimensions);
+                }
+            }
+        }
+        if index.projection != Projection::KeysOnly {
+            if let Some(payload) = self.extra {
+                bytes += extra_bytes(payload);
+            }
+        }
+        bytes.max(UNIT_BYTES) as f64
+    }
+
+    /// The capacity units the write of this item consumes: the item as the store holds it,
+    /// with every vector counted at four bytes per dimension, at one unit per kilobyte.
+    fn units(&self) -> f64 {
+        let mut size = KEY_BYTES;
+        for (attribute, dimensions) in &self.vectors {
+            size += vector_bytes(attribute, *dimensions);
+        }
+        if let Some(payload) = self.extra {
+            size += extra_bytes(payload);
+        }
+        let units = (size / UNIT_BYTES + i64::from(size % UNIT_BYTES != 0)).max(1);
+        units as f64
+    }
+}
+
+/// Create the table the rows write to, with [`INDEXES`] over two attributes of very
+/// different dimension counts and with three different projections.
 async fn vector_table(router: &MultiServiceRouter) {
+    let declarations: Vec<Value> = INDEXES
+        .iter()
+        .map(|index| {
+            json!({
+                "IndexName": index.name,
+                "VectorAttribute": {"AttributeName": index.attribute},
+                "Dimensions": index.dimensions,
+                "DistanceFunction": "COSINE",
+                "Projection": index.projection.body(),
+            })
+        })
+        .collect();
     ok(
         router,
         "CreateTable",
@@ -113,22 +258,7 @@ async fn vector_table(router: &MultiServiceRouter) {
             "BillingMode": "PAY_PER_REQUEST",
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
-            "VectorIndexes": [
-                {
-                    "IndexName": "idx-small",
-                    "VectorAttribute": {"AttributeName": "emb_small"},
-                    "Dimensions": SMALL_DIMENSIONS,
-                    "DistanceFunction": "COSINE",
-                    "Projection": {"ProjectionType": "ALL"},
-                },
-                {
-                    "IndexName": "idx-large",
-                    "VectorAttribute": {"AttributeName": "emb_large"},
-                    "Dimensions": LARGE_DIMENSIONS,
-                    "DistanceFunction": "COSINE",
-                    "Projection": {"ProjectionType": "ALL"},
-                },
-            ],
+            "VectorIndexes": declarations,
         }),
     )
     .await;
@@ -144,107 +274,97 @@ fn figure(consumed: &Value, path: &[&str]) -> Option<f64> {
     value.as_f64()
 }
 
-/// One row: the case, the vector attributes the item carries with their dimension counts,
-/// and how many significant digits each coordinate is spelled with.
-struct WriteRow {
-    case: &'static str,
-    vectors: Vec<(&'static str, usize)>,
-    digits: usize,
-}
-
 #[tokio::test]
-async fn a_write_is_charged_for_the_vector_it_stores() {
+async fn a_write_is_charged_for_the_entry_each_index_holds() {
     let router = emulator();
     vector_table(&router).await;
 
-    // Rows differ in which indexes the item reaches and in how many digits each coordinate
-    // carries: the two 18-digit rows write kilobytes more TEXT than their 1-digit
-    // counterparts for the same vectors, and must be metered and charged identically.
+    // Rows differ in which indexes the item reaches, in what those indexes project of it,
+    // and in how many digits each coordinate carries: the two 18-digit rows write kilobytes
+    // more TEXT than their 1-digit counterparts for the same vectors, and must be metered
+    // and charged identically.
     let both = vec![
         ("emb_small", SMALL_DIMENSIONS),
         ("emb_large", LARGE_DIMENSIONS),
     ];
     let small = vec![("emb_small", SMALL_DIMENSIONS)];
     let large = vec![("emb_large", LARGE_DIMENSIONS)];
-    let cases: [WriteRow; 6] = [
-        WriteRow {
-            case: "both vectors, one digit a coordinate",
-            vectors: both.clone(),
-            digits: 1,
-        },
-        WriteRow {
-            case: "both vectors, eighteen digits a coordinate",
-            vectors: both,
-            digits: 18,
-        },
-        WriteRow {
-            case: "the small vector alone, one digit",
-            vectors: small.clone(),
-            digits: 1,
-        },
-        WriteRow {
-            case: "the small vector alone, eighteen digits",
-            vectors: small,
-            digits: 18,
-        },
-        WriteRow {
-            case: "the large vector alone, one digit",
-            vectors: large.clone(),
-            digits: 1,
-        },
-        WriteRow {
-            case: "the large vector alone, eighteen digits",
-            vectors: large,
-            digits: 18,
-        },
+    let cases: [(&str, Written); 7] = [
+        (
+            "both vectors, one digit a coordinate",
+            Written { row: 0, vectors: both.clone(), digits: 1, extra: None },
+        ),
+        (
+            "both vectors, eighteen digits a coordinate",
+            Written { row: 1, vectors: both, digits: 18, extra: None },
+        ),
+        (
+            "the small vector alone, one digit",
+            Written { row: 2, vectors: small.clone(), digits: 1, extra: None },
+        ),
+        (
+            "the small vector alone, eighteen digits",
+            Written { row: 3, vectors: small.clone(), digits: 18, extra: None },
+        ),
+        (
+            "the large vector alone, one digit",
+            Written { row: 4, vectors: large.clone(), digits: 1, extra: None },
+        ),
+        (
+            "the large vector alone, eighteen digits",
+            Written { row: 5, vectors: large, digits: 18, extra: None },
+        ),
+        (
+            "the small vector beside a projected payload",
+            Written { row: 6, vectors: small, digits: 1, extra: Some(EXTRA_BYTES) },
+        ),
     ];
 
-    for (row, WriteRow { case, vectors, digits }) in cases.into_iter().enumerate() {
-        let mut item = json!({"pk": {"S": key_of(row)}});
-        for (attribute, dimensions) in &vectors {
-            item[*attribute] = json!({"L": vector(*dimensions, digits)});
-        }
+    for (case, written) in cases {
         let answered = ok(
             &router,
             "PutItem",
-            json!({"TableName": TABLE, "Item": item,
+            json!({"TableName": TABLE, "Item": written.item(),
                    "ReturnConsumedCapacity": "INDEXES"}),
         )
         .await;
         let consumed = &answered["ConsumedCapacity"];
 
-        // Each index the write reached reports the figure it metered, which is the stored
-        // vector and nothing of the text it was written as — under both the byte member and
-        // the request-units member, since the two report one meter; an index the item does
-        // not reach reports nothing at all.
-        for (index, attribute, dimensions) in [
-            ("idx-small", "emb_small", SMALL_DIMENSIONS),
-            ("idx-large", "emb_large", LARGE_DIMENSIONS),
-        ] {
-            let expected = vectors
-                .iter()
-                .any(|(written, _)| *written == attribute)
-                .then(|| expected_index_bytes(attribute, dimensions));
+        // Each index the write reached reports the bytes of the entry it holds — which is
+        // what its projection stores, and nothing of the text the vector was written as —
+        // under both the byte member and the request-units member, since the two report one
+        // meter; an index the item does not reach reports nothing at all.
+        for index in &INDEXES {
+            let expected = written.reaches(index).then(|| written.index_bytes(index));
             for member in ["VectorWriteRequestBytes", "VectorWriteRequestUnits"] {
-                let reported = figure(consumed, &["VectorIndexes", index, member]);
+                let reported = figure(consumed, &["VectorIndexes", index.name, member]);
                 assert_eq!(
                     reported, expected,
-                    "case {case:?}: expected {index} to meter {expected:?} under {member}, got \
-                     {reported:?} in {consumed}"
+                    "case {case:?}: expected {} to meter {expected:?} under {member}, got \
+                     {reported:?} in {consumed}",
+                    index.name
                 );
             }
             assert_eq!(
-                figure(consumed, &["VectorIndexes", index, "VectorSearchRequestBytes"]),
+                figure(
+                    consumed,
+                    &["VectorIndexes", index.name, "VectorSearchRequestBytes"]
+                ),
                 None,
-                "case {case:?}: a write searches nothing, so {index} reports no search \
-                 figure, got {consumed}"
+                "case {case:?}: a write searches nothing, so {} reports no search figure, got \
+                 {consumed}",
+                index.name
             );
         }
 
         // And the capacity the write consumed counts the vector at that same stored size,
         // on the aggregate and on the table's own line alike.
-        let expected = expected_units(&vectors);
-        for member in [vec!["CapacityUnits"], vec!["Table", "CapacityUnits"], vec!["WriteCapacityUnits"]] {
+        let expected = written.units();
+        for member in [
+            vec!["CapacityUnits"],
+            vec!["Table", "CapacityUnits"],
+            vec!["WriteCapacityUnits"],
+        ] {
             let reported = figure(consumed, &member);
             assert_eq!(
                 reported,
@@ -257,6 +377,134 @@ async fn a_write_is_charged_for_the_vector_it_stores() {
 }
 
 #[tokio::test]
+async fn only_the_indexes_whose_entry_the_write_changes_are_metered() {
+    let router = emulator();
+    vector_table(&router).await;
+
+    // One item reaching the three indexes over the small vector, with the payload only two
+    // of them project.
+    let stored = Written {
+        row: 7,
+        vectors: vec![("emb_small", SMALL_DIMENSIONS)],
+        digits: 1,
+        extra: Some(EXTRA_BYTES),
+    };
+    let put = |item: Value| {
+        let router = &router;
+        async move {
+            let answered = ok(
+                router,
+                "PutItem",
+                json!({"TableName": TABLE, "Item": item, "ReturnConsumedCapacity": "INDEXES"}),
+            )
+            .await;
+            answered["ConsumedCapacity"]["VectorIndexes"]
+                .as_object()
+                .map(|indexes| {
+                    let mut names: Vec<String> = indexes.keys().cloned().collect();
+                    names.sort();
+                    names
+                })
+                .unwrap_or_default()
+        }
+    };
+
+    // Rows differ in what the rewrite CHANGES: nothing at all, the payload only two
+    // indexes project, and the vector every one of them is built over. Each row states the
+    // indexes that must be metered for it.
+    let mut item = stored.item();
+    let metered = put(item.clone()).await;
+    assert_eq!(
+        metered,
+        vec![
+            "idx-all".to_string(),
+            "idx-inc".to_string(),
+            "idx-keys".to_string()
+        ],
+        "the first write puts an entry in every index the item reaches, got {metered:?}"
+    );
+
+    let metered = put(item.clone()).await;
+    assert!(
+        metered.is_empty(),
+        "a rewrite that stores what already stood there changes no entry, so no index is \
+         metered, got {metered:?}"
+    );
+
+    // A number respelt is the same number, so a rewrite that only changes how the vector
+    // was spelled changes no entry either.
+    item["emb_small"] = json!({"L": (0..SMALL_DIMENSIONS)
+        .map(|_| json!({"N": "1e-1"}))
+        .collect::<Vec<Value>>()});
+    let respelt = put(item.clone()).await;
+    assert!(
+        respelt.is_empty(),
+        "a rewrite that respells the same coordinates changes no entry, got {respelt:?}"
+    );
+
+    item["extra"] = json!({"S": "y".repeat(EXTRA_BYTES)});
+    let metered = put(item.clone()).await;
+    assert_eq!(
+        metered,
+        vec!["idx-all".to_string(), "idx-inc".to_string()],
+        "changing the payload must meter the indexes that project it and no others, got \
+         {metered:?}"
+    );
+
+    item["emb_small"] = json!({"L": vector(SMALL_DIMENSIONS, 1)});
+    item["emb_small"]["L"][0] = json!({"N": "0.5"});
+    let metered = put(item).await;
+    assert_eq!(
+        metered,
+        vec![
+            "idx-all".to_string(),
+            "idx-inc".to_string(),
+            "idx-keys".to_string()
+        ],
+        "changing the vector must meter every index built over it, got {metered:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_per_index_figures_are_the_itemisation_indexes_asks_for() {
+    let router = emulator();
+    vector_table(&router).await;
+
+    // Rows differ along `ReturnConsumedCapacity`: `TOTAL` reports "only the aggregate
+    // ConsumedCapacity for the operation" while `INDEXES` reports it "together with
+    // ConsumedCapacity for each table and secondary index that was accessed" (the
+    // `ReturnConsumedCapacity` doc), so only the latter carries the per-index figures.
+    let cases: [(&str, Value, bool); 3] = [
+        ("NONE", json!("NONE"), false),
+        ("TOTAL", json!("TOTAL"), false),
+        ("INDEXES", json!("INDEXES"), true),
+    ];
+    for (row, (case, requested, itemised)) in cases.into_iter().enumerate() {
+        let written = Written {
+            row: 10 + row,
+            vectors: vec![("emb_small", SMALL_DIMENSIONS)],
+            digits: 1,
+            extra: None,
+        };
+        let answered = ok(
+            &router,
+            "PutItem",
+            json!({"TableName": TABLE, "Item": written.item(),
+                   "ReturnConsumedCapacity": requested}),
+        )
+        .await;
+        let consumed = &answered["ConsumedCapacity"];
+        let reported = figure(consumed, &["VectorIndexes", "idx-all", "VectorWriteRequestBytes"]);
+        assert_eq!(
+            reported,
+            itemised.then(|| written.index_bytes(&INDEXES[0])),
+            "case {case:?}: expected the per-index figure only where the itemisation was asked \
+             for, got {answered}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn every_write_that_reaches_a_vector_index_meters_it_the_same_way() {
     let router = emulator();
     vector_table(&router).await;
@@ -264,20 +512,26 @@ async fn every_write_that_reaches_a_vector_index_meters_it_the_same_way() {
     // Rows differ in the OPERATION that reaches the index: what is metered is the index
     // ENTRY a write puts there, changes or removes, so each of the three write operations
     // reports the same figure for the same index and item.
+    let written = Written {
+        row: 20,
+        vectors: vec![("emb_small", SMALL_DIMENSIONS)],
+        digits: 1,
+        extra: None,
+    };
     let vector = json!({"L": vector(SMALL_DIMENSIONS, 1)});
-    let expected = expected_index_bytes("emb_small", SMALL_DIMENSIONS);
+    let expected = written.index_bytes(&INDEXES[1]);
     let cases: [(&str, &str, Value); 3] = [
         (
             "a put that stores the entry",
             "PutItem",
             json!({"TableName": TABLE, "ReturnConsumedCapacity": "INDEXES",
-                   "Item": {"pk": {"S": "w1"}, "emb_small": vector.clone()}}),
+                   "Item": written.item()}),
         ),
         (
             "an update that sets the vector attribute",
             "UpdateItem",
             json!({"TableName": TABLE, "ReturnConsumedCapacity": "INDEXES",
-                   "Key": {"pk": {"S": "w2"}},
+                   "Key": {"pk": {"S": key_of(21)}},
                    "UpdateExpression": "SET emb_small = :v",
                    "ExpressionAttributeValues": {":v": vector.clone()}}),
         ),
@@ -285,7 +539,7 @@ async fn every_write_that_reaches_a_vector_index_meters_it_the_same_way() {
             "a delete that removes the entry the put stored",
             "DeleteItem",
             json!({"TableName": TABLE, "ReturnConsumedCapacity": "INDEXES",
-                   "Key": {"pk": {"S": "w1"}}}),
+                   "Key": {"pk": {"S": key_of(20)}}}),
         ),
     ];
 
@@ -293,7 +547,7 @@ async fn every_write_that_reaches_a_vector_index_meters_it_the_same_way() {
         let answered = ok(&router, operation, request).await;
         let consumed = &answered["ConsumedCapacity"];
         for member in ["VectorWriteRequestBytes", "VectorWriteRequestUnits"] {
-            let reported = figure(consumed, &["VectorIndexes", "idx-small", member]);
+            let reported = figure(consumed, &["VectorIndexes", "idx-keys", member]);
             assert_eq!(
                 reported,
                 Some(expected),

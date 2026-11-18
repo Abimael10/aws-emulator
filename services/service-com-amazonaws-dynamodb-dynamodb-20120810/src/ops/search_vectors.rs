@@ -9,9 +9,9 @@
 //! Everything reported is computed from stored state: the index comes from the table
 //! `CreateTable`/`UpdateTable` wrote, the candidates are the table's own items (those the
 //! index covers, carrying a vector of the index's dimensions), and each result item is the
-//! entry the index REPORTS for it ([`crate::state::VectorIndex::reported_entry`]) — the
-//! attributes the index projects, without the vector it finds them by, so a search can
-//! report only what the index stores and never the embedding itself.
+//! entry the index HOLDS for it ([`crate::state::VectorIndex::index_entry`]) — the
+//! attributes the index projects, the vector it finds them by included, so a search
+//! reports exactly what the index stores and nothing the table holds outside it.
 //!
 //! The refusals, each grounded in the operation's own contract:
 //!
@@ -402,7 +402,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The index holds an entry per item it covers, so the search reads those entries:
         // the vector each is found by, and the attributes the condition filters on "at the
         // storage layer during search" (`SearchSchemaElement$SearchSchemaElementType`).
-        let mut read_bytes: i64 = 0;
         let mut ranked: Vec<(f64, &crate::state::Item)> = Vec::new();
         for item in table.items.values() {
             if !index.covers(item) {
@@ -415,9 +414,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) else {
                 continue;
             };
-            let entry = index.index_entry(item, &table.key_schema);
-            read_bytes = read_bytes.saturating_add(crate::state::item_size(&entry));
             if let Some(condition) = condition.as_ref() {
+                let entry = index.index_entry(item, &table.key_schema);
                 if !condition.evaluate(Some(&entry)).map_err(lift)? {
                     continue;
                 }
@@ -435,16 +433,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let top_k = usize::try_from(input.top_k).unwrap_or(0);
         let mut search_results: Vec<SearchResultItem> = Vec::new();
         let mut reported_bytes: i64 = 0;
+        // What the search METERS is the ITEMS it HANDED BACK:
+        // `VectorSearchRequestBytes` is "the number of vector search request bytes
+        // consumed" (`VectorCapacity$VectorSearchRequestBytes`), and a similarity search
+        // walks the index to the most similar entries rather than reading every one of
+        // them — so the figure is what the results carry, each sized as the index holds it
+        // ([`crate::state::Table::metered_item_size`], a vector at four bytes per
+        // dimension), and it grows with the `TopK` the request asked for, with the index's
+        // `Dimensions` and with the attributes the projection reports, never with how many
+        // items the table happens to hold.
+        let mut metered_bytes: i64 = 0;
         for (score, item) in ranked.into_iter().take(top_k) {
             if !search_results.is_empty() && page_budget_spent(reported_bytes) {
                 break;
             }
-            let entry = index.reported_entry(item, &table.key_schema);
+            let entry = index.index_entry(item, &table.key_schema);
             let projected = match requested_attributes.as_ref() {
                 Some(requested) => crate::state::project_paths(&entry, requested),
                 None => entry,
             };
             reported_bytes = reported_bytes.saturating_add(crate::state::item_size(&projected));
+            metered_bytes = metered_bytes.saturating_add(table.metered_item_size(&projected));
             search_results.push(SearchResultItem {
                 item: Some(projected),
                 score,
@@ -455,7 +464,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             search_results: Some(search_results),
             consumed_capacity: consumed_vector_capacity(
                 input.return_consumed_capacity.as_deref(),
-                read_bytes,
+                metered_bytes,
             ),
         })
     }
@@ -610,15 +619,19 @@ fn projected_attributes(
 ///
 /// `VectorCapacity` denominates a search in BYTES ("ConsumedCapacity … Contains
 /// VectorSearchRequestBytes, which represents the vector search capacity consumed" —
-/// `SearchVectors$ConsumedCapacity`), so what is reported is the index data this search
-/// read: the entries of every item the index holds that the search scored or filtered.
-/// Nothing was written, so the write figure is left out.
-fn consumed_vector_capacity(requested: Option<&str>, read_bytes: i64) -> Option<VectorCapacity> {
+/// `SearchVectors$ConsumedCapacity`), so what is reported is the data this search HANDED
+/// BACK: the bytes of each result as the index holds it, a vector at the four bytes per
+/// dimension it is stored as, held to the same one-kilobyte floor a vector write is held to
+/// ([`crate::state::MIN_VECTOR_REQUEST_BYTES`]) — a small search costs that minimum rather
+/// than its own few bytes. Nothing was written, so the write figure is left out.
+fn consumed_vector_capacity(requested: Option<&str>, metered_bytes: i64) -> Option<VectorCapacity> {
     match requested {
         Some("TOTAL" | "INDEXES") => Some(VectorCapacity {
             // Exact: the store admits far fewer bytes than an `f64` carries whole numbers
             // for, so the figure reported is the figure counted.
-            vector_search_request_bytes: Some(read_bytes.max(0) as f64),
+            vector_search_request_bytes: Some(
+                metered_bytes.max(crate::state::MIN_VECTOR_REQUEST_BYTES) as f64,
+            ),
             vector_write_request_bytes: None,
             vector_write_request_units: None,
         }),

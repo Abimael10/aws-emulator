@@ -222,10 +222,15 @@ pub fn consumed_write_capacity(
         global_secondary_indexes: detail
             .then(|| capacity_breakdown(kind, &capacity.global_secondary_indexes))
             .flatten(),
-        // A vector index's figure is not part of the capacity breakdown `INDEXES` asks
-        // for — it is a different meter, in bytes — so it is reported whenever the
-        // request asked for its consumption at all, for each index the write reached.
-        vector_indexes: vector_breakdown(&capacity.vector_indexes),
+        // A vector index's figure is a different meter from the capacity breakdown — it is
+        // in bytes — but it is part of the same ITEMISATION: "the aggregate
+        // ConsumedCapacity for the operation, together with ConsumedCapacity for each
+        // table and secondary index that was accessed" is what `INDEXES` asks for, while
+        // `TOTAL` asks for "only the aggregate" (the `ReturnConsumedCapacity` doc), so a
+        // `TOTAL` answer carries no per-index figure of either meter.
+        vector_indexes: detail
+            .then(|| vector_breakdown(&capacity.vector_indexes))
+            .flatten(),
         ..kind.consumed(table_name, capacity.total(), detail, report)
     })
 }

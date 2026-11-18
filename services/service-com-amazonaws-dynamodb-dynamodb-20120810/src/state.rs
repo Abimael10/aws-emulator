@@ -413,6 +413,16 @@ pub const MAX_VECTOR_INDEXES: usize = MAX_GLOBAL_SECONDARY_INDEXES;
 /// request body.
 pub const MAX_VECTOR_SEARCH_SCHEMA_ELEMENTS: usize = MAX_INDEX_KEY_ELEMENTS;
 
+/// How many `HASH` elements one vector index's search schema may declare.
+///
+/// "HASH - A partition key that partitions the vector index for independent scaling"
+/// (`SearchSchemaElement$SearchSchemaElementType`): ONE partition key partitions the
+/// index, so a schema naming the role twice states two partitionings of one index and is
+/// refused ([`crate::ops::create_table::DeclaredVectorIndex`] states that refusal). Every
+/// other element of a search schema takes the `INLINE_FILTER` role, which has no such
+/// bound beyond the length of the schema itself.
+pub const MAX_VECTOR_SEARCH_SCHEMA_PARTITION_KEYS: usize = 1;
+
 /// The most attribute definitions one table may declare.
 ///
 /// "The attributes in KeySchema must also be defined in the AttributeDefinitions
@@ -1341,7 +1351,15 @@ impl VectorIndex {
     }
 
     /// The entry this index holds for one covered item: just the attributes it stores
-    /// ([`Self::stored_attributes`]), which is what a search through it can report.
+    /// ([`Self::stored_attributes`]), which is what a search through it reports.
+    ///
+    /// A read of an index answers "attributes that are copied (projected) from the table
+    /// into the vector index" (`VectorIndex$Projection`), and the vector attribute is one
+    /// of the attributes the index holds ([`Self::consumed_attributes`]) — so a search
+    /// reports the vector it found the item by beside the score it computed from it, and
+    /// one entry serves every question about what the index holds for an item: what a
+    /// search reports, and what a write of it meters
+    /// ([`Table::vector_write_request_bytes`]).
     pub fn index_entry(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> Item {
         match self.stored_attributes(table_key_schema) {
             None => item.clone(),
@@ -1351,22 +1369,6 @@ impl VectorIndex {
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
         }
-    }
-
-    /// The entry this index REPORTS for one covered item: the entry it holds
-    /// ([`Self::index_entry`]) without the vector attribute itself.
-    ///
-    /// A read of an index answers "attributes that are copied (projected) from the table
-    /// into the vector index" (`VectorIndex$Projection`). The vector is what the index
-    /// FINDS an item by rather than an attribute it projects — the result carries the
-    /// similarity score computed from it instead — so it is not handed back as an item
-    /// attribute, whatever the index's `Projection` is. Everything else the index stores is
-    /// reported, which is why this is stated over [`Self::index_entry`] rather than beside
-    /// it.
-    pub fn reported_entry(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> Item {
-        let mut entry = self.index_entry(item, table_key_schema);
-        entry.remove(self.vector_attribute.attribute_name.as_str());
-        entry
     }
 
     /// The bytes this index stores for one covered item: the size of the entry it holds
@@ -1576,6 +1578,11 @@ fn index_projected_size(
 /// values with ([`attribute_values_equal`]) — a number respelt is the same number — and
 /// an attribute one version carries and the other does not is a change, whichever side
 /// carries it.
+///
+/// It is the same question [`same_item`] answers for two items that have already been
+/// narrowed to what an index stores ([`VectorIndex::index_entry`]): one rule, asked of the
+/// two shapes an index's projection comes in — a key schema with a `Projection` to apply
+/// here, a materialised entry there.
 fn index_entry_changed(
     key_schema: &[KeySchemaElement],
     projection: &Projection,
@@ -1909,7 +1916,11 @@ impl PendingStreamRecord {
 ///
 /// An attribute one version carries and the other does not is a change, whichever side
 /// carries it, which the name count settles before any value is compared.
-fn same_item(before: &Item, after: &Item) -> bool {
+///
+/// `pub(crate)`: it is also what decides whether a write changed the ENTRY a vector index
+/// holds ([`Table::write_capacity`]), which is two items narrowed to what that index stores
+/// ([`VectorIndex::index_entry`]) — the same question, over the same comparison.
+pub(crate) fn same_item(before: &Item, after: &Item) -> bool {
     before.len() == after.len()
         && before.iter().all(|(name, value)| {
             after

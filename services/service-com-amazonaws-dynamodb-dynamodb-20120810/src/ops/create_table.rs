@@ -1438,6 +1438,28 @@ impl DeclaredVectorIndex<'_> {
     ) -> Result<crate::state::VectorIndex, crate::state::RequestError> {
         validated_projection(self.index_name, self.projection)?;
         check_vector_dimensions(self.dimensions)?;
+        // "HASH - A partition key that partitions the vector index for independent
+        // scaling" (`SearchSchemaElement$SearchSchemaElementType`): ONE partition key
+        // partitions the index, so a schema declaring the role twice declares two
+        // partitionings of one index and has exceeded the count that role admits — the
+        // violation a key schema's second `HASH` element is, refused with the sentence
+        // this service already states for it
+        // ([`key_schema_exceeds_key_kind_message`]). The role every further element may
+        // take is the `INLINE_FILTER` one, of which a schema may declare as many as it
+        // carries elements.
+        let partition_keys = self
+            .search_schema
+            .unwrap_or_default()
+            .iter()
+            .filter(|element| {
+                element.search_schema_element_type == crate::state::SEARCH_SCHEMA_PARTITION_KEY
+            })
+            .count();
+        if partition_keys > crate::state::MAX_VECTOR_SEARCH_SCHEMA_PARTITION_KEYS {
+            return Err(crate::state::RequestError::Validation(
+                key_schema_exceeds_key_kind_message(crate::state::SEARCH_SCHEMA_PARTITION_KEY),
+            ));
+        }
         for element in self.search_schema.unwrap_or_default() {
             let name = element.attribute_name.as_str();
             if !definitions
@@ -1460,7 +1482,11 @@ impl DeclaredVectorIndex<'_> {
             dimensions: self.dimensions,
             distance_function: self.distance_function.to_string(),
             transient_status: crate::state::IndexStatus::Creating,
-            active_at: now + crate::state::STATUS_TRANSITION,
+            // An index is built when it has read what it was given to read
+            // ([`crate::state::IndexBackfill::complete_at`]): one declared with the table
+            // settles with the table, and one added to a table that already holds items
+            // keeps building after the table's own update has settled.
+            active_at: backfill.settled_at(now + crate::state::STATUS_TRANSITION),
             reported_counters: crate::state::MeteredCounters::new(now),
             backfill,
         })
@@ -1524,6 +1550,16 @@ fn count_of_key_type(key_schema: &[KeySchemaElement], key_type: &str) -> usize {
 /// sentence names the kind whose count was exceeded and nothing else — not the index, not
 /// the maximum, not the count that was sent — because the fact is about that kind's limit,
 /// which is the same limit for every index of every table.
+///
+/// A vector index's SEARCH SCHEMA is the schema that index is partitioned and filtered by
+/// — "the search schema that defines partition key and inline filter attributes"
+/// (`VectorIndex$SearchSchema`), with "HASH - A partition key that partitions the vector
+/// index" as the role a key schema's `HASH` plays — so a search schema declaring more than
+/// the one partitioning element its index admits
+/// ([`crate::state::MAX_VECTOR_SEARCH_SCHEMA_PARTITION_KEYS`]) has exceeded that same
+/// count, and earns this same sentence over the same role. One rule, one sentence, and no
+/// text invented for the vector surface: the wording here is the one this service already
+/// states for a key schema past that count.
 fn key_schema_exceeds_key_kind_message(key_type: &str) -> String {
     format!(
         "{}: The KeySchema exceeds the maximum allowed number of {key_type} key attributes",

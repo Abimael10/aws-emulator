@@ -511,6 +511,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::resolve_index`]).
         let index = crate::state::resolve_index(
             table,
+            OPERATION,
             input.index_name.as_deref(),
             consistent_read,
             &selection,
@@ -711,9 +712,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 break;
             }
             page_size = page_size.saturating_add(size);
+            // Each figure the scan BILLS is weighed as this table meters an item
+            // ([`crate::state::Table::metered_item_size`]) — a vector at the four bytes
+            // per dimension it is held as — while the page's own budget above stays the
+            // bytes the response carries.
             page_units += crate::state::walk_row_capacity_units(
                 index.is_some(),
-                crate::state::item_size(read.projected()),
+                table.metered_item_size(read.projected()),
                 consistent_read,
             );
             // What the scan spends ON THE TABLE: an index read that had to fetch the
@@ -722,7 +727,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ([`crate::state::fetch_capacity_units`]); what it spends on the INDEX is
             // what the index holds for the item, which is what `page_units` above sums.
             if fetches_from_table {
-                fetched_units += crate::state::fetch_capacity_units(size);
+                fetched_units +=
+                    crate::state::fetch_capacity_units(table.metered_item_size(read.seen()));
             }
             page.push(read);
         }

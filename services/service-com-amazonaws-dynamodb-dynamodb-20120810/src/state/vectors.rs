@@ -40,3 +40,19 @@ pub fn vector_component(element: &AttributeValue) -> Option<f32> {
         _ => None,
     }
 }
+
+/// What one dimension of a STORED vector costs: a vector attribute is a list of 32-bit
+/// IEEE-754 floats ([`vector_values`]), so each dimension is four bytes once it is held as
+/// the index holds it rather than as the decimal text the request sent.
+///
+/// It is what sizes a vector wherever this service meters one — the capacity a read or a
+/// write of the item consumes, the bytes a write of an index entry meters, and the bytes a
+/// search meters for each vector it scored — so none of those figures depends on how many
+/// digits a coordinate was written with.
+pub const BYTES_PER_VECTOR_DIMENSION: i64 = 4;
+
+/// The least one vector request meters: a vector index is metered in BYTES
+/// ("VectorWriteRequestBytes", "VectorSearchRequestBytes" — `VectorCapacity`) with a
+/// one-kilobyte floor, so a small vector costs the floor rather than its own few bytes, the
+/// way a write of a small item still costs one capacity unit.
+pub const MIN_VECTOR_REQUEST_BYTES: i64 = 1024;

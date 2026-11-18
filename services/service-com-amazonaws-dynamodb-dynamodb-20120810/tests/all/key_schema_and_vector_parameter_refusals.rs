@@ -854,10 +854,12 @@ async fn a_vector_write_reports_the_parameter_and_the_element_at_fault() {
     );
 }
 
-/// Rule 7: the metered bytes follow the index's `Dimensions`, the key the entry is held
-/// under and the per-write floor — and not the size of the item that carries the vector.
+/// Rule 7: the metered bytes follow the ENTRY the index holds — four bytes per dimension
+/// of the index's `Dimensions`, the key the entry is held under, the attributes the index's
+/// `Projection` adds — and the per-write floor; the decimal text the vector was written
+/// with never moves them.
 #[tokio::test]
-async fn a_vector_write_meters_the_vector_and_not_the_item_around_it() {
+async fn a_vector_write_meters_the_entry_the_index_holds() {
     let router = emulator();
 
     // Rows differ along the index's Dimensions: well below the floor, around the
@@ -873,15 +875,16 @@ async fn a_vector_write_meters_the_vector_and_not_the_item_around_it() {
         let vector = vector_of(usize::try_from(dimensions).unwrap_or_default());
 
         // The same vector under keys of two lengths, and once in an item carrying 8 KB
-        // of other attributes: the entry holds the key and the vector, so the key's
-        // length moves the figure and the rest of the item does not.
+        // of other attributes: this index projects ALL of the item, so the key's length and
+        // the attributes beside the vector are part of the entry it holds — and the vector
+        // itself is counted at four bytes a dimension whatever text it arrived as.
         for (shape, key_value, payload) in [
             ("a short key", "s", None),
             ("a longer key", "a-much-longer-item-key", None),
             (
                 "an item of several kilobytes beside the vector",
                 "payloaded",
-                Some(8_192),
+                Some(8_192_usize),
             ),
         ] {
             let mut item = json!({"pk": {"S": key_value}, "emb": vector.clone()});
@@ -890,9 +893,14 @@ async fn a_vector_write_meters_the_vector_and_not_the_item_around_it() {
             }
             // The entry sized the way the Developer Guide sizes an item ("Item sizes and
             // formats": each attribute's name plus its value bytes) — the key attribute
-            // `pk` and its value, the vector attribute's name `emb`, and four bytes per
-            // stored dimension — never less than the per-write floor.
-            let expected = ((dimensions * 4) + 2 + key_value.len() as i64 + 3).max(1024) as f64;
+            // `pk` and its value, the vector attribute's name `emb` and four bytes per
+            // stored dimension, and the projected payload where the item carries one —
+            // never less than the per-write floor.
+            let projected = payload.map_or(0, |bytes| {
+                ("payload".len() + bytes) as i64
+            });
+            let expected = ((dimensions * 4) + 2 + key_value.len() as i64 + 3 + projected)
+                .max(1024) as f64;
             let written = ok(
                 &router,
                 "PutItem",
@@ -905,8 +913,8 @@ async fn a_vector_write_meters_the_vector_and_not_the_item_around_it() {
             assert_eq!(
                 metered,
                 Some(expected),
-                "case {case:?} with {shape}: expected {expected} bytes (the key plus four per \
-                 dimension, never below the floor), got {written}"
+                "case {case:?} with {shape}: expected {expected} bytes (the key, the projected \
+                 attributes and four per dimension, never below the floor), got {written}"
             );
         }
     }

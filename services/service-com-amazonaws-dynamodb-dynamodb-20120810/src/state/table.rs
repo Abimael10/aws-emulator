@@ -33,58 +33,46 @@ enum IndexKeyWrite {
     Update,
 }
 
-/// The least a write to a vector index meters: a vector write is denominated in BYTES
-/// ("VectorWriteRequestBytes" — `ConsumedCapacity$VectorIndexes`) with a 1 KB floor, so a
-/// small vector costs the floor rather than its own few bytes, the way a write of a small
-/// item still costs one capacity unit.
-pub const MIN_VECTOR_WRITE_BYTES: i64 = 1024;
-
-/// What one dimension of a STORED vector costs: a vector attribute is a list of 32-bit
-/// IEEE-754 floats ([`vector_values`]), so each dimension is four bytes once it is held
-/// as the index holds it rather than as the decimal text the request sent.
-pub const BYTES_PER_VECTOR_DIMENSION: i64 = 4;
-
-impl VectorIndex {
-    /// The bytes one write of an item this index covers meters on it, where `key_bytes` is
-    /// the stored size of that item's primary KEY.
-    ///
-    /// What a vector write meters is the index ENTRY, not the item it was written from,
-    /// and the entry is sized the way this store sizes an item: the key it is held under,
-    /// plus the vector attribute — its name, and four bytes per dimension of the index
-    /// ([`BYTES_PER_VECTOR_DIMENSION`]) for the vector itself rather than the decimal text
-    /// the request spelled it with. The figure is then held to the per-write floor
-    /// ([`MIN_VECTOR_WRITE_BYTES`]).
-    ///
-    /// So it grows with the index's `Dimensions`, a small vector meters the floor however
-    /// large the item around it is, and the attributes that item carries beside the vector
-    /// are metered on the table's own capacity rather than here.
-    pub fn write_request_bytes(&self, key_bytes: i64) -> i64 {
-        let attribute =
-            i64::try_from(self.vector_attribute.attribute_name.len()).unwrap_or(i64::MAX);
-        self.dimensions
-            .saturating_mul(BYTES_PER_VECTOR_DIMENSION)
-            .saturating_add(attribute)
-            .saturating_add(key_bytes)
-            .max(MIN_VECTOR_WRITE_BYTES)
-    }
-}
-
 impl Table {
-    /// The size a WRITE of `item` against this table is charged for: the item as the
-    /// store holds it, with every attribute a vector index of this table indexes counted
-    /// at four bytes per dimension ([`BYTES_PER_VECTOR_DIMENSION`]) instead of at the
-    /// decimal text the request spelled that vector with.
+    /// The bytes one write of `item` meters on the vector index `index`, or `None` when
+    /// this write leaves that index's entry exactly as it stood.
+    ///
+    /// What a vector write meters is the index ENTRY, not the item it was written from, and
+    /// the entry is sized the way this store sizes an item it meters
+    /// ([`Self::metered_item_size`]): every attribute the index holds for that item —
+    /// the table's key, the vector attribute and its search schema, and whatever the
+    /// index's `Projection` adds ([`VectorIndex::index_entry`]) — each counted by its name
+    /// and its value, with a vector counted at four bytes per dimension
+    /// ([`BYTES_PER_VECTOR_DIMENSION`]) rather than at the decimal text the request spelled
+    /// it with. The figure is then held to the per-request floor
+    /// ([`MIN_VECTOR_REQUEST_BYTES`]).
+    ///
+    /// So it grows with the index's `Dimensions` and with the attributes that index
+    /// projects, a small entry meters the floor however large the item around it is, and
+    /// how many digits a coordinate was written with changes nothing.
+    fn vector_write_request_bytes(&self, index: &VectorIndex, item: &Item) -> i64 {
+        self.metered_item_size(&index.index_entry(item, &self.key_schema))
+            .max(MIN_VECTOR_REQUEST_BYTES)
+    }
+
+    /// The size a read or a write of `item` against this table is METERED at: the item as
+    /// the store holds it, with every attribute a vector index of this table indexes
+    /// counted at four bytes per dimension ([`BYTES_PER_VECTOR_DIMENSION`]) instead of at
+    /// the decimal text the request spelled that vector with.
     ///
     /// A vector is held as 32-bit floats, which is the form the index meters as well
-    /// ([`VectorIndex::write_request_bytes`]), so one rule sizes a vector wherever it is
-    /// metered: the per-dimension cost of writing it is part of what the item's own
-    /// capacity is charged for, and it does not depend on how many digits the request
-    /// spelled each coordinate with.
+    /// ([`Self::vector_write_request_bytes`]), so one rule sizes a vector wherever capacity
+    /// is metered — the units a write of the item consumes, and the units a read of it
+    /// consumes alike — and what either costs does not depend on how many digits the
+    /// request spelled each coordinate with.
     ///
     /// An attribute several indexes index is counted once: what is being sized is the
     /// ITEM, not the entries the write fans out to. An item carrying no vector, and every
     /// item of a table with no vector index, is sized exactly as the store holds it.
-    fn metered_item_size(&self, item: &Item) -> i64 {
+    ///
+    /// `pub`: every capacity figure of this table is metered through it, and the read
+    /// paths that bill one live in `crate::ops`.
+    pub fn metered_item_size(&self, item: &Item) -> i64 {
         let mut size = item_size(item);
         let mut counted: Vec<&str> = Vec::new();
         for index in &self.vector_indexes {
@@ -724,9 +712,25 @@ impl Table {
             // doc's own list of what a vector index requires of a write).
             for element in &index.search_schema {
                 let attribute = element.attribute_name.as_str();
+                // The `HASH` element is what "partitions the vector index"
+                // (`SearchSchemaElementType`), so it is a key attribute of the index: an
+                // item that carries this index's vector and a value no key may hold under
+                // that name — "Attribute values of type String and Binary must have a
+                // length greater than zero if the attribute is used as a key attribute for
+                // a table or index" (the `PutItem$Item` doc) — could not be indexed, so
+                // the write is refused rather than stored outside the index it was written
+                // for. An item that carries NO value for the attribute states no partition
+                // of the index and is simply not covered by it
+                // ([`VectorIndex::covers`]), which is the same rule a secondary index's
+                // key follows, so it is written as it stands.
                 let Some(supplied) = item.get(attribute) else {
                     continue;
                 };
+                if element.search_schema_element_type == SEARCH_SCHEMA_PARTITION_KEY {
+                    if let Some(kind) = empty_key_value_kind(supplied) {
+                        return Err(empty_index_key_attribute(attribute, kind, &index.name));
+                    }
+                }
                 if let Some(declared) = self.declared_type(attribute) {
                     let actual = attribute_value_type(supplied);
                     if declared != actual {
@@ -1536,7 +1540,11 @@ impl Table {
     /// The item is weighed as this table meters a write of it
     /// ([`Self::metered_item_size`]), which counts a vector at the four bytes per
     /// dimension it is stored as.
-    pub fn write_capacity(&self, before: Option<&Item>, after: Option<&Item>) -> WriteCapacity {
+    pub fn write_capacity<'a>(
+        &self,
+        before: Option<&'a Item>,
+        after: Option<&'a Item>,
+    ) -> WriteCapacity {
         let weighed = |item: Option<&Item>| item.map_or(0, |item| self.metered_item_size(item));
         let mut capacity = WriteCapacity {
             table: write_capacity_units(weighed(before).max(weighed(after))),
@@ -1571,20 +1579,35 @@ impl Table {
         // A VECTOR index is metered in bytes rather than in capacity units
         // ("ConsumedCapacity … also includes a VectorIndexes field with
         // VectorWriteRequestBytes consumed for each affected vector index" —
-        // `PutItem$ConsumedCapacity`), so each index the write reached carries its own
-        // figure beside the capacity breakdown above.
+        // `PutItem$ConsumedCapacity`), so each index this write AFFECTED carries its own
+        // figure beside the capacity breakdown above — by the same rule the capacity
+        // breakdown follows ([`index_write_units`]): an index whose stored entry this
+        // write leaves exactly as it stood is not affected and reports nothing.
         for index in &self.vector_indexes {
-            let reached = [before, after]
-                .into_iter()
-                .flatten()
-                .find(|item| index.covers(item));
-            if let Some(item) = reached {
-                let key_bytes = item_size(&self.key_attributes(item));
+            let entry = |version: Option<&'a Item>| version.filter(|item| index.covers(item));
+            let bytes = match (entry(before), entry(after)) {
+                (None, None) => None,
+                (None, Some(item)) | (Some(item), None) => {
+                    Some(self.vector_write_request_bytes(index, item))
+                }
+                (Some(old), Some(new)) => {
+                    let stored = index.index_entry(old, &self.key_schema);
+                    if same_item(&stored, &index.index_entry(new, &self.key_schema)) {
+                        None
+                    } else {
+                        Some(
+                            self.vector_write_request_bytes(index, old)
+                                .max(self.vector_write_request_bytes(index, new)),
+                        )
+                    }
+                }
+            };
+            if let Some(bytes) = bytes {
                 capacity.vector_indexes.insert(
                     index.name.clone(),
                     // Exact: the store admits far fewer bytes than an `f64` carries
                     // whole numbers for, so the figure reported is the figure counted.
-                    index.write_request_bytes(key_bytes) as f64,
+                    bytes as f64,
                 );
             }
         }

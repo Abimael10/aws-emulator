@@ -315,7 +315,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A key that holds no item still consumed the read it asked for, which is why
             // the capacity is charged for every `Get` and only the ones that were there
             // report an `Item`.
-            let size = item.as_ref().map_or(0, crate::state::item_size);
+            let size = item
+                .as_ref()
+                .map_or(0, |item| table.metered_item_size(item));
             let units = crate::state::read_capacity_units(size, true)
                 * crate::state::TRANSACTIONAL_CAPACITY_FACTOR;
             // One `Get` is one access of that item's key, charged the units this element

@@ -452,7 +452,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A key that holds no item still consumed the read it asked for, which
                 // is why the capacity is charged for every key and the list only grows
                 // for the ones that were there.
-                let size = item.as_ref().map_or(0, crate::state::item_size);
+                let size = item
+                    .as_ref()
+                    .map_or(0, |item| table.metered_item_size(item));
                 let units = crate::state::read_capacity_units(size, consistent_read);
                 // What this table's entry would REPORT of the item it found — its own
                 // projection applied — because the budget is on the bytes the response

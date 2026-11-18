@@ -598,7 +598,9 @@ fn read_item(
         _ => None,
     };
     let units = crate::state::read_capacity_units(
-        found.as_ref().map_or(0, crate::state::item_size),
+        found
+            .as_ref()
+            .map_or(0, |item| table.metered_item_size(item)),
         consistent_read,
     );
     // The read is ADMITTED against the read capacity the table is provisioned for, the

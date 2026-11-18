@@ -274,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
-        let item = {
+        let (item, size) = {
             let table = store.active_table(&region, &name, now).map_err(lift)?;
             // A table the policies in force do not let this caller read answers the
             // denial, not the item: it is decided before anything is read, against the
@@ -305,10 +305,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .key_of_key_map(&input.key)
                 .map_err(crate::state::unenveloped)
                 .map_err(lift)?;
-            table.items.get(&key).cloned()
+            let found = table.items.get(&key).cloned();
+            // What the read is BILLED for is the item as this table meters one
+            // ([`crate::state::Table::metered_item_size`]), which counts a vector at the
+            // four bytes per dimension it is held as rather than at the decimal text it
+            // was written with — so it is weighed here, while the table that meters it is
+            // still in hand.
+            let size = found
+                .as_ref()
+                .map_or(0, |item| table.metered_item_size(item));
+            (found, size)
         };
 
-        let size = item.as_ref().map_or(0, crate::state::item_size);
         let units =
             crate::state::read_capacity_units(size, input.consistent_read.unwrap_or(false));
         // The read is ADMITTED against the read capacity the table is provisioned for:

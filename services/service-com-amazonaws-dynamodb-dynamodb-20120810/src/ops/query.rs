@@ -545,6 +545,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // all ([`crate::state::resolve_index`]).
         let index = crate::state::resolve_index(
             table,
+            OPERATION,
             input.index_name.as_deref(),
             consistent_read,
             &selection,
@@ -737,10 +738,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ([`crate::state::fetch_capacity_units`]); what it spends on the INDEX is
             // what the index holds for the item, which is all the index itself was read
             // for.
+            //
+            // Both are weighed as this table METERS an item
+            // ([`crate::state::Table::metered_item_size`]) — a vector at the four bytes
+            // per dimension it is held as — while the page's own budget above stays the
+            // bytes the response carries.
             if fetches_from_table {
-                fetched_units += crate::state::fetch_capacity_units(size);
+                fetched_units +=
+                    crate::state::fetch_capacity_units(table.metered_item_size(read.seen()));
             }
-            index_bytes = index_bytes.saturating_add(crate::state::item_size(read.projected()));
+            index_bytes = index_bytes.saturating_add(table.metered_item_size(read.projected()));
             page.push(read);
         }
         let truncated = available > page.len();

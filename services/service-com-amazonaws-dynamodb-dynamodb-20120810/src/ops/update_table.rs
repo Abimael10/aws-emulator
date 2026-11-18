@@ -431,20 +431,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
-            crate::state::TableStatus::Updating => {
-                // "While it's UPDATING, you can't issue another UpdateTable request"
-                // (the doc above); `ResourceInUseException` is the modelled answer for
-                // "you tried to update a resource that was already being updated".
-                return Err(UpdateTableErrorModeled::ResourceInUseException(
-                    ResourceInUseException {
-                        message: Some(format!(
-                            "Attempt to change a resource which is still in use: Table is being \
-                             updated: {name}"
-                        )),
-                    },
-                )
-                .into())
-            }
+            crate::state::TableStatus::Updating => {}
             crate::state::TableStatus::Deleting => {
                 return Err(UpdateTableErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -455,6 +442,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
+        }
+        // What this request asks of an index that is still being BUILT, and of a table
+        // whose own update has not settled: "While it's UPDATING, you can't issue another
+        // UpdateTable request" (the doc above), and an index change asked for while one
+        // index is being built is past the limit on how many may be built at once
+        // ([`index_build_refusal`] decides which of the three answers each request earns).
+        if let Some(refusal) = index_build_refusal(
+            stored,
+            &name,
+            stored.status(now) == crate::state::TableStatus::Updating,
+            &index_updates,
+            &vector_index_updates,
+            now,
+        ) {
+            return Err(refusal);
         }
 
         // A table-class CHANGE is held to the quota on how many of them one table may be
@@ -1211,22 +1213,33 @@ fn validated_index_updates(
 /// which is one more than a single call may carry, so the two are counted TOGETHER; the
 /// sentence names the limit and nothing of which index or how many the request named.
 fn index_lifecycle_actions_over_limit(updates: &[GlobalSecondaryIndexUpdate]) -> Option<String> {
-    /// How many indexes one `UpdateTable` may create or delete, counted over both
-    /// actions: "You can create or delete only one global secondary index per UpdateTable
-    /// operation".
-    const PER_CALL: usize = 1;
     let lifecycle = updates
         .iter()
         .filter(|update| update.create.is_some() || update.delete.is_some())
         .count();
-    if lifecycle <= PER_CALL {
+    if lifecycle <= ONLINE_INDEX_ACTIONS_AT_ONCE {
         return None;
     }
     // AWS's text for this limit is FIXED: it states the limit and nothing of which
     // index or how many the request named, so it reads the same whichever side of the
     // lifecycle the request asked twice for — and the same sentence answers for a vector
     // index ([`vector_index_actions_over_limit`]).
-    Some(online_index_limit_message(PER_CALL))
+    Some(online_index_limit_message(ONLINE_INDEX_ACTIONS_AT_ONCE))
+}
+
+/// The build an index ADDED to `table` at `now` has ahead of it, whichever kind of index
+/// it is: the storage its entries need is laid down first, and then the items the table
+/// already holds are read ([`crate::state::IndexBackfill::added`] states the phases over
+/// the span the table's own update takes).
+fn added_index_backfill(
+    table: &crate::state::Table,
+    now: ::std::time::SystemTime,
+) -> crate::state::IndexBackfill {
+    crate::state::IndexBackfill::added(
+        !table.items.is_empty(),
+        now,
+        crate::state::STATUS_TRANSITION,
+    )
 }
 
 /// The sentence AWS states a per-call index lifecycle limit with: the limit, and nothing
@@ -1236,6 +1249,142 @@ fn online_index_limit_message(per_call: usize) -> String {
         "Subscriber limit exceeded: Only {per_call} online index can be created or deleted \
          simultaneously per table"
     )
+}
+
+/// How many of a table's indexes may be created or deleted AT ONCE: "Only 1 online index
+/// can be created or deleted simultaneously per table"
+/// ([`online_index_limit_message`]) — the limit each call is held to
+/// ([`index_lifecycle_actions_over_limit`], [`vector_index_actions_over_limit`]) and the
+/// limit the TABLE is held to across calls ([`refusal_while_updating`]), which is one
+/// figure: a second index change cannot be started while the first is still being built,
+/// whether both were asked for in one request or in two.
+const ONLINE_INDEX_ACTIONS_AT_ONCE: usize = 1;
+
+/// How an index DELETE is refused while that index is still having the storage its entries
+/// need allocated: the phase the index is in, the phases a delete of it is served in, and
+/// the table and index the caller asked about.
+///
+/// A newly created index has that storage laid down before it starts reading the items the
+/// table already held ([`crate::state::IndexBackfill`]), and only once that reading is
+/// under way — or over — can the build be cancelled; a delete that arrives first is refused
+/// as the in-use resource it addresses, and the sentence tells the caller which phase to
+/// retry in. One sentence for both kinds of index, because the phases are the build's
+/// rather than the kind's.
+fn index_allocating_message(table: &str, index: &str) -> String {
+    format!(
+        "Attempt to change a resource which is still in use: Index creation is in resource \
+         allocation phase. Retry deletion during backfilling phase or when the index is active. \
+         Table: {table} Index: {index}"
+    )
+}
+
+/// The refusal an `UpdateTable` earns from the index BUILDS already running on the table
+/// it addresses, and from the table's own unsettled update, or `None` when the request is
+/// one such a table still serves.
+///
+/// "While it's UPDATING, you can't issue another UpdateTable request" (the operation's
+/// doc), and `ResourceInUseException` is the modelled answer for "you tried to update a
+/// resource that was already being updated" — but a table whose update has settled keeps
+/// BUILDING an index it was given over items it already held, and what the caller asked of
+/// that build decides the answer:
+///
+/// * a second index change, while one index is still being built, is past the limit on how
+///   many of a table's indexes may be built at once ([`ONLINE_INDEX_ACTIONS_AT_ONCE`]), so
+///   it is answered the control plane's `LimitExceededException` — the code a client backs
+///   off and retries one index at a time on, rather than the in-use code it would abort on;
+/// * a DELETE of the very index that is being built cancels that build rather than asking
+///   for a second one, so it is served — unless the index is still having the storage its
+///   entries need allocated, which cannot be released yet
+///   ([`index_allocating_message`]);
+/// * everything else asked of a table that is still UPDATING is the plain in-use refusal,
+///   over the table this request addressed.
+///
+/// Every answer is decided over the indexes of BOTH kinds, because each of them is about
+/// an index being built and none of them is about the kind of index it is.
+fn index_build_refusal(
+    stored: &crate::state::Table,
+    name: &str,
+    table_updating: bool,
+    index_updates: &[GlobalSecondaryIndexUpdate],
+    vector_index_updates: &[VectorIndexUpdate],
+    now: ::std::time::SystemTime,
+) -> Option<UpdateTableError> {
+    let in_use = |message: String| -> UpdateTableError {
+        UpdateTableErrorModeled::ResourceInUseException(ResourceInUseException {
+            message: Some(message),
+        })
+        .into()
+    };
+    // Every index of this table the clock still owes its build, whichever KIND it is: each
+    // as the name it answers to and the backfill its build is made of
+    // ([`crate::state::IndexBackfill`]). One list, because both the per-table limit and the
+    // cancellation below are about an index being BUILT and neither is about its kind.
+    let building: Vec<(&str, crate::state::IndexBackfill)> = stored
+        .vector_indexes
+        .iter()
+        .filter(|index| index.status(now) == crate::state::IndexStatus::Creating)
+        .map(|index| (index.name.as_str(), index.backfill))
+        .chain(
+            stored
+                .global_secondary_indexes
+                .iter()
+                .filter(|index| index.status(now) == crate::state::IndexStatus::Creating)
+                .map(|index| (index.name.as_str(), index.backfill)),
+        )
+        .collect();
+    // How many of the lifecycle actions this request asks for CANCEL a build that is still
+    // running, which is work on the build already in flight rather than a second one — a
+    // delete naming an index of either kind that is being built.
+    let mut cancels: usize = 0;
+    let deleted = index_updates
+        .iter()
+        .filter_map(|update| update.delete.as_ref())
+        .map(|delete| delete.index_name.as_str())
+        .chain(
+            vector_index_updates
+                .iter()
+                .filter_map(|update| update.delete.as_ref())
+                .map(|delete| delete.index_name.as_str()),
+        );
+    for index_name in deleted {
+        let Some((index_name, backfill)) = building
+            .iter()
+            .find(|(building, _)| *building == index_name)
+        else {
+            continue;
+        };
+        if backfill.allocating(now) {
+            return Some(in_use(index_allocating_message(name, index_name)));
+        }
+        cancels += 1;
+    }
+    let lifecycle = index_updates
+        .iter()
+        .filter(|update| update.create.is_some() || update.delete.is_some())
+        .count()
+        + vector_index_updates
+            .iter()
+            .filter(|update| update.create.is_some() || update.delete.is_some())
+            .count();
+    if lifecycle > cancels {
+        if !building.is_empty() {
+            return Some(
+                UpdateTableErrorModeled::LimitExceededException(LimitExceededException {
+                    message: Some(online_index_limit_message(ONLINE_INDEX_ACTIONS_AT_ONCE)),
+                })
+                .into(),
+            );
+        }
+    } else if cancels > 0 {
+        // Nothing but the cancellation of a build already running, which is served even
+        // while the table's own update is settling: it is that very update it stops.
+        return None;
+    }
+    table_updating.then(|| {
+        in_use(format!(
+            "Attempt to change a resource which is still in use: Table is being updated: {name}"
+        ))
+    })
 }
 
 /// Why one request asks for more VECTOR-index lifecycle work than a single `UpdateTable`
@@ -1250,13 +1399,12 @@ fn online_index_limit_message(per_call: usize) -> String {
 /// answered with the control plane's modelled `LimitExceededException` — the code a client
 /// backs off on and retries one index at a time.
 fn vector_index_actions_over_limit(updates: &[VectorIndexUpdate]) -> Option<String> {
-    /// How many vector index actions one `UpdateTable` may carry.
-    const PER_CALL: usize = 1;
     let actions = updates
         .iter()
         .filter(|update| update.create.is_some() || update.delete.is_some())
         .count();
-    (actions > PER_CALL).then(|| online_index_limit_message(PER_CALL))
+    (actions > ONLINE_INDEX_ACTIONS_AT_ONCE)
+        .then(|| online_index_limit_message(ONLINE_INDEX_ACTIONS_AT_ONCE))
 }
 
 /// The vector-index actions one request asks for, each index named at most once.
@@ -1652,7 +1800,12 @@ fn resolve_indexes(
                 projection: create.projection.clone(),
                 provisioned_throughput: throughput,
                 transient_status: crate::state::IndexStatus::Creating,
-                active_at: now + crate::state::STATUS_TRANSITION,
+                // An index is built when it has read what it was given to read and the
+                // table's own update has settled, so one added to a table that already
+                // holds items keeps building after that update
+                // ([`crate::state::IndexBackfill::settled_at`]).
+                active_at: added_index_backfill(table, now)
+                    .settled_at(now + crate::state::STATUS_TRANSITION),
                 throughput_history: crate::state::ThroughputHistory::default(),
                 warm_throughput,
                 // An index added to a table that already holds items is metered on the
@@ -1664,11 +1817,7 @@ fn resolve_indexes(
                 // An index ADDED to a table has the items that table already holds to
                 // read, which is the backfill its description reports until those items
                 // have been processed ([`crate::state::IndexBackfill`]).
-                backfill: crate::state::IndexBackfill::added(
-                    !table.items.is_empty(),
-                    now,
-                    now + crate::state::STATUS_TRANSITION,
-                ),
+                backfill: added_index_backfill(table, now),
             });
         }
         if let Some(delete) = &update.delete {
@@ -1819,15 +1968,6 @@ fn resolve_vector_indexes(
     now: ::std::time::SystemTime,
 ) -> Result<Vec<crate::state::VectorIndex>, crate::state::RequestError> {
     let mut indexes = table.vector_indexes.clone();
-    // The mode the table is left in by this very update is what a created index has to hold
-    // on: an update that switches the table to the provisioned mode cannot add one either.
-    crate::state::check_vector_index_capacity_mode(
-        billing_mode,
-        updates
-            .iter()
-            .filter(|update| update.create.is_some())
-            .count(),
-    )?;
     for delete in updates.iter().filter_map(|update| update.delete.as_ref()) {
         let before = indexes.len();
         indexes.retain(|index| index.name != delete.index_name);
@@ -1880,15 +2020,24 @@ fn resolve_vector_indexes(
                 // What this index has to read is what the table ALREADY holds: an index
                 // added to a populated table backfills those items, and one added to an
                 // empty table has nothing to read
-                // ([`crate::state::IndexBackfill`]).
-                crate::state::IndexBackfill::added(
-                    !table.items.is_empty(),
-                    now,
-                    now + crate::state::STATUS_TRANSITION,
-                ),
+                // ([`crate::state::IndexBackfill`]). Its resources are allocated first,
+                // which takes the span the table's own update takes, and reading the items
+                // takes one more — so the table settles while the index is still being
+                // built, which is what a client that waits for the table and then looks at
+                // the index sees.
+                added_index_backfill(table, now),
                 now,
             )?,
         );
     }
+    // A vector index exists only on an ON-DEMAND table, so the mode this very update
+    // leaves the table in is what every index it will still CARRY has to hold on
+    // ([`crate::state::check_vector_index_capacity_mode`]): an update that adds one to a
+    // provisioned table is refused, and so is one that switches a table carrying vector
+    // indexes to the provisioned mode — while one that removes the last of them in the
+    // same call may switch it, because the table is left carrying none. Asked of the
+    // resolved list, after the deletes and the creates above, so one rule answers all
+    // three.
+    crate::state::check_vector_index_capacity_mode(billing_mode, indexes.len())?;
     Ok(indexes)
 }
