@@ -15,7 +15,9 @@
 //! The table spans what the rule generalises over: the OPERATION (every one that resolves
 //! a queue, addressed by url and by name), and the FORM of the absence (a name never
 //! created, a url of another account, an owner id that is not this emulator's, a bare name
-//! no queue carries, and a queue that was deleted). The expected message is the
+//! no queue carries, and a queue that was deleted), and the DIALECT the client speaks (the
+//! native JSON one, and the query-compatible one a client opts into, which is answered the
+//! legacy query code and fault BESIDE the same sentence). The expected message is the
 //! constant exported by [`service_com_amazonaws_sqs_amazonsqs::state`], which one test
 //! pins to AWS's own sentence written out literally.
 
@@ -23,7 +25,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::QUEUE_DOES_NOT_EXIST_MESSAGE;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::support::{account, call, create_ok, emulator, error_code, HOST, OTHER_ACCOUNT};
+use super::support::{
+    account, call, call_in_query_mode, call_with_headers, create_ok, emulator, error_code, HOST,
+    OTHER_ACCOUNT, QUERY_ERROR_HEADER,
+};
 
 /// AWS's own sentence for a queue the account does not hold, written out here rather than
 /// read off the service, so the constant the service exports stays pinned to it.
@@ -304,6 +309,122 @@ async fn every_refusal_of_an_absent_queue_carries_awss_own_sentence() {
             (400, "QueueDoesNotExist", AWS_SENTENCE),
             "case {operation} on {case}: expected a 400 QueueDoesNotExist reading \
              {AWS_SENTENCE:?}, got {status} with {parsed}"
+        );
+    }
+}
+
+/// The legacy query code this class travels under for a client that asked for the report:
+/// the model's `awsQueryError.code` for the error shape
+/// (`smithy_query(query="shape", shape="QueueDoesNotExist",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
+/// beside the fault side a refusal the caller caused is reported under.
+const NON_EXISTENT_QUEUE_REPORT: &str = "AWS.SimpleQueueService.NonExistentQueue;Sender";
+
+/// The value of one response header, or `None` when the answer carries none.
+fn header_of(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+}
+
+/// The DIALECT a client speaks decides only what the answer reports ALONGSIDE the error —
+/// the legacy query code and fault a query-compatible client opts into — and never the
+/// message: a client that asked for the legacy report is answered the same fixed sentence,
+/// with no clause of the retired endpoint appended to it, as a native client.
+///
+/// This is the half of the rule a dialect could drift on: the rows run every operation
+/// that resolves a queue, over the forms of absence, through BOTH dialects of the one
+/// answer and compare the sentence across them.
+#[tokio::test]
+async fn the_refusal_reads_the_same_in_both_wire_dialects() {
+    let router = emulator();
+    let deleted = create_ok(&router, "dialect-deleted", &json!({})).await;
+    let (status, parsed) = call(&router, "DeleteQueue", &json!({"QueueUrl": deleted})).await;
+    assert_eq!(
+        status, 200,
+        "case deleting the queue: expected HTTP 200, got {status} with {parsed}"
+    );
+
+    let forms: Vec<(&str, String)> = vec![
+        ("a url that was deleted", deleted.clone()),
+        (
+            "a url that was never created",
+            format!("https://{HOST}/{}/dialect-never-created", account()),
+        ),
+        (
+            "a bare name no queue of this account carries",
+            "dialect-never-created".to_string(),
+        ),
+        (
+            "another account's url for a name this account held",
+            format!("https://{HOST}/{OTHER_ACCOUNT}/dialect-deleted"),
+        ),
+    ];
+
+    let mut requests: Vec<(&str, &'static str, Value)> = Vec::new();
+    for (case, url) in &forms {
+        for (operation, request) in url_requests(url) {
+            requests.push((case, operation, request));
+        }
+    }
+    requests.push((
+        "a name that was never created",
+        "GetQueueUrl",
+        json!({"QueueName": "dialect-never-created"}),
+    ));
+    requests.push((
+        "a name that was deleted",
+        "GetQueueUrl",
+        json!({"QueueName": "dialect-deleted"}),
+    ));
+
+    for (case, operation, request) in &requests {
+        let (query_status, query_headers, query_body) =
+            call_in_query_mode(&router, operation, request).await;
+        let query_message = message_of(&query_body);
+        assert_eq!(
+            (
+                query_status,
+                error_code(&query_body).as_str(),
+                query_message.as_str(),
+                header_of(&query_headers, QUERY_ERROR_HEADER),
+            ),
+            (
+                400,
+                "QueueDoesNotExist",
+                AWS_SENTENCE,
+                Some(NON_EXISTENT_QUEUE_REPORT.to_string()),
+            ),
+            "case {operation} on {case} in the query-compatible dialect: expected a 400 \
+             QueueDoesNotExist reading {AWS_SENTENCE:?} reported as \
+             {NON_EXISTENT_QUEUE_REPORT:?}, got {query_status} with {query_body} and \
+             {QUERY_ERROR_HEADER} {:?}",
+            header_of(&query_headers, QUERY_ERROR_HEADER)
+        );
+
+        let (native_status, native_headers, native_body) =
+            call_with_headers(&router, operation, request).await;
+        let native_message = message_of(&native_body);
+        assert_eq!(
+            (
+                native_status,
+                error_code(&native_body).as_str(),
+                native_message.as_str(),
+                header_of(&native_headers, QUERY_ERROR_HEADER),
+            ),
+            (400, "QueueDoesNotExist", AWS_SENTENCE, None),
+            "case {operation} on {case} in the native dialect: expected a 400 \
+             QueueDoesNotExist reading {AWS_SENTENCE:?} and no {QUERY_ERROR_HEADER}, got \
+             {native_status} with {native_body} and {QUERY_ERROR_HEADER} {:?}",
+            header_of(&native_headers, QUERY_ERROR_HEADER)
+        );
+
+        assert_eq!(
+            query_message, native_message,
+            "case {operation} on {case}: the sentence must not depend on the dialect the \
+             client speaks, got {query_message:?} for a query-compatible client and \
+             {native_message:?} for a native one"
         );
     }
 }
