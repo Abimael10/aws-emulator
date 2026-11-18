@@ -537,15 +537,22 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// hyphens — so the 36-character grouped form is a value of the member, and it
     /// is distinguishable at a glance from the bare-hex `DetectorId` / finding id.
     pub fn mint_investigation_id(&mut self) -> String {
-        let hex = self.mint_id();
-        format!(
-            "{}-{}-{}-{}-{}",
-            &hex[0..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..32]
-        )
+        hyphenated_groups(&self.mint_id())
+    }
+
+    /// Mint an `AssociationId` for a custom detection rule association: the 32
+    /// hexadecimal characters [`Self::mint_id`] mints, grouped in the same
+    /// 8-4-4-4-12 form.
+    ///
+    /// `AssociationId` is `len 1..64, pattern ^[a-zA-Z0-9_-]{1,64}$`
+    /// (`smithy_query(shape="AssociationDetail")`) — a pattern that, unlike the
+    /// bare-hex `DetectorId` and finding id, admits the hyphen — so the grouped
+    /// 36-character form is a value of the member, and it is the form the member is
+    /// served in wherever it appears: the create that mints it, the detail read, the
+    /// listing summary and the `/association/<id>` suffix of the ARN built from it
+    /// ([`custom_detection_rule_association_arn`]).
+    pub fn mint_association_id(&mut self) -> String {
+        hyphenated_groups(&self.mint_id())
     }
 
     /// Mint a `MalwareProtectionPlanId`: the
@@ -1345,6 +1352,35 @@ pub struct MalwareProtectionPlanTokenRecord {
     /// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::tick_millis`].
     pub recorded_at_millis: i64,
 }
+
+/// Group 32 hexadecimal characters in the 8-4-4-4-12 form, the shape an id whose
+/// member admits the hyphen is served in ([`ComAmazonawsGuarddutyGuarddutyapiserviceState::mint_investigation_id`],
+/// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::mint_association_id`]).
+///
+/// One grouping for every such id, so two members of the same family cannot be
+/// served in two different forms. A value that is not the [`MINTED_HEX_LEN`]
+/// characters [`ComAmazonawsGuarddutyGuarddutyapiserviceState::mint_id`] mints is
+/// handed back ungrouped rather than sliced at a width it does not have, which no
+/// caller here can reach.
+fn hyphenated_groups(hex: &str) -> String {
+    if hex.len() != MINTED_HEX_LEN {
+        return hex.to_string();
+    }
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// The width of the hexadecimal value
+/// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::mint_id`] mints, which
+/// [`hyphenated_groups`] splits — the same 32 characters [`DETECTOR_ID_LEN`] names
+/// for the bare form a member whose pattern forbids the hyphen is served in.
+const MINTED_HEX_LEN: usize = DETECTOR_ID_LEN;
 
 /// The 64-bit golden-ratio odd constant used to decorrelate the two hash inputs.
 const GOLDEN_RATIO_64: u64 = 0x9E37_79B9_7F4A_7C15;

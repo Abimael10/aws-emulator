@@ -242,7 +242,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = state.tick_millis();
-        let association_id = state.mint_id();
+        // The association's `AssociationId` and the `/association/<id>` suffix of
+        // the ARN built from it are ONE value, minted in the form that member is
+        // served in ([`crate::state::ComAmazonawsGuarddutyGuarddutyapiserviceState::mint_association_id`]).
+        let association_id = state.mint_association_id();
         let record = crate::state::DetectionRuleAssociationRecord {
             association_id,
             region: region.clone(),

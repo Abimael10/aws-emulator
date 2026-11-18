@@ -349,9 +349,11 @@ pub fn dry_run_association_expiry(mode: &str, since_millis: i64) -> Option<i64> 
 #[derive(Debug, Clone)]
 pub struct DetectionRuleAssociationRecord {
     /// The minted `AssociationId`: `len 1..64`, `pattern ^[a-zA-Z0-9_-]{1,64}$`
-    /// (`smithy_query(shape="AssociationDetail")`), which the 32 hexadecimal
-    /// characters [`ComAmazonawsGuarddutyGuarddutyapiserviceState::mint_id`] mints
-    /// satisfy.
+    /// (`smithy_query(shape="AssociationDetail")`) — a pattern that admits the
+    /// hyphen, which is why the value is the grouped form
+    /// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::mint_association_id`] mints
+    /// rather than the bare hexadecimal one a member whose pattern forbids the
+    /// hyphen carries.
     pub association_id: String,
     /// The Region whose endpoint made this association, and the only one that
     /// reports it.
