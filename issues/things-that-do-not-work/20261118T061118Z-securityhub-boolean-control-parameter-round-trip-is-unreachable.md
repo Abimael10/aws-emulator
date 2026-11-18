@@ -1,0 +1,77 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: securityhub.batch-get-security-controls-parameter-round-trip
+Issue-Shape-Id: com.amazonaws.securityhub#SecurityHubAPIService
+Issue-Key: securityhub.batch-get-security-controls-parameter-round-trip|run#4|AssertionError|raise AssertionError(
+Issue-Commit: 5e1ce66aaf40efbb8bcb903be4505a65ffac087e
+
+# securityhub boolean control-parameter round trip is unreachable: no published control exposes ConfigurationOptions.Boolean, and UpdateSecurityControl + BatchGetSecurityControls are unimplemented 501 stubs
+
+> _Note: this issue was identified against the code base at commit `5e1ce66aaf40efbb8bcb903be4505a65ffac087e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+UpdateSecurityControl
+
+## Description
+Three distinct causes, all grounded in the single failing behavioral check securityhub.batch-get-security-controls-parameter-round-trip, which discovers a control with a customizable boolean parameter, sets it with UpdateSecurityControl(ValueType=CUSTOM) and reads it back with BatchGetSecurityControls. The check dies at the discovery step, so causes 2 and 3 are reached from the source but not from the wire; all three must be closed before the check can pass.
+
+Cause 1 of 3 — the published security-control catalog exposes no boolean customizable parameter, so ConfigurationOptions$Boolean is unreachable.
+AWS: Smithy: GetSecurityControlDefinition (GET /securityControl/definition -> 200) returns SecurityControlDefinition, whose ParameterDefinitions is a map of ParameterDefinition{Description @required, ConfigurationOptions @required}. ConfigurationOptions is a union with members Integer, IntegerList, Double, String, StringList, Boolean, Enum, EnumList; Boolean targets BooleanConfigurationOptions{DefaultValue: Boolean}, documented "The options for customizing a security control parameter that is a boolean. For a boolean parameter, the options are true and false." The model therefore requires the service to be able to publish a boolean-typed control parameter. The AWS Security Hub controls reference publishes boolean parameters on real controls — e.g. the IAM password-policy control's RequireUppercaseCharacters / RequireLowercaseCharacters / RequireSymbols / RequireNumbers parameters are boolean. The exact set of controls and parameter names is catalog content (recorded behavior only); the requirement is that at least the controls AWS publishes boolean parameters for do so here, with ConfigurationOptions.Boolean.DefaultValue carrying that control's published default.
+Emulator: the static catalog models a parameter's options with a two-variant enum — crate::state::security_controls::ParameterConfiguration has only Integer{default_value,min,max} and StringList{max_items,re2_expression,expression_description}. Of the 22 catalog entries, only three carry any parameter at all (ACM.1 -> daysToExpiration Integer; EC2.52 and ECS.13 -> requiredTagKeys StringList), so parameter_definition_view can only ever emit ConfigurationOptions::Integer or ConfigurationOptions::StringList. No reachable response ever carries a Boolean (or Double, String, Enum, EnumList) configuration option. The check enumerates every definition whose CustomizableProperties contains "Parameters", fetches each with GetSecurityControlDefinition, finds no ConfigurationOptions with a "Boolean" member, and fails with AssertionError: "no security control definition in this account/region exposes a customizable boolean parameter, so UpdateSecurityControl's parameter round trip cannot be exercised".
+Why: a client that discovers customizable parameters from the catalog and branches on the parameter's data type never takes its boolean path against the emulator. Code that sets a boolean control parameter (password-policy hardening, toggle-style control tuning) cannot be exercised or tested at all, and a client that enumerates the catalog to build a parameter-editing UI renders no boolean widgets where AWS reports boolean parameters.
+Fix: the security-control catalog data and its view in services/service-com-amazonaws-securityhub-securityhubapiservice/src/state/security_controls.rs — ParameterConfiguration needs a Boolean{default_value} variant (and the remaining ConfigurationOptions union variants as the catalog needs them), parameter_definition_view needs the matching arm, and SECURITY_CONTROL_CATALOG needs the entries AWS publishes boolean parameters for. This is catalog/representation data, not a serializer or pagination defect.
+Traces: securityhub.batch-get-security-controls-parameter-round-trip.
+
+Cause 2 of 3 — UpdateSecurityControl is an unimplemented scaffold stub and answers 501.
+AWS: Smithy: UpdateSecurityControl, PATCH /securityControl/update -> 200 with an empty UpdateSecurityControlResponse; input SecurityControlId (@required, pattern \S), Parameters (@required map of SecurityControlParameter{ValueType, Value}), LastUpdateReason (pattern ^([^\u0000-\u007F]|[-_ a-zA-Z0-9])+$); modeled errors AccessDeniedException(403), InternalException(500), InvalidAccessException(401), InvalidInputException(400), ResourceInUseException(400), ResourceNotFoundException(404), LimitExceededException(429). Setting a parameter with ValueType CUSTOM must persist it for the account/Region; ValueType DEFAULT must restore the control's published default.
+Emulator: services/service-com-amazonaws-securityhub-securityhubapiservice/src/ops/update_security_control.rs is still the generated stub — its handler discards the input and returns crate::scaffolded::Scaffolded::not_implemented("UpdateSecurityControl"), which the framework renders as HTTP 501 with error code NotImplemented. Expected 200 and a persisted parameter; actual 501 NotImplemented, nothing persisted.
+Why: a client cannot customize any security control parameter. A 501 is not a modeled failure for this operation, so an SDK surfaces it as an unexpected protocol error rather than one of the documented exceptions, and no retry or fallback path a client has written for AccessDenied/ResourceNotFound applies.
+Fix: implement the handler in that file — validate SecurityControlId against the published catalog (refusing an unpublished id with ResourceNotFoundException and the existing security_control_does_not_exist_message wording), validate each supplied parameter name and value against that control's ParameterDefinitions/ConfigurationOptions with InvalidInputException, and persist the per-account/Region custom parameter values in crate::state.
+Traces: securityhub.batch-get-security-controls-parameter-round-trip.
+
+Cause 3 of 3 — BatchGetSecurityControls is an unimplemented scaffold stub and answers 501.
+AWS: Smithy: BatchGetSecurityControls, POST /securityControls/batchGet -> 200; input SecurityControlIds (@required StringList); output SecurityControls (@required list of SecurityControl) plus UnprocessedIds; modeled errors InternalException(500), InvalidAccessException(401), InvalidInputException(400), LimitExceededException(429). Each returned SecurityControl must report the control's current effective Parameters, each entry carrying ValueType CUSTOM with the caller's Value when the parameter has been customized and DEFAULT otherwise.
+Emulator: services/service-com-amazonaws-securityhub-securityhubapiservice/src/ops/batch_get_security_controls.rs is still the generated stub — its handler discards the input and returns Scaffolded::not_implemented("BatchGetSecurityControls"), rendered as HTTP 501 NotImplemented. Expected 200 with SecurityControls[0].Parameters reflecting the write; actual 501 NotImplemented.
+Why: there is no way to read back a control's enabled/disabled state or its effective parameters, so the write side of cause 2 is unverifiable and any client that reconciles desired against actual control configuration is blind. As in cause 2, 501 is outside this operation's modeled error set.
+Fix: implement the handler in that file — resolve each id against the published catalog, report unknown ids under UnprocessedIds (with an error code/reason rather than failing the whole batch), and merge the per-account/Region custom parameter values from crate::state over the catalog's published defaults when building each SecurityControl's Parameters.
+Traces: securityhub.batch-get-security-controls-parameter-round-trip.
+
+Related open issues that do NOT cover any of these causes: 20261108T003636Z-securityhub-listsecuritycontroldefinitions-catalog-entries-diverge-from-aws-content.md and 20261109T143938Z-securityhub-listsecuritycontroldefinitions-serves-synthesized-control-metadata-instead-of.md concern the field VALUES (Description, RemediationUrl) and the presence of ParameterDefinitions on the list response for the 22 entries that already exist; neither adds a boolean-parameter control nor implements either operation above. The two auto-filed stub issues for this service name EnableOrganizationAdminAccount and UpdateSecurityHubConfiguration only. 20261029T180317Z-securityhub-mutations-are-not-reflected-by-later-reads.md concerns DescribeActionTargets/member accounts, not control parameters.
+
+## Evidence
+Failing behavioral check: securityhub.batch-get-security-controls-parameter-round-trip (verdict: mismatch), listed by the suite under service heading '### securityhub'. Suite total 20/26; this is the only surviving securityhub failure after the ALREADY-FILED and OWNED-by exclusions.
+
+Replay output:
+  File "check_securityhub_batch_get_security_controls_parameter_round_trip.py", line 20, in run
+    raise AssertionError(
+  AssertionError: no security control definition in this account/region exposes a customizable boolean parameter, so UpdateSecurityControl's parameter round trip cannot be exercised
+
+What the check does, and where each cause bites:
+  1. EnableSecurityHub(EnableDefaultStandards=False), tolerating ResourceConflictException — succeeds.
+  2. ListSecurityControlDefinitions, paged, collecting every SecurityControlId whose CustomizableProperties contains 'Parameters' — succeeds; the emulator's catalog yields exactly three such ids (ACM.1, EC2.52, ECS.13).
+  3. GetSecurityControlDefinition for each candidate, looking for a ParameterDefinitions entry whose ConfigurationOptions has a 'Boolean' member — succeeds, but finds none. This is CAUSE 1 and is where the check dies.
+  4. (never reached) UpdateSecurityControl(SecurityControlId=<id>, Parameters={<name>: {ValueType: 'CUSTOM', Value: {Boolean: <not default>}}}, LastUpdateReason=...). Expected HTTP 200 / empty UpdateSecurityControlResponse; the emulator's handler is the generated stub and returns HTTP 501, error code NotImplemented, message naming 'UpdateSecurityControl'. CAUSE 2.
+  5. (never reached) BatchGetSecurityControls(SecurityControlIds=[<id>]) polled until SecurityControls[0].Parameters[<name>].Value.Boolean == <custom value>, then asserting ValueType == 'CUSTOM'. Expected HTTP 200; the emulator's handler is the generated stub and returns HTTP 501, error code NotImplemented, message naming 'BatchGetSecurityControls'. CAUSE 3.
+  6. (never reached) cleanup UpdateSecurityControl(Parameters={<name>: {ValueType: 'DEFAULT'}}) — blocked by CAUSE 2.
+
+Source evidence for cause 1 — services/service-com-amazonaws-securityhub-securityhubapiservice/src/state/security_controls.rs:
+  * lines 51-68: `pub enum ParameterConfiguration { Integer { default_value, min, max }, StringList { max_items, re2_expression, expression_description } }` — only two variants, so the ConfigurationOptions union's Boolean/Double/String/Enum/EnumList members can never be produced.
+  * lines 294-320: `parameter_definition_view` matches exactly those two variants, emitting `ConfigurationOptions::Integer` or `ConfigurationOptions::StringList`.
+  * lines 150-261: `SECURITY_CONTROL_CATALOG: [SecurityControlCatalogEntry; 22]` — 19 entries carry `parameters: &[]`; only ACM.1 (`&ACM_1_PARAMETERS`, one Integer parameter `daysToExpiration`) and EC2.52 / ECS.13 (`&REQUIRED_TAG_KEYS_PARAMETERS`, one StringList parameter `requiredTagKeys`) carry any.
+  * lines 332-363: `security_control_definition_view` sets `customizable_properties = ['Parameters']` and populates `parameter_definitions` only when `!entry.parameters.is_empty()`, which is why the check's candidate list is non-empty yet no candidate yields a Boolean option.
+
+Source evidence for causes 2 and 3 — both handlers are untouched generated stubs whose body is `let _ = (&input, ctx, &self.engine); Err(crate::scaffolded::Scaffolded::not_implemented("<Op>"))`:
+  * src/ops/update_security_control.rs lines 155-173.
+  * src/ops/batch_get_security_controls.rs lines 151-169.
+  src/scaffolded.rs lines 7-11 state that `Scaffolded::not_implemented` is rendered as a protocol-correct HTTP 501 `NotImplemented`. 501/NotImplemented is not in either operation's modeled error set (UpdateSecurityControl: AccessDenied 403, Internal 500, InvalidAccess 401, InvalidInput 400, ResourceInUse 400, ResourceNotFound 404, LimitExceeded 429; BatchGetSecurityControls: Internal 500, InvalidAccess 401, InvalidInput 400, LimitExceeded 429).
+
+No host, port, request id, timestamp or account-specific value is part of this finding: the catalog is static service metadata and the two 501s are unconditional. The control ids, parameter names and numeric bounds quoted above are the emulator's current catalog values, cited as evidence of the gap — they are not the requirement.
+
+## Steps to Reproduce
+1. Clone the repo and boot the emulator from this checkout (the securityhub data listener plus /__admin/health must be up).
+2. Replay behavioral check securityhub.batch-get-security-controls-parameter-round-trip.
+3. Cause 1: call EnableSecurityHub(EnableDefaultStandards=False), then page ListSecurityControlDefinitions and collect every SecurityControlId whose CustomizableProperties contains 'Parameters'; for each, call GetSecurityControlDefinition and inspect SecurityControlDefinition.ParameterDefinitions[*].ConfigurationOptions. No entry has a 'Boolean' member — every option is 'Integer' or 'StringList' — so the check raises AssertionError 'no security control definition in this account/region exposes a customizable boolean parameter, ...'. Against AWS at least one published control (e.g. the IAM password-policy control) reports ConfigurationOptions.Boolean with a DefaultValue.
+4. Cause 2: independently of step 3, call UpdateSecurityControl(SecurityControlId='ACM.1', Parameters={'daysToExpiration': {'ValueType': 'CUSTOM', 'Value': {'Integer': 60}}}, LastUpdateReason='parameter round trip'). The emulator answers HTTP 501 with error code NotImplemented instead of HTTP 200 with an empty response body.
+5. Cause 3: call BatchGetSecurityControls(SecurityControlIds=['ACM.1']). The emulator answers HTTP 501 with error code NotImplemented instead of HTTP 200 with a SecurityControls list reporting that control's effective Parameters.
+6. After the fix, re-replay securityhub.batch-get-security-controls-parameter-round-trip: the catalog must offer a boolean customizable parameter, UpdateSecurityControl must accept ValueType CUSTOM with a Boolean value and return 200, BatchGetSecurityControls must report that parameter with ValueType 'CUSTOM' and the written Boolean value, and the cleanup UpdateSecurityControl with ValueType 'DEFAULT' must restore the published default.
