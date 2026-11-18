@@ -17,14 +17,17 @@
 //!    the detail is pinned to the stored type system and not to the test's own
 //!    arithmetic; and over a second creation on the SAME API, whose detail follows the new
 //!    document's count;
-//! 2. `StartSchemaCreation` VALIDATES the `apiId` it is addressed at: an id that resolves
-//!    to no API of this account is a 400 `BadRequestException` whose message echoes the
-//!    rejected id ("Invalid API ID `<apiId>`"), on every ground an id can fail on — a
-//!    value no API id can be, a well-formed id this account does not hold, inside the
-//!    alphabet the service mints ids over and outside it, and a value of another form
-//!    altogether. The reporting call of the same plane keeps resolving a RESOURCE through
-//!    its id, so the identical id is a 404 there — the contrast is asserted on the same
-//!    pair of calls.
+//! 2. `StartSchemaCreation` classifies the `apiId` it is addressed at by that id's FORM:
+//!    a value no id the service issues could be is a 400 `BadRequestException` whose
+//!    message echoes the rejected id ("Invalid API ID `<apiId>`"), while a value of the
+//!    form the service issues is a reference it could have handed out, so an API this
+//!    account does not hold is the 404 `NotFoundException` it is — asserted over a value
+//!    no API id can be, a value shorter than one, a value of another form altogether, an
+//!    id of the issued form this account does not hold and one of the issued length drawn
+//!    from outside the alphabet those ids are written in. The reporting call of the same
+//!    plane classifies the identical id by its own rule — the contrast is asserted on the
+//!    same pair of calls (`schema_creation_api_resolution` asserts the submitting call's
+//!    rule over the whole class, deleted APIs included).
 //!
 //! The harness is the one the schema suites already carry (the router the production
 //! emulator mounts, `start_creation`, `creation_status` and the poll that waits for the
@@ -235,8 +238,13 @@ async fn a_second_creation_detail_follows_the_new_document() {
 struct Rejected {
     label: &'static str,
     api_id: &'static str,
-    /// The status and error shape the REPORTING call owes the same id, which resolves a
-    /// resource through it rather than validating it.
+    /// Whether the value has the form of an id the service ISSUES, which is what the
+    /// submitting call reads: a value of that form is a reference the service could have
+    /// handed out, so the API it does not resolve to is a missing resource; any other
+    /// value is a request no API id appears in at all.
+    issued_form: bool,
+    /// The status and error shape the REPORTING call owes the same id, which classifies it
+    /// by its own rule.
     read: (u16, &'static str),
 }
 
@@ -249,47 +257,64 @@ fn rejected() -> Vec<Rejected> {
         Rejected {
             label: "an id too long to be one",
             api_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            issued_form: false,
             read: (400, "BadRequestException"),
         },
         Rejected {
             label: "a well-formed id this account does not hold",
             api_id: "abcdefghijklmnopqrstuvwxyz",
+            issued_form: true,
             read: (404, "NotFoundException"),
         },
         Rejected {
             label: "an id outside the id alphabet",
             api_id: "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            issued_form: false,
             read: (404, "NotFoundException"),
         },
         Rejected {
             label: "a value far shorter than an id",
             api_id: "zzz",
+            issued_form: false,
             read: (404, "NotFoundException"),
         },
         Rejected {
             label: "a value of another form altogether",
             api_id: "no.such.api",
+            issued_form: false,
             read: (404, "NotFoundException"),
         },
     ]
 }
 
 #[tokio::test]
-async fn submitting_a_schema_to_an_unresolvable_api_id_is_a_bad_request() {
+async fn submitting_a_schema_classifies_an_unresolvable_api_id_by_its_form() {
     let router = router();
     let document = b"type Query {\n  hello: String\n}\n";
 
     for row in rejected() {
         let refused = start_creation(&router, row.api_id, document).await;
-        let expected = format!("Invalid API ID {}", row.api_id);
+        let expected: (u16, &str, String) = if row.issued_form {
+            (
+                404,
+                "NotFoundException",
+                state::API_NOT_FOUND_MESSAGE.to_string(),
+            )
+        } else {
+            (
+                400,
+                "BadRequestException",
+                format!("Invalid API ID {}", row.api_id),
+            )
+        };
         assert_eq!(
             (
                 refused.status,
                 refused.error_type.as_str(),
                 refused.body["message"].as_str().unwrap_or_default()
             ),
-            (400, "BadRequestException", expected.as_str()),
-            "case {:?}: expected 400 BadRequestException {expected:?}, got {} {} {:?}",
+            (expected.0, expected.1, expected.2.as_str()),
+            "case {:?}: expected {expected:?}, got {} {} {:?}",
             row.label,
             refused.status,
             refused.error_type,

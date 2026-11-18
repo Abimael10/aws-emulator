@@ -874,8 +874,9 @@ async fn a_document_at_the_type_quota_is_created_and_one_past_it_fails() {
 /// One row of the reference table: an `apiId` that names no API of this account, and the
 /// answer the READING call of the schema plane owes it.
 ///
-/// The SUBMITTING call's answer is one for every row — the bad request its own suite
-/// pins (`schema_creation_plane_refusals`) — so it is not carried per row here.
+/// What the SUBMITTING call owes the same id follows a rule of its own, pinned by its own
+/// suites (`schema_creation_plane_refusals`, `schema_creation_api_resolution`), so it is
+/// not carried per row here.
 #[derive(Debug)]
 struct Reference {
     label: &'static str,

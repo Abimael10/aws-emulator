@@ -2446,6 +2446,12 @@ pub const API_ID_LEN: usize = 26;
 /// not-found. The alphabet is deliberately NOT part of the test: AppSync answers
 /// not-found for a short id drawn from outside the id alphabet, so a character outside
 /// it does not make the request malformed.
+///
+/// This is NOT the test for the form of an id the service ISSUES ([`is_opaque_id`]),
+/// which reads the length and the alphabet both: the two are deliberately different
+/// tests, because the operations that classify an `apiId` by the form of the reference
+/// rather than by its length are refused differently. Neither is a worse copy of the
+/// other, so they are not to be unified.
 pub fn is_api_id(candidate: &str) -> bool {
     !candidate.is_empty() && candidate.chars().count() <= API_ID_LEN
 }
@@ -3442,6 +3448,10 @@ fn base32_13(value: u64) -> String {
 /// This is a test on the FORM of a reference, not on what the store holds: a value that
 /// fails it is one the service could never have generated, so no resource of this
 /// account was ever addressable by it.
+///
+/// Stricter than [`is_api_id`], which reads the length of an `apiId` alone: an operation
+/// that refuses a reference no id it issued could be reads THIS test, and one that
+/// refuses only a value longer than an id reads that one.
 pub fn is_opaque_id(candidate: &str) -> bool {
     candidate.len() == API_ID_LEN
         && candidate

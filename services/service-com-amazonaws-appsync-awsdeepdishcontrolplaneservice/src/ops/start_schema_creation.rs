@@ -158,6 +158,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same way, through the status of the creation this call schedules.
         let definition = String::from_utf8_lossy(&input.definition).into_owned();
 
+        // Submitting a document is addressed at an API by its id, and the two grounds an
+        // `apiId` fails on are kept apart: a value whose FORM is none this service could
+        // ever have issued (`crate::state::is_opaque_id`) names no API at all, so the
+        // request itself is malformed and the refusal carries the rejected value; a value
+        // of the form the service issues is a reference it could have handed out, so the
+        // request is well formed and an API this account no longer holds — one deleted
+        // earlier, say — is the missing resource it is, reported with the fixed sentence
+        // every operation resolving an `apiId` states it with. This test is on the form of
+        // the reference alone, so it is answered before the store is consulted.
+        if !crate::state::is_opaque_id(&input.api_id) {
+            return Err(StartSchemaCreationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
         // A type is reported in the region the caller addressed, so its ARN is built
         // from that region rather than from a fixed one.
         let region = crate::state::request_region(ctx);
@@ -169,18 +188,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // left behind.
         guard.settle_schema_creations(now);
 
-        // Submitting a document is addressed at an API by its id, and this operation
-        // VALIDATES that id rather than resolving a resource through it: an `apiId` that
-        // names no API of this account is a malformed request — the id is the thing that
-        // is wrong — so the refusal is the modelled bad request, carrying the rejected id
-        // so the caller can see which value was refused. Every ground an `apiId` fails on
-        // is that one refusal: a value no API id can be at all and a well-formed id this
-        // account does not hold both name no API to add a schema to.
+        // The form of the id was settled above, so a miss here is an API this account
+        // does not hold: the resource is absent, not the request malformed.
         let Some(api) = guard.graphql_apis.get(&input.api_id) else {
-            return Err(StartSchemaCreationErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::invalid_api_id_message(&input.api_id)),
-                    ..Default::default()
+            return Err(StartSchemaCreationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
