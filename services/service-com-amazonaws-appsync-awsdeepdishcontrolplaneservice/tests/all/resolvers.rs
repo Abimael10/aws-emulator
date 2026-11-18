@@ -824,8 +824,8 @@ async fn a_listing_that_addresses_nothing_is_refused() {
         );
         assert_eq!(
             answer.message, "Invalid pagination token given.",
-            "case resuming from {token:?}: expected AppSync's fixed invalid-token text, got \
-             {answer:?}"
+            "case resuming from {token:?}: expected the v1 control plane's fixed \
+             invalid-token text, got {answer:?}"
         );
     }
 
@@ -1217,8 +1217,8 @@ async fn a_listing_by_function_reports_the_resolvers_that_invoke_it() {
         );
         assert_eq!(
             answer.message, "Invalid pagination token given.",
-            "case resuming the listing by function from {token:?}: expected AppSync's fixed \
-             invalid-token text, got {answer:?}"
+            "case resuming the listing by function from {token:?}: expected the v1 control \
+             plane's fixed invalid-token text, got {answer:?}"
         );
     }
 }

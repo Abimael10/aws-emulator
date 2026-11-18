@@ -18,8 +18,10 @@
 //! 3. a value outside an enumerated type's value set is reported by member path and
 //!    permitted value set, WITHOUT echoing the rejected value, while every other
 //!    constraint class keeps its echo;
-//! 4. a `nextToken` a list operation cannot resume from takes AppSync's fixed
-//!    invalid-token text, while a token that does name a page still resumes.
+//! 4. a `nextToken` a list operation of the v1 control plane cannot resume from takes
+//!    AppSync's fixed invalid-token text, while a token that does name a page still
+//!    resumes (the `/v2/apis…` surface words its own refusal — see
+//!    `crate::pagination_token_diagnosis`).
 //!
 //! Every assertion goes through the router the production emulator mounts, so these
 //! exercise routing, restJson1 (de)serialization, the boundary validator, the handlers
@@ -317,12 +319,12 @@ async fn a_value_outside_a_modelled_range_names_the_limit_and_the_range() {
     let router = router();
     let api_id = create_api(&router, "Api_range_rows").await;
 
-    // One row per `@range` member: where the value goes, the label the refusal names
-    // it by, and the bounds as the refusal renders them.
+    // One row per `@range` member: where the value goes, and the sentence the service
+    // states that member's range in.
     struct RangeCase {
         member: &'static str,
-        limit: &'static str,
-        range: &'static str,
+        /// The whole refusal sentence, as the service words it for THIS member.
+        stated: String,
         min: i64,
         max: i64,
         carrier: Carrier,
@@ -336,8 +338,7 @@ async fn a_value_outside_a_modelled_range_names_the_limit_and_the_range() {
     let rows = vec![
         RangeCase {
             member: "queryDepthLimit",
-            limit: "queryDepthLimit",
-            range: "0 to 75",
+            stated: "Invalid queryDepthLimit given. Must fall within range 0 to 75".to_string(),
             min: 0,
             max: 75,
             carrier: Carrier::Body {
@@ -348,8 +349,7 @@ async fn a_value_outside_a_modelled_range_names_the_limit_and_the_range() {
             member: "resolverCountLimit",
             // AppSync names this limit `resolverLimit`, and groups the thousands in
             // its bound; `service::REFUSAL_LABELS` holds that vocabulary.
-            limit: "resolverLimit",
-            range: "0 to 10,000",
+            stated: "Invalid resolverLimit given. Must fall within range 0 to 10,000".to_string(),
             min: 0,
             max: 10_000,
             carrier: Carrier::Body {
@@ -358,8 +358,9 @@ async fn a_value_outside_a_modelled_range_names_the_limit_and_the_range() {
         },
         RangeCase {
             member: "maxResults",
-            limit: "maxResults",
-            range: "0 to 25",
+            // A page size is stated as a value above the minimum and at most the
+            // maximum, which is not how the two API-level limits above are stated.
+            stated: "maxResults must be greater than 0 and less than or equal to 25.".to_string(),
             min: 0,
             max: 25,
             carrier: Carrier::Query {
@@ -368,8 +369,7 @@ async fn a_value_outside_a_modelled_range_names_the_limit_and_the_range() {
         },
         RangeCase {
             member: "maxResults",
-            limit: "maxResults",
-            range: "0 to 25",
+            stated: "maxResults must be greater than 0 and less than or equal to 25.".to_string(),
             min: 0,
             max: 25,
             carrier: Carrier::Query {
@@ -412,9 +412,9 @@ async fn a_value_outside_a_modelled_range_names_the_limit_and_the_range() {
                 "case {case:?}: expected error type BadRequestException, got {answer:?}"
             );
             assert_eq!(
-                answer.message,
-                format!("Invalid {} given. Must fall within range {}", row.limit, row.range),
-                "case {case:?}: expected the limit and its modelled range, got {answer:?}"
+                answer.message, row.stated,
+                "case {case:?}: expected the sentence the service states this limit's range \
+                 in, got {answer:?}"
             );
         }
     }
@@ -635,9 +635,8 @@ async fn a_pattern_clause_still_echoes_the_rejected_value() {
     );
 }
 
-/// Rule 4: a `nextToken` that names no page of the list takes AppSync's fixed
-/// invalid-token text, on every list operation; a token the list itself handed back
-/// still resumes.
+/// Rule 4: a `nextToken` that names no page of a v1 list operation takes AppSync's fixed
+/// invalid-token text; a token the list itself handed back still resumes.
 #[tokio::test]
 async fn an_unusable_pagination_token_takes_appsyncs_fixed_text() {
     let router = router();
@@ -677,7 +676,8 @@ async fn an_unusable_pagination_token_takes_appsyncs_fixed_text() {
             );
             assert_eq!(
                 answer.message, "Invalid pagination token given.",
-                "case {case:?}: expected AppSync's fixed invalid-token text, got {answer:?}"
+                "case {case:?}: expected the v1 control plane's fixed invalid-token text, \
+                 got {answer:?}"
             );
         }
 

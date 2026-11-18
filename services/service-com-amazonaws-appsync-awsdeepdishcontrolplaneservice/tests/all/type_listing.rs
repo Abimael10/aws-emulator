@@ -38,9 +38,9 @@ use super::graphql_types::{
 };
 use super::source_api_association::{associate_path, create_pair};
 
-/// The text a `BadRequestException` carries for a `nextToken` that resumes nothing.
-/// Pinned here rather than read from the service, so a drift in the wording fails this
-/// suite.
+/// The text a `BadRequestException` carries for a `nextToken` that resumes nothing: the
+/// v1 control plane's one fixed sentence. Pinned here rather than read from the service,
+/// so a drift in the wording fails this suite.
 const INVALID_PAGINATION_TOKEN: &str = "Invalid pagination token given.";
 
 /// The text a `NotFoundException` carries for a pair that names no source-API

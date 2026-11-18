@@ -11,15 +11,18 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-appsync-awsdeepdishcontrolplaneservice.json");
 
-// `skip_validation` names both mapping templates, for the reason given on
-// `CreateResolverInput` (`create_resolver_types`): `MappingTemplate`'s `@pattern` `^.*$`
-// admits every value, newlines included, so a multi-line Velocity template is one
-// AppSync accepts and the boundary's anchored match must not refuse it. The shape's
-// `@length` is enforced by the handler instead
-// (`crate::state::mapping_templates_refusal`).
+// `skip_validation` names both mapping templates and the function's `name`. The
+// templates, for the reason given on `CreateResolverInput` (`create_resolver_types`):
+// `MappingTemplate`'s `@pattern` `^.*$` admits every value, newlines included, so a
+// multi-line Velocity template is one AppSync accepts and the boundary's anchored match
+// must not refuse it. The shape's `@length` is enforced by the handler instead
+// (`crate::state::mapping_templates_refusal`). The `name`, because a value outside
+// `ResourceName`'s form is answered with the service's own sentence NAMING the resource
+// (`crate::state::resource_name_refusal`), which only this operation can choose — the
+// boundary's refusal seam is handed the broken clauses with no operation to key on.
 #[smithy_macros::smithy(
     shape = "com.amazonaws.appsync#CreateFunctionRequest",
-    skip_validation = ["requestMappingTemplate", "responseMappingTemplate"]
+    skip_validation = ["name", "requestMappingTemplate", "responseMappingTemplate"]
 )]
 #[derive(Debug, Clone, Default)]
 pub struct CreateFunctionInput {

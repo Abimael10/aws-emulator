@@ -234,13 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The candidate has to describe a data source AppSync could reach, exactly as
-        // the create's does, and it is judged in the same order: a data source of a
-        // type that is set up through a configuration member cannot be left without
-        // it — the request names a backend it does not say where to find, so it is not
-        // well formed whatever else it carries.
-        if let Some(member) = updated.missing_config() {
+        // the create's does, and it is judged by the same reading: ONE configuration,
+        // the one the declared type names, and — for a relational database — the source
+        // type that says how that database is reached
+        // (`crate::state::data_source_configuration_refusal`). The refusal comes before
+        // the stored record is replaced, so it leaves the data source as it was.
+        if let Some(message) = crate::state::data_source_configuration_refusal(&updated) {
             return Err(UpdateDataSourceErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::missing_data_source_config_message(member)),
+                message: Some(message),
                 ..Default::default()
             })
             .into());
@@ -258,7 +259,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_none_or(str::is_empty)
         {
             return Err(UpdateDataSourceErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::SERVICE_ROLE_NOT_SPECIFIED_MESSAGE.to_string()),
+                message: Some(
+                    crate::state::service_role_refusal_message(&updated.r#type).to_string(),
+                ),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // And the caller's credentials, by the same reading the create uses: a data
+        // source that would act as the CALLER needs an API that authenticates callers
+        // with IAM, so an update that would leave it without one is refused before the
+        // stored record is replaced.
+        if let Some(message) = crate::state::caller_credentials_refusal(
+            &updated,
+            crate::service::graphql_api::configures(
+                api,
+                crate::service::graphql_api::caller::IAM_AUTH_TYPE,
+            ),
+        ) {
+            return Err(UpdateDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message.to_string()),
                 ..Default::default()
             })
             .into());

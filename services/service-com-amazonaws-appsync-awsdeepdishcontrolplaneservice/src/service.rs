@@ -83,9 +83,10 @@ const BAD_REQUEST_CODE: &str = "BadRequestException";
 const FRAMEWORK_REFUSAL_CODE: &str = "ValidationException";
 
 /// Every member this service's model constrains with `@range`, with the bounds the
-/// shape it targets declares, keyed by the member name a violation path ends in.
+/// shape it targets declares and the sentence this service states a value outside them
+/// in, keyed by the member name a violation path ends in.
 ///
-/// Source: `smithy_query(query="shape", shape="MaxResults,MaxBatchSize,
+/// Source of the bounds: `smithy_query(query="shape", shape="MaxResults,MaxBatchSize,
 /// QueryDepthLimit,ResolverCountLimit")` — `MaxResults` 0..25 (every list operation's
 /// `maxResults`), `MaxBatchSize` 0..2000 (`CreateResolver`/`UpdateResolver`/
 /// `CreateFunction`/`UpdateFunction`), `QueryDepthLimit` 0..75 and
@@ -93,6 +94,13 @@ const FRAMEWORK_REFUSAL_CODE: &str = "ValidationException";
 /// shapes are the whole of it: every other numeric member of this model (the `ttl`
 /// and `expires` members among them) targets an unconstrained `Long`, so no other
 /// member can produce a range violation.
+///
+/// The SENTENCE is the service's vocabulary rather than the model's, the way
+/// [`REFUSAL_LABELS`] is: AppSync does not state every limit alike — it states a batch
+/// size as a value that must lie between the bounds, a page size as one that must be
+/// greater than the minimum and at most the maximum, and the two API-level limits as a
+/// range the value must fall within — so each member carries the form the service states
+/// it in ([`RangeSentence`]) and the bounds in that sentence are filled from this table.
 ///
 /// FOLLOW-UP: these bounds are copied out of the model rather than read from it,
 /// because a refusal reaches this file as a [`Violation`] whose
@@ -103,12 +111,46 @@ const FRAMEWORK_REFUSAL_CODE: &str = "ValidationException";
 /// change to the vendored framework, which this fix cannot make. Until then a member
 /// absent from the table is named alone rather than with invented bounds, so drift
 /// drops the range clause instead of stating a wrong one.
-const RANGED_MEMBERS: &[(&str, i64, i64)] = &[
-    ("maxBatchSize", 0, 2_000),
-    ("maxResults", 0, 25),
-    ("queryDepthLimit", 0, 75),
-    ("resolverCountLimit", 0, 10_000),
+const RANGED_MEMBERS: &[(&str, i64, i64, RangeSentence)] = &[
+    ("maxBatchSize", 0, 2_000, RangeSentence::ValueBetween),
+    ("maxResults", 0, 25, RangeSentence::GreaterThanAndAtMost),
+    ("queryDepthLimit", 0, 75, RangeSentence::WithinRange),
+    ("resolverCountLimit", 0, 10_000, RangeSentence::WithinRange),
 ];
+
+/// The forms this service states a value outside a member's modelled `@range` in — one
+/// per member ([`RANGED_MEMBERS`]), because the service words its limits differently and
+/// each member's wording is a requirement of the refusal.
+#[derive(Clone, Copy, Debug)]
+enum RangeSentence {
+    /// The value has to lie between the two bounds, with both written plainly: "Invalid
+    /// value for `<member>`. Must be between `<min>` and `<max>` (inclusive)".
+    ValueBetween,
+    /// The value has to be above the minimum and at most the maximum: "`<member>` must be
+    /// greater than `<min>` and less than or equal to `<max>`."
+    GreaterThanAndAtMost,
+    /// The value has to fall within the range, whose bounds are written with their
+    /// thousands grouped ([`grouped`]): "Invalid `<member>` given. Must fall within range
+    /// `<min>` to `<max>`".
+    WithinRange,
+}
+
+/// The sentence this service states a `label` outside `min..=max` in.
+fn range_message(label: &str, min: i64, max: i64, sentence: RangeSentence) -> String {
+    match sentence {
+        RangeSentence::ValueBetween => {
+            format!("Invalid value for {label}. Must be between {min} and {max} (inclusive)")
+        }
+        RangeSentence::GreaterThanAndAtMost => {
+            format!("{label} must be greater than {min} and less than or equal to {max}.")
+        }
+        RangeSentence::WithinRange => format!(
+            "Invalid {label} given. Must fall within range {} to {}",
+            grouped(min),
+            grouped(max)
+        ),
+    }
+}
 
 /// The members AppSync's own refusal labels differently from the request member that
 /// carries them.
@@ -160,7 +202,8 @@ fn grouped(value: i64) -> String {
 /// AppSync's own refusal for a member whose value the model rules out outright — an
 /// absent required member, or a value outside the member's modelled `@range`: the
 /// service's `BadRequestException`, naming the offending member, and the whole
-/// modelled range rather than the single bound that was crossed.
+/// modelled range rather than the single bound that was crossed, in the sentence the
+/// service states THAT member's range in ([`RANGED_MEMBERS`]).
 ///
 /// The framework's generic report would name `ValidationException`, a shape no
 /// operation of this service models, so a client matching on `BadRequestException`
@@ -174,15 +217,11 @@ fn member_refusal(violations: &[Violation]) -> Option<Refused> {
     violations.iter().find_map(|violation| {
         let member = violated_member(&violation.path);
         let label = refusal_label(member);
-        let range = RANGED_MEMBERS.iter().find(|(name, _, _)| *name == member);
+        let range = RANGED_MEMBERS.iter().find(|(name, ..)| *name == member);
         let message = match violation.kind {
             ViolationKind::MissingRequiredMember => format!("Invalid {label} given."),
             ViolationKind::MinValue(_) | ViolationKind::MaxValue(_) => match range {
-                Some((_, min, max)) => format!(
-                    "Invalid {label} given. Must fall within range {} to {}",
-                    grouped(*min),
-                    grouped(*max)
-                ),
+                Some((_, min, max, sentence)) => range_message(label, *min, *max, *sentence),
                 // A range this model does not declare cannot be stated; name the
                 // member alone rather than inventing bounds for it.
                 None => format!("Invalid {label} given."),
@@ -227,6 +266,97 @@ fn format_refusal(violations: &[Violation]) -> Option<Refused> {
     })
 }
 
+/// The order this service recites the values of `AuthenticationType` in when a refusal
+/// states that member's permitted set.
+///
+/// It is the SERVICE's order rather than the model's: the model declares `API_KEY`,
+/// `AWS_IAM`, `AMAZON_COGNITO_USER_POOLS`, `OPENID_CONNECT`, `AWS_LAMBDA`
+/// (`smithy_query(query="shape", shape="AuthenticationType")`), and a recorded refusal of
+/// an authorization mode recites them in the order below — so the permitted set a clause
+/// states is rendered from here, as the whole set, and nothing of the model's own order
+/// reaches the wire.
+const RECITED_AUTHENTICATION_TYPES: &[&str] = &[
+    "AWS_LAMBDA",
+    "AMAZON_COGNITO_USER_POOLS",
+    "OPENID_CONNECT",
+    "AWS_IAM",
+    "API_KEY",
+];
+
+/// Every enumerated type whose permitted set this service recites in an order of its own,
+/// each as the WHOLE set in that order.
+///
+/// A clause's set is matched to an entry by the values it holds rather than by the member
+/// it is stated at, because the violation carries the value set and not the shape that
+/// declared it; an enum absent from here keeps the order the model declares.
+const RECITED_VALUE_SETS: &[&[&str]] = &[RECITED_AUTHENTICATION_TYPES];
+
+/// The order this service traverses a structure's members in when it recites ONE clause
+/// per offending member.
+///
+/// The framework's walk recites them in the order the model declares the members, where
+/// the service recites them in the order it traverses its own: a recorded `CreateApi`
+/// refusal of all three of an `EventConfig`'s authorization-mode members states the
+/// publishing modes first, then the connection modes, then the subscription modes, where
+/// the model declares `connectionAuthModes` before either. A member absent from here keeps
+/// its place in the walk's order, after the members named below.
+const RECITED_MEMBERS: &[&str] = &[
+    "defaultPublishAuthModes",
+    "connectionAuthModes",
+    "defaultSubscribeAuthModes",
+];
+
+/// Where `path`'s member sits in the order this service recites members in
+/// ([`RECITED_MEMBERS`]), or past every named one when it names none of them.
+///
+/// Every segment of the path is read, so a member reached through a list or a map
+/// (`eventConfig.defaultPublishAuthModes.1.member.authType`) is ranked by the member whose
+/// value broke, not by the leaf the walk reports it at.
+fn recited_rank(path: &str) -> usize {
+    path.split('.')
+        .filter_map(|segment| RECITED_MEMBERS.iter().position(|named| *named == segment))
+        .min()
+        .unwrap_or(RECITED_MEMBERS.len())
+}
+
+/// `violations` as this service recites them: one clause per offending member in the order
+/// the service traverses those members ([`RECITED_MEMBERS`]), each enumerated clause's
+/// permitted set in the order the service recites that enum's values
+/// ([`RECITED_VALUE_SETS`]).
+///
+/// The clauses themselves, and the envelope around them, stay the framework's: only the
+/// ORDER of the report is the service's. The sort is stable, so clauses of members this
+/// service recites no order for keep the walk's own.
+fn recited(violations: &[Violation]) -> Vec<Violation> {
+    let mut stated: Vec<Violation> = violations
+        .iter()
+        .map(|violation| {
+            let mut violation = violation.clone();
+            if let ViolationKind::EnumValue(allowed) = &violation.kind {
+                if let Some(order) = recited_value_set(allowed) {
+                    violation.kind = ViolationKind::EnumValue(
+                        order.iter().map(|value| (*value).to_string()).collect(),
+                    );
+                }
+            }
+            violation
+        })
+        .collect();
+    stated.sort_by_key(|violation| recited_rank(&violation.path));
+    stated
+}
+
+/// The order this service recites `allowed` in, when `allowed` is the whole value set of
+/// an enum it recites in an order of its own.
+fn recited_value_set(allowed: &[String]) -> Option<&'static [&'static str]> {
+    RECITED_VALUE_SETS.iter().copied().find(|recited| {
+        recited.len() == allowed.len()
+            && recited
+                .iter()
+                .all(|value| allowed.iter().any(|held| held == value))
+    })
+}
+
 /// The framework's aggregated constraint report with the rejected value lifted out of
 /// every ENUM clause, or `None` when no clause echoes one.
 ///
@@ -237,6 +367,9 @@ fn format_refusal(violations: &[Violation]) -> Option<Refused> {
 /// echo, and the code stays the one the framework answers with
 /// ([`FRAMEWORK_REFUSAL_CODE`]).
 ///
+/// The clauses are recited in the order this service recites them, and each enumerated
+/// clause's permitted set in the order it recites that enum's values ([`recited`]).
+///
 /// The text replaced is built from the SAME two fields the framework interpolated
 /// (`Violation::message`), so it matches the echo exactly whatever the value holds.
 fn without_rejected_enum_values(violations: &[Violation]) -> Option<Refused> {
@@ -246,8 +379,9 @@ fn without_rejected_enum_values(violations: &[Violation]) -> Option<Refused> {
     if !echoes_enum_value {
         return None;
     }
-    let mut message = aws_smithy_schema_server::envelope(violations)?;
-    for violation in violations {
+    let stated = recited(violations);
+    let mut message = aws_smithy_schema_server::envelope(&stated)?;
+    for violation in &stated {
         if !matches!(violation.kind, ViolationKind::EnumValue(_)) {
             continue;
         }
@@ -377,6 +511,10 @@ fn tag_value_refusal(violations: &[Violation]) -> Option<Refused> {
 /// The last of the wordings this file states, so a member with a sentence of its own
 /// (a tagging `resourceArn`, a `format`) keeps it; `None` when no violation is of either
 /// class, which leaves a class this service does not word to the framework.
+///
+/// Its clauses are recited in the order this service recites them ([`recited`]), the same
+/// order the enum report above is recited in: the report's ORDER is the service's however
+/// many clauses it carries.
 fn declared_form_refusal(violations: &[Violation]) -> Option<Refused> {
     let breaks_declared_form = violations.iter().any(|violation| {
         matches!(
@@ -389,7 +527,7 @@ fn declared_form_refusal(violations: &[Violation]) -> Option<Refused> {
     }
     Some(Refused {
         code: BAD_REQUEST_CODE.to_string(),
-        message: aws_smithy_schema_server::envelope(violations)?,
+        message: aws_smithy_schema_server::envelope(&recited(violations))?,
     })
 }
 

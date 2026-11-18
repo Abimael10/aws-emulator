@@ -218,9 +218,13 @@ async fn an_update_points_a_function_at_a_data_source_its_own_api_holds() {
             "case move the function to {name:?}: expected NotFoundException, got {answer:?}"
         );
         assert_eq!(
-            answer.message,
-            format!("Data source {name} not found"),
+            answer.message, "Data source not found.",
             "case move the function to {name:?}: expected the data-source not-found text, \
+             which names no data source, got {answer:?}"
+        );
+        assert!(
+            !answer.message.contains(name),
+            "case move the function to {name:?}: expected the requested name withheld, \
              got {answer:?}"
         );
         let after = get_function(&router, &api_id, &function_id).await;

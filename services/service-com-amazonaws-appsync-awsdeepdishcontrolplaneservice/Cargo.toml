@@ -87,11 +87,13 @@ apollo-parser = "0.8"
 # issues its source-API association references in, and mints the random UUID a mapping
 # template's `$util.autoId()` answers with (`v4`).
 uuid = { version = "1", features = ["v4"] }
-# Evaluates the one modelled `@pattern` this crate checks outside the request boundary —
+# Evaluates the modelled `@pattern`s this crate checks outside the request boundary —
 # `ApiName`'s expression, which `CreateApi` and `UpdateApi` check in their handlers
-# (`src/state/api_name.rs`) — through the same linear-time engine the boundary's own
-# constraint walk uses, rather than a hand-coded character test. That expression is a
-# constant of the model, compiled once. The one expression this crate compiles from
+# (`src/state/api_name.rs`), and `ResourceName`'s, which the function operations check in
+# theirs (`src/state/resource_name.rs`) — through the same linear-time engine the
+# boundary's own constraint walk uses, rather than a hand-coded character test, and under
+# one reading of that evaluation (`src/state/declared_pattern.rs`). Both expressions are
+# constants of the model, compiled once. The one expression this crate compiles from
 # caller text is a mapping template's `$util.matches` pattern, which is built under an
 # explicit program budget for that reason
 # (`src/service/graphql_api/mapping_template/utilities.rs`).

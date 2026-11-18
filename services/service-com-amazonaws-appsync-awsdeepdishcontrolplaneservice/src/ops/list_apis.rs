@@ -167,8 +167,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.next_token.as_deref(),
             input.max_results,
         ) else {
+            // This is a `/v2/apis…` operation, so a token it cannot resume from is
+            // answered with the token decoder's own failure — this operation's name and
+            // the decoder's diagnosis of the payload — rather than with the v1 control
+            // plane's one fixed sentence (`crate::state::pagination_token`).
             return Err(ListApisErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::INVALID_PAGINATION_TOKEN_MESSAGE.to_string()),
+                message: Some(crate::state::pagination_token_refusal(
+                    Self::NAME,
+                    input.next_token.as_deref(),
+                )),
                 ..Default::default()
             })
             .into());

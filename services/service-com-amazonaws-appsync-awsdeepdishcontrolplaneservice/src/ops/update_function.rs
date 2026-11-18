@@ -188,6 +188,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A `name` outside the form `ResourceName` declares is refused here rather than
+        // at the boundary (`skip_validation` on `UpdateFunctionInput`), for the reason the
+        // create's is: the service answers it with ONE sentence naming the resource whose
+        // name it is (`crate::state::resource_name_refusal`). The refusal comes before the
+        // stored record is touched, so it leaves the function as it was.
+        if let Some(message) =
+            crate::state::resource_name_refusal(crate::state::FUNCTION_RESOURCE, &input.name)
+        {
+            return Err(UpdateFunctionErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // A mapping template outside the modelled `@length` of `MappingTemplate` is
         // refused here rather than at the boundary (`skip_validation` on
         // `UpdateFunctionInput`): the shape's `@pattern` admits any content, newlines
@@ -248,9 +263,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource, including one held by a DIFFERENT API.
         if !api.data_sources.contains_key(&input.data_source_name) {
             return Err(UpdateFunctionErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::data_source_not_found_message(
-                    &input.data_source_name,
-                )),
+                // The data source is a DEPENDENCY this request names rather than the
+                // resource it addresses, so the absence is stated without the name
+                // (`crate::state::DATA_SOURCE_NOT_FOUND_MESSAGE`).
+                message: Some(crate::state::DATA_SOURCE_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         }

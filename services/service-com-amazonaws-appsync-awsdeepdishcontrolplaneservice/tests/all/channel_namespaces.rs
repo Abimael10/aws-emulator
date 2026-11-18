@@ -738,9 +738,12 @@ async fn the_listing_pages_the_stored_namespaces_without_their_code_handlers() {
             answer.status, 400,
             "case resuming from {token:?}: expected status 400, got {answer:?}"
         );
-        assert_eq!(
-            answer.message, "Invalid pagination token given.",
-            "case resuming from {token:?}: expected AppSync's fixed text, got {answer:?}"
+        assert!(
+            answer
+                .message
+                .starts_with("Pagination token exception in operation 'ListChannelNamespaces': "),
+            "case resuming from {token:?}: expected the refusal to name the operation the \
+             token was submitted to, got {answer:?}"
         );
     }
 }

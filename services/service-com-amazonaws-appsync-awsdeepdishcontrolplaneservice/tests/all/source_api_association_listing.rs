@@ -428,8 +428,9 @@ async fn a_listing_pages_through_its_associations_in_creation_order() {
         );
         assert_eq!(
             answer.body["message"].as_str(),
-            Some("Invalid maxResults given. Must fall within range 0 to 25"),
-            "case {case}: expected the limit and its modelled range, got {:?}",
+            Some("maxResults must be greater than 0 and less than or equal to 25."),
+            "case {case}: expected the sentence the service states this limit's range in, \
+             got {:?}",
             answer.body
         );
     }

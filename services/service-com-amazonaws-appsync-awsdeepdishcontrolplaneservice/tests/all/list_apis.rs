@@ -48,8 +48,9 @@ const COUNTS: &[usize] = &[0, 1, 4, 13, state::DEFAULT_PAGE_SIZE];
 /// i.e. unspecified, so `0` and an absent member select the same page).
 const PAGE_SIZES: &[Option<i32>] = &[None, Some(0), Some(1), Some(2), Some(7), Some(25)];
 
-/// AppSync's fixed text for a `nextToken` a listing cannot resume from.
-const INVALID_TOKEN: &str = "Invalid pagination token given.";
+/// The half of the text for a `nextToken` a listing cannot resume from that is fixed: the
+/// sentence also carries the token decoder's diagnosis of the payload.
+const INVALID_TOKEN: &str = "Pagination token exception in operation 'ListApis': ";
 
 /// One page of a listing: the ids it reported, the cursor that resumes after them, and
 /// the entries themselves.
@@ -345,13 +346,23 @@ async fn a_listing_that_cannot_resume_is_refused() {
                 "case resuming from {token:?} at maxResults {max_results:?}: expected \
                  BadRequestException, got {answer:?}"
             );
-            assert_eq!(
-                answer.message, INVALID_TOKEN,
-                "case resuming from {token:?} at maxResults {max_results:?}: expected AppSync's \
-                 fixed invalid-token text, got {answer:?}"
+            assert!(
+                answer.message.starts_with(INVALID_TOKEN),
+                "case resuming from {token:?} at maxResults {max_results:?}: expected the \
+                 refusal to name the operation the token was submitted to, got {answer:?}"
             );
         }
     }
+
+    // One row stated in FULL, so this suite pins the whole sentence and not only the half
+    // that names the operation: `bogus`'s payload states the wrapping schema 28296 (the
+    // leading 16 bits of the bytes its base64 characters `b`, `o`, `g` spell).
+    let answer = list_page(&router, None, Some("bogus")).await;
+    assert_eq!(
+        answer.message,
+        format!("{INVALID_TOKEN}invalid payload wrapping schema 28296"),
+        "case resuming from \"bogus\": expected the whole sentence, got {answer:?}"
+    );
 
     // `maxResults` is modelled `@range` 0..25: both published bounds are served, and
     // one past either bound is refused naming the member and the whole range.
@@ -367,7 +378,9 @@ async fn a_listing_that_cannot_resume_is_refused() {
                 "case maxResults {max_results}: expected BadRequestException, got {answer:?}"
             );
             assert!(
-                answer.message.contains("maxResults") && answer.message.contains("0 to 25"),
+                answer.message.contains("maxResults")
+                    && answer.message.contains("greater than 0")
+                    && answer.message.contains("less than or equal to 25"),
                 "case maxResults {max_results}: expected the refusal to name the member and its \
                  range, got {answer:?}"
             );

@@ -390,8 +390,8 @@ async fn a_listing_that_addresses_nothing_is_refused() {
         );
         assert_eq!(
             answer.message, "Invalid pagination token given.",
-            "case resuming from {token:?}: expected AppSync's fixed invalid-token text, got \
-             {answer:?}"
+            "case resuming from {token:?}: expected the v1 control plane's fixed \
+             invalid-token text, got {answer:?}"
         );
     }
 

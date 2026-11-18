@@ -55,7 +55,7 @@ const METRICS_CONFIGS: &[Option<&str>] = &[Some("ENABLED"), Some("DISABLED"), No
 /// relational database configuration" and "the new Amazon EventBridge settings".
 const MISSING_CONFIG_REFUSALS: &[(&str, &str)] = &[
     ("lambdaConfig", "Missing Lambda data source config"),
-    ("dynamodbConfig", "Missing Amazon DynamoDB data source config"),
+    ("dynamodbConfig", "Missing DynamoDB data source config"),
     ("elasticsearchConfig", "Missing OpenSearch data source config"),
     ("openSearchServiceConfig", "Missing OpenSearch data source config"),
     ("httpConfig", "Missing HTTP endpoint data source config"),

@@ -79,8 +79,20 @@ pub(crate) fn reported_service_role<'a>(
     sent.filter(|_| needs_service_role(data_source_type))
 }
 
-/// The refusal a data source of a role-requiring type with no role takes.
+/// The refusal a data source with no role takes: the sentence every type states it in,
+/// and the one `AMAZON_DYNAMODB`'s own validation states, which ends on the member rather
+/// than on a full stop.
 const ROLE_REFUSAL: &str = "Service role arn not specified.";
+const DYNAMO_ROLE_REFUSAL: &str = "Service role arn not specified";
+
+/// The sentence a data source of this `type` with no role is refused with.
+fn role_refusal(data_source_type: &str) -> &'static str {
+    if data_source_type == "AMAZON_DYNAMODB" {
+        DYNAMO_ROLE_REFUSAL
+    } else {
+        ROLE_REFUSAL
+    }
+}
 
 /// The settings member a `DataSourceType` is configured through, as a request fragment
 /// to merge into a create body — present on every row, so the only thing a row's
@@ -236,7 +248,8 @@ async fn a_type_that_needs_a_service_role_is_refused_without_one() {
             // The row carries its per-type configuration, so the refusal has to be
             // the ROLE's rather than a missing configuration's.
             assert_eq!(
-                created.message, ROLE_REFUSAL,
+                created.message,
+                role_refusal(data_source_type),
                 "case {case:?}: expected the refusal to name the absent member, got {created:?}"
             );
 
@@ -396,7 +409,8 @@ async fn the_refusal_turns_on_the_role_alone_and_leaves_the_name_free() {
                     "case {case:?}: expected error type BadRequestException, got {refused:?}"
                 );
                 assert_eq!(
-                    refused.message, ROLE_REFUSAL,
+                    refused.message,
+                    role_refusal(data_source_type),
                     "case {case:?}: expected the refusal to name the absent member, \
                      got {refused:?}"
                 );
@@ -587,7 +601,8 @@ async fn an_update_cannot_leave_a_data_source_without_the_role_its_type_needs() 
                 "case {case:?}: expected status 400, got {updated:?}"
             );
             assert_eq!(
-                updated.message, ROLE_REFUSAL,
+                updated.message,
+                role_refusal(data_source_type),
                 "case {case:?}: expected the role refusal, got {updated:?}"
             );
             // A refused update changes nothing.

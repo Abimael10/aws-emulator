@@ -186,6 +186,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A `name` outside the form `ResourceName` declares is refused here rather than
+        // at the boundary (`skip_validation` on `CreateFunctionInput`): the service
+        // answers it with ONE sentence naming the resource whose name it is, which only
+        // the operation that names that resource can choose (see
+        // `crate::state::resource_name_refusal`).
+        if let Some(message) =
+            crate::state::resource_name_refusal(crate::state::FUNCTION_RESOURCE, &input.name)
+        {
+            return Err(CreateFunctionErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // A mapping template outside the modelled `@length` of `MappingTemplate` is
         // refused here rather than at the boundary (`skip_validation` on
         // `CreateFunctionInput`): the shape's `@pattern` admits any content, newlines
@@ -268,9 +283,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // DIFFERENT API.
         if !api.data_sources.contains_key(&input.data_source_name) {
             return Err(CreateFunctionErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::data_source_not_found_message(
-                    &input.data_source_name,
-                )),
+                // The data source is a DEPENDENCY this request names rather than the
+                // resource it addresses, so the absence is stated without the name
+                // (`crate::state::DATA_SOURCE_NOT_FOUND_MESSAGE`).
+                message: Some(crate::state::DATA_SOURCE_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         }

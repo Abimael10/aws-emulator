@@ -73,6 +73,26 @@ pub use free_text::*;
 mod api_name;
 pub use api_name::*;
 
+/// How a modelled `@pattern` a handler checks itself is evaluated: compiled once, with
+/// the engine the request boundary's own walk uses.
+mod declared_pattern;
+
+/// The `name` a resource of a GraphQL API carries: the form `ResourceName` declares for
+/// it, and the service's own refusal for a value outside that form.
+mod resource_name;
+pub use resource_name::*;
+
+/// The per-type configuration a data source is set up through: how many of those members
+/// one request may carry, and the refusals for a request that describes a data source
+/// AppSync could not reach.
+mod data_source_config;
+pub use data_source_config::*;
+
+/// The `nextToken` a list operation resumes from: how the token decoder reads one, and the
+/// refusal for a token it cannot read.
+mod pagination_token;
+pub use pagination_token::*;
+
 /// What inside one API still uses one of its resources, and the refusal a delete that
 /// would break that use answers with.
 mod dependencies;
@@ -686,32 +706,11 @@ impl DataSourceRecord {
     /// The configuration member this data source's `type` is set up through and which
     /// it does not carry, or `None` when the type carries it (or needs none at all).
     ///
-    /// Source: the per-type configuration members of `CreateDataSourceRequest` /
-    /// `UpdateDataSourceRequest` and the `DataSourceType` values they configure —
-    /// `dynamodbConfig` ("Amazon DynamoDB settings"), `lambdaConfig` ("Lambda
-    /// settings"), `elasticsearchConfig` / `openSearchServiceConfig` ("Amazon
-    /// OpenSearch Service settings"), `httpConfig` ("HTTP endpoint settings"),
-    /// `relationalDatabaseConfig` ("Relational database settings") and
-    /// `eventBridgeConfig` ("Amazon EventBridge settings"). `NONE` and
-    /// `AMAZON_BEDROCK_RUNTIME` are configured by no member of either request, so a
-    /// data source of either type is complete without one.
+    /// Which member configures which type is [`data_source_config_member`]'s reading, the
+    /// one this crate has.
     pub fn missing_config(&self) -> Option<&'static str> {
-        match self.r#type.as_str() {
-            "AMAZON_DYNAMODB" if self.dynamodb_config.is_none() => Some("dynamodbConfig"),
-            "AWS_LAMBDA" if self.lambda_config.is_none() => Some("lambdaConfig"),
-            "AMAZON_ELASTICSEARCH" if self.elasticsearch_config.is_none() => {
-                Some("elasticsearchConfig")
-            }
-            "AMAZON_OPENSEARCH_SERVICE" if self.open_search_service_config.is_none() => {
-                Some("openSearchServiceConfig")
-            }
-            "HTTP" if self.http_config.is_none() => Some("httpConfig"),
-            "RELATIONAL_DATABASE" if self.relational_database_config.is_none() => {
-                Some("relationalDatabaseConfig")
-            }
-            "AMAZON_EVENTBRIDGE" if self.event_bridge_config.is_none() => Some("eventBridgeConfig"),
-            _ => None,
-        }
+        let member = data_source_config_member(&self.r#type)?;
+        (!carries_data_source_config(self, member)).then_some(member)
     }
 
     /// This record as the modelled `DataSource` shape.
@@ -755,15 +754,31 @@ pub fn data_source_resource(api_id: &str, name: &str) -> String {
 }
 
 /// The text a `NotFoundException` (HTTP 404) carries for a data source the named API
-/// does not hold: the absent data source, which is what the caller has to act on.
+/// does not hold, where the request ADDRESSES that data source as its own resource: the
+/// absent data source, which is what the caller has to act on.
 ///
 /// The requirement the refusal answers is the status and the error shape; the wording
 /// is the one a recorded `GetDataSource` on a name no create left behind answers with,
 /// which is a fixed template over the requested name rather than anything of the
 /// request's own values.
+///
+/// An operation that only REFERENCES a data source — one whose own resource is something
+/// else and whose body names a data source it has to resolve — states the absence without
+/// the name ([`DATA_SOURCE_NOT_FOUND_MESSAGE`]).
 pub fn data_source_not_found_message(name: &str) -> String {
     format!("Data source {name} not found")
 }
+
+/// AppSync's fixed, request-independent text for a data source a request REFERENCES and
+/// the named API does not hold, carried by `NotFoundException` (HTTP 404).
+///
+/// A request that names a data source as a DEPENDENCY of the resource it writes — a
+/// function's or a resolver's `dataSourceName`, a body member rather than the resource the
+/// URI addresses — is told the data source is not there and nothing more: the sentence has
+/// no variable part, so the requested name is not echoed back. An operation that addresses
+/// the data source ITSELF names it ([`data_source_not_found_message`]), because there the
+/// absent resource is what the call was about.
+pub const DATA_SOURCE_NOT_FOUND_MESSAGE: &str = "Data source not found.";
 
 /// The text a `BadRequestException` (HTTP 400) carries for a create whose name is
 /// already taken within the API: the name, which is the member the caller has to
@@ -777,9 +792,12 @@ pub fn data_source_exists_message(name: &str) -> String {
 /// ([`DataSourceRecord::missing_config`]): the backend that configuration describes,
 /// so the caller can fix the request from the message alone.
 ///
-/// The backend each member names is the subject of that member's own doc on
-/// `CreateDataSourceRequest` / `UpdateDataSourceRequest` — `lambdaConfig` "the new
-/// Lambda configuration", `dynamodbConfig` "the new Amazon DynamoDB configuration",
+/// The backend each member names is the service's own name for it — `dynamodbConfig` is
+/// stated as `DynamoDB`, which is what the recorded refusal of a create that carries no
+/// DynamoDB configuration states, i.e. the product's name without the vendor prefix the
+/// member's doc writes ("the new Amazon DynamoDB configuration"). The other members take
+/// the subject of their own doc on `CreateDataSourceRequest` /
+/// `UpdateDataSourceRequest` — `lambdaConfig` "the new Lambda configuration",
 /// `elasticsearchConfig` and `openSearchServiceConfig` "the new OpenSearch
 /// configuration", `httpConfig` "the new HTTP endpoint configuration",
 /// `relationalDatabaseConfig` "the new relational database configuration" and
@@ -788,7 +806,7 @@ pub fn data_source_exists_message(name: &str) -> String {
 pub fn missing_data_source_config_message(member: &str) -> String {
     let subject = match member {
         "lambdaConfig" => "Lambda",
-        "dynamodbConfig" => "Amazon DynamoDB",
+        "dynamodbConfig" => "DynamoDB",
         "elasticsearchConfig" | "openSearchServiceConfig" => "OpenSearch",
         "httpConfig" => "HTTP endpoint",
         "relationalDatabaseConfig" => "relational database",
@@ -2815,9 +2833,11 @@ pub fn invalid_resource_arn_message(candidate: Option<&str>) -> String {
     }
 }
 
-/// AppSync's fixed, request-independent text for a `nextToken` a list operation cannot
-/// resume from, carried by `BadRequestException` (HTTP 400).
-pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token given.";
+// The text `BadRequestException` (HTTP 400) carries for a `nextToken` a list operation
+// cannot resume from lives in `pagination_token`: the v1 control plane's one fixed
+// sentence (`INVALID_PAGINATION_TOKEN_MESSAGE`) and the v2 surface's own refusal, worded
+// from the operation the token was submitted to and the token decoder's diagnosis of the
+// payload (`pagination_token_refusal`).
 
 /// The text a `NotFoundException` (HTTP 404) carries for an association this account
 /// does not hold.
@@ -3185,10 +3205,40 @@ pub fn data_source_needs_service_role(data_source_type: &str, iam_authorized: bo
     ROLE_ASSUMING_DATA_SOURCE_TYPES.contains(&data_source_type)
 }
 
-/// The text `BadRequestException` (HTTP 400) carries for a data source whose type
-/// needs a service role ([`data_source_needs_service_role`]) and whose request carried
-/// none: the absent member.
+/// The text `BadRequestException` (HTTP 400) carries for a data source that needs a
+/// service role ([`data_source_needs_service_role`]) and whose request carried none: the
+/// absent member, with nothing of the request in it.
 pub const SERVICE_ROLE_NOT_SPECIFIED_MESSAGE: &str = "Service role arn not specified.";
+
+/// The same absence, in the sentence that ends with the member rather than on a full stop
+/// ([`SERVICE_ROLE_REFUSAL_WITHOUT_A_STOP`]).
+pub const SERVICE_ROLE_NOT_SPECIFIED_UNSTOPPED_MESSAGE: &str = "Service role arn not specified";
+
+/// The `DataSourceType`s whose own validation states that sentence WITHOUT the full stop.
+///
+/// Each type is validated on its own — the requirement is about THAT backend's
+/// credentials — and the service's sentence for the absent role is the one that type's
+/// validation states, which is not the same sentence for every type. Three recorded
+/// refusals of this one absence pin that: in one recorded create sequence, the refusal of
+/// a data source of type `AMAZON_DYNAMODB` with no role ends on the member, while the next
+/// two, of other role-assuming types, end on a full stop; and the recorded UPDATE of a
+/// DynamoDB data source left without its role ends on the member too, so the difference
+/// follows the TYPE rather than the operation. A type absent from here takes the sentence
+/// every other recorded one does.
+const SERVICE_ROLE_REFUSAL_WITHOUT_A_STOP: &[&str] = &["AMAZON_DYNAMODB"];
+
+/// How the service states the absence of the `serviceRoleArn` a data source of this
+/// `data_source_type` needs ([`data_source_needs_service_role`], the requirement these
+/// are the sentences of).
+///
+/// Shared by the create and the update, so the two state one absence alike.
+pub fn service_role_refusal_message(data_source_type: &str) -> &'static str {
+    if SERVICE_ROLE_REFUSAL_WITHOUT_A_STOP.contains(&data_source_type) {
+        SERVICE_ROLE_NOT_SPECIFIED_UNSTOPPED_MESSAGE
+    } else {
+        SERVICE_ROLE_NOT_SPECIFIED_MESSAGE
+    }
+}
 
 /// The service role a data source of this `type` KEEPS out of the `serviceRoleArn` a
 /// create or update request carried.

@@ -419,8 +419,8 @@ async fn a_resume_that_names_no_page_is_refused() {
         assert_eq!(
             answer.body["message"].as_str().unwrap_or_default(),
             "Invalid pagination token given.",
-            "case resuming from {token:?}: expected AppSync's fixed invalid-token text, got \
-             {answer:?}"
+            "case resuming from {token:?}: expected the v1 control plane's fixed \
+             invalid-token text, got {answer:?}"
         );
     }
 

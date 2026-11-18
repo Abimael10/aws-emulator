@@ -52,24 +52,15 @@ pub const API_NAME_PATTERN: &str = r"^[A-Za-z0-9_\-\ ]+$";
 /// clause reports.
 pub const API_NAME_MEMBER: &str = "name";
 
-/// [`API_NAME_PATTERN`] compiled, which is how it is EVALUATED: the expression is a
-/// constant of the model, so it compiles once for the process and never per request, and
-/// the engine is the one the request boundary's own constraint walk evaluates a `@pattern`
-/// with — so this check and the boundary's cannot read one expression two ways.
-///
-/// `None` for an expression that does not compile, which [`matches_api_name_pattern`]
-/// reads as matching, exactly as the framework's own walk reads one: no value is refused
-/// because of an unreadable model pattern.
-static API_NAME_REGEX: ::std::sync::LazyLock<Option<::regex::Regex>> =
+/// [`API_NAME_PATTERN`] compiled, which is how it is EVALUATED: see
+/// [`super::declared_pattern`] for the one reading of a `@pattern` a handler checks
+/// itself.
+static API_NAME_REGEX: super::declared_pattern::CompiledPattern =
     ::std::sync::LazyLock::new(|| ::regex::Regex::new(API_NAME_PATTERN).ok());
 
-/// Whether `name` satisfies [`API_NAME_PATTERN`]. A Smithy `@pattern` is a FIND rather
-/// than a total match, which is what [`::regex::Regex::is_match`] is; this expression
-/// anchors both ends itself, so the find it describes is the whole value.
+/// Whether `name` satisfies [`API_NAME_PATTERN`].
 fn matches_api_name_pattern(name: &str) -> bool {
-    API_NAME_REGEX
-        .as_ref()
-        .is_none_or(|expression| expression.is_match(name))
+    super::declared_pattern::matches_declared_pattern(&API_NAME_REGEX, name)
 }
 
 /// Every constraint of `ApiName` that `name` breaks, in the order the framework's own

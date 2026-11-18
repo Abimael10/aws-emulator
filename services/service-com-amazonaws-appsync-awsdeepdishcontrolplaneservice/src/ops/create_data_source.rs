@@ -232,12 +232,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             metrics_config: input.metrics_config,
         };
 
-        // A data source of a type that is set up through a configuration member
-        // cannot be created without it: the request names a backend it does not say
-        // where to find, so it is not well formed.
-        if let Some(member) = record.missing_config() {
+        // The configuration the request carries has to describe a data source AppSync
+        // could reach: ONE backend, the one the declared type names, and — for a
+        // relational database — the source type that says how that database is reached
+        // (see `crate::state::data_source_configuration_refusal`, the one reading this
+        // create and `UpdateDataSource` share). Nothing has been written at this point,
+        // so the refusal leaves nothing behind.
+        if let Some(message) = crate::state::data_source_configuration_refusal(&record) {
             return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::missing_data_source_config_message(member)),
+                message: Some(message),
                 ..Default::default()
             })
             .into());
@@ -258,7 +261,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_none_or(str::is_empty)
         {
             return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::SERVICE_ROLE_NOT_SPECIFIED_MESSAGE.to_string()),
+                message: Some(
+                    crate::state::service_role_refusal_message(&record.r#type).to_string(),
+                ),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // A data source that would act with the CALLER's own credentials needs an IAM
+        // identity to act as, which only an API authenticating with `AWS_IAM` hands it
+        // (see `crate::state::caller_credentials_refusal`), so a create that asks for
+        // them on an API in any other mode is refused rather than stored.
+        if let Some(message) = crate::state::caller_credentials_refusal(
+            &record,
+            crate::service::graphql_api::configures(
+                api,
+                crate::service::graphql_api::caller::IAM_AUTH_TYPE,
+            ),
+        ) {
+            return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message.to_string()),
                 ..Default::default()
             })
             .into());
