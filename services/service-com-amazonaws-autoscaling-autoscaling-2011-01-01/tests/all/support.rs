@@ -523,6 +523,31 @@ pub fn tag_value(xml: &str, tag: &str) -> String {
     tag_values(xml, tag).first().cloned().unwrap_or_default()
 }
 
+/// Each `<member>` of the list element `list` in one answer, as its own block.
+///
+/// THE ONE COPY for every suite here that reads a LIST of structures back: scoped to that
+/// list, so a member of one element is read inside the element it belongs to rather than as
+/// "the first element of that name in the document". The serializer stamps the document's
+/// namespace onto the first member of a list, so a block starts after its own tag's closing
+/// bracket; an answer reporting no such list, or an empty one, has no blocks to read.
+pub fn list_members<'a>(xml: &'a str, list: &str) -> Vec<&'a str> {
+    let Some(open) = xml.find(&format!("<{list}")) else {
+        return Vec::new();
+    };
+    let Some((_, body)) = xml[open..].split_once('>') else {
+        return Vec::new();
+    };
+    let body = body
+        .split(&format!("</{list}>"))
+        .next()
+        .unwrap_or_default();
+    body.split("<member")
+        .skip(1)
+        .filter_map(|block| block.split_once('>'))
+        .filter_map(|(_, inner)| inner.split("</member>").next())
+        .collect()
+}
+
 /// The causes of the scaling activities a group has recorded, newest first, unescaped.
 ///
 /// THE ONE COPY for every suite here that reads WHY a group moved an instance: the cause is

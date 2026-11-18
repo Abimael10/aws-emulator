@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The scheduled scaling actions of an Auto Scaling group: the resource
-//! `PutScheduledUpdateGroupAction` creates or updates and `DescribeScheduledActions`
-//! reports.
+//! `PutScheduledUpdateGroupAction` and `BatchPutScheduledUpdateGroupAction` create or update
+//! and `DescribeScheduledActions` reports.
 //!
 //! A scheduled action is a CHILD of one Auto Scaling group, named uniquely within it, so it
 //! is stored on [`StoredGroup`] itself ([`StoredGroup::scheduled_actions`]): one collection
@@ -20,6 +20,14 @@
 //! into it, while the identity minted when the action was created (its
 //! `ScheduledActionARN`) survives the update, because putting an action again updates that
 //! action rather than replacing it with a different resource.
+//!
+//! "Creates or updates one or more scheduled scaling actions for an Auto Scaling group"
+//! (`smithy_query(query="operation",operation="BatchPutScheduledUpdateGroupAction")`) states
+//! the same upsert for a whole list of actions at once, so one call of either operation puts
+//! an action through [`super::AutoScalingState::put_scheduled_action`] and is taken against
+//! the rules below; the batch states the sizes per action, so an action the batch could not
+//! store is reported on its own ([`ScheduledActionRefusal::error_code`]) rather than
+//! refusing the actions beside it.
 //!
 //! # What the action carries
 //!
@@ -73,6 +81,27 @@ pub type ScheduledActions = BTreeMap<String, StoredScheduledAction>;
 /// The member carries no modelled bound, so the handler checks it and answers the
 /// operation's modelled `LimitExceededFault` past it.
 pub const MAX_SCHEDULED_ACTIONS_PER_GROUP: usize = 125;
+
+/// The most scheduled actions ONE call may state.
+///
+/// From the model's own documentation for
+/// `BatchPutScheduledUpdateGroupActionType$ScheduledUpdateGroupActions`: "One or more
+/// scheduled actions. The maximum number allowed is 50." The member carries no modelled
+/// length, so the bound is the service's own and the handler checks it.
+pub const MAX_SCHEDULED_ACTIONS_PER_CALL: usize = 50;
+
+/// The sentence a call stating more than [`MAX_SCHEDULED_ACTIONS_PER_CALL`] actions is
+/// refused with: the one sentence this service states for a list member past the bound it
+/// has to satisfy ([`super::too_many_items_message`]), naming the member as the wire names
+/// it.
+#[must_use]
+pub fn too_many_scheduled_actions_in_one_call_message(count: usize) -> String {
+    super::too_many_items_message(
+        count,
+        "scheduledUpdateGroupActions",
+        MAX_SCHEDULED_ACTIONS_PER_CALL,
+    )
+}
 
 /// The action one `PutScheduledUpdateGroupAction` states: when it runs, and the sizes it
 /// leaves the group with.
@@ -365,6 +394,24 @@ impl ScheduledActionRefusal {
     #[must_use]
     pub fn is_quota(&self) -> bool {
         matches!(self, Self::LimitExceeded | Self::SizePastCeiling(_))
+    }
+
+    /// The wire error code this refusal is reported under when it is reported PER ACTION,
+    /// inside the answer of a call that puts several at once rather than as the call's own
+    /// error.
+    ///
+    /// The same two classes [`Self::is_quota`] decides between, under the codes a single put
+    /// answers them with: a ceiling on the account's resources is the `LimitExceededFault`
+    /// the operations model (wire code `LimitExceeded`), and everything else is about what
+    /// the request carries, which this service answers `ValidationError` for — so one
+    /// refusal reads the same whichever operation the caller reached it through.
+    #[must_use]
+    pub fn error_code(&self) -> &'static str {
+        if self.is_quota() {
+            "LimitExceeded"
+        } else {
+            "ValidationError"
+        }
     }
 }
 

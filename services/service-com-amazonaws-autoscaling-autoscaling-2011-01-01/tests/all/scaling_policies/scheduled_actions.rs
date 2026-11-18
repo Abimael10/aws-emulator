@@ -38,8 +38,8 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{
-    borrowed, max_below_min_message, new_engine, p, query, router_with, tag_value, tag_values,
-    xml_unescape, REGION,
+    borrowed, list_members, max_below_min_message, new_engine, p, query, router_with, tag_value,
+    tag_values, xml_unescape, REGION,
 };
 
 /// The launch source every group in this suite is created from — a launch TEMPLATE, because
@@ -202,28 +202,11 @@ async fn describe(
     body
 }
 
-/// Each scheduled action one answer reports, as its own `<member>` block.
-///
-/// Scoped to the answer's `ScheduledUpdateGroupActions` list, so a member is read inside the
-/// action it belongs to rather than as "the first element of that name in the document". The
-/// serializer stamps the document's namespace onto the first member of a list, so a block
-/// starts after its own tag's closing bracket.
+/// Each scheduled action one answer reports, as its own `<member>` block: the answer's
+/// `ScheduledUpdateGroupActions` list, read through the harness's own list reader so a member
+/// is read inside the action it belongs to.
 fn reported_actions(xml: &str) -> Vec<&str> {
-    let Some(open) = xml.find("<ScheduledUpdateGroupActions") else {
-        return Vec::new();
-    };
-    let Some((_, list)) = xml[open..].split_once('>') else {
-        return Vec::new();
-    };
-    let list = list
-        .split("</ScheduledUpdateGroupActions>")
-        .next()
-        .unwrap_or_default();
-    list.split("<member")
-        .skip(1)
-        .filter_map(|block| block.split_once('>'))
-        .filter_map(|(_, body)| body.split("</member>").next())
-        .collect()
+    list_members(xml, "ScheduledUpdateGroupActions")
 }
 
 /// The names of the actions one answer reports, in the order it reports them.

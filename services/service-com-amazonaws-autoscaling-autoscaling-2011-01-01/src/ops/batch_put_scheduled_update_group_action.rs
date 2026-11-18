@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchPutScheduledUpdateGroupAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchPutScheduledUpdateGroupAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchPutScheduledUpdateGroupAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates SEVERAL scheduled scaling actions of one Auto Scaling group in a
+//! single call.
+//!
+//! The collection, the upsert rule and the rules each action is taken against are
+//! [`crate::state::scheduled_actions`] — the same ones `PutScheduledUpdateGroupAction` is
+//! taken against, because both write the same resource; `DescribeScheduledActions` reports
+//! from that same collection. Each action of the request is stated WHOLE, so an action this
+//! call could not store is reported on its own under
+//! `FailedScheduledUpdateGroupActions` ("the names of the scheduled actions that could not
+//! be created or updated, including an error message") rather than refusing the actions
+//! beside it.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +153,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchPutScheduledUpdateGroupAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchPutScheduledUpdateGroupActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchPutScheduledUpdateGroupAction"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchPutScheduledUpdateGroupActionErrorModeled::ResourceContentionFault(
+                    ResourceContentionFault {
+                        message: Some(
+                            "the Auto Scaling store is not mounted on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let group_name = input.auto_scaling_group_name;
+        let requested = input.scheduled_update_group_actions;
+
+        // How many actions ONE call may state, checked FIRST — before the store is locked
+        // and before a single action is read: every pass below is then over a bounded list,
+        // so no caller decides how much work this request costs.
+        if requested.len() > crate::state::MAX_SCHEDULED_ACTIONS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_scheduled_actions_in_one_call_message(requested.len()),
+            ));
+        }
+
+        // Whether IAM lets this caller schedule actions on THIS group, decided against the
+        // group's own ARN before anything is read or written
+        // ([`crate::service::authorization`]). Every action of the request belongs to the
+        // one group the request names, so that is the one decision this call takes.
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &group_name,
+        ) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &group_name,
+                "refused: not authorized",
+            );
+            return Err(refusal);
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let (written, failed) = {
+            let mut state = store.lock();
+            state.materialize_due(&*self.engine, now);
+
+            // A scheduled action belongs to a group, so the group is resolved before any
+            // action of the request is read: a call naming no stored group is refused for
+            // the group whatever its actions carry.
+            if !state.groups.contains_key(&group_name) {
+                crate::state::audit(
+                    ctx.parts(),
+                    Self::NAME,
+                    &group_name,
+                    "refused: no such group",
+                );
+                return Err(absent_group(&group_name));
+            }
+
+            let mut written: Vec<String> = Vec::with_capacity(requested.len());
+            let mut failed: Vec<FailedScheduledUpdateGroupActionRequest> = Vec::new();
+            for request in requested {
+                let action_name = request.scheduled_action_name;
+                // The batch's request shape carries no legacy `Time` member
+                // (`smithy_query(query="shape",shape="ScheduledUpdateGroupActionRequest")`),
+                // so `StartTime` is the only spelling of the instant an action starts at
+                // here; everything else is the action stated whole, exactly as a single put
+                // states it.
+                let put = crate::state::ScheduledActionPut {
+                    start_time: request.start_time,
+                    end_time: request.end_time,
+                    recurrence: request.recurrence,
+                    min_size: request.min_size,
+                    max_size: request.max_size,
+                    desired_capacity: request.desired_capacity,
+                    time_zone: request.time_zone,
+                };
+                match state.put_scheduled_action(&group_name, &action_name, put, now) {
+                    Ok(Some(_stored)) => written.push(format!("{group_name}/{action_name}")),
+                    // The group was resolved under this same lock, so the writer found it
+                    // too; a name it no longer answers to is refused as any unknown name is.
+                    Ok(None) => return Err(absent_group(&group_name)),
+                    // One action the call could not store: the caller is told which action
+                    // and why, and the actions beside it are still written — each action of
+                    // this request is a resource of its own.
+                    Err(refusal) => failed.push(FailedScheduledUpdateGroupActionRequest {
+                        scheduled_action_name: action_name,
+                        error_code: Some(refusal.error_code().to_string()),
+                        error_message: Some(refusal.message()),
+                    }),
+                }
+            }
+            (written, failed)
+        };
+
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &crate::state::audited_resources(&written),
+            "scheduled actions put",
+        );
+        Ok(BatchPutScheduledUpdateGroupActionOutput {
+            failed_scheduled_update_group_actions: Some(failed),
+        })
     }
+}
+
+/// The refusal a request naming a group the account does not hold is answered with: the
+/// `ValidationError` Amazon EC2 Auto Scaling answers such a request with, carrying this
+/// service's absent-group sentence for the name the request asked for.
+fn absent_group(group_name: &str) -> BatchPutScheduledUpdateGroupActionError {
+    crate::scaffolded::Scaffolded::validation_error(crate::state::absent_group_message(group_name))
 }

@@ -179,14 +179,15 @@ pub use scaling_policies::{PolicyKey, StoredScalingPolicy};
 pub mod recurrence;
 
 /// The scheduled scaling actions of a group: the named collection
-/// `PutScheduledUpdateGroupAction` upserts into and `DescribeScheduledActions` projects
-/// from, and the rules every writer of it shares.
+/// `PutScheduledUpdateGroupAction` and `BatchPutScheduledUpdateGroupAction` upsert into and
+/// `DescribeScheduledActions` projects from, and the rules every writer of it shares.
 pub mod scheduled_actions;
 
 pub use scheduled_actions::{
     invalid_recurrence_message, invalid_time_zone_message, scheduled_action_arn,
-    too_many_scheduled_actions_message, ScheduledActionPut, ScheduledActionRefusal,
-    ScheduledActions, StoredScheduledAction, END_TIME_MESSAGE, MAX_SCHEDULED_ACTIONS_PER_GROUP,
+    too_many_scheduled_actions_in_one_call_message, too_many_scheduled_actions_message,
+    ScheduledActionPut, ScheduledActionRefusal, ScheduledActions, StoredScheduledAction,
+    END_TIME_MESSAGE, MAX_SCHEDULED_ACTIONS_PER_CALL, MAX_SCHEDULED_ACTIONS_PER_GROUP,
     SIZE_REQUIRED_MESSAGE,
 };
 
@@ -647,16 +648,28 @@ pub const MAX_ACTIVITY_IDS_PER_CALL: usize = 50;
 /// bound is the service's own and is checked by the handlers.
 pub const MAX_MOVED_INSTANCE_IDS_PER_CALL: usize = 20;
 
+/// The standard sentence this service states for a LIST member carrying more items than
+/// the bound it has to satisfy: how many items the request wrote, the member as the WIRE
+/// names it (lowerCamel, the spelling the boundary validator uses), and the bound it
+/// missed.
+///
+/// THE ONE COPY of that sentence, the list counterpart of
+/// [`constraint_violation_message`]: every per-call list bound this service checks in a
+/// handler — because the model does not express it — is reported through here, so two of
+/// them cannot drift into two different spellings of the same refusal.
+pub fn too_many_items_message(count: usize, member: &str, limit: usize) -> String {
+    format!(
+        "1 validation error detected: Value with {count} items at '{member}' failed to \
+         satisfy constraint: Member must have length less than or equal to {limit}"
+    )
+}
+
 /// The message a move of a group's instances naming more instance IDs than
 /// [`MAX_MOVED_INSTANCE_IDS_PER_CALL`] is refused with: the framework's own envelope for
 /// a member value outside its bounds, naming the member as the wire names it and the bound
 /// the request missed.
 pub fn too_many_moved_instance_ids_message(count: usize) -> String {
-    format!(
-        "1 validation error detected: Value with {count} items at 'instanceIds' failed to \
-         satisfy constraint: Member must have length less than or equal to \
-         {MAX_MOVED_INSTANCE_IDS_PER_CALL}"
-    )
+    too_many_items_message(count, "instanceIds", MAX_MOVED_INSTANCE_IDS_PER_CALL)
 }
 
 /// The message a read of the scaling activities refuses more than
@@ -664,11 +677,7 @@ pub fn too_many_moved_instance_ids_message(count: usize) -> String {
 /// a member value outside its bounds, naming the member as the wire names it and the
 /// bound the request missed.
 pub fn too_many_activity_ids_message(count: usize) -> String {
-    format!(
-        "1 validation error detected: Value with {count} items at 'activityIds' failed to \
-         satisfy constraint: Member must have length less than or equal to \
-         {MAX_ACTIVITY_IDS_PER_CALL}"
-    )
+    too_many_items_message(count, "activityIds", MAX_ACTIVITY_IDS_PER_CALL)
 }
 
 /// The least `HealthCheckGracePeriod` a group may be configured with.

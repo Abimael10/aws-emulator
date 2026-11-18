@@ -50,6 +50,12 @@ use crate::support::{borrowed, new_engine, p, query, tag_value, tag_values, xml_
 #[path = "scaling_policies/scheduled_actions.rs"]
 mod scheduled_actions;
 
+/// Putting SEVERAL of those scheduled actions in ONE call —
+/// `BatchPutScheduledUpdateGroupAction` — in its own file beside the single put it shares its
+/// collection and its rules with.
+#[path = "scaling_policies/batch_scheduled_actions.rs"]
+mod batch_scheduled_actions;
+
 /// The launch source every group in this suite is created from — a launch TEMPLATE,
 /// because no account can create a launch configuration (see
 /// `launch_configurations_are_unavailable.rs`).
