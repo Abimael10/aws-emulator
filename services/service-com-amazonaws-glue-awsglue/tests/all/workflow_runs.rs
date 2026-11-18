@@ -16,13 +16,17 @@
 //! with `ConcurrentRunsExceededException`. A run comes to rest once the runs its actions
 //! began have come to rest, in the modelled status of a run whose actions have run their
 //! course — what each action came to is reported by the run's own statistics and not by its
-//! status.
+//! status. A run that nothing errored, failed, stopped or timed out in therefore settles
+//! `COMPLETED`, never the `ERROR` the enum reserves for a run that errored, and every
+//! reader projects that settled run — the workflow's own `Workflow$LastRun` included.
 //!
 //! The recorded behavioural case — a bare workflow refused for having no starting trigger,
 //! then the same workflow started once an on-demand trigger is bound to it — is TWO rows
 //! of the tables below; the rows differ along the type of the entry-point trigger, how many
 //! actions it initiates, which run properties the workflow and the start carry, the form
-//! and length of the workflow name, and the concurrency the workflow allows.
+//! and length of the workflow name, and the concurrency the workflow allows. The
+//! terminal-status table adds the axes that rule generalises over: how many actions the run
+//! initiated and of which kind, down to a run that began no job run at all.
 //!
 //! The due instants the lifecycle turns on are read and moved THROUGH THE STORE rather than
 //! slept for, so the transient window is deterministic.
@@ -41,6 +45,7 @@ use crate::job_runs::{
     already_past, emulator_with_engine, far_future, set_workflow_due_instant,
     RUN_AT_REST_DEADLINE, RUN_POLL_INTERVAL,
 };
+use crate::job_script_execution::{create_bucket, emulator_with_s3, stage_script};
 use crate::wire::{call, error_code, error_message, ok};
 
 /// The role ARN the job every trigger action below runs is registered with.
@@ -881,6 +886,367 @@ async fn a_start_past_the_workflows_concurrency_ceiling_is_refused() {
                      {status} with {body}"
                 );
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The terminal status a run with nothing failing in it comes to rest in
+// ---------------------------------------------------------------------------
+
+/// The crawler the terminal-status rows' crawler action names. Its own target lives in the
+/// suite's bucket, because the emulator this suite drives has Amazon S3 mounted beside Glue
+/// and a crawler is admitted only over a target that store really serves.
+const SETTLED_CRAWLER: &str = "settled-run-crawler";
+
+/// A script that exits cleanly, so the run of the job it belongs to comes to rest having
+/// SUCCEEDED: an action with no failure in it.
+const EXITS_CLEANLY: &str = "total = sum([1, 2, 3])\n";
+
+/// A second such script, reading its own command line the way any Python program does and
+/// still exiting cleanly — so the action it is the job of succeeds too.
+const READS_ITS_COMMAND_LINE: &str = "import sys\n\nnamed = list(sys.argv)\n";
+
+/// One row of the terminal-status table: a workflow whose entry point initiates actions
+/// that nothing fails in, and what the run of it must report once it has come to rest.
+struct SettledCase {
+    /// What this row varies, named in every assertion it drives.
+    case: &'static str,
+    /// The `CreateWorkflow` body.
+    workflow: Value,
+    /// The script of each JOB action the entry point initiates, one per action. Every one
+    /// of them exits cleanly, so no action of the run errors, fails, stops or times out.
+    job_scripts: Vec<&'static str>,
+    /// Whether the entry point also initiates a CRAWLER action, which begins no job run at
+    /// all and so reports no outcome of its own.
+    crawler_action: bool,
+    /// The `CreateTrigger` body of the entry point, minus `Name`, `WorkflowName` and the
+    /// `Actions` the two members above amount to.
+    entry_point: Value,
+    /// The `StartWorkflowRun` body, minus `Name`.
+    start: Value,
+    /// `Statistics$TotalActions`: "Total number of Actions in the workflow run", which is
+    /// what the entry point initiates — its job actions and its crawler action alike.
+    total_actions: i64,
+}
+
+/// The rows the terminal-status suite drives: one per axis the rule generalises over —
+/// how many actions the run initiated and of which kind (one job, two jobs, a job beside a
+/// crawler, a crawler alone, so a run with no job run in it at all is a row too), the type
+/// of the entry point that began it, the run properties it carries, and the form of the
+/// workflow name it belongs to.
+fn settled_cases() -> Vec<SettledCase> {
+    vec![
+        SettledCase {
+            case: "one job action whose script exits cleanly",
+            workflow: json!({ "Name": "settled-one-action" }),
+            job_scripts: vec![EXITS_CLEANLY],
+            crawler_action: false,
+            entry_point: json!({ "Type": "ON_DEMAND" }),
+            start: json!({}),
+            total_actions: 1,
+        },
+        SettledCase {
+            case: "two job actions, each of whose scripts exits cleanly",
+            workflow: json!({ "Name": "settled-two-actions" }),
+            job_scripts: vec![EXITS_CLEANLY, READS_ITS_COMMAND_LINE],
+            crawler_action: false,
+            entry_point: json!({ "Type": "ON_DEMAND" }),
+            start: json!({}),
+            total_actions: 2,
+        },
+        SettledCase {
+            case: "a job action beside a crawler action",
+            workflow: json!({ "Name": "settled-job-and-crawler" }),
+            job_scripts: vec![READS_ITS_COMMAND_LINE],
+            crawler_action: true,
+            entry_point: json!({ "Type": "ON_DEMAND" }),
+            start: json!({}),
+            total_actions: 2,
+        },
+        SettledCase {
+            case: "a crawler action alone, so the run initiated no job run",
+            workflow: json!({ "Name": "settled-crawler-only" }),
+            job_scripts: Vec::new(),
+            crawler_action: true,
+            entry_point: json!({ "Type": "ON_DEMAND" }),
+            start: json!({}),
+            total_actions: 1,
+        },
+        SettledCase {
+            case: "a scheduled entry point, with run properties over the workflow's \
+                   defaults",
+            workflow: json!({
+                "Name": "settled-scheduled",
+                "DefaultRunProperties": { "env": "staging", "mode": "full" },
+            }),
+            job_scripts: vec![EXITS_CLEANLY],
+            crawler_action: false,
+            entry_point: json!({ "Type": "SCHEDULED", "Schedule": "cron(15 12 * * ? *)" }),
+            start: json!({ "RunProperties": { "env": "prod" } }),
+            total_actions: 1,
+        },
+        SettledCase {
+            case: "a workflow name at the modelled length bound",
+            workflow: json!({ "Name": "s".repeat(MAX_NAME_LENGTH) }),
+            job_scripts: vec![EXITS_CLEANLY],
+            crawler_action: false,
+            entry_point: json!({ "Type": "ON_DEMAND" }),
+            start: json!({}),
+            total_actions: 1,
+        },
+    ]
+}
+
+/// One counter of a run's `WorkflowRunStatistics`, with an absent member read as the zero
+/// the shape defaults it to and awsJson may therefore omit.
+fn counted(statistics: &Value, member: &str) -> i64 {
+    statistics.get(member).and_then(Value::as_i64).unwrap_or(0)
+}
+
+/// The `Statistics` of a reported run.
+fn statistics_of(case: &str, run: &Value) -> Value {
+    run.get("Statistics")
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case}: a run reports Statistics, got {run}"))
+}
+
+/// "The information about the last execution of the workflow" (`Workflow$LastRun`) as
+/// `GetWorkflow` reports it, asking for the graph when `include_graph` says to.
+async fn last_run(
+    router: &MultiServiceRouter,
+    case: &str,
+    workflow: &str,
+    include_graph: Option<bool>,
+) -> Value {
+    let mut request = json!({ "Name": workflow });
+    if let Some(include_graph) = include_graph {
+        request["IncludeGraph"] = json!(include_graph);
+    }
+    let body = ok(router, "GetWorkflow", &request).await;
+    body["Workflow"]
+        .get("LastRun")
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case}: the workflow reports a LastRun, got {body}"))
+}
+
+/// The same projection, as the BATCH reader reports it for one workflow.
+async fn batch_last_run(router: &MultiServiceRouter, case: &str, workflow: &str) -> Value {
+    let body = ok(router, "BatchGetWorkflows", &json!({ "Names": [workflow] })).await;
+    let projected = body
+        .get("Workflows")
+        .and_then(Value::as_array)
+        .and_then(|workflows| workflows.first().cloned())
+        .unwrap_or_else(|| panic!("case {case}: the batch reports the workflow, got {body}"));
+    projected
+        .get("LastRun")
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case}: the batch reports a LastRun, got {projected}"))
+}
+
+/// The newest run `GetWorkflowRuns` reports for `workflow` — the runs come newest started
+/// first, so the run a row just started is the first of them.
+async fn newest_listed_run(router: &MultiServiceRouter, case: &str, workflow: &str) -> Value {
+    let page = ok(router, "GetWorkflowRuns", &json!({ "Name": workflow })).await;
+    page.get("Runs")
+        .and_then(Value::as_array)
+        .and_then(|runs| runs.first().cloned())
+        .unwrap_or_else(|| panic!("case {case}: the listing reports the run, got {page}"))
+}
+
+/// A workflow run that nothing failed in comes to rest in the modelled status of a run
+/// whose actions ran their course — `COMPLETED`, never the `ERROR` the enum reserves for a
+/// run that errored — carrying no `ErrorMessage` and statistics that count every action's
+/// own outcome; and that settled run is what every reader of it projects, the workflow's
+/// own `Workflow$LastRun` included.
+///
+/// The actions really execute here: each job action's script is staged in the emulator's
+/// own Amazon S3 and exits cleanly, so the premise of the rule — a run with nothing
+/// errored, failed, stopped or timed out in it — holds of the job runs the store actually
+/// holds rather than by assumption.
+///
+/// The due instants the lifecycle turns on are made due THROUGH THE STORE and polled for
+/// rather than slept out, so no row depends on how fast the host runs.
+#[tokio::test]
+async fn a_run_whose_actions_all_succeeded_settles_completed() {
+    let (router, engine) = emulator_with_s3();
+    create_bucket(&router).await;
+    // The crawler an action may name instead of a job, over a target the object store
+    // really serves: one object, staged where the crawler's own S3 target points.
+    let crawled = stage_script(&router, "crawled/rows.csv", "id,name\n1,one\n").await;
+    let target = crawled
+        .rsplit_once('/')
+        .map(|(prefix, _)| format!("{prefix}/"))
+        .expect("the staged location names a prefix");
+    ok(
+        &router,
+        "CreateCrawler",
+        &json!({
+            "Name": SETTLED_CRAWLER,
+            "Role": "arn:aws:iam::000000000000:role/sim2real-crawler-role",
+            "Targets": { "S3Targets": [{ "Path": target }] },
+        }),
+    )
+    .await;
+
+    for (index, row) in settled_cases().into_iter().enumerate() {
+        let case = row.case;
+        ok(&router, "CreateWorkflow", &row.workflow).await;
+        let workflow = row.workflow["Name"]
+            .as_str()
+            .expect("the row carries a Name")
+            .to_string();
+
+        // Each job action runs a job of its own, whose script is staged where the job's
+        // `ScriptLocation` names it, so the run of that job really executes it.
+        let mut actions: Vec<Value> = Vec::new();
+        for (action, script) in row.job_scripts.iter().enumerate() {
+            let job = format!("settled-job-{index}-{action}");
+            let location =
+                stage_script(&router, &format!("scripts/{job}.py"), script).await;
+            ok(
+                &router,
+                "CreateJob",
+                &json!({
+                    "Name": job,
+                    "Role": ROLE_ARN,
+                    "Command": { "Name": "glueetl", "ScriptLocation": location },
+                }),
+            )
+            .await;
+            actions.push(json!({ "JobName": job }));
+        }
+        if row.crawler_action {
+            actions.push(json!({ "CrawlerName": SETTLED_CRAWLER }));
+        }
+        let mut entry_point = row.entry_point.clone();
+        entry_point["Actions"] = Value::Array(actions);
+        bind_trigger(
+            &router,
+            &format!("settled-trigger-{index}"),
+            &workflow,
+            &entry_point,
+        )
+        .await;
+
+        let run_id = start_run(&router, &workflow, &row.start).await;
+
+        // The run is read back UNTIL it has come to rest, with everything the clock owes it
+        // and the runs its actions began made due on every turn: a read performs the script
+        // an action's run is still owed and only then stamps when that run rests, so the
+        // instant to push past can be the one the previous read made due. The deadline is
+        // the crate's own ([`crate::job_runs::RUN_AT_REST_DEADLINE`]).
+        let deadline = SystemTime::now() + RUN_AT_REST_DEADLINE;
+        let settled = loop {
+            set_workflow_due_instant(&engine, &workflow, already_past());
+            let read = get_run(&router, &workflow, &run_id).await;
+            if read.get("Status").and_then(Value::as_str) != Some(WORKFLOW_RUN_STATUS_RUNNING) {
+                break read;
+            }
+            assert!(
+                SystemTime::now() < deadline,
+                "case {case}: run {run_id:?} of workflow {workflow:?} must come to rest, and \
+                 it reports {read}"
+            );
+            ::tokio::time::sleep(RUN_POLL_INTERVAL).await;
+        };
+
+        let status = settled.get("Status").and_then(Value::as_str).unwrap_or("");
+        assert!(
+            TERMINAL_WORKFLOW_RUN_STATUSES.contains(&status),
+            "case {case}: expected one of {TERMINAL_WORKFLOW_RUN_STATUSES:?}, got {settled}"
+        );
+        assert_eq!(
+            status, WORKFLOW_RUN_STATUS_COMPLETED,
+            "case {case}: nothing in the run errored, failed, stopped or timed out, so it \
+             comes to rest in {WORKFLOW_RUN_STATUS_COMPLETED}, got {settled}"
+        );
+        assert!(
+            settled.get("ErrorMessage").is_none_or(Value::is_null),
+            "case {case}: nothing went wrong in starting the run, so it carries no \
+             ErrorMessage, got {settled}"
+        );
+        assert!(
+            settled.get("CompletedOn").and_then(Value::as_f64).is_some(),
+            "case {case}: a finished run reports when it finished, got {settled}"
+        );
+
+        // The statistics report what each action came to: every job action succeeded, and
+        // the crawler action a row may carry began no job run, so it is counted among the
+        // run's total actions and in no outcome.
+        let succeeded = i64::try_from(row.job_scripts.len()).expect("a row has few actions");
+        let statistics = statistics_of(case, &settled);
+        assert_eq!(
+            counted(&statistics, "TotalActions"),
+            row.total_actions,
+            "case {case}: expected {} total actions, got {statistics}",
+            row.total_actions
+        );
+        assert_eq!(
+            counted(&statistics, "SucceededActions"),
+            succeeded,
+            "case {case}: expected {succeeded} succeeded actions, got {statistics}"
+        );
+        for failure in [
+            "FailedActions",
+            "ErroredActions",
+            "TimeoutActions",
+            "StoppedActions",
+            "RunningActions",
+            "WaitingActions",
+        ] {
+            assert_eq!(
+                counted(&statistics, failure),
+                0,
+                "case {case}: no action of a run that came to rest in {status} is counted \
+                 under {failure}, got {statistics}"
+            );
+        }
+
+        // Every reader of that run projects the status it settled in — the workflow's own
+        // last execution, with and without the graph a reader may ask for, the run listing,
+        // and the batch reader.
+        let projections = [
+            (
+                "the workflow's LastRun",
+                last_run(&router, case, &workflow, None).await,
+            ),
+            (
+                "the workflow's LastRun beside its graph",
+                last_run(&router, case, &workflow, Some(true)).await,
+            ),
+            (
+                "the run listing",
+                newest_listed_run(&router, case, &workflow).await,
+            ),
+            (
+                "the batch reader's LastRun",
+                batch_last_run(&router, case, &workflow).await,
+            ),
+        ];
+        for (reader, projection) in &projections {
+            assert_eq!(
+                projection.get("WorkflowRunId").and_then(Value::as_str),
+                Some(run_id.as_str()),
+                "case {case}: {reader} reports the run that was started, got {projection}"
+            );
+            assert_eq!(
+                projection.get("Status").and_then(Value::as_str),
+                Some(WORKFLOW_RUN_STATUS_COMPLETED),
+                "case {case}: {reader} reports the status the run settled in, got \
+                 {projection}"
+            );
+            assert!(
+                projection.get("ErrorMessage").is_none_or(Value::is_null),
+                "case {case}: {reader} reports no ErrorMessage for a run that went wrong at \
+                 nothing, got {projection}"
+            );
+            assert_eq!(
+                counted(&statistics_of(case, projection), "SucceededActions"),
+                succeeded,
+                "case {case}: {reader} reports the outcomes the run's actions came to, got \
+                 {projection}"
+            );
         }
     }
 }
