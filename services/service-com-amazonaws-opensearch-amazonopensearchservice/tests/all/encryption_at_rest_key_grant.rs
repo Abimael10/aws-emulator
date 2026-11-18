@@ -27,10 +27,19 @@
 //! domain on the same key, a change that re-states the encryption a domain already has, a
 //! change that enables encryption on a domain created without it, and the delete that takes
 //! the domain away.
+//!
+//! The last test drives the other half of the same rule: the grant is the key owner's to take
+//! AWAY. A client that revokes it through KMS's own `RevokeGrant` has taken the service's
+//! permission on its key, and no READ of the domain may hand it back — a reporting operation
+//! reports, so nothing a client polls can restore a permission it just removed — while the
+//! next call that CONFIGURES the domain's encryption takes the grant that domain's storage
+//! needs again. Its rows differ along which read is driven in between: the two reads of the
+//! one domain, the listing of every domain, the batch read of several (a read whose method is
+//! a POST), and the read that materialises the settled record the clock owed.
 
 use serde_json::{json, Value};
 
-use super::domain_lifecycle::{baseline_create, settled_domain, Emulator, REGION};
+use super::domain_lifecycle::{baseline_create, settled_domain, Emulator, PREFIX, REGION};
 
 /// The encryption-context key the data keys of ONE OpenSearch domain carry, and so the key
 /// of the `EncryptionContextSubset` constraint the grant is scoped by: the domain's ARN
@@ -243,11 +252,9 @@ fn assert_domain_grant(grant: &Value, key_arn: &str, domain_arn: &str, case: &st
     // A grant id is KMS's own: 64 lowercase hex characters, minted per grant — the form
     // that service reads a grant id by
     // (`service_com_amazonaws_kms_trentservice::state::names_a_grant_id`).
-    let grant_id = grant["GrantId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case}: expected the grant's GrantId, got {grant:?}"));
+    let grant_id = grant_id_of(grant, case);
     assert!(
-        service_com_amazonaws_kms_trentservice::state::names_a_grant_id(grant_id),
+        service_com_amazonaws_kms_trentservice::state::names_a_grant_id(&grant_id),
         "case {case}: expected a KMS grant id, got {grant_id:?}"
     );
 }
@@ -474,5 +481,139 @@ async fn the_grant_follows_the_domains_encryption_and_is_retired_with_the_domain
         for_domain(&listed, &two).len(),
         1,
         "case {case}: expected the surviving domain to keep its grant, got {listed:?}"
+    );
+}
+
+/// The reads driven against the domain `name` while its grant is revoked: both reads of the
+/// one domain, the listing of every domain this account holds, and the batch read of several
+/// — every control-plane path that resolves a domain and answers for it.
+///
+/// Each is `(case, method, uri, body)`, taken from the operation's own HTTP binding
+/// (`smithy_query(query="operation",operation="DescribeDomain,DescribeDomains,ListDomainNames")`),
+/// so the last row is a read whose method is a `POST`: what decides whether a call may write
+/// is what it DOES, not the verb it is bound to.
+fn reads(name: &str) -> Vec<(&'static str, &'static str, String, Option<Value>)> {
+    vec![
+        (
+            "DescribeDomain",
+            "GET",
+            format!("{PREFIX}/opensearch/domain/{name}"),
+            None,
+        ),
+        (
+            "DescribeDomainConfig",
+            "GET",
+            format!("{PREFIX}/opensearch/domain/{name}/config"),
+            None,
+        ),
+        ("ListDomainNames", "GET", format!("{PREFIX}/domain"), None),
+        (
+            "DescribeDomains",
+            "POST",
+            format!("{PREFIX}/opensearch/domain-info"),
+            Some(json!({ "DomainNames": [name] })),
+        ),
+    ]
+}
+
+/// The `GrantId` of one reported grant — KMS's own identifier for it, which is what a revoke
+/// names and what a grant is asserted to carry. One extraction with one wording, so the two
+/// readers of it cannot disagree.
+fn grant_id_of(grant: &Value, case: &str) -> String {
+    grant["GrantId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: expected the grant's GrantId, got {grant:?}"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_revoked_grant_is_not_retaken_by_a_read_and_comes_back_with_a_configuring_call() {
+    let emulator = Emulator::with_kms();
+    let key = emulator.created_key(REGION).await;
+    let name = "grant-revoked-domain";
+    let domain_arn = created_domain(&emulator, name, Some(&enabled(&key))).await;
+
+    // What the create left on the key: the one grant binding this domain's storage to it.
+    let case = "the grant the create took";
+    let held = for_domain(&grants_on(&emulator, &key, case).await, &domain_arn);
+    assert_eq!(
+        held.len(),
+        1,
+        "case {case}: expected exactly one grant for {domain_arn} on {key}, got {held:?}"
+    );
+    assert_domain_grant(&held[0], &key, &domain_arn, case);
+    let revoked = grant_id_of(&held[0], case);
+
+    // The key's owner takes that permission away, through the operation KMS gives it for
+    // exactly that — which is the whole point of the grant being the observable record.
+    let case = "RevokeGrant";
+    let answer = emulator
+        .kms_call(
+            REGION,
+            "RevokeGrant",
+            json!({ "KeyId": key.clone(), "GrantId": revoked.clone() }),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let listed = grants_on(&emulator, &key, case).await;
+    assert!(
+        for_domain(&listed, &domain_arn).is_empty(),
+        "case {case}: expected the revoked grant to be gone, got {listed:?}"
+    );
+
+    // Every read of the domain, with the permission withdrawn: each answers for the domain
+    // and each leaves the key exactly as the revoke left it.
+    for (case, method, uri, body) in reads(name) {
+        let answer = emulator.call(method, &uri, body).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        let held = for_domain(&grants_on(&emulator, &key, case).await, &domain_arn);
+        assert!(
+            held.is_empty(),
+            "case {case}: a read must take no permission on {key} back, got {held:?}"
+        );
+    }
+
+    // Including the read that materialises the change the clock owed the domain — the
+    // provisioning that settles it is due whether or not anybody looked, and settling it is
+    // not a call that configures its encryption.
+    let case = "the read that settles the domain";
+    settled_domain(&emulator, name).await;
+    let held = for_domain(&grants_on(&emulator, &key, case).await, &domain_arn);
+    assert!(
+        held.is_empty(),
+        "case {case}: expected the revoked grant to stay revoked, got {held:?}"
+    );
+
+    // And the call that CONFIGURES the encryption again takes the grant that domain's
+    // storage needs — a grant of its own, not the revoked one brought back to life.
+    let case = "UpdateDomainConfig re-stating the same encryption";
+    let answer = emulator
+        .update_config(name, json!({ "EncryptionAtRestOptions": enabled(&key) }))
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let held = for_domain(&grants_on(&emulator, &key, case).await, &domain_arn);
+    assert_eq!(
+        held.len(),
+        1,
+        "case {case}: expected exactly one grant for {domain_arn} on {key}, got {held:?}"
+    );
+    assert_domain_grant(&held[0], &key, &domain_arn, case);
+    assert_ne!(
+        grant_id_of(&held[0], case),
+        revoked,
+        "case {case}: expected a grant of its own rather than the revoked id, got {:?}",
+        held[0]
     );
 }
