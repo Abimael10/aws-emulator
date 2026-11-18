@@ -29,13 +29,25 @@
 //!    [`principal_policies`](IamState::principal_policies) accessor so this service
 //!    sees exactly what `CreateRole`/`PutRolePolicy` wrote, plus the permissions
 //!    boundary that caps them;
-//! 4. **the decision** — [`::service_common::iam_authorization`], the tree's ONE
+//! 4. **what the TARGET allows** — the resource-based policy in force on the resource
+//!    the call acts on, read out of the owning service's own store
+//!    ([`super::target_resource_policy`]), because a call on a resource of the same
+//!    account is allowed when EITHER kind of document allows it: "if an identity-based
+//!    policy or a resource-based policy grants the request, then AWS allows the
+//!    request". A role carrying no identity-based grant at all may therefore make a
+//!    call the target's own policy grants it — which is how a function whose
+//!    `lambda:AddPermission` statement names the role is invoked — and an explicit
+//!    `Deny` in that policy refuses the call whatever a grant says;
+//! 5. **the decision** — [`::service_common::iam_authorization`], the tree's ONE
 //!    evaluation of policy documents against a request, so this service and every
 //!    other one handed the same documents decide alike. How the documents in force
 //!    combine — an attachment whose document this account does not hold grants
 //!    something unreadable, so it withholds a refusal without overturning an explicit
 //!    `Deny`, and the boundary caps rather than grants — is read exactly as IAM's own
-//!    authorizer reads it, which is the authority on its own store.
+//!    authorizer reads it, which is the authority on its own store. A grant in the
+//!    TARGET's policy stands on its own: "a permissions boundary does not limit the
+//!    permissions granted to the entity by a resource-based policy that names it as a
+//!    principal".
 //!
 //! The refusal is worded here, because only the invoked service can say what its own
 //! refusal says: the principal is the SESSION of the role the call is made as — this
@@ -58,10 +70,11 @@
 //! [`super::integration::TARGET_RESOURCES`] entry names the target resource of, since
 //! an access request cannot be formed without the resource it is about. What the
 //! documents DO state is decided in IAM's own order: an explicit `Deny` refuses, a
-//! grant allows, and policies that state nothing about the call withhold it, because
-//! the documents in force on a role are the authority on what it may do — and so is
-//! the absence of any: a role of this account carrying no identity-based document
-//! grants nothing, which is the implicit deny every identity starts from.
+//! grant in either kind of document allows, and policies that state nothing about the
+//! call withhold it, because the documents in force are the authority on what the role
+//! may do — and so is the absence of any: a role of this account carrying no
+//! identity-based document, over a target whose own policy grants it nothing, grants
+//! nothing, which is the implicit deny every identity starts from.
 //!
 //! ## Assuming the role at all
 //!
@@ -363,6 +376,10 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
         // either way ([`super::integration::Api::refused_action`]).
         let action = call.api.refused_action(&action);
         let (code, status) = denied_answer(call.api, targets.denied);
+        // What the TARGET's own policy says about the call, read before IAM's store is
+        // locked: a grant in it allows the call even where the role carries no
+        // identity-based grant ([`super::target_resource_policy`]).
+        let target_policy = super::target_resource_policy::in_force(&*engine, &resource);
         if let Some(refused) = refusal(
             &iam.lock(),
             Acts {
@@ -371,6 +388,7 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
             },
             &action,
             &resource,
+            target_policy.as_deref(),
             Answered {
                 api: call.api,
                 family: call.family,
@@ -512,6 +530,7 @@ pub fn job_report_denial<Eng: Send + Sync + 'static>(
     // access-denied error for one, so its refusal carries the code and the status an
     // unmodelled one does ([`denied_answer`]).
     let (code, status) = denied_answer(call.api, None);
+    let target_policy = super::target_resource_policy::in_force(engine, resource);
     let cause = refusal(
         &iam.lock(),
         Acts {
@@ -520,6 +539,7 @@ pub fn job_report_denial<Eng: Send + Sync + 'static>(
         },
         &call.api.refused_action(&call.action()),
         resource,
+        target_policy.as_deref(),
         Answered {
             api: call.api,
             family: call.family,
@@ -554,9 +574,11 @@ pub fn iam_holds_role<Eng: Send + Sync + 'static>(engine: &Eng, role_arn: &str) 
 /// The same reading as [`withheld`], for a decision whose own refusal is not an
 /// invoked service's message but a sentence of THIS service's: a capability a state
 /// machine's role needs is often several actions at once, and the role has it only
-/// when its documents allow all of them. `false` wherever nothing can be shown — an
-/// engine with no IAM store, a role this account does not hold, a role carrying a
-/// grant this emulator cannot read — exactly as that function reports it.
+/// when its documents allow all of them — the documents in force on the role and the
+/// resource-based policy in force on `resource`, read as that function reads them.
+/// `false` wherever nothing can be shown — an engine with no IAM store, a role this
+/// account does not hold, a role carrying a grant this emulator cannot read — exactly
+/// as that function reports it.
 pub fn role_is_denied<Eng: Send + Sync + 'static>(
     engine: &Eng,
     role_arn: &str,
@@ -569,10 +591,23 @@ pub fn role_is_denied<Eng: Send + Sync + 'static>(
     let Some(iam) = iam_state(engine) else {
         return false;
     };
+    let target_policy = super::target_resource_policy::in_force(engine, resource);
     let iam = iam.lock();
-    actions
-        .iter()
-        .any(|action| withheld(&iam, role_arn, action, resource).is_some())
+    actions.iter().any(|action| {
+        withheld(
+            &iam,
+            Acts {
+                role_arn,
+                // No session: the decision is the ROLE's, and what this reading reports
+                // is worded by the caller rather than blamed on a session of it.
+                session_name: "",
+            },
+            action,
+            resource,
+            target_policy.as_deref(),
+        )
+        .is_some()
+    })
 }
 
 /// WHO a call is made as: the execution role, and the name of the session this service
@@ -610,9 +645,10 @@ fn refusal(
     acts: Acts<'_>,
     action: &str,
     resource: &str,
+    target_policy: Option<&str>,
     answered: Answered<'_>,
 ) -> Option<String> {
-    let sentence = not_authorized(iam, acts, action, resource)?;
+    let sentence = not_authorized(iam, acts, action, resource, target_policy)?;
     Some(super::integration::sdk_exception_message(
         answered.api,
         answered.family,
@@ -653,8 +689,9 @@ fn not_authorized(
     acts: Acts<'_>,
     action: &str,
     resource: &str,
+    target_policy: Option<&str>,
 ) -> Option<String> {
-    let because = withheld(iam, acts.role_arn, action, resource)?;
+    let because = withheld(iam, acts, action, resource, target_policy)?;
     let principal = acting_principal(acts.role_arn, acts.session_name);
     Some(format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} \
@@ -662,26 +699,67 @@ fn not_authorized(
     ))
 }
 
-/// WHY the documents in force on `role_arn` withhold `action` on `resource` — the clause
-/// IAM's own sentence ends with — or `None` where they allow it, and wherever nothing of
-/// the kind can be shown (see the module docs for the cases that show nothing).
+/// WHY the documents in force withhold `action` on `resource` from the identity `acts` —
+/// the clause IAM's own sentence ends with — or `None` where they allow it, and wherever
+/// nothing of the kind can be shown (see the module docs for the cases that show nothing).
+///
+/// `target_policy` is the resource-based policy in force on `resource`, where this
+/// emulator holds one ([`super::target_resource_policy`]): a call on a resource of the
+/// same account is allowed when EITHER that policy or the role's own identity-based
+/// documents allow it, and an explicit `Deny` in either refuses it.
 ///
 /// The ONE decision about a state machine's role in this crate: whatever the refusal is
 /// then reported AS — an invoked service's SDK exception ([`refusal`]), or a sentence
 /// this service words itself — the documents are read here, in this order.
 fn withheld(
     iam: &IamState,
-    role_arn: &str,
+    acts: Acts<'_>,
     action: &str,
     resource: &str,
+    target_policy: Option<&str>,
 ) -> Option<String> {
+    let role_arn = acts.role_arn;
     iam.roles.values().find(|role| role.arn == role_arn)?;
     // The documents in force on the role. The collection is bounded by IAM's own
     // quotas on how many policies one role carries, so this walk is bounded by the
     // store rather than by a number of its own.
     let policies = iam.principal_policies(role_arn)?;
-    let request = iam::Request::new(action, resource, &[]);
+    // The spellings of the identity the call is made as travel with the request, because
+    // that is what a resource-based statement's `Principal` element is matched against;
+    // an identity-based document states no such element, so for those the decision rests
+    // on the action and the resource alone ([`acting_principals`]).
+    let principals = acting_principals(acts);
+    let request = iam::Request::new(action, resource, &principals);
+    // Every spelling, the account's included: a statement that DENIES the account denies
+    // each of its principals, while one that merely names the account delegates to that
+    // account's own identity-based policies rather than granting.
+    let mut named = principals.clone();
+    named.extend(iam::account_principals(role_arn));
+    let denying = iam::Request::new(action, resource, &named);
+    // An explicit `Deny` in the TARGET's own policy refuses the call whatever any grant
+    // says, which is the order IAM evaluates the two kinds of document in.
+    if target_policy
+        .is_some_and(|document| iam::resource_decision(document, &denying) == Decision::Denied)
+    {
+        return Some("with an explicit deny in a resource-based policy".to_string());
+    }
     let stated = iam::identity_decision(&policies.documents, &request);
+    // Taken before any grant is read, so an explicit `Deny` in a document that CAN be
+    // read refuses the call whatever else is in force — including a grant this emulator
+    // cannot read, which only lifts the default deny of a call no readable statement
+    // allows.
+    if stated == Decision::Denied {
+        return Some("with an explicit deny in an identity-based policy".to_string());
+    }
+    // A grant in the target's own policy names this identity directly, and "a permissions
+    // boundary does not limit the permissions granted to the entity by a resource-based
+    // policy that names it as a principal": such a grant stands on its own, so a role
+    // carrying no identity-based document at all makes the call the target allows it.
+    if target_policy
+        .is_some_and(|document| iam::resource_decision(document, &request) == Decision::Allowed)
+    {
+        return None;
+    }
     // Whether the documents in force grant the call at all. Nothing stated is IAM's
     // implicit deny, so a role carrying NO identity-based document grants nothing: a
     // grant has to come from a document, which is how IAM's own gate over this same
@@ -689,34 +767,25 @@ fn withheld(
     // not hold is the one grant this emulator cannot read, so it cannot be the basis of
     // a refusal — but it cannot overturn one either: an explicit `Deny` in a document
     // that IS held wins over every grant, including one whose content is unknown here.
-    let granted = iam::is_allowed(stated, Decision::NotStated)
-        || (stated != Decision::Denied && !policies.uncarried.is_empty());
+    let granted = iam::is_allowed(stated, Decision::NotStated) || !policies.uncarried.is_empty();
     // "A permissions boundary sets the maximum permissions that an identity-based
     // policy can grant to an entity": the boundary CAPS what those policies grant and
     // grants nothing itself, so a call it does not allow is refused even where they
     // allow it. A role carrying none — or one whose document is not held, a ceiling
-    // this emulator cannot read — is capped by nothing. A call an identity-based
-    // policy explicitly DENIES is already refused on that deny, so no ceiling is read
-    // for it.
-    let capped = if stated == Decision::Denied {
-        Decision::Allowed
-    } else {
-        iam.permissions_boundary_document(role_arn)
-            .map_or(Decision::Allowed, |document| {
-                iam::identity_decision(::std::slice::from_ref(&document), &request)
-            })
-    };
+    // this emulator cannot read — is capped by nothing.
+    let capped = iam
+        .permissions_boundary_document(role_arn)
+        .map_or(Decision::Allowed, |document| {
+            iam::identity_decision(::std::slice::from_ref(&document), &request)
+        });
     if granted && capped == Decision::Allowed {
         return None;
     }
-    // Why the call was refused: an explicit `Deny` that is about it — stated in an
-    // identity-based policy or in the boundary, either of which wins over every
-    // `Allow` — or the absence of an `Allow`, which names the DOCUMENT that withheld
-    // it: the boundary where the identity-based policies did allow the call, and the
+    // Why the call was refused: an explicit `Deny` in the boundary, which wins over every
+    // `Allow`, or the absence of an `Allow`, which names the DOCUMENT that withheld it:
+    // the boundary where the identity-based policies did allow the call, and the
     // identity-based policies where nothing allowed it at all.
-    let because = if stated == Decision::Denied {
-        "with an explicit deny in an identity-based policy".to_string()
-    } else if capped == Decision::Denied {
+    let because = if capped == Decision::Denied {
         "with an explicit deny in a permissions boundary".to_string()
     } else if granted {
         format!("because no permissions boundary allows the {action} action")
@@ -724,4 +793,18 @@ fn withheld(
         format!("because no identity-based policy allows the {action} action")
     };
     Some(because)
+}
+
+/// Every spelling of the identity a call is made as, which is what a resource-based
+/// statement's `Principal` element is matched against: the SESSION of the execution role
+/// this service assumed for the work ([`assumed_role_session`]), and the ROLE's own ARN —
+/// a statement naming the role covers every session of it ("the principals in the policy
+/// include the role").
+fn acting_principals(acts: Acts<'_>) -> Vec<String> {
+    let mut principals = Vec::new();
+    if let Some(session) = assumed_role_session(acts.role_arn, acts.session_name) {
+        principals.push(session);
+    }
+    principals.push(acts.role_arn.to_string());
+    principals
 }

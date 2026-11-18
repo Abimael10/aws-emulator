@@ -338,7 +338,7 @@ pub(crate) mod role_actions;
 /// reads, and the store that holds it, stay in this module.
 pub mod invoke_authorization;
 pub use invoke_authorization::{
-    authorize_invocation, INVOKE_ASYNC_ACTION, INVOKE_FUNCTION_ACTION,
+    authorize_invocation, function_resource_policy, INVOKE_ASYNC_ACTION, INVOKE_FUNCTION_ACTION,
 };
 
 /// Whether IAM lets the principal a CONTROL-PLANE request speaks for perform the action it

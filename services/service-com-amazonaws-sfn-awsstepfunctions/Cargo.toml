@@ -84,6 +84,12 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # what a `Task` state's integration call is made as: read out of IAM's own store, so
 # this service judges that call against the documents IAM's handlers wrote.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The RESOURCE-BASED policy in force on a Lambda FUNCTION a `Task` state invokes: read
+# out of that service's own store (`state::target_resource_policy`), because a call on a
+# resource of the same account is allowed when either the role's identity-based policies
+# or the target's own policy allows it, and only the owning service holds the statements
+# `lambda:AddPermission` wrote.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # The EventBridge CONNECTION an HTTP Task's `Authentication.ConnectionArn` names: its
 # state and the credentials it holds, read out of EventBridge's own store — the same
 # records `CreateConnection` wrote and an api-destination invocation carries — so a
@@ -128,8 +134,8 @@ service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # The same, for the service a `Task` state whose `Resource` names a Lambda FUNCTION
 # invokes (`tests/all/lambda_task_control_flow.rs`): the function really runs there, so
-# the control flow around the task is driven by what the run answered.
-service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# the control flow around the task is driven by what the run answered. (The crate is a
+# dependency above, because a function's resource-based policy is read out of its store.)
 # A deployment package is a .zip archive the suite above writes in memory...
 zip = { version = "9", default-features = false, features = ["deflate"] }
 # ...and `FunctionCode$ZipFile` is a blob, which a restJson1 request carries base64-encoded.

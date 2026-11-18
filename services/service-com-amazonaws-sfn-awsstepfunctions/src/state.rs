@@ -4776,6 +4776,7 @@ pub use store::{
     ActivityPoll, CallbackHandoverReply, StateMachineUpdate, StateMachineUpdateRejection, Stopped,
 };
 pub mod task_authorization;
+pub mod target_resource_policy;
 pub mod xml_answer;
 pub mod xray_tracing;
 

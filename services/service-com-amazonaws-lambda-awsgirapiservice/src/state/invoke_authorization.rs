@@ -246,6 +246,24 @@ fn addressed_resource_policy<Eng: Send + Sync + 'static>(
         .map(crate::state::PolicyRecord::to_json)
 }
 
+/// The resource-based policy document in force on the function the ARN `function_arn` names,
+/// or `None` when this endpoint holds no such function, that qualifier carries no policy, or
+/// the value is not a reference to a function at all.
+///
+/// The ACCESSOR another emulated service reads a function's own policy through, so a service
+/// that decides for itself whether the role it acts as may invoke
+/// ([`crate::state::FunctionRecord::policies`] is this store's) judges the call against the
+/// very statements `AddPermission` and `PutResourcePolicy` wrote, rather than against a second
+/// copy of them. The qualifier is the one the ARN itself carries, which is the key the grant
+/// was stored under ([`addressed_resource_policy`]). A pure READ.
+#[must_use]
+pub fn function_resource_policy<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    function_arn: &str,
+) -> Option<String> {
+    addressed_resource_policy(engine, function_arn, None)
+}
+
 /// The refusal AWS words an authorization failure with: who was refused, which action, on
 /// which resource, and which rule withheld the grant. Every value in it comes from the request
 /// and the stored policies.
