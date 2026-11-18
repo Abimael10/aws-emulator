@@ -231,6 +231,14 @@ fn register_consumer(
     // than the `TagMap` `@length` of 1..200 the boundary validator enforces, so the
     // documented ceiling is applied here, BEFORE anything is stored.
     let tags: HashMap<String, String> = input.tags.clone().unwrap_or_default();
+    // A key in the namespace AWS keeps for itself is no caller's to write
+    // ([`crate::state::reserved_tag_keys`]), so a registration carrying one stores no
+    // consumer.
+    if crate::state::names_reserved_tag_key(tags.keys().map(String::as_str)) {
+        return Err(invalid_argument(
+            crate::state::RESERVED_TAG_KEYS_MESSAGE.to_string(),
+        ));
+    }
     if tags.len() > crate::state::MAX_CONSUMER_TAGS {
         return Err(invalid_argument(crate::state::tag_ceiling_exceeded_message(
             tags.len(),

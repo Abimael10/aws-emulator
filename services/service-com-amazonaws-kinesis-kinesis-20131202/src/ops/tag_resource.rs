@@ -190,6 +190,16 @@ fn not_found(resource_arn: &str) -> TagResourceError {
     .into()
 }
 
+/// The modelled refusal for a request this operation cannot serve as asked: "A specified
+/// parameter exceeds its restrictions, is not supported, or can't be used"
+/// (`InvalidArgumentException`).
+fn invalid_argument(message: String) -> TagResourceError {
+    TagResourceErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// Assign the request's tags to the resource its ARN names, or answer the modelled refusal
 /// that stands in the way. The whole write lives here so the caller holds the store's lock
 /// for exactly this long.
@@ -199,6 +209,15 @@ fn apply_assignment(
     now: ::std::time::SystemTime,
     input: &TagResourceInput,
 ) -> Result<(), TagResourceError> {
+    // A key in the namespace AWS keeps for itself is no caller's to write
+    // ([`crate::state::reserved_tag_keys`]), and the refusal is taken before the resource is
+    // even resolved, so the stored tag set is left exactly as it was.
+    if crate::state::names_reserved_tag_key(input.tags.keys().map(String::as_str)) {
+        return Err(invalid_argument(
+            crate::state::RESERVED_TAG_KEYS_MESSAGE.to_string(),
+        ));
+    }
+
     // `ResourceARN` addresses "the Kinesis resource" rather than one kind of it — it is
     // modelled `^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`, so a channel is a
     // first-class tagging target — and each kind carries ONE stored tag set, so the write

@@ -329,6 +329,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (false, Some(requested)) => u32::try_from(requested).unwrap_or(u32::MAX),
         };
 
+        // A key in the namespace AWS keeps for itself is no caller's to write
+        // ([`crate::state::reserved_tag_keys`]), so a create carrying one stores no stream.
+        if input.tags.as_ref().is_some_and(|tags| {
+            crate::state::names_reserved_tag_key(tags.keys().map(String::as_str))
+        }) {
+            audit(&akid, &region, "refused");
+            return Err(invalid_argument(
+                crate::state::RESERVED_TAG_KEYS_MESSAGE.to_string(),
+            ));
+        }
+
         // "A set of up to 50 key-value pairs to use to create the tags"
         // (`CreateStreamInput$Tags`) — narrower than the `TagMap` `@length` of 1..200 the
         // boundary validator enforces, so the documented ceiling is applied here.

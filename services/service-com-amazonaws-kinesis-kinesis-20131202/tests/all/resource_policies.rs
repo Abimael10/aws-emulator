@@ -55,7 +55,7 @@ pub(crate) fn account() -> &'static str {
 /// no policy to remove: this service's not-found sentence for a policy, spelled out here
 /// rather than taken from the handler's own helper so a drift away from the wording fails.
 pub(crate) fn policy_not_found_says(arn: &str) -> String {
-    format!("Policy for resource {arn} under account {} not found.", account())
+    format!("No resource policy found for resource ARN {arn}.")
 }
 
 /// A resource-based policy document: `Version`, one statement granting one action to one

@@ -35,6 +35,7 @@ pub mod channel_delivery;
 mod channel_key_access;
 mod channels;
 mod kms_key;
+mod reserved_tag_keys;
 mod service_execution_role;
 mod shard_reading;
 mod streaming_table;
@@ -43,6 +44,7 @@ mod write_quota;
 pub use channel_key_access::*;
 pub use channels::*;
 pub use kms_key::*;
+pub use reserved_tag_keys::*;
 pub use service_execution_role::*;
 pub use shard_reading::*;
 pub use streaming_table::*;
@@ -3237,7 +3239,7 @@ pub fn stream_has_consumers_message(stream_name: &str) -> String {
         "DeleteStream can\u{2019}t delete {}:{stream_name} because there are consumers \
          associated with this data stream. To delete {stream_name} anyway, set the \
          EnforceConsumerDeletion parameter to true to force the deletion of all the \
-         consumers associated with this data stream.",
+         consumers that are associated with it.",
         ::engine::emulator_account_id()
     )
 }
@@ -3397,16 +3399,13 @@ pub fn policy_invalid_effect_message(effect: &str) -> String {
 /// the stored slot stays empty until an attach writes a document into it.
 pub const EMPTY_RESOURCE_POLICY: &str = "{}";
 
-/// How a delete states that the resource the request named carries no policy to
-/// remove, worded with the fixed tail this service states every not-found with
-/// ("... under account `<account>` not found."): the thing not found is the POLICY of that
-/// resource, and the resource is named the way the request addressed it — by its
-/// `ResourceARN`, the only identifier these operations have.
+/// How a delete states that the resource the request named carries no policy to remove: the
+/// thing not found is the POLICY of that resource, so the sentence names the policy and the
+/// RESOURCE ARN the request addressed it by — the only identifier these operations have — and
+/// nothing else. The account is not part of it: a `ResourceARN` carries the account the
+/// resource belongs to already.
 pub fn resource_policy_not_found_message(arn: &str) -> String {
-    format!(
-        "Policy for resource {arn} under account {} not found.",
-        ::engine::emulator_account_id()
-    )
+    format!("No resource policy found for resource ARN {arn}.")
 }
 
 /// Whether `arn`'s resource segment names a CHANNEL, which is the other resource kind a

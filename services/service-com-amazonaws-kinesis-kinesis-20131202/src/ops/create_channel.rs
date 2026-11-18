@@ -524,6 +524,17 @@ fn create_channel<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     // store's, which keeps a refusal the same whatever the store happens to hold. AWS
     // documents no precedence between them.
     let destination = destination(input)?;
+    // A key in the namespace AWS keeps for itself is no caller's to write
+    // ([`crate::state::reserved_tag_keys`]), so a create carrying one stores no channel.
+    if input
+        .tags
+        .as_ref()
+        .is_some_and(|tags| crate::state::names_reserved_tag_key(tags.keys().map(String::as_str)))
+    {
+        return Err(invalid_argument(
+            crate::state::RESERVED_TAG_KEYS_MESSAGE.to_string(),
+        ));
+    }
     if let Some(refusal) = input
         .encryption_configuration
         .as_ref()

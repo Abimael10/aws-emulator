@@ -216,6 +216,16 @@ fn stream_identifier(input: &AddTagsToStreamInput) -> &str {
         .unwrap_or_default()
 }
 
+/// The modelled refusal for a request this operation cannot serve as asked: "A specified
+/// parameter exceeds its restrictions, is not supported, or can't be used"
+/// (`InvalidArgumentException`).
+fn invalid_argument(message: String) -> AddTagsToStreamError {
+    AddTagsToStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// Assign the request's tags to the stream it names, or answer the modelled refusal that
 /// stands in the way. The whole write lives here so the caller holds the store's lock for
 /// exactly this long.
@@ -225,6 +235,15 @@ fn assign_tags(
     now: ::std::time::SystemTime,
     input: &AddTagsToStreamInput,
 ) -> Result<(), AddTagsToStreamError> {
+    // A key in the namespace AWS keeps for itself is no caller's to write
+    // ([`crate::state::reserved_tag_keys`]), and the refusal is taken before the stream is
+    // even resolved, so the stored tag set is left exactly as it was.
+    if crate::state::names_reserved_tag_key(input.tags.keys().map(String::as_str)) {
+        return Err(invalid_argument(
+            crate::state::RESERVED_TAG_KEYS_MESSAGE.to_string(),
+        ));
+    }
+
     // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
     // carries one and a request naming only that member names no stream.
     let stream = store
