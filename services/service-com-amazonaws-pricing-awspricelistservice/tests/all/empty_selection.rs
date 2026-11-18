@@ -12,7 +12,9 @@
 //!
 //! The rows span what the rule generalises over: which operation, which selector
 //! misses, how many selectors miss at once, and the kind of miss (an unknown value, an
-//! unknown field, a value of the wrong case, a bound no item reaches).
+//! unknown field, a field or attribute NAME of the wrong case — a filter's VALUE is
+//! compared without regard to case, so re-casing one is not a miss — and a bound no
+//! item reaches).
 
 use serde_json::{json, Value};
 
@@ -70,12 +72,12 @@ async fn a_selection_that_matches_nothing_is_an_empty_page() {
             "PriceList",
         ),
         (
-            "GetProducts with a value that differs only in case",
+            "GetProducts with a published attribute name in the wrong case",
             "GetProducts",
             json!({
                 "ServiceCode": "AmazonEC2",
                 "Filters": [
-                    { "Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "LINUX" },
+                    { "Type": "TERM_MATCH", "Field": "OperatingSystem", "Value": "Linux" },
                 ],
             }),
             "PriceList",

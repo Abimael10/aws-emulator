@@ -1614,12 +1614,10 @@ const S3_SERVICE_CODE: &str = "AmazonS3";
 /// The `servicename` the object-storage service's products carry.
 const S3_SERVICE_NAME: &str = "Amazon Simple Storage Service";
 
-/// The `licenseModel` of an operating system that needs no license — the value the
-/// documented EC2 on-demand filter set keys on for Linux.
+/// The `licenseModel` of an instance that brings no licence of its own — the value the
+/// documented EC2 on-demand filter set keys on, under every operating system the
+/// published fleet is priced for, licensed or not.
 const NO_LICENSE_REQUIRED: &str = "No License required";
-
-/// The `licenseModel` of an operating system whose license is in the instance rate.
-const LICENSE_INCLUDED: &str = "License included";
 
 // --- Regions ---------------------------------------------------------------
 
@@ -1728,6 +1726,12 @@ impl InstanceTypeSeed {
             current_generation,
             rate_e10,
         }
+    }
+
+    /// Whether this type's processor is an ARM one, which is what decides whether an
+    /// operating system published for the x86 types only is priced for it.
+    fn is_arm(&self) -> bool {
+        self.physical_processor.contains("Graviton")
     }
 }
 
@@ -1983,35 +1987,18 @@ fn normalization_size_factor(instance_type: &str) -> String {
         .map_or_else(|| "NA".to_string(), |multiple| (multiple * 8).to_string())
 }
 
-/// Which instance types the catalog prices in one Region under one operating system.
+/// Which instance types the catalog prices in one Region.
 struct ComputePlan {
     region_code: &'static str,
-    operating_system: &'static str,
-    /// The `licenseModel` the Price List API reports for this operating system.
-    license_model: &'static str,
-    /// The `operation` code the usage is billed under.
-    operation: &'static str,
-    /// This operating system's rate as a percentage of the Linux rate.
-    rate_percent: u64,
-    /// The instance types this Region prices under this operating system.
+    /// The instance types this Region prices, each under every operating system it is
+    /// published for.
     instance_types: PlannedInstanceTypes,
 }
 
 impl ComputePlan {
-    const fn new(
-        region_code: &'static str,
-        operating_system: &'static str,
-        license_model: &'static str,
-        operation: &'static str,
-        rate_percent: u64,
-        instance_types: PlannedInstanceTypes,
-    ) -> Self {
+    const fn new(region_code: &'static str, instance_types: PlannedInstanceTypes) -> Self {
         Self {
             region_code,
-            operating_system,
-            license_model,
-            operation,
-            rate_percent,
             instance_types,
         }
     }
@@ -2067,10 +2054,13 @@ struct CapacitySeed {
 
 /// The tenancy and capacity statuses the Price List API publishes a separate SKU for.
 ///
-/// AWS bills a dedicated instance at the same hourly rate as a shared one (its
-/// dedicated charge is per Region, not per instance) and bills the hours a capacity
-/// reservation holds unused at the instance's own rate — so these differ in the usage
-/// they are billed under, not in the rate.
+/// AWS bills an instance hour under one of three capacity statuses — the hour a running
+/// instance uses, the hour a capacity reservation holds unused, and the hour an instance
+/// runs inside a reservation that was allocated for it — and publishes a SKU per status
+/// for each tenancy the hardware is dedicated under. It bills a dedicated instance at
+/// the same hourly rate as a shared one (its dedicated charge is per Region, not per
+/// instance) and bills a reservation's hour at the instance's own rate, so these differ
+/// in the usage they are billed under, not in the rate.
 const CAPACITY_SEEDS: &[CapacitySeed] = &[
     CapacitySeed {
         tenancy: "Shared",
@@ -2083,6 +2073,11 @@ const CAPACITY_SEEDS: &[CapacitySeed] = &[
         usage_kind: "UnusedBox",
     },
     CapacitySeed {
+        tenancy: "Shared",
+        capacity_status: "AllocatedCapacityReservation",
+        usage_kind: "Reservation",
+    },
+    CapacitySeed {
         tenancy: "Dedicated",
         capacity_status: "Used",
         usage_kind: "DedicatedUsage",
@@ -2092,78 +2087,96 @@ const CAPACITY_SEEDS: &[CapacitySeed] = &[
         capacity_status: "UnusedCapacityReservation",
         usage_kind: "UnusedDed",
     },
+    CapacitySeed {
+        tenancy: "Dedicated",
+        capacity_status: "AllocatedCapacityReservation",
+        usage_kind: "DedicatedRes",
+    },
 ];
 
-/// The operating systems the launch Region prices the published fleet under, beyond
-/// Linux: a licensed platform's rate includes its license, which is the `licenseModel`
-/// the Price List API reports for it.
-const WINDOWS_INSTANCE_TYPES: &[&str] = &[
-    "t2.micro",
-    "t2.small",
-    "t2.medium",
-    "t3.nano",
-    "t3.micro",
-    "t3.small",
-    "t3.medium",
-    "t3.large",
-    "m4.large",
-    "m5.large",
-    "m5.xlarge",
-    "m5.2xlarge",
-    "m6i.large",
-    "c4.large",
-    "c5.large",
-    "c5.xlarge",
-    "c6i.large",
-    "r4.large",
-    "r5.large",
-    "r5.xlarge",
-    "z1d.large",
+/// One operating system the catalog prices a compute instance under.
+///
+/// The hour of the same hardware is a different product under each operating system:
+/// its own SKU, the `operation` code its usage is billed under, and a rate that carries
+/// whatever licence the platform includes. The licence is what the operation code and
+/// the rate say; it is not a different `licenseModel`, which an instance running the
+/// platform the hour is billed under needs none of either way.
+struct PlatformSeed {
+    /// The `operatingSystem` attribute.
+    operating_system: &'static str,
+    /// The `operation` code the usage is billed under.
+    operation: &'static str,
+    /// This operating system's rate as a percentage of the Linux rate.
+    rate_percent: u64,
+    /// Whether this operating system is published for the ARM instance types as well as
+    /// the x86 ones.
+    on_arm: bool,
+}
+
+impl PlatformSeed {
+    /// Whether the catalog prices `instance` under this operating system.
+    fn prices(&self, instance: &InstanceTypeSeed) -> bool {
+        self.on_arm || !instance.is_arm()
+    }
+}
+
+/// The operating systems the catalog prices every published instance type under.
+///
+/// AWS prices an instance type under each operating system it can run, in every Region
+/// that type is offered in, so an on-demand lookup that pins the platform resolves for
+/// each of them. A platform whose rate includes a licence is billed under its own
+/// `operation` code and priced above the one that includes none; Windows Server runs on
+/// the x86 instance types only, so the ARM (Graviton) types are priced under Linux
+/// alone.
+const COMPUTE_PLATFORMS: &[PlatformSeed] = &[
+    PlatformSeed {
+        operating_system: "Linux",
+        operation: "RunInstances",
+        rate_percent: 100,
+        on_arm: true,
+    },
+    PlatformSeed {
+        operating_system: "Windows",
+        operation: "RunInstances:0002",
+        rate_percent: 200,
+        on_arm: false,
+    },
 ];
 
 /// The compute instances the catalog prices. Every Region carries
 /// [`COMMON_INSTANCE_TYPES`]; `us-east-1`, where AWS launches the whole fleet, carries
-/// every type the catalog publishes.
+/// every type the catalog publishes. Each of them is priced under every operating system
+/// [`COMPUTE_PLATFORMS`] publishes it for.
 const EC2_COMPUTE_PLAN: &[ComputePlan] = &[
-    ComputePlan::new(
-        "us-east-1",
-        "Linux",
-        NO_LICENSE_REQUIRED,
-        "RunInstances",
-        100,
-        PlannedInstanceTypes::Every,
-    ),
-    ComputePlan::new("us-east-1", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, PlannedInstanceTypes::Named(WINDOWS_INSTANCE_TYPES)),
-    ComputePlan::new("us-east-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("us-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("us-west-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("us-west-2", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, PlannedInstanceTypes::Named(&["m5.large"])),
-    ComputePlan::new("ca-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("ca-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("eu-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("eu-west-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("eu-west-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("eu-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("eu-central-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("eu-north-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("eu-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("ap-northeast-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("ap-northeast-1", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, PlannedInstanceTypes::Named(&["m5.large"])),
-    ComputePlan::new("ap-northeast-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("ap-northeast-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("ap-southeast-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("ap-southeast-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("ap-southeast-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("ap-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("ap-south-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("ap-east-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("sa-east-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("af-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("il-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("me-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("me-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("cn-north-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
-    ComputePlan::new("cn-northwest-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("us-east-1", PlannedInstanceTypes::Every),
+    ComputePlan::new("us-east-2", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("us-west-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("us-west-2", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ca-central-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ca-west-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-west-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-west-2", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-west-3", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-central-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-central-2", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-north-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-south-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-northeast-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-northeast-2", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-northeast-3", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-southeast-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-southeast-2", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-southeast-3", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-south-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-south-2", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-east-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("sa-east-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("af-south-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("il-central-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("me-central-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("me-south-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("cn-north-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("cn-northwest-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
 ];
 
 // --- AmazonEC2: EBS volumes ------------------------------------------------
@@ -2485,61 +2498,68 @@ fn ec2_products() -> Vec<Product> {
                 .collect(),
         };
         for instance in instance_types {
-            // The attributes of the instance's own hardware and platform, which every
-            // SKU of that type publishes whatever tenancy or capacity status it prices.
+            // The attributes of the instance's own hardware, which every SKU of that type
+            // publishes whatever platform, tenancy or capacity status it prices.
             let shape = instance_shape_attributes(instance);
-            for capacity in CAPACITY_SEEDS {
-                let mut pairs = vec![
-                    ("capacitystatus", capacity.capacity_status.to_string()),
-                    ("currentGeneration", instance.current_generation.to_string()),
-                    ("instanceFamily", instance.instance_family.to_string()),
-                    ("instanceType", instance.instance_type.to_string()),
-                    ("licenseModel", plan.license_model.to_string()),
-                    ("location", region.location.to_string()),
-                    ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
-                    ("memory", instance.memory.to_string()),
-                    (
-                        "normalizationSizeFactor",
-                        normalization_size_factor(instance.instance_type),
-                    ),
-                    ("operatingSystem", plan.operating_system.to_string()),
-                    ("operation", plan.operation.to_string()),
-                    ("physicalProcessor", instance.physical_processor.to_string()),
-                    ("preInstalledSw", "NA".to_string()),
-                    ("regionCode", region.code.to_string()),
-                    ("servicecode", EC2_SERVICE_CODE.to_string()),
-                    ("servicename", EC2_SERVICE_NAME.to_string()),
-                    ("tenancy", capacity.tenancy.to_string()),
-                    (
-                        "usagetype",
-                        format!(
-                            "{}{}:{}",
-                            region.usage_prefix, capacity.usage_kind, instance.instance_type
+            // Every operating system that type is published under: the hour of the same
+            // hardware is a product of its own under each.
+            for platform in COMPUTE_PLATFORMS
+                .iter()
+                .filter(|platform| platform.prices(instance))
+            {
+                for capacity in CAPACITY_SEEDS {
+                    let mut pairs = vec![
+                        ("capacitystatus", capacity.capacity_status.to_string()),
+                        ("currentGeneration", instance.current_generation.to_string()),
+                        ("instanceFamily", instance.instance_family.to_string()),
+                        ("instanceType", instance.instance_type.to_string()),
+                        ("licenseModel", NO_LICENSE_REQUIRED.to_string()),
+                        ("location", region.location.to_string()),
+                        ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
+                        ("memory", instance.memory.to_string()),
+                        (
+                            "normalizationSizeFactor",
+                            normalization_size_factor(instance.instance_type),
                         ),
-                    ),
-                    ("vcpu", instance.vcpu.to_string()),
-                ];
-                pairs.extend(shape.iter().cloned());
-                let draft = ProductDraft {
-                    sku: sku(&[
-                        instance.instance_type,
-                        region.code,
-                        plan.operating_system,
-                        capacity.tenancy,
-                        capacity.capacity_status,
-                    ]),
-                    product_family: "Compute Instance",
-                    unit: "Hrs",
-                    rate_e10: scale(
-                        scale(instance.rate_e10, region.rate_percent),
-                        plan.rate_percent,
-                    ),
-                    // AWS prices a compute instance both on demand and under a
-                    // reservation, so its offer document carries both term types.
-                    reserved: true,
-                    attributes: attributes(pairs),
-                };
-                products.push(product_from_draft(EC2_SERVICE_CODE, draft));
+                        ("operatingSystem", platform.operating_system.to_string()),
+                        ("operation", platform.operation.to_string()),
+                        ("physicalProcessor", instance.physical_processor.to_string()),
+                        ("preInstalledSw", "NA".to_string()),
+                        ("regionCode", region.code.to_string()),
+                        ("servicecode", EC2_SERVICE_CODE.to_string()),
+                        ("servicename", EC2_SERVICE_NAME.to_string()),
+                        ("tenancy", capacity.tenancy.to_string()),
+                        (
+                            "usagetype",
+                            format!(
+                                "{}{}:{}",
+                                region.usage_prefix, capacity.usage_kind, instance.instance_type
+                            ),
+                        ),
+                        ("vcpu", instance.vcpu.to_string()),
+                    ];
+                    pairs.extend(shape.iter().cloned());
+                    let draft = ProductDraft {
+                        sku: sku(&[
+                            instance.instance_type,
+                            region.code,
+                            platform.operating_system,
+                            capacity.tenancy,
+                            capacity.capacity_status,
+                        ]),
+                        product_family: "Compute Instance",
+                        unit: "Hrs",
+                        rate_e10: scale(
+                            scale(instance.rate_e10, region.rate_percent),
+                            platform.rate_percent,
+                        ),
+                        // AWS prices a compute instance both on demand and under a
+                        // reservation, so its offer document carries both term types.
+                        reserved: true,
+                        attributes: attributes(pairs),
+                    };
+                    products.push(product_from_draft(EC2_SERVICE_CODE, draft));
+                }
             }
         }
     }

@@ -1531,3 +1531,434 @@ async fn an_offer_document_is_dated_at_the_catalogs_current_publication() {
         }
     }
 }
+
+#[tokio::test]
+async fn the_recorded_on_demand_filter_set_resolves_one_sku_per_platform() {
+    let router = router();
+
+    // The whole filter set a price lookup sends, `licenseModel` included: the licence a
+    // licensed platform's rate carries is stated by the `operation` the hour is billed
+    // under, so the instance itself still brings no licence of its own and the same
+    // filter set resolves a SKU under every platform.
+    let rows: &[(&str, &str, &str)] = &[
+        ("US West (Oregon)", "t3.micro", "Linux"),
+        ("US West (Oregon)", "t3.micro", "Windows"),
+        ("US West (Oregon)", "t3.nano", "Windows"),
+        ("US East (N. Virginia)", "t3.micro", "Windows"),
+        ("Asia Pacific (Tokyo)", "m5.large", "Windows"),
+    ];
+
+    for (location, instance_type, operating_system) in rows.iter().copied() {
+        let case = format!("{location}/{instance_type}/{operating_system}");
+        let response = ok(
+            &router,
+            "GetProducts",
+            &json!({
+                "ServiceCode": "AmazonEC2",
+                "Filters": term_matches(&[
+                    ("instanceType", instance_type),
+                    ("operatingSystem", operating_system),
+                    ("location", location),
+                    ("tenancy", "Shared"),
+                    ("preInstalledSw", NO_PRE_INSTALLED_SW),
+                    ("capacitystatus", "Used"),
+                    ("licenseModel", NO_LICENSE_REQUIRED),
+                ]),
+                "MaxResults": 100,
+            }),
+        )
+        .await;
+        assert_eq!(
+            product_skus(&response).len(),
+            1,
+            "case {case}: the lookup must resolve exactly one SKU, got {:?}",
+            product_skus(&response)
+        );
+        assert!(
+            response.get("NextToken").is_none_or(Value::is_null),
+            "case {case}: a one-product answer carries no NextToken, got {response}"
+        );
+    }
+}
+
+/// The operating systems the catalog prices compute under, as
+/// `GetAttributeValues(AmazonEC2, operatingSystem)` enumerates them — read off the API
+/// rather than written out here.
+async fn published_operating_systems(router: &MultiServiceRouter) -> Vec<String> {
+    let mut systems = all_attribute_values(
+        router,
+        &json!({ "ServiceCode": "AmazonEC2", "AttributeName": "operatingSystem" }),
+    )
+    .await;
+    systems.sort();
+    systems.dedup();
+    systems
+}
+
+/// The capacity statuses the catalog prices compute under, as
+/// `GetAttributeValues(AmazonEC2, capacitystatus)` enumerates them.
+async fn published_capacity_statuses(router: &MultiServiceRouter) -> Vec<String> {
+    let mut statuses = all_attribute_values(
+        router,
+        &json!({ "ServiceCode": "AmazonEC2", "AttributeName": "capacitystatus" }),
+    )
+    .await;
+    statuses.sort();
+    statuses.dedup();
+    statuses
+}
+
+/// The in-use shared on-demand SKU of one instance type, Region and operating system,
+/// looked up by the attributes that identify it apart from the `licenseModel` the
+/// platform carries — which is what the lookup READS off the product.
+fn in_use_lookup<'a>(
+    instance_type: &'a str,
+    operating_system: &'a str,
+    location: &'a str,
+) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("instanceType", instance_type),
+        ("operatingSystem", operating_system),
+        ("location", location),
+        ("tenancy", "Shared"),
+        ("preInstalledSw", NO_PRE_INSTALLED_SW),
+        ("capacitystatus", "Used"),
+    ]
+}
+
+/// The (location, instance type) pairs the coverage rule is read off.
+///
+/// The types are published `instanceType` values (as
+/// `GetAttributeValues(AmazonEC2, instanceType)` enumerates them) that run on x86
+/// hardware, so every operating system the catalog publishes prices them; the rows
+/// differ in Region, instance family and size. The last three name neither the type nor
+/// the Region the report cited.
+const COVERAGE_ROWS: &[(&str, &str)] = &[
+    ("US West (Oregon)", "t3.micro"),
+    ("US West (Oregon)", "t3.nano"),
+    ("US East (N. Virginia)", "m5.large"),
+    ("Asia Pacific (Tokyo)", "c5.large"),
+    ("EU (Ireland)", "m5.xlarge"),
+    ("South America (Sao Paulo)", "t2.micro"),
+];
+
+#[tokio::test]
+async fn a_priced_instance_type_is_published_under_every_platform_that_runs_it() {
+    let router = router();
+
+    let operating_systems = published_operating_systems(&router).await;
+    assert!(
+        operating_systems.len() > 1,
+        "the catalog must price compute under more than one operating system, got \
+         {operating_systems:?}"
+    );
+
+    for (location, instance_type) in COVERAGE_ROWS.iter().copied() {
+        // (operating system, SKU, operation, hourly rate)
+        let mut by_platform: BTreeMap<String, (String, String, String)> = BTreeMap::new();
+
+        for operating_system in &operating_systems {
+            let case = format!("{location}/{instance_type}/{operating_system}");
+            let pinned = in_use_lookup(instance_type, operating_system, location);
+            let response = ok(
+                &router,
+                "GetProducts",
+                &json!({
+                    "ServiceCode": "AmazonEC2",
+                    "Filters": term_matches(&pinned),
+                    "MaxResults": 100,
+                }),
+            )
+            .await;
+            let documents = offer_documents(&response);
+            assert_eq!(
+                documents.len(),
+                1,
+                "case {case}: the lookup must select exactly one SKU, got {}: {:?}",
+                documents.len(),
+                product_skus(&response)
+            );
+            let document = &documents[0];
+            let sku = product_sku(document);
+            for (field, value) in &pinned {
+                assert_eq!(
+                    offer_attribute(document, field).as_deref(),
+                    Some(*value),
+                    "case {case}: the selected SKU must carry {field}={value}, got {document}"
+                );
+            }
+
+            // Whatever licence a platform's rate carries, the instance brings none of
+            // its own, and the whole filter set a price lookup sends — the licence model
+            // included — selects that one SKU again.
+            let license_model = attribute_or_empty(document, "licenseModel");
+            assert_eq!(
+                license_model, NO_LICENSE_REQUIRED,
+                "case {case}: a priced instance hour needs no licence of its own, got \
+                 {license_model:?}"
+            );
+            let mut whole = pinned.clone();
+            whole.push(("licenseModel", license_model.as_str()));
+            let again = ok(
+                &router,
+                "GetProducts",
+                &json!({
+                    "ServiceCode": "AmazonEC2",
+                    "Filters": term_matches(&whole),
+                    "MaxResults": 100,
+                }),
+            )
+            .await;
+            assert_eq!(
+                product_skus(&again),
+                vec![sku.clone()],
+                "case {case}: the whole on-demand filter set must select the same one SKU, \
+                 got {:?}",
+                product_skus(&again)
+            );
+
+            let on_demand = terms_of(document, "OnDemand");
+            assert_eq!(
+                on_demand.len(),
+                1,
+                "case {case}: an instance is offered on demand once, got {on_demand:?}"
+            );
+            let dimensions = dimensions_of(&on_demand[0].1);
+            assert_eq!(
+                dimensions.len(),
+                1,
+                "case {case}: the on-demand term prices one dimension, got {dimensions:?}"
+            );
+            assert_eq!(
+                dimensions[0].1.get("unit").and_then(Value::as_str),
+                Some("Hrs"),
+                "case {case}: on-demand instance usage is priced per hour, got {:?}",
+                dimensions[0].1
+            );
+            let rate = dimension_rate(&dimensions[0].1);
+            assert!(
+                rate.parse::<f64>().is_ok_and(|rate| rate > 0.0),
+                "case {case}: expected a positive USD on-demand rate, got {rate:?}"
+            );
+
+            by_platform.insert(
+                operating_system.clone(),
+                (sku, attribute_or_empty(document, "operation"), rate),
+            );
+        }
+
+        // One platform's hour is a product of its own: its own SKU, its own billed
+        // operation, and — where the platform carries a licence — a rate above the
+        // platform that carries none, which is the one the published value set names
+        // Linux.
+        let case = format!("{location}/{instance_type}");
+        let skus: BTreeSet<&String> = by_platform.values().map(|(sku, ..)| sku).collect();
+        assert_eq!(
+            skus.len(),
+            by_platform.len(),
+            "case {case}: each platform must publish its own SKU, got {by_platform:?}"
+        );
+        let operations: BTreeSet<&String> = by_platform
+            .values()
+            .map(|(_, operation, _)| operation)
+            .collect();
+        assert_eq!(
+            operations.len(),
+            by_platform.len(),
+            "case {case}: each platform's usage must be billed under its own operation, got \
+             {by_platform:?}"
+        );
+        let (_, _, unlicensed_rate) = by_platform.get("Linux").unwrap_or_else(|| {
+            panic!("case {case}: the catalog must price the unlicensed platform, got {by_platform:?}")
+        });
+        let unlicensed = unlicensed_rate.parse::<f64>().unwrap_or_default();
+        for (operating_system, (_, _, rate)) in &by_platform {
+            if operating_system == "Linux" {
+                continue;
+            }
+            let licensed = rate.parse::<f64>().unwrap_or_default();
+            assert!(
+                licensed > unlicensed,
+                "case {case}/{operating_system}: a licensed platform's rate must be above the \
+                 unlicensed {unlicensed}, got {licensed}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn each_published_platform_prices_every_type_its_hardware_runs() {
+    let router = router();
+
+    let operating_systems = published_operating_systems(&router).await;
+
+    // The processor family whose instance types run no licensed Windows image, as the
+    // products' own `physicalProcessor` attribute names it: AWS publishes no Windows
+    // product for an ARM (Graviton) type, which is the one exclusion in the catalog's
+    // per-platform coverage.
+    const ARM_PROCESSOR: &str = "Graviton";
+
+    // Rows: the Region the whole published fleet is priced in, and two more, so the
+    // coverage is read off more than one Region.
+    for location in [
+        "US East (N. Virginia)",
+        "US West (Oregon)",
+        "Asia Pacific (Tokyo)",
+    ] {
+        // Per platform, the types the Region prices under it with the processor each one
+        // runs on, read off the products themselves.
+        let mut by_platform: BTreeMap<&String, BTreeMap<String, String>> = BTreeMap::new();
+        for operating_system in &operating_systems {
+            let documents = selected(
+                &router,
+                &term_matches(&[
+                    ("operatingSystem", operating_system),
+                    ("location", location),
+                    ("tenancy", "Shared"),
+                    ("capacitystatus", "Used"),
+                    ("preInstalledSw", NO_PRE_INSTALLED_SW),
+                ]),
+            )
+            .await;
+            let types: BTreeMap<String, String> = documents
+                .iter()
+                .filter_map(|document| {
+                    Some((
+                        offer_attribute(document, "instanceType")?,
+                        attribute_or_empty(document, "physicalProcessor"),
+                    ))
+                })
+                .collect();
+            assert!(
+                types.len() > 5,
+                "case {location}/{operating_system}: a published platform must price the \
+                 Region's instance types, got {} of them",
+                types.len()
+            );
+            by_platform.insert(operating_system, types);
+        }
+
+        // Every type the Region prices under any platform, with its processor.
+        let region: BTreeMap<&String, &String> = by_platform
+            .values()
+            .flat_map(|types| types.iter())
+            .collect();
+
+        for (operating_system, types) in &by_platform {
+            let case = format!("{location}/{operating_system}");
+            // A platform priced for ARM hardware at all runs every type the Region
+            // prices; one that is not must still price every other type of it.
+            let runs_arm = types
+                .values()
+                .any(|processor| processor.contains(ARM_PROCESSOR));
+            let expected: BTreeSet<&String> = region
+                .iter()
+                .filter(|(_, processor)| runs_arm || !processor.contains(ARM_PROCESSOR))
+                .map(|(instance_type, _)| *instance_type)
+                .collect();
+            let actual: BTreeSet<&String> = types.keys().collect();
+            assert_eq!(
+                actual, expected, "case {case}: this platform must price every type the \
+                 Region prices whose hardware it runs"
+            );
+        }
+
+        // Both sides of the rule are exercised: a platform priced for every type the
+        // Region prices, and one the ARM hardware excludes.
+        let widths: BTreeSet<usize> = by_platform.values().map(BTreeMap::len).collect();
+        assert_eq!(
+            widths.len(),
+            2,
+            "case {location}: the catalog must price one platform for every type and one \
+             for the x86 types only, got widths {widths:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn leaving_the_capacity_status_free_admits_every_status_the_catalog_prices() {
+    let router = router();
+
+    let statuses = published_capacity_statuses(&router).await;
+    assert!(
+        statuses.len() > 1,
+        "the catalog must price more than one capacity status, got {statuses:?}"
+    );
+
+    // Rows differ in Region, instance type and operating system: the capacity statuses
+    // are published for every priced (type, Region, platform), not for one of them.
+    let rows: &[(&str, &str, &str)] = &[
+        ("US West (Oregon)", "t3.micro", "Linux"),
+        ("US West (Oregon)", "t3.micro", "Windows"),
+        ("US East (N. Virginia)", "m5.large", "Linux"),
+        ("Asia Pacific (Tokyo)", "c5.large", "Windows"),
+    ];
+
+    for (location, instance_type, operating_system) in rows.iter().copied() {
+        let case = format!("{location}/{instance_type}/{operating_system}");
+        // The same filter set with the capacity status left free: one SKU per status the
+        // catalog publishes, rather than the one the strict lookup pins.
+        let loose = selected(
+            &router,
+            &term_matches(&[
+                ("instanceType", instance_type),
+                ("operatingSystem", operating_system),
+                ("location", location),
+                ("tenancy", "Shared"),
+                ("preInstalledSw", NO_PRE_INSTALLED_SW),
+            ]),
+        )
+        .await;
+        let by_status: BTreeMap<String, String> = loose
+            .iter()
+            .filter_map(|document| {
+                Some((
+                    offer_attribute(document, "capacitystatus")?,
+                    product_sku(document),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            by_status.keys().cloned().collect::<Vec<String>>(),
+            statuses,
+            "case {case}: leaving the capacity status free must admit every published \
+             status, got {by_status:?}"
+        );
+        assert_eq!(
+            by_status.len(),
+            loose.len(),
+            "case {case}: each published capacity status must publish one SKU, got {} SKUs \
+             over {} statuses",
+            loose.len(),
+            by_status.len()
+        );
+
+        // Pinning one of them back selects exactly that SKU — which is what makes the
+        // attribute part of a price lookup's filter set.
+        for (status, sku) in &by_status {
+            let strict = ok(
+                &router,
+                "GetProducts",
+                &json!({
+                    "ServiceCode": "AmazonEC2",
+                    "Filters": term_matches(&[
+                        ("instanceType", instance_type),
+                        ("operatingSystem", operating_system),
+                        ("location", location),
+                        ("tenancy", "Shared"),
+                        ("preInstalledSw", NO_PRE_INSTALLED_SW),
+                        ("capacitystatus", status),
+                    ]),
+                    "MaxResults": 100,
+                }),
+            )
+            .await;
+            assert_eq!(
+                product_skus(&strict),
+                vec![sku.clone()],
+                "case {case}/{status}: pinning the status must select its own SKU, got {:?}",
+                product_skus(&strict)
+            );
+        }
+    }
+}

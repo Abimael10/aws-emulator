@@ -238,9 +238,10 @@ async fn get_attribute_values_returns_the_distinct_values_of_the_attribute() {
 }
 
 /// Whether `document` satisfies the filter, by the comparison the `FilterType` member
-/// documents: `TERM_MATCH`/`EQUALS` an exact value, `CONTAINS` a substring, and
-/// `ANY_OF`/`NONE_OF` membership of the comma-separated list. `ServiceCode` is the
-/// pseudo-field the `Filter.Field` doc names beside the attribute names.
+/// documents: `TERM_MATCH`/`EQUALS` the same value, `CONTAINS` a substring, and
+/// `ANY_OF`/`NONE_OF` membership of the comma-separated list. A filter's VALUE is
+/// compared to the attribute's without regard to case. `ServiceCode` is the pseudo-field
+/// the `Filter.Field` doc names beside the attribute names.
 fn selects(filter_type: &str, field: &str, value: &str, document: &Value) -> bool {
     let field_value = if field == "ServiceCode" {
         document
@@ -255,11 +256,17 @@ fn selects(filter_type: &str, field: &str, value: &str, document: &Value) -> boo
         value
             .split(',')
             .map(str::trim)
-            .any(|alternative| alternative == candidate)
+            .any(|alternative| alternative.eq_ignore_ascii_case(candidate))
     };
     match filter_type {
-        "TERM_MATCH" | "EQUALS" => field_value == Some(value),
-        "CONTAINS" => field_value.is_some_and(|actual| actual.contains(value)),
+        "TERM_MATCH" | "EQUALS" => {
+            field_value.is_some_and(|actual| actual.eq_ignore_ascii_case(value))
+        }
+        "CONTAINS" => field_value.is_some_and(|actual| {
+            actual
+                .to_ascii_lowercase()
+                .contains(&value.to_ascii_lowercase())
+        }),
         "ANY_OF" => field_value.is_some_and(listed),
         "NONE_OF" => field_value.is_none_or(|actual| !listed(actual)),
         other => panic!("case {field}={value}: unexpected filter type {other}"),
@@ -389,6 +396,187 @@ async fn get_products_applies_every_filter_type() {
         "InvalidParameterException",
     )
     .await;
+}
+
+/// One row of the re-casing table: the filter type, the field it names, the canonical
+/// value the catalog publishes for that field, and the canonical filter set that narrows
+/// the query to a handful of products.
+type RecasedFilterRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
+#[tokio::test]
+async fn a_filter_value_selects_the_same_products_however_it_is_cased() {
+    let router = router();
+
+    // Rows: one per filter type the model declares, over fields whose published values
+    // carry upper- and lower-case letters, digits, dots, hyphens and spaces, plus the
+    // `ServiceCode` pseudo-field. `scope` is a canonical filter set that narrows the
+    // query to a handful of products, so each row reads the whole selection off one
+    // page; the filter UNDER TEST is the one that gets re-cased.
+    let cases: &[RecasedFilterRow] = &[
+        (
+            "TERM_MATCH",
+            "instanceType",
+            "t3.micro",
+            &[("regionCode", "us-west-2"), ("capacitystatus", "Used")],
+        ),
+        (
+            "TERM_MATCH",
+            "operatingSystem",
+            "Linux",
+            &[("regionCode", "us-west-2"), ("instanceType", "t3.micro")],
+        ),
+        (
+            "TERM_MATCH",
+            "operatingSystem",
+            "Windows",
+            &[("regionCode", "us-west-2"), ("instanceType", "t3.micro")],
+        ),
+        (
+            "TERM_MATCH",
+            "location",
+            "US West (Oregon)",
+            &[("instanceType", "t3.nano"), ("capacitystatus", "Used")],
+        ),
+        (
+            "TERM_MATCH",
+            "capacitystatus",
+            "AllocatedCapacityReservation",
+            &[("regionCode", "us-west-2"), ("instanceType", "t3.micro")],
+        ),
+        (
+            "TERM_MATCH",
+            "ServiceCode",
+            "AmazonEC2",
+            &[("regionCode", "us-west-2"), ("instanceType", "t3.micro")],
+        ),
+        ("EQUALS", "volumeApiName", "gp3", &[("regionCode", "us-west-2")]),
+        (
+            "EQUALS",
+            "licenseModel",
+            "No License required",
+            &[("regionCode", "us-west-2"), ("instanceType", "t3.micro")],
+        ),
+        (
+            "CONTAINS",
+            "usagetype",
+            "BoxUsage:t3",
+            &[("regionCode", "us-west-2"), ("operatingSystem", "Linux")],
+        ),
+        ("CONTAINS", "volumeType", "HDD", &[("regionCode", "us-west-2")]),
+        (
+            "ANY_OF",
+            "instanceType",
+            "t2.micro,t2.small",
+            &[("regionCode", "us-east-1"), ("capacitystatus", "Used")],
+        ),
+        (
+            "ANY_OF",
+            "regionCode",
+            "eu-west-1,ap-northeast-1",
+            &[("instanceType", "t3.micro"), ("capacitystatus", "Used")],
+        ),
+        (
+            "NONE_OF",
+            "instanceType",
+            "t2.micro,t2.small",
+            &[
+                ("regionCode", "us-west-2"),
+                ("operatingSystem", "Linux"),
+                ("capacitystatus", "Used"),
+            ],
+        ),
+        (
+            "NONE_OF",
+            "tenancy",
+            "Dedicated",
+            &[("regionCode", "us-west-2"), ("instanceType", "t3.micro")],
+        ),
+    ];
+
+    for (filter_type, field, canonical, scope) in cases.iter().copied() {
+        let query = |value: String| {
+            let mut filters: Vec<Value> = scope
+                .iter()
+                .map(|(scope_field, scope_value)| {
+                    json!({ "Type": "TERM_MATCH", "Field": scope_field, "Value": scope_value })
+                })
+                .collect();
+            filters.push(json!({ "Type": filter_type, "Field": field, "Value": value }));
+            json!({
+                "ServiceCode": "AmazonEC2",
+                "Filters": Value::Array(filters),
+                "MaxResults": 100,
+            })
+        };
+
+        let canonical_answer = ok(&router, "GetProducts", &query(canonical.to_string())).await;
+        assert!(
+            canonical_answer
+                .get("NextToken")
+                .is_none_or(Value::is_null),
+            "case {filter_type} {field}={canonical}: the narrowed query must fit one page, \
+             got {canonical_answer}"
+        );
+        let expected: BTreeSet<String> = offer_documents(&canonical_answer)
+            .iter()
+            .map(product_sku)
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "case {filter_type} {field}={canonical}: the canonical casing must select \
+             products for this row to mean anything"
+        );
+
+        // The same value in every casing a client can hold it in.
+        for recased in [
+            canonical.to_ascii_lowercase(),
+            canonical.to_ascii_uppercase(),
+            swap_case(canonical),
+        ] {
+            let case = format!("{filter_type} {field}={recased}");
+            let response = ok(&router, "GetProducts", &query(recased.clone())).await;
+            let documents = offer_documents(&response);
+            let actual: BTreeSet<String> = documents.iter().map(product_sku).collect();
+            assert_eq!(
+                actual, expected,
+                "case {case}: a re-cased value must select the products the canonical \
+                 {canonical:?} selects, got {} of them",
+                actual.len()
+            );
+
+            // The selected products keep the canonical attribute values the catalog
+            // publishes: the comparison ignores case, the answer re-cases nothing.
+            if matches!(filter_type, "TERM_MATCH" | "EQUALS") && field != "ServiceCode" {
+                for document in &documents {
+                    assert_eq!(
+                        offer_attribute(document, field).as_deref(),
+                        Some(canonical),
+                        "case {case}: {} must still report {field}={canonical}, got {document}",
+                        product_sku(document)
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `text` with the case of every ASCII letter flipped: a casing that is neither the
+/// value's own nor either uniform one.
+fn swap_case(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_ascii_uppercase() {
+                character.to_ascii_lowercase()
+            } else {
+                character.to_ascii_uppercase()
+            }
+        })
+        .collect()
 }
 
 #[tokio::test]

@@ -280,6 +280,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// which the model documents alongside the attribute names. The comparison is the one
 /// the filter's type documents: `TERM_MATCH`/`EQUALS` an exact value, `CONTAINS` a
 /// substring, and `ANY_OF`/`NONE_OF` membership of the filter's comma-separated list.
+///
+/// A filter's VALUE is compared to the attribute's without regard to case, so a client
+/// that forwards an attribute value cased differently from the way the catalog publishes
+/// it still selects the same products; each selected product keeps — and reports — its
+/// own canonical attribute values.
 fn filter_matches(
     filter: &Filter,
     catalog: &crate::state::ServiceCatalog,
@@ -292,8 +297,10 @@ fn filter_matches(
     };
 
     match filter.r#type.as_str() {
-        "TERM_MATCH" | "EQUALS" => field_value == Some(filter.value.as_str()),
-        "CONTAINS" => field_value.is_some_and(|value| value.contains(filter.value.as_str())),
+        "TERM_MATCH" | "EQUALS" => {
+            field_value.is_some_and(|value| same_value(value, &filter.value))
+        }
+        "CONTAINS" => field_value.is_some_and(|value| contains_value(value, &filter.value)),
         "ANY_OF" => field_value.is_some_and(|value| any_of(&filter.value, value)),
         // A product that carries the field at all must not hold one of the listed
         // values; one that does not carry it holds none of them.
@@ -302,9 +309,31 @@ fn filter_matches(
     }
 }
 
+/// Whether an attribute value and a filter value are the same value — the comparison
+/// every filter type is built on: they differ in case, if at all.
+fn same_value(attribute: &str, filter_value: &str) -> bool {
+    attribute.eq_ignore_ascii_case(filter_value)
+}
+
+/// Whether `attribute` holds `filter_value` as a substring, under that same comparison.
+///
+/// Compared byte by byte rather than over a lowercased copy, so matching one filter
+/// against the catalog allocates nothing. The model gives a filter value a minimum
+/// length of one; an empty one is held by every value, as an empty substring is.
+fn contains_value(attribute: &str, filter_value: &str) -> bool {
+    let needle = filter_value.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    attribute
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 /// Whether `value` is one of the comma-separated alternatives in `list`.
 fn any_of(list: &str, value: &str) -> bool {
     list.split(',')
         .map(str::trim)
-        .any(|alternative| alternative == value)
+        .any(|alternative| same_value(value, alternative))
 }
