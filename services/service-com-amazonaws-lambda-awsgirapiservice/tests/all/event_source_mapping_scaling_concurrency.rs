@@ -41,7 +41,7 @@ use crate::event_source_mappings::{
 /// same value, which is the pairing `CreateEventSourceMapping` accepts (a queue must outlast
 /// the function it feeds). Several seconds, so a message a pass took is still out of the queue
 /// while the row reads the counts that pass left.
-const TIMEOUT_SECONDS: i64 = 30;
+pub(crate) const TIMEOUT_SECONDS: i64 = 30;
 
 /// Where `PutFunctionConcurrency` is bound
 /// (`PUT /2017-10-31/functions/{FunctionName}/concurrency`).
@@ -78,11 +78,23 @@ const LOOK_AGAIN: Duration = Duration::from_millis(50);
 /// other test beside it — and it is the HANDLER's own run, not a wait this test makes: a pass
 /// that dispatched its batches one after another would take as many of these as it has
 /// batches, and one that dispatches them together takes one.
-const HELD_SECONDS: f64 = 0.4;
+pub(crate) const HELD_SECONDS: f64 = 0.4;
 
 /// The least concurrency the overlap test accepts as evidence that the batches of one pass
 /// really overlapped: two invocations of the function in flight at one instant.
-const OVERLAP: f64 = 2.0;
+pub(crate) const OVERLAP: f64 = 2.0;
+
+/// The handler the suites over this rule run: it holds its execution environment for the span
+/// the record it is handed names, which is what makes the concurrency of a pass's invocations
+/// observable at all.
+///
+/// Shared with [`crate::event_source_mapping_concurrency_ceiling`]; see [`driven_router`].
+pub(crate) const HANDLER_SOURCE: &str = "import time\n\
+                                        \n\
+                                        \n\
+                                        def lambda_handler(event, context):\n\
+                                        \x20   time.sleep(float(event['Records'][0]['body'] or 0))\n\
+                                        \x20   return {'records': len(event['Records'])}\n";
 
 /// One row of the counting table: what the mapping and the function ask for, how long the
 /// backlog is, and how many messages one pass must then take out of the queue.
@@ -169,7 +181,11 @@ fn rows() -> Vec<Row> {
 
 /// Lambda beside Amazon SQS and CloudWatch on ONE engine, with the poll passes of its
 /// mappings this test's own to make.
-fn driven_router() -> (MultiServiceRouter, DrivenPolling, Arc<engine::InMemoryEngine>) {
+///
+/// Shared with [`crate::event_source_mapping_concurrency_ceiling`], which pins the other half
+/// of the same rule, rather than copied there.
+pub(crate) fn driven_router() -> (MultiServiceRouter, DrivenPolling, Arc<engine::InMemoryEngine>)
+{
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = router_on(&engine);
     router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
@@ -185,7 +201,14 @@ fn driven_router() -> (MultiServiceRouter, DrivenPolling, Arc<engine::InMemoryEn
 }
 
 /// `PutFunctionConcurrency` reserving `reserved` simultaneous executions for `function`.
-async fn reserve(router: &MultiServiceRouter, case: &str, function: &str, reserved: i64) {
+///
+/// Shared with [`crate::event_source_mapping_concurrency_ceiling`]; see [`driven_router`].
+pub(crate) async fn reserve(
+    router: &MultiServiceRouter,
+    case: &str,
+    function: &str,
+    reserved: i64,
+) {
     let answer = call(
         router,
         "PUT",
@@ -203,7 +226,9 @@ async fn reserve(router: &MultiServiceRouter, case: &str, function: &str, reserv
 }
 
 /// The mapping a row asks for, created and settled into `Enabled`.
-async fn given_mapping(
+///
+/// Shared with [`crate::event_source_mapping_concurrency_ceiling`]; see [`driven_router`].
+pub(crate) async fn given_mapping(
     router: &MultiServiceRouter,
     case: &str,
     function: &str,
@@ -373,12 +398,7 @@ async fn the_batches_of_one_pass_are_in_flight_together() {
         &router,
         case,
         function,
-        "import time\n\
-         \n\
-         \n\
-         def lambda_handler(event, context):\n\
-         \x20   time.sleep(float(event['Records'][0]['body'] or 0))\n\
-         \x20   return {'records': len(event['Records'])}\n",
+        HANDLER_SOURCE,
         TIMEOUT_SECONDS,
         &json!({}),
     )

@@ -33,10 +33,23 @@ const SCHEDULED_SOURCE: &str = "aws.events";
 /// The `detail-type` it publishes one under.
 const SCHEDULED_DETAIL_TYPE: &str = "Scheduled Event";
 
-/// How long a row waits for the first firing: the span this emulator holds a new schedule
+/// How long a row waits for a firing it EXPECTS: the span this emulator holds a new schedule
 /// rule for ([`service_com_amazonaws_eventbridge_awsevents::state::schedule::FIRST_FIRING_DELAY`])
-/// and room for the clock's own tick and the delivery.
-const PATIENCE: Duration = Duration::from_secs(20);
+/// and generous room for the clock's own tick, the delivery and however loaded the host running
+/// every other suite beside this one is. A ceiling on patience, never a span anything here
+/// counts on.
+const PATIENCE: Duration = Duration::from_secs(60);
+
+/// How long the row that expects NO firing watches for one: several times over the span a new
+/// rule's first firing falls after, so "nothing fired" is an observation rather than a race. Its
+/// own budget, because a row waiting for something to happen and a row waiting to see nothing
+/// stop for different reasons, and one of them must not wait out the other's.
+const QUIET_WATCH: Duration = Duration::from_secs(20);
+
+/// How long the wait for the SECOND firing is given: the rule's own cadence
+/// ([`SCHEDULE_EXPRESSION`]) with the same generous room over it. The cadence is the rule's
+/// figure; this is only the ceiling on how long the firing it owes is waited for.
+const CADENCE_PATIENCE: Duration = Duration::from_secs(180);
 
 /// How long one poll of the target's executions sleeps between reads.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -109,19 +122,24 @@ async fn execution_inputs(emulator: &Emulator, arn: &str) -> Vec<String> {
 }
 
 /// The inputs of the executions the state machine at `arn` holds once it holds at least one,
-/// or an empty list once [`PATIENCE`] has passed with none.
-async fn fired(emulator: &Emulator, arn: &str) -> Vec<String> {
+/// or an empty list once `budget` has passed with none.
+async fn fired_within(emulator: &Emulator, arn: &str, budget: Duration) -> Vec<String> {
     let began = Instant::now();
     loop {
         let inputs = execution_inputs(emulator, arn).await;
         if !inputs.is_empty() {
             return inputs;
         }
-        if began.elapsed() >= PATIENCE {
+        if began.elapsed() >= budget {
             return Vec::new();
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// [`fired_within`] over the budget a firing this suite EXPECTS is waited for.
+async fn fired(emulator: &Emulator, arn: &str) -> Vec<String> {
+    fired_within(emulator, arn, PATIENCE).await
 }
 
 /// What a row expects the target to have been handed.
@@ -199,7 +217,12 @@ async fn a_schedule_rule_fires_its_targets_with_the_scheduled_event() {
         }
         given_schedule_rule(&emulator, &rule, row.state, target).await;
 
-        let inputs = fired(&emulator, &machine).await;
+        // A row that expects a firing waits the budget for one; the row that expects none
+        // watches for its own, shorter span rather than waiting out the other's.
+        let inputs = match row.expected {
+            Expected::Nothing => fired_within(&emulator, &machine, QUIET_WATCH).await,
+            Expected::Text(_) | Expected::Envelope => fired(&emulator, &machine).await,
+        };
         match row.expected {
             Expected::Nothing => {
                 assert!(
@@ -306,7 +329,7 @@ async fn each_firing_of_a_schedule_rule_carries_a_fresh_event_id() {
             break inputs;
         }
         assert!(
-            began.elapsed() < Duration::from_secs(90),
+            began.elapsed() < CADENCE_PATIENCE,
             "case {case:?}: expected a second firing one cadence on, got {inputs:?}"
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
