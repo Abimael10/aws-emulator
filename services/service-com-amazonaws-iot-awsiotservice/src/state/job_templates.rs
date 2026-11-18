@@ -156,6 +156,13 @@ impl RegisteredJobTemplate {
 
     /// The record as `DescribeJobTemplate` reports it — every member of the stored
     /// record, so the read and the create that wrote it cannot drift.
+    ///
+    /// The configuration structures whose own members are all optional
+    /// (`presignedUrlConfig`, `jobExecutionsRolloutConfig`, `timeoutConfig`) are reported
+    /// for every template, empty for one created without them, under the rule
+    /// [`super::reported_configuration`] states; `abortConfig` and
+    /// `jobExecutionsRetryConfig` have a `@required` criteria list and so have no empty
+    /// form, and the LIST members are reported only from a record that holds entries.
     pub fn to_description(&self) -> DescribeJobTemplateOutput {
         DescribeJobTemplateOutput {
             job_template_arn: Some(self.job_template_arn.clone()),
@@ -164,10 +171,14 @@ impl RegisteredJobTemplate {
             document_source: self.document_source.clone(),
             document: self.document.clone(),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            presigned_url_config: self.presigned_url_config.clone(),
-            job_executions_rollout_config: self.job_executions_rollout_config.clone(),
+            presigned_url_config: super::reported_configuration(
+                self.presigned_url_config.clone(),
+            ),
+            job_executions_rollout_config: super::reported_configuration(
+                self.job_executions_rollout_config.clone(),
+            ),
             abort_config: self.abort_config.clone(),
-            timeout_config: self.timeout_config.clone(),
+            timeout_config: super::reported_configuration(self.timeout_config.clone()),
             job_executions_retry_config: self.job_executions_retry_config.clone(),
             maintenance_windows: self.maintenance_windows.clone(),
             destination_package_versions: self.destination_package_versions.clone(),

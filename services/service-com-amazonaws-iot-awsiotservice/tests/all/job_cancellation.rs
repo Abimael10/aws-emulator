@@ -493,16 +493,18 @@ async fn a_cancel_moves_the_job_and_the_executions_its_force_flag_reaches() {
             read.body
                 .pointer("/job/jobProcessDetails/numberOfInProgressThings")
                 .and_then(Value::as_i64),
-            (still_running > 0)
-                .then(|| i64::try_from(still_running).expect("a handful of devices")),
+            Some(i64::try_from(still_running).expect("a handful of devices")),
             "case {:?}: expected {still_running} in-progress thing(s), got {:?}",
             case.case,
             read.job()
         );
-        assert!(
+        // Each counter is "the number of things" in one status, so a status no execution
+        // of the job is in is counted as the zero things it is.
+        assert_eq!(
             read.body
                 .pointer("/job/jobProcessDetails/numberOfQueuedThings")
-                .is_none(),
+                .and_then(Value::as_i64),
+            Some(0),
             "case {:?}: a cancelled job leaves no device queued, got {:?}",
             case.case,
             read.job()

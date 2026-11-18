@@ -568,7 +568,9 @@ async fn a_jobs_progress_is_counted_from_the_executions_its_devices_report() {
                 after.number("/job/jobProcessDetails/numberOfQueuedThings"),
                 after.list("/job/jobProcessDetails/processingTargets"),
             ),
-            (Some(1), None, Vec::new()),
+            // Each counter is "the number of things" in one status, so the status the
+            // device left is counted as the zero things now in it.
+            (Some(1), Some(0), Vec::new()),
             "case {case:?}: the counts follow the executions, got {:?}",
             after.body
         );
