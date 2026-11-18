@@ -46,7 +46,11 @@ const SNS_VERSION: &str = "2010-03-31";
 
 /// A router carrying this API and Amazon SNS over ONE engine — the arrangement
 /// `core/router` builds.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` because a sibling suite that needs a topic Amazon SNS really holds
+/// stands this arrangement up rather than carrying a second copy of it
+/// ([`crate::tag_batch_partial_failure`]).
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The tests exercise handler behaviour, not SigV4: the `Authorization` header
@@ -135,7 +139,9 @@ async fn sns_ok(router: &MultiServiceRouter, action: &str, params: &[(&str, &str
 /// other", so the name and the `FifoTopic` attribute have to agree (SNS refuses the
 /// pair that disagrees with `Invalid parameter: Topic Name`). The attribute is therefore
 /// read off the name rather than passed by every caller.
-async fn topic(router: &MultiServiceRouter, name: &str) -> String {
+///
+/// `pub(crate)` for the same reason [`emulator`] is.
+pub(crate) async fn topic(router: &MultiServiceRouter, name: &str) -> String {
     let mut params: Vec<(&str, &str)> = vec![("Name", name)];
     if name.ends_with(".fifo") {
         params.push(("Attributes.entry.1.key", "FifoTopic"));
@@ -149,7 +155,10 @@ async fn topic(router: &MultiServiceRouter, name: &str) -> String {
 /// A list member's open tag carries the envelope's default namespace
 /// (`<member xmlns="http://sns.amazonaws.com/doc/2010-03-31/">`), so the opening is
 /// matched up to its first `>` rather than as a bare `<member>`.
-async fn sns_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String, String> {
+///
+/// `pub(crate)` for the same reason [`emulator`] is: a sibling suite reads the tag set a
+/// topic holds through the OWNING service's own reader, not through a second scraper.
+pub(crate) async fn sns_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String, String> {
     let body = sns_ok(router, "ListTagsForResource", &[("ResourceArn", arn)]).await;
     let Some(block) = element(&body, "Tags") else {
         return BTreeMap::new();

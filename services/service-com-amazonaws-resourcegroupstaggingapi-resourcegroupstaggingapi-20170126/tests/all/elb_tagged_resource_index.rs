@@ -34,7 +34,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request below is signed for, and therefore the one both endpoints
 /// serve and the one the ARNs Elastic Load Balancing mints belong to.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` for the same reason [`encode`] is: a sibling suite that builds an ARN of
+/// ANOTHER owning service for this endpoint names the Region the harness signs for rather
+/// than restating it ([`crate::tag_batch_partial_failure`]).
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The SigV4 signing name this API is routed on.
 const TAGGING: &str = "tagging";
@@ -64,7 +68,11 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 }
 
 /// The account id every ARN this emulator mints carries.
-fn account() -> &'static str {
+///
+/// `pub(crate)` for the same reason [`REGION`] is: a sibling suite building an ARN of
+/// another owning service names the account this endpoint answers for rather than
+/// restating it ([`crate::tag_batch_partial_failure`]).
+pub(crate) fn account() -> &'static str {
     emulator_server::emulator_account_id()
 }
 

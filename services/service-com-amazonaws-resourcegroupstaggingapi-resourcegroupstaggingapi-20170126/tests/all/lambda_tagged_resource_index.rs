@@ -393,7 +393,10 @@ async fn all_tag_values(router: &MultiServiceRouter, key: &str) -> Vec<String> {
 
 /// The `FailedResourcesMap` of a `TagResources` answer, as
 /// `ARN -> (StatusCode, ErrorCode, ErrorMessage)`.
-fn failures(body: &Value) -> BTreeMap<String, (i64, String, String)> {
+///
+/// `pub(crate)` so a sibling suite comparing two answers entry by entry reads them the
+/// same way rather than carrying a second copy ([`crate::tag_batch_partial_failure`]).
+pub(crate) fn failures(body: &Value) -> BTreeMap<String, (i64, String, String)> {
     body["FailedResourcesMap"]
         .as_object()
         .unwrap_or_else(|| panic!("a TagResources body with no FailedResourcesMap: {body}"))
