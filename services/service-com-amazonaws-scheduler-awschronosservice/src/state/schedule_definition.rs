@@ -25,7 +25,8 @@
 //!   instant is a schedule that can never fire ([`schedule_window_violation`]).
 //! * both instants are stored at MILLISECOND resolution
 //!   ([`to_millisecond_precision`]), which is the resolution a schedule's
-//!   timestamps are reported back at.
+//!   timestamps are reported back at, and at the millisecond the request stated
+//!   rather than one below it.
 //!
 //! The expression grammars are read by maintained parsers — the `cron` crate for
 //! a `cron(...)` body and `chrono` for an `at(...)` instant — rather than by a
@@ -278,15 +279,37 @@ fn instant(at: DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
 }
 
+/// A nanosecond count of one second, which a rounded-up remainder carries into.
+const NANOS_PER_SECOND: u32 = 1_000_000_000;
+
 /// One of a schedule's instants at the resolution the service holds it: the
-/// sub-second remainder truncated to whole milliseconds.
+/// instant at the NEAREST whole millisecond.
 ///
 /// EventBridge Scheduler reports `StartDate`/`EndDate` at millisecond resolution,
-/// so a request stating a finer instant is stored at the millisecond it falls in —
-/// which is the instant every later read of the schedule reports.
+/// and the instant it reports is the one the request stated: a client that writes a
+/// schedule and reads it back sees the millisecond it submitted.
+///
+/// The nearest millisecond, rather than the one below, is what answers the instant
+/// submitted: a timestamp travels in this protocol as DECIMAL epoch seconds and is
+/// read through a binary floating-point number, which represents almost no decimal
+/// remainder exactly — a submitted `.12` arrives a few hundred nanoseconds short of
+/// 120 ms, so discarding the remainder would report a whole millisecond less than
+/// was accepted. That error is a fraction of a microsecond — orders of magnitude
+/// below the millisecond the instant is held at — so the nearest millisecond is the
+/// one the request stated.
 pub fn to_millisecond_precision(at: DateTime) -> DateTime {
-    let whole_milliseconds = at.subsec_nanos() / NANOS_PER_MILLISECOND;
-    DateTime::from_secs_and_nanos(at.secs(), whole_milliseconds * NANOS_PER_MILLISECOND)
+    let whole_milliseconds = at
+        .subsec_nanos()
+        .saturating_add(NANOS_PER_MILLISECOND / 2)
+        / NANOS_PER_MILLISECOND;
+    let remainder = whole_milliseconds.saturating_mul(NANOS_PER_MILLISECOND);
+    // A remainder that rounds up to a whole second is that next second, with no
+    // remainder left: the instant moves, the resolution does not.
+    if remainder >= NANOS_PER_SECOND {
+        DateTime::from_secs_and_nanos(at.secs().saturating_add(1), 0)
+    } else {
+        DateTime::from_secs_and_nanos(at.secs(), remainder)
+    }
 }
 
 #[cfg(test)]
@@ -407,26 +430,39 @@ mod tests {
         }
     }
 
-    /// An instant is held at the millisecond it falls in, whatever finer value the
-    /// request stated.
+    /// An instant is held at the millisecond NEAREST the one the request stated,
+    /// so a remainder the wire's floating-point form lands just short of is held
+    /// at the millisecond it names rather than the one below it.
     #[test]
-    fn an_instant_is_held_to_the_millisecond() {
-        // (case, submitted nanos, held nanos)
-        let rows: [(&str, u32, u32); 6] = [
-            ("a whole second", 0, 0),
-            ("whole milliseconds", 123_000_000, 123_000_000),
-            ("microseconds", 123_456_000, 123_000_000),
-            ("nanoseconds", 123_456_789, 123_000_000),
-            ("under a millisecond", 999_999, 0),
-            ("one nanosecond under a millisecond", 1_999_999, 1_000_000),
+    fn an_instant_is_held_to_the_nearest_millisecond() {
+        // (case, submitted nanos, the second held, the nanos held)
+        let rows: [(&str, u32, i64, u32); 9] = [
+            ("a whole second", 0, 7, 0),
+            ("whole milliseconds", 123_000_000, 7, 123_000_000),
+            ("microseconds", 123_456_000, 7, 123_000_000),
+            ("nanoseconds", 123_456_789, 7, 123_000_000),
+            // Just short of a whole millisecond is that millisecond: this is the
+            // shape a decimal remainder read through a binary float arrives in.
+            ("a nanosecond under a millisecond", 999_999, 7, 1_000_000),
+            (
+                "a nanosecond under a later millisecond",
+                119_999_999,
+                7,
+                120_000_000,
+            ),
+            ("past half a millisecond", 123_600_000, 7, 124_000_000),
+            // A remainder that rounds up to a whole second carries into the next
+            // second and leaves no remainder behind.
+            ("a nanosecond under a second", 999_999_999, 8, 0),
+            ("half a second", 500_000_000, 7, 500_000_000),
         ];
 
-        for (case, submitted, held) in rows {
+        for (case, submitted, held_secs, held_nanos) in rows {
             let normalised = to_millisecond_precision(DateTime::from_secs_and_nanos(7, submitted));
             assert_eq!(
                 (normalised.secs(), normalised.subsec_nanos()),
-                (7, held),
-                "case {case:?}: expected the instant held at {held} nanos, got \
+                (held_secs, held_nanos),
+                "case {case:?}: expected the instant held at {held_secs}s {held_nanos}ns, got \
                  {normalised:?}"
             );
         }

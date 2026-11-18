@@ -261,8 +261,9 @@ pub fn tag_keys_after<'a>(held: &'a [Tag], incoming: &'a [Tag]) -> BTreeSet<&'a 
 
 /// A `Schedule` as this emulator persists it.
 ///
-/// `start_date`/`end_date` keep the wire `DateTime` the client sent, so a
-/// `GetSchedule` hands back exactly what `CreateSchedule` was given;
+/// `start_date`/`end_date` keep the instant the client sent, at the resolution the
+/// service holds it ([`to_millisecond_precision`]), so a `GetSchedule` hands back
+/// the instant `CreateSchedule` was given;
 /// `creation_date`/`last_modification_date` are server clock readings, so they
 /// are `SystemTime` and can be compared.
 #[derive(Debug, Clone)]
