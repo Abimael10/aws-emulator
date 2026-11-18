@@ -43,7 +43,11 @@ const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 /// (`smithy_query(query="shape",shape="PublicAccessBlockConfiguration")` reports
 /// `BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`,
 /// each targeting the boolean `Setting` and each carrying its own `xmlName`).
-const SETTINGS: [&str; 4] = [
+///
+/// `pub(crate)` with [`put_public_access_block`]: a suite that hardens a bucket as one of
+/// its cases ([`super::bucket_encryption_reported_members`]) turns the published switches on
+/// through this one list rather than keeping a second copy of it.
+pub(crate) const SETTINGS: [&str; 4] = [
     "BlockPublicAcls",
     "IgnorePublicAcls",
     "BlockPublicPolicy",
