@@ -46,7 +46,7 @@ use serde_json::{json, Map, Value};
 
 use crate::harness::{
     harness, list_tags, provider_arn_for, reported_tags_of, seed_provider, stored_provider_count,
-    tag, untag, Harness, Reply, ACCOUNT, REGION, SIGNING_NAME,
+    tag, untag, denial_message, Harness, Reply, ACCOUNT, REGION, SIGNING_NAME,
 };
 
 /// A Secrets Manager ARN satisfying the modelled `SecretArn` pattern.
@@ -76,22 +76,6 @@ const EMPTY_TAGS: (u16, &str, &str) = (
 /// an ARN's account field holds; the values differ along their digits only, because the rule
 /// is about the field not matching rather than about any particular account.
 const FOREIGN_ACCOUNTS: &[&str] = &["123456789012", "999999999999", "111122223333"];
-
-/// The IAM principal every request to this emulator speaks for — read from the shared
-/// definition of that identity, so this suite states the principal rather than a literal ARN.
-fn caller_principal() -> String {
-    service_common::caller_principal::ambient_user_arn()
-}
-
-/// The sentence the denial carries: AWS's IAM denial template for a resource the caller may
-/// not reach at all — the fixed text `User: `, the calling principal, and the fixed text
-/// ` is not authorized to access this resource`.
-fn denial_message() -> String {
-    format!(
-        "User: {} is not authorized to access this resource",
-        caller_principal()
-    )
-}
 
 /// `count` distinct pairs, as the `tags` map of a `TagResource` body.
 fn tag_map(count: usize) -> Value {

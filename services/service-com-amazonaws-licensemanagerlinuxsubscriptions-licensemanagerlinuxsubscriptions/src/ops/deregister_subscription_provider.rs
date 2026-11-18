@@ -3,7 +3,10 @@
 //! @op DeregisterSubscriptionProvider
 //! Removes a registered Linux subscription provider from this service's state, so a
 //! later Get answers `ResourceNotFoundException` and a later List no longer reports it.
-//! Deregistering an ARN no registration holds answers `ResourceNotFoundException`.
+//! An ARN naming another account is denied HTTP 403 `AccessDeniedException` before the
+//! store is consulted (the one gate in [`crate::service::authorization`], which every
+//! operation handed a resource ARN of this service applies); deregistering an ARN of this
+//! account that no registration holds answers `ResourceNotFoundException`.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -139,6 +142,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // AUTHORIZATION first, from the ARN alone and ahead of the store: a removal aimed
+        // at a registration in another account is denied rather than reported absent, so
+        // the account field decides it whether or not this account happens to hold a
+        // registration under the same id — and the one resource kind this ARN can address
+        // answers the same way here as it does through the tag APIs, which reach it through
+        // the same lookup.
+        crate::service::authorization::authorize_resource_arn(&input.subscription_provider_arn)?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeregisterSubscriptionProviderErrorModeled::InternalServerException(
                 InternalServerException {

@@ -55,6 +55,26 @@ pub const INVALID: &str = PROVIDER_STATUS_INVALID;
 /// it back out of the handler it is testing.
 pub const TOKEN_REFUSAL_MESSAGE: &str = "The subscription provider token is invalid or expired";
 
+/// The IAM principal every request to this emulator speaks for — read from the shared
+/// definition of that identity, so a suite states the principal rather than a literal ARN.
+pub fn caller_principal() -> String {
+    service_common::caller_principal::ambient_user_arn()
+}
+
+/// The sentence an authorization denial carries: AWS's IAM denial for a resource the caller
+/// may not reach at all — the fixed text `User: `, the calling principal, and the fixed text
+/// ` is not authorized to access this resource`.
+///
+/// Held HERE rather than per suite because it is one refusal of one surface: every operation
+/// of this service that is handed a resource ARN states it, so the suites that assert it on
+/// the tag plane and on the provider plane compare against the same one sentence.
+pub fn denial_message() -> String {
+    format!(
+        "User: {} is not authorized to access this resource",
+        caller_principal()
+    )
+}
+
 /// The wire error code the tagging surface's own refusals must never name: `UntagResource`
 /// declares no error for it (`smithy_query(query="operation",operation="UntagResource")`
 /// lists `InternalServerException` and `ResourceNotFoundException` only), so a client

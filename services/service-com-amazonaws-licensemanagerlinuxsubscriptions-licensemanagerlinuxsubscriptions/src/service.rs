@@ -49,8 +49,8 @@ use std::sync::Arc;
 /// tag APIs' own error taxonomy, and the AWS constraint envelope for everything else.
 pub mod validation;
 
-/// The one authorization pre-condition the tag APIs apply to the `resourceArn` they are
-/// addressed with, ahead of every input check and every lookup.
+/// The one authorization pre-condition applied to a resource ARN this service was handed,
+/// ahead of every input check and every lookup — whichever operation carried it.
 pub mod authorization;
 
 /// The HTTP method of the one route of this service whose model requires a query

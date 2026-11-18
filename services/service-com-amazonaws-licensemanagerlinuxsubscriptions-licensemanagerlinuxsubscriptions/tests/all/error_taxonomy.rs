@@ -25,12 +25,17 @@
 //!    no resource of this account, and the tag removal they perform is readable back
 //!    (`tag_plane_authorization.rs` owns the denial stage in full);
 //! 7. a not-found refusal on a subscription-provider ARN carries FIXED text and nothing
-//!    from the request, and is idempotent.
+//!    from the request, and is idempotent;
+//! 8. the operations addressed by a `SubscriptionProviderArn` settle authorization from
+//!    that ARN's ACCOUNT field alone, ahead of the store, exactly as the tag APIs do with
+//!    the `resourceArn` that addresses the very same resource: an ARN naming another
+//!    account is HTTP 403 `AccessDeniedException` on either plane, and only an ARN of this
+//!    account reaches the existence refusal rule 7 is about.
 
 use serde_json::{json, Value};
 
 use crate::harness::{
-    deregister, get_provider, get_settings, harness, list_providers, list_tags,
+    denial_message, deregister, get_provider, get_settings, harness, list_providers, list_tags,
     provider_arn_for, register, seed_provider, stored_provider_count, untag, update_settings,
     Reply, ACCOUNT, RED_HAT, REGION, SIGNING_NAME,
 };
@@ -441,10 +446,7 @@ async fn the_tag_apis_separate_a_bad_arn_from_a_missing_resource() {
         format!("arn:aws:{SIGNING_NAME}:{REGION}:123456789012:subscription-provider/other"),
         format!("arn:aws:{SIGNING_NAME}:eu-central-1:999999999999:subscription-provider/other"),
     ];
-    let denial = format!(
-        "User: {} is not authorized to access this resource",
-        service_common::caller_principal::ambient_user_arn()
-    );
+    let denial = denial_message();
     for arn in &foreign {
         for (op, reply) in [
             ("UntagResource", untag(&h, arn, &["a"]).await),
@@ -545,12 +547,15 @@ async fn the_tag_apis_separate_a_bad_arn_from_a_missing_resource() {
 #[tokio::test]
 async fn a_not_found_provider_is_refused_with_fixed_text() {
     let h = harness();
-    // Rows differ along the ARN's region, account and resource id, none of which may
-    // show up in the refusal.
+    // Rows differ along the ARN's region, resource kind and resource id, none of which may
+    // show up in the refusal. The ACCOUNT field is not a row here: an ARN naming another
+    // account is settled by the authorization stage ahead of this lookup (rule 8), so this
+    // rule is about the ARNs of THIS account that address nothing.
     let unknown = [
         provider_arn_for("22222222-2222-2222-2222-222222222222"),
         provider_arn_for("00000000-0000-4000-8000-000000000009"),
-        format!("arn:aws:{SIGNING_NAME}:eu-central-1:123456789012:subscription-provider/other"),
+        format!("arn:aws:{SIGNING_NAME}:eu-central-1:{ACCOUNT}:subscription-provider/other"),
+        format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT}:linux-subscription/abc"),
         "arn:aws:iam:us-west-2:000000000000:role/not-a-provider".to_string(),
     ];
     for arn in &unknown {
@@ -576,4 +581,182 @@ async fn a_not_found_provider_is_refused_with_fixed_text() {
             }
         }
     }
+}
+
+/// Accounts other than the one this emulator serves, for rule 8's rows. Twelve decimal
+/// digits, which is what an ARN's account field holds; the values differ along their digits
+/// only, because the rule is about that field not matching rather than about any particular
+/// account.
+const FOREIGN_ACCOUNTS: &[&str] = &["123456789012", "999999999999", "111122223333"];
+
+/// A `SecretArn` of this account for the registrations rule 8 seeds, satisfying the modelled
+/// `SecretArn` pattern.
+const AUTH_SECRET_ARN: &str = "arn:aws:secretsmanager:us-west-2:000000000000:secret:rhel-auth";
+
+/// The tag set a seeded registration carries throughout rule 8, so a refusal can be shown to
+/// have left it alone.
+const SEEDED_TAGS: &[(&str, &str)] = &[("env", "prod")];
+
+/// The ARN shapes one row of rule 8 is built in, each carrying `account` in its account
+/// field: `live`'s own ARN, an id nothing was registered under, another Region, another
+/// resource kind, another partition and another service's namespace — so the verdict is shown
+/// to come from the account field rather than from the rest of the ARN. Every shape satisfies
+/// the modelled `SubscriptionProviderArn` pattern, so none of them is refused at the request
+/// boundary instead.
+fn provider_arn_shapes(live: &str, account: &str) -> Vec<(String, String)> {
+    let in_account = |arn: &str| arn.replace(ACCOUNT, account);
+    vec![
+        ("the live registration's own ARN".to_string(), in_account(live)),
+        (
+            "an id nothing was registered under".to_string(),
+            in_account(&provider_arn_for("88888888-8888-4888-8888-888888888888")),
+        ),
+        (
+            "another region".to_string(),
+            in_account(&live.replace(REGION, "eu-west-1")),
+        ),
+        (
+            "another resource kind".to_string(),
+            in_account(&live.replace("subscription-provider/", "linux-subscription/")),
+        ),
+        (
+            "another partition".to_string(),
+            in_account(&live.replace("arn:aws:", "arn:aws-us-gov:")),
+        ),
+        (
+            "another service's namespace".to_string(),
+            in_account(&live.replace(&format!(":{SIGNING_NAME}:"), ":license-manager:")),
+        ),
+    ]
+}
+
+/// Rule 8: a `SubscriptionProviderArn` naming another account is denied — by the read and by
+/// the removal, whatever the ARN's shape, on a repeat, with the IAM denial naming the calling
+/// principal and nothing of the request — and the tag API addressing the identical ARN
+/// answers identically, because it addresses the identical resource.
+#[tokio::test]
+async fn a_provider_arn_in_another_account_is_denied_rather_than_reported_absent() {
+    let h = harness();
+    // One registered resource throughout: a denial must come from the ARN's account field
+    // rather than from a store that holds nothing at all.
+    let live = seed_provider(
+        &h,
+        "00000000-0000-4000-8000-0000000000b1",
+        AUTH_SECRET_ARN,
+        SEEDED_TAGS,
+    );
+    let registrations = stored_provider_count(&h);
+    let denial = denial_message();
+
+    for &account in FOREIGN_ACCOUNTS {
+        for (shape, arn) in provider_arn_shapes(&live, account) {
+            for attempt in 0..2 {
+                for (op, reply) in [
+                    (
+                        "GetRegisteredSubscriptionProvider",
+                        get_provider(&h, &arn).await,
+                    ),
+                    ("DeregisterSubscriptionProvider", deregister(&h, &arn).await),
+                    // The same ARN through the tag plane: one resource kind, one lookup, so
+                    // one answer — which is the agreement this rule is about.
+                    ("ListTagsForResource", list_tags(&h, &arn).await),
+                ] {
+                    let case = format!("{op} on {shape} in {account}, attempt {attempt}");
+                    reply.error(&case, 403, "AccessDeniedException");
+                    assert_eq!(
+                        reply.message(),
+                        denial,
+                        "case {case:?}: expected the IAM denial {denial:?}, got {:?}",
+                        reply.message()
+                    );
+                    // The denial names the caller's own principal and nothing it was asked
+                    // about, so a caller learns nothing about an account that is not its own.
+                    for leaked in [arn.as_str(), account] {
+                        assert!(
+                            !reply.message().contains(leaked),
+                            "case {case:?}: the denial must carry nothing from the request, \
+                             got {:?} carrying {leaked:?}",
+                            reply.message()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // No denied call reached the store: nothing was removed, and the registration this
+    // account does hold is still served.
+    assert_eq!(
+        stored_provider_count(&h),
+        registrations,
+        "expected the store untouched at {registrations} record(s), got {}",
+        stored_provider_count(&h)
+    );
+    let served = get_provider(&h, &live).await;
+    let case = "GetRegisteredSubscriptionProvider on the live registration after the denials";
+    assert_eq!(
+        served.ok(case).get("SubscriptionProviderArn").and_then(Value::as_str),
+        Some(live.as_str()),
+        "case {case:?}: expected the seeded registration to be served, got {:?}",
+        served.body
+    );
+}
+
+/// The boundary of rule 8: the gate is keyed on the ACCOUNT field, so the same ARN shapes in
+/// the caller's OWN account reach the existence stage instead, and the registration that does
+/// exist is read and removed.
+#[tokio::test]
+async fn the_same_provider_arn_shapes_in_the_callers_account_are_answered_about_existence() {
+    let h = harness();
+    let live = seed_provider(
+        &h,
+        "00000000-0000-4000-8000-0000000000b2",
+        AUTH_SECRET_ARN,
+        SEEDED_TAGS,
+    );
+
+    // `ACCOUNT` is the account this emulator serves, so these rows are the shapes above with
+    // the account field left as it is: every one of them addresses no registration, and none
+    // of them is denied.
+    for (shape, arn) in provider_arn_shapes(&live, ACCOUNT) {
+        if arn == live {
+            continue;
+        }
+        for (op, reply) in [
+            (
+                "GetRegisteredSubscriptionProvider",
+                get_provider(&h, &arn).await,
+            ),
+            ("DeregisterSubscriptionProvider", deregister(&h, &arn).await),
+        ] {
+            let case = format!("{op} on {shape} in the caller's account");
+            reply.error(&case, 400, "ResourceNotFoundException");
+            assert_eq!(
+                reply.message(),
+                PROVIDER_NOT_FOUND_MESSAGE,
+                "case {case:?}: expected {PROVIDER_NOT_FOUND_MESSAGE:?}, got {:?}",
+                reply.message()
+            );
+        }
+    }
+
+    // And the registration that exists is served and then removed, read back through the
+    // implemented reader: what the two refusals above are about is the ARN, not the
+    // operations.
+    let case = "GetRegisteredSubscriptionProvider on the live registration";
+    let served = get_provider(&h, &live).await;
+    assert_eq!(
+        served.ok(case).get("SubscriptionProviderArn").and_then(Value::as_str),
+        Some(live.as_str()),
+        "case {case:?}: expected the seeded registration to be served, got {:?}",
+        served.body
+    );
+    deregister(&h, &live)
+        .await
+        .ok("DeregisterSubscriptionProvider on the live registration");
+    get_provider(&h, &live).await.error(
+        "GetRegisteredSubscriptionProvider after the removal",
+        400,
+        "ResourceNotFoundException",
+    );
 }

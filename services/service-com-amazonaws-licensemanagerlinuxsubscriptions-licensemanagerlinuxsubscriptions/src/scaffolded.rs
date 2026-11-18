@@ -52,7 +52,9 @@
 //! that addresses no
 //! resource is HTTP 404 `NotFoundException` ([`Scaffolded::not_found`]), one the caller may
 //! not reach at all is HTTP 403 `AccessDeniedException` ([`Scaffolded::access_denied`], the
-//! verdict `crate::service::authorization` reaches), and a tag
+//! verdict `crate::service::authorization` reaches — the one refusal here that is not the tag
+//! APIs' alone, because every operation of this service that is handed a resource ARN states
+//! it), and a tag
 //! selection past the size a resource may carry — a write's tag map or a removal's tag-key
 //! list alike — is HTTP 400 `BadRequestException`
 //! ([`Scaffolded::tag_limit_exceeded`]). None of those codes is a shape this service's
@@ -267,9 +269,10 @@ pub const TAG_LIMIT_MESSAGE: &str = "The resultant tag set must not have more th
 /// constraint envelope `crate::service::validation` states for every other member.
 pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
 
-/// The wire error code the tag APIs answer when the caller may not reach the resource
-/// `resourceArn` names at all — a resource field naming an account other than the one this
-/// request is served for.
+/// The wire error code this service answers when the caller may not reach the resource an
+/// ARN it was handed names at all — a resource field naming an account other than the one this
+/// request is served for, on the tag APIs' `resourceArn` and on the `SubscriptionProviderArn`
+/// of the operations that address one registration alike.
 ///
 /// This service's model declares no shape for an authorization refusal on these operations
 /// (`smithy_query(query="operation",operation="TagResource")` lists `InternalServerException`,
@@ -333,7 +336,7 @@ impl UnmodeledRefusal {
         }
     }
 
-    /// The tag APIs' refusal of a `resourceArn` the caller may not reach at all: HTTP 403
+    /// The refusal of a resource ARN the caller may not reach at all: HTTP 403
     /// `AccessDeniedException`, naming `principal` — the identity whose authorization was
     /// evaluated — and nothing about what it asked for.
     pub fn access_denied(principal: &str) -> Self {
@@ -432,7 +435,7 @@ impl<E> Scaffolded<E> {
         Self::Unmodeled(UnmodeledRefusal::not_found())
     }
 
-    /// Refuse the request the way the tag APIs refuse a `resourceArn` the caller may not
+    /// Refuse the request the way this service refuses a resource ARN the caller may not
     /// reach at all: HTTP 403 `AccessDeniedException`, naming `principal`.
     ///
     /// Reached through `crate::service::authorization`, which is where the verdict itself

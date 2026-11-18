@@ -520,7 +520,10 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
 
     /// Resolve a registration by its `SubscriptionProviderArn`.
     ///
-    /// `ResourceNotFoundException` when no provider with that ARN is registered.
+    /// `ResourceNotFoundException` when no provider with that ARN is registered. Absence is
+    /// all this answers: whether the caller may reach the ARN at all is settled before any
+    /// handler calls this (`crate::service::authorization`), so an ARN naming another
+    /// account never reaches this lookup.
     pub fn resolve_provider(&self, arn: &str) -> Result<&SubscriptionProviderRecord, StateError> {
         self.providers
             .get(arn)
@@ -756,7 +759,10 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
     /// provider is the only resource of this service they can address: every tag
     /// operation resolves its `resourceArn` through this one lookup (and
     /// [`resource_tags_mut`](Self::resource_tags_mut)) rather than reaching into
-    /// `providers` itself, so what one of them writes is what the next one reports.
+    /// `providers` itself, so what one of them writes is what the next one reports — and
+    /// it is the same resource the provider-plane operations reach through
+    /// [`resolve_provider`](Self::resolve_provider), which is why one caller-supplied ARN
+    /// is authorized the same way whichever of them was addressed with it.
     pub fn resource_tags(&self, arn: &str) -> Option<&HashMap<String, String>> {
         self.providers.get(arn).map(|record| &record.tags)
     }

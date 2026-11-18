@@ -2,7 +2,10 @@
 
 //! @op GetRegisteredSubscriptionProvider
 //! Reports one registered Linux subscription provider, read from this service's state
-//! by its `SubscriptionProviderArn`. An ARN no registration holds answers
+//! by its `SubscriptionProviderArn`. An ARN naming another account is denied HTTP 403
+//! `AccessDeniedException` before the store is consulted (the one gate in
+//! [`crate::service::authorization`], which every operation handed a resource ARN of this
+//! service applies); an ARN of this account that no registration holds answers
 //! `ResourceNotFoundException`; the modelled ARN pattern is enforced before this handler
 //! runs, so a malformed ARN is already a `ValidationException`.
 //!
@@ -161,6 +164,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // AUTHORIZATION first, from the ARN alone and ahead of the store: a read of a
+        // registration in another account is denied rather than reported absent, so the
+        // account field decides it whether or not this account happens to hold a
+        // registration under the same id — and the one resource kind this ARN can address
+        // answers the same way here as it does through the tag APIs, which reach it through
+        // the same lookup.
+        crate::service::authorization::authorize_resource_arn(&input.subscription_provider_arn)?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetRegisteredSubscriptionProviderErrorModeled::InternalServerException(
                 InternalServerException {
