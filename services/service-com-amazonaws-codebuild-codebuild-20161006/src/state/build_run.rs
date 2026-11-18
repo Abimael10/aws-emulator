@@ -14,6 +14,10 @@
 //!
 //! What this module adds is only WHERE the steps happen; the order is the build's own:
 //!
+//! 0. the stream the build's output is delivered to is provisioned, which is a decision about
+//!    the role the build runs as ([`withheld_log_delivery`]) — a build whose role does not let
+//!    CodeBuild deliver there reports nothing and runs nothing, because every step after this
+//!    one reports what it did into that stream;
 //! 1. the variables the build environment is given are resolved, which for a variable naming
 //!    a value another service holds is a call to that service ([`super::build_secrets`]) — a
 //!    build whose environment cannot be given them runs nothing at all;
@@ -52,7 +56,7 @@ use super::{
     artifact_upload, build_cache, build_secrets, build_source, now_millis, BuildRun, BuildSeed,
     ComAmazonawsCodebuildCodebuild20161006State,
 };
-use crate::ops::types::{Build, BuildArtifacts, BuildPhase, ProjectArtifacts};
+use crate::ops::types::{Build, BuildArtifacts, BuildPhase, PhaseContext, ProjectArtifacts};
 
 /// One build whose run the clock owes, claimed out of the store
 /// ([`ComAmazonawsCodebuildCodebuild20161006State::claim_due_build_runs`]) by the
@@ -172,9 +176,71 @@ async fn performed_commands(
     Some(run)
 }
 
-/// The IAM action a build's log delivery is performed under ("Actions defined by Amazon
-/// CloudWatch Logs", IAM Service Authorization Reference).
-const PUT_LOG_EVENTS_ACTION: &str = "logs:PutLogEvents";
+/// The IAM actions CodeBuild performs a build's log delivery under ("Actions defined by Amazon
+/// CloudWatch Logs", IAM Service Authorization Reference): the stream the build's output goes
+/// to is created, and the build's records are put into it. Both are taken on the stream's own
+/// ARN, which is the one the build reports.
+const LOG_DELIVERY_ACTIONS: [&str; 2] = ["logs:CreateLogStream", "logs:PutLogEvents"];
+
+/// CodeBuild's own sentence for a build whose service role does not let it deliver the
+/// build's output to CloudWatch Logs: the role it was to deliver as, the build it was
+/// delivering for, and the refusal the delivery would have been answered with — which names
+/// the action that was withheld and the stream it was withheld on.
+fn log_delivery_withheld_message(role_arn: &str, build_arn: &str, refusal: &str) -> String {
+    format!(
+        "Service role {role_arn} does not allow AWS CodeBuild to create Amazon CloudWatch Logs \
+         log streams for build {build_arn}. Error message: {refusal}"
+    )
+}
+
+/// `Some(context)` when the permissions in force on `build`'s service role do NOT let
+/// CodeBuild deliver the build's output to the stream the build reports — the context the
+/// phase that provisions the build then carries — and `None` when they do, when the build
+/// delivers to no stream at all, or when nothing is known about the role.
+///
+/// A build's log stream is provisioned as CodeBuild starts the build, BEFORE its source is
+/// fetched and before any command of any phase runs: the build's own agent reports everything
+/// it does into that stream, so a build whose role withholds a delivery action is one CodeBuild
+/// does not run at all. The decision is the one every call made for a build goes
+/// through ([`super::build_tools::role_withholds`]), asked of the stream's own ARN, so a role
+/// that states no policies withholds nothing.
+async fn withheld_log_delivery(
+    callback: &EmbeddedEmulator,
+    region: &str,
+    build: &Build,
+    build_id: &str,
+) -> Option<PhaseContext> {
+    let logs = build.logs.as_ref()?;
+    // The stream's own ARN is the resource the delivery actions are granted on, and a build
+    // whose CloudWatch delivery is DISABLED reports none: nothing is delivered for it, so no
+    // permission on a stream is needed.
+    let stream_arn = logs.cloud_watch_logs_arn.as_deref()?;
+    let role_arn = build.service_role.as_deref()?;
+    // The principal a refusal names is the session CodeBuild assumes the role in for this
+    // build, the same one every other call made for it is refused as.
+    let principal =
+        super::role_session_arn(role_arn, build_id).unwrap_or_else(|| role_arn.to_string());
+    for action in LOG_DELIVERY_ACTIONS {
+        let Some(withheld) =
+            super::build_tools::role_withholds(callback, region, role_arn, action, stream_arn).await
+        else {
+            continue;
+        };
+        let refusal = ::service_common::iam_authorization::not_authorized_by_identity_policy(
+            &principal,
+            action,
+            stream_arn,
+            &withheld.reason(action),
+        );
+        let message = log_delivery_withheld_message(
+            role_arn,
+            &super::build_arn(region, build_id),
+            &refusal,
+        );
+        return Some(super::build_source::client_error(&message));
+    }
+    None
+}
 
 /// Deliver what `build`'s commands wrote into the log group and stream the build REPORTS
 /// ([`super::build_logs`]).
@@ -185,10 +251,9 @@ const PUT_LOG_EVENTS_ACTION: &str = "logs:PutLogEvents";
 /// workspace's one vended-logs write (`::service_common::cloudwatch_logs`). A build whose
 /// delivery is DISABLED names no group or stream and nothing is delivered.
 ///
-/// The delivery is made under the build's service role, so a role whose policies do not allow
-/// `logs:PutLogEvents` on that stream delivers no events — the build still runs and still
-/// reports where its output would have gone, exactly as a build whose log delivery is denied
-/// does.
+/// Whether the build's service role lets CodeBuild deliver there at all is decided before the
+/// build runs ([`withheld_log_delivery`]), so a build that got this far has a stream its role
+/// may write.
 async fn deliver_log(
     callback: &EmbeddedEmulator,
     region: &str,
@@ -205,28 +270,6 @@ async fn deliver_log(
     else {
         return;
     };
-    if let Some(role_arn) = build.service_role.as_deref() {
-        // The stream's own ARN is the resource `logs:PutLogEvents` is granted on, and it is
-        // the one the build already reports.
-        let resource = logs.cloud_watch_logs_arn.clone().unwrap_or_default();
-        if let Some(withheld) = super::build_tools::role_withholds(
-            callback,
-            region,
-            role_arn,
-            PUT_LOG_EVENTS_ACTION,
-            &resource,
-        )
-        .await
-        {
-            ::tracing::debug!(
-                role_arn = %role_arn,
-                log_group = %group,
-                withheld = ?withheld,
-                "a build's log events were not delivered: its service role may not put them"
-            );
-            return;
-        }
-    }
     ::service_common::cloudwatch_logs::delivered_over(callback, region, group, stream, records)
         .await;
 }
@@ -274,6 +317,23 @@ async fn perform<Eng: Send + Sync + 'static>(
 ) -> RecordedRun {
     let project_name = claimed.project_name.as_str();
     let mut seed = BuildSeed::default();
+    // The stream the build's output is delivered to is provisioned before anything of the
+    // build happens, because every later step reports what it did into it: a build whose role
+    // does not let CodeBuild deliver there gets no environment at all — nothing runs, nothing
+    // is delivered, and the phase that provisions it carries why.
+    if let Some(context) =
+        withheld_log_delivery(callback, region, &claimed.build, &claimed.id).await
+    {
+        return RecordedRun {
+            run: super::environment_failure(claimed.start_millis, claimed.due_millis, context),
+            artifacts: None,
+            secondary_artifacts: Vec::new(),
+            cache_saved_millis: None,
+            // Nothing of this build ran, so it produced no result file to read a report run
+            // from.
+            reports: Vec::new(),
+        };
+    }
     // The variables the build environment is given come first: they are in place before the
     // first command of any phase runs, and one that names a value another service holds is
     // substituted with that value. An environment that could not be given them is a build

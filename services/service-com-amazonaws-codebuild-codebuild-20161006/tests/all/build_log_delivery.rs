@@ -8,9 +8,9 @@
 //! to read WHY a build ended as it did: a client reads the location off the build record and
 //! then reads the events there. What is delivered is what the build's commands wrote, on both
 //! of their streams: the lines a command wrote on standard output, and the diagnostic a
-//! command that could not do its work wrote on standard error. A build whose service role may
-//! not `logs:PutLogEvents` into that stream still runs and still reports where its output
-//! would have gone, and delivers no events.
+//! command that could not do its work wrote on standard error. A build whose service role does
+//! not let CodeBuild deliver into that stream gets no build environment at all: it fails at
+//! the phase that provisions it, runs no command and delivers nothing.
 //!
 //! Two services have to agree for that to hold — CloudWatch Logs holds the group, IAM holds
 //! the role's policies — so this suite mounts both beside CodeBuild on ONE engine, the way
@@ -19,7 +19,7 @@
 //!
 //! The rows differ along what the rule generalises over: whether the project configures a
 //! group and a stream prefix of its own, what the build's commands wrote and on which stream,
-//! and whether the build's role may deliver at all.
+//! and which of the delivery actions the build's role withholds.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,8 +40,9 @@ const CODEBUILD_TRUST: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":
 "Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
 
 /// The actions AWS documents a build's service role needs to deliver its log events (the
-/// CodeBuild service-role policy its User Guide publishes).
-const LOG_ACTIONS: [&str; 3] = [
+/// CodeBuild service-role policy its User Guide publishes). Shared with every other suite
+/// whose builds have to run at all, so the two cannot drift.
+pub(crate) const LOG_ACTIONS: [&str; 3] = [
     "logs:CreateLogGroup",
     "logs:CreateLogStream",
     "logs:PutLogEvents",
@@ -169,6 +170,17 @@ async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 /// Create a role trusted by CodeBuild whose inline policy allows `actions`, and answer the
 /// ARN IAM holds it under.
 async fn role_allowing(router: &MultiServiceRouter, name: &str, actions: &[&str]) -> String {
+    role_stating(
+        router,
+        name,
+        json!([{"Effect": "Allow", "Action": actions, "Resource": "*"}]),
+    )
+    .await
+}
+
+/// Create a role trusted by CodeBuild whose inline policy carries `statements`, and answer the
+/// ARN IAM holds it under.
+async fn role_stating(router: &MultiServiceRouter, name: &str, statements: Value) -> String {
     let (status, created) = iam(
         router,
         "CreateRole",
@@ -184,7 +196,7 @@ async fn role_allowing(router: &MultiServiceRouter, name: &str, actions: &[&str]
     );
     let document = json!({
         "Version": "2012-10-17",
-        "Statement": [{"Effect": "Allow", "Action": actions, "Resource": "*"}],
+        "Statement": statements,
     })
     .to_string();
     let (status, attached) = iam(
@@ -410,40 +422,181 @@ async fn a_denied_call_is_reported_in_the_builds_log() {
     }
 }
 
-/// RULE: a build whose service role may not put log events into its stream still runs and
-/// still reports where its output would have gone — and delivers none.
+/// RULE: a build whose service role does not let CodeBuild deliver its output to the log
+/// stream the build reports FAILS at the phase that provisions it, carrying CodeBuild's
+/// client error for a role that does not allow the delivery, and nothing of the build runs or
+/// is delivered. A build that delivers to no stream at all needs no such permission.
+///
+/// The rows differ along what the rule generalises over: which of the delivery actions the
+/// role withholds, how it withholds it (a policy set that allows nothing of the kind, or one
+/// that denies the action outright), and whether the project configures CloudWatch delivery at
+/// all.
 #[tokio::test]
-async fn a_build_whose_role_may_not_deliver_delivers_no_events() {
+async fn a_build_whose_role_may_not_deliver_its_log_fails() {
     let router = emulator();
-    let role = role_allowing(&router, "codebuild-logs-denied", &["s3:GetObject"]).await;
-    let case = "a role that states permissions and allows no log delivery";
-    codebuild(
-        &router,
-        case,
-        "CreateProject",
-        &project_body(
-            "log-undelivered-proj",
-            &role,
-            &buildspec(&["echo nothing reaches the group"]),
+
+    /// One row: the case, the statements the build's role carries, the extra `CreateProject`
+    /// members, the status the build must end in, and the delivery action the build's failure
+    /// must name — `None` for a build that ends in success.
+    type Row = (
+        &'static str,
+        Value,
+        Value,
+        &'static str,
+        Option<&'static str>,
+    );
+
+    let allowing =
+        |actions: &[&str]| json!([{"Effect": "Allow", "Action": actions, "Resource": "*"}]);
+    let rows: Vec<Row> = vec![
+        (
+            "a role that states permissions and allows no log action",
+            allowing(&["s3:GetObject"]),
             json!({}),
+            "FAILED",
+            Some("logs:CreateLogStream"),
         ),
-    )
-    .await;
-    let build = settled_build(&router, case, "log-undelivered-proj").await;
-    assert_eq!(
-        build["buildStatus"], json!("SUCCEEDED"),
-        "case {case:?}: the build still runs, got {build}"
-    );
-    let group = build["logs"]["groupName"].as_str().unwrap_or_default();
-    let stream = build["logs"]["streamName"].as_str().unwrap_or_default();
-    assert!(
-        !group.is_empty() && !stream.is_empty(),
-        "case {case:?}: the build still reports where its output would have gone, got {build}"
-    );
-    // Nothing was delivered: CloudWatch Logs holds no such stream, or an empty one.
-    let messages = delivered_messages(&router, group, stream).await;
-    assert!(
-        messages.as_ref().is_none_or(Vec::is_empty),
-        "case {case:?}: expected no delivered events, got {messages:?}"
-    );
+        (
+            "a role allowed everything but putting the events",
+            json!([
+                {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                {"Effect": "Deny", "Action": "logs:PutLogEvents", "Resource": "*"},
+            ]),
+            json!({}),
+            "FAILED",
+            Some("logs:PutLogEvents"),
+        ),
+        (
+            "a role allowed to put events into a stream it may not create",
+            allowing(&["logs:CreateLogGroup", "logs:PutLogEvents"]),
+            json!({}),
+            "FAILED",
+            Some("logs:CreateLogStream"),
+        ),
+        (
+            "a role allowed every delivery action, into its own group",
+            allowing(&LOG_ACTIONS),
+            json!({"logsConfig": {"cloudWatchLogs": {
+                "status": "ENABLED",
+                "groupName": "delivered-group",
+                "streamName": "delivered-prefix",
+            }}}),
+            "SUCCEEDED",
+            None,
+        ),
+        (
+            // Nothing is delivered for a build whose CloudWatch delivery is off, so there is
+            // no stream for a permission to be needed on.
+            "a project whose CloudWatch delivery is disabled, with a role allowing no log \
+             action",
+            allowing(&["s3:GetObject"]),
+            json!({"logsConfig": {"cloudWatchLogs": {"status": "DISABLED"}}}),
+            "SUCCEEDED",
+            None,
+        ),
+    ];
+
+    for (index, (case, statements, extra, expected_status, withheld)) in rows.iter().enumerate() {
+        let role = role_stating(
+            &router,
+            &format!("codebuild-delivery-role-{index}"),
+            statements.clone(),
+        )
+        .await;
+        let project = format!("log-delivery-proj-{index}");
+        codebuild(
+            &router,
+            case,
+            "CreateProject",
+            &project_body(
+                &project,
+                &role,
+                &buildspec(&["echo the marker line"]),
+                extra.clone(),
+            ),
+        )
+        .await;
+        let build = settled_build(&router, case, &project).await;
+        assert_eq!(
+            build["buildStatus"],
+            json!(expected_status),
+            "case {case:?}: expected the build to end {expected_status}, got {build}"
+        );
+        let group = build["logs"]["groupName"].as_str().unwrap_or_default();
+        let stream = build["logs"]["streamName"].as_str().unwrap_or_default();
+        let messages = delivered_messages(&router, group, stream).await;
+        let Some(withheld) = withheld else {
+            // A build that was delivered to has the line its command wrote; one whose
+            // delivery is off reports no stream to read at all.
+            if group.is_empty() {
+                assert!(
+                    stream.is_empty(),
+                    "case {case:?}: a build delivering nowhere reports no stream, got {build}"
+                );
+            } else {
+                assert!(
+                    messages
+                        .as_ref()
+                        .is_some_and(|held| held.iter().any(|line| line == "the marker line")),
+                    "case {case:?}: expected the build's own line in {group}/{stream}, \
+                     got {messages:?}"
+                );
+            }
+            continue;
+        };
+        // The build still reports WHERE its output would have gone, and nothing is there.
+        assert!(
+            !group.is_empty() && !stream.is_empty(),
+            "case {case:?}: the build still reports where its output would have gone, \
+             got {build}"
+        );
+        assert!(
+            messages.as_ref().is_none_or(Vec::is_empty),
+            "case {case:?}: expected no delivered events, got {messages:?}"
+        );
+        // The phase that provisions the build is the one that failed, and no phase after it
+        // ran: the build's commands never did.
+        let phases = build["phases"].as_array().cloned().unwrap_or_default();
+        let provisioning = phases
+            .iter()
+            .find(|phase| phase["phaseType"] == json!("PROVISIONING"))
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the build must report its provisioning phase, got {build}")
+            });
+        assert_eq!(
+            provisioning["phaseStatus"],
+            json!("FAILED"),
+            "case {case:?}: expected the provisioning phase to have failed, got {provisioning}"
+        );
+        assert!(
+            !phases
+                .iter()
+                .any(|phase| phase["phaseType"] == json!("BUILD")),
+            "case {case:?}: a build with no log stream runs no command phase, got {phases:?}"
+        );
+        let context = provisioning["contexts"][0].clone();
+        assert_eq!(
+            context["statusCode"],
+            json!("CLIENT_ERROR"),
+            "case {case:?}: expected CodeBuild's client error, got {context}"
+        );
+        let message = context["message"].as_str().unwrap_or_default();
+        // CodeBuild's own sentence, naming the role and the build, followed by the refusal the
+        // delivery would have been answered with: the session the build acts in, the action
+        // withheld and the stream it was withheld on.
+        for named in [
+            format!(
+                "Service role {role} does not allow AWS CodeBuild to create Amazon CloudWatch \
+                 Logs log streams for build "
+            ),
+            format!("is not authorized to perform: {withheld} on resource: "),
+            "AWSCodeBuild-".to_string(),
+            format!(":log-stream:{stream}"),
+        ] {
+            assert!(
+                message.contains(&named),
+                "case {case:?}: expected {named:?} in the phase context, got {message:?}"
+            );
+        }
+    }
 }

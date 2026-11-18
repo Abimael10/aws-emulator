@@ -32,6 +32,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use super::build_log_delivery::LOG_ACTIONS;
 use super::project_build_lifecycle::{call, REGION};
 
 /// Amazon ECR's `X-Amz-Target` prefix, from that service's own OPERATIONS.md.
@@ -170,8 +171,8 @@ async fn ecr_ok(router: &MultiServiceRouter, case: &str, operation: &str, body: 
     answer
 }
 
-/// Create a role trusted by CodeBuild whose inline policy allows `actions`, and answer its
-/// ARN.
+/// Create a role trusted by CodeBuild whose inline policy allows `actions`, beside the log
+/// delivery every build's role allows ([`LOG_ACTIONS`]), and answer its ARN.
 async fn role_allowing(router: &MultiServiceRouter, name: &str, actions: &[&str]) -> String {
     let (status, created) = iam(
         router,
@@ -188,7 +189,10 @@ async fn role_allowing(router: &MultiServiceRouter, name: &str, actions: &[&str]
     );
     let document = json!({
         "Version": "2012-10-17",
-        "Statement": [{"Effect": "Allow", "Action": actions, "Resource": "*"}],
+        "Statement": [
+            {"Effect": "Allow", "Action": actions, "Resource": "*"},
+            {"Effect": "Allow", "Action": LOG_ACTIONS, "Resource": "*"},
+        ],
     })
     .to_string();
     let (status, attached) = iam(
