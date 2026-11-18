@@ -198,8 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteDistributionConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        // Reported as the required resource it is, the same sentence a read
-                        // of one and a reference to one carry.
+                        // Reported as the required resource it is, the same sentence a
+                        // reference to one carries. A READ of this family quotes the ARN
+                        // instead (see `get_distribution_configuration`); this mutation
+                        // names the kind, as the sibling configuration family's update
+                        // does.
                         message: Some(crate::state::required_resource_not_found_message(
                             &input.distribution_configuration_arn,
                         )),

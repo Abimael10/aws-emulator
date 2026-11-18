@@ -228,8 +228,9 @@ fn required_resource_message(resource_type: &str, arn: &str) -> String {
     format!("The following required resource '{resource_type}' cannot be found: '{arn}'.")
 }
 
-/// The not-found report the INFRASTRUCTURE configuration carries, quoting the ARN the
-/// request named.
+/// The not-found report a READ of a CONFIGURATION carries — the infrastructure and the
+/// distribution configuration alike — quoting the ARN the request named. The infrastructure
+/// configuration carries it for its delete as well.
 fn configuration_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
 }
@@ -650,8 +651,12 @@ struct Row {
     delete_referrer: &'static str,
     /// The dependency refusal the delete earns while the reference stands.
     dependency: String,
-    /// The report a read and a repeat delete answer once it is gone.
+    /// The report a READ answers once it is gone.
     missing: String,
+    /// The report a REPEAT DELETE answers once it is gone. The same sentence as the read's
+    /// for every kind but the distribution configuration, whose read quotes the ARN while
+    /// its mutations name the kind.
+    missing_on_delete: String,
 }
 
 #[tokio::test]
@@ -684,6 +689,7 @@ async fn a_dependency_refusal_quotes_only_the_arn_the_request_asked_to_delete() 
                     delete_referrer: "/DeleteImageRecipe?imageRecipeArn=",
                     dependency: dependency_message(&component),
                     missing: required_resource_message("Component", &component),
+                    missing_on_delete: required_resource_message("Component", &component),
                 }
             }
             "a component a container recipe includes" => {
@@ -700,6 +706,7 @@ async fn a_dependency_refusal_quotes_only_the_arn_the_request_asked_to_delete() 
                     delete_referrer: "/DeleteContainerRecipe?containerRecipeArn=",
                     dependency: dependency_message(&component),
                     missing: required_resource_message("Component", &component),
+                    missing_on_delete: required_resource_message("Component", &component),
                 }
             }
             "an image recipe a pipeline builds" => {
@@ -725,6 +732,7 @@ async fn a_dependency_refusal_quotes_only_the_arn_the_request_asked_to_delete() 
                     delete_referrer: "/DeleteImagePipeline?imagePipelineArn=",
                     dependency: dependency_message(&recipe),
                     missing: required_resource_message("ImageRecipe", &recipe),
+                    missing_on_delete: required_resource_message("ImageRecipe", &recipe),
                 }
             }
             "a container recipe a pipeline builds" => {
@@ -750,6 +758,7 @@ async fn a_dependency_refusal_quotes_only_the_arn_the_request_asked_to_delete() 
                     delete_referrer: "/DeleteImagePipeline?imagePipelineArn=",
                     dependency: dependency_message(&recipe),
                     missing: required_resource_message("ContainerRecipe", &recipe),
+                    missing_on_delete: required_resource_message("ContainerRecipe", &recipe),
                 }
             }
             "an infrastructure configuration a pipeline builds in" => {
@@ -775,6 +784,7 @@ async fn a_dependency_refusal_quotes_only_the_arn_the_request_asked_to_delete() 
                     delete_referrer: "/DeleteImagePipeline?imagePipelineArn=",
                     dependency: configuration_dependency_message(&configuration),
                     missing: configuration_not_found_message(&configuration),
+                    missing_on_delete: configuration_not_found_message(&configuration),
                 }
             }
             _ => {
@@ -803,7 +813,8 @@ async fn a_dependency_refusal_quotes_only_the_arn_the_request_asked_to_delete() 
                     echoed: "distributionConfigurationArn",
                     delete_referrer: "/DeleteImagePipeline?imagePipelineArn=",
                     dependency: dependency_message(&distribution),
-                    missing: required_resource_message(
+                    missing: configuration_not_found_message(&distribution),
+                    missing_on_delete: required_resource_message(
                         "DistributionConfiguration",
                         &distribution,
                     ),
@@ -864,10 +875,11 @@ async fn a_dependency_refusal_quotes_only_the_arn_the_request_asked_to_delete() 
             row.case
         );
 
-        // And both a read and a repeat of the delete report that ARN missing.
-        for (what, method, uri) in [
-            ("read after the delete", "GET", &row.read),
-            ("deleted twice", "DELETE", &row.delete),
+        // And both a read and a repeat of the delete report that ARN missing, each in the
+        // sentence its own path carries.
+        for (what, method, uri, expected) in [
+            ("read after the delete", "GET", &row.read, &row.missing),
+            ("deleted twice", "DELETE", &row.delete, &row.missing_on_delete),
         ] {
             let (status, missing) =
                 call(&router, method, &format!("{}{}", uri, row.arn), None).await;
@@ -877,7 +889,7 @@ async fn a_dependency_refusal_quotes_only_the_arn_the_request_asked_to_delete() 
                 &missing,
                 404,
                 "ResourceNotFoundException",
-                &row.missing,
+                expected,
             );
         }
     }

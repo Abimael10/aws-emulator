@@ -248,8 +248,9 @@ fn required_resource_message(resource_type: &str, arn: &str) -> String {
     format!("The following required resource '{resource_type}' cannot be found: '{arn}'.")
 }
 
-/// The not-found report the INFRASTRUCTURE configuration carries, quoting the ARN the
-/// request named.
+/// The not-found report a READ of a CONFIGURATION carries — the infrastructure and the
+/// distribution configuration alike — quoting the ARN the request named. The infrastructure
+/// configuration carries it for its delete as well.
 fn configuration_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
 }
@@ -400,8 +401,12 @@ struct Dependent {
     echoed: &'static str,
     /// The refusal a delete earns while the pipeline still reaches it.
     dependency: String,
-    /// The report a read answers once it is gone.
+    /// The report a READ answers once it is gone.
     missing: String,
+    /// The report a REPEAT DELETE answers once it is gone. The same sentence as the read's
+    /// for every kind but the distribution configuration, whose read quotes the ARN while
+    /// its mutations name the kind.
+    missing_on_delete: String,
 }
 
 #[tokio::test]
@@ -444,6 +449,7 @@ async fn a_resource_a_pipeline_reaches_is_deleted_only_once_the_pipeline_is_gone
                 echoed: "imageRecipeArn",
                 dependency: dependency_message(&image_recipe),
                 missing: required_resource_message("ImageRecipe", &image_recipe),
+                missing_on_delete: required_resource_message("ImageRecipe", &image_recipe),
             },
             "a container recipe" => Dependent {
                 case: "a container recipe a pipeline builds",
@@ -453,6 +459,7 @@ async fn a_resource_a_pipeline_reaches_is_deleted_only_once_the_pipeline_is_gone
                 echoed: "containerRecipeArn",
                 dependency: dependency_message(&container),
                 missing: required_resource_message("ContainerRecipe", &container),
+                missing_on_delete: required_resource_message("ContainerRecipe", &container),
             },
             "an infrastructure configuration" => Dependent {
                 case: "an infrastructure configuration a pipeline builds in",
@@ -462,6 +469,7 @@ async fn a_resource_a_pipeline_reaches_is_deleted_only_once_the_pipeline_is_gone
                 echoed: "infrastructureConfigurationArn",
                 dependency: configuration_dependency_message(&configuration),
                 missing: configuration_not_found_message(&configuration),
+                missing_on_delete: configuration_not_found_message(&configuration),
             },
             _ => Dependent {
                 case: "a distribution configuration a pipeline distributes with",
@@ -470,7 +478,11 @@ async fn a_resource_a_pipeline_reaches_is_deleted_only_once_the_pipeline_is_gone
                 read: "/GetDistributionConfiguration?distributionConfigurationArn=",
                 echoed: "distributionConfigurationArn",
                 dependency: dependency_message(&distribution),
-                missing: required_resource_message("DistributionConfiguration", &distribution),
+                missing: configuration_not_found_message(&distribution),
+                missing_on_delete: required_resource_message(
+                    "DistributionConfiguration",
+                    &distribution,
+                ),
             },
         };
 
@@ -563,7 +575,7 @@ async fn a_resource_a_pipeline_reaches_is_deleted_only_once_the_pipeline_is_gone
             &repeated,
             404,
             "ResourceNotFoundException",
-            &dependent.missing,
+            &dependent.missing_on_delete,
         );
     }
 }

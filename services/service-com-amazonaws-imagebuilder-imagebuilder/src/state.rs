@@ -4619,12 +4619,11 @@ pub fn incomplete_filter_message() -> String {
 /// resource that does exist. The type token is the kind the ARN itself names
 /// ([`arn_resource_type`]).
 ///
-/// WHICH of this service's two missing-resource sentences a call carries follows the FAMILY
-/// of the resource, not what the call does with it: every family but one is reported this
-/// way — the components, recipes, pipelines, images, workflows and the DISTRIBUTION
-/// configuration — whether the call reads one, deletes one, updates one or resolves a
-/// reference to one. The INFRASTRUCTURE configuration is the single family reported by
-/// [`resource_arn_not_found_message`] instead.
+/// The sentence every missing-resource report of this service carries except where
+/// [`resource_arn_not_found_message`] states otherwise: the components, recipes, pipelines,
+/// images and workflows are reported this way whether the call reads one, deletes one,
+/// updates one or resolves a reference to one, and so is any call that resolves a reference
+/// to a configuration or updates one.
 #[must_use]
 pub fn required_resource_not_found_message(arn: &str) -> String {
     missing_resource_message(&arn_resource_type(arn), arn)
@@ -4642,13 +4641,14 @@ pub fn missing_resource_message(resource_type: &str, identifier: &str) -> String
     format!("The following required resource '{resource_type}' cannot be found: '{identifier}'.")
 }
 
-/// Why a call naming an INFRASTRUCTURE configuration this Region holds nothing under reports
-/// it missing.
+/// Why a READ of a configuration resource this Region holds nothing under reports it missing.
 ///
-/// The sentence that one family carries, for a read of one and for its delete alike: it
-/// quotes the ARN the request carried and names no kind. The resources of every other
-/// family — the distribution configuration included — are reported by
-/// [`required_resource_not_found_message`] instead, see the note there.
+/// The sentence the two CONFIGURATION resources carry when a call addresses one by its own
+/// ARN to read it — the infrastructure and the distribution configuration alike: it quotes
+/// the ARN the request carried and names no kind. The INFRASTRUCTURE configuration carries it
+/// for its delete as well. Every other missing-resource report of this service — the
+/// versioned families, a reference a create or an update has to resolve, a tagging write —
+/// names the kind through [`required_resource_not_found_message`], see the note there.
 #[must_use]
 pub fn resource_arn_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
