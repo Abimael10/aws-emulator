@@ -851,17 +851,19 @@ async fn categories_are_refused_without_a_source_type_and_past_the_stored_bounds
     );
 
     // The count and length bounds this service stores categories under, each at the bound
-    // and one past it.
+    // and one past it. Every source type a subscription can name publishes a category map,
+    // so the names below are a published category of the source type the rows use, repeated:
+    // what is under test is the LIST, not the membership.
     let bounded = "emu-mod-bounded";
     expect_ok(
         "create the subscription the bounds are checked against",
-        create_subscription(&router, REGION, bounded, Some("zero-etl"), &[], None).await,
+        create_subscription(&router, REGION, bounded, Some("db-instance"), &[], None).await,
     );
     let at_count: Vec<String> = (0..MAX_EVENT_CATEGORIES_PER_REQUEST)
-        .map(|index| format!("emu-category-{index}"))
+        .map(|_| "availability".to_string())
         .collect();
     let mut past_count = at_count.clone();
-    past_count.push(format!("emu-category-{MAX_EVENT_CATEGORIES_PER_REQUEST}"));
+    past_count.push("availability".to_string());
     let at_length = "c".repeat(MAX_EVENT_CATEGORY_LEN);
     let past_length = "c".repeat(MAX_EVENT_CATEGORY_LEN + 1);
     for (case, categories, expected) in [
@@ -869,20 +871,28 @@ async fn categories_are_refused_without_a_source_type_and_past_the_stored_bounds
         (
             "one category past the count bound",
             past_count,
-            Some("InvalidParameterValue"),
+            Some((400, "InvalidParameterValue")),
         ),
-        ("a category as long as the bound allows", vec![at_length], None),
+        // A name as long as the bound allows passes the LENGTH check and is then refused by
+        // the membership one — no published category is that long — while one character past
+        // it is refused by the length check itself, before the source type's map is
+        // consulted. The two refusals together pin the bound.
+        (
+            "a category as long as the bound allows",
+            vec![at_length],
+            Some((404, "SubscriptionCategoryNotFound")),
+        ),
         (
             "a category one character past the length bound",
             vec![past_length],
-            Some("InvalidParameterValue"),
+            Some((400, "InvalidParameterValue")),
         ),
     ] {
         let mut params: Vec<(String, String)> = vec![
             ("SubscriptionName".to_string(), bounded.to_string()),
             // The categories' own source type, which a request that names categories has
             // to carry: the bounds under test are on the LIST, not on the pair.
-            ("SourceType".to_string(), "zero-etl".to_string()),
+            ("SourceType".to_string(), "db-instance".to_string()),
         ];
         params.extend(category_params(&categories));
         let response = call(&router, "ModifyEventSubscription", &params).await;
@@ -895,8 +905,8 @@ async fn categories_are_refused_without_a_source_type_and_past_the_stored_bounds
                     "case {case:?}: expected the categories the modify named, got {body}"
                 );
             }
-            Some(code) => {
-                expect_error(case, response, 400, code);
+            Some((status, code)) => {
+                expect_error(case, response, status, code);
             }
         }
     }

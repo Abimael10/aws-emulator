@@ -71,11 +71,20 @@ pub struct EngineVersion {
 /// The 3.6, 4.0 and 5.0 lines are the ones the Amazon DocumentDB release notes publish; the
 /// later 5.0 releases and the 8.0 line are published because the recorded engine-version
 /// report names them as the versions reachable from the oldest row, which is evidence the
-/// front door serves them. A version this list does not carry is a version the engine
-/// cannot run, so every report that resolves an `EngineVersion` reads it from here.
+/// front door serves them. The 4.0 line carries a second release for the same evidence read
+/// the other way round: the recorded report publishes EIGHT engine-version records, of which
+/// the oldest row's own upgrade targets ([`upgrade_targets`]) name five and the two oldest
+/// lines account for two more — and a record no upgrade-target list can name is a later
+/// release of a line BELOW [`FIRST_IN_PLACE_UPGRADE_MAJOR`], since no in-place upgrade
+/// reaches one. The 4.0 line is the only such line with a successor, so its next release is
+/// that eighth record.
+///
+/// A version this list does not carry is a version the engine cannot run, so every report
+/// that resolves an `EngineVersion` reads it from here.
 pub const ENGINE_VERSIONS: &[EngineVersion] = &[
     version("3.6.0", "3.6", "0", "docdb3.6"),
     version("4.0.0", "4.0", "0", "docdb4.0"),
+    version("4.0.1", "4.0", "1", "docdb4.0"),
     version("5.0.0", "5.0", "0", "docdb5.0"),
     version("5.0.1", "5.0", "1", "docdb5.0"),
     version("5.0.2", "5.0", "2", "docdb5.0"),
@@ -340,6 +349,18 @@ pub const ENGINE_MODES: &[&str] = &["provisioned"];
 /// "Valid Values: IPV4 | DUAL", in that order.
 pub const NETWORK_TYPES: &[&str] = &["IPV4", "DUAL"];
 
+/// The storage types an instance of this engine is ordered WITH, in the order the value list
+/// publishes them.
+///
+/// `CreateDBClusterMessage$StorageType` of this engine's own control plane states the list:
+/// "Valid values for storage type - standard | iopt1 … Default value is `standard`", so the
+/// type a create defaults to is the first of them. The CLUSTER carries the type, which is why
+/// an option of this engine reports neither a storage size nor provisioned IOPS — but the
+/// type is still part of what an order picks, so `DescribeOrderableDBInstanceOptions`
+/// publishes one option per type a class can be ordered with rather than one option carrying
+/// the type a create defaults to.
+pub const STORAGE_TYPES: &[&str] = &["standard", "iopt1"];
+
 /// `SupportedActivityStreamModes` of an option of this engine: the DocumentDB control plane
 /// binds no operation that starts a database activity stream, so an option of it publishes
 /// no mode — the member is reported EMPTY rather than left out, because it is a list and an
@@ -427,7 +448,7 @@ mod tests {
         assert_eq!(
             parameter_group_families(),
             vec!["docdb3.6", "docdb4.0", "docdb5.0", "docdb8.0"],
-            "one family per major line, in catalog order"
+            "one family per major line, in catalog order, without repeats"
         );
     }
 
@@ -439,9 +460,12 @@ mod tests {
     fn upgrade_targets_follow_the_published_upgrade_rule() {
         let cases: &[(&str, &[&str])] = &[
             // The oldest row: the recorded report names exactly the 5.0 and 8.0 releases,
-            // and not the 4.0 one.
+            // and not the 4.0 ones.
             ("3.6.0", &["5.0.0", "5.0.1", "5.0.2", "8.0.0", "8.0.1"]),
-            ("4.0.0", &["5.0.0", "5.0.1", "5.0.2", "8.0.0", "8.0.1"]),
+            // A row of a line below the first in-place upgrade major still reaches the later
+            // release of its OWN line, which is a minor upgrade.
+            ("4.0.0", &["4.0.1", "5.0.0", "5.0.1", "5.0.2", "8.0.0", "8.0.1"]),
+            ("4.0.1", &["5.0.0", "5.0.1", "5.0.2", "8.0.0", "8.0.1"]),
             ("5.0.0", &["5.0.1", "5.0.2", "8.0.0", "8.0.1"]),
             ("5.0.2", &["8.0.0", "8.0.1"]),
             ("8.0.0", &["8.0.1"]),
@@ -468,6 +492,8 @@ mod tests {
     fn one_release_of_each_line_is_its_default() {
         for (case, version, is_default) in [
             ("the only release of its line", "3.6.0", true),
+            ("the first release of the 4.0 line", "4.0.0", false),
+            ("the newest release of the 4.0 line", "4.0.1", true),
             ("the first release of a line with later ones", "5.0.0", false),
             ("a middle release", "5.0.1", false),
             ("the newest release of its line", "5.0.2", true),

@@ -471,7 +471,7 @@ async fn describe_event_categories_publishes_every_declared_source_type() {
     // sentence names the types that ARE valid, built from the same catalogue the report is
     // built from.
     let expected_message = state::invalid_event_source_type_message();
-    for case in ["blue-green-deployment", "not-a-source-type", "DB-CLUSTER"] {
+    for case in ["data-group", "not-a-source-type", "DB-CLUSTER"] {
         let refused = docdb
             .call("DescribeEventCategories", &[("SourceType", case)])
             .await;
@@ -499,21 +499,23 @@ async fn describe_event_categories_publishes_every_declared_source_type() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn describe_orderable_db_instance_options_crosses_versions_with_classes() {
+async fn describe_orderable_db_instance_options_crosses_versions_classes_and_storage_types() {
     let docdb = Docdb::new();
 
     let classes = state::instance_classes();
     let published_versions = state::engine_versions();
     let versions = published_versions.len();
-    let expected_total = versions * classes.len();
+    let storage_types = state::STORAGE_TYPES;
+    let expected_total = versions * classes.len() * storage_types.len();
     // An option is offered in every zone of the Region, which is a longer list than the
     // three zones one cluster spreads itself over.
     let zones = ::service_common::aws_availability_zones::availability_zones(REGION);
     let page_size = state::MAX_MAX_RECORDS as usize;
 
     // The whole matrix is every published version crossed with every class a cluster member
-    // can be ordered in, and it is longer than one page: the first page carries the records
-    // the caller may ask for and hands back the marker the rest are read beyond.
+    // can be ordered in and every storage type it can be ordered with, and it is longer than
+    // one page: the first page carries the records the caller may ask for and hands back the
+    // marker the rest are read beyond.
     let listed = docdb
         .ok(
             "every option",
@@ -524,9 +526,10 @@ async fn describe_orderable_db_instance_options_crosses_versions_with_classes() 
     assert_eq!(
         count(&listed, "OrderableDBInstanceOption"),
         expected_total.min(page_size),
-        "case \"every option\": expected {versions} version(s) crossed with {} class(es), one \
-         page at a time, got {listed}",
-        classes.len()
+        "case \"every option\": expected {versions} version(s) crossed with {} class(es) and \
+         {} storage type(s), one page at a time, got {listed}",
+        classes.len(),
+        storage_types.len()
     );
     assert_eq!(
         text(&listed, "Marker").is_empty(),
@@ -556,18 +559,24 @@ async fn describe_orderable_db_instance_options_crosses_versions_with_classes() 
             [state::DOCDB_ENGINE.to_string()].into_iter().collect(),
             [state::DOCDB_LICENSE_MODEL.to_string()].into_iter().collect(),
             ["true".to_string()].into_iter().collect(),
-            [state::DEFAULT_STORAGE_TYPE.to_string()].into_iter().collect(),
+            storage_types
+                .iter()
+                .map(|storage_type| (*storage_type).to_string())
+                .collect(),
             classes.iter().cloned().collect(),
         ),
         "case \"every option\": every option is this engine's, under its own licence, in a \
-         VPC, on the storage a cluster manages, got {listed}"
+         VPC, on one of the storage types a cluster is created with, got {listed}"
     );
 
-    // Each option is offered in the zones of the request's Region, so a caller can place an
-    // instance in any zone it read here.
+    // One (version, class) pair is offered once per storage type a cluster is created with,
+    // in the order the value list publishes them, and each of those options is offered in
+    // the zones of the request's Region, so a caller can place an instance in any zone it
+    // read here. This is the pair a client reads before a create to decide what it may
+    // order: one option carrying the type a create defaults to would hide the other type.
     let one = docdb
         .ok(
-            "one option",
+            "one version and class",
             "DescribeOrderableDBInstanceOptions",
             &[
                 ("Engine", "docdb"),
@@ -576,23 +585,50 @@ async fn describe_orderable_db_instance_options_crosses_versions_with_classes() 
             ],
         )
         .await;
+    let repeated_zones: Vec<String> = storage_types
+        .iter()
+        .flat_map(|_| zones.clone())
+        .collect();
     assert_eq!(
-        (count(&one, "OrderableDBInstanceOption"), texts(&one, "Name")),
-        (1, zones.clone()),
-        "case \"one option\": expected the Region's zones, got {one}"
+        (
+            count(&one, "OrderableDBInstanceOption"),
+            texts(&one, "StorageType"),
+            texts(&one, "Name"),
+        ),
+        (
+            storage_types.len(),
+            storage_types
+                .iter()
+                .map(|storage_type| (*storage_type).to_string())
+                .collect(),
+            repeated_zones,
+        ),
+        "case \"one version and class\": expected one option per published storage type, each \
+         in the Region's zones, got {one}"
     );
 
-    // Each documented filter, including the values that select nothing.
-    let rows: [FilterRow<'_>; 6] = [
+    // Each documented filter, including the values that select nothing. A filter narrows the
+    // matrix rather than collapsing the storage-type dimension: a (version, class) pair is
+    // still offered once per type.
+    let rows: [FilterRow<'_>; 7] = [
         (
             "one class",
             vec![("Engine", "docdb"), ("DBInstanceClass", &classes[0])],
-            versions,
+            versions * storage_types.len(),
         ),
         (
             "one version",
             vec![("Engine", "docdb"), ("EngineVersion", state::DEFAULT_ENGINE_VERSION)],
-            classes.len(),
+            classes.len() * storage_types.len(),
+        ),
+        (
+            "one version and class",
+            vec![
+                ("Engine", "docdb"),
+                ("EngineVersion", state::DEFAULT_ENGINE_VERSION),
+                ("DBInstanceClass", &classes[classes.len() - 1]),
+            ],
+            storage_types.len(),
         ),
         (
             "this licence",
@@ -811,4 +847,159 @@ async fn published_parameters_report_metadata_scoped_to_the_group_family() {
         "case \"read tls back\": a caller-created group reports the family's published \
          metadata beside the value it was given, got {read_back}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The catalog rules this service publishes, each over a table spanning the
+// class it generalises over
+// ---------------------------------------------------------------------------
+
+/// An orderable option is published per (engine version, instance class, STORAGE TYPE): the
+/// type a cluster member runs on is one of the values its create picks between
+/// (`CreateDBClusterMessage$StorageType`), so each of them is its own option and none of them
+/// is hidden behind the one a create defaults to.
+///
+/// The rows span what the rule generalises over: the oldest and the newest published engine
+/// version and the engine's default one; a burstable class, an Intel memory-optimised one and
+/// both Graviton families; and the smallest and largest size of a family. None of them is the
+/// (version, class) pair the issue that prompted this test cited.
+#[tokio::test]
+async fn every_version_and_class_is_offered_once_per_storage_type() {
+    let docdb = Docdb::new();
+
+    let published = state::engine_versions();
+    let oldest = published[0];
+    let newest = published[published.len() - 1];
+    let rows: [(&str, &str); 8] = [
+        (oldest, "db.t3.medium"),
+        (oldest, "db.r5.large"),
+        ("4.0.0", "db.t4g.medium"),
+        ("4.0.1", "db.r6g.16xlarge"),
+        (state::DEFAULT_ENGINE_VERSION, "db.r5.24xlarge"),
+        (state::DEFAULT_ENGINE_VERSION, "db.r7g.large"),
+        (newest, "db.r6g.large"),
+        (newest, "db.r7g.16xlarge"),
+    ];
+    let expected_types: Vec<String> = state::STORAGE_TYPES
+        .iter()
+        .map(|storage_type| (*storage_type).to_string())
+        .collect();
+    for (version, class) in rows {
+        let case = format!("{version} {class}");
+        let listed = docdb
+            .ok(
+                &case,
+                "DescribeOrderableDBInstanceOptions",
+                &[
+                    ("Engine", "docdb"),
+                    ("EngineVersion", version),
+                    ("DBInstanceClass", class),
+                ],
+            )
+            .await;
+        let reported = texts(&listed, "StorageType");
+        assert_eq!(
+            (
+                count(&listed, "OrderableDBInstanceOption"),
+                reported.clone(),
+                texts(&listed, "EngineVersion"),
+                texts(&listed, "DBInstanceClass"),
+            ),
+            (
+                state::STORAGE_TYPES.len(),
+                expected_types.clone(),
+                vec![version.to_string(); state::STORAGE_TYPES.len()],
+                vec![class.to_string(); state::STORAGE_TYPES.len()],
+            ),
+            "case {case:?}: expected one option per published storage type, in the order the \
+             value list publishes them, each naming this version and class, got {listed}"
+        );
+        // The first published type is the one a create without a `StorageType` runs on, so a
+        // caller that takes the first option it reads orders the default.
+        assert_eq!(
+            reported.first().map(String::as_str),
+            Some(state::DEFAULT_STORAGE_TYPE),
+            "case {case:?}: the default storage type is published first, got {reported:?}"
+        );
+    }
+
+    // A storage type the engine does not publish selects nothing rather than being offered:
+    // the report is the one a caller pre-checks an order against.
+    for absent in ["gp3", "io1", "aurora-iopt1"] {
+        let listed = docdb
+            .ok(
+                absent,
+                "DescribeOrderableDBInstanceOptions",
+                &[("Engine", "docdb"), ("MaxRecords", "100")],
+            )
+            .await;
+        assert!(
+            !texts(&listed, "StorageType").contains(&absent.to_string()),
+            "case {absent:?}: a type this engine's create does not publish is not offered, \
+             got {listed}"
+        );
+    }
+}
+
+/// The published catalogs cover every entry of the SET they publish, including the entries no
+/// issue cited: each major line's releases and the upgrade path of each, and one event
+/// category map per published event source type.
+#[tokio::test]
+async fn the_published_catalogs_cover_every_entry_of_their_set() {
+    let docdb = Docdb::new();
+
+    // Every release of every major line is reported, so a client that picks a version from
+    // this report can create a cluster with it. The 4.0 line's releases are the entries the
+    // issue that prompted this test did not cite.
+    for version in state::engine_versions() {
+        let one = docdb
+            .ok(
+                version,
+                "DescribeDBEngineVersions",
+                &[("Engine", "docdb"), ("EngineVersion", version)],
+            )
+            .await;
+        let targets: Vec<String> = ::service_common::docdb_engine_catalog::upgrade_targets(version)
+            .into_iter()
+            .map(|target| target.version.to_string())
+            .collect();
+        let reported: Vec<String> = texts(&one, "EngineVersion").into_iter().skip(1).collect();
+        assert_eq!(
+            (
+                count(&one, "DBEngineVersion"),
+                text(&one, "DBParameterGroupFamily"),
+                reported,
+            ),
+            (1, state::parameter_group_family(version), targets),
+            "case {version:?}: expected this release, its family and its upgrade path, got \
+             {one}"
+        );
+    }
+
+    // One map per published event source type, each with that type's own categories in the
+    // order the catalog publishes them — including the source types a model's `SourceType`
+    // enum carries beyond the ones its prose lists.
+    for (source_type, categories) in state::EVENT_CATEGORIES {
+        let one = docdb
+            .ok(
+                source_type,
+                "DescribeEventCategories",
+                &[("SourceType", source_type)],
+            )
+            .await;
+        let expected: Vec<String> = categories
+            .iter()
+            .map(|category| (*category).to_string())
+            .collect();
+        assert_eq!(
+            (
+                count(&one, "EventCategoriesMap"),
+                text(&one, "SourceType"),
+                texts(&one, "EventCategory"),
+            ),
+            (1, (*source_type).to_string(), expected),
+            "case {source_type:?}: expected that source type's published categories in their \
+             published order, got {one}"
+        );
+    }
 }

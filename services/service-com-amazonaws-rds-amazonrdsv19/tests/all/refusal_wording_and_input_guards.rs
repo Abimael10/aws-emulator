@@ -372,7 +372,7 @@ async fn an_event_source_type_outside_the_published_set_is_refused_with_the_fixe
         "not-a-real-source-type",
         "DB-Instance",
         "db-instance-group",
-        "zero-etl",
+        "data-group",
         "",
     ] {
         let case = format!("SourceType {value:?}");

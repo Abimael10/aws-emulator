@@ -2298,6 +2298,13 @@ pub fn instance_classes() -> Vec<String> {
         .collect()
 }
 
+/// The storage types a cluster member of this engine can be ordered with, in the order the
+/// value list publishes them — the shared catalog's own
+/// ([`::service_common::docdb_engine_catalog::STORAGE_TYPES`]), so this view and the Amazon
+/// RDS view of the same front door offer the same types for this engine. The first of them
+/// is the type a create without a `StorageType` gets ([`DEFAULT_STORAGE_TYPE`]).
+pub use ::service_common::docdb_engine_catalog::STORAGE_TYPES;
+
 /// `OrderableDBInstanceOption$LicenseModel` for this engine.
 ///
 /// The licence setting does not apply to Amazon DocumentDB — the model declares no
@@ -2305,16 +2312,21 @@ pub fn instance_classes() -> Vec<String> {
 /// itself carries `na`.
 pub const DOCDB_LICENSE_MODEL: &str = "na";
 
-/// One (engine version, instance class) pair as the modelled `OrderableDBInstanceOption`.
+/// One (engine version, instance class, storage type) row as the modelled
+/// `OrderableDBInstanceOption`.
 ///
 /// The zones are the ones the REGION exposes
 /// ([`::service_common::aws_availability_zones`]) — an option is offered in every zone of
 /// the Region, which is a longer list than the three a single cluster spreads itself over
 /// ([`default_availability_zones`]) — so a caller that places an instance in a zone this
 /// report names is not refused a zone the Region in fact offers. `Vpc` is true because every
-/// endpoint this emulator serves is reached inside a VPC; and the storage type is the one a
-/// cluster member reports ([`DEFAULT_STORAGE_TYPE`]), since a DocumentDB cluster — not its
-/// instance — owns the storage.
+/// endpoint this emulator serves is reached inside a VPC.
+///
+/// `StorageType` is the ROW's own: a DocumentDB cluster — not its instance — owns the
+/// storage, so the option reports no size and no provisioned IOPS, but the type is one of the
+/// values a create picks between
+/// ([`::service_common::docdb_engine_catalog::STORAGE_TYPES`]) and each of them is its own
+/// option.
 ///
 /// The capability members are the ones the shared front door reports on EVERY orderable
 /// option, answered for this engine from the one catalog both of its views read
@@ -2325,6 +2337,7 @@ pub const DOCDB_LICENSE_MODEL: &str = "na";
 pub fn orderable_option_to_shape(
     version: &str,
     instance_class: &str,
+    storage_type: &str,
     region: &str,
 ) -> OrderableDBInstanceOption {
     let capabilities = ::service_common::docdb_engine_catalog::OPTION_CAPABILITIES;
@@ -2340,7 +2353,7 @@ pub fn orderable_option_to_shape(
                 .collect(),
         ),
         vpc: Some(true),
-        storage_type: Some(DEFAULT_STORAGE_TYPE.to_string()),
+        storage_type: Some(storage_type.to_string()),
         multi_az_capable: Some(capabilities.multi_az_capable),
         read_replica_capable: Some(capabilities.read_replica_capable),
         supports_storage_encryption: Some(capabilities.storage_encryption),

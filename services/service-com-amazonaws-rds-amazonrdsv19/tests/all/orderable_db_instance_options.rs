@@ -563,10 +563,16 @@ const STORAGE_RULES: &[StorageRule] = &[
         min_storage_throughput: None,
     },
     // The DocumentDB and Neptune models' `CreateDBCluster$StorageType`: "Valid values for
-    // storage type - standard | iopt1 … Default value is standard" — carried by the
-    // cluster, so the instance option reports no bounds either.
+    // storage type - standard | iopt1 … Default value is standard" — both carried by the
+    // cluster, so the instance option reports no bounds for either.
     StorageRule {
         storage_type: "standard",
+        min_storage_size: None,
+        max_iops_per_gib: None,
+        min_storage_throughput: None,
+    },
+    StorageRule {
+        storage_type: "iopt1",
         min_storage_size: None,
         max_iops_per_gib: None,
         min_storage_throughput: None,
@@ -640,11 +646,12 @@ async fn a_class_is_offered_once_per_storage_type_it_can_be_ordered_with() {
         ("aurora-mysql", "db.serverless", &["aurora", "aurora-iopt1"], None),
         ("aurora-postgresql", "db.r6g.2xlarge", &["aurora", "aurora-iopt1"], None),
         // The DocumentDB and Neptune control planes this same front door serves are
-        // cluster engines too, and report their own cluster-managed type — one type, because
-        // this door's view of another control plane's option catalogue must agree with that
-        // service's own view of it.
-        ("docdb", "db.r5.2xlarge", &["standard"], None),
-        ("neptune", "db.serverless", &["standard"], None),
+        // cluster engines too, and report their own cluster-managed types — one option per
+        // value their own `CreateDBCluster$StorageType` publishes ("standard | iopt1"),
+        // because this door's view of another control plane's option catalogue must agree
+        // with that service's own view of it.
+        ("docdb", "db.r5.2xlarge", &["standard", "iopt1"], None),
+        ("neptune", "db.serverless", &["standard", "iopt1"], None),
     ];
 
     for (engine, class, expected_types, max_storage_size) in ROWS {

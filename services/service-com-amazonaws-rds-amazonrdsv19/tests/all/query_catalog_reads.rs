@@ -266,13 +266,12 @@ async fn describe_event_categories_reports_the_published_source_types() {
     // answers for a parameter value it does not accept, in the one fixed sentence that names
     // the source types the front door accepts (`rds_event_source_types::EVENT_SOURCE_TYPES`,
     // a wider set than the ones this report carries a map for) and that echoes nothing of
-    // the request. `db-shard-group` is a value the model's `SourceType` enum carries but
-    // this operation's own documented valid values do not, and this front door publishes no
-    // categories for it (see `state::EVENT_CATEGORIES`).
+    // the request. `data-group` is a value that refusal names and this front door publishes
+    // no categories for (see `state::EVENT_CATEGORIES`).
     for case in [
         "db-instances",
         "DB-INSTANCE",
-        "db-shard-group",
+        "data-group",
         "not-a-source-type",
     ] {
         let body = expect_error(
@@ -381,6 +380,28 @@ async fn the_published_event_categories_are_the_documented_ones() {
         (
             "db-proxy",
             vec!["creation", "configuration change", "deletion", "failure"],
+        ),
+        // The newer source types of the same enum, published after the ones above: the
+        // events of a blue/green deployment, of a DB shard group and of a zero-ETL
+        // integration.
+        (
+            "blue-green-deployment",
+            vec!["creation", "failure", "deletion", "notification"],
+        ),
+        (
+            "db-shard-group",
+            vec![
+                "creation",
+                "deletion",
+                "availability",
+                "maintenance",
+                "failure",
+                "notification",
+            ],
+        ),
+        (
+            "zero-etl",
+            vec!["creation", "deletion", "failure", "notification"],
         ),
     ];
 

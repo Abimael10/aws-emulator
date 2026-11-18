@@ -275,7 +275,7 @@ struct Row {
 /// instance storage" section of the Amazon RDS User Guide (General Purpose SSD `gp2`/`gp3`
 /// and Provisioned IOPS SSD `io1`/`io2`, with the per-engine storage caps), plus the
 /// cluster engines whose storage the cluster manages (`aurora`/`aurora-iopt1`, and the
-/// `standard` type the Amazon DocumentDB and Amazon Neptune front doors publish).
+/// `standard`/`iopt1` pair the Amazon DocumentDB and Amazon Neptune front doors publish).
 ///
 /// The rows differ along everything the rule generalises over: burstable versus standard
 /// class, all three engine storage caps (65,536 / 16,384 / 64,000 GiB), a class the
@@ -362,7 +362,7 @@ const ROWS: &[Row] = &[
     Row {
         engine: "docdb",
         class: "db.r5.large",
-        storage_types: &["standard"],
+        storage_types: &["standard", "iopt1"],
         max_storage_size: None,
         processor_features: false,
         dedicated_log_volume: false,
@@ -371,7 +371,7 @@ const ROWS: &[Row] = &[
     Row {
         engine: "neptune",
         class: "db.t3.medium",
-        storage_types: &["standard"],
+        storage_types: &["standard", "iopt1"],
         max_storage_size: None,
         processor_features: false,
         dedicated_log_volume: false,
@@ -606,11 +606,16 @@ async fn every_reported_bound_is_well_formed_for_the_instances_engine_and_class(
         let case = format!("{} on {}", row.engine, row.class);
         let report = describe(&router, &case, &identifier(index)).await;
 
+        // The report is collected into a map KEYED by storage type, so what this asserts is
+        // the SET of types reported for the instance's engine and class; the order the
+        // option report publishes them in is `orderable_db_instance_options.rs`'s subject.
         let reported_types: Vec<&str> = report.storage.keys().map(String::as_str).collect();
+        let mut expected_types: Vec<&str> = row.storage_types.to_vec();
+        expected_types.sort_unstable();
         assert_eq!(
-            reported_types, row.storage_types,
-            "case {case:?}: expected the published storage types {:?}, got {reported_types:?}",
-            row.storage_types
+            reported_types, expected_types,
+            "case {case:?}: expected the published storage types {expected_types:?}, got \
+             {reported_types:?}"
         );
         assert_eq!(
             report.supports_dedicated_log_volume.as_deref(),

@@ -90,9 +90,11 @@ const VERSION_DESCRIPTION_PRODUCT: &str = "Neptune";
 /// by AWS itself rather than by a database vendor.
 const LICENSE_MODEL: &str = "amazon-license";
 
-/// The one storage type a cluster member of this engine is offered with: its cluster owns
-/// the storage, so the instance orders no size or IOPS of its own.
-const STORAGE_TYPE: &str = "standard";
+/// The storage types a cluster member of this engine is offered with, in the order its own
+/// `CreateDBCluster$StorageType` publishes them ("Valid values: standard, iopt1"): the
+/// CLUSTER owns the storage, so the instance orders no size or IOPS of its own, but the type
+/// is part of what an order picks and each of them is its own option.
+const STORAGE_TYPES: [&str; 2] = ["standard", "iopt1"];
 
 /// The network types an option of this engine is offered for: the values `NetworkType`
 /// publishes for a DB cluster of this front door, in the order an option reports them.
@@ -340,10 +342,11 @@ async fn the_graph_engine_is_orderable_for_every_version_it_publishes() {
                 LICENSE_MODEL,
                 "case {case:?}: expected this engine's own licence model, got {option}"
             );
-            assert_eq!(
-                text(option, "StorageType"),
-                STORAGE_TYPE,
-                "case {case:?}: expected the cluster-managed storage type, got {option}"
+            let storage_type = text(option, "StorageType");
+            assert!(
+                STORAGE_TYPES.contains(&storage_type.as_str()),
+                "case {case:?}: expected one of the cluster-managed storage types \
+                 {STORAGE_TYPES:?}, got {option}"
             );
             assert_eq!(
                 text(option, "Vpc"),

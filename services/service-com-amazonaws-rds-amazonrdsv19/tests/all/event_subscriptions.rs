@@ -102,10 +102,10 @@ const SUBSCRIPTION_CASES: &[SubscriptionCase] = &[
         reported_enabled: true,
     },
     SubscriptionCase {
-        case: "zero-etl, a source type with no published category map",
+        case: "zero-etl, one of the newer source types the catalog publishes",
         name: "emu-sub-zero-etl",
         source_type: Some("zero-etl"),
-        event_categories: &[],
+        event_categories: &["creation", "failure"],
         enabled: None,
         reported_enabled: true,
     },
@@ -659,18 +659,21 @@ fn source_ids_params(name: &str, count: usize) -> Vec<(String, String)> {
     params
 }
 
-/// A create naming `count` event categories of a source type this emulator publishes no
-/// category map for, so the row tests the COUNT rather than the membership.
+/// A create naming `count` event categories of a source type whose published map carries
+/// the one category named, repeated: the COUNT is what the row tests, and every published
+/// source type the create accepts now publishes a category map, so the names are a published
+/// category of that map rather than invented ones (which the membership check would refuse
+/// before the count was reached).
 fn categories_params(name: &str, count: usize) -> Vec<(String, String)> {
     let mut params = vec![
         ("SubscriptionName".to_string(), name.to_string()),
         ("SnsTopicArn".to_string(), topic_arn(REGION)),
-        ("SourceType".to_string(), "zero-etl".to_string()),
+        ("SourceType".to_string(), "db-instance".to_string()),
     ];
     for index in 0..count {
         params.push((
             format!("EventCategories.EventCategory.{}", index + 1),
-            format!("category-{index}"),
+            "availability".to_string(),
         ));
     }
     params

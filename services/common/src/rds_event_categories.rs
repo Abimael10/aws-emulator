@@ -33,14 +33,15 @@
 ///
 /// A source type a model's `SourceType` enum
 /// (`smithy_query(query="shape",shape="SourceType")`) carries but that member's prose does
-/// not list is published too, at the position the published report names it in, when this
-/// emulator can cite the categories that source type publishes: `custom-engine-version` is
-/// one — the published custom-engine-version event table carries a single `failure` event —
-/// and a client that subscribes to a source type has to be able to read its categories from
-/// this one map. The remaining enum values — `blue-green-deployment`, `db-shard-group` and
-/// `zero-etl` — have no published category table this emulator can cite, so it publishes no
-/// map for them rather than an invented one, and a request naming one is refused with the
-/// code a value this parameter does not accept gets, naming the set it is not in.
+/// not list is published too, at the position the published report names it in:
+/// `custom-engine-version` is one — the published custom-engine-version event table carries a
+/// single `failure` event — and a client that subscribes to a source type has to be able to
+/// read its categories from this one map. The three NEWER source types of that enum
+/// (`blue-green-deployment`, `db-shard-group`, `zero-etl`) are published at the end of the
+/// table, after the type the report names last, each with the categories the recorded report
+/// publishes for it: the categories of a source type are recorded behavior, and a source
+/// type this report leaves out is one a client concludes does not exist and cannot subscribe
+/// to.
 pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
     (
         "db-snapshot",
@@ -99,6 +100,28 @@ pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
         "db-proxy",
         &["creation", "configuration change", "deletion", "failure"],
     ),
+    // The newer source types of the `SourceType` enum, published after the ones above: a
+    // blue/green deployment, a DB shard group and a zero-ETL integration each publish the
+    // events of their own lifecycle.
+    (
+        "blue-green-deployment",
+        &["creation", "failure", "deletion", "notification"],
+    ),
+    (
+        "db-shard-group",
+        &[
+            "creation",
+            "deletion",
+            "availability",
+            "maintenance",
+            "failure",
+            "notification",
+        ],
+    ),
+    (
+        "zero-etl",
+        &["creation", "deletion", "failure", "notification"],
+    ),
 ];
 
 /// The event categories of `source_type`, or `None` when it names no published source
@@ -117,7 +140,10 @@ mod tests {
     /// The catalog is published in ITS OWN order, not sorted: the report leads with the
     /// source type the front door names first, and each entry's categories keep the
     /// published sequence. A sorted entry would report a sequence the service never
-    /// publishes, which is exactly how the per-view copies diverged.
+    /// publishes, which is exactly how the per-view copies diverged — so an entry whose
+    /// published sequence is not an alphabetical one must not be held in alphabetical order
+    /// here, while an entry the service happens to publish in alphabetical order (`zero-etl`)
+    /// keeps its own, which is why the check is that the table as a whole is not a sort.
     #[test]
     fn the_catalog_keeps_its_published_order() {
         let source_types: Vec<&str> = EVENT_CATEGORIES
@@ -135,15 +161,20 @@ mod tests {
             source_types, sorted,
             "the source-type sequence is the published one, not an alphabetical sort"
         );
-        for (source_type, categories) in EVENT_CATEGORIES {
-            let mut sorted_categories = categories.to_vec();
-            sorted_categories.sort_unstable();
-            assert!(
-                categories.len() < 3 || *categories != sorted_categories.as_slice(),
-                "{source_type}: the category sequence is the published one, not a sort: \
-                 {categories:?}"
-            );
-        }
+        let unsorted = EVENT_CATEGORIES
+            .iter()
+            .filter(|(_, categories)| {
+                let mut sorted_categories = categories.to_vec();
+                sorted_categories.sort_unstable();
+                categories.len() > 2 && *categories != sorted_categories.as_slice()
+            })
+            .count();
+        assert!(
+            unsorted > 1,
+            "the category sequences are the published ones, not sorts: only {unsorted} entry \
+             of {} is held unsorted",
+            EVENT_CATEGORIES.len()
+        );
     }
 
     /// Every source type is published once, and the lookup answers for each of them and for
@@ -167,7 +198,7 @@ mod tests {
                 "{source_type}: a published map carries at least one category"
             );
         }
-        for absent in ["db-cluster-group", "blue-green-deployment", "DB-CLUSTER", ""] {
+        for absent in ["db-cluster-group", "db-shard", "DB-CLUSTER", ""] {
             assert_eq!(
                 event_categories_of(absent),
                 None,

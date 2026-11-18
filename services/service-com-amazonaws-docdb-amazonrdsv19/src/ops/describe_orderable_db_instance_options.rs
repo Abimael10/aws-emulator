@@ -4,7 +4,8 @@
 //!
 //! Serves this service's published option catalogue: every engine version
 //! `DescribeDBEngineVersions` publishes, crossed with every instance class a cluster
-//! member can be ordered in (`crate::state::DOCDB_INSTANCE_FAMILIES`), projected by
+//! member can be ordered in (`crate::state::DOCDB_INSTANCE_FAMILIES`) and every storage
+//! type such a member can be ordered with (`crate::state::STORAGE_TYPES`), projected by
 //! `crate::state::orderable_option_to_shape`. Reference data: nothing here is written.
 //!
 //! ## Shape of an operation
@@ -213,7 +214,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     continue;
                 }
-                options.push(docdb::orderable_option_to_shape(version, class, &region));
+                // An option is ordered WITH a storage type, and which type a cluster member
+                // runs on is one of the values its create picks between
+                // (`crate::state::STORAGE_TYPES`), so each of them is its OWN option: a
+                // client that enumerates options to pick a valid (class, storage type) pair
+                // before a create sees every pair it may order, rather than one option
+                // carrying the type a create defaults to.
+                for storage_type in docdb::STORAGE_TYPES {
+                    options.push(docdb::orderable_option_to_shape(
+                        version,
+                        class,
+                        storage_type,
+                        &region,
+                    ));
+                }
             }
         }
 

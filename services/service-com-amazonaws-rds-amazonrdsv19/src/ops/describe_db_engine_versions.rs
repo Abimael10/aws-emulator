@@ -1896,8 +1896,15 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     // default is the line default of the latest line this catalogue lists engine versions
     // for (`docdb_engine_catalog::DEFAULT_ENGINE_VERSION`), so exactly one row of each line
     // is its default and the engine default is one of them.
-    docdb_row("3.6.0", STATUS_DEPRECATED, DefaultLevel::Major),
-    docdb_row("4.0.0", STATUS_AVAILABLE, DefaultLevel::Major),
+    // The 3.6 line is `available`, not `deprecated`: the recorded report of this engine
+    // publishes its 3.6 record in the DEFAULT listing — the one that carries no `IncludeAll`
+    // and so reports only the versions the front door still offers — so a new cluster can
+    // still be created with that line and a client enumerating versions to pick one, or
+    // reading its upgrade path, sees it. A line this front door no longer offers is the one
+    // `deprecated` is for.
+    docdb_row("3.6.0", STATUS_AVAILABLE, DefaultLevel::Major),
+    docdb_row("4.0.0", STATUS_AVAILABLE, DefaultLevel::Neither),
+    docdb_row("4.0.1", STATUS_AVAILABLE, DefaultLevel::Major),
     docdb_row("5.0.0", STATUS_AVAILABLE, DefaultLevel::Neither),
     docdb_row("5.0.1", STATUS_AVAILABLE, DefaultLevel::Neither),
     docdb_row("5.0.2", STATUS_AVAILABLE, DefaultLevel::Engine),

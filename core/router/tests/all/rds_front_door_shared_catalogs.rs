@@ -17,8 +17,8 @@
 //! published Amazon DocumentDB engine catalog and the published Amazon RDS event-category
 //! table, which the emulator holds in `service_common::docdb_engine_catalog` and
 //! `service_common::rds_event_categories`; the rows cover entries the issue that prompted
-//! this suite did not cite (`custom-engine-version`, the 4.0 engine version, the `db.r5.large`
-//! class).
+//! this suite did not cite (`custom-engine-version`, the 4.0 engine versions, the
+//! `db.r5.large` class, the IO-optimized storage type).
 //!
 //! Assembling the router costs stack (see `boot_serve.rs`), so it is built — and the requests
 //! driven — on an explicitly sized thread.
@@ -92,6 +92,25 @@ const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
         "db-proxy",
         &["creation", "configuration change", "deletion", "failure"],
     ),
+    (
+        "blue-green-deployment",
+        &["creation", "failure", "deletion", "notification"],
+    ),
+    (
+        "db-shard-group",
+        &[
+            "creation",
+            "deletion",
+            "availability",
+            "maintenance",
+            "failure",
+            "notification",
+        ],
+    ),
+    (
+        "zero-etl",
+        &["creation", "deletion", "failure", "notification"],
+    ),
 ];
 
 /// One published Amazon DocumentDB engine version: the version, its major line, its minor
@@ -121,6 +140,13 @@ const DOCDB_VERSIONS: &[DocdbVersion] = &[
         version: "4.0.0",
         major: "4.0",
         minor: "0",
+        family: "docdb4.0",
+        upgrade_targets: &["4.0.1", "5.0.0", "5.0.1", "5.0.2", "8.0.0", "8.0.1"],
+    },
+    DocdbVersion {
+        version: "4.0.1",
+        major: "4.0",
+        minor: "1",
         family: "docdb4.0",
         upgrade_targets: &["5.0.0", "5.0.1", "5.0.2", "8.0.0", "8.0.1"],
     },
@@ -207,6 +233,11 @@ const OPTION_CAPABILITIES: &[(&str, bool)] = &[
 /// The engine modes and network types an option of this engine is offered with, in the order
 /// the report publishes them. Both are unnamed `<member>` lists, so they read as one sequence.
 const OPTION_LIST_MEMBERS: [&str; 3] = ["provisioned", "IPV4", "DUAL"];
+
+/// The storage types an option of this engine is offered with, in the order its own
+/// `CreateDBCluster$StorageType` publishes them ("standard | iopt1"): the class is offered
+/// once per type, because the type is part of what an order picks.
+const OPTION_STORAGE_TYPES: [&str; 2] = ["standard", "iopt1"];
 
 /// POST one awsQuery action to the router under `signing_name`'s routing key and hand back
 /// the body.
@@ -464,41 +495,49 @@ fn every_view_of_the_rds_front_door_publishes_one_catalog() {
                     ],
                 );
                 let options = subtrees(&body, "OrderableDBInstanceOption");
+                let storage_types: Vec<String> = options
+                    .iter()
+                    .filter_map(|option| text(option, "StorageType"))
+                    .collect();
                 assert_eq!(
-                    options.len(),
-                    1,
-                    "case {key:?}: one option per (version, class) this engine offers, got \
-                     {body}"
-                );
-                let option = &options[0];
-                let zones = texts(option, "Name");
-                assert_eq!(
-                    zones,
-                    REGION_ZONES
+                    storage_types,
+                    OPTION_STORAGE_TYPES
                         .iter()
-                        .map(|zone| (*zone).to_string())
+                        .map(|storage_type| (*storage_type).to_string())
                         .collect::<Vec<_>>(),
-                    "case {key:?}: an option is offered in the Region's published zones, got \
-                     {zones:?}"
+                    "case {key:?}: one option per (version, class, storage type) this engine \
+                     offers, got {body}"
                 );
-                for (member, flag) in OPTION_CAPABILITIES {
-                    let got = text(option, member);
+                for option in &options {
+                    let zones = texts(option, "Name");
                     assert_eq!(
-                        got,
-                        Some(flag.to_string()),
-                        "case {key:?}: expected {member} {flag}, got {got:?}"
+                        zones,
+                        REGION_ZONES
+                            .iter()
+                            .map(|zone| (*zone).to_string())
+                            .collect::<Vec<_>>(),
+                        "case {key:?}: an option is offered in the Region's published zones, \
+                         got {zones:?}"
+                    );
+                    for (member, flag) in OPTION_CAPABILITIES {
+                        let got = text(option, member);
+                        assert_eq!(
+                            got,
+                            Some(flag.to_string()),
+                            "case {key:?}: expected {member} {flag}, got {got:?}"
+                        );
+                    }
+                    let list_members = texts(option, "member");
+                    assert_eq!(
+                        list_members,
+                        OPTION_LIST_MEMBERS
+                            .iter()
+                            .map(|value| (*value).to_string())
+                            .collect::<Vec<_>>(),
+                        "case {key:?}: expected the published engine modes and network types, \
+                         got {list_members:?}"
                     );
                 }
-                let list_members = texts(option, "member");
-                assert_eq!(
-                    list_members,
-                    OPTION_LIST_MEMBERS
-                        .iter()
-                        .map(|value| (*value).to_string())
-                        .collect::<Vec<_>>(),
-                    "case {key:?}: expected the published engine modes and network types, got \
-                     {list_members:?}"
-                );
             }
         })
         .expect("the catalog thread starts")

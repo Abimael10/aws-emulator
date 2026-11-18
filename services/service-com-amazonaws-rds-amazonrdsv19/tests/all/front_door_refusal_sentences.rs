@@ -743,37 +743,59 @@ async fn a_category_a_source_type_does_not_publish_is_refused_with_the_services_
         );
     }
 
-    // A source type the published map carries NO entry for has nothing to resolve a category
-    // against, so a subscription of one is served with whatever categories it names — the
-    // refusal is the map's, not a blanket one.
-    let unmapped_category = "not-a-real-category";
+    // Every source type a subscription can name publishes a category map, including the
+    // newer ones, so a category of THAT type's map is served and one outside it is refused by
+    // the same sentence: the refusal is the map's, and the map is the whole published set.
     expect_ok(
-        "a source type the published map carries no entry for",
+        "a newer source type, with a category its own map publishes",
         call(
             &router,
             "CreateEventSubscription",
             &[
-                ("SubscriptionName", "emu-fdrs-sub-unmapped"),
+                ("SubscriptionName", "emu-fdrs-sub-newer"),
                 ("SnsTopicArn", TOPIC_ARN),
                 ("SourceType", "blue-green-deployment"),
-                ("EventCategories.EventCategory.1", unmapped_category),
+                ("EventCategories.EventCategory.1", "deletion"),
             ],
         )
         .await,
     );
     let served = expect_ok(
-        "a source type the published map carries no entry for",
+        "a newer source type, with a category its own map publishes",
         call(
             &router,
             "DescribeEventSubscriptions",
-            &[("SubscriptionName", "emu-fdrs-sub-unmapped")],
+            &[("SubscriptionName", "emu-fdrs-sub-newer")],
         )
         .await,
     );
     assert_eq!(
         text(&served, "EventCategory"),
-        unmapped_category,
-        "case \"a source type the published map carries no entry for\": expected the stored \
-         subscription to carry the category it named, got {served}"
+        "deletion",
+        "case \"a newer source type, with a category its own map publishes\": expected the \
+         stored subscription to carry the category it named, got {served}"
+    );
+    let refused = expect_error(
+        "a newer source type, with a category its map does not publish",
+        call(
+            &router,
+            "CreateEventSubscription",
+            &[
+                ("SubscriptionName", "emu-fdrs-sub-newer-bad"),
+                ("SnsTopicArn", TOPIC_ARN),
+                ("SourceType", "blue-green-deployment"),
+                ("EventCategories.EventCategory.1", "not-a-real-category"),
+            ],
+        )
+        .await,
+        404,
+        "SubscriptionCategoryNotFound",
+    );
+    let message = text(&refused, "Message");
+    assert_eq!(
+        message,
+        "Category : not-a-real-category not found for source type blue-green-deployment.",
+        "case \"a newer source type, with a category its map does not publish\": expected the \
+         service's own sentence, got {message:?}"
     );
 }

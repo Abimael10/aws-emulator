@@ -262,10 +262,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // the provisioned throughput bounds) are properties of that type — so
                     // each storage type the class can be ordered with is its OWN option,
                     // never one option carrying the type `CreateDBInstance` defaults to.
-                    for storage in storage_profiles(version.engine) {
+                    // The types are placed by their POSITION in the engine's published
+                    // storage list rather than by the spelling of their names, so the report
+                    // publishes them in the order that engine's own value list names them
+                    // (`standard` before `iopt1` for a cluster engine of another control
+                    // plane) rather than in an alphabetical one.
+                    for (position, storage) in storage_profiles(version.engine).iter().enumerate() {
                         matching.push((
                             format!(
-                                "{}#{}#{}#{license_model}#{}",
+                                "{}#{}#{}#{license_model}#{position:02}#{}",
                                 version.engine,
                                 version.engine_version,
                                 class.name,
@@ -803,18 +808,32 @@ const CLUSTER_STANDARD: StorageProfile = StorageProfile {
     throughput: None,
 };
 
+/// The IO-OPTIMIZED storage of an Amazon DocumentDB or Amazon Neptune cluster member: the
+/// second type those models' `CreateDBClusterMessage$StorageType` publishes ("Valid values
+/// for storage type - standard | iopt1"), under the name that value list carries
+/// ([`crate::state::SIBLING_CLUSTER_IO_OPTIMIZED_STORAGE_TYPE`]). It is the same
+/// cluster-managed storage under a different I/O configuration, so it carries the same
+/// absence of per-instance bounds as [`CLUSTER_STANDARD`].
+const CLUSTER_IO_OPTIMIZED: StorageProfile = StorageProfile {
+    name: crate::state::SIBLING_CLUSTER_IO_OPTIMIZED_STORAGE_TYPE,
+    size_range: None,
+    iops: None,
+    throughput: None,
+};
+
 /// The storage types an Aurora DB instance is offered with: one option per type the
 /// CLUSTER's own `StorageType` publishes, because that is what an order picks between.
 const AURORA_STORAGE: &[StorageProfile] = &[AURORA, AURORA_IO_OPTIMIZED];
 
-/// The storage types a DocumentDB or Neptune cluster member is offered with.
-///
-/// ONE type, where [`AURORA_STORAGE`] has one per value its cluster's member publishes: an
-/// option of an engine of another control plane is that control plane's own catalogue entry,
-/// and this front door's view of it must agree with that service's own view
-/// (`core/router/tests/all/rds_front_door_shared_catalogs.rs` holds the two to one answer),
-/// so the second type those models publish is offered once both views publish it.
-const CLUSTER_STANDARD_STORAGE: &[StorageProfile] = &[CLUSTER_STANDARD];
+/// The storage types a DocumentDB or Neptune cluster member is offered with: one option per
+/// type that engine's own `CreateDBCluster` publishes, for the same reason
+/// [`AURORA_STORAGE`] carries two — the type is part of what an order picks, and an option of
+/// an engine of another control plane is that control plane's own catalog entry, which this
+/// front door's view of it must agree with (`core/router/tests/all/
+/// rds_front_door_shared_catalogs.rs` holds the two views to one answer, and the document
+/// engine's own catalog publishes both types in
+/// `::service_common::docdb_engine_catalog::STORAGE_TYPES`).
+const CLUSTER_STORAGE: &[StorageProfile] = &[CLUSTER_STANDARD, CLUSTER_IO_OPTIMIZED];
 
 /// The storage types a provisioned-storage (non-cluster) class is offered with, in the
 /// order the published storage table lists them.
@@ -866,7 +885,7 @@ pub fn storage_profiles(engine: &str) -> &'static [StorageProfile] {
         return AURORA_STORAGE;
     }
     if matches!(engine, "docdb" | "neptune") {
-        return CLUSTER_STANDARD_STORAGE;
+        return CLUSTER_STORAGE;
     }
     ALL_PROVISIONED_STORAGE
 }

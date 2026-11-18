@@ -296,6 +296,26 @@ const PUBLISHED_CATALOG: &[(&str, &[&str])] = &[
         "db-proxy",
         &["creation", "configuration change", "deletion", "failure"],
     ),
+    // The newer source types of the same enum, published after the ones above.
+    (
+        "blue-green-deployment",
+        &["creation", "failure", "deletion", "notification"],
+    ),
+    (
+        "db-shard-group",
+        &[
+            "creation",
+            "deletion",
+            "availability",
+            "maintenance",
+            "failure",
+            "notification",
+        ],
+    ),
+    (
+        "zero-etl",
+        &["creation", "deletion", "failure", "notification"],
+    ),
 ];
 
 #[tokio::test]
