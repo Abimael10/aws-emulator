@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendPipelineExecutionStepSuccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendPipelineExecutionStepSuccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: settles the callback step the `CallbackToken` was minted for — the token a
+//! run recorded on the step when it handed that step's work to an Amazon SQS queue
+//! ([`crate::state::pipeline_run`]) — at `Succeeded` with the output parameters the worker
+//! reports, and then settles the run itself if that was the last step it was waiting for.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendPipelineExecutionStepSuccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A token is recorded on the step it dispatched, so a value naming no such step resolves
+//! to nothing and is the modelled `ResourceNotFound`, and one whose step has already
+//! stopped executing is the modelled `ConflictException`: a step settles once.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +151,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendPipelineExecutionStepSuccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendPipelineExecutionStepSuccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendPipelineExecutionStepSuccess"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The token is this call's whole subject, and it is recorded ON the step it
+        // dispatched: a value no step of any run is holding names nothing to settle.
+        let Some((execution, index)) = store.step_with_callback_token(&input.callback_token) else {
+            return Err(SendPipelineExecutionStepSuccessErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::callback_token_does_not_exist()),
+                },
+            )
+            .into());
+        };
+        // A step settles once: the worker that reports a second outcome for one that has
+        // already stopped executing is in conflict with the step's recorded outcome, not
+        // holding an unknown token — unless it is a RETRY of the very call that settled it,
+        // which `ClientRequestToken` makes complete no more than once.
+        if execution.steps[index].is_terminal() {
+            if execution.steps[index].settled_by(input.client_request_token.as_deref()) {
+                return Ok(SendPipelineExecutionStepSuccessOutput {
+                    pipeline_execution_arn: Some(execution.arn.clone()),
+                });
+            }
+            return Err(SendPipelineExecutionStepSuccessErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::callback_step_already_settled(
+                        &execution.steps[index].name,
+                        &execution.arn,
+                        &execution.steps[index].status,
+                    )),
+                },
+            )
+            .into());
+        }
+        // "a list of the step's output parameters": they are what the WORKER produced, so
+        // they are recorded on the step's grant, which is where
+        // `CallbackStepMetadata$OutputParameters` reports them from.
+        let reported = input.output_parameters.unwrap_or_default();
+        if let Some(grant) = execution.steps[index].callback.as_mut() {
+            grant.output_parameters = reported;
+        }
+        execution.steps[index].settle(
+            now,
+            crate::state::STEP_STATUS_SUCCEEDED,
+            None,
+            input.client_request_token,
+        );
+        // The run was held open by this step, so its own terminal status may now be due.
+        execution.settle_status(now);
+        let arn = execution.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(SendPipelineExecutionStepSuccessOutput {
+            pipeline_execution_arn: Some(arn),
+        })
     }
 }

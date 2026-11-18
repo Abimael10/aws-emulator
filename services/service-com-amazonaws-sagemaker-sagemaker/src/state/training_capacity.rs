@@ -29,9 +29,13 @@
 //!    ([`crate::state::cluster_usage_quota_name`]) — so a request past it is the modelled
 //!    `ResourceLimitExceeded` too.
 //!
-//! Each quota refusal is [`crate::state::account_quota_exceeded`]'s sentence over that
-//! quota's own entry, with the limit from this module, the utilisation from the account's
-//! stored jobs and the delta from the request.
+//! Each quota refusal is an account-level-limit sentence over that quota's own entry, with
+//! the limit from this module. WHICH sentence follows what the quota bounds: a quota on the
+//! SIZE one resource of one request may be given states the total that request asked for
+//! ([`crate::state::account_quota_total_requested_exceeded`]), since the account holds
+//! nothing of it to weigh the ask against; a quota on a COUNT the account accumulates
+//! across resources states its utilisation and this request's delta beside the limit
+//! ([`crate::state::account_quota_exceeded`]).
 //!
 //! All three readings are stated here once, over the `ResourceConfig` SHAPE, so every
 //! operation that carries one judges the same configuration the same way rather than each
@@ -54,14 +58,16 @@ pub const INSTANCE_TYPE_AND_COUNT_REQUIRED: &str =
     "InstanceType and InstanceCount greater than 0 must be specified";
 
 /// The largest ML storage volume SageMaker provisions for one training job instance, in
-/// GiB: the Amazon EBS General Purpose SSD (gp2) volume `ResourceConfig$VolumeSizeInGB`
-/// names, at its published maximum size of 16 TiB.
+/// GB: the quota [`TRAINING_VOLUME_QUOTA_NAME`] publishes for the Amazon EBS General
+/// Purpose SSD (gp2) volume `ResourceConfig$VolumeSizeInGB` names, at its published default
+/// of 1024 GB.
 ///
 /// `OptionalVolumeSizeInGB` declares no maximum, so the boundary validator passes a size
-/// nothing can be provisioned at and this is the bound the service holds it to. A size of
-/// ZERO stays admitted: the member's own doc says SageMaker selects the volume for an
-/// instance type whose storage is fixed.
-pub const TRAINING_VOLUME_SIZE_MAX_GB: i32 = 16_384;
+/// nothing can be provisioned at and this is the bound the service holds it to. This
+/// emulator models neither Service Quotas nor an account's adjustments, so every account is
+/// held to that published default. A size of ZERO stays admitted: the member's own doc says
+/// SageMaker selects the volume for an instance type whose storage is fixed.
+pub const TRAINING_VOLUME_SIZE_MAX_GB: i32 = 1_024;
 
 /// The published name of the quota [`TRAINING_VOLUME_SIZE_MAX_GB`] is the limit of, as a
 /// refusal states it: the Service Quotas entry for the ML storage volume one training job
@@ -69,10 +75,11 @@ pub const TRAINING_VOLUME_SIZE_MAX_GB: i32 = 16_384;
 /// entries in.
 pub const TRAINING_VOLUME_QUOTA_NAME: &str = "Size of EBS volume for a training job instance";
 
-/// The unit the ML storage volume quota is counted in: what its limit, the account's
-/// utilisation of it and a request's delta are numbers OF, as [`account_quota_exceeded`]
-/// states them.
-pub const VOLUME_SIZE_UNIT: &str = "GB";
+/// The unit the ML storage volume quota is counted in: what its limit and the total a
+/// request asked for are numbers OF, as
+/// [`account_quota_total_requested_exceeded`] states them. Spelled as the refusal spells
+/// it — a plural of gigabytes — in both of the sentence's slots.
+pub const VOLUME_SIZE_UNIT: &str = "GBs";
 
 /// How many instances of ONE ML instance type an account may run for its training jobs.
 ///
@@ -130,25 +137,25 @@ pub fn resource_config_refusal(config: &ResourceConfig) -> Option<String> {
 
 /// Why the capacity `config` asks for is past an account quota, or `None` when every quota
 /// it draws on has room — the modelled `ResourceLimitExceeded` half of this module's
-/// reading, worded by [`account_quota_exceeded`] over the quota's own entry.
+/// reading, worded over the quota's own entry.
 ///
 /// `instances_in_use` answers how many instances of one type the account is already
-/// running, and `volume_in_use` the largest ML storage volume its jobs already hold, so
-/// each quota is weighed against the account's own utilisation of it.
+/// running, so the COUNT quota is weighed against the account's own utilisation of it. The
+/// per-instance volume quota takes no utilisation: it bounds the size of ONE instance's
+/// volume, which is what this request asks for and nothing the account accumulates.
 pub fn resource_config_quota_refusal(
     config: &ResourceConfig,
     instances_in_use: impl Fn(&str) -> i64,
-    volume_in_use: i64,
 ) -> Option<String> {
     // The storage first: it is a property of ONE instance, so the quota it draws on is the
-    // per-instance entry rather than a per-type one.
+    // per-instance entry rather than a per-type one, and the refusal states the total this
+    // request asked for rather than a utilisation the quota does not accumulate.
     if let Some(size) = config.volume_size_in_gb {
         if size > TRAINING_VOLUME_SIZE_MAX_GB {
-            return Some(account_quota_exceeded(
+            return Some(account_quota_total_requested_exceeded(
                 TRAINING_VOLUME_QUOTA_NAME,
                 VOLUME_SIZE_UNIT,
                 i64::from(TRAINING_VOLUME_SIZE_MAX_GB),
-                volume_in_use,
                 i64::from(size),
             ));
         }
@@ -212,33 +219,13 @@ impl ComAmazonawsSagemakerSagemakerState {
             .sum()
     }
 
-    /// The largest ML storage volume the account's training jobs already hold — the
-    /// utilisation the per-instance volume quota is measured against.
-    ///
-    /// The entry bounds ONE instance's volume, so what an account is using of it is the
-    /// largest volume any of its running jobs was given rather than a sum; a job the clock
-    /// has settled into a terminal status has released its storage and counts for nothing,
-    /// while one whose stop is still in flight holds it until `Stopped` falls due.
-    pub fn training_volume_in_use(&self) -> i64 {
-        self.training_jobs
-            .values()
-            .filter(|job| !job.is_terminal())
-            .filter_map(|job| job.request.resource_config.as_ref())
-            .filter_map(|config| config.volume_size_in_gb)
-            .map(i64::from)
-            .max()
-            .unwrap_or_default()
-    }
-
     /// Why this account cannot run the capacity `config` asks for, or `None` when every
     /// quota it draws on has room: [`resource_config_quota_refusal`] over this account's
     /// own utilisation.
     pub fn training_quota_refusal(&self, config: &ResourceConfig) -> Option<String> {
-        resource_config_quota_refusal(
-            config,
-            |instance_type| self.training_instances_in_use(instance_type),
-            self.training_volume_in_use(),
-        )
+        resource_config_quota_refusal(config, |instance_type| {
+            self.training_instances_in_use(instance_type)
+        })
     }
 }
 
@@ -250,7 +237,9 @@ mod tests {
         TRAINING_VOLUME_SIZE_MAX_GB, UNNAMED_INSTANCE_TYPE, VOLUME_SIZE_UNIT,
     };
     use crate::ops::types::{InstanceGroup, ResourceConfig};
-    use crate::state::{account_quota_exceeded, INSTANCES_UNIT};
+    use crate::state::{
+        account_quota_exceeded, account_quota_total_requested_exceeded, INSTANCES_UNIT,
+    };
 
     /// A configuration of `count` instances of `instance_type` with a `size` GiB volume.
     fn config(instance_type: Option<&str>, count: Option<i32>, size: Option<i32>) -> ResourceConfig {
@@ -413,17 +402,13 @@ mod tests {
         ];
 
         for (case, held, in_use, refused) in rows {
-            let refusal = resource_config_quota_refusal(
-                &held,
-                |instance_type| {
-                    if instance_type == "ml.m5.large" {
-                        in_use
-                    } else {
-                        0
-                    }
-                },
-                0,
-            );
+            let refusal = resource_config_quota_refusal(&held, |instance_type| {
+                if instance_type == "ml.m5.large" {
+                    in_use
+                } else {
+                    0
+                }
+            });
             assert!(
                 refusal.is_some() == refused,
                 "case {case:?}: expected refused={refused}, got {refusal:?}"
@@ -431,25 +416,21 @@ mod tests {
         }
     }
 
-    /// RULE: each quota refusal is the account-quota sentence over that quota's own entry,
-    /// stating its limit, the account's utilisation of it and this request's delta.
+    /// RULE: a SIZE quota's refusal states the entry, the limit and the total this request
+    /// asked for; a COUNT quota's states the entry, the limit, the account's utilisation and
+    /// this request's delta.
     #[test]
-    fn a_quota_refusal_states_the_entry_the_limit_the_utilisation_and_the_delta() {
+    fn a_quota_refusal_states_the_entry_the_limit_and_what_the_request_asked_for() {
         let size = TRAINING_VOLUME_SIZE_MAX_GB + 1;
-        let held = 30;
-        let refusal = resource_config_quota_refusal(
-            &config(Some("ml.m5.large"), Some(1), Some(size)),
-            |_| 0,
-            held,
-        );
+        let refusal =
+            resource_config_quota_refusal(&config(Some("ml.m5.large"), Some(1), Some(size)), |_| 0);
         assert_eq!(
             refusal.as_deref(),
             Some(
-                account_quota_exceeded(
+                account_quota_total_requested_exceeded(
                     TRAINING_VOLUME_QUOTA_NAME,
                     VOLUME_SIZE_UNIT,
                     i64::from(TRAINING_VOLUME_SIZE_MAX_GB),
-                    held,
                     i64::from(size),
                 )
                 .as_str()
@@ -457,11 +438,10 @@ mod tests {
             "case \"a volume past its quota\": the refusal's message, got {refusal:?}"
         );
 
-        let refusal = resource_config_quota_refusal(
-            &config(Some("ml.m5.large"), Some(600), Some(30)),
-            |_| 500,
-            0,
-        );
+        let refusal =
+            resource_config_quota_refusal(&config(Some("ml.m5.large"), Some(600), Some(30)), |_| {
+                500
+            });
         assert_eq!(
             refusal.as_deref(),
             Some(

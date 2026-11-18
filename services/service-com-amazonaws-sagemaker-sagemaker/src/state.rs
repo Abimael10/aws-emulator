@@ -87,6 +87,11 @@ pub use boosted_model::*;
 pub mod binary_json;
 pub use binary_json::*;
 
+/// The PIPELINE RUN slice: the steps a started execution dispatches, the callback work it
+/// really performs and the statuses those steps report. See `state/pipeline_run.rs`.
+pub mod pipeline_run;
+pub use pipeline_run::*;
+
 use crate::ops::types::{
     AdditionalInferenceSpecificationDefinition, AppSpecification, ArtifactSource,
     AsyncInferenceConfig, AutoMLComputeConfig, AutoMLDataSplitConfig, AutoMLJobChannel,
@@ -441,6 +446,31 @@ pub fn account_quota_exceeded(
     )
 }
 
+/// How SageMaker words a refusal of a request whose own ASK is past an adjustable account
+/// quota AWS publishes: the quota by its published name, its limit, and the TOTAL the
+/// request asked for — each followed by the UNIT the quota is counted in — then how to ask
+/// for more.
+///
+/// This is the wording for a quota that bounds the SIZE of one resource a single request
+/// asks for, rather than a COUNT the account accumulates across resources
+/// ([`account_quota_exceeded`]): there is nothing of the account's own to weigh the ask
+/// against, so the clause states what this request asked for in total and no utilisation
+/// or delta pair. Stated once here so every operation that evaluates such a quota words it
+/// the same way.
+pub fn account_quota_total_requested_exceeded(
+    quota: &str,
+    unit: &str,
+    limit: i64,
+    requested: i64,
+) -> String {
+    format!(
+        "The account-level service limit '{quota}' is {limit} {unit}, with total requested \
+         utilization of {requested} {unit}. Please use AWS Service Quotas to request an \
+         increase for this quota. If AWS Service Quotas is not available, contact AWS \
+         support to request an increase for this quota."
+    )
+}
+
 /// The most hyperparameters one tuning job may search over, across
 /// `ParameterRanges`' integer, continuous and categorical lists together.
 ///
@@ -609,6 +639,30 @@ pub const PIPELINE_INITIAL_VERSION: i64 = 1;
 pub const PIPELINE_EXECUTION_STATUS_EXECUTING: &str = "Executing";
 /// See [`PIPELINE_EXECUTION_STATUS_EXECUTING`].
 pub const PIPELINE_EXECUTION_STATUS_FAILED: &str = "Failed";
+/// See [`PIPELINE_EXECUTION_STATUS_EXECUTING`]: the terminal status of a run every step of
+/// which was performed and succeeded — which, while a callback step is the one kind this
+/// emulator performs, means a run of callback steps whose workers all reported success.
+pub const PIPELINE_EXECUTION_STATUS_SUCCEEDED: &str = "Succeeded";
+/// See [`PIPELINE_EXECUTION_STATUS_EXECUTING`]: the transient status a run carries from the
+/// `StopPipelineExecution` call until it has stopped — which, while a callback step of it is
+/// still waiting for its token, is only once that token is reported back
+/// (`StopPipelineExecution`'s own doc).
+pub const PIPELINE_EXECUTION_STATUS_STOPPING: &str = "Stopping";
+/// See [`PIPELINE_EXECUTION_STATUS_STOPPING`]: the terminal status of a run the caller
+/// stopped.
+pub const PIPELINE_EXECUTION_STATUS_STOPPED: &str = "Stopped";
+
+/// How long after `StopPipelineExecution` the clock owes a run its `Stopping` -> `Stopped`
+/// move.
+///
+/// The emulator's OWN span, not a duration AWS documents (`StopPipelineExecution` states
+/// none): compressed, and the same one its sibling [`PIPELINE_EXECUTION_ENDS_AFTER`] gives
+/// the run's own end, so the two moves of one run are owed on one scale. It is never zero,
+/// so a caller that describes the run straight after asking it to stop still observes
+/// `Stopping` and one that waits observes `Stopped`. A run with a callback step still
+/// waiting for its token stops only when that token is reported back, whatever this span
+/// says.
+pub const PIPELINE_EXECUTION_STOPS_AFTER: Duration = Duration::from_millis(300);
 
 /// The most steps one selective run may name, and the least.
 ///
@@ -630,24 +684,25 @@ pub const MAX_SELECTED_STEPS: usize = 50;
 /// due instant is stored rather than slept on.
 pub const PIPELINE_EXECUTION_ENDS_AFTER: Duration = Duration::from_millis(400);
 
-/// Why an execution this emulator started ends [`PIPELINE_EXECUTION_STATUS_FAILED`].
+/// Why a run that performed none of its steps ends
+/// [`PIPELINE_EXECUTION_STATUS_FAILED`].
 ///
-/// A pipeline's steps are training, processing, transform, Lambda and callback work run
-/// outside SageMaker's control plane, and this emulator has no runtime that performs any
-/// of it. So an accepted execution is never reported `Succeeded`: nothing ran its steps,
-/// and a success status, a job ARN, a step output or a runtime for work nothing performed
-/// would be fabricated. The execution instead ends in the modelled failure state with
-/// this reason, which says exactly that, and the steps the run was to perform report the
-/// same failure state and the same reason — see [`step_status_of_execution`] and
-/// [`pipeline_definition_step_declarations`], which is what
-/// `ListPipelineExecutionSteps` reports them from. Within the modelled
-/// `PipelineExecutionFailureReason` length (0..1300), and within the shorter
-/// `FailureReason` (0..1024) a step execution reports it under.
+/// A pipeline's steps are training, processing, transform, Lambda and callback work. Of
+/// those, the callback step's work is one this emulator PERFORMS — the message it owes the
+/// caller's queue (see [`pipeline_run`]) — and the rest need a runtime this emulator does
+/// not have. So a run holding a step of one of those kinds is never reported `Succeeded`:
+/// nothing ran that step, and a success status, a job ARN, a step output or a runtime for
+/// work nothing performed would be fabricated. The run instead ends in the modelled failure
+/// state with this reason, which says exactly that, and the steps it performed nothing for
+/// report the same failure state and the same reason — see [`step_status_of_execution`] and
+/// [`pipeline_definition_step_declarations`], which is what `ListPipelineExecutionSteps`
+/// reports them from. Within the modelled `PipelineExecutionFailureReason` length
+/// (0..1300), and within the shorter `FailureReason` (0..1024) a step execution reports it
+/// under.
 pub const PIPELINE_EXECUTION_NOT_RUN: &str =
     "The pipeline execution was accepted but no step of it ran: this emulator has no \
-     runtime that performs a pipeline step's work (training, processing, transform, \
-     Lambda or callback), so the execution ended Failed rather than reporting work that \
-     did not happen.";
+     runtime that performs this step's work (training, processing, transform or Lambda), \
+     so the execution ended Failed rather than reporting work that did not happen.";
 
 /// The `StepStatus` the steps of an execution in `execution_status` report, or `None`
 /// while that execution has reached no step at all.
@@ -1603,34 +1658,109 @@ pub struct PipelineExecution {
     /// before a run begins. It is what [`PipelineExecution::settle_status`] reports as the
     /// failed run's reason, so the step the role was needed for carries it too.
     pub role_failure_reason: Option<String>,
+    /// The steps this run DISPATCHED, in declaration order, each with the status, the
+    /// instants and the callback grant of its own run (see [`PipelineStepRun`]). A run that
+    /// dispatched none holds none.
+    pub steps: Vec<PipelineStepRun>,
+    /// How many of the steps this run was to perform it dispatched nothing for, because no
+    /// runtime here performs their kind of work — see [`PIPELINE_EXECUTION_NOT_RUN`], which
+    /// is the reason such a run ends with.
+    pub undispatched_steps: usize,
+    /// When the clock owes this run its `Stopping` -> `Stopped` move, set by the
+    /// `StopPipelineExecution` call that asked for it; `None` for a run nobody stopped.
+    pub stops_at: Option<SystemTime>,
 }
 
 impl PipelineExecution {
-    /// Materialise the move out of `Executing` the clock already owes.
+    /// Materialise the move out of `Executing`, or out of `Stopping`, the clock already
+    /// owes.
     ///
-    /// This is the one write a reporting operation may make: the move was due at
-    /// `ends_at` whether or not anybody described the execution, so the observer makes
-    /// no difference to the result. `LastModifiedTime` takes the instant the move was
-    /// due, not "now", so it is stable across later reads.
+    /// This is the one write a reporting operation may make: the move was due at `ends_at`
+    /// (or, for a run the caller stopped, at `stops_at`) whether or not anybody described
+    /// the execution, so the observer makes no difference to the result.
+    /// `LastModifiedTime` takes the instant the move was due, not "now", so it is stable
+    /// across later reads.
     ///
-    /// The terminal status is [`PIPELINE_EXECUTION_STATUS_FAILED`]. Its reason is the
-    /// run's own `role_failure_reason` where the role its steps had to be performed as
-    /// resolved to nothing, and [`PIPELINE_EXECUTION_NOT_RUN`] otherwise: see that
-    /// constant for why an execution this emulator accepted cannot end `Succeeded`.
+    /// A step still waiting for its callback token holds the run OPEN whatever the clock
+    /// says: a callback step runs until the worker it handed its work to reports that token
+    /// back, which is the step's own doc, so nothing is due while one is waiting.
+    ///
+    /// Once no step is waiting, a run nobody stopped ends `Succeeded` when every step it was
+    /// to perform was dispatched and succeeded, and [`PIPELINE_EXECUTION_STATUS_FAILED`]
+    /// otherwise. The failed run's reason is, in order: the run's own
+    /// `role_failure_reason`, where the role its steps had to be performed as resolved to
+    /// nothing; the reason a dispatched step failed with; and [`PIPELINE_EXECUTION_NOT_RUN`]
+    /// for a step nothing here performed — see that constant for why such a run cannot end
+    /// `Succeeded`. A run the caller stopped ends [`PIPELINE_EXECUTION_STATUS_STOPPED`].
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == PIPELINE_EXECUTION_STATUS_EXECUTING && now >= self.ends_at {
-            self.status = PIPELINE_EXECUTION_STATUS_FAILED.to_string();
-            self.failure_reason = Some(
-                self.role_failure_reason
-                    .clone()
-                    .unwrap_or_else(|| PIPELINE_EXECUTION_NOT_RUN.to_string()),
-            );
-            self.last_modified_time = self.ends_at;
-            return true;
+        // A step still waiting for its callback token holds the run open, whichever
+        // transition is owed: "only when SageMaker Pipelines receives one of these calls
+        // will it stop the pipeline execution" (`StopPipelineExecution`'s own doc), and a
+        // run still performing a step has not ended either.
+        if self.steps.iter().any(|step| !step.is_terminal()) {
+            return false;
         }
-        false
+        match self.status.as_str() {
+            PIPELINE_EXECUTION_STATUS_EXECUTING => self.settle_end(now),
+            PIPELINE_EXECUTION_STATUS_STOPPING => self.settle_stop(now),
+            _ => false,
+        }
+    }
+
+    /// The `Executing` -> terminal move: see [`PipelineExecution::settle_status`].
+    fn settle_end(&mut self, now: SystemTime) -> bool {
+        if now < self.ends_at {
+            return false;
+        }
+        let failed_step = self
+            .steps
+            .iter()
+            .find(|step| step.status == STEP_STATUS_FAILED);
+        let reason = self
+            .role_failure_reason
+            .clone()
+            .or_else(|| failed_step.and_then(|step| step.failure_reason.clone()))
+            .or_else(|| {
+                (self.undispatched_steps > 0).then(|| PIPELINE_EXECUTION_NOT_RUN.to_string())
+            });
+        let performed = self.undispatched_steps == 0 && failed_step.is_none();
+        self.status = if performed && reason.is_none() {
+            PIPELINE_EXECUTION_STATUS_SUCCEEDED.to_string()
+        } else {
+            PIPELINE_EXECUTION_STATUS_FAILED.to_string()
+        };
+        self.failure_reason = reason;
+        self.last_modified_time = self.settled_at(self.ends_at);
+        true
+    }
+
+    /// The `Stopping` -> `Stopped` move the stop owes: a run the caller stopped reports
+    /// `Stopped` and no failure reason, whatever its steps then reported, because what
+    /// ended it is the stop.
+    fn settle_stop(&mut self, now: SystemTime) -> bool {
+        let Some(stops_at) = self.stops_at else {
+            return false;
+        };
+        if now < stops_at {
+            return false;
+        }
+        self.status = PIPELINE_EXECUTION_STATUS_STOPPED.to_string();
+        self.last_modified_time = self.settled_at(stops_at);
+        true
+    }
+
+    /// The instant a move was DUE: the clock's own `owed` span, or the last step's end when
+    /// a step the run was waiting for settled after that. Never "now", so the value is
+    /// stable across later reads.
+    fn settled_at(&self, owed: SystemTime) -> SystemTime {
+        self.steps
+            .iter()
+            .filter_map(|step| step.end_time)
+            .chain(::std::iter::once(owed))
+            .max()
+            .unwrap_or(owed)
     }
 }
 

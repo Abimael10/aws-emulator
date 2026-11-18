@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopPipelineExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopPipelineExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: moves the execution the request names into `Stopping`, hands every
+//! callback step of it that is still waiting the ADDITIONAL message its doc says a stop
+//! sends — the same token and arguments with the `Status` field set to `Stopping` — and
+//! leaves the run to reach `Stopped` when nothing is waiting any more. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopPipelineExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "A pipeline execution won't stop while a callback step is running": a run with a step
+//! waiting for its token stays `Stopping` until that token is reported back with
+//! `SendPipelineExecutionStepSuccess`/`Failure`, and one with nothing waiting is owed
+//! `Stopped` by the clock ([`crate::state::PIPELINE_EXECUTION_STOPS_AFTER`]), which the
+//! reporting operations materialise. A run that has already stopped, succeeded or failed is
+//! past stopping, so the stop of one is the modelled `ConflictException`; a second stop of a
+//! run already `Stopping` changes nothing and hands no second message over, which is what
+//! `ClientRequestToken`'s idempotency asks for.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +162,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopPipelineExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopPipelineExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopPipelineExecution"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        // Everything the STORE decides about the stop happens in [`ask_to_stop`], which
+        // gives its guard up when it answers: the messages below reach ANOTHER service, so
+        // no guard may be held across them.
+        let deliveries = ask_to_stop(&state, &region, &input.pipeline_execution_arn)?;
+        for delivery in &deliveries {
+            // A queue that takes no message leaves the worker untold, and the step waiting
+            // for its token: the run stays `Stopping`, which is what a reader then
+            // reports, rather than claiming a stop nothing was told about completed.
+            if let Some(reason) =
+                crate::state::deliver_callback_message(ctx, &region, delivery).await
+            {
+                ::tracing::warn!(
+                    step = delivery.step_name,
+                    %reason,
+                    "the stop of a waiting callback step was not handed over"
+                );
+            }
+        }
+
+        crate::state::record_state_change(Self::NAME, &input.pipeline_execution_arn, ctx);
+        Ok(StopPipelineExecutionOutput {
+            pipeline_execution_arn: Some(input.pipeline_execution_arn),
+        })
     }
+}
+
+/// Ask the run `execution_arn` to stop, answering the ADDITIONAL messages its waiting
+/// callback steps are owed.
+///
+/// Holds this service's guard for the whole reading — resolving the run, refusing one past
+/// stopping, and moving it into `Stopping` are one atomic step — and gives it up by
+/// ANSWERING: the caller hands those messages over, and may not hold a guard while it calls
+/// another service.
+fn ask_to_stop(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsSagemakerSagemakerState>,
+    region: &str,
+    execution_arn: &str,
+) -> Result<Vec<crate::state::CallbackDelivery>, StopPipelineExecutionError> {
+    let now = ::std::time::SystemTime::now();
+    let mut store = state.lock();
+    // The run is this call's subject, so it is resolved first: never a 200 for an ARN
+    // nothing resolves.
+    let Some(execution) = store.pipeline_executions.get_mut(execution_arn) else {
+        return Err(StopPipelineExecutionErrorModeled::ResourceNotFound(ResourceNotFound {
+            message: Some(crate::state::does_not_exist(
+                crate::state::PIPELINE_EXECUTION_ENTITY,
+                execution_arn,
+            )),
+        })
+        .into());
+    };
+    // The terminal status the clock already owed is materialised first: it was due at its
+    // stored instant whether or not anybody called, so a run that had already ended is
+    // refused for THAT rather than stopped a second time.
+    execution.settle_status(now);
+    // A retry of the stop finds the run already `Stopping` and changes nothing: the
+    // message the stop owed was handed over by the call that asked for it.
+    if execution.status == crate::state::PIPELINE_EXECUTION_STATUS_STOPPING {
+        return Ok(Vec::new());
+    }
+    if execution.status != crate::state::PIPELINE_EXECUTION_STATUS_EXECUTING {
+        return Err(StopPipelineExecutionErrorModeled::ConflictException(ConflictException {
+            message: Some(crate::state::pipeline_execution_not_stoppable(
+                execution_arn,
+                &execution.status,
+            )),
+        })
+        .into());
+    }
+    execution.status = crate::state::PIPELINE_EXECUTION_STATUS_STOPPING.to_string();
+    execution.last_modified_time = now;
+    execution.stops_at = Some(now + crate::state::PIPELINE_EXECUTION_STOPS_AFTER);
+    // Every step of this run still waiting for its token is owed the additional message,
+    // and the pipeline whose definition carries those steps' arguments is read next — so
+    // what the run holds is taken off it before the store is reached again.
+    let pipeline_name = execution.pipeline_name.clone();
+    let waiting: Vec<(String, String, String)> = execution
+        .steps
+        .iter()
+        .filter(|step| !step.is_terminal())
+        .filter_map(|step| {
+            let grant = step.callback.as_ref()?;
+            Some((
+                step.name.clone(),
+                grant.token.clone(),
+                grant.queue_url.clone(),
+            ))
+        })
+        .collect();
+    // The arguments the additional message repeats are the step's own, read from the
+    // definition the run was started from rather than invented here.
+    let definition = store
+        .pipelines
+        .get(&pipeline_name)
+        .map(|pipeline| pipeline.definition.clone())
+        .unwrap_or_default();
+    let declared = crate::state::pipeline_definition_step_declarations(&definition);
+    Ok(waiting
+        .into_iter()
+        .filter_map(|(step_name, token, declared_url)| {
+            let arguments = declared
+                .iter()
+                .find(|step| step.name == step_name)
+                .and_then(|step| step.arguments.clone());
+            // The ADDRESS the additional message is taken at is built the same way the
+            // dispatch's was ([`crate::state::callback_queue_address`]): from the Region and
+            // the queue the step's declared url names, never from that url. A step whose
+            // queue addresses nothing is one the dispatch already failed, so it is not
+            // waiting and never reaches here.
+            Some(crate::state::CallbackDelivery {
+                message: crate::state::callback_stop_message(&token, arguments.as_ref()),
+                step_name,
+                queue_url: crate::state::callback_queue_address(region, &declared_url)?,
+            })
+        })
+        .collect())
 }

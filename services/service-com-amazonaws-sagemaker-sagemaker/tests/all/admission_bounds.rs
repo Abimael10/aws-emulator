@@ -45,9 +45,9 @@ const CLUSTER_NODE_BOUND: i64 = 1_000;
 const TRAINING_INSTANCE_BOUND: i64 = 1_000;
 
 /// The largest ML storage volume SageMaker provisions for one training job instance, in
-/// GiB (`state::TRAINING_VOLUME_SIZE_MAX_GB`: the published maximum size of the Amazon
-/// EBS gp2 volume `ResourceConfig$VolumeSizeInGB` names).
-const VOLUME_SIZE_MAX_GB: i64 = 16_384;
+/// GB (`state::TRAINING_VOLUME_SIZE_MAX_GB`: the published default of the Service Quotas
+/// entry for the Amazon EBS gp2 volume `ResourceConfig$VolumeSizeInGB` names).
+const VOLUME_SIZE_MAX_GB: i64 = 1_024;
 
 /// A `CreateTrainingJob` body naming `name` and carrying `resource_config`, with the
 /// members the model marks required
@@ -390,9 +390,10 @@ async fn create_training_job_refuses_compute_it_cannot_launch() {
 
 /// RULE: the ML storage volume SageMaker provisions for a training job instance is bounded
 /// by the account's published quota for it, so a `VolumeSizeInGB` past that bound is the
-/// modelled `ResourceLimitExceeded` stating the quota entry, its limit, the account's
-/// utilisation of it and this request's delta; a size at the bound — and the zero the
-/// member's own doc admits — is accepted.
+/// modelled `ResourceLimitExceeded` stating the quota entry, its limit and the TOTAL this
+/// request asked for — the quota bounds ONE instance's volume, so there is no utilisation
+/// the account accumulates of it and no delta against one; a size at the bound — and the
+/// zero the member's own doc admits — is accepted.
 #[tokio::test]
 async fn create_training_job_refuses_a_volume_past_the_published_quota() {
     let config = |size: i64| {
@@ -427,10 +428,10 @@ async fn create_training_job_refuses_a_volume_past_the_published_quota() {
             message(&answer),
             format!(
                 "The account-level service limit 'Size of EBS volume for a training job \
-                 instance' is {VOLUME_SIZE_MAX_GB} GB, with current utilization of 0 GB and a \
-                 request delta of {size} GB. Please use AWS Service Quotas to request an \
-                 increase for this quota. If AWS Service Quotas is not available, contact AWS \
-                 support to request an increase for this quota."
+                 instance' is {VOLUME_SIZE_MAX_GB} GBs, with total requested utilization of \
+                 {size} GBs. Please use AWS Service Quotas to request an increase for this \
+                 quota. If AWS Service Quotas is not available, contact AWS support to \
+                 request an increase for this quota."
             ),
             "case {case:?}: the refusal's message, got {answer}"
         );
@@ -446,8 +447,9 @@ async fn create_training_job_refuses_a_volume_past_the_published_quota() {
         );
     }
 
-    // The utilisation the refusal states is the account's own: a job already running holds
-    // its storage, so the same refusal reports that volume rather than zero.
+    // The quota bounds ONE instance's volume, so what the refusal states is the total this
+    // request asked for: a job already running holds its own storage and changes neither
+    // the limit nor the clause.
     let emulator = Emulator::new();
     let held = 512;
     let (status, answer) = emulator
@@ -474,9 +476,9 @@ async fn create_training_job_refuses_a_volume_past_the_published_quota() {
          ResourceLimitExceeded, got {status} with {answer}"
     );
     assert!(
-        message(&answer).contains(&format!("current utilization of {held} GB")),
-        "case \"a volume past the quota beside a held one\": the refusal must state the \
-         account's own utilisation, got {}",
+        message(&answer).contains(&format!("total requested utilization of {asked} GBs")),
+        "case \"a volume past the quota beside a held one\": the refusal must state the total \
+         this request asked for, got {}",
         message(&answer)
     );
 }

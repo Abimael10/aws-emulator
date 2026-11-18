@@ -64,3 +64,27 @@ Cause 1: create an IAM role sagemaker can assume, then CreateTrainingJob(Trainin
 Cause 2: CreatePipeline(PipelineName=<p>, ClientRequestToken=<uuid>, RoleArn='arn:aws:iam::<account>:role/<a role that does not exist>', PipelineDefinition=<a one-step SQS-callback pipeline pointing at a queue you created>), then StartPipelineExecution(PipelineName=<p>, ClientRequestToken=<uuid>) and poll DescribePipelineExecution(PipelineExecutionArn=<arn>). Within seconds AWS settles PipelineExecutionStatus='Failed' and ListPipelineExecutionSteps reports the sole step StepStatus='Failed' with a FailureReason naming the role ARN as not existing, and GetQueueAttributes(ApproximateNumberOfMessages) on the callback queue stays '0'. The emulator leaves the execution non-terminal indefinitely. Control: the identical pipeline with a real sagemaker-trusted role delivers the callback message.
 
 Cause 3: CreateNotebookInstance(NotebookInstanceName=<nb>, InstanceType='ml.t3.medium', RoleArn=<role>), wait for InService, then CreatePresignedNotebookInstanceUrl(NotebookInstanceName=<nb>) and again with SessionExpirationDurationInSeconds=1800. Inspect AuthorizedUrl's host: it must be an address the emulator serves (the endpoint host/port the request arrived on, or a per-resource listener it owns); the emulator returns <nb>.notebook.<region>.sagemaker.aws, which the client cannot reach. Fetching each URL immediately must land on an authenticated page in the URL's own zone. Then, with botocore parameter validation disabled, call CreatePresignedNotebookInstanceUrl(NotebookInstanceName=<nb>, SessionExpirationDurationInSeconds=1799) and =43201: each must be refused with ValidationException and "1 validation error detected: Value '<value>' at 'sessionExpirationDurationInSeconds' failed to satisfy constraint: Member must have value greater than or equal to 1800" / "... less than or equal to 43200", and no URL returned.
+
+## Resolution
+All three causes are closed; the replay's three checks pass.
+
+* Cause 1 (CreateTrainingJob's EBS-volume refusal): a quota that bounds the SIZE one
+  resource of one request may be given is refused with the account-level-limit sentence
+  whose middle clause is the TOTAL REQUESTED utilization in that quota's unit
+  (`state::account_quota_total_requested_exceeded`), and the published quota for the ML
+  storage volume of one training job instance is 1024 GBs. The COUNT quotas (instances of
+  one type, endpoints, the training jobs of a tuning job, cluster instances) keep the
+  utilisation-and-delta sentence, which is the one AWS words for them.
+* Cause 2 (a pipeline execution's steps): a run now DISPATCHES the steps it can perform. A
+  callback step's work is the message it hands the caller's own Amazon SQS queue, so the run
+  really sends it with the token it minted, the step stays `Executing` with that token in
+  its `Metadata.Callback` until `SendPipelineExecutionStepSuccess`/`Failure` reports it back
+  (both implemented), and `StopPipelineExecution` (implemented) hands over the additional
+  `Status: Stopping` message its doc describes and stops the run only once that token comes
+  back. A run whose `RoleArn` resolves to nothing dispatches nothing, so it still settles
+  `Failed` with its step reporting the missing role and no message on the queue.
+* Cause 3 (CreatePresignedNotebookInstanceUrl): already served by the time this issue was
+  worked — the `AuthorizedUrl` addresses the session path on the endpoint the request
+  arrived on, and the modelled `SessionExpirationDurationInSeconds` range is refused at the
+  boundary with the standard constraint sentence. The replay check passes unchanged, and
+  `tests/all/presigned_notebook_instance_url.rs` pins both.

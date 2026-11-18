@@ -108,6 +108,10 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # subnets and its security groups are EC2's resources, minted through that service's own API
 # exactly where `CreateDomain` resolves the placement it is given.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# Amazon SQS, mounted beside SageMaker on one engine by the pipeline-callback suite: a
+# callback step's whole work is the message it hands the caller's own queue, so the suite
+# creates that queue through SQS's own API and reads the message back off it.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true

@@ -10,16 +10,23 @@
 //! from the run and from the definition the run was started from, never from this
 //! request: the step's `StepName`, `StepDisplayName` and `StepDescription` are what the
 //! stored pipeline definition declares (restricted to the selected steps when the run is
-//! selective), and its `StepStatus` and `FailureReason` are the execution's own
-//! ([`crate::state::step_status_of_execution`]). An execution still `Executing` has
-//! reached no step, so it lists none.
+//! selective).
 //!
-//! Nothing here reports work this emulator did not perform:
-//! [`crate::state::PIPELINE_EXECUTION_NOT_RUN`] says why an accepted execution ends in
-//! the modelled failure state rather than `Succeeded`, and a step of such a run reports
-//! that same failure state with that same reason and NO `StartTime`, `EndTime`,
-//! `Metadata`, `AttemptCount` or `CacheHitResult` — no success, no duration, no job ARN
-//! and no step output for work nothing ran.
+//! What a step reports beyond that depends on whether the run PERFORMED it
+//! ([`crate::state::pipeline_run`]):
+//!
+//! * a step the run DISPATCHED reports its own run — the instants it started and stopped
+//!   executing, the status it is in, the reason it failed with, that it was attempted once,
+//!   and, for a callback step, the `Metadata.Callback` naming the queue it handed its work
+//!   over through, the token it was dispatched with and the output parameters the worker
+//!   reported back. Such a step is reported while the run is still `Executing`, because it
+//!   really is executing;
+//! * a step of a kind nothing here performs reports the EXECUTION's status and reason
+//!   ([`crate::state::step_status_of_execution`],
+//!   [`crate::state::PIPELINE_EXECUTION_NOT_RUN`]) and NO `StartTime`, `EndTime`,
+//!   `Metadata`, `AttemptCount` or `CacheHitResult` — no success, no duration, no job ARN
+//!   and no step output for work nothing ran — and is reported only once the run says what
+//!   became of it, so an execution still `Executing` lists none of them.
 //!
 //! ## Shape of an operation
 //!
@@ -236,11 +243,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An execution that has reached no step lists none, and so does one whose status
         // names no step outcome: a step execution is reported only where the run says
-        // what became of it.
+        // what became of it — or where the run DISPATCHED it, which is a step really
+        // executing (see `state::pipeline_run`).
         let step_status = crate::state::step_status_of_execution(&reported.status);
-        let mut steps: Vec<crate::state::PipelineStepDeclaration> = match (step_status, &definition)
-        {
-            (Some(_), Some(definition)) => {
+        let mut steps: Vec<crate::state::PipelineStepDeclaration> = match &definition {
+            Some(definition) => {
                 let declared = crate::state::pipeline_definition_step_declarations(definition);
                 match &reported.selective_execution_config {
                     // `SelectiveExecutionConfig$SelectedSteps` is "a list of pipeline
@@ -262,12 +269,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     None => declared,
                 }
             }
-            // A run still `Executing` has reached no step. The other arm — an execution
-            // whose pipeline record is gone — is unreachable while `remove_pipeline` takes
-            // a pipeline's executions with it, and a store that broke that invariant has
-            // no definition to report steps from either.
-            _ => Vec::new(),
+            // An execution whose pipeline record is gone — unreachable while
+            // `remove_pipeline` takes a pipeline's executions with it, and a store that
+            // broke that invariant has no definition to report steps from either.
+            None => Vec::new(),
         };
+        // A run still `Executing` has reached no step of a kind it does not perform, so
+        // only the steps it dispatched are reported while it runs.
+        if step_status.is_none() {
+            steps.retain(|step| reported.step_run(&step.name).is_some());
+        }
         // The declaration order the walk answers is the order the steps are reached, so
         // `SortOrder` reverses exactly that. Step names are unique within one definition,
         // so the order is total either way and a `NextToken` resolved against a freshly
@@ -313,25 +324,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // reached no step answers an empty list rather than omitting the member.
             pipeline_execution_steps: Some(
                 page.iter()
-                    .map(|step| PipelineExecutionStep {
-                        step_name: Some(step.name.clone()),
-                        step_display_name: step.display_name.clone(),
-                        step_description: step.description.clone(),
-                        // No `StartTime`, `EndTime`, `Metadata`, `AttemptCount` or
-                        // `CacheHitResult`: nothing ran this step, so it spent no time,
-                        // created no job, was attempted no number of times and hit no
-                        // cache. The status and the reason are the run's own — see this
-                        // module's header and `state::PIPELINE_EXECUTION_NOT_RUN`.
-                        step_status: step_status.map(str::to_string),
-                        failure_reason: reported.failure_reason.clone(),
-                        // SageMaker fills this where a selective run REUSED the result of
-                        // the step from its source execution. This run reports only the
-                        // steps it was to perform itself, so no reused result is named.
-                        selective_execution_result: None,
-                        // A `ForEach` step's iterations are step executions of their own,
-                        // which only a performed run has; a declared step is not one.
-                        iteration_context: None,
-                        ..Default::default()
+                    .map(|step| match reported.step_run(&step.name) {
+                        // A step the run DISPATCHED reports its own run: the instants it
+                        // started and stopped executing, the status it is in, the reason
+                        // it failed with and — for a callback step — the queue it handed
+                        // its work over through, the token it was dispatched with and the
+                        // output parameters the worker reported back.
+                        Some(run) => PipelineExecutionStep {
+                            step_name: Some(run.name.clone()),
+                            step_display_name: run.display_name.clone(),
+                            step_description: run.description.clone(),
+                            start_time: Some(crate::state::timestamp(run.start_time)),
+                            end_time: run.end_time.map(crate::state::timestamp),
+                            step_status: Some(run.status.clone()),
+                            failure_reason: run.failure_reason.clone(),
+                            attempt_count: Some(run.attempt_count),
+                            metadata: run.callback.as_ref().map(|grant| {
+                                PipelineExecutionStepMetadata {
+                                    callback: Some(CallbackStepMetadata {
+                                        callback_token: Some(grant.token.clone()),
+                                        sqs_queue_url: Some(grant.queue_url.clone()),
+                                        output_parameters: Some(grant.output_parameters.clone()),
+                                    }),
+                                    ..Default::default()
+                                }
+                            }),
+                            // No `CacheHitResult`: this run performed the step rather than
+                            // reusing another run's result. The same goes for
+                            // `SelectiveExecutionResult` and a `ForEach` step's
+                            // `IterationContext`, which only a reused or an iterated step
+                            // has.
+                            ..Default::default()
+                        },
+                        None => PipelineExecutionStep {
+                            step_name: Some(step.name.clone()),
+                            step_display_name: step.display_name.clone(),
+                            step_description: step.description.clone(),
+                            // No `StartTime`, `EndTime`, `Metadata`, `AttemptCount` or
+                            // `CacheHitResult`: nothing ran this step, so it spent no
+                            // time, created no job, was attempted no number of times and
+                            // hit no cache. The status and the reason are the run's own —
+                            // see this module's header and
+                            // `state::PIPELINE_EXECUTION_NOT_RUN`.
+                            step_status: step_status.map(str::to_string),
+                            failure_reason: reported.failure_reason.clone(),
+                            // SageMaker fills this where a selective run REUSED the result
+                            // of the step from its source execution. This run reports only
+                            // the steps it was to perform itself, so no reused result is
+                            // named.
+                            selective_execution_result: None,
+                            // A `ForEach` step's iterations are step executions of their
+                            // own, which only a performed run has; a declared step is not
+                            // one.
+                            iteration_context: None,
+                            ..Default::default()
+                        },
                     })
                     .collect(),
             ),

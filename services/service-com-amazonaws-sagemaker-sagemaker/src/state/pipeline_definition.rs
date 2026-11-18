@@ -216,6 +216,11 @@ fn too_many_steps(declared: usize) -> String {
     )
 }
 
+/// The key a pipeline definition's step names the Amazon SQS queue a callback step hands
+/// its work over through under, as the SageMaker Python SDK's `CallbackStep` serialises its
+/// `sqs_queue_url`.
+const PIPELINE_STEP_QUEUE_KEY: &str = "SqsQueueUrl";
+
 /// `<pipeline arn>/execution/<id>` — the one `PipelineExecutionArn` form this service
 /// mints, and the form the modelled pattern
 /// `^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:pipeline\/.*\/execution\/.*$`
@@ -240,20 +245,30 @@ pub fn pipeline_definition_step_names(definition: &str) -> Vec<String> {
 }
 
 /// One step a pipeline definition declares, in the members a step EXECUTION of it
-/// reports: the name it is addressed by, plus the display name and description the
-/// definition optionally gives it.
+/// reports and the members the run needs to PERFORM it: the name it is addressed by, the
+/// display name and description the definition optionally gives it, the kind of work it
+/// declares, and — for a callback step — the queue it hands that work over through and the
+/// arguments it hands over with it.
 ///
-/// `PipelineExecutionStep` carries exactly these three as `StepName`,
+/// `PipelineExecutionStep` carries the first three as `StepName`,
 /// `StepDisplayName` and `StepDescription`
 /// (`smithy_query(query="shape",shape="PipelineExecutionStep")`), and a definition's step
 /// object carries them under `Name`, `DisplayName` and `Description` — the keys the
 /// SageMaker Python SDK's `Step` serialises its own `name`, `display_name` and
 /// `description` to. A step that declares neither optional key reports neither member.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `sqs_queue_url` and `arguments` are what [`crate::state::dispatch_pipeline_steps`]
+/// performs a callback step from; that SDK's `CallbackStep` serialises its queue beside the
+/// step's `Arguments`, as `SqsQueueUrl`, and a definition written with the queue INSIDE the
+/// arguments names the same queue, so both placements are read.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PipelineStepDeclaration {
     pub name: String,
     pub display_name: Option<String>,
     pub description: Option<String>,
+    pub step_type: String,
+    pub sqs_queue_url: Option<String>,
+    pub arguments: Option<::serde_json::Value>,
 }
 
 /// Every step a pipeline definition declares, in declaration order, as the control plane
@@ -275,6 +290,9 @@ pub fn pipeline_definition_step_declarations(definition: &str) -> Vec<PipelineSt
             name: step.name.to_string(),
             display_name: step.display_name.map(str::to_string),
             description: step.description.map(str::to_string),
+            step_type: step.step_type.to_string(),
+            sqs_queue_url: step.sqs_queue_url.map(str::to_string),
+            arguments: step.arguments.cloned(),
         })
         .collect()
 }
@@ -323,11 +341,17 @@ fn declared_parameter_names(document: &::serde_json::Value) -> Vec<&str> {
 struct PipelineStep<'a> {
     name: &'a str,
     /// The step's declared `Type`, which decides whether another step may depend on it
-    /// ([`PIPELINE_UNDEPENDABLE_STEP_TYPES`]) and whether it holds branches of its own.
+    /// ([`PIPELINE_UNDEPENDABLE_STEP_TYPES`]), whether it holds branches of its own, and
+    /// whether the run can perform it ([`crate::state::dispatch_pipeline_steps`]).
     step_type: &'a str,
     depends_on: Vec<&'a str>,
     display_name: Option<&'a str>,
     description: Option<&'a str>,
+    /// The Amazon SQS queue a callback step hands its work over through, from the step's
+    /// own `SqsQueueUrl` or from the same key inside its `Arguments`.
+    sqs_queue_url: Option<&'a str>,
+    /// The step's own `Arguments`, which a performed step hands to the worker.
+    arguments: Option<&'a ::serde_json::Value>,
 }
 
 /// Every step one definition declares, in declaration order, plus the index that makes
@@ -417,6 +441,7 @@ fn collect_pipeline_steps<'a>(
             }
         }
         out.by_name.insert(name, out.steps.len());
+        let arguments = member.get("Arguments");
         out.steps.push(PipelineStep {
             name,
             step_type,
@@ -427,6 +452,11 @@ fn collect_pipeline_steps<'a>(
             description: member
                 .get("Description")
                 .and_then(::serde_json::Value::as_str),
+            sqs_queue_url: member
+                .get(PIPELINE_STEP_QUEUE_KEY)
+                .or_else(|| arguments.and_then(|args| args.get(PIPELINE_STEP_QUEUE_KEY)))
+                .and_then(::serde_json::Value::as_str),
+            arguments,
         });
 
         // Only a condition step holds steps of its own, and only under the two branch
