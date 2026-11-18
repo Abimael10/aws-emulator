@@ -25,7 +25,19 @@
 //!   `resourceId` names the resource;
 //! * an update whose updatable members are each optional on their own refuses a
 //!   request carrying none of them with `ValidationException` (400), and leaves the
-//!   stored record exactly as it was.
+//!   stored record exactly as it was;
+//! * a value outside a constraint the MODEL declares is refused with the modelled
+//!   `ValidationException` (400) whose `message` is
+//!   `<N> validation error(s) detected. ` over one clause per failing member —
+//!   `Value at '<JSON pointer>' failed to satisfy constraint: <requirement>`, with no
+//!   value of the caller's in it — and whose `fieldList` carries that same clause under
+//!   the pointer naming its member;
+//! * a refusal this service words ITSELF names the member at fault in `fieldList` by the
+//!   member's own name, and the identifier-format gate states there the one sentence it
+//!   states in `message`.
+//!
+//! The constraint rows reach operations beyond the brand profiles, because the envelope is
+//! the service's rather than one operation's: `call` addresses any of them.
 
 use std::sync::Arc;
 
@@ -731,5 +743,346 @@ async fn an_update_carrying_nothing_is_refused_before_the_identifier_is_resolved
             "case {case}: unexpected message, got {:?}",
             refused.body
         );
+    }
+}
+
+/// The clause this service states about one failing member: the member as the JSON
+/// pointer that names it in the request body, and the requirement it failed.
+fn constraint_clause(pointer: &str, requirement: &str) -> String {
+    format!("Value at '{pointer}' failed to satisfy constraint: {requirement}")
+}
+
+/// One row of the constraint table below: the case it names, the request that breaks one
+/// modelled constraint (method, path, body), and the clause the refusal must state about it
+/// (the member's JSON pointer and the requirement it failed).
+type ConstraintRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<Value>,
+    &'static str,
+    String,
+);
+
+#[tokio::test]
+async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_field_list() {
+    let em = Emulator::new();
+
+    // One row per class of modelled constraint, spread over the operations and depths
+    // this service declares them at rather than over the one request a report cited.
+    // Sources for the bounds and value sets: `smithy_query(query="shape",
+    // shape="RegistrationIdOrArn,BrandProfileName,CodeConfigurationParameters,CodeType,\
+    // MaxResults,Tag")`.
+    let rows: Vec<ConstraintRow> = vec![
+        (
+            "a body member outside its @pattern",
+            "POST",
+            "/v1/brand-profiles/create-from-registration",
+            Some(json!({
+                "registrationId": "not a valid registration id!!",
+                "brandProfileName": "from-registration",
+            })),
+            "/registrationId",
+            "Member must satisfy regular expression pattern: ^[A-Za-z0-9_:/-]+$".to_string(),
+        ),
+        (
+            "a required body member absent",
+            "POST",
+            "/v1/brand-profiles",
+            Some(json!({})),
+            "/brandProfileName",
+            "Member must not be null".to_string(),
+        ),
+        (
+            "a body member past its @length maximum",
+            "POST",
+            "/v1/brand-profiles",
+            Some(json!({ "brandProfileName": "n".repeat(65) })),
+            "/brandProfileName",
+            "Member must have length between 1 and 64, inclusive".to_string(),
+        ),
+        (
+            "a nested member above its @range",
+            "POST",
+            "/v1/notify-code-configurations",
+            Some(json!({
+                "notifyCodeConfigurationName": "policy",
+                "codeConfigurationParameters": { "codeLength": 9 },
+            })),
+            "/codeConfigurationParameters/codeLength",
+            "Member must be between 4 and 8, inclusive".to_string(),
+        ),
+        (
+            "the same nested member below its @range: the same window",
+            "POST",
+            "/v1/notify-code-configurations",
+            Some(json!({
+                "notifyCodeConfigurationName": "policy",
+                "codeConfigurationParameters": { "codeLength": 3 },
+            })),
+            "/codeConfigurationParameters/codeLength",
+            "Member must be between 4 and 8, inclusive".to_string(),
+        ),
+        (
+            "another nested member of the same structure",
+            "POST",
+            "/v1/notify-code-configurations",
+            Some(json!({
+                "notifyCodeConfigurationName": "policy",
+                "codeConfigurationParameters": { "validityPeriodMinutes": 61 },
+            })),
+            "/codeConfigurationParameters/validityPeriodMinutes",
+            "Member must be between 1 and 60, inclusive".to_string(),
+        ),
+        (
+            "a nested member outside its enumerated value set",
+            "POST",
+            "/v1/notify-code-configurations",
+            Some(json!({
+                "notifyCodeConfigurationName": "policy",
+                "codeConfigurationParameters": { "codeType": "ROMAN" },
+            })),
+            "/codeConfigurationParameters/codeType",
+            "Member must satisfy enum value set: [NUMERIC, ALPHA, ALPHANUMERIC]".to_string(),
+        ),
+        (
+            "a member of a list element, reported at its 0-based position",
+            "POST",
+            "/v1/brand-profiles",
+            Some(json!({
+                "brandProfileName": "tagged",
+                "tags": [{ "key": "k".repeat(129), "value": "v" }],
+            })),
+            "/tags/0/key",
+            "Member must have length between 1 and 128, inclusive".to_string(),
+        ),
+        (
+            "a member of a LATER list element",
+            "POST",
+            "/v1/brand-profiles",
+            Some(json!({
+                "brandProfileName": "tagged",
+                "tags": [
+                    { "key": "env", "value": "prod" },
+                    { "key": "k".repeat(129), "value": "v" },
+                ],
+            })),
+            "/tags/1/key",
+            "Member must have length between 1 and 128, inclusive".to_string(),
+        ),
+        (
+            "a query-bound member below its @range",
+            "GET",
+            "/v1/brand-profiles?maxResults=0",
+            None,
+            "/maxResults",
+            "Member must be between 1 and 100, inclusive".to_string(),
+        ),
+        (
+            "a query-bound member above the same @range",
+            "GET",
+            "/v1/brand-profiles?maxResults=101",
+            None,
+            "/maxResults",
+            "Member must be between 1 and 100, inclusive".to_string(),
+        ),
+    ];
+
+    for (case, method, path, body, pointer, requirement) in rows {
+        let refused = em.call(method, path, body).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected 400, got {} / {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: unexpected error code, got {:?}",
+            refused.error
+        );
+        let clause = constraint_clause(pointer, &requirement);
+        let expected = format!("1 validation error detected. {clause}");
+        assert_eq!(
+            refused.string("message"),
+            expected,
+            "case {case:?}: expected message {expected:?}, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.body["fieldList"],
+            json!([{ "path": pointer, "message": clause }]),
+            "case {case:?}: the refusal must list the member at fault, got {:?}",
+            refused.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_constraint_refusal_states_no_value_the_request_carried() {
+    // The summary message reports the member and the rule, never the input: a caller's
+    // own bytes — which can carry anything, and which some members of this service are
+    // modelled `@sensitive` for — are not echoed back inside it.
+    let em = Emulator::new();
+
+    // (case, method, path, body, the submitted value no part of the refusal may carry)
+    let rows: Vec<(&str, &str, &str, Option<Value>, String)> = vec![
+        (
+            "an identifier outside its pattern",
+            "POST",
+            "/v1/brand-profiles/create-from-registration",
+            Some(json!({
+                "registrationId": "not a valid registration id!!",
+                "brandProfileName": "from-registration",
+            })),
+            "not a valid registration id!!".to_string(),
+        ),
+        (
+            "a sensitive member outside its length",
+            "POST",
+            "/v1/notify-code-configurations",
+            Some(json!({
+                "notifyCodeConfigurationName": "policy",
+                "clientToken": "t".repeat(129),
+            })),
+            "t".repeat(129),
+        ),
+        (
+            "an over-long name",
+            "POST",
+            "/v1/brand-profiles",
+            Some(json!({ "brandProfileName": "n".repeat(65) })),
+            "n".repeat(65),
+        ),
+    ];
+
+    for (case, method, path, body, submitted) in rows {
+        let refused = em.call(method, path, body).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected 400, got {} / {:?}",
+            refused.status, refused.body
+        );
+        let rendered = refused.body.to_string();
+        assert!(
+            !rendered.contains(&submitted),
+            "case {case:?}: the refusal must carry no submitted value, got {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_over_several_members_counts_them_and_lists_each() {
+    // Two members of one request outside their own constraints: the envelope counts the
+    // clauses, pluralises with the count, joins them, and lists every one of them.
+    let em = Emulator::new();
+    let refused = em
+        .call(
+            "POST",
+            "/v1/brand-profiles/create-from-registration",
+            Some(json!({
+                "registrationId": "not a valid registration id!!",
+                "brandProfileName": "a name that is far too long to be accepted here, and then \
+                                     some more of it",
+            })),
+        )
+        .await;
+    assert_eq!(
+        refused.status, 400,
+        "expected 400, got {} / {:?}",
+        refused.status, refused.body
+    );
+    let listed = refused.body["fieldList"]
+        .as_array()
+        .unwrap_or_else(|| panic!("fieldList is not an array in {}", refused.body))
+        .clone();
+    assert!(
+        listed.len() >= 2,
+        "both members at fault must be listed, got {:?}",
+        refused.body
+    );
+    let clauses: Vec<String> = listed
+        .iter()
+        .map(|field| {
+            field["message"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a fieldList entry carries no message in {}", refused.body))
+                .to_string()
+        })
+        .collect();
+    let expected = format!(
+        "{} validation errors detected. {}",
+        listed.len(),
+        clauses.join("; ")
+    );
+    assert_eq!(
+        refused.string("message"),
+        expected,
+        "the envelope must count and join its clauses, got {:?}",
+        refused.body
+    );
+    let pointers: Vec<&str> = listed
+        .iter()
+        .filter_map(|field| field["path"].as_str())
+        .collect();
+    for member in ["/registrationId", "/brandProfileName"] {
+        assert!(
+            pointers.contains(&member),
+            "case {member:?}: every member at fault is listed, got {pointers:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_identifier_format_gate_names_its_member_and_states_one_sentence() {
+    // The gate this service applies before any lookup states its one sentence twice: as
+    // the summary, and as the entry for the member the value arrived on — named by the
+    // member's own name, the spelling every refusal this service words itself uses.
+    let em = Emulator::new();
+
+    for identifier in malformed_single_segment_identifiers() {
+        for (operation, reply) in [
+            ("GetBrandProfile", em.get(&identifier).await),
+            ("DeleteBrandProfile", em.delete(&identifier).await),
+            (
+                "UpdateBrandProfile",
+                em.update(&identifier, json!({ "brandProfileName": "renamed" }))
+                    .await,
+            ),
+            (
+                "ListBrandProfileAttributes",
+                em.list_attributes(&identifier).await,
+            ),
+            (
+                "GetBrandProfileAttribute",
+                em.get_attribute(&identifier, "CompanyName").await,
+            ),
+        ] {
+            let case = format!("{operation} identifier={identifier:?}");
+            assert_eq!(
+                reply.status, 400,
+                "case {case}: expected 400, got {} / {:?}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("ValidationException"),
+                "case {case}: unexpected error code, got {:?}",
+                reply.error
+            );
+            let stated = invalid_format_message(&identifier);
+            assert_eq!(
+                reply.string("message"),
+                stated,
+                "case {case}: expected message {stated:?}, got {:?}",
+                reply.body
+            );
+            assert_eq!(
+                reply.body["fieldList"],
+                json!([{ "path": "brandProfileId", "message": stated }]),
+                "case {case}: the gate must name the member it refused, got {:?}",
+                reply.body
+            );
+        }
     }
 }

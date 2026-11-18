@@ -179,13 +179,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
+        // The parameters this request asks for, which is what a repeat of its
+        // `clientToken` is compared against. Both parameter structures are kept exactly
+        // as supplied: no value is applied for a member the request omits, and the
+        // passcode defaults are applied when a code is sent rather than at create time.
+        let requested = crate::state::NotifyCodeConfigurationCreate {
+            name: input.notify_code_configuration_name,
+            code_configuration_parameters: input.code_configuration_parameters,
+            channel_parameters: input.channel_parameters,
+            deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.key, tag.value))
+                .collect(),
+        };
+
         // `clientToken` is `@idempotencyToken`: a repeat of a request already served
-        // reports the SAME configuration instead of creating a second one.
+        // reports the SAME configuration instead of creating a second one — and only a
+        // repeat of THAT request does. A caller that reused the token for different
+        // parameters is told so, rather than handed the first request's configuration as
+        // if the new parameters had been applied.
         if let Some(existing) = input
             .client_token
             .as_deref()
             .and_then(|token| store.notify_code_configuration_minted_by(token))
         {
+            if existing.created_from != requested {
+                return Err(
+                    CreateNotifyCodeConfigurationErrorModeled::ValidationException(
+                        crate::state::idempotency_mismatch(),
+                    )
+                    .into(),
+                );
+            }
             return Ok(CreateNotifyCodeConfigurationOutput {
                 notify_code_configuration: crate::state::notify_code_configuration_view(existing),
             });
@@ -214,22 +242,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::NotifyCodeConfigurationRecord {
             arn: crate::state::notify_code_configuration_arn(&region, &id),
             id: id.clone(),
-            name: input.notify_code_configuration_name,
+            name: requested.name.clone(),
             // Both parameter structures are stored exactly as supplied: no value is
             // applied for a member the request omits, and the passcode defaults are
             // applied when a code is sent rather than at create time.
-            code_configuration_parameters: input.code_configuration_parameters,
-            channel_parameters: input.channel_parameters,
-            deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
+            code_configuration_parameters: requested.code_configuration_parameters.clone(),
+            channel_parameters: requested.channel_parameters.clone(),
+            deletion_protection_enabled: requested.deletion_protection_enabled,
             created_at: now,
             updated_at: now,
-            tags: input
-                .tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|tag| (tag.key, tag.value))
-                .collect(),
+            tags: requested.tags.clone(),
             client_token: input.client_token,
+            created_from: requested,
         };
         // Insert, then report from the record now in the store.
         let stored = store.notify_code_configurations.entry(id).or_insert(record);

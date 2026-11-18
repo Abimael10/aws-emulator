@@ -848,16 +848,33 @@ async fn a_value_outside_a_modelled_constraint_is_a_400_validation_exception() {
 async fn a_repeated_client_token_reports_the_first_profile() {
     let em = Emulator::new();
 
-    // Rows differ in what the repeat asks for: the same body, a different name, and a
-    // different deletionProtectionEnabled. An idempotent repeat answers the first
-    // result in every one.
-    let repeats: Vec<Value> = vec![
-        json!({ "brandProfileName": "first" }),
-        json!({ "brandProfileName": "second" }),
-        json!({ "brandProfileName": "first", "deletionProtectionEnabled": true }),
+    // Rows differ in what the repeat asks for: the same body, which is the repeat an
+    // idempotent retry sends and which answers the first result; and two that differ
+    // from it — a different name, and a different deletionProtectionEnabled — which are
+    // a reuse of the token for ANOTHER request and are refused rather than served the
+    // first profile.
+    let repeats: Vec<(Value, u16)> = vec![
+        (json!({ "brandProfileName": "first" }), 200),
+        (
+            json!({ "brandProfileName": "first", "tags": [] }),
+            200,
+        ),
+        (json!({ "brandProfileName": "second" }), 400),
+        (
+            json!({ "brandProfileName": "first", "deletionProtectionEnabled": true }),
+            400,
+        ),
+        (
+            json!({ "brandProfileName": "first", "tags": [{ "key": "env", "value": "prod" }] }),
+            400,
+        ),
     ];
 
-    for (index, repeat) in repeats.into_iter().enumerate() {
+    let served = repeats
+        .iter()
+        .filter(|(_, expected)| *expected == 200)
+        .count();
+    for (index, (repeat, expected)) in repeats.into_iter().enumerate() {
         let token = format!("token-{index}");
         let case = format!("clientToken={token} repeat={repeat}");
         let first = em
@@ -873,17 +890,44 @@ async fn a_repeated_client_token_reports_the_first_profile() {
         repeat_body["clientToken"] = json!(token);
         let again = em.create(repeat_body).await;
         assert_eq!(
-            again.status, 200,
-            "case {case}: the repeat must succeed, got {} / {:?}",
+            again.status, expected,
+            "case {case}: expected {expected}, got {} / {:?}",
             again.status, again.body
         );
+        if expected == 200 {
+            assert_eq!(
+                again.body, first.body,
+                "case {case}: a repeated clientToken must report the first result"
+            );
+            continue;
+        }
         assert_eq!(
-            again.body, first.body,
-            "case {case}: a repeated clientToken must report the first result"
+            again.error.as_deref(),
+            Some("ValidationException"),
+            "case {case}: unexpected error code, got {:?}",
+            again.error
+        );
+        assert_eq!(
+            again.string("message"),
+            "The idempotency token and parameters presented do not match",
+            "case {case}: unexpected refusal message, got {:?}",
+            again.body
+        );
+        // The refused replay changed nothing: the profile the token minted still
+        // carries the parameters of the request it served.
+        let stored = em.get(&first.string("brandProfileId")).await;
+        assert_eq!(
+            (
+                stored.string("brandProfileName"),
+                stored.member("deletionProtectionEnabled").clone()
+            ),
+            ("first".to_string(), json!(false)),
+            "case {case}: a refused replay must leave the first profile as it was, got {:?}",
+            stored.body
         );
     }
 
-    // Three tokens, three profiles — the repeats created nothing extra.
+    // One profile per token, and the repeats that were served created nothing extra.
     let listed = em.list("").await;
     assert_eq!(
         listed
@@ -891,9 +935,13 @@ async fn a_repeated_client_token_reports_the_first_profile() {
             .as_array()
             .map(Vec::len)
             .unwrap_or_default(),
-        3,
+        5,
         "a repeated clientToken must not create a second profile, got {:?}",
         listed.body
+    );
+    assert_eq!(
+        served, 2,
+        "the table must cover the repeat that IS idempotent, got {served} such rows"
     );
 }
 

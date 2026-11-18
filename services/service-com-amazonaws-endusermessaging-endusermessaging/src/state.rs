@@ -101,6 +101,27 @@ pub struct NotifyCodeConfigurationRecord {
     /// one. Kept on the record rather than in a map beside it, so the token lives
     /// and dies with the resource it names and is bounded by the same ceiling.
     pub client_token: Option<String>,
+    /// The request that minted this record, as it was submitted.
+    ///
+    /// Kept beside [`Self::client_token`] because a repeat of that token is served this
+    /// record only when the request repeats the one the token served, and an update
+    /// changes the record while leaving the request that minted it what it was.
+    pub created_from: NotifyCodeConfigurationCreate,
+}
+
+/// The parameters a `CreateNotifyCodeConfiguration` request asks a configuration to be
+/// minted with: every member of that input but its `@idempotencyToken`.
+///
+/// Compared member for member against a later request carrying the same token
+/// ([`idempotency_mismatch`]), so it holds the values as submitted — an omitted member
+/// stays omitted, exactly as the record keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifyCodeConfigurationCreate {
+    pub name: String,
+    pub code_configuration_parameters: Option<crate::ops::types::CodeConfigurationParameters>,
+    pub channel_parameters: Option<crate::ops::types::ChannelParameters>,
+    pub deletion_protection_enabled: bool,
+    pub tags: Vec<(String, String)>,
 }
 
 /// The most notify code configurations this emulator stores for one account.
@@ -142,10 +163,11 @@ pub struct ComAmazonawsEndusermessagingEndusermessagingState {
     /// recipient is in a stable order. Bounded by [`MAX_VERIFICATIONS`], and
     /// pruned of elapsed validity windows by [`Self::expire_verifications`].
     pub verifications: BTreeMap<String, Verification>,
-    /// `CreateBrandProfile` idempotency: `clientToken` -> `brandProfileId`.
-    /// Bounded by [`MAX_CREATE_TOKENS`]; write it through
-    /// [`Self::record_create_token`], never directly.
-    pub create_tokens: HashMap<String, String>,
+    /// `CreateBrandProfile` idempotency: `clientToken` -> the profile it minted and
+    /// the request it served ([`CreatedBrandProfile`]). Bounded by
+    /// [`MAX_CREATE_TOKENS`]; write it through [`Self::record_create_token`], never
+    /// directly.
+    pub create_tokens: HashMap<String, CreatedBrandProfile>,
     /// The order [`Self::create_tokens`] was written in, so the cap evicts the
     /// oldest token rather than an arbitrary one.
     create_token_order: VecDeque<String>,
@@ -207,9 +229,14 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
         )
     }
 
-    /// Record `token` as having minted `brand_profile_id`, evicting the oldest
-    /// token first if that would push the map past [`MAX_CREATE_TOKENS`].
-    pub fn record_create_token(&mut self, token: String, brand_profile_id: &str) {
+    /// Record `token` as having minted `brand_profile_id` from `request`, evicting the
+    /// oldest token first if that would push the map past [`MAX_CREATE_TOKENS`].
+    pub fn record_create_token(
+        &mut self,
+        token: String,
+        brand_profile_id: &str,
+        request: BrandProfileCreate,
+    ) {
         while self.create_tokens.len() >= MAX_CREATE_TOKENS {
             match self.create_token_order.pop_front() {
                 Some(oldest) => {
@@ -226,17 +253,30 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
         }
         if self
             .create_tokens
-            .insert(token.clone(), brand_profile_id.to_string())
+            .insert(
+                token.clone(),
+                CreatedBrandProfile {
+                    brand_profile_id: brand_profile_id.to_string(),
+                    request,
+                },
+            )
             .is_none()
         {
             self.create_token_order.push_back(token);
         }
     }
 
+    /// What a previous `CreateBrandProfile` recorded for `token`: the profile it minted
+    /// and the request it served, or `None` for a token this state has no record of.
+    pub fn brand_profile_created_by(&self, token: &str) -> Option<&CreatedBrandProfile> {
+        self.create_tokens.get(token)
+    }
+
     /// Drop every idempotency token that minted `brand_profile_id`, so a token
     /// never outlives the profile it names.
     pub fn forget_create_tokens_for(&mut self, brand_profile_id: &str) {
-        self.create_tokens.retain(|_, minted| minted != brand_profile_id);
+        self.create_tokens
+            .retain(|_, minted| minted.brand_profile_id != brand_profile_id);
         let live = &self.create_tokens;
         self.create_token_order.retain(|token| live.contains_key(token));
     }
@@ -340,29 +380,72 @@ pub fn brand_profile_id_of(id_or_arn: &str) -> Option<&str> {
     is_brand_profile_id(id).then_some(id)
 }
 
-/// The JSON pointer naming the member a refused `brandProfileId` arrived on, as
-/// `ValidationExceptionField$path` documents it.
-const BRAND_PROFILE_ID_POINTER: &str = "/brandProfileId";
+/// The member a refused `brandProfileId` arrived on, as this service's own refusals name a
+/// member at fault in `ValidationExceptionField$path`: by the member's own name.
+const BRAND_PROFILE_ID_MEMBER: &str = "brandProfileId";
 
 /// `ValidationException` for a `BrandProfileIdOrArn` that is not an identifier of a
 /// brand profile at all — neither a bare `brandProfileId` nor the ARN of one.
 ///
 /// Such a value can name no profile in any state, so it is a refusal about the input
 /// rather than about a missing resource. The fixed text is this refusal's; the only
-/// variable part is the value the request gave, and `fieldList` points at the member
-/// it came in on.
+/// variable part is the value the request gave, and `fieldList` names the member it came
+/// in on and states that one sentence about it: the gate has one thing to say about the
+/// member it refused, so the entry says it rather than a second sentence of its own.
 fn invalid_brand_profile_id(id_or_arn: &str) -> crate::ops::types::ValidationException {
+    let stated = format!("invalid brand profile ID format: {id_or_arn}");
     crate::ops::types::ValidationException {
-        message: format!("invalid brand profile ID format: {id_or_arn}"),
+        message: stated.clone(),
         field_list: Some(vec![crate::ops::types::ValidationExceptionField {
-            path: BRAND_PROFILE_ID_POINTER.to_string(),
-            message: format!(
-                "The value must be a brand profile identifier: the bare ID, or the full \
-                 Amazon Resource Name of the form \
-                 arn:<partition>:{ARN_NAMESPACE}:<region>:<account-id>:{BRAND_PROFILE_RESOURCE}/<id>"
-            ),
+            path: BRAND_PROFILE_ID_MEMBER.to_string(),
+            message: stated,
         }]),
     }
+}
+
+/// The fixed sentence a replay of an `@idempotencyToken` carrying other parameters than
+/// the request that token first served is refused with.
+///
+/// Entirely fixed text: it names neither the token nor any value of the request, because
+/// what it reports is that the two do not agree — the caller's remedy is a fresh token,
+/// not a corrected field.
+pub const IDEMPOTENCY_MISMATCH: &str = "The idempotency token and parameters presented do not match";
+
+/// `ValidationException` for a replay of an `@idempotencyToken` whose request differs from
+/// the one it first served.
+///
+/// The whole point of the token is to detect that a caller reused it for a DIFFERENT
+/// request, so such a replay is refused rather than served the resource the first request
+/// minted. It is a statement about the request as a whole — the token together with the
+/// parameters beside it — rather than about one member, so no `fieldList` names a member at
+/// fault.
+pub fn idempotency_mismatch() -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message: IDEMPOTENCY_MISMATCH.to_string(),
+        field_list: None,
+    }
+}
+
+/// The parameters a `CreateBrandProfile` request asks a profile to be minted with: every
+/// member of that input but its `@idempotencyToken`.
+///
+/// Compared member for member against a later request carrying the same token
+/// ([`idempotency_mismatch`]), which is why it is recorded beside the token rather than
+/// read back off the profile: an update or a tag write changes the profile, and neither
+/// changes the request that minted it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrandProfileCreate {
+    pub name: String,
+    pub deletion_protection_enabled: bool,
+    pub tags: Vec<(String, String)>,
+}
+
+/// What a recorded `CreateBrandProfile` idempotency token minted: the profile, and the
+/// request that token served.
+#[derive(Debug, Clone)]
+pub struct CreatedBrandProfile {
+    pub brand_profile_id: String,
+    pub request: BrandProfileCreate,
 }
 
 /// `ValidationException` for an update request that carries no updatable member at

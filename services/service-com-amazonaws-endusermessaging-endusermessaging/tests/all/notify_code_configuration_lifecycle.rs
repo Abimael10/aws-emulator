@@ -599,23 +599,34 @@ async fn a_value_outside_a_modelled_constraint_is_a_400_validation_exception() {
 async fn a_repeated_client_token_reports_the_first_configuration() {
     let em = Emulator::new();
 
-    // Rows differ in what the repeat asks for: the same body, a different name, a
-    // different policy, and a different deletionProtectionEnabled. An idempotent
-    // repeat answers the first result in every one.
-    let repeats: Vec<Value> = vec![
-        json!({ "notifyCodeConfigurationName": "idempotent" }),
-        json!({ "notifyCodeConfigurationName": "renamed-on-repeat" }),
-        json!({
-            "notifyCodeConfigurationName": "idempotent",
-            "codeConfigurationParameters": { "codeLength": 8 },
-        }),
-        json!({
-            "notifyCodeConfigurationName": "idempotent",
-            "deletionProtectionEnabled": true,
-        }),
+    // Rows differ in what the repeat asks for: the same body, which is the repeat an
+    // idempotent retry sends and which answers the first result; and three that differ
+    // from it — a different name, a different passcode policy, and a different
+    // deletionProtectionEnabled — which are a reuse of the token for ANOTHER request and
+    // are refused rather than served the first configuration.
+    let repeats: Vec<(Value, u16)> = vec![
+        (json!({ "notifyCodeConfigurationName": "idempotent" }), 200),
+        (
+            json!({ "notifyCodeConfigurationName": "renamed-on-repeat" }),
+            400,
+        ),
+        (
+            json!({
+                "notifyCodeConfigurationName": "idempotent",
+                "codeConfigurationParameters": { "codeLength": 8 },
+            }),
+            400,
+        ),
+        (
+            json!({
+                "notifyCodeConfigurationName": "idempotent",
+                "deletionProtectionEnabled": true,
+            }),
+            400,
+        ),
     ];
 
-    for (index, repeat) in repeats.into_iter().enumerate() {
+    for (index, (repeat, expected)) in repeats.into_iter().enumerate() {
         let token = format!("token-{index}");
         let case = format!("clientToken={token} repeat={repeat}");
         let first = em
@@ -634,15 +645,39 @@ async fn a_repeated_client_token_reports_the_first_configuration() {
         body["clientToken"] = json!(token);
         let again = em.create(body).await;
         assert_eq!(
-            again.status, 200,
-            "case {case}: the repeat must succeed, got {} / {:?}",
+            again.status, expected,
+            "case {case}: expected {expected}, got {} / {:?}",
             again.status, again.body
         );
+        if expected == 200 {
+            assert_eq!(
+                again.resource(),
+                first.resource(),
+                "case {case}: an idempotent repeat reports the first configuration, got {:?}",
+                again.body
+            );
+            continue;
+        }
         assert_eq!(
-            again.resource(),
-            first.resource(),
-            "case {case}: an idempotent repeat reports the first configuration, got {:?}",
+            again.error.as_deref(),
+            Some("ValidationException"),
+            "case {case}: unexpected error code, got {:?}",
+            again.error
+        );
+        assert_eq!(
+            again.top("message"),
+            "The idempotency token and parameters presented do not match",
+            "case {case}: unexpected refusal message, got {:?}",
             again.body
+        );
+        // The refused replay changed nothing: the configuration the token minted still
+        // reads back exactly as the request it served left it.
+        let stored = em.get(&first.string("notifyCodeConfigurationId")).await;
+        assert_eq!(
+            stored.resource(),
+            first.resource(),
+            "case {case}: a refused replay must leave the first configuration as it was, got {:?}",
+            stored.body
         );
     }
 

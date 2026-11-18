@@ -391,10 +391,15 @@ fn output_for(
 /// `member` the member at fault and `instead` the one that type takes.
 ///
 /// The member is reported at its path WITHIN the request — the element and then the
-/// member — so a caller sending ten attributes is told which of them to change, in the
-/// same path vocabulary and the same wording this service's constraint refusals use: a
-/// list element contributes a ONE-based `<index>.member` segment, as the framework's own
-/// constraint reports spell it.
+/// member — so a caller sending ten attributes is told which of them to change: a list
+/// element contributes a ONE-based `<index>.member` segment, as the validating
+/// framework's own constraint reports spell it.
+///
+/// This is a requirement the MODEL does not declare, stated by the handler, so it keeps
+/// the framework's clause form rather than the envelope
+/// [`crate::service`]'s boundary renderer states a modelled constraint in — which is the
+/// form this API's recordings show for a modelled constraint alone. Nothing recorded
+/// shows this API's words for this rule.
 fn member_not_applicable(
     index: usize,
     member: &str,

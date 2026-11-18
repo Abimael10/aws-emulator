@@ -185,14 +185,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
+        // The parameters this request asks for, which is what a repeat of its
+        // `clientToken` is compared against.
+        let requested = crate::state::BrandProfileCreate {
+            name: input.brand_profile_name,
+            deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.key, tag.value))
+                .collect(),
+        };
+
         // `clientToken` is `@idempotencyToken`: a repeat of a request already served
-        // reports the SAME profile instead of creating a second one.
-        if let Some(id) = input
+        // reports the SAME profile instead of creating a second one — and only a repeat
+        // of THAT request does. A caller that reused the token for different parameters
+        // is told so, rather than handed a profile carrying the first request's values
+        // as if the new ones had been applied.
+        if let Some(minted) = input
             .client_token
             .as_deref()
-            .and_then(|token| store.create_tokens.get(token))
-            .cloned()
+            .and_then(|token| store.brand_profile_created_by(token))
         {
+            if minted.request != requested {
+                return Err(CreateBrandProfileErrorModeled::ValidationException(
+                    crate::state::idempotency_mismatch(),
+                )
+                .into());
+            }
+            let id = minted.brand_profile_id.clone();
             if let Some(existing) = store.brand_profiles.get(&id) {
                 return Ok(output_for(existing));
             }
@@ -224,24 +246,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let profile = crate::state::BrandProfile {
             arn: crate::state::brand_profile_arn(&region, &id),
             id: id.clone(),
-            name: input.brand_profile_name,
+            name: requested.name.clone(),
             // A profile AWS returns from this call is already usable, so it is created
             // in the terminal `ACTIVE` status with no pending transition owed.
             status: crate::state::ACTIVE_STATUS.to_string(),
-            deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
+            deletion_protection_enabled: requested.deletion_protection_enabled,
             created_at: now,
             updated_at: now,
-            tags: input
-                .tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|tag| (tag.key, tag.value))
-                .collect(),
+            tags: requested.tags.clone(),
             default_attributes_created: attributes.len(),
             attributes,
         };
         if let Some(token) = input.client_token {
-            store.record_create_token(token, &id);
+            store.record_create_token(token, &id, requested);
         }
         // Insert, then report from the record now in the store.
         let stored = store.brand_profiles.entry(id).or_insert(profile);

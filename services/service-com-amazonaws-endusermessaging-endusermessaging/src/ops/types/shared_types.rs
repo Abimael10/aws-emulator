@@ -80,7 +80,10 @@ pub struct JobResult {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.endusermessaging#CodeConfigurationParameters")]
-#[derive(Debug, Clone, Default)]
+// `PartialEq`/`Eq`: a repeat of a create's `@idempotencyToken` is served the resource that
+// token minted only when the request repeats the one it served, which is a comparison of
+// these parameter structures member for member (`crate::state::idempotency_mismatch`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodeConfigurationParameters {
     pub code_type: Option<String>,
     pub code_length: Option<i32>,
@@ -89,7 +92,7 @@ pub struct CodeConfigurationParameters {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.endusermessaging#ChannelParameters")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChannelParameters {
     pub text: Option<TextParameters>,
     pub voice: Option<VoiceParameters>,
@@ -98,14 +101,14 @@ pub struct ChannelParameters {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.endusermessaging#TextParameters")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TextParameters {
     pub inline_template_body: Option<String>,
     pub destination_country_parameters: Option<std::collections::HashMap<String, String>>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.endusermessaging#VoiceParameters")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VoiceParameters {
     pub inline_template_body: Option<String>,
     pub language_code: Option<String>,
@@ -114,14 +117,14 @@ pub struct VoiceParameters {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.endusermessaging#NotifyParameters")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NotifyParameters {
     pub notify_template_id: Option<String>,
     pub voice_id: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.endusermessaging#WhatsAppParameters")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WhatsAppParameters {
     pub whats_app_template_name: Option<String>,
     pub language_code: Option<String>,

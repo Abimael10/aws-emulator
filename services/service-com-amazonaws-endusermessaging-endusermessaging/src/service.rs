@@ -24,8 +24,10 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. This service states that refusal in its own modelled
+//!   `ValidationException` instead, which carries a `fieldList` the framework's
+//!   two-field refusal body cannot ([`validation`]), so the seam itself keeps the
+//!   framework's wording for the one refusal class that is not about a member.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -43,6 +45,11 @@
 //! One data plane is mounted here as well: the presigned `mediaDownloadUrl` an attribute
 //! read hands out names no modelled operation, so it is claimed through
 //! [`Service::override_operation`] and served by [`brand_profile_attribute_media`].
+//!
+//! Every MODELLED operation is claimed through that same seam too, so a request refused
+//! before its handler runs is stated in this service's own modelled shape — see
+//! [`validation`], which hands every request it does not refuse straight to the generated
+//! operation.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -50,6 +57,7 @@ use smithy_server_runtime::{
 use std::sync::Arc;
 
 mod brand_profile_attribute_media;
+mod validation;
 
 /// The `com-amazonaws-endusermessaging-endusermessaging` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -62,6 +70,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// media. Claimed through [`Service::override_operation`], which hands it the
     /// requests it claims (see [`brand_profile_attribute_media`]).
     attribute_media: brand_profile_attribute_media::AttributeMediaRoute<Eng>,
+    /// One modelled-refusal wrapper per modelled operation, keyed by the routing key the
+    /// model names that operation by ([`smithy_server_runtime::Operation::NAME`], the same
+    /// key the generated routing table uses). Built once here, never per request; each
+    /// entry is zero-sized, so this is a table of NAMES rather than a second set of
+    /// operations — the operation that serves a request is still the one the generated
+    /// table built from the shared engine.
+    refusals: std::collections::HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -72,6 +87,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             attribute_media: brand_profile_attribute_media::AttributeMediaRoute::new(engine),
+            refusals: validation::modelled_validation_table::<Eng>(),
         }
     }
 }
@@ -110,19 +126,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if self.attribute_media.claims(req).is_some() {
             return Some(&self.attribute_media as &dyn ErasedOperation);
         }
-        None
+        // Every MODELLED operation is served through its modelled-refusal wrapper, so a
+        // request this service refuses before the handler runs is stated in the service's
+        // OWN modelled `ValidationException` — with the `fieldList` the model declares —
+        // instead of the framework's two-field refusal body. The wrapper hands every request
+        // it does not refuse to the generated operation in the routing table, which remains
+        // the only thing that serves one.
+        //
+        // Keyed by the protocol's own routing key, so a request the model names no operation
+        // for resolves to nothing here and keeps the framework's routing failure.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.refusals.get(key).map(|wrapper| &**wrapper)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
+        // service reword it. This service does not reword one HERE, because the
+        // answer it owes such a request is a modelled `ValidationException` whose
+        // `fieldList` names every member at fault, and this seam carries an error
+        // code and a message and nothing else: the refusal is stated in that shape
+        // by [`validation`], in front of every modelled operation, and the few
+        // requests that reach this seam at all (a body no codec can read, an
+        // unauthenticated caller) keep the framework's own code and wording.
         let _ = refusal;
         None
     }
