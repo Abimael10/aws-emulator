@@ -13,7 +13,10 @@
 //! * a resource policy attaches to a NAMESPACE, so an ARN naming a resource of
 //!   any other type is refused by the write, the read and the delete alike, with
 //!   the type the request's own ARN carried named in the refusal — whether or
-//!   not the resource that ARN names exists;
+//!   not the resource that ARN names exists. WHICH of the two refusals it earns
+//!   is the validation layer that catches it: the service's shared ARN resolver
+//!   answers a type segment it resolves no resource of at all, and only a
+//!   segment it does resolve reaches the resource-policy rule proper;
 //! * a policy body that is no JSON policy document is refused with the service's
 //!   fixed parse-failure sentence, which carries no part of the request;
 //! * the document the service reports is the one it was given in ITS canonical
@@ -57,7 +60,8 @@ fn serverless_arn(resource: &str) -> String {
     )
 }
 /// The sentence a resource-policy operation answers an ARN naming a resource of
-/// a type that carries no resource policy with.
+/// a type the shared ARN resolver RESOLVES, but which carries no resource
+/// policy, with.
 ///
 /// Written out here rather than taken from the handler's own catalog: the fixed
 /// text is the requirement, and its one variable part is the resource type read
@@ -69,12 +73,50 @@ fn unsupported_type_message(resource_type: &str) -> String {
     )
 }
 
-/// One row of the resource-type table: the case, the ARN the call carries, and
-/// the resource type the refusal must name.
+/// The fixed text the shared ARN resolver opens its own refusal with, up to the
+/// resource-type segment it quotes.
+const RESOLVER_REFUSAL_PREFIX: &str = "Tagging is not supported for this type of resource: '";
+
+/// The fixed text that closes the resolver's refusal, after the quoted segment.
+const RESOLVER_REFUSAL_SUFFIX: &str =
+    "' (the ARN is potentially malformed, please check the ARN documentation for more information)";
+
+/// The sentence a resource-policy operation answers an ARN whose resource-type
+/// segment names none of the resource types this service resolves an ARN for
+/// with: the refusal of the shared ARN resolver, which runs BEFORE the
+/// resource-policy rule above.
+///
+/// Written out here rather than taken from the handler's own catalog, for the
+/// reason [`unsupported_type_message`] is: the fixed text is the requirement and
+/// its one variable part is the type segment read from the `ResourceArn` the
+/// request carried. Assembled from its two halves so each can be asserted on its
+/// own.
+fn unresolvable_type_message(resource_type: &str) -> String {
+    format!("{RESOLVER_REFUSAL_PREFIX}{resource_type}{RESOLVER_REFUSAL_SUFFIX}")
+}
+
+/// One row of the resource-type table: the case, the ARN the call carries, the
+/// resource type the refusal must name, and whether that type is one the shared
+/// ARN resolver resolves a resource of — which decides WHICH of the two
+/// sentences the refusal carries.
 struct TypeCase {
     case: &'static str,
     resource_arn: String,
     resource_type: &'static str,
+    resolvable: bool,
+}
+
+impl TypeCase {
+    /// The message this row's refusal must carry: the resource-policy rule's
+    /// sentence for a type the ARN resolver resolves, the resolver's own for a
+    /// segment it resolves nothing for.
+    fn expected_message(&self) -> String {
+        if self.resolvable {
+            unsupported_type_message(self.resource_type)
+        } else {
+            unresolvable_type_message(self.resource_type)
+        }
+    }
 }
 
 /// The resource types an Amazon Redshift ARN names, as the published ARN forms
@@ -94,66 +136,81 @@ fn resource_type_table() -> Vec<TypeCase> {
             case: "the cluster this account holds",
             resource_arn: state::cluster_arn("policy-types", REGION),
             resource_type: "cluster",
+            resolvable: true,
         },
         TypeCase {
             case: "a cluster nothing created",
             resource_arn: state::cluster_arn("no-such-cluster", REGION),
             resource_type: "cluster",
+            resolvable: true,
         },
         TypeCase {
             case: "the snapshot this account holds",
             resource_arn: state::snapshot_arn("policy-types", "snap-1", REGION),
             resource_type: "snapshot",
+            resolvable: true,
         },
         TypeCase {
             case: "a snapshot nothing took",
             resource_arn: state::snapshot_arn("policy-types", "no-such-snapshot", REGION),
             resource_type: "snapshot",
+            resolvable: true,
         },
         TypeCase {
+            // A datashare is no resource type the shared ARN resolver resolves a
+            // resource for, so the resolver, not the resource-policy rule, is
+            // what refuses this one.
             case: "a datashare of a namespace",
             resource_arn: redshift_arn(
                 "datashare:3fd3f0cf-11bd-4fd0-9c4b-1c0f2c4b1a4f/sales",
             ),
             resource_type: "datashare",
+            resolvable: false,
         },
         TypeCase {
             case: "a cluster parameter group",
             resource_arn: state::parameter_group_arn("default.redshift-1.0", REGION),
             resource_type: "parametergroup",
+            resolvable: true,
         },
         TypeCase {
             case: "a cluster subnet group",
             resource_arn: state::subnet_group_arn("policy-types-subnets", REGION),
             resource_type: "subnetgroup",
+            resolvable: true,
         },
         TypeCase {
             case: "an HSM configuration",
             resource_arn: state::hsm_configuration_arn("policy-types-hsm", REGION),
             resource_type: "hsmconfiguration",
+            resolvable: true,
         },
         TypeCase {
             case: "an event subscription",
             resource_arn: redshift_arn("eventsubscription:policy-types-events"),
             resource_type: "eventsubscription",
+            resolvable: false,
         },
         TypeCase {
             case: "a serverless workgroup, whose resource portion uses a slash",
             resource_arn: serverless_arn("workgroup/8a7d2f3c-5b1e-4a90-9c2d-6f0b1e3a4c5d"),
             resource_type: "workgroup",
+            resolvable: false,
         },
         TypeCase {
             case: "a serverless snapshot, whose resource portion uses a slash",
             resource_arn: serverless_arn("snapshot/policy-types-snapshot"),
             resource_type: "snapshot",
+            resolvable: true,
         },
         TypeCase {
             // An ARN whose resource portion opens with its separator names no
             // type at all, and the refusal says so with the type it read: the
-            // empty one.
+            // empty one, which the resolver resolves nothing for.
             case: "a resource portion that opens with its separator",
             resource_arn: redshift_arn("/policy-types"),
             resource_type: "",
+            resolvable: false,
         },
     ]
 }
@@ -188,7 +245,7 @@ async fn only_a_namespace_takes_a_resource_policy() {
             assert_refused(&case, &answer, 400, "InvalidParameterValue");
             assert_eq!(
                 answer.text("Message").as_deref(),
-                Some(unsupported_type_message(row.resource_type).as_str()),
+                Some(row.expected_message().as_str()),
                 "case {case}: expected the refusal to name the resource type {:?}, got {:?}",
                 row.resource_type,
                 answer.text("Message")
@@ -215,6 +272,180 @@ async fn only_a_namespace_takes_a_resource_policy() {
         Some(attached.as_str()),
         "case \"the namespace's own document\": expected it untouched, got {:?}",
         stored_policy(&emulator, &namespace)
+    );
+}
+
+/// Resource-type segments the service's shared ARN resolver DOES resolve a
+/// resource for, none of which carries a resource policy.
+///
+/// Source: the resource types a Redshift tag attaches to —
+/// `smithy_query(query="doc", shape="TaggedResource", member="ResourceType")`
+/// ("Cluster, CIDR/IP, EC2 security group, Snapshot, Cluster security group,
+/// Subnet group, HSM connection, HSM certificate, Parameter group") plus the two
+/// `smithy_query(query="doc", shape="DescribeTagsMessage", member="ResourceType")`
+/// adds ("Snapshot copy grant", "Integration") — written as the ARN segments the
+/// Amazon Redshift Cluster Management Guide's "Constructing an Amazon Redshift
+/// Amazon Resource Name (ARN)" page (the page that doc links to) publishes for
+/// them. Every entry here is a type the table above does not carry.
+const RESOLVED_TYPES: [&str; 6] = [
+    "securitygroup",
+    "securitygroupingress-cidr",
+    "securitygroupingress-ec2securitygroup",
+    "hsmclientcertificate",
+    "snapshotcopygrant",
+    "integration",
+];
+
+/// Resource-type segments the shared ARN resolver resolves NOTHING for: resource
+/// portions naming Redshift concepts that are absent from the catalog above — a
+/// datashare, a usage limit, a scheduled action, an IAM Identity Center
+/// application, a database user — beside a segment no published ARN form uses at
+/// all and an empty one.
+///
+/// Source for the segments: the resource portions this service's own ARN
+/// builders and the published ARN forms write for those concepts.
+const UNRESOLVED_TYPES: [&str; 7] = [
+    "datashare",
+    "usagelimit",
+    "scheduledaction",
+    "redshiftidcapplication",
+    "dbuser",
+    "widget",
+    "",
+];
+
+/// The three resource-policy operations' answers to one ARN, so one row of a
+/// table is asserted across the whole surface.
+async fn refusals(
+    emulator: &Emulator,
+    resource_arn: &str,
+) -> Vec<(&'static str, Answer)> {
+    let document = policy_with_sid("ArnResolution");
+    vec![
+        (
+            "PutResourcePolicy",
+            put(emulator, resource_arn, &document).await,
+        ),
+        ("GetResourcePolicy", get(emulator, resource_arn).await),
+        ("DeleteResourcePolicy", delete(emulator, resource_arn).await),
+    ]
+}
+
+/// A resource type the shared ARN resolver resolves, but which carries no
+/// resource policy, is refused by the resource-policy rule — which names the
+/// type, whatever the resource portion after it looks like.
+#[tokio::test]
+async fn a_resolvable_resource_type_is_refused_by_the_resource_policy_rule() {
+    let emulator = Emulator::new();
+
+    for resource_type in RESOLVED_TYPES {
+        // Both separators a published ARN writes its resource portion with, and
+        // a portion that is the type alone: the refusal is about the TYPE, not
+        // about how the identifier after it is spelled.
+        for (shape, resource) in [
+            (
+                "a colon before the identifier",
+                format!("{resource_type}:policy-arn-probe"),
+            ),
+            (
+                "a slash before the identifier",
+                format!("{resource_type}/policy-arn-probe"),
+            ),
+            ("no identifier at all", resource_type.to_string()),
+        ] {
+            let resource_arn = redshift_arn(&resource);
+            for (action, answer) in refusals(&emulator, &resource_arn).await {
+                let case = format!("{resource_type} with {shape} through {action}");
+                assert_refused(&case, &answer, 400, "InvalidParameterValue");
+                assert_eq!(
+                    answer.text("Message").as_deref(),
+                    Some(unsupported_type_message(resource_type).as_str()),
+                    "case {case}: expected the resource-policy rule's sentence naming {resource_type:?}, got {:?}",
+                    answer.text("Message")
+                );
+            }
+            assert_eq!(
+                stored_policy(&emulator, &resource_arn),
+                None,
+                "case {resource_type} with {shape}: expected the refused write to attach nothing, got {:?}",
+                stored_policy(&emulator, &resource_arn)
+            );
+        }
+    }
+}
+
+/// A resource-type segment the shared ARN resolver resolves nothing for is
+/// refused by the RESOLVER, with its two fixed halves around the segment the
+/// request's own ARN carried.
+#[tokio::test]
+async fn an_unresolvable_resource_type_is_refused_by_the_arn_resolver() {
+    let emulator = Emulator::new();
+
+    for resource_type in UNRESOLVED_TYPES {
+        // A resource portion written `<type>/<identifier>` is the one form every
+        // segment takes, the empty one included.
+        let mut shapes = vec![(
+            "a slash before the identifier",
+            format!("{resource_type}/probe"),
+        )];
+        // The other two forms need a NON-empty segment: with an empty one, a
+        // colon after it leaves the ARN's sixth field empty and a portion that
+        // is the segment alone leaves no resource portion at all — in both cases
+        // the value is no ARN, which is a different refusal.
+        if !resource_type.is_empty() {
+            shapes.push((
+                "a colon before the identifier",
+                format!("{resource_type}:11111111-1111-1111-1111-111111111111/probe"),
+            ));
+            shapes.push(("no identifier at all", resource_type.to_string()));
+        }
+        for (shape, resource) in shapes {
+            let resource_arn = redshift_arn(&resource);
+            for (action, answer) in refusals(&emulator, &resource_arn).await {
+                let case = format!("{resource_type:?} with {shape} through {action}");
+                assert_refused(&case, &answer, 400, "InvalidParameterValue");
+                let message = answer.text("Message").unwrap_or_default();
+                assert_eq!(
+                    message,
+                    unresolvable_type_message(resource_type),
+                    "case {case}: expected the resolver's sentence quoting {resource_type:?}, got {message:?}"
+                );
+                // The halves are asserted on their own too, so a sentence that
+                // matched by carrying different fixed text cannot pass, and the
+                // segment between them is read by stripping EXACTLY one of each.
+                let quoted = message
+                    .strip_prefix(RESOLVER_REFUSAL_PREFIX)
+                    .and_then(|rest| rest.strip_suffix(RESOLVER_REFUSAL_SUFFIX));
+                assert_eq!(
+                    quoted,
+                    Some(resource_type),
+                    "case {case}: expected the resolver's fixed halves around the segment the ARN carried, got {message:?}"
+                );
+            }
+            assert_eq!(
+                stored_policy(&emulator, &resource_arn),
+                None,
+                "case {resource_type:?} with {shape}: expected the refused write to attach nothing, got {:?}",
+                stored_policy(&emulator, &resource_arn)
+            );
+        }
+    }
+
+    // Every call above was refused, so this account holds no policy at all — and
+    // a namespace ARN still takes one, so the refusals are about the type
+    // segment rather than an emulator refusing everything.
+    assert_eq!(
+        stored_arns(&emulator),
+        Vec::<String>::new(),
+        "case \"the policies this account holds\": expected none, got {:?}",
+        stored_arns(&emulator)
+    );
+    let namespace = serverless_namespace_arn("4f2b1d7e-9c3a-4f55-8c2b-7d1e0a6b3c48");
+    let attached = put(&emulator, &namespace, &policy_with_sid("Control")).await;
+    assert_eq!(
+        attached.status, 200,
+        "case \"a namespace ARN\": expected 200, got {} with body {}",
+        attached.status, attached.body
     );
 }
 

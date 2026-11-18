@@ -116,6 +116,23 @@ pub fn published_resource_types() -> Vec<&'static str> {
 /// the Cluster Management Guide publishes).
 const ARN_SERVICE: &str = "redshift";
 
+/// The taggable resource type an ARN's resource-type SEGMENT names, matched as
+/// an ARN carries it — exactly, with no folding — or `None` when the segment
+/// names none of [`TAGGABLE_RESOURCE_TYPES`].
+///
+/// The ONE segment lookup over the catalog, so every caller that reads a type
+/// out of an ARN ([`arn_resource`] here, the resource-policy ARN resolution in
+/// [`super::is_resolvable_arn_resource_type`]) agrees about which segments this
+/// service resolves a resource for, and adding a type to the catalog reaches all
+/// of them. [`resource_type_named`] is the other lookup — for a request's
+/// `ResourceType` FILTER, which a caller may spell in any case or separator
+/// style and by the documented name.
+pub fn resource_type_of_arn_segment(segment: &str) -> Option<&'static TaggableResourceType> {
+    TAGGABLE_RESOURCE_TYPES
+        .iter()
+        .find(|candidate| candidate.arn_segment == segment)
+}
+
 /// The published resource type and the bare identifier the resource portion of
 /// `resource_name` carries, or `None` when the value is not an Amazon Redshift
 /// ARN of a type this service publishes.
@@ -142,9 +159,7 @@ fn arn_resource(resource_name: &str) -> Option<(&'static str, &str)> {
     fields.next()?;
     let resource_type = fields.next()?;
     let identifier = fields.next().filter(|value| !value.is_empty())?;
-    let published = TAGGABLE_RESOURCE_TYPES
-        .iter()
-        .find(|candidate| candidate.arn_segment == resource_type)?;
+    let published = resource_type_of_arn_segment(resource_type)?;
     Some((published.arn_segment, identifier))
 }
 

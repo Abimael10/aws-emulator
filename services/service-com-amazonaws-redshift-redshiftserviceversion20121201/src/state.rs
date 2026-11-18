@@ -1838,10 +1838,13 @@ pub enum PolicyResourceRefusal {
     /// Redshift resource policy — the modelled `UnsupportedOperationFault`,
     /// declared by all three resource-policy operations.
     UnsupportedResource(String),
-    /// The ARN names a resource of this service of a TYPE that carries no
-    /// resource policy ([`POLICY_RESOURCE_TYPE`]). The service models no error
-    /// for it: it is a fact about the parameter's value, so it is the up-front
-    /// parameter refusal, `InvalidParameterValue`.
+    /// The ARN names a resource of a TYPE that carries no resource policy
+    /// ([`POLICY_RESOURCE_TYPE`]), worded by the layer that caught it: the
+    /// shared ARN resolver for a type segment it resolves no resource of at all
+    /// ([`is_resolvable_arn_resource_type`]), the resource-policy rule for one it
+    /// does. The service models no error for either: both are facts about the
+    /// parameter's value, so both are the up-front parameter refusal,
+    /// `InvalidParameterValue`.
     UnsupportedResourceType(String),
     /// The ARN is this service's own and names a resource that does not exist,
     /// so there is no resource to attach a policy to, report one for or detach
@@ -1876,11 +1879,18 @@ pub fn check_policy_resource_arn(resource_arn: &str) -> Result<(), PolicyResourc
     // A resource policy is attached to a namespace, so every other type of
     // resource either service publishes is refused on the strength of the type
     // alone — before the resource is resolved and before any policy is
-    // attached, reported or detached.
+    // attached, reported or detached. WHICH refusal it earns is the layer that
+    // catches it: the shared ARN resolver answers a type segment it resolves no
+    // resource of at all, and only a segment it does resolve reaches the
+    // resource-policy rule proper.
     let resource_type = arn_resource_type(resource_arn);
     if resource_type != POLICY_RESOURCE_TYPE {
         return Err(PolicyResourceRefusal::UnsupportedResourceType(
-            unsupported_policy_resource_type_message(resource_type),
+            if is_resolvable_arn_resource_type(resource_type) {
+                unsupported_policy_resource_type_message(resource_type)
+            } else {
+                unresolvable_arn_resource_type_message(resource_type)
+            },
         ));
     }
     Ok(())

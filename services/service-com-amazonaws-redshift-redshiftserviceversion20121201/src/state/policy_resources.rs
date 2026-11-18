@@ -61,18 +61,61 @@ pub fn arn_resource_type(resource_arn: &str) -> &str {
     portion.split(['/', ':']).next().unwrap_or(portion)
 }
 
-/// Why a resource-policy request naming a resource of a type that carries no
-/// resource policy is refused, naming the type it carried.
+/// Why a resource-policy request naming a resource of a type the service's ARN
+/// resolver knows, but which carries no resource policy, is refused — naming the
+/// type it carried.
 ///
 /// A resource policy is attached to a namespace ([`POLICY_RESOURCE_TYPE`]), so a
 /// request naming any other type of this service's resources — a cluster, a
-/// snapshot, a datashare — is refused on the strength of the TYPE alone, before
-/// the resource it names is resolved and before any policy is attached, read or
-/// detached. The sentence's only variable part is the type read from the
+/// snapshot, a parameter group — is refused on the strength of the TYPE alone,
+/// before the resource it names is resolved and before any policy is attached,
+/// read or detached. The sentence's only variable part is the type read from the
 /// request's own `ResourceArn` ([`arn_resource_type`]).
+///
+/// This is the SECOND of the two refusals an unsupported `ResourceArn` earns:
+/// the resource-policy rule proper, which only a type the shared ARN resolver
+/// resolves a resource for reaches ([`is_resolvable_arn_resource_type`]).
 pub fn unsupported_policy_resource_type_message(resource_type: &str) -> String {
     format!(
         "Resource type {resource_type} isn't supported for the resource policy. Choose another resource type."
+    )
+}
+
+/// Whether `resource_type` is a resource type the service's shared ARN resolver
+/// names a resource of.
+///
+/// The resolver an operation taking a resource ARN validates that ARN through is
+/// the one the tagging surface resolves a `ResourceName` with, so the types it
+/// knows are the types a tag attaches to — the catalog behind
+/// [`super::resource_type_of_arn_segment`], whose segments are the ARN forms the
+/// Cluster Management Guide publishes — together with the namespace a resource
+/// policy itself attaches to ([`POLICY_RESOURCE_TYPE`]). The lookup is that ONE
+/// segment lookup rather than a second walk of the catalog, so the two cannot
+/// drift when a type is added. A segment outside it is one the resolver cannot
+/// tell apart from a misspelled ARN — which is what
+/// [`unresolvable_arn_resource_type_message`] says.
+pub fn is_resolvable_arn_resource_type(resource_type: &str) -> bool {
+    resource_type == POLICY_RESOURCE_TYPE
+        || super::resource_type_of_arn_segment(resource_type).is_some()
+}
+
+/// Why a request carrying an ARN whose resource type the shared ARN resolver
+/// resolves nothing for is refused, naming the type segment it read.
+///
+/// This is the FIRST of the two refusals an unsupported `ResourceArn` earns, and
+/// it comes from the resolver rather than from the operation: a segment naming
+/// none of the resource types this service resolves an ARN for
+/// ([`is_resolvable_arn_resource_type`]) is as likely a malformed ARN as a
+/// resource of some other kind, so the refusal states that resources of this
+/// kind take none of the resource-level metadata the resolver attaches and
+/// points the caller back at the published ARN forms. The one variable part is
+/// the type segment read from the request's own ARN ([`arn_resource_type`]), and
+/// the sentence says nothing about whether such a resource exists.
+pub fn unresolvable_arn_resource_type_message(resource_type: &str) -> String {
+    format!(
+        "Tagging is not supported for this type of resource: '{resource_type}' \
+         (the ARN is potentially malformed, please check the ARN documentation \
+         for more information)"
     )
 }
 
