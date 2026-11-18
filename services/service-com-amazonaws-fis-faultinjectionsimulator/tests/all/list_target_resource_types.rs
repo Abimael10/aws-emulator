@@ -214,9 +214,10 @@ const UNTARGETED_PUBLISHED_TYPES: &[&str] = &[];
 ///
 /// The two tables are independent published data in both directions: an action names the
 /// type it is pointed at, and the listing enumerates the types FIS publishes, which does not
-/// carry every type an action targets. Named here so such a type is a deliberate row rather
-/// than an unnoticed hole.
-const TARGETED_UNPUBLISHED_TYPES: &[&str] = &["aws:ec2:route-table"];
+/// have to carry every type an action targets. Every type a catalogued action targets is
+/// published today, so this list is empty. Named here so the cross-table check below stays an
+/// assertion rather than an exception: a type moving into this position is a deliberate row.
+const TARGETED_UNPUBLISHED_TYPES: &[&str] = &[];
 
 /// The resource type ids this suite expects the list to publish, by the reference named in
 /// the module docs.

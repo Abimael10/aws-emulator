@@ -203,10 +203,12 @@ pub const FIS_ACTION_ID_CONDITION_KEY: &str = "ec2:FisActionId";
 ///   a noun phrase rather than a sentence), and it is the value a client that renders or
 ///   snapshots `Action$description` sees. The published strings follow no one pattern — some
 ///   are imperative (`aws:ec2:reboot-instances`, `aws:ec2:stop-instances`,
-///   `aws:ec2:terminate-instances`, `aws:ssm:start-automation-execution` and
-///   `aws:arc:start-zonal-autoshift` are published that way, which is why they read
-///   differently from their neighbours), others open with the verb in the third person — so a
-///   row carries the string published for ITS id and never one shaped after a sibling row's;
+///   `aws:ec2:terminate-instances`, `aws:ssm:send-command`,
+///   `aws:ssm:start-automation-execution` and `aws:arc:start-zonal-autoshift` are published
+///   that way, which is why they read differently from their neighbours), others open with
+///   the verb in the third person — so a row carries the string published for ITS id and
+///   never one shaped after a sibling row's, and a row whose published string is not
+///   established keeps the text it has rather than being restated to look published;
 /// * an action FIS performs through another service's agent carries that service's own
 ///   call as its permission — the `aws:ecs:task-*` actions run through SSM on the task, so
 ///   `ssm:SendCommand` is what their execution role needs, and the `aws:eks:*` actions
@@ -350,41 +352,9 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
         permissions: &[],
     },
     ActionCatalogEntry {
-        id: "aws:ec2:api-error",
-        description: "Injects the specified error into the EC2 API requests made with a set of \
-                      IAM roles.",
-        parameters: &[
-            ActionCatalogParameter {
-                name: "duration",
-                description: "The duration of the action, in ISO 8601 format.",
-                required: true,
-            },
-            ActionCatalogParameter {
-                name: "errorCode",
-                description: "The error code of the error to return.",
-                required: true,
-            },
-            ActionCatalogParameter {
-                name: "operations",
-                description: "The API operations to affect, separated by commas.",
-                required: true,
-            },
-            ActionCatalogParameter {
-                name: "percentage",
-                description: "The percentage of calls to affect.",
-                required: false,
-            },
-        ],
-        targets: &[ActionCatalogTarget {
-            name: "Roles",
-            resource_type: "aws:iam:role",
-        }],
-        permissions: &[&[EC2_INJECT_API_ERROR]],
-    },
-    ActionCatalogEntry {
         id: "aws:ec2:api-insufficient-instance-capacity-error",
-        description: "Injects insufficient instance capacity errors into the EC2 RunInstances \
-                      requests made with a set of IAM roles.",
+        description: "Cause the EC2 service to return insufficient capacity error responses \
+                      for specific callers.",
         parameters: &[
             ActionCatalogParameter {
                 name: "availabilityZoneIdentifiers",
@@ -410,8 +380,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ec2:asg-insufficient-instance-capacity-error",
-        description: "Injects insufficient instance capacity errors into the instance launches \
-                      of a set of Auto Scaling groups.",
+        description: "Cause the targeted AutoScaling Groups to receive insufficient instance \
+                      capacity errors when attempting to provision new instances.",
         parameters: &[
             ActionCatalogParameter {
                 name: "availabilityZoneIdentifiers",
@@ -447,7 +417,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ec2:send-spot-instance-interruptions",
-        description: "Interrupts a set of Spot Instances after sending an interruption notice.",
+        description: "Interrupt the specified EC2 Spot instances.",
         parameters: &[ActionCatalogParameter {
             name: "durationBeforeInterruption",
             description: "The length of time before the interruption notice is sent, in ISO 8601 \
@@ -495,8 +465,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:drain-container-instances",
-        description: "Drains a percentage of the container instances of a set of Amazon ECS \
-                      clusters.",
+        description: "Drain percentage of underlying EC2 instances on an ECS cluster.",
         parameters: &[
             ActionCatalogParameter {
                 name: "drainagePercentage",
@@ -517,7 +486,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:stop-task",
-        description: "Stops a set of Amazon ECS tasks.",
+        description: "Stop the specified ECS tasks of an ECS cluster.",
         parameters: &[],
         targets: &[ActionCatalogTarget {
             name: "Tasks",
@@ -527,7 +496,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-cpu-stress",
-        description: "Runs CPU stress on a set of Amazon ECS tasks.",
+        description: "It runs CPU stress via stress-ng tool.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -559,7 +528,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-io-stress",
-        description: "Runs I/O stress on a set of Amazon ECS tasks.",
+        description: "It runs IO stress via stress-ng tool.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -1127,7 +1096,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             required: true,
         }],
         targets: &[ActionCatalogTarget {
-            name: "Streams",
+            name: "KinesisStreams",
             resource_type: "aws:kinesis:stream",
         }],
         // See `aws:dsql:cluster-connection-failure`: no single API call is stated for it.
@@ -1143,7 +1112,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             required: true,
         }],
         targets: &[ActionCatalogTarget {
-            name: "Streams",
+            name: "KinesisStreams",
             resource_type: "aws:kinesis:stream",
         }],
         // See `aws:dsql:cluster-connection-failure`: no single API call is stated for it.
@@ -1257,7 +1226,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             required: true,
         }],
         targets: &[ActionCatalogTarget {
-            name: "Clusters",
+            name: "MultiRegionClusters",
             resource_type: "aws:memorydb:multi-region-cluster",
         }],
         // See `aws:dsql:cluster-connection-failure`: no single API call is stated for it.
@@ -1293,35 +1262,10 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             required: true,
         }],
         targets: &[ActionCatalogTarget {
-            name: "VpcEndpoints",
+            name: "VPCEndpoints",
             resource_type: "aws:ec2:vpc-endpoint",
         }],
         // See `aws:dsql:cluster-connection-failure`: no single API call is stated for it.
-        permissions: &[],
-    },
-    ActionCatalogEntry {
-        id: "aws:network:route-table-disrupt-connectivity",
-        description: "Disrupts connectivity to a service for the subnets a set of route tables \
-                      serve.",
-        parameters: &[
-            ActionCatalogParameter {
-                name: "duration",
-                description: "The duration of the action, in ISO 8601 format.",
-                required: true,
-            },
-            ActionCatalogParameter {
-                name: "service",
-                description: "The service to disrupt connectivity to.",
-                required: true,
-            },
-        ],
-        targets: &[ActionCatalogTarget {
-            name: "RouteTables",
-            resource_type: "aws:ec2:route-table",
-        }],
-        // The reference lists several route-mutating EC2 calls for this action rather than one
-        // primary call, so this table records none rather than one it would guess: the
-        // privileges gate shows nothing about an action whose entry records no permission.
         permissions: &[],
     },
     ActionCatalogEntry {
@@ -1341,10 +1285,12 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             },
         ],
         targets: &[ActionCatalogTarget {
-            name: "RouteTables",
-            resource_type: "aws:ec2:route-table",
+            name: "Subnets",
+            resource_type: "aws:ec2:subnet",
         }],
-        // See `aws:network:route-table-disrupt-connectivity` for why no permission is recorded.
+        // The reference lists several route-mutating EC2 calls for this action rather than one
+        // primary call, so this table records none rather than one it would guess: the
+        // privileges gate shows nothing about an action whose entry records no permission.
         permissions: &[],
     },
     ActionCatalogEntry {
@@ -1366,7 +1312,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "TransitGateways",
             resource_type: "aws:ec2:transit-gateway",
         }],
-        // See `aws:network:route-table-disrupt-connectivity` for why no permission is recorded.
+        // See `aws:network:route-table-disrupt-cross-region-connectivity` for why no
+        // permission is recorded.
         permissions: &[],
     },
     ActionCatalogEntry {
@@ -1409,7 +1356,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ssm:send-command",
-        description: "Runs an SSM document on a set of instances.",
+        description: "Run the specified SSM document.",
         parameters: &[
             ActionCatalogParameter {
                 name: "documentArn",
@@ -1579,9 +1526,9 @@ impl TargetResourceTypeCatalogEntry {
 /// contract here is invented for a type documented without one.
 ///
 /// The published LISTING is its own catalog, independent of [`ACTION_CATALOG`] in both
-/// directions: a published action can target a type the listing does not carry
-/// (`aws:ec2:route-table` is one), and the listing can carry a type no catalogued action
-/// targets, which is why what makes a type TARGETABLE is this table or the action table
+/// directions: a published action names the type it is pointed at rather than a row of this
+/// table, and the listing can carry a type no catalogued action targets, which is why what
+/// makes a type TARGETABLE is this table or the action table
 /// ([`action_catalog_targets_resource_type`]) rather than this table alone.
 ///
 /// ORDER: the order the published listing enumerates the types in, which is the order

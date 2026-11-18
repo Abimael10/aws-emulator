@@ -10,6 +10,9 @@
 //!   action, of a target resource type, and of each of their parameters is fixed data keyed
 //!   by that entry's id, so it is reported character for character, punctuation included,
 //!   and never restated in the emulator's own words;
+//! * an action publishes each supported target under the PUBLISHED key for that action —
+//!   the key an experiment template's action binds the target by — paired with the resource
+//!   type that key names;
 //! * the same id answers the same text from either reader (`ListActions` and `GetAction`,
 //!   `ListTargetResourceTypes` and `GetTargetResourceType`), at any page size and however
 //!   often it is read, because one table is behind all four;
@@ -28,7 +31,7 @@
 //!
 //! The HTTP harness below is local to this suite, as each sibling suite's is.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -244,10 +247,22 @@ struct ActionText {
 
 /// The rows the text rule is asserted over for the action catalog.
 ///
+/// Every row's description is a string the RECORDED page establishes for that id: the seven
+/// the report quotes verbatim, `aws:ssm:send-command` (whose string the replay of that page
+/// confirms), and the two rows the recording reports no divergence on at all
+/// (`aws:arc:start-zonal-autoshift`, `aws:ec2:reboot-instances`). A row whose published text
+/// is not established is NOT pinned here — `aws:fis:wait` is one such id, and it carries no
+/// row — because this table is the authority check: an unverified expectation in it would only
+/// re-assert what the table under test carries.
+///
 /// They differ along what the rule generalises over: how many parameters the action takes
-/// (none, one, two) and whether a parameter's published text names a unit or a format.
-/// `aws:ec2:reboot-instances`, `aws:ec2:send-spot-instance-interruptions` and `aws:fis:wait`
-/// are rows no issue cited.
+/// (none, one, two, three, four) and whether a parameter's published text names a unit or a
+/// format; and, for the description, whether the published string is imperative
+/// (`aws:ec2:reboot-instances`, `aws:ssm:send-command`), states the fault as the consequence a
+/// caller observes (`aws:ec2:api-insufficient-instance-capacity-error`), names the tool that
+/// performs it inside the container (`aws:ecs:task-cpu-stress`), or opens with a bare
+/// percentage (`aws:ecs:drain-container-instances`). `aws:ec2:reboot-instances` and
+/// `aws:ssm:send-command` are rows no issue quoted a string for.
 fn action_text() -> Vec<ActionText> {
     vec![
         ActionText {
@@ -271,20 +286,183 @@ fn action_text() -> Vec<ActionText> {
             parameters: &[],
         },
         ActionText {
+            id: "aws:ec2:api-insufficient-instance-capacity-error",
+            description: "Cause the EC2 service to return insufficient capacity error responses \
+                          for specific callers.",
+            parameters: &[
+                (
+                    "availabilityZoneIdentifiers",
+                    "The Availability Zones, separated by commas.",
+                ),
+                ("duration", "The duration of the action, in ISO 8601 format."),
+                ("percentage", "The percentage of calls to affect."),
+            ],
+        },
+        ActionText {
+            id: "aws:ec2:asg-insufficient-instance-capacity-error",
+            description: "Cause the targeted AutoScaling Groups to receive insufficient instance \
+                          capacity errors when attempting to provision new instances.",
+            parameters: &[
+                (
+                    "availabilityZoneIdentifiers",
+                    "The Availability Zones, separated by commas.",
+                ),
+                ("duration", "The duration of the action, in ISO 8601 format."),
+                ("percentage", "The percentage of calls to affect."),
+            ],
+        },
+        ActionText {
             id: "aws:ec2:send-spot-instance-interruptions",
-            description: "Interrupts a set of Spot Instances after sending an interruption \
-                          notice.",
+            description: "Interrupt the specified EC2 Spot instances.",
             parameters: &[(
                 "durationBeforeInterruption",
                 "The length of time before the interruption notice is sent, in ISO 8601 format.",
             )],
         },
         ActionText {
-            id: "aws:fis:wait",
-            description: "Waits for the specified duration.",
-            parameters: &[("duration", "The duration of the action, in ISO 8601 format.")],
+            id: "aws:ecs:drain-container-instances",
+            description: "Drain percentage of underlying EC2 instances on an ECS cluster.",
+            parameters: &[
+                (
+                    "drainagePercentage",
+                    "The percentage of container instances to drain.",
+                ),
+                ("duration", "The duration of the action, in ISO 8601 format."),
+            ],
+        },
+        ActionText {
+            id: "aws:ecs:stop-task",
+            description: "Stop the specified ECS tasks of an ECS cluster.",
+            parameters: &[],
+        },
+        ActionText {
+            id: "aws:ecs:task-cpu-stress",
+            description: "It runs CPU stress via stress-ng tool.",
+            parameters: &[
+                ("duration", "The duration of the action, in ISO 8601 format."),
+                (
+                    "installDependencies",
+                    "Whether to install the dependencies the action needs on the target tasks.",
+                ),
+                ("percent", "The percentage of CPU load to generate."),
+                ("workers", "The number of stress workers to run."),
+            ],
+        },
+        ActionText {
+            id: "aws:ecs:task-io-stress",
+            description: "It runs IO stress via stress-ng tool.",
+            parameters: &[
+                ("duration", "The duration of the action, in ISO 8601 format."),
+                (
+                    "installDependencies",
+                    "Whether to install the dependencies the action needs on the target tasks.",
+                ),
+                ("percent", "The percentage of the file system to use."),
+                ("workers", "The number of stress workers to run."),
+            ],
+        },
+        ActionText {
+            id: "aws:ssm:send-command",
+            description: "Run the specified SSM document.",
+            parameters: &[
+                (
+                    "documentArn",
+                    "The Amazon Resource Name (ARN) of the document.",
+                ),
+                (
+                    "documentParameters",
+                    "The document parameters, as a JSON object.",
+                ),
+                ("documentVersion", "The version of the document."),
+                ("duration", "The duration of the action, in ISO 8601 format."),
+            ],
         },
     ]
+}
+
+/// One published action's TARGET contract: every key the catalog publishes a supported target
+/// under, paired with the `ActionTarget$resourceType` that key names.
+struct ActionTargets {
+    id: &'static str,
+    targets: &'static [(&'static str, &'static str)],
+}
+
+/// The rows the target-key rule is asserted over.
+///
+/// A target's key is published data, not a label: it is the key an experiment template's
+/// action names in `ExperimentTemplateAction$targets` to bind the action to a declared
+/// target, so a client that reads an action's target contract here and then builds a
+/// template has to find the same key the published catalog uses. It is published PER ACTION
+/// and is derivable neither from the resource type (`aws:ec2:subnet` is published under
+/// `Subnets` here, `aws:kinesis:stream` under `KinesisStreams`) nor from the resource's
+/// spelling elsewhere (`VPCEndpoints`, not `VpcEndpoints`).
+///
+/// The rows differ along what the rule generalises over: how many targets an action
+/// publishes (none for `aws:ssm:start-automation-execution`, one for the rest), and whether
+/// the key is the plain plural of the resource (`Pods`, `Subnets`), the resource qualified by
+/// its service (`KinesisStreams`), the resource qualified by its topology
+/// (`MultiRegionClusters`), an acronym (`VPCEndpoints`), or a noun the action's own id does
+/// not carry (`Subnets` for the route-table action, which is pointed at the subnets a route
+/// table serves). `aws:eks:pod-delete`, `aws:network:disrupt-connectivity` and
+/// `aws:ssm:start-automation-execution` are rows no issue cited.
+fn action_targets() -> Vec<ActionTargets> {
+    vec![
+        ActionTargets {
+            id: "aws:eks:pod-delete",
+            targets: &[("Pods", "aws:eks:pod")],
+        },
+        ActionTargets {
+            id: "aws:kinesis:stream-expired-iterator-exception",
+            targets: &[("KinesisStreams", "aws:kinesis:stream")],
+        },
+        ActionTargets {
+            id: "aws:kinesis:stream-provisioned-throughput-exception",
+            targets: &[("KinesisStreams", "aws:kinesis:stream")],
+        },
+        ActionTargets {
+            id: "aws:memorydb:multi-region-cluster-pause-replication",
+            targets: &[("MultiRegionClusters", "aws:memorydb:multi-region-cluster")],
+        },
+        ActionTargets {
+            id: "aws:network:disrupt-connectivity",
+            targets: &[("Subnets", "aws:ec2:subnet")],
+        },
+        ActionTargets {
+            id: "aws:network:disrupt-vpc-endpoint",
+            targets: &[("VPCEndpoints", "aws:ec2:vpc-endpoint")],
+        },
+        ActionTargets {
+            id: "aws:network:route-table-disrupt-cross-region-connectivity",
+            targets: &[("Subnets", "aws:ec2:subnet")],
+        },
+        ActionTargets {
+            id: "aws:ssm:start-automation-execution",
+            targets: &[],
+        },
+    ]
+}
+
+/// The `targets` map `reported` carries, as key -> `resourceType` pairs.
+fn reported_targets(case: &str, reported: &Value) -> BTreeMap<String, String> {
+    reported
+        .as_object()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a targets map, got {reported:?}"))
+        .iter()
+        .map(|(key, target)| {
+            let resource_type = target["resourceType"].as_str().unwrap_or_else(|| {
+                panic!("case {case:?}: target {key:?} names no resourceType: {target:?}")
+            });
+            (key.clone(), resource_type.to_string())
+        })
+        .collect()
+}
+
+/// A row's expected `targets` map, in the same form [`reported_targets`] reports.
+fn expected_targets(targets: &[(&str, &str)]) -> BTreeMap<String, String> {
+    targets
+        .iter()
+        .map(|(key, resource_type)| ((*key).to_string(), (*resource_type).to_string()))
+        .collect()
 }
 
 /// The parameter text of the resource types that publish a parameter contract, as the
@@ -546,6 +724,36 @@ async fn every_catalogued_entry_reports_the_same_text_from_both_readers() {
             body["action"]["description"], entry["description"],
             "case {id:?}: expected the read to report the listed description {:?}, got {:?}",
             entry["description"], body["action"]["description"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_action_publishes_its_targets_under_the_published_key_from_both_readers() {
+    let router = emulator();
+    let listed = actions(&router, None).await;
+
+    for row in action_targets() {
+        let case = row.id;
+        let summary = listed_entry(&listed, "id", row.id);
+        let expected = expected_targets(row.targets);
+        assert_eq!(
+            reported_targets(case, &summary["targets"]),
+            expected,
+            "case {case:?}: expected the listing to publish the targets {expected:?}, got {:?}",
+            summary["targets"]
+        );
+
+        let (status, body) = get(&router, &format!("/actions/{}", row.id)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 reading the action, got {status} with {body:?}"
+        );
+        assert_eq!(
+            reported_targets(case, &body["action"]["targets"]),
+            expected,
+            "case {case:?}: expected the read to report the targets {expected:?}, got {:?}",
+            body["action"]["targets"]
         );
     }
 }

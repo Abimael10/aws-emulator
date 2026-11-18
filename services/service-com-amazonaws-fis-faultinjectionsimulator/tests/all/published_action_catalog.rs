@@ -141,12 +141,10 @@ fn pinned_rows() -> Vec<ActionRow> {
 /// The action ids the catalog published no record for while it was a subset of the published
 /// one, each with the resource type its target names.
 ///
-/// They span eight AWS services and four families of fault — a connectivity failover, a
-/// connection failure, a storage-latency fault, an API error, two wire exceptions injected
-/// into a stream, a paused replication and two routing disruptions — so the membership rule
-/// is asserted over the class rather than over one id. `aws:ec2:api-error` and
-/// `aws:network:route-table-disrupt-connectivity` are published entries this suite asserts
-/// beside them.
+/// They span seven AWS services and four families of fault — a connectivity failover, a
+/// connection failure, a storage-latency fault, two wire exceptions injected into a stream, a
+/// paused replication, a disrupted VPC endpoint and a cross-Region routing disruption — so
+/// the membership rule is asserted over the class rather than over one id.
 const REGAINED_ACTIONS: &[(&str, &str)] = &[
     (
         "aws:directconnect:virtual-interface-disconnect",
@@ -154,7 +152,6 @@ const REGAINED_ACTIONS: &[(&str, &str)] = &[
     ),
     ("aws:dsql:cluster-connection-failure", "aws:dsql:cluster"),
     ("aws:ebs:volume-io-latency", "aws:ec2:ebs-volume"),
-    ("aws:ec2:api-error", "aws:iam:role"),
     (
         "aws:kinesis:stream-expired-iterator-exception",
         "aws:kinesis:stream",
@@ -169,12 +166,8 @@ const REGAINED_ACTIONS: &[(&str, &str)] = &[
     ),
     ("aws:network:disrupt-vpc-endpoint", "aws:ec2:vpc-endpoint"),
     (
-        "aws:network:route-table-disrupt-connectivity",
-        "aws:ec2:route-table",
-    ),
-    (
         "aws:network:route-table-disrupt-cross-region-connectivity",
-        "aws:ec2:route-table",
+        "aws:ec2:subnet",
     ),
 ];
 

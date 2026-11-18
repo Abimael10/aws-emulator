@@ -594,6 +594,28 @@ async fn a_listing_and_a_read_of_either_catalog_agree_entry_for_entry() {
                 actions[index][member], answer.body["action"][member]
             );
         }
+        // `ActionSummary` models `id`, `arn`, `description`, `targets` and `tags` and no
+        // `parameters`, so the listed entry carries exactly those five members: the entry is
+        // one row of one table reported at summary width, not a second shape beside the
+        // action.
+        let reported_members: BTreeSet<&str> = actions[index]
+            .as_object()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected an action object, got {:?}",
+                    actions[index]
+                )
+            })
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected_members: BTreeSet<&str> =
+            ["arn", "description", "id", "tags", "targets"].into_iter().collect();
+        assert_eq!(
+            reported_members, expected_members,
+            "case {case:?}: expected exactly the published summary members \
+             {expected_members:?}, got {reported_members:?}"
+        );
     }
 
     let types = list_resource_types(&router).await;
@@ -639,11 +661,12 @@ async fn a_listing_and_a_read_of_either_catalog_agree_entry_for_entry() {
 /// enumerate.
 ///
 /// The two catalogs are independent published lists: an action names the type it is pointed
-/// at, and the listing enumerates the types the service publishes, which is not every type
-/// an action targets. Named here so such a type is a deliberate row rather than an unnoticed
-/// hole. That a template may name one all the same is asserted in
+/// at, and the listing enumerates the types the service publishes, which does not have to
+/// carry every type an action targets. Every type a published action targets is published
+/// today, so this list is empty. Named here so such a type is a deliberate row rather than an
+/// unnoticed hole. That a template may name one all the same is asserted in
 /// `catalog_membership_and_text.rs`.
-const TARGETED_UNPUBLISHED_TYPES: &[&str] = &["aws:ec2:route-table"];
+const TARGETED_UNPUBLISHED_TYPES: &[&str] = &[];
 
 #[tokio::test]
 async fn a_resource_type_a_published_action_targets_is_published_unless_the_listing_omits_it() {
@@ -709,10 +732,24 @@ async fn a_resource_type_a_published_action_targets_is_published_unless_the_list
 #[tokio::test]
 async fn an_action_id_the_catalog_does_not_publish_draws_the_one_fixed_refusal() {
     let router = emulator();
+    // The listing reports from the same table the point read answers from, so an id outside
+    // the catalog is an action at NEITHER reader: it is enumerated nowhere and the read
+    // refuses it.
+    let published: Vec<String> = list_actions(&router, FALLBACK_REGION)
+        .await
+        .iter()
+        .map(|entry| {
+            entry["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a listed action carries no id: {entry:?}"))
+                .to_string()
+        })
+        .collect();
     // Each row is a different way of naming no action — a service FIS has no actions for, a
-    // published id with its case changed, one truncated, one suffixed, an unqualified word
-    // and a near miss of the entry this issue added — so the refusal is shown to be fixed
-    // text rather than one built from the value.
+    // published id with its case changed, one truncated, one suffixed, an unqualified word,
+    // a near miss of the entry this issue added, and two ids the published catalog carries no
+    // entry for although a published action of the same family reads like them — so the
+    // refusal is shown to be fixed text rather than one built from the value.
     let unknown = [
         "aws:not-a-real-service:fake-action",
         "AWS:ARC:START-ZONAL-AUTOSHIFT",
@@ -720,8 +757,14 @@ async fn an_action_id_the_catalog_does_not_publish_draws_the_one_fixed_refusal()
         "aws:arc:start-zonal-autoshift:v2",
         "start-zonal-autoshift",
         "aws:arc:stop-zonal-autoshift",
+        "aws:ec2:api-error",
+        "aws:network:route-table-disrupt-connectivity",
     ];
     for id in unknown {
+        assert!(
+            !published.iter().any(|listed| listed == id),
+            "case {id:?}: expected the listing to publish no such action, got {published:?}"
+        );
         let answer = get_action(&router, id, FALLBACK_REGION).await;
         assert_eq!(
             answer.status, 404,

@@ -242,7 +242,8 @@ fn ids(case: &str, listed: &[Value]) -> Vec<String> {
 ///
 /// They span eighteen AWS services and every family of fault the catalog publishes:
 /// instance lifecycle (`aws:ec2:stop-instances`, `aws:ec2:terminate-instances`), API faults
-/// (`aws:ec2:api-error`, the `aws:fis:inject-api-*` and `aws:kinesis:stream-*` families),
+/// (`aws:ec2:api-insufficient-instance-capacity-error`, the `aws:fis:inject-api-*` and
+/// `aws:kinesis:stream-*` families),
 /// container faults (the `aws:ecs:task-*` and `aws:eks:pod-*` families), storage and
 /// database faults (`aws:ebs:pause-volume-io`, `aws:ebs:volume-io-latency`,
 /// `aws:dsql:cluster-connection-failure`, `aws:rds:failover-db-cluster`,
@@ -260,7 +261,6 @@ fn expected_ids() -> BTreeSet<String> {
         "aws:dynamodb:global-table-pause-replication",
         "aws:ebs:pause-volume-io",
         "aws:ebs:volume-io-latency",
-        "aws:ec2:api-error",
         "aws:ec2:api-insufficient-instance-capacity-error",
         "aws:ec2:asg-insufficient-instance-capacity-error",
         "aws:ec2:reboot-instances",
@@ -297,7 +297,6 @@ fn expected_ids() -> BTreeSet<String> {
         "aws:memorydb:multi-region-cluster-pause-replication",
         "aws:network:disrupt-connectivity",
         "aws:network:disrupt-vpc-endpoint",
-        "aws:network:route-table-disrupt-connectivity",
         "aws:network:route-table-disrupt-cross-region-connectivity",
         "aws:network:transit-gateway-disrupt-cross-region-connectivity",
         "aws:rds:failover-db-cluster",

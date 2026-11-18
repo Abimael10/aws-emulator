@@ -54,11 +54,13 @@
 //!
 //! # What is NOT published
 //!
-//! An action whose injected failure this emulator cannot STATE is not published, and nothing
-//! is invented for it: `aws:ec2:api-error` takes the error code to inject as a caller-written
-//! `errorCode` parameter, and the HTTP status that goes with an arbitrary code is not
-//! something this emulator can derive from the code — so that action affects no call here,
-//! exactly as it did before, rather than failing one with a status nothing documents.
+//! An action whose injected failure this emulator cannot STATE is not published as a fault
+//! here, and nothing is invented for it: the EC2 API-error family
+//! (`aws:ec2:api-insufficient-instance-capacity-error`,
+//! `aws:ec2:asg-insufficient-instance-capacity-error`) fails a call of ANOTHER service's own
+//! API path with the error that service words for it, which is not a failure this module can
+//! state — so such an action affects no call here, exactly as it did before, rather than
+//! failing one with a code and status nothing documents.
 
 use std::time::{Duration, SystemTime};
 
@@ -422,8 +424,8 @@ mod tests {
                 failure: None,
             },
             Class {
-                case: "an action whose code the caller names",
-                action_id: "aws:ec2:api-error",
+                case: "an EC2 API-error action whose failure this module does not state",
+                action_id: "aws:ec2:api-insufficient-instance-capacity-error",
                 failure: None,
             },
         ];

@@ -24,7 +24,7 @@
 //! reference: they span nine AWS services, actions that take one parameter and actions that
 //! take five, required-only and mixed parameter sets, and target resource types from
 //! containers (`aws:ecs:task`, `aws:eks:pod`, `aws:eks:cluster`) to storage
-//! (`aws:s3:bucket`, `aws:dynamodb:global-table`) and networking (`aws:ec2:route-table`,
+//! (`aws:s3:bucket`, `aws:dynamodb:global-table`) and networking (`aws:ec2:subnet`,
 //! `aws:ec2:transit-gateway`). Several of them are actions no issue cited.
 //!
 //! The HTTP harness below is local to this suite, as each sibling suite's is.
@@ -123,13 +123,12 @@ fn rows() -> Vec<Row> {
             parameters: &[("duration", true)],
             targets: &[("Tables", "aws:dynamodb:global-table")],
         },
-        // Four parameters, three of them required, an IAM-role target.
+        // Three parameters, two of them required, an IAM-role target.
         Row {
-            id: "aws:ec2:api-error",
+            id: "aws:ec2:api-insufficient-instance-capacity-error",
             parameters: &[
+                ("availabilityZoneIdentifiers", true),
                 ("duration", true),
-                ("errorCode", true),
-                ("operations", true),
                 ("percentage", false),
             ],
             targets: &[("Roles", "aws:iam:role")],
@@ -324,11 +323,11 @@ fn rows() -> Vec<Row> {
             ],
             targets: &[("Functions", "aws:lambda:function")],
         },
-        // A networking action whose target is a route table.
+        // A networking action pointed at the subnets a route table serves.
         Row {
-            id: "aws:network:route-table-disrupt-connectivity",
-            parameters: &[("duration", true), ("service", true)],
-            targets: &[("RouteTables", "aws:ec2:route-table")],
+            id: "aws:network:route-table-disrupt-cross-region-connectivity",
+            parameters: &[("duration", true), ("region", true)],
+            targets: &[("Subnets", "aws:ec2:subnet")],
         },
         // A networking action whose target is a transit gateway.
         Row {
