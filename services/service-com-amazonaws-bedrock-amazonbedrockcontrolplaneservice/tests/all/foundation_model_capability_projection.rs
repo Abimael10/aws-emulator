@@ -21,12 +21,12 @@
 //!    members report membership in that set one feature at a time — so a model no feature's
 //!    supported-models table lists, which is where a freshly offered model starts, supports
 //!    none of them whatever its modalities, streaming or inference types are.
-//! 4. **What a model itself establishes is decided from the row**: `invokeModel` reaches
-//!    every offered model; `converse` carries a CONVERSATION, so it reaches a model that
-//!    produces TEXT and streams through it when the model streams; the OpenAI-compatible
-//!    endpoints reach the models that provider publishes; and a guardrail applies to a
-//!    model that produces TEXT, because a guardrail decides about text and is applied
-//!    beside the invocation.
+//! 4. **What a model itself establishes is decided from the row**: `inferenceAPIsSupported`
+//!    answers per API and per calling mode — `invokeModel` reaches every offered model;
+//!    `converse` carries a CONVERSATION, so it reaches a model that produces TEXT and
+//!    streams through it when the model streams; the OpenAI-compatible endpoints reach the
+//!    models that provider publishes — and a guardrail applies to a model that produces
+//!    TEXT, because a guardrail decides about text and is applied beside the invocation.
 //! 5. **The account-level access default travels with the listing**: a response reports
 //!    once, beside the summaries, whether this account reaches every model the catalog
 //!    offers without requesting access per model — whatever filters the request carried and
@@ -204,9 +204,9 @@ const ALL_FEATURES: &[&str] = &[
     "PROMPT_CACHING",
 ];
 
-/// The APIs a model that produces TEXT and is published by anybody but OpenAI is reachable
-/// through: Amazon Bedrock's own conversation API, and `invokeModel`, which reaches every
-/// offered model.
+/// The APIs whose own answer for a model that produces TEXT and is published by anybody but
+/// OpenAI is yes: Amazon Bedrock's own conversation API, and `invokeModel`, which reaches
+/// every offered model.
 const CONVERSE_AND_INVOKE: &[&str] = &["converse", "invokeModel"];
 
 #[tokio::test]
@@ -395,10 +395,62 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
         let model = &case.model;
 
         let apis = bedrock::state::model_inference_apis_supported(model);
+        let answers = |api: &str| case.inference_apis.contains(&api);
+        let converse_api = apis.converse.clone().unwrap_or_else(|| {
+            panic!(
+                "case {name:?}: inferenceAPIsSupported must answer for the Converse API, got \
+                 {apis:?}"
+            )
+        });
         assert_eq!(
-            apis, case.inference_apis,
-            "case {name:?}: expected inferenceAPIsSupported {:?}, got {apis:?}",
-            case.inference_apis
+            converse_api.sync,
+            Some(answers("converse")),
+            "case {name:?}: expected inferenceAPIsSupported.converse.sync {:?}, got {apis:?}",
+            answers("converse")
+        );
+        // Converse streams a turn exactly where the model streams its answer.
+        assert_eq!(
+            converse_api.streaming,
+            Some(answers("converse") && model.response_streaming_supported),
+            "case {name:?}: expected inferenceAPIsSupported.converse.streaming {:?}, got \
+             {apis:?}",
+            answers("converse") && model.response_streaming_supported
+        );
+        let invoke_api = apis.invoke_model.clone().unwrap_or_else(|| {
+            panic!(
+                "case {name:?}: inferenceAPIsSupported must answer for the InvokeModel API, got \
+                 {apis:?}"
+            )
+        });
+        assert_eq!(
+            (
+                invoke_api.sync,
+                invoke_api.response_streaming,
+                invoke_api.bidirectional_streaming,
+            ),
+            (
+                Some(answers("invokeModel")),
+                Some(model.response_streaming_supported),
+                Some(false),
+            ),
+            "case {name:?}: InvokeModel reaches every offered model and streams where the row \
+             streams, and no modality this catalogue declares is carried by a two-way stream, \
+             got {apis:?}"
+        );
+        assert_eq!(
+            (apis.open_ai_chat_completions, apis.open_ai_responses),
+            (
+                Some(answers("openAiChatCompletions")),
+                Some(answers("openAiResponses")),
+            ),
+            "case {name:?}: an OpenAI-compatible endpoint serves the models that provider \
+             publishes, got {apis:?}"
+        );
+        assert_eq!(
+            apis.async_invoke,
+            Some(false),
+            "case {name:?}: an asynchronous invocation generates a clip, and no modality this \
+             catalogue declares is one, got {apis:?}"
         );
         // `featuresSupported` names each published feature, and the capability members
         // below report one feature at a time, so the record and those members agree.

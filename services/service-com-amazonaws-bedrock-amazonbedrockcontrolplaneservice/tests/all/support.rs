@@ -152,16 +152,22 @@ pub fn profile_model_id(profile_arn: &str) -> String {
 /// Computed HERE from the row's own published attributes rather than by asking the service
 /// for them, so it is an independent statement of the rule a summary must satisfy:
 ///
-/// * The capability metadata is published for a model that TAKES PART IN A CONVERSATION —
-///   one that produces TEXT — and for no other: the summary of a model that answers with a
-///   vector or an image carries the ten modelled members and `guardrailsSupported`, and
-///   none of `modelFamily`, `inferenceAPIsSupported`, `featuresSupported`,
-///   `explicitPromptCaching`, `intelligentPromptRouting`, `latencyOptimizationSupported`,
-///   `batchSupported` or `converse`.
+/// * The capability metadata splits by what it answers about. What answers about an
+///   INVOCATION of the model — `inferenceAPIsSupported`, `featuresSupported` and the two
+///   features reported one by one beside it (`explicitPromptCaching`,
+///   `intelligentPromptRouting`) — is reported for EVERY offered model, because every
+///   offered model can be invoked. What describes a CONVERSATION with the model, or a job
+///   built over one — `modelFamily`, `converse`, `batchSupported` and
+///   `latencyOptimizationSupported` — is reported for a model that TAKES PART IN A
+///   CONVERSATION (one that produces TEXT) and for no other.
 /// * `modelFamily` is the row's family.
-/// * `inferenceAPIsSupported` carries `invokeModel` for every offered model, `converse` for
-///   one that produces TEXT, and the two OpenAI-compatible endpoints for a model that
-///   provider publishes.
+/// * `inferenceAPIsSupported` is the RECORD of the invocation APIs the model is reachable
+///   through, one member per API naming the calling modes that API offers for it:
+///   `invokeModel` answers for every offered model and streams where the row streams,
+///   `converse` answers and streams for a model that produces TEXT, the two
+///   OpenAI-compatible endpoints answer for a model that provider publishes, and the two
+///   long-running modes (`asyncInvoke`, `invokeModel.bidirectionalStreaming`) answer no for
+///   every row, because no modality this model copy declares is a clip or a spoken turn.
 /// * `guardrailsSupported` holds of a model that produces TEXT — a guardrail decides about
 ///   text and about nothing else, and is applied beside the invocation rather than built
 ///   into the model's integration, so nothing else is needed of the model.
@@ -193,15 +199,23 @@ pub fn expected_foundation_model_projection(
     let published = |feature: &str| model.features_supported.contains(&feature);
     let takes = |modality: &str| model.input_modalities.contains(&modality);
 
-    let mut apis: Vec<&str> = Vec::new();
-    if conversational {
-        apis.push("converse");
-    }
-    apis.push("invokeModel");
-    if model.provider_name == "OpenAI" {
-        apis.push("openAiChatCompletions");
-        apis.push("openAiResponses");
-    }
+    let apis = json!({
+        // A clip is what an asynchronous invocation generates and a spoken turn is what a
+        // two-way stream carries, and `ModelModality` declares neither, so no row of this
+        // catalogue is reachable either way.
+        "asyncInvoke": false,
+        "converse": {
+            "streaming": conversational && model.response_streaming_supported,
+            "sync": conversational,
+        },
+        "invokeModel": {
+            "bidirectionalStreaming": false,
+            "responseStreaming": model.response_streaming_supported,
+            "sync": true,
+        },
+        "openAiChatCompletions": model.provider_name == "OpenAI",
+        "openAiResponses": model.provider_name == "OpenAI",
+    });
 
     let mut lifecycle = json!({
         "status": model.lifecycle_status,
@@ -228,12 +242,37 @@ pub fn expected_foundation_model_projection(
         "modelLifecycle": lifecycle,
         "guardrailsSupported": conversational,
     });
+
+    // What answers about an INVOCATION of the model is reported for every offered model,
+    // because every offered model can be invoked.
+    projection["inferenceAPIsSupported"] = apis;
+    projection["featuresSupported"] = json!({
+        // Batch inference is published per region scope, so it answers with a record.
+        "batchInference": {
+            "crossRegion": published("BATCH_INFERENCE"),
+            "inRegion": published("BATCH_INFERENCE"),
+        },
+        "countTokens": expected_count_tokens_supported(model),
+        "intelligentPromptRouting": published("INTELLIGENT_PROMPT_ROUTING"),
+        "latencyOptimization": published("LATENCY_OPTIMIZATION"),
+        "promptCaching": published("PROMPT_CACHING"),
+        // A prompt optimization job rewrites a prompt template for the models it targets,
+        // so it needs of a model only that a prompt is what the model is given.
+        "promptOptimization": conversational,
+        // Reserved capacity may be bought for a model the catalogue offers it under, which
+        // is the same fact that decides whether a purchase over the model is accepted.
+        "provisionedThroughput": model.inference_types_supported.contains(&"PROVISIONED"),
+    });
+    projection["explicitPromptCaching"] = json!({ "isSupported": published("PROMPT_CACHING") });
+    projection["intelligentPromptRouting"] =
+        json!({ "isSupported": published("INTELLIGENT_PROMPT_ROUTING") });
+
     if !conversational {
         return projection;
     }
 
-    // The formats a turn may carry TO the model: one modality's format set when the model
-    // takes that modality, and empty when it does not.
+    // The formats a turn may carry TO the model, per attachment kind: one modality's format
+    // set when the model takes that modality, and empty when it does not.
     let formats = |carried: bool, values: &'static [&'static str]| {
         if carried {
             values.to_vec()
@@ -268,27 +307,6 @@ pub fn expected_foundation_model_projection(
     }
 
     projection["modelFamily"] = json!(model.model_family);
-    projection["inferenceAPIsSupported"] = json!(apis);
-    projection["featuresSupported"] = json!({
-        // Batch inference is published per region scope, so it answers with a record.
-        "batchInference": {
-            "crossRegion": published("BATCH_INFERENCE"),
-            "inRegion": published("BATCH_INFERENCE"),
-        },
-        "countTokens": expected_count_tokens_supported(model),
-        "intelligentPromptRouting": published("INTELLIGENT_PROMPT_ROUTING"),
-        "latencyOptimization": published("LATENCY_OPTIMIZATION"),
-        "promptCaching": published("PROMPT_CACHING"),
-        // A prompt optimization job rewrites a prompt template for the models it targets,
-        // so it needs of a model only that a prompt is what the model is given.
-        "promptOptimization": conversational,
-        // Reserved capacity may be bought for a model the catalogue offers it under, which
-        // is the same fact that decides whether a purchase over the model is accepted.
-        "provisionedThroughput": model.inference_types_supported.contains(&"PROVISIONED"),
-    });
-    projection["explicitPromptCaching"] = json!({ "isSupported": published("PROMPT_CACHING") });
-    projection["intelligentPromptRouting"] =
-        json!({ "isSupported": published("INTELLIGENT_PROMPT_ROUTING") });
     projection["latencyOptimizationSupported"] = json!(published("LATENCY_OPTIMIZATION"));
     projection["batchSupported"] = json!({
         "baseModelSupported": published("BATCH_INFERENCE"),

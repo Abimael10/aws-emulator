@@ -27,6 +27,14 @@
 //!    reports the `ImageFormat` values in the published order, because a client that takes
 //!    the FIRST supported format as its default reads a different default from a different
 //!    order.
+//! 5. **The invocation APIs are a RECORD of per-API calling modes**, reported for EVERY
+//!    offered model: `inferenceAPIsSupported` names each API Amazon Bedrock serves a base
+//!    model on and, for an API whose answer has parts, the modes it offers for that model
+//!    (`converse.sync`/`.streaming`,
+//!    `invokeModel.sync`/`.responseStreaming`/`.bidirectionalStreaming`). A client reads the
+//!    mode it is about to use by name, which a list of API names cannot be asked; and every
+//!    offered model can be invoked, so the record answers for a model that takes part in no
+//!    conversation too.
 //!
 //! The capability members are RECORDED behaviour: the on-disk model declares none of them
 //! (`smithy_query(query="shape", shape="com.amazonaws.bedrock#FoundationModelSummary")`
@@ -193,6 +201,192 @@ fn string_list(value: &Value, member: &str) -> Option<Vec<String>> {
             })
             .collect()
     })
+}
+
+// ---------------------------------------------------------------------------------------
+// 5. The invocation APIs are a RECORD of per-API calling modes, reported for every offered
+// model, and the Converse record states one answer per attachment kind.
+// ---------------------------------------------------------------------------------------
+
+/// One catalogue row and what the invocation-API rule says its record answers.
+struct ApiCase {
+    /// The `modelId` the listing carries the summary under.
+    model_id: &'static str,
+    /// What this row contributes: the attribute combination it stands for.
+    note: &'static str,
+    /// Whether the model takes part in a conversation, which is what Converse carries.
+    converse: bool,
+    /// Whether the model streams what it answers.
+    streaming: bool,
+    /// Whether its provider's own OpenAI-compatible endpoints serve it.
+    openai_published: bool,
+}
+
+/// The table: the rows differ along everything the rule reads off a row — what the model
+/// answers with (text, an embedding vector, a relevance score, an image, a clip of
+/// frames), whether it streams that answer, and who publishes it. None of these is an id
+/// the issue this rule was written for cites as an example of the defect.
+const API_CASES: &[ApiCase] = &[
+    ApiCase {
+        model_id: "cohere.embed-v4:0",
+        note: "an embedding model: a vector is no turn of a conversation",
+        converse: false,
+        streaming: false,
+        openai_published: false,
+    },
+    ApiCase {
+        model_id: "cohere.rerank-v3-5:0",
+        note: "a reranking model: a relevance score is no turn either",
+        converse: false,
+        streaming: false,
+        openai_published: false,
+    },
+    ApiCase {
+        model_id: "stability.stable-image-ultra-v1:1",
+        note: "an image model, answered in one piece",
+        converse: false,
+        streaming: false,
+        openai_published: false,
+    },
+    ApiCase {
+        model_id: "luma.ray-v2:0",
+        note: "a model that generates a clip of frames",
+        converse: false,
+        streaming: false,
+        openai_published: false,
+    },
+    ApiCase {
+        model_id: "google.gemma-3-27b-it",
+        note: "a streaming text model published by neither Amazon nor OpenAI",
+        converse: true,
+        streaming: true,
+        openai_published: false,
+    },
+    ApiCase {
+        model_id: "openai.gpt-oss-safeguard-20b",
+        note: "a text model its provider also serves on its own OpenAI-compatible APIs",
+        converse: true,
+        streaming: true,
+        openai_published: true,
+    },
+];
+
+#[tokio::test]
+async fn the_invocation_apis_answer_per_api_and_per_calling_mode() {
+    let emu = emulator();
+    let listed = summaries(&list(&emu).await);
+
+    for case in API_CASES {
+        let name = case.model_id;
+        let note = case.note;
+        let model = row(name, name);
+        assert_eq!(
+            model.output_modalities.contains(&"TEXT"),
+            case.converse,
+            "case {name:?} ({note}): the table says this row {} a conversation, got the output \
+             modalities {:?}",
+            if case.converse { "takes part in" } else { "answers no turn of" },
+            model.output_modalities
+        );
+        assert_eq!(
+            model.response_streaming_supported, case.streaming,
+            "case {name:?} ({note}): the table says this row streams {:?}, got {:?}",
+            case.streaming, model.response_streaming_supported
+        );
+
+        let summary = summary_of(name, &listed, name);
+        // Every offered model can be invoked, so the record is reported for every row.
+        let apis = summary.get("inferenceAPIsSupported").unwrap_or(&Value::Null);
+        assert!(
+            apis.is_object(),
+            "case {name:?} ({note}): expected inferenceAPIsSupported to be the record naming \
+             each invocation API, got {apis:?}"
+        );
+        // InvokeModel reaches every offered model, whatever it answers with, and streams
+        // its answer exactly where the row streams; no modality this catalogue declares is
+        // carried by a stream running in both directions.
+        assert_eq!(
+            (
+                apis["invokeModel"]["sync"].as_bool(),
+                apis["invokeModel"]["responseStreaming"].as_bool(),
+                apis["invokeModel"]["bidirectionalStreaming"].as_bool(),
+            ),
+            (Some(true), Some(case.streaming), Some(false)),
+            "case {name:?} ({note}): expected invokeModel to answer in one piece, to stream \
+             {:?} and to carry no two-way stream, got {apis:?}",
+            case.streaming
+        );
+        // Converse carries a CONVERSATION, so it answers for a model that takes part in one
+        // and streams under the same condition.
+        assert_eq!(
+            (
+                apis["converse"]["sync"].as_bool(),
+                apis["converse"]["streaming"].as_bool(),
+            ),
+            (Some(case.converse), Some(case.converse && case.streaming)),
+            "case {name:?} ({note}): expected converse to answer {:?} and to stream {:?}, got \
+             {apis:?}",
+            case.converse,
+            case.converse && case.streaming
+        );
+        for member in ["openAiChatCompletions", "openAiResponses"] {
+            assert_eq!(
+                apis.get(member).and_then(Value::as_bool),
+                Some(case.openai_published),
+                "case {name:?} ({note}): an OpenAI-compatible endpoint serves a model that \
+                 provider publishes ({:?}), got {apis:?}",
+                case.openai_published
+            );
+        }
+        // An asynchronous invocation answers with an artifact instead of a response body,
+        // which Amazon Bedrock serves for a generation that takes minutes; no modality
+        // `ModelModality` declares is one, so no row answers yes.
+        assert_eq!(
+            apis["asyncInvoke"].as_bool(),
+            Some(false),
+            "case {name:?} ({note}): expected asyncInvoke false, got {apis:?}"
+        );
+
+        // The Converse record states one answer per attachment kind, and the schema of the
+        // provider-specific fields the model accepts — the empty object where it accepts
+        // none. A model that answers no turn of a conversation carries no record at all.
+        match summary.get("converse") {
+            Some(converse) => {
+                assert!(
+                    case.converse,
+                    "case {name:?} ({note}): this row answers no turn of a conversation, so no \
+                     Converse record is reported for it, got {converse:?}"
+                );
+                for kind in ["userImageTypesSupported", "userVideoTypesSupported"] {
+                    assert!(
+                        string_list(converse, kind).is_some(),
+                        "case {name:?} ({note}): {kind} answers for a modality the model takes \
+                         and is empty for one it does not, got {converse:?}"
+                    );
+                }
+            }
+            None => assert!(
+                !case.converse,
+                "case {name:?} ({note}): a conversational model carries a Converse record, got \
+                 {summary:?}"
+            ),
+        }
+
+        // And a read of that one model answers what the listing carries for it.
+        let reply = read(&emu, name).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {name:?} ({note}): a read of a published model must answer 200, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.get("modelDetails"),
+            summary,
+            "case {name:?} ({note}): expected the read to report the listed projection \
+             {summary:?}, got {:?}",
+            reply.get("modelDetails")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -364,11 +558,11 @@ async fn every_summary_answers_every_capability_in_the_published_shape() {
     for model in FOUNDATION_MODELS {
         let name = model.model_id;
         let summary = summary_of(name, &listed, name);
-        let Some(features) = summary.get("featuresSupported") else {
-            // A model that answers no turn of a conversation carries no feature record at
-            // all; the suite that owns that rule asserts it.
-            continue;
-        };
+        // The feature record answers for every offered model, because every offered model
+        // can be invoked.
+        let features = summary.get("featuresSupported").unwrap_or_else(|| {
+            panic!("case {name:?}: every offered model carries a feature record, got {summary:?}")
+        });
         let batch = features.get("batchInference").unwrap_or(&Value::Null);
         let runs_batch = model.features_supported.contains(&"BATCH_INFERENCE");
         for scope in ["crossRegion", "inRegion"] {
@@ -390,9 +584,13 @@ async fn every_summary_answers_every_capability_in_the_published_shape() {
             model.inference_types_supported
         );
 
-        let converse = summary
-            .get("converse")
-            .unwrap_or_else(|| panic!("case {name:?}: a conversational model carries a Converse record, got {summary:?}"));
+        let Some(converse) = summary.get("converse") else {
+            // A model that answers no turn of a conversation carries no Converse record at
+            // all; the suite that owns that rule asserts it.
+            continue;
+        };
+        // The reasoning record names where that reasoning arrives: in a block of its own
+        // for every model this catalogue publishes.
         assert_eq!(
             converse
                 .get("reasoningSupported")

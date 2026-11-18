@@ -85,7 +85,7 @@ pub struct FoundationModelSummary {
     pub inference_types_supported: Option<Vec<String>>,
     pub model_lifecycle: Option<FoundationModelLifecycle>,
     pub model_family: Option<String>,
-    pub inference_apis_supported: Option<Vec<String>>,
+    pub inference_apis_supported: Option<InferenceApisSupport>,
     pub features_supported: Option<FeaturesSupport>,
     pub guardrails_supported: Option<bool>,
     pub explicit_prompt_caching: Option<CapabilitySupport>,
@@ -167,7 +167,7 @@ bedrock_schema_and_codec!(
         "inferenceAPIsSupported",
         11,
         opt,
-        list_of_string
+        struct_of(InferenceApisSupport)
     ),
     (
         M_FEATURES_SUPPORTED,

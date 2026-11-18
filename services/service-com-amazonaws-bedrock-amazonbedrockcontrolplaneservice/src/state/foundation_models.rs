@@ -1915,11 +1915,16 @@ pub fn provider_matches(model: &FoundationModel, by_provider: &str) -> bool {
 // one bit: batch inference, for instance, runs the base model, runs it from another region
 // and runs a customization of it, and each of those is its own answer.
 //
-// And the capability metadata is published for a model that TAKES PART IN A CONVERSATION
-// and for no other: a model that answers with a vector or an image carries the ten members
-// the shape declares plus `guardrailsSupported`, and the catalog publishes it no family, no
-// invocation APIs, no feature record and no Converse record, so the summary reports none of
-// them for it rather than reporting one it made up.
+// And the capability members split by WHAT THEY ANSWER ABOUT. The ones that answer about an
+// INVOCATION of the model — the APIs it is reachable through, the features Amazon Bedrock
+// publishes for it, and the two of those features that are also reported one by one — are
+// reported for every offered model, because every offered model can be invoked: a model
+// that answers with a vector or an image is invoked through `InvokeModel` like any other,
+// and a feature no table lists it in simply answers no for it. The ones that describe a
+// CONVERSATION with the model, or a job built over one — the model's family line, the
+// Converse record, the batch record and latency-optimized inference — are published for a
+// model that TAKES PART IN A CONVERSATION and for no other, so the summary of a model that
+// answers with a vector or an image reports none of those rather than one it made up.
 
 /// `ModelModality` — the modality a model that takes part in a conversation produces
 /// (`crate::ops::types::MODEL_MODALITY_VALUES`).
@@ -1930,14 +1935,12 @@ pub(super) const MODALITY_TEXT: &str = "TEXT";
 /// `inferenceAPIsSupported`.
 pub(super) const OPENAI_MODEL_PROVIDER: &str = "OpenAI";
 
-/// The Converse API: Amazon Bedrock's own conversation API.
-pub(super) const INFERENCE_API_CONVERSE: &str = "converse";
-/// The InvokeModel API: every offered model is reachable through it, whatever it produces.
-pub(super) const INFERENCE_API_INVOKE_MODEL: &str = "invokeModel";
-/// The OpenAI-compatible chat completions endpoint.
-pub(super) const INFERENCE_API_OPENAI_CHAT_COMPLETIONS: &str = "openAiChatCompletions";
-/// The OpenAI-compatible responses endpoint.
-pub(super) const INFERENCE_API_OPENAI_RESPONSES: &str = "openAiResponses";
+/// The modality a turn of a SPOKEN conversation carries: the one a two-way stream is made
+/// of. `ModelModality` declares no such value in this model copy
+/// (`crate::ops::types::MODEL_MODALITY_VALUES`), so the catalog carries it on no row; it is
+/// named so [`model_bidirectional_streaming_supported`] states its rule as a rule rather
+/// than as a constant answer.
+pub(super) const MODALITY_SPEECH: &str = "SPEECH";
 
 /// `featuresSupported` — a model invocation job may run the model over a dataset ("Supported
 /// models and Regions for batch inference").
@@ -2030,25 +2033,66 @@ pub fn model_batch_supported(model: &FoundationModel) -> bool {
     model_publishes_feature(model, FEATURE_BATCH_INFERENCE)
 }
 
-/// The invocation APIs `model` is reachable through, in the order this control plane
-/// reports them.
+/// The invocation APIs `model` is reachable through, as the RECORD a summary reports them
+/// in: one member per API, each naming the calling modes that API offers FOR THIS MODEL.
 ///
-/// `invokeModel` reaches every offered model, whatever it produces; `converse` carries a
-/// CONVERSATION, so it reaches a conversational model ([`model_is_conversational`]) and no
-/// other; and the two OpenAI-compatible endpoints reach a model published by that provider
-/// ([`OPENAI_MODEL_PROVIDER`]), whose own API they are the shape of.
+/// A record rather than a list of API names because what an API offers for a model is more
+/// than one bit, and a client reads the mode it is about to use by name: `converse` answers
+/// a turn (`sync`) and streams that answer (`streaming`), and `invokeModel` answers in one
+/// piece (`sync`), streams an answer back (`responseStreaming`) and carries a stream in both
+/// directions (`bidirectionalStreaming`).
+///
+/// Each mode is read off the catalog row: `invokeModel` answers for every offered model,
+/// whatever it produces, and streams its answer exactly where the row streams; `converse`
+/// carries a CONVERSATION, so it reaches a conversational model
+/// ([`model_is_conversational`]) and no other, and streams under the same condition; the two
+/// OpenAI-compatible endpoints reach a model published by that provider
+/// ([`OPENAI_MODEL_PROVIDER`]), whose own API they are the shape of; and the two
+/// long-running modes are [`model_async_invoke_supported`] and
+/// [`model_bidirectional_streaming_supported`].
 #[must_use]
-pub fn model_inference_apis_supported(model: &FoundationModel) -> Vec<String> {
-    let mut apis: Vec<String> = Vec::new();
-    if model_is_conversational(model) {
-        apis.push(INFERENCE_API_CONVERSE.to_string());
+pub fn model_inference_apis_supported(model: &FoundationModel) -> InferenceApisSupport {
+    let conversational = model_is_conversational(model);
+    let openai_published = model.provider_name == OPENAI_MODEL_PROVIDER;
+    InferenceApisSupport {
+        async_invoke: Some(model_async_invoke_supported(model)),
+        converse: Some(ConverseApiSupport {
+            streaming: Some(conversational && model.response_streaming_supported),
+            sync: Some(conversational),
+        }),
+        invoke_model: Some(InvokeModelApiSupport {
+            bidirectional_streaming: Some(model_bidirectional_streaming_supported(model)),
+            response_streaming: Some(model.response_streaming_supported),
+            sync: Some(true),
+        }),
+        open_ai_chat_completions: Some(openai_published),
+        open_ai_responses: Some(openai_published),
     }
-    apis.push(INFERENCE_API_INVOKE_MODEL.to_string());
-    if model.provider_name == OPENAI_MODEL_PROVIDER {
-        apis.push(INFERENCE_API_OPENAI_CHAT_COMPLETIONS.to_string());
-        apis.push(INFERENCE_API_OPENAI_RESPONSES.to_string());
-    }
-    apis
+}
+
+/// Whether an ASYNCHRONOUS invocation may be started for `model`.
+///
+/// `StartAsyncInvoke` answers with an artifact written to Amazon S3 instead of with a
+/// response body, which is how Amazon Bedrock serves a model whose generation takes minutes
+/// — a model that generates a CLIP. No value `ModelModality` declares
+/// (`crate::ops::types::MODEL_MODALITY_VALUES` is EMBEDDING/IMAGE/TEXT) is that modality, so
+/// no row of this catalog produces one and no offered model is reachable asynchronously.
+#[must_use]
+pub fn model_async_invoke_supported(model: &FoundationModel) -> bool {
+    model.output_modalities.contains(&MODALITY_VIDEO)
+}
+
+/// Whether `model` is reachable through a stream that runs in BOTH directions.
+///
+/// `InvokeModelWithBidirectionalStream` carries the conversation as a stream each way: the
+/// caller streams what it says while the model streams what it answers. That takes a model
+/// whose input and output are both the streamed modality a spoken turn is made of
+/// ([`MODALITY_SPEECH`]), and `ModelModality` declares no such value, so no row of this
+/// catalog is reachable that way.
+#[must_use]
+pub fn model_bidirectional_streaming_supported(model: &FoundationModel) -> bool {
+    model.input_modalities.contains(&MODALITY_SPEECH)
+        && model.output_modalities.contains(&MODALITY_SPEECH)
 }
 
 /// Whether a model invocation job may run `model` over a dataset, as the record the FEATURE
@@ -2357,9 +2401,14 @@ pub(super) const MODALITY_VIDEO: &str = "VIDEO";
 /// available. `publicExtendedAccessTime` is left out, because nothing publishes it per
 /// model: it is part of a legacy window AWS states no instant for.
 ///
-/// The members after `modelLifecycle` are the model's CAPABILITIES, each computed from this
-/// row — see the capability section above for what each one takes of a model, and why only
-/// a model that takes part in a conversation carries them.
+/// The members after `modelLifecycle` are the model's CAPABILITIES. The ones that answer
+/// about an INVOCATION of the model — the APIs it is reachable through, the Amazon Bedrock
+/// features published for it and the two features reported one by one beside the record —
+/// are reported for EVERY offered model, because every offered model can be invoked, so a
+/// client that reads one of them always gets an answer. The ones that describe a
+/// CONVERSATION with the model or a job built over it — its family line, the Converse
+/// record, the batch record and latency-optimized inference — are reported for a model that
+/// takes part in a conversation and for no other; see the capability section above.
 #[must_use]
 pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> FoundationModelSummary {
     let list = |values: &[&str]| values.iter().map(|value| (*value).to_string()).collect();
@@ -2386,13 +2435,13 @@ pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> Founda
             public_extended_access_time: None,
         }),
         model_family: conversational.then(|| model.model_family.to_string()),
-        inference_apis_supported: conversational.then(|| model_inference_apis_supported(model)),
-        features_supported: conversational.then(|| model_features_supported(model)),
+        inference_apis_supported: Some(model_inference_apis_supported(model)),
+        features_supported: Some(model_features_supported(model)),
         guardrails_supported: Some(model_guardrails_supported(model)),
-        explicit_prompt_caching: conversational
-            .then(|| capability_support(model_explicit_prompt_caching(model))),
-        intelligent_prompt_routing: conversational
-            .then(|| capability_support(model_intelligent_prompt_routing(model))),
+        explicit_prompt_caching: Some(capability_support(model_explicit_prompt_caching(model))),
+        intelligent_prompt_routing: Some(capability_support(model_intelligent_prompt_routing(
+            model,
+        ))),
         latency_optimization_supported: conversational
             .then(|| model_latency_optimization_supported(model)),
         batch_supported: conversational.then(|| model_batch_support(model)),

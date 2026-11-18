@@ -11,14 +11,18 @@
 //!    boolean: `batchSupported` answers for the base model, for another region and for a
 //!    customization of the model; `explicitPromptCaching`, `intelligentPromptRouting` and
 //!    `converse.reasoningSupported` each name whether that capability is supported;
-//!    `featuresSupported` names each Amazon Bedrock feature; and `converse` carries what a
+//!    `featuresSupported` names each Amazon Bedrock feature; `inferenceAPIsSupported` names
+//!    each invocation API and the calling modes it offers; and `converse` carries what a
 //!    conversation may ask of the model. What one of them says about a model is more than
 //!    one bit, so a client reads it by member name.
-//! 2. **The capability metadata is published for a model that takes part in a conversation
-//!    and for no other**: the summary of a model that answers with a vector or an image
-//!    carries the modelled members and `guardrailsSupported`, and no family, invocation
-//!    APIs, feature record, capability record or Converse record — the catalogue publishes
-//!    it none, so the summary reports none rather than one it made up.
+//! 2. **The capability metadata splits by what it answers about**: what answers about an
+//!    INVOCATION of the model (`inferenceAPIsSupported`, `featuresSupported` and the two
+//!    features reported one by one beside it) is reported for every offered model, because
+//!    every offered model can be invoked; what describes a CONVERSATION with the model or a
+//!    job built over one (`modelFamily`, `converse`, `batchSupported`,
+//!    `latencyOptimizationSupported`) is reported for a model that takes part in a
+//!    conversation and for no other, so the summary of a model that answers with a vector
+//!    or an image reports none of those rather than one it made up.
 //! 3. **Every member of a record is read off the catalogue row**: the features the row
 //!    publishes, the customizations it accepts, the modalities it takes, who publishes it.
 //! 4. **The listing reports one summary per model the service offers**, so a client that
@@ -47,16 +51,22 @@ use crate::support::{
 /// one model under (`smithy_query(query="operation",operation="ListFoundationModels")`).
 const PATH: &str = "/foundation-models";
 
-/// The members a summary carries ONLY for a model that takes part in a conversation.
+/// The members a summary carries ONLY for a model that takes part in a conversation: what
+/// describes the conversation itself, or a job built over one.
 const CONVERSATIONAL_ONLY_MEMBERS: &[&str] = &[
     "modelFamily",
+    "latencyOptimizationSupported",
+    "batchSupported",
+    "converse",
+];
+
+/// The capability members a summary carries for EVERY offered model: what answers about an
+/// invocation of it, which every offered model can be given.
+const EVERY_MODEL_CAPABILITY_MEMBERS: &[&str] = &[
     "inferenceAPIsSupported",
     "featuresSupported",
     "explicitPromptCaching",
     "intelligentPromptRouting",
-    "latencyOptimizationSupported",
-    "batchSupported",
-    "converse",
 ];
 
 /// The members of the record `featuresSupported` is.
@@ -72,6 +82,16 @@ const FEATURE_MEMBERS: &[&str] = &[
 /// The members of the record `featuresSupported.batchInference` is: batch inference is
 /// published per region scope, so it answers for each scope rather than with one boolean.
 const BATCH_INFERENCE_MEMBERS: &[&str] = &["crossRegion", "inRegion"];
+
+/// The members of the record `inferenceAPIsSupported` is: one per invocation API Amazon
+/// Bedrock serves a base model on.
+const INVOCATION_API_MEMBERS: &[&str] = &[
+    "asyncInvoke",
+    "converse",
+    "invokeModel",
+    "openAiChatCompletions",
+    "openAiResponses",
+];
 
 /// The members of the record `batchSupported` is.
 const BATCH_MEMBERS: &[&str] = &[
@@ -176,6 +196,60 @@ async fn a_capability_is_reported_as_the_record_that_names_what_is_supported() {
             Some(published("INTELLIGENT_PROMPT_ROUTING")),
             "case {case:?}: expected intelligentPromptRouting.isSupported {:?}, got {routing:?}",
             published("INTELLIGENT_PROMPT_ROUTING")
+        );
+
+        // The invocation APIs answer per API, and the ones whose answer has parts answer
+        // with a record of their own, so a client reads the mode it is about to use.
+        let apis = summary.get("inferenceAPIsSupported").unwrap_or(&Value::Null);
+        assert!(
+            apis.is_object(),
+            "case {case:?}: inferenceAPIsSupported must be the record naming each invocation \
+             API, got {apis:?}"
+        );
+        for member in INVOCATION_API_MEMBERS {
+            assert!(
+                apis.get(member).is_some(),
+                "case {case:?}: inferenceAPIsSupported must answer for {member}, got {apis:?}"
+            );
+        }
+        assert_eq!(
+            (
+                apis["converse"]["sync"].as_bool(),
+                apis["converse"]["streaming"].as_bool(),
+            ),
+            (Some(true), Some(model.response_streaming_supported)),
+            "case {case:?}: Converse reaches a conversational model and streams where the row \
+             streams ({:?}), got {apis:?}",
+            model.response_streaming_supported
+        );
+        assert_eq!(
+            (
+                apis["invokeModel"]["sync"].as_bool(),
+                apis["invokeModel"]["responseStreaming"].as_bool(),
+                apis["invokeModel"]["bidirectionalStreaming"].as_bool(),
+            ),
+            (
+                Some(true),
+                Some(model.response_streaming_supported),
+                Some(false),
+            ),
+            "case {case:?}: InvokeModel reaches every offered model and streams where the row \
+             streams, and no row is published with a two-way stream, got {apis:?}"
+        );
+        let openai_published = model.provider_name == "OpenAI";
+        for member in ["openAiChatCompletions", "openAiResponses"] {
+            assert_eq!(
+                apis.get(member).and_then(Value::as_bool),
+                Some(openai_published),
+                "case {case:?}: an OpenAI-compatible endpoint serves a model that provider \
+                 publishes ({openai_published:?}), got {apis:?}"
+            );
+        }
+        assert_eq!(
+            apis["asyncInvoke"].as_bool(),
+            Some(false),
+            "case {case:?}: an asynchronous invocation generates a clip, which no modality \
+             this catalogue's rows declare is, got {apis:?}"
         );
 
         // Batch inference answers for the base model, for another region, and for a
@@ -351,6 +425,29 @@ async fn a_model_that_answers_no_turn_of_a_conversation_carries_no_capability_me
                 summary.get(member)
             );
         }
+        // What answers about an INVOCATION of the model is still reported: this model is
+        // invoked through `InvokeModel` like any other, and a feature no supported-models
+        // table lists it in simply answers no for it.
+        for member in EVERY_MODEL_CAPABILITY_MEMBERS {
+            let reported = summary.get(member);
+            assert!(
+                reported.is_some_and(Value::is_object),
+                "case {case:?}: every offered model can be invoked, so {member} is reported for \
+                 this model too, as the record naming what is supported, got {reported:?}"
+            );
+        }
+        let apis = &summary["inferenceAPIsSupported"];
+        assert_eq!(
+            apis["invokeModel"]["sync"].as_bool(),
+            Some(true),
+            "case {case:?}: every offered model is reachable through InvokeModel, got {apis:?}"
+        );
+        assert_eq!(
+            apis["converse"]["sync"].as_bool(),
+            Some(false),
+            "case {case:?}: Converse carries a conversation, so it does not reach a model that \
+             answers no turn of one, got {apis:?}"
+        );
         // What is decided BESIDE the invocation is still reported: a guardrail decides about
         // text, so it does not apply to this model.
         assert_eq!(

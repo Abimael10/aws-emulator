@@ -214,6 +214,7 @@ use crate::ops::types::{
     ReasoningSupport,
     CustomModelSummary, CustomizationConfig, EndpointConfig, EvaluationConfig,
     ConverseSupport, FeaturesSupport,
+    ConverseApiSupport, InferenceApisSupport, InvokeModelApiSupport,
     ModelInvocationJobInputDataConfig, ModelInvocationJobOutputDataConfig,
     ModelInvocationJobSummary,
     EvaluationInferenceConfig, EvaluationOutputDataConfig, FoundationModelDetails,

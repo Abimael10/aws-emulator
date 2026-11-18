@@ -1788,6 +1788,128 @@ bedrock_schema_and_codec!(
     ),
 );
 
+/// What the Converse API offers for one published foundation model, as the `converse` member
+/// of the invocation-API record carries it: the API answers a turn, and it streams that
+/// answer, and those are two different questions a client settles before it calls.
+///
+/// RECORDED behaviour, not modelled, like [`InferenceApisSupport`], which says why an API is
+/// reported as a record of its calling modes rather than as a name in a list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConverseApiSupport {
+    pub streaming: Option<bool>,
+    pub sync: Option<bool>,
+}
+
+bedrock_schema_and_codec!(
+    ConverseApiSupport,
+    FOUNDATION_MODEL_CONVERSE_API_SUPPORT_SCHEMA,
+    "com.amazonaws.bedrock#FoundationModelConverseApiSupport",
+    "com.amazonaws.bedrock",
+    "FoundationModelConverseApiSupport",
+    (M_STREAMING, streaming, "streaming", 0, opt, boolean),
+    (M_SYNC, sync, "sync", 1, opt, boolean),
+);
+
+/// What the InvokeModel API offers for one published foundation model, as the `invokeModel`
+/// member of the invocation-API record carries it: the API answers in one piece, it streams
+/// the answer back, and it carries a stream in BOTH directions — three calling modes, each
+/// its own question.
+///
+/// RECORDED behaviour, not modelled, like [`InferenceApisSupport`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InvokeModelApiSupport {
+    pub bidirectional_streaming: Option<bool>,
+    pub response_streaming: Option<bool>,
+    pub sync: Option<bool>,
+}
+
+bedrock_schema_and_codec!(
+    InvokeModelApiSupport,
+    FOUNDATION_MODEL_INVOKE_MODEL_API_SUPPORT_SCHEMA,
+    "com.amazonaws.bedrock#FoundationModelInvokeModelApiSupport",
+    "com.amazonaws.bedrock",
+    "FoundationModelInvokeModelApiSupport",
+    (
+        M_BIDIRECTIONAL_STREAMING,
+        bidirectional_streaming,
+        "bidirectionalStreaming",
+        0,
+        opt,
+        boolean
+    ),
+    (
+        M_RESPONSE_STREAMING,
+        response_streaming,
+        "responseStreaming",
+        1,
+        opt,
+        boolean
+    ),
+    (M_SYNC, sync, "sync", 2, opt, boolean),
+);
+
+/// The invocation APIs one published foundation model is reachable through, as the
+/// `inferenceAPIsSupported` member of a `FoundationModelSummary` / `FoundationModelDetails`
+/// carries it: a RECORD with one member per API, so a client tests the API it is about to
+/// call by name.
+///
+/// RECORDED behaviour, not modelled, like [`FeaturesSupport`]: the on-disk model declares no
+/// such member. A record rather than a list of API NAMES because what an API offers for a
+/// model is more than one bit — Converse answers a turn and may stream it, InvokeModel
+/// answers in one piece, streams an answer and carries a two-way stream — so an API whose
+/// answer has parts answers with a record of its own ([`ConverseApiSupport`],
+/// [`InvokeModelApiSupport`]) and one whose answer is a single bit answers yes or no. A
+/// client reads the mode it needs by member name, which a list of names cannot be asked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InferenceApisSupport {
+    pub async_invoke: Option<bool>,
+    pub converse: Option<ConverseApiSupport>,
+    pub invoke_model: Option<InvokeModelApiSupport>,
+    pub open_ai_chat_completions: Option<bool>,
+    pub open_ai_responses: Option<bool>,
+}
+
+bedrock_schema_and_codec!(
+    InferenceApisSupport,
+    FOUNDATION_MODEL_INFERENCE_APIS_SUPPORT_SCHEMA,
+    "com.amazonaws.bedrock#FoundationModelInferenceApisSupport",
+    "com.amazonaws.bedrock",
+    "FoundationModelInferenceApisSupport",
+    (M_ASYNC_INVOKE, async_invoke, "asyncInvoke", 0, opt, boolean),
+    (
+        M_CONVERSE,
+        converse,
+        "converse",
+        1,
+        opt,
+        struct_of(ConverseApiSupport)
+    ),
+    (
+        M_INVOKE_MODEL,
+        invoke_model,
+        "invokeModel",
+        2,
+        opt,
+        struct_of(InvokeModelApiSupport)
+    ),
+    (
+        M_OPEN_AI_CHAT_COMPLETIONS,
+        open_ai_chat_completions,
+        "openAiChatCompletions",
+        3,
+        opt,
+        boolean
+    ),
+    (
+        M_OPEN_AI_RESPONSES,
+        open_ai_responses,
+        "openAiResponses",
+        4,
+        opt,
+        boolean
+    ),
+);
+
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrock#PromptRouterTargetModel")]
 #[derive(Debug, Clone, Default)]
 pub struct PromptRouterTargetModel {
