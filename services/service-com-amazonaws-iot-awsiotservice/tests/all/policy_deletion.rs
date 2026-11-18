@@ -25,6 +25,15 @@
 //! INACTIVE one, a thing group ARN and a Cognito identity), one, two and three attached
 //! targets at once, policy names of several forms and lengths, and a policy holding a
 //! second version whichever of the two is in effect.
+//!
+//! The last two suites take the rule where BOTH dependencies hold at once — a policy a
+//! target still names AND that still holds a version other than the one in effect — and
+//! where the successful delete lands: clearing either half on its own leaves the delete
+//! refused, worded for the half that remains, in whichever order the documented
+//! remediation (`DeletePolicyVersion`, then `DetachPolicy`) is worked; and once it
+//! succeeds "its default version is deleted with it", so the readers of one version and
+//! of all of them refuse the name, and a policy created under that name again starts its
+//! versions over.
 
 use std::sync::Arc;
 
@@ -93,6 +102,46 @@ impl Reply {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The `versionId` of every version a `ListPolicyVersions` answer carries, in the
+    /// order it reported them.
+    fn version_ids(&self) -> Vec<String> {
+        self.body
+            .get("policyVersions")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .get("versionId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `versionId` of the version a `ListPolicyVersions` answer flags
+    /// `isDefaultVersion` — the one in EFFECT, which a delete of the policy takes with
+    /// it.
+    fn default_version_id(&self) -> Option<String> {
+        self.body
+            .get("policyVersions")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|entry| {
+                entry
+                    .get("isDefaultVersion")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_default()
+            })
+            .and_then(|entry| entry.get("versionId"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     /// Whether the body carries no member at all — what an operation whose output shape
@@ -232,6 +281,35 @@ impl Emulator {
     async fn create_thing_group(&self, name: &str) -> Reply {
         self.call("POST", &format!("/thing-groups/{name}"), Some(&json!({})))
             .await
+    }
+
+    /// `ListPolicyVersions`: `GET /policies/{policyName}/version` — the reader that
+    /// reports which versions a policy still holds.
+    async fn list_policy_versions(&self, policy_name: &str) -> Reply {
+        self.call("GET", &format!("/policies/{policy_name}/version"), None)
+            .await
+    }
+
+    /// `GetPolicyVersion`: `GET /policies/{policyName}/version/{policyVersionId}`.
+    async fn get_policy_version(&self, policy_name: &str, version_id: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!("/policies/{policy_name}/version/{version_id}"),
+            None,
+        )
+        .await
+    }
+
+    /// `DeletePolicyVersion`: `DELETE /policies/{policyName}/version/{policyVersionId}`
+    /// — the remediation `DeletePolicy` documents for a policy holding a non-default
+    /// version.
+    async fn delete_policy_version(&self, policy_name: &str, version_id: &str) -> Reply {
+        self.call(
+            "DELETE",
+            &format!("/policies/{policy_name}/version/{version_id}"),
+            None,
+        )
+        .await
     }
 }
 
@@ -668,4 +746,332 @@ async fn a_policy_the_registry_does_not_hold_is_refused_not_found() {
         survivor.status, 200,
         "a refused delete must leave the existing policy in place, got {survivor:?}"
     );
+}
+
+/// Which of the two dependencies the documented remediation clears FIRST: the rule is
+/// about what still remains, so the order the caller works in must not change the
+/// outcome.
+#[derive(Debug, Clone, Copy)]
+enum ClearedFirst {
+    NonDefaultVersion,
+    Attachment,
+}
+
+#[tokio::test]
+async fn a_policy_held_back_by_both_halves_is_deleted_only_after_the_last_one_is_cleared() {
+    // The two halves of the rule hold TOGETHER, and each on its own keeps holding: the
+    // rows differ along which half the caller clears first and which target form the
+    // attachment uses, because what decides the delete is the dependency that remains
+    // rather than the sequence of calls that cleared the rest.
+    let rows = [
+        (
+            "the non-default version cleared first, an ACTIVE certificate attached",
+            ClearedFirst::NonDefaultVersion,
+            TargetKind::ActiveCertificate,
+        ),
+        (
+            "the attachment cleared first, an ACTIVE certificate attached",
+            ClearedFirst::Attachment,
+            TargetKind::ActiveCertificate,
+        ),
+        (
+            "the non-default version cleared first, a thing group attached",
+            ClearedFirst::NonDefaultVersion,
+            TargetKind::ThingGroup,
+        ),
+        (
+            "the attachment cleared first, an INACTIVE certificate attached",
+            ClearedFirst::Attachment,
+            TargetKind::InactiveCertificate,
+        ),
+        (
+            "the attachment cleared first, a Cognito identity attached",
+            ClearedFirst::Attachment,
+            TargetKind::CognitoIdentity,
+        ),
+    ];
+
+    for (label, cleared_first, target_kind) in rows {
+        let emulator = Emulator::new();
+        let policy_name = "held-by-both";
+
+        let created = emulator.create_policy(policy_name, POLICY_DOCUMENT).await;
+        assert_eq!(
+            created.status, 200,
+            "case {label:?}: CreatePolicy must succeed, got {created:?}"
+        );
+        let added = emulator
+            .create_policy_version(policy_name, OTHER_POLICY_DOCUMENT, false)
+            .await;
+        assert_eq!(
+            added.status, 200,
+            "case {label:?}: CreatePolicyVersion must succeed, got {added:?}"
+        );
+        let non_default_version = added
+            .text("policyVersionId")
+            .unwrap_or_else(|| panic!("case {label:?}: no policyVersionId in {added:?}"));
+        let target = given_attached_target(&emulator, policy_name, target_kind, 0).await;
+
+        // With BOTH halves in place the delete is refused the one modelled conflict, and
+        // the sentence it states is one of the two the two halves are worded with.
+        let refused = emulator.delete_policy(policy_name).await;
+        assert_eq!(
+            refused.status, 409,
+            "case {label:?}: a policy held back by both halves must be refused 409, got \
+             {refused:?}"
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some("DeleteConflictException"),
+            "case {label:?}: expected DeleteConflictException, got {refused:?}"
+        );
+        let stated = refused.text("message");
+        assert!(
+            stated.as_deref() == Some(attached_message(policy_name).as_str())
+                || stated.as_deref() == Some(non_default_versions_message(policy_name).as_str()),
+            "case {label:?}: the refusal must state one of the two documented conflicts, \
+             got {refused:?}"
+        );
+
+        // Clearing ONE half leaves the other holding the delete back, and the refusal is
+        // then worded for the half that remains.
+        let remaining_message = match cleared_first {
+            ClearedFirst::NonDefaultVersion => {
+                let deleted = emulator
+                    .delete_policy_version(policy_name, &non_default_version)
+                    .await;
+                assert_eq!(
+                    deleted.status, 200,
+                    "case {label:?}: DeletePolicyVersion must clear version \
+                     {non_default_version:?}, got {deleted:?}"
+                );
+                attached_message(policy_name)
+            }
+            ClearedFirst::Attachment => {
+                let detached = emulator.detach_policy(policy_name, &target).await;
+                assert_eq!(
+                    detached.status, 200,
+                    "case {label:?}: DetachPolicy must clear {target:?}, got {detached:?}"
+                );
+                non_default_versions_message(policy_name)
+            }
+        };
+
+        let still_refused = emulator.delete_policy(policy_name).await;
+        assert_eq!(
+            still_refused.status, 409,
+            "case {label:?}: one half cleared must leave the delete refused 409, got \
+             {still_refused:?}"
+        );
+        assert_eq!(
+            still_refused.error_code.as_deref(),
+            Some("DeleteConflictException"),
+            "case {label:?}: expected DeleteConflictException, got {still_refused:?}"
+        );
+        assert_eq!(
+            still_refused.text("message"),
+            Some(remaining_message.clone()),
+            "case {label:?}: the refusal must be worded for the half that remains, got \
+             {still_refused:?}"
+        );
+
+        // Neither refused delete removed anything: the policy still reads back, and so do
+        // the versions it holds.
+        let read = emulator.get_policy(policy_name).await;
+        assert_eq!(
+            read.status, 200,
+            "case {label:?}: a refused delete must leave the policy readable, got {read:?}"
+        );
+        let versions = emulator.list_policy_versions(policy_name).await;
+        let expected_versions: usize = match cleared_first {
+            ClearedFirst::NonDefaultVersion => 1,
+            ClearedFirst::Attachment => 2,
+        };
+        assert_eq!(
+            versions.version_ids().len(),
+            expected_versions,
+            "case {label:?}: a refused delete must leave every version it did not clear, \
+             got {versions:?}"
+        );
+
+        // Clearing the SECOND half unblocks it.
+        match cleared_first {
+            ClearedFirst::NonDefaultVersion => {
+                let detached = emulator.detach_policy(policy_name, &target).await;
+                assert_eq!(
+                    detached.status, 200,
+                    "case {label:?}: DetachPolicy must clear {target:?}, got {detached:?}"
+                );
+            }
+            ClearedFirst::Attachment => {
+                let deleted = emulator
+                    .delete_policy_version(policy_name, &non_default_version)
+                    .await;
+                assert_eq!(
+                    deleted.status, 200,
+                    "case {label:?}: DeletePolicyVersion must clear version \
+                     {non_default_version:?}, got {deleted:?}"
+                );
+            }
+        }
+
+        let deleted = emulator.delete_policy(policy_name).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {label:?}: with both halves cleared the delete must succeed, got \
+             {deleted:?}"
+        );
+        let read = emulator.get_policy(policy_name).await;
+        assert_eq!(
+            read.status, 404,
+            "case {label:?}: the deleted policy must be gone for every later reader, got \
+             {read:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_policy_takes_the_version_in_effect_with_it() {
+    // "When a policy is deleted using DeletePolicy, its default version is deleted with
+    // it": the rows differ along WHICH id is in effect when the policy goes — the first
+    // version a create minted, and a later one the account re-pointed the policy at —
+    // because what the delete removes is the record, not an id.
+    struct Row {
+        label: &'static str,
+        policy_name: &'static str,
+        /// How many versions beyond the first the policy is given, the last of them
+        /// pointed at as the one in effect; the earlier ones are deleted first, as the
+        /// documented remediation requires.
+        extra_versions: usize,
+    }
+    let rows = [
+        Row {
+            label: "the first version is the one in effect",
+            policy_name: "effect-first",
+            extra_versions: 0,
+        },
+        Row {
+            label: "the second version is the one in effect",
+            policy_name: "effect-second",
+            extra_versions: 1,
+        },
+        Row {
+            label: "the fourth version is the one in effect",
+            policy_name: "effect-fourth",
+            extra_versions: 3,
+        },
+    ];
+
+    for row in rows {
+        let label = row.label;
+        let emulator = Emulator::new();
+
+        let created = emulator
+            .create_policy(row.policy_name, POLICY_DOCUMENT)
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {label:?}: CreatePolicy must succeed, got {created:?}"
+        );
+        for index in 0..row.extra_versions {
+            let added = emulator
+                .create_policy_version(row.policy_name, OTHER_POLICY_DOCUMENT, true)
+                .await;
+            assert_eq!(
+                added.status, 200,
+                "case {label:?}: CreatePolicyVersion #{index} must succeed, got {added:?}"
+            );
+        }
+
+        // Only the version in effect is left standing, so nothing but the documented
+        // rule's own subject holds the delete back.
+        let listed = emulator.list_policy_versions(row.policy_name).await;
+        let in_effect = listed
+            .default_version_id()
+            .unwrap_or_else(|| panic!("case {label:?}: no default version in {listed:?}"));
+        for version_id in listed.version_ids() {
+            if version_id == in_effect {
+                continue;
+            }
+            let cleared = emulator
+                .delete_policy_version(row.policy_name, &version_id)
+                .await;
+            assert_eq!(
+                cleared.status, 200,
+                "case {label:?}: DeletePolicyVersion must clear version {version_id:?}, \
+                 got {cleared:?}"
+            );
+        }
+        let remaining = emulator.list_policy_versions(row.policy_name).await;
+        assert_eq!(
+            remaining.version_ids(),
+            vec![in_effect.clone()],
+            "case {label:?}: only the version in effect must remain, got {remaining:?}"
+        );
+        // The row's point: the id in effect is the one this row set up.
+        assert_eq!(
+            in_effect,
+            (row.extra_versions + 1).to_string(),
+            "case {label:?}: unexpected version in effect, got {in_effect:?}"
+        );
+
+        let deleted = emulator.delete_policy(row.policy_name).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {label:?}: the delete must succeed, got {deleted:?}"
+        );
+
+        // The default version went with the policy: the reader of ONE version and the
+        // reader of ALL of them both refuse the name, worded the way every operation
+        // addressing the policy record words a miss.
+        let read_version = emulator
+            .get_policy_version(row.policy_name, &in_effect)
+            .await;
+        assert_eq!(
+            read_version.status, 404,
+            "case {label:?}: the version in effect must be gone with the policy, got \
+             {read_version:?}"
+        );
+        assert_eq!(
+            read_version.error_code.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {label:?}: expected ResourceNotFoundException, got {read_version:?}"
+        );
+        assert_eq!(
+            read_version.text("message"),
+            Some(missing_message(row.policy_name)),
+            "case {label:?}: unexpected not-found message from the version reader, got \
+             {read_version:?}"
+        );
+        let listed_after = emulator.list_policy_versions(row.policy_name).await;
+        assert_eq!(
+            listed_after.status, 404,
+            "case {label:?}: the deleted policy must hold no versions to list, got \
+             {listed_after:?}"
+        );
+        assert_eq!(
+            listed_after.text("message"),
+            Some(missing_message(row.policy_name)),
+            "case {label:?}: unexpected not-found message from the version listing, got \
+             {listed_after:?}"
+        );
+
+        // Nothing of the deleted record survived under the name: a policy created under
+        // it again starts its versions over at the first id rather than continuing the
+        // numbering the deleted policy had reached.
+        let recreated = emulator
+            .create_policy(row.policy_name, POLICY_DOCUMENT)
+            .await;
+        assert_eq!(
+            recreated.status, 200,
+            "case {label:?}: the name must be free after the delete, got {recreated:?}"
+        );
+        let fresh = emulator.list_policy_versions(row.policy_name).await;
+        assert_eq!(
+            fresh.version_ids(),
+            vec!["1".to_string()],
+            "case {label:?}: the re-created policy must start its versions over, got \
+             {fresh:?}"
+        );
+    }
 }
