@@ -162,6 +162,14 @@ pub mod health_check_schedule;
 
 pub use health_check_schedule::{check_health_check_schedule, HEALTH_CHECK_SCHEDULE_MESSAGE};
 
+/// The health-check members a probe carries only when it speaks HTTP semantics.
+pub mod health_check_http_members;
+
+pub use health_check_http_members::{
+    check_http_only_health_check_members, default_health_check_protocol,
+    http_only_health_check_member_message,
+};
+
 /// The RETURN CODES a target group's health check counts as success, and the range each
 /// kind of code may name.
 pub mod health_check_matcher;

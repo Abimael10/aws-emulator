@@ -294,6 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
         validate_health_check_port(input.health_check_port.as_deref())?;
         validate_health_check_path(input.health_check_path.as_deref())?;
+        validate_http_only_health_check_members(&input, &target_type)?;
         validate_protocol_version(
             input.protocol_version.as_deref(),
             input.protocol.as_deref(),
@@ -524,6 +525,40 @@ fn validate_health_check_path(path: Option<&str>) -> Result<(), CreateTargetGrou
     }
 }
 
+/// Refuse a `HealthCheckPath` or a `Matcher` on a health check that does not speak HTTP
+/// semantics, as [`crate::state::check_http_only_health_check_members`] states the rule:
+/// both members are documented "[HTTP/HTTPS health checks]", so a probe that opens a
+/// connection rather than sending a request can carry neither.
+///
+/// Judged on the EFFECTIVE protocol of the probe this create would store — what the
+/// request names, else the default `HealthCheckProtocol` documents for a target group of
+/// this protocol ([`crate::state::default_health_check_protocol`], the same default
+/// [`health_check_config`] fills) — so a request naming a path and no protocol is judged
+/// against the probe it actually asks for. A `lambda` target group's probe reports no
+/// protocol at all and is an HTTP one, so it carries both members.
+///
+/// It is a combination of members no target group can hold rather than a bad value, so it
+/// answers the modelled `InvalidConfigurationRequest`, as `validate_protocol_version`
+/// below does for the other member pair the model brackets to a protocol.
+fn validate_http_only_health_check_members(
+    input: &CreateTargetGroupInput,
+    target_type: &str,
+) -> Result<(), CreateTargetGroupError> {
+    let probe = if target_type == crate::state::LAMBDA_TARGET_TYPE {
+        None
+    } else {
+        Some(input.health_check_protocol.as_deref().unwrap_or_else(|| {
+            crate::state::default_health_check_protocol(input.protocol.as_deref())
+        }))
+    };
+    crate::state::check_http_only_health_check_members(
+        probe,
+        input.health_check_path.is_some(),
+        input.matcher.is_some(),
+    )
+    .map_err(invalid_configuration)
+}
+
 /// Refuse a `ProtocolVersion` on a target group that has no HTTP protocol to version.
 ///
 /// The member is documented "[HTTP/HTTPS protocol] The protocol version", and "if the
@@ -594,10 +629,8 @@ fn health_check_config(
     let health_check_protocol = input.health_check_protocol.clone().or_else(|| {
         if lambda {
             None
-        } else if is_http(protocol) {
-            Some("HTTP".to_string())
         } else {
-            Some("TCP".to_string())
+            Some(crate::state::default_health_check_protocol(protocol).to_string())
         }
     });
     // A Lambda target group reports no health-check protocol at all — the load

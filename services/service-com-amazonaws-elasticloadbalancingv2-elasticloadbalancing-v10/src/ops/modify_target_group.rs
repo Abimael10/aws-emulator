@@ -257,23 +257,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // `HealthCheckPath` and `Matcher` are both documented "[HTTP/HTTPS health
         // checks]", so naming either for a health check that will not be an HTTP one is
-        // a configuration that cannot hold together.
-        let health_check_will_be_http = match input.health_check_protocol.as_deref() {
-            Some(protocol) => group.is_lambda() || crate::state::is_http_protocol(Some(protocol)),
-            None => group.health_check_is_http(),
-        };
-        if !health_check_will_be_http {
-            for (member, named) in [
-                ("HealthCheckPath", input.health_check_path.is_some()),
-                ("Matcher", input.matcher.is_some()),
-            ] {
-                if named {
-                    return Err(invalid_configuration(format!(
-                        "{member} is only supported for an HTTP or HTTPS health check"
-                    )));
-                }
-            }
-        }
+        // a configuration that cannot hold together — the ONE reading of that rule in
+        // `crate::state`, which `CreateTargetGroup` applies to the probe a target group
+        // STARTS with. It is judged on the protocol the probe this modify would leave
+        // behind speaks: what the request names, else what the group already stores. A
+        // `lambda` target group's probe reports no protocol at all and is an HTTP one.
+        let resulting_health_check_protocol = input
+            .health_check_protocol
+            .as_deref()
+            .or(group.health_check.protocol.as_deref());
+        crate::state::check_http_only_health_check_members(
+            resulting_health_check_protocol.filter(|_| !group.is_lambda()),
+            input.health_check_path.is_some(),
+            input.matcher.is_some(),
+        )
+        .map_err(invalid_configuration)?;
+        let health_check_will_be_http = group.is_lambda()
+            || crate::state::is_http_protocol(resulting_health_check_protocol);
         // The matcher the request carries, as the record a health check holds, so the
         // rule below and the write further down read ONE value.
         let requested_matcher = input.matcher.as_ref().map(|matcher| crate::state::MatcherRecord {
