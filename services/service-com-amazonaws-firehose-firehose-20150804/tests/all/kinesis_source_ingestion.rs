@@ -14,6 +14,11 @@
 //! directly-put record is: an object under the destination's `Prefix` with the automatic
 //! `YYYY/MM/DD/HH` expansion, on whichever `BufferingHints` condition is met first.
 //!
+//! The ORDER is part of that rule: a shard appends in arrival order and the records it took are
+//! buffered and delivered in that same order, so for the records carrying one partition key —
+//! which always addresses one shard — the bytes at the destination carry them in the order the
+//! producer published them, however the sequence is cut into buffers.
+//!
 //! Three services are mounted on ONE shared engine, as the router mounts them, so what is
 //! exercised is the hand-off between them: the Kinesis writes and the Firehose calls as
 //! `POST /` with `X-Amz-Target`, the destination reads as the path-style Amazon S3 requests a
@@ -24,8 +29,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use crate::buffering_hints::SHORT_INTERVAL;
 use crate::delivery_stream_lifecycle::{REGION, ROLE_ARN};
-use crate::destination_delivery::{base64, carries_time_prefix, Emulator};
+use crate::destination_delivery::{base64, carries_time_prefix, offsets, Emulator};
 
 /// The `X-Amz-Target` prefix of the Kinesis Data Streams wire.
 pub(crate) const KINESIS_TARGET: &str = "Kinesis_20131202";
@@ -277,6 +283,239 @@ async fn a_source_fed_stream_takes_no_direct_put() {
     );
 }
 
+/// How long a record-order case waits for the records it published to be delivered.
+///
+/// Longer than the suite's own [`DELIVERY_DEADLINE`]: every row of this table waits out a
+/// source poll AND a non-zero buffering window before its last buffer can be an object, so the
+/// wait is kept generous enough that a loaded machine cannot decide a case. The case fails only
+/// if a record is still undelivered once this has passed.
+const ORDER_DEADLINE: Duration = Duration::from_secs(90);
+
+/// One record-ORDER case: the case shape the consumption rows already describe, plus how the
+/// producer spreads the records over the source's partition keys.
+struct OrderRow {
+    /// The source's shards, the destination member, its `Prefix`, its `BufferingHints` and the
+    /// records published — the SAME row type the consumption cases use, so the stream is
+    /// created by the one helper rather than by a second spelling of it.
+    source: SourceRow,
+    /// How many partition keys those records are published round-robin over. One partition
+    /// key always addresses ONE shard, so the records carrying it are a subsequence of that
+    /// shard's own order.
+    partition_keys: usize,
+}
+
+/// The record-order cases.
+///
+/// The rows differ along what the rule generalises over: how many records are published, how
+/// many partition keys they are spread over and how many shards the source has, which
+/// destination member carries the Amazon S3 location, whether that destination names a
+/// `Prefix`, the size of each record, and — the point of the table — WHICH buffering
+/// condition flushes the buffers the sequence passes through: an interval that takes every
+/// record of the sequence in one window, the shortest interval the member admits so a window
+/// closes while the producer is still publishing, and a `SizeInMBs` several of the records
+/// cross so the size condition cuts the sequence part-way through. The order has to hold
+/// however the sequence is cut into buffers.
+///
+/// Every row names a non-zero interval or the shortest one its member admits, so whatever a
+/// row's last buffer holds is delivered on one of the two conditions: a tail left below
+/// `SizeInMBs` is still closed by the interval, and no row depends on how the consumption of
+/// its source happened to group the records.
+fn order_rows() -> Vec<OrderRow> {
+    vec![
+        OrderRow {
+            source: SourceRow {
+                case: "eight records on one partition key of a single shard, one window",
+                shards: 1,
+                member: "ExtendedS3DestinationConfiguration",
+                prefix: Some("ordered/"),
+                hints: Some((1, SHORT_INTERVAL)),
+                records: 8,
+                record_filler: 0,
+            },
+            partition_keys: 1,
+        },
+        OrderRow {
+            source: SourceRow {
+                case: "twenty records on one partition key, flushed as each buffer opens",
+                shards: 1,
+                member: "S3DestinationConfiguration",
+                prefix: None,
+                hints: Some((1, 0)),
+                records: 20,
+                record_filler: 0,
+            },
+            partition_keys: 1,
+        },
+        OrderRow {
+            source: SourceRow {
+                case: "records crossing SizeInMBs part-way through the sequence",
+                shards: 1,
+                member: "ExtendedS3DestinationConfiguration",
+                prefix: Some("by-size/"),
+                hints: Some((1, SHORT_INTERVAL)),
+                records: 6,
+                record_filler: 400 * 1024,
+            },
+            partition_keys: 1,
+        },
+        OrderRow {
+            source: SourceRow {
+                case: "twelve records over four partition keys of a four-shard source",
+                shards: 4,
+                member: "ExtendedS3DestinationConfiguration",
+                prefix: Some("fan/in/"),
+                hints: Some((5, SHORT_INTERVAL)),
+                records: 12,
+                record_filler: 24,
+            },
+            partition_keys: 4,
+        },
+    ]
+}
+
+/// Where one published record was found at the destination.
+#[derive(Debug)]
+struct Placement {
+    /// The key of the object holding it.
+    object: String,
+    /// Its offset inside that object's bytes, which is the flushed buffer's own order.
+    offset: usize,
+}
+
+#[tokio::test]
+async fn the_order_a_shard_took_its_records_in_is_the_order_they_are_delivered_in() {
+    for (ordinal, row) in order_rows().into_iter().enumerate() {
+        let case = row.source.case;
+        let emulator = Emulator::new();
+        let bucket = format!("record-order-bucket-{ordinal}");
+        let source = format!("record-order-source-{ordinal}");
+        let stream = format!("record-order-stream-{ordinal}");
+        emulator.create_bucket(&bucket).await;
+        let source_arn = create_source_stream(&emulator, &source, row.source.shards).await;
+        create_source_fed_stream(&emulator, &stream, &source_arn, &row.source, &bucket).await;
+
+        // What the producer publishes, in order: the `index`th record on the partition key
+        // `index % partition_keys`, never through a put to Firehose, which a stream fed by a
+        // configured source refuses.
+        let records = row.source.records;
+        let keys: Vec<usize> = (0..records).map(|index| index % row.partition_keys).collect();
+        let payloads: Vec<Vec<u8>> = (0..records)
+            .map(|index| ordered_payload(ordinal, keys[index], index, row.source.record_filler))
+            .collect();
+        for (index, payload) in payloads.iter().enumerate() {
+            put_to_source(&emulator, &source, &partition_key(keys[index]), payload).await;
+        }
+
+        let prefix = row.source.prefix.unwrap_or_default();
+        let bodies =
+            delivered_payloads_within(&emulator, case, &bucket, prefix, &payloads, ORDER_DEADLINE)
+                .await;
+        let placements = placements(case, &bodies, ordinal, &keys);
+        for key in 0..row.partition_keys {
+            let published: Vec<usize> = (0..records).filter(|index| keys[*index] == key).collect();
+            assert_delivered_in_order(case, key, &published, &placements);
+        }
+    }
+}
+
+/// Where each published record was delivered, by its index in put order.
+///
+/// A record missing from `bodies`, or carried by more than one of its objects, fails the case
+/// here: an order is only an order over a sequence each of whose records was delivered exactly
+/// once.
+fn placements(
+    case: &str,
+    bodies: &BTreeMap<String, Vec<u8>>,
+    ordinal: usize,
+    keys: &[usize],
+) -> Vec<Placement> {
+    keys.iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let marker = marker(ordinal, *key, index).into_bytes();
+            let mut found: Vec<Placement> = Vec::new();
+            for (object, body) in bodies {
+                found.extend(offsets(body, &marker).into_iter().map(|offset| Placement {
+                    object: object.clone(),
+                    offset,
+                }));
+            }
+            assert_eq!(
+                found.len(),
+                1,
+                "case {case:?}: the record {index} published to the source is delivered exactly \
+                 once, got {found:?}"
+            );
+            found.remove(0)
+        })
+        .collect()
+}
+
+/// Require the records `published` on ONE partition key — one shard's own subsequence, given
+/// in put order — to be delivered in that order: each object holds a run of them in put order,
+/// and the runs, taken in the order the sequence enters them, are the whole sequence.
+///
+/// The runs are ordered by the first record each holds rather than by object key, because a
+/// delivered object's name ends in a value unique to the object: the keys of two objects of one
+/// stream say nothing about which buffer was flushed first. What this pins is what the rule
+/// states — a buffer carries a CONSECUTIVE run of its shard in the shard's own order, so no
+/// record is delivered before one the shard took earlier or after one it took later. A buffer
+/// holding a single record carries its order trivially, which is why the rows whose window
+/// takes several records at once are in the table beside the ones that flush as they fill.
+fn assert_delivered_in_order(
+    case: &str,
+    partition_key: usize,
+    published: &[usize],
+    placements: &[Placement],
+) {
+    let mut per_object: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
+    for index in published {
+        let placement = &placements[*index];
+        per_object
+            .entry(placement.object.as_str())
+            .or_default()
+            .push((placement.offset, *index));
+    }
+    let mut runs: Vec<Vec<usize>> = per_object
+        .into_values()
+        .map(|mut placed| {
+            placed.sort_unstable();
+            placed.into_iter().map(|(_, index)| index).collect()
+        })
+        .collect();
+    runs.sort_by_key(|run| run.first().copied().unwrap_or_default());
+    let delivered: Vec<usize> = runs.concat();
+    assert_eq!(
+        delivered.as_slice(),
+        published,
+        "case {case:?}: the records published on partition key {partition_key} are delivered in \
+         the order the shard took them, got the delivered order {delivered:?} over {} object \
+         run(s)",
+        runs.len()
+    );
+}
+
+/// The partition key the `key`th group of a case's records is published under. One key always
+/// addresses one shard, whatever the source's shard count is, so the records of a group are a
+/// subsequence of one shard.
+fn partition_key(key: usize) -> String {
+    format!("order-key-{key}")
+}
+
+/// The marker the `index`th record of the `ordinal`th case carries: unique over the suite, and
+/// terminated, so no marker is a prefix of another and counting one counts that record alone.
+fn marker(ordinal: usize, key: usize, index: usize) -> String {
+    format!("order-{ordinal}/key-{key}/{index:04}|")
+}
+
+/// The bytes of one record of a record-order case: its marker, padded to the row's record size
+/// with a filler byte no marker holds, so a row can cross its destination's `SizeInMBs`.
+fn ordered_payload(ordinal: usize, key: usize, index: usize, filler: usize) -> Vec<u8> {
+    let mut payload = marker(ordinal, key, index).into_bytes();
+    payload.extend(std::iter::repeat_n(b'z', filler));
+    payload
+}
+
 /// Create the source Kinesis data stream `name` with `shards` shards and answer its
 /// `StreamARN`, once the stream reports `ACTIVE`.
 pub(crate) async fn create_source_stream(emulator: &Emulator, name: &str, shards: u32) -> String {
@@ -475,7 +714,21 @@ pub(crate) async fn delivered_payloads(
     prefix: &str,
     payloads: &[Vec<u8>],
 ) -> BTreeMap<String, Vec<u8>> {
-    let deadline = Instant::now() + DELIVERY_DEADLINE;
+    delivered_payloads_within(emulator, case, bucket, prefix, payloads, DELIVERY_DEADLINE).await
+}
+
+/// [`delivered_payloads`], waiting `within` for the delivery rather than the suite's own
+/// deadline — for a case whose rows wait out a buffering window of their own as well as the
+/// consumption of the source.
+async fn delivered_payloads_within(
+    emulator: &Emulator,
+    case: &str,
+    bucket: &str,
+    prefix: &str,
+    payloads: &[Vec<u8>],
+    within: Duration,
+) -> BTreeMap<String, Vec<u8>> {
+    let deadline = Instant::now() + within;
     loop {
         let bodies = bodies_under(emulator, bucket, prefix).await;
         let held: Vec<u8> = bodies.values().flatten().copied().collect();
@@ -589,14 +842,11 @@ fn summarised(record: &[u8]) -> String {
     shown
 }
 
-/// How many times `needle` occurs in `held`.
+/// How many times `needle` occurs in `held` — the count of the one byte-window scan the
+/// delivery suites share (`crate::destination_delivery::offsets`), so where a record is and how
+/// many copies of it there are are read the same way.
 pub(crate) fn occurrences(held: &[u8], needle: &[u8]) -> usize {
-    if needle.is_empty() || held.len() < needle.len() {
-        return 0;
-    }
-    held.windows(needle.len())
-        .filter(|window| *window == needle)
-        .count()
+    offsets(held, needle).len()
 }
 
 /// The `index`th record of the `ordinal`th case: a marker no other record of the suite

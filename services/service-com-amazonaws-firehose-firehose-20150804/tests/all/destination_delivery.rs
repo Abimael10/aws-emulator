@@ -447,12 +447,25 @@ pub(crate) fn base64(data: &[u8]) -> String {
     aws_smithy_types::base64::encode(data)
 }
 
+/// Every offset at which `needle` occurs in `haystack` — the ONE byte-window scan the
+/// delivery suites read a delivered object's bytes with: whether a record reached an object
+/// ([`contains`]), how many copies of it are there, and where in the object each copy sits.
+pub(crate) fn offsets(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return Vec::new();
+    }
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, window)| *window == needle)
+        .map(|(offset, _)| offset)
+        .collect()
+}
+
 /// Whether `haystack` holds `needle` anywhere in it — what a suite asks to see whether a
 /// record's own bytes reached an object.
 pub(crate) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+    !offsets(haystack, needle).is_empty()
 }
 
 /// Every element of an XML document as `(element name, text)` in document order, read with
