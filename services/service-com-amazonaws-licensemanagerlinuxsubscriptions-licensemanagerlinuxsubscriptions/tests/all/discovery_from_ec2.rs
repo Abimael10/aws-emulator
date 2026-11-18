@@ -197,13 +197,25 @@ pub struct Fleet {
 
 impl Fleet {
     pub fn new() -> Self {
+        Self::with_ec2(|ec2| ec2)
+    }
+
+    /// The same two services on one engine, with EC2 mounted as `mount` hands it back: the
+    /// seam a suite whose rule is about HOW EC2 ANSWERS a hop of the pass — a page of the
+    /// inventory refused half-way through a Region's walk — puts its own service in front of
+    /// the real one through, so the instances and the AMIs stay EC2's own.
+    ///
+    /// `Fleet::new` mounts EC2 itself, which is what every other suite drives.
+    pub fn with_ec2<Mounted: smithy_server_runtime::Service>(
+        mount: impl FnOnce(ec2::EmulatedService<engine::InMemoryEngine>) -> Mounted,
+    ) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The tests sign nothing; authentication is the framework's concern, not this
         // service's.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
-        router.register_service(ec2::EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(mount(ec2::EmulatedService::new(Arc::clone(&engine))));
         let callback = EmbeddedEmulator::from_router(router.clone());
         Self {
             h: Harness { router, engine },

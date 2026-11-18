@@ -238,10 +238,12 @@ pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
             _ => None,
         };
         let Some(read) = discovered_in_region(ctx, region, &mut budget, from).await else {
-            // EC2 could not be asked about this Region at all: that is evidence of
+            // Not one page of this Region's inventory was answered: that is evidence of
             // NOTHING, so what an earlier pass discovered there stays as it was rather
             // than being dropped. The Region was still asked about, so the next pass goes
-            // on past it instead of stopping on the same unanswerable hop.
+            // on past it instead of stopping on the same unanswerable hop. A read that WAS
+            // answered in part does not come here — it is a truncated read below, whose
+            // records are merged and whose unread remainder the next pass resumes at.
             stopped = Some(crate::state::DiscoveryResume::After(region.clone()));
             continue;
         };
@@ -314,8 +316,14 @@ struct RegionRead {
     resume: crate::state::DiscoveryResume,
 }
 
-/// The instances this pass discovered in `region`, or `None` when EC2 could not be asked
-/// about it at all.
+/// The instances this pass discovered in `region`, or `None` when EC2 answered NO page of
+/// its inventory — the only outcome that establishes nothing at all about the Region.
+///
+/// A hop that failed after an earlier one was answered leaves a read that covered only PART
+/// of the inventory: what the answered pages held was established, so it is reported as
+/// [`RegionPass::Truncated`] — merged with what an earlier pass found rather than replacing
+/// it — and the unread remainder begins at the page the failed hop asked for, which is
+/// where a later pass resumes this Region.
 ///
 /// `from` is the owner's inventory cursor to begin at — `None` being the beginning of that
 /// inventory, and `Some` the point an earlier pass stopped inside it, so the remainder it
@@ -335,8 +343,12 @@ async fn discovered_in_region(
     // Where the inventory this read has NOT covered begins: the cursor the next page is
     // asked for, which starts at the point an earlier pass stopped at.
     let mut cursor: Option<String> = from.clone();
-    // Whether the Region's inventory ran out, or the budget ran out first.
+    // Whether the Region's inventory ran out, or the read stopped short of it.
     let mut reached_end = false;
+    // Whether the owner answered any page of this Region's inventory at all. A read it
+    // answered in part established that part, and only a read it answered not at all is
+    // evidence of nothing.
+    let mut answered_a_page = false;
     loop {
         if budget.spent() {
             break;
@@ -357,15 +369,25 @@ async fn discovered_in_region(
             Err(error) => {
                 // At `debug`: an account with no instances in a Region, and a process that
                 // mounts this service with no EC2 beside it, are both ordinary — but a
-                // failed hop IS why a pass discovered nothing, so it is traceable.
+                // failed hop IS why a pass discovered no more than it did, so it is
+                // traceable.
                 ::tracing::debug!(
                     %region,
                     error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                     "the EC2 inventory of a source Region could not be read"
                 );
-                return None;
+                if !answered_a_page {
+                    // Not one page was answered, so this read established nothing about the
+                    // Region.
+                    return None;
+                }
+                // Earlier pages WERE answered, so what they held stands: the read stops
+                // here as a partial one, and the inventory it has not covered begins at the
+                // page this hop asked for — the cursor it was asked with, left as it is.
+                break;
             }
         };
+        answered_a_page = true;
         budget.pages -= 1;
         let mut whole_page = true;
         'page: for reservation in page.reservations() {
