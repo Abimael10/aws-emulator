@@ -30,11 +30,14 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::parameter_store::{call, error_code, error_message, ACCOUNT, REGION};
 
-/// The service principal a hybrid-registration role's trust policy has to admit.
-const SSM_PRINCIPAL: &str = "ssm.amazonaws.com";
+/// The service principal a hybrid-registration role's trust policy has to admit. Shared
+/// with the sibling suite that spans the role NAME's form
+/// ([`crate::hybrid_activation_role_names`]).
+pub(crate) const SSM_PRINCIPAL: &str = "ssm.amazonaws.com";
 
-/// The action such a trust policy grants that principal.
-const ASSUME_ROLE: &str = "sts:AssumeRole";
+/// The action such a trust policy grants that principal. Shared with the sibling suite
+/// above.
+pub(crate) const ASSUME_ROLE: &str = "sts:AssumeRole";
 
 /// Another service's principal, for the rows whose trust policy names the wrong one.
 const OTHER_PRINCIPAL: &str = "ec2.amazonaws.com";
@@ -73,8 +76,9 @@ fn statement(effect: &str, principals: Value, action: Value) -> Value {
     json!({ "Effect": effect, "Principal": { "Service": principals }, "Action": action })
 }
 
-/// The trust policy of a role this service can act as, in its plainest form.
-fn trusted_by_ssm() -> Value {
+/// The trust policy of a role this service can act as, in its plainest form. Shared with
+/// the sibling suite above.
+pub(crate) fn trusted_by_ssm() -> Value {
     trust(json!([statement(
         "Allow",
         json!(SSM_PRINCIPAL),
@@ -319,16 +323,18 @@ fn iam_role_value(row: &Row) -> String {
 
 /// The refusal a create naming an unassumable role carries, written out here independently
 /// of the service: the fixed sentence plus the ARN of the role, composed from the account
-/// and the `IamRole` the request supplied.
-fn expected_refusal(iam_role: &str) -> String {
+/// and the `IamRole` the request supplied. Shared with the sibling suite above, so the one
+/// template is written out once.
+pub(crate) fn expected_refusal(iam_role: &str) -> String {
     format!(
         "Nonexistent role or missing ssm service principal in trust policy: \
          arn:aws:iam::{ACCOUNT}:role/{iam_role}"
     )
 }
 
-/// The activation ids `DescribeActivations` reports in [`REGION`].
-async fn listed_activations(router: &MultiServiceRouter, case: &str) -> Vec<String> {
+/// The activation ids `DescribeActivations` reports in [`REGION`]. Shared with the sibling
+/// suite above.
+pub(crate) async fn listed_activations(router: &MultiServiceRouter, case: &str) -> Vec<String> {
     let (status, body) = call(router, "DescribeActivations", &json!({})).await;
     assert_eq!(
         status, 200,
