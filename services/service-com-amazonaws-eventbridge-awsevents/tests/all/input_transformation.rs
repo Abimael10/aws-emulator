@@ -434,15 +434,13 @@ async fn a_path_this_emulator_does_not_evaluate_is_refused_when_the_target_is_co
 }
 
 /// A TEXT template renders every placeholder as the value's own characters, so a
-/// sentence reads as a sentence — and a placeholder no map key and no
-/// reserved name stands for is left exactly as the template wrote it, because
-/// nothing says what it means.
+/// sentence reads as a sentence.
 ///
 /// The template is the JSON STRING such a sentence is written as, which is what
 /// makes the rendering an input a target may be handed (the counterpart rows,
 /// where it is not, are in `tests/all/transformed_input_is_json.rs`).
 #[tokio::test]
-async fn a_text_template_renders_values_as_text_and_leaves_unknown_keys_alone() {
+async fn a_text_template_renders_values_as_text() {
     let rows = [
         (
             "a sentence spanning two placeholders",
@@ -479,12 +477,6 @@ async fn a_text_template_renders_values_as_text_and_leaves_unknown_keys_alone() 
             json!({ "missing": "$.detail.missing" }),
             "\"value <missing>.\"",
             "\"value .\"",
-        ),
-        (
-            "a placeholder nothing names",
-            json!({ "order": "$.detail.orderId" }),
-            "\"<order> then <unknown>\"",
-            "\"A-1 then <unknown>\"",
         ),
     ];
 

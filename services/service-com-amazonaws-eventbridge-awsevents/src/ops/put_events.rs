@@ -71,7 +71,11 @@
 //! ([`crate::state::publication_refusal`]) as well as that role's policies. A
 //! forward the destination bus denies publishes nothing onto it, so none of its
 //! rules sees the event, and the refused event goes to the target's dead-letter
-//! queue carrying the condition.
+//! queue carrying the condition. A forward happens AT MOST ONCE per event: the
+//! copy published onto the destination bus is matched by that bus's rules and
+//! delivered to their targets, but a bus target of one of those rules does not
+//! forward it on ([`MAX_BUS_HOPS`]), so buses cannot be chained and no bus sees
+//! one event twice.
 //!
 //! Routing also feeds the ARCHIVES of the entry's bus: "if you do not specify a
 //! pattern to filter events sent to the archive, all events are sent to the
@@ -630,8 +634,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An event-bus target re-publishes the event onto the bus it names,
         // whose own rules match the copy and deliver it, so the queue this pass
         // works from GROWS as such a target is reached ([`republish`]); every
-        // copy spends the same request budget, and the chain is bounded by
-        // [`MAX_BUS_HOPS`].
+        // copy spends the same request budget, and a copy that arrived by a
+        // forward is not forwarded on ([`MAX_BUS_HOPS`]).
         let mut budget = DeliveryBudget::new();
         let mut clients = Clients::default();
         // The messages this request's QUEUE targets are handed, sent to each queue
@@ -2525,11 +2529,15 @@ fn invalid_input_refusal(body: &str) -> Option<crate::state::InvocationOutcome> 
 
 /// How many event-bus targets ONE published event may be re-published through.
 ///
-/// This operation's OWN bound, not a limit AWS publishes. A bus whose target is
-/// another bus can be chained, and two buses that name each other would
-/// otherwise re-publish for ever; a copy that has already crossed this many
-/// buses is not re-published again and says so in the log.
-const MAX_BUS_HOPS: usize = 2;
+/// EventBridge forwards an event between buses AT MOST ONCE: a bus target
+/// publishes the event onto the bus it names, and that bus does not forward it
+/// on, so buses cannot be chained and an event is never seen twice on one bus.
+/// A copy that reached its bus BY a forward is therefore not re-published again,
+/// whatever the Region of the bus its own rules name, and the handover says so
+/// in the log. That the bound is also what keeps two buses naming each other
+/// from re-publishing for ever is a consequence of the rule rather than its
+/// reason.
+const MAX_BUS_HOPS: usize = 1;
 
 /// The event bus a target's ARN names: the Region it lives in and its name —
 /// `None` when the ARN names anything else.
@@ -2567,7 +2575,9 @@ fn event_bus_target(arn: &str) -> Option<BusTarget> {
 /// targets — the bus is reached by publishing, not by an API call to another
 /// service. The copy is the SAME event with a NEW event id: every other member
 /// of the envelope is carried over, the `region` it was published in included,
-/// so a rule of the other Region sees where the event came from.
+/// so a rule of the other Region sees where the event came from. The forward
+/// happens at most once per event: a copy that reached its bus BY a forward is
+/// not forwarded on ([`MAX_BUS_HOPS`]).
 ///
 /// The handover spends the request's own delivery budget — charged BEFORE
 /// anything about it is decided, so every outcome it can have, a refusal and the
@@ -2629,8 +2639,9 @@ async fn republish(
     }
     if dispatch.hops >= MAX_BUS_HOPS {
         return crate::state::InvocationOutcome::NotAttempted(format!(
-            "this event has already been re-published through {MAX_BUS_HOPS} event-bus \
-             target(s), which is this emulator's bound on such a chain"
+            "this event reached event bus {} by a forward from another bus, and EventBridge \
+             forwards an event between buses at most once, so it is not forwarded on",
+            dispatch.bus
         ));
     }
     let mut envelope = match crate::state::parse_delivered_event(handover.rendered) {

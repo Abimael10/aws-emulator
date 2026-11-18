@@ -17,8 +17,8 @@
 //! The rows differ along where the target bus lives (the publisher's Region,
 //! another Region), along what the receiving bus's rules do with the copy (match
 //! it, not match it), and along the cases that deliver nothing: a bus the account
-//! does not hold, and a chain of bus targets past the bound this emulator puts on
-//! one.
+//! does not hold, and a chain of bus targets past the ONE hop EventBridge
+//! forwards an event between buses in.
 
 use std::sync::Arc;
 
@@ -468,11 +468,11 @@ async fn a_bus_target_naming_no_bus_of_this_account_is_not_attempted() {
     }
 }
 
-/// A CHAIN of bus targets is followed, and only as far as this emulator's bound
-/// on one: the copy that has already crossed that many buses is not re-published
-/// again, so two buses naming each other cannot loop for ever.
+/// A chain of bus targets is followed for ONE hop: the copy a forward published
+/// onto a bus is not forwarded on by a bus target of that bus's own rules, so
+/// buses cannot be chained and two naming each other cannot loop.
 #[tokio::test]
-async fn a_chain_of_bus_targets_is_followed_up_to_its_bound() {
+async fn a_forwarded_event_is_not_forwarded_on_by_the_receiving_buss_own_bus_target() {
     let emulator = emulator();
     // Three buses in a row, each forwarding to the next, with a queue at every
     // step so where the chain stopped is observable.
@@ -524,9 +524,9 @@ async fn a_chain_of_bus_targets_is_followed_up_to_its_bound() {
 
     publish(&emulator).await;
 
-    // Two hops are followed — onto `first` and onto `second` — and the third is
-    // not, which is the bound stated once in the handler.
-    let expected = [("first", 1usize), ("second", 1), ("third", 0)];
+    // One hop is followed — onto `first` — and the copy that arrived there by
+    // that forward is not forwarded on, so neither `second` nor `third` sees it.
+    let expected = [("first", 1usize), ("second", 0), ("third", 0)];
     for (bus, copies) in expected {
         let url = queues
             .iter()

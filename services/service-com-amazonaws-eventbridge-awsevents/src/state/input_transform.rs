@@ -29,6 +29,35 @@ pub struct Delivery<'a> {
     pub ingestion_time: &'a str,
 }
 
+/// The placeholder standing for the whole event, and the one standing for its
+/// JSON text.
+const EVENT_PLACEHOLDER: &str = "aws.events.event";
+const EVENT_JSON_PLACEHOLDER: &str = "aws.events.event.json";
+
+/// The placeholders standing for the DELIVERY: the matched rule's ARN and name,
+/// and the instant the event was ingested.
+const RULE_ARN_PLACEHOLDER: &str = "aws.events.rule-arn";
+const RULE_NAME_PLACEHOLDER: &str = "aws.events.rule-name";
+const INGESTION_TIME_PLACEHOLDER: &str = "aws.events.event.ingestion-time";
+
+/// Every placeholder of the reserved namespace EventBridge fills itself, named
+/// once: what [`reserved`] fills and what [`fills_itself`] recognises are the
+/// same five, so a template may carry exactly the placeholders a rendering can
+/// fill.
+const RESERVED_PLACEHOLDERS: [&str; 5] = [
+    EVENT_PLACEHOLDER,
+    EVENT_JSON_PLACEHOLDER,
+    RULE_ARN_PLACEHOLDER,
+    RULE_NAME_PLACEHOLDER,
+    INGESTION_TIME_PLACEHOLDER,
+];
+
+/// Whether `key` is a placeholder EventBridge fills from the delivery rather
+/// than from a caller's own path ([`RESERVED_PLACEHOLDERS`]).
+fn fills_itself(key: &str) -> bool {
+    RESERVED_PLACEHOLDERS.contains(&key)
+}
+
 /// What the reserved placeholder `key` is filled with, or `None` when the
 /// reserved namespace holds no such placeholder.
 ///
@@ -44,16 +73,16 @@ pub struct Delivery<'a> {
 /// anywhere, so they fill like a selected value does.
 fn reserved(key: &str, event: &Value, delivery: &Delivery<'_>) -> Option<Fill> {
     match key {
-        "aws.events.event" | "aws.events.event.json" => {
+        EVENT_PLACEHOLDER | EVENT_JSON_PLACEHOLDER => {
             Some(Fill::Document(event.to_string()))
         }
-        "aws.events.rule-arn" => Some(Fill::Selected(Value::String(
+        RULE_ARN_PLACEHOLDER => Some(Fill::Selected(Value::String(
             delivery.rule_arn.to_string(),
         ))),
-        "aws.events.rule-name" => Some(Fill::Selected(Value::String(
+        RULE_NAME_PLACEHOLDER => Some(Fill::Selected(Value::String(
             delivery.rule.to_string(),
         ))),
-        "aws.events.event.ingestion-time" => Some(Fill::Selected(Value::String(
+        INGESTION_TIME_PLACEHOLDER => Some(Fill::Selected(Value::String(
             delivery.ingestion_time.to_string(),
         ))),
         _ => None,
@@ -168,7 +197,9 @@ pub fn by_input_path(path: &str, event: &Value) -> Result<String, String> {
 ///
 /// A key the map does not hold and the reserved namespace does not name is
 /// not a placeholder at all: the text is left exactly as the template wrote
-/// it, since nothing says what it stands for.
+/// it, since nothing says what it stands for — and a TARGET carrying such a
+/// template is refused where it is configured ([`unfilled_placeholder`]), so no
+/// delivery is built from a placeholder nothing fills.
 ///
 /// A placeholder whose path selects NO place of the event is filled with the
 /// EMPTY STRING, so `{"k": <absent>}` renders the JSON string `""` and
@@ -190,35 +221,29 @@ pub fn render(
     event: &Value,
     delivery: &Delivery<'_>,
 ) -> Result<String, String> {
-    // A template that opens a JSON object or array is one whose own JSON the
-    // rendering keeps; anything else — a quoted string, a sentence — is plain
-    // text, which escapes nothing (see above).
-    let structured = template.trim_start().starts_with(['{', '[']);
+    // Where the scan stands as it walks the template: whether the template's own
+    // JSON is kept, whether the scan is inside one of its strings, and whether
+    // the character before escaped this one ([`Scan`]).
+    let mut scan = Scan::of(template);
     let mut rendered = String::with_capacity(template.len());
-    // Whether the scan stands inside a string literal of a STRUCTURED
-    // template, and whether the character before it escaped this one, which
-    // is what tells a closing quote from an escaped one. A text template has
-    // no JSON structure to stand inside.
-    let mut in_string = false;
-    let mut escaped = false;
     let mut rest = template;
     while !rest.is_empty() {
         // A placeholder is read before the character opening it is
         // classified: `<` is never part of a template's own JSON structure.
-        if let Some((key, tail)) = placeholder(rest).filter(|_| !escaped) {
+        if let Some((key, tail)) = placeholder(rest).filter(|_| !scan.escaped()) {
             if let Some(fill) = filling(key, paths, event, delivery)? {
                 match fill {
                     // A JSON document stands as it is where the template takes a
                     // value, and as its characters — escaped for the string it
                     // lands in — inside one.
-                    Fill::Document(document) if structured && in_string => {
+                    Fill::Document(document) if scan.in_string() => {
                         rendered.push_str(&escaped_for_a_string(&document));
                     }
                     Fill::Document(document) => rendered.push_str(&document),
-                    Fill::Selected(value) if structured && !in_string => {
+                    Fill::Selected(value) if scan.structured() && !scan.in_string() => {
                         rendered.push_str(&value.to_string());
                     }
-                    Fill::Selected(value) if structured => {
+                    Fill::Selected(value) if scan.structured() => {
                         rendered.push_str(&escaped_for_a_string(&text(&value)));
                     }
                     Fill::Selected(value) => rendered.push_str(&text(&value)),
@@ -234,23 +259,74 @@ pub fn render(
             }
         }
         let character = rest.chars().next().unwrap_or_default();
-        if structured {
-            if in_string {
-                if escaped {
-                    escaped = false;
-                } else if character == '\\' {
-                    escaped = true;
-                } else if character == '"' {
-                    in_string = false;
-                }
-            } else if character == '"' {
-                in_string = true;
-            }
-        }
+        scan.advance(character);
         rendered.push(character);
         rest = &rest[character.len_utf8()..];
     }
     Ok(rendered)
+}
+
+/// Where a walk of a template STANDS, which is what tells a placeholder from
+/// text the template wrote: whether the template is the structured JSON whose
+/// own punctuation the rendering keeps, whether the walk is inside one of that
+/// JSON's string literals, and whether the character before escaped this one.
+///
+/// One state machine, read by the rendering ([`render`]) and by the check that a
+/// template's placeholders can be filled at all ([`unfilled_placeholder`]), so
+/// the two cannot disagree about what a template carries: a `<` the template
+/// escaped inside one of its strings opens no placeholder for either of them.
+struct Scan {
+    structured: bool,
+    in_string: bool,
+    escaped: bool,
+}
+
+impl Scan {
+    /// The state a walk of `template` starts in. A template that opens a JSON
+    /// object or array is one whose own JSON the rendering keeps; anything else —
+    /// a quoted string, a sentence — is plain text, which escapes nothing and has
+    /// no JSON structure to stand inside.
+    fn of(template: &str) -> Self {
+        Self {
+            structured: template.trim_start().starts_with(['{', '[']),
+            in_string: false,
+            escaped: false,
+        }
+    }
+
+    /// Whether the template's own JSON is kept.
+    fn structured(&self) -> bool {
+        self.structured
+    }
+
+    /// Whether the walk stands inside a string literal of a structured template.
+    fn in_string(&self) -> bool {
+        self.structured && self.in_string
+    }
+
+    /// Whether the character the walk stands on was escaped by the one before it,
+    /// so a `<` there is the template's own text rather than a placeholder.
+    fn escaped(&self) -> bool {
+        self.escaped
+    }
+
+    /// Read one character of the template.
+    fn advance(&mut self, character: char) {
+        if !self.structured {
+            return;
+        }
+        if self.in_string {
+            if self.escaped {
+                self.escaped = false;
+            } else if character == '\\' {
+                self.escaped = true;
+            } else if character == '"' {
+                self.in_string = false;
+            }
+        } else if character == '"' {
+            self.in_string = true;
+        }
+    }
 }
 
 /// The most bytes ONE rendering may produce.
@@ -303,6 +379,41 @@ fn placeholder(text: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((key, &after[end + 1..]))
+}
+
+/// The first placeholder of `template` that NOTHING would fill: one whose key
+/// `declared` does not name and which is not one EventBridge fills itself
+/// ([`RESERVED_PLACEHOLDERS`]) — `None` when every placeholder it carries has a
+/// value to carry.
+///
+/// A template's placeholders "will be filled with the values of the keys from
+/// `InputPathsMap`" (`InputTransformer$InputTemplate`), so a key that map does
+/// not hold names no value: the transformation is a configuration the service
+/// refuses when the target is written, rather than one that delivers the
+/// placeholder's own text to the target. `declared` answers whether the target's
+/// own map holds a key, and the walk stands where [`render`]'s does ([`Scan`]),
+/// so this reads the SAME placeholders that rendering fills — a `<` the template
+/// escaped inside one of its own strings is text to both — and an accepted
+/// target is one every delivery can render.
+pub fn unfilled_placeholder<'a>(
+    template: &'a str,
+    declared: &dyn Fn(&str) -> bool,
+) -> Option<&'a str> {
+    let mut scan = Scan::of(template);
+    let mut rest = template;
+    while !rest.is_empty() {
+        if let Some((key, tail)) = placeholder(rest).filter(|_| !scan.escaped()) {
+            if !declared(key) && !fills_itself(key) {
+                return Some(key);
+            }
+            rest = tail;
+            continue;
+        }
+        let character = rest.chars().next().unwrap_or_default();
+        scan.advance(character);
+        rest = &rest[character.len_utf8()..];
+    }
+    None
 }
 
 /// The characters a selected value contributes to TEXT: what the value holds,

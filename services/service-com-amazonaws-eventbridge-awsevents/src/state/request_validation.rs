@@ -177,7 +177,8 @@ pub fn reserved_tag_key_removal_violation(keys: &[String]) -> Option<String> {
 /// target's own kind of resource can only be delivered to with, what that block
 /// itself states (an ECS task's definition, count, launch type and network
 /// configuration — [`ecs_parameters_violation`]), the service its dead-letter
-/// destination has to belong to, and the JSON paths it reshapes its input with.
+/// destination has to belong to, the JSON paths it reshapes its input with, and
+/// the placeholders the template it renders names.
 /// Each is a property of ONE target, so the request is refused whole
 /// before any of its targets is stored — a rule carrying a target EventBridge
 /// could never invoke would report back a healthy rule that delivers nothing.
@@ -196,6 +197,7 @@ pub fn target_violation(target: &Target) -> Option<String> {
                 .and_then(dead_letter_arn_violation)
         })
         .or_else(|| target_input_path_violation(target))
+        .or_else(|| target_input_template_violation(target))
 }
 
 /// The services EventBridge invokes exactly ONE kind of resource of, and the
@@ -812,4 +814,40 @@ fn supported_path(path: &str) -> bool {
         .iter()
         .any(|bracketed| path.contains(bracketed))
         && ::service_common::json_reference_path::selection_segments(path).is_some()
+}
+
+/// Why a target's `InputTransformer` names a placeholder nothing fills, or
+/// `None` when every placeholder of its template has a value to carry.
+///
+/// `InputTemplate` is the text in which "you specify placeholders that will be
+/// filled with the values of the keys from `InputPathsMap`", each written
+/// `<key>` — so a placeholder whose key that map does not declare, and which is
+/// not one of the placeholders EventBridge fills from the delivery itself
+/// (`super::input_transform`), is an INVALID placeholder: it stands for nothing,
+/// so the target is refused where it is CONFIGURED rather than stored and found
+/// to deliver a payload carrying the template's own text.
+///
+/// The placeholders are read through the one reader a delivery renders with, so
+/// a target this operation accepts is one every delivery can render. The service
+/// words the refusal for the member, the target the template belongs to — by the
+/// `Id` the request gave it, as the other refusal of a target's input reshaping
+/// does ([`target_input_path_violation`]) — and the placeholder itself, named as
+/// the template wrote it and without its brackets, which is what a caller has to
+/// change.
+fn target_input_template_violation(target: &Target) -> Option<String> {
+    let transformer = target.input_transformer.as_ref()?;
+    let declared = |key: &str| {
+        transformer
+            .input_paths_map
+            .as_ref()
+            .is_some_and(|map| map.contains_key(key))
+    };
+    super::input_transform::unfilled_placeholder(&transformer.input_template, &declared).map(
+        |key| {
+            format!(
+                "InputTemplate for target {} contains invalid placeholder {key}.",
+                target.id
+            )
+        },
+    )
 }
