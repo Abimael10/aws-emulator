@@ -272,7 +272,7 @@ pub fn invalid_scheduled_action_message() -> String {
 /// (`smithy_query(query="doc", shape="CreateScheduledActionMessage",
 /// member="ScheduledActionName")`), so the refusal names it — single-quoted, as
 /// this family words an identifier it reports back inside a sentence (see
-/// [`snapshot_schedule_already_exists_message`]).
+/// [`snapshot_copy_grant_already_exists_message`]).
 pub fn scheduled_action_already_exists_message(name: &str) -> String {
     format!(
         "Cannot create the scheduled action because an action with the name '{name}' already exists."

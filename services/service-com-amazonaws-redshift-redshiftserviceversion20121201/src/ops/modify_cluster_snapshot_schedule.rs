@@ -257,7 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyClusterSnapshotScheduleErrorModeled::SnapshotScheduleNotFoundFault(
                     SnapshotScheduleNotFoundFault {
-                        message: Some(st::snapshot_schedule_not_found_message(&identifier)),
+                        message: Some(st::snapshot_schedule_not_found_message(
+                            st::SnapshotScheduleNotFoundWording::NoSnapshotScheduleForIdentifier,
+                            &identifier,
+                        )),
                     },
                 )
                 .into(),

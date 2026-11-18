@@ -7,7 +7,7 @@
 //! error response is
 //! `<ErrorResponse><Error><Type/><Code/><Message/></Error><RequestId/></ErrorResponse>`,
 //! so whichever layer refused the call — a handler's modelled error, a handler refusal,
-//! the boundary validator, the scaffold's 501, the routing table — the answer carries a
+//! the boundary validator, the routing table — the answer carries a
 //! request id. That element is what an SDK's error object exposes as the request id of a
 //! failure and what correlates a failed call against server-side records, exactly as a
 //! success carries `ResponseMetadata/RequestId`.
@@ -56,7 +56,7 @@ fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 /// A `CreateIntegration` request whose members all satisfy the model, so the call reaches
-/// the (still scaffolded) handler instead of being refused at the boundary.
+/// the handler instead of being refused at the boundary.
 ///
 /// The ARNs satisfy the `SourceArn` / `TargetArn` patterns the model declares
 /// (`smithy_query(query="operation",operation="CreateIntegration")`).
@@ -110,9 +110,8 @@ async fn seed_existing_group(emulator: &Emulator) {
 /// a handler refusal the model cannot express the query-protocol code the service
 /// itself answers (`InvalidParameterCombination` for members that cannot stand
 /// together), a body the codec
-/// could not read `MalformedInput`, a value outside a declared bound `ValidationError`, a
-/// scaffolded operation `NotImplemented`, and an `Action` naming no modelled operation
-/// `InvalidAction`.
+/// could not read `MalformedInput`, a value outside a declared bound `ValidationError`,
+/// and an `Action` naming no modelled operation `InvalidAction`.
 fn error_cases() -> Vec<ErrorCase> {
     // The family of the engine version this service publishes, read off the store's own
     // seed rather than spelled here.
@@ -187,11 +186,11 @@ fn error_cases() -> Vec<ErrorCase> {
             code: "ValidationError",
         },
         ErrorCase {
-            case: "a scaffolded operation, which answers the 501 channel",
+            case: "a modelled 400: a delete naming no snapshot schedule",
             action: "DeleteSnapshotSchedule",
             params: vec![("ScheduleIdentifier".to_string(), "nightly".to_string())],
-            status: 501,
-            code: "NotImplemented",
+            status: 400,
+            code: "SnapshotScheduleNotFound",
         },
         ErrorCase {
             case: "an Action naming no modelled operation",

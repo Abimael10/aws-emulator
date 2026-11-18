@@ -14,14 +14,18 @@
 //! instants those definitions name, in order and spaced by the period each
 //! states; a definition written in an expression type the service reads no
 //! schedule from, and one that states no schedule, are refused with the fault
-//! the model declares for each and nothing stored; the IDENTIFIER being what an
-//! account's schedules are unique on, so a second create under one identifier is
-//! refused and overwrites nothing; the documented identifier syntax; a dry run
-//! reporting the schedule it describes and storing nothing; a schedule's
-//! associated clusters being read off the clusters that name it; and the
-//! creation order, the `ScheduleIdentifier` / `ClusterIdentifier` /
-//! `TagKeys` / `TagValues` filters, the service's `MaxRecords` window and its
-//! `Marker` cursor.
+//! the model declares for each and nothing stored; a definition stating a
+//! cadence faster than the shortest interval a snapshot schedule takes
+//! snapshots at is refused too, on every path that accepts one; the IDENTIFIER
+//! being what an account's schedules are unique on, so a second create under
+//! one identifier is refused and overwrites nothing; the documented identifier
+//! syntax; a dry run reporting the schedule it describes and storing nothing; a
+//! schedule's associated clusters being read off the clusters that name it; a
+//! delete removing the record, so no later read reports it and its identifier
+//! is free again, while a schedule a cluster takes its snapshots on cannot be
+//! dropped out from under it; and the creation order, the `ScheduleIdentifier`
+//! / `ClusterIdentifier` / `TagKeys` / `TagValues` filters, the service's
+//! `MaxRecords` window and its `Marker` cursor.
 
 use std::time::{Duration, SystemTime};
 
@@ -767,6 +771,15 @@ async fn the_identifier_is_what_snapshot_schedules_are_unique_on() {
         )
         .await;
         assert_refused(case, &answer, 400, "SnapshotScheduleAlreadyExists");
+        // The wording is the service's own for this fault: the fixed text
+        // "Snapshot schedule " and " already exists.", with the identifier the
+        // REQUEST spelled as its one variable part.
+        assert_text(
+            case,
+            &answer,
+            "Message",
+            Some(&format!("Snapshot schedule {identifier} already exists.")),
+        );
         assert_eq!(
             stored_definitions(&emulator, identifier).as_deref(),
             Some(["rate(12 hours)".to_string()].as_slice()),
@@ -1225,4 +1238,368 @@ async fn snapshot_schedules_are_paginated_over_the_documented_window() {
             answer.body
         );
     }
+}
+
+/// A snapshot schedule takes at most one snapshot an hour, so a definition whose
+/// invocations are closer together than [`state::MIN_SCHEDULE_INTERVAL`] states
+/// a cadence no schedule fires at: it is refused with the modelled
+/// `InvalidSchedule`, naming the definition it was given, and nothing is stored.
+///
+/// The table spans the floor rather than one definition: the bound itself, one
+/// step under it, the units a rate states an interval in, and the calendar
+/// expressions whose named instants fall that close together — the interval a
+/// definition STATES is what the rule is about, so it holds for either
+/// expression type.
+#[tokio::test]
+async fn a_definition_under_the_minimum_interval_is_refused_with_nothing_stored() {
+    let emulator = Emulator::new();
+    // The bound is read off the service's own constant rather than spelled here,
+    // so the row at it and the row under it follow the rule and not a number.
+    let floor_minutes = state::MIN_SCHEDULE_INTERVAL.as_secs() / 60;
+    let at_the_floor = format!("rate({floor_minutes} minutes)");
+    let one_under = format!("rate({} minutes)", floor_minutes - 1);
+    let owned = |definitions: &[&str]| -> Vec<String> {
+        definitions.iter().map(|value| (*value).to_string()).collect()
+    };
+    // Each row: the case, its definitions, and which of them the refusal names —
+    // `None` for a row the service serves.
+    let rows: Vec<(&str, Vec<String>, Option<usize>)> = vec![
+        ("the bound itself, stated in minutes", vec![at_the_floor.clone()], None),
+        ("one minute under the bound", vec![one_under.clone()], Some(0)),
+        ("the bound stated in hours", owned(&["rate(1 hour)"]), None),
+        ("a rate of a single minute", owned(&["rate(1 minute)"]), Some(0)),
+        ("half the bound", owned(&["rate(30 minutes)"]), Some(0)),
+        ("twice the bound", owned(&["rate(2 hours)"]), None),
+        ("a rate in days", owned(&["rate(1 day)"]), None),
+        // A calendar definition states its interval as the gap between the
+        // instants it names, so the same bound decides it.
+        (
+            "a calendar definition firing once an hour",
+            owned(&["cron(15 * * * ?)"]),
+            None,
+        ),
+        (
+            "a calendar definition firing every minute",
+            owned(&["cron(* * * * ?)"]),
+            Some(0),
+        ),
+        (
+            "a calendar definition firing twice an hour",
+            owned(&["cron(0,30 * * * ?)"]),
+            Some(0),
+        ),
+        (
+            "a calendar definition firing once a day",
+            owned(&["cron(30 12 *)"]),
+            None,
+        ),
+        (
+            "a definition over the bound beside one under it",
+            vec!["rate(12 hours)".to_string(), one_under.clone()],
+            Some(1),
+        ),
+    ];
+
+    for (index, (case, definitions, offending)) in rows.iter().enumerate() {
+        let identifier = format!("schedule-interval-{index}");
+        let borrowed: Vec<&str> = definitions.iter().map(String::as_str).collect();
+        let params = create_params(Some(&identifier), &borrowed, None, &[], None, None);
+        let answer = call_with(&emulator, "CreateSnapshotSchedule", &params).await;
+        match offending {
+            None => {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case}: expected {definitions:?} served with 200, got {} with body {}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    stored_definitions(&emulator, &identifier).as_deref(),
+                    Some(&definitions[..]),
+                    "case {case}: expected {definitions:?} stored, got {:?}",
+                    stored_definitions(&emulator, &identifier)
+                );
+            }
+            Some(position) => {
+                assert_refused(case, &answer, 400, "InvalidSchedule");
+                // The wording of this refusal: the fixed text "Schedule
+                // interval " and " is less than minimum interval of <bound>
+                // minutes", with the offending definition the request carried
+                // as its one variable part.
+                assert_text(
+                    case,
+                    &answer,
+                    "Message",
+                    Some(&format!(
+                        "Schedule interval {} is less than minimum interval of {floor_minutes} \
+                         minutes",
+                        definitions[*position]
+                    )),
+                );
+                assert!(
+                    stored_definitions(&emulator, &identifier).is_none(),
+                    "case {case}: a refused create stores nothing, got {:?}",
+                    stored_definitions(&emulator, &identifier)
+                );
+            }
+        }
+    }
+
+    // A dry run is the create's own refusals without the write, so a dry run of
+    // a create under the bound is refused exactly as that create is.
+    let dry_run = call_with(
+        &emulator,
+        "CreateSnapshotSchedule",
+        &create_params(
+            Some("schedule-interval-dry-run"),
+            &[one_under.as_str()],
+            None,
+            &[],
+            None,
+            Some(true),
+        ),
+    )
+    .await;
+    assert_refused("a dry run under the bound", &dry_run, 400, "InvalidSchedule");
+    assert_text(
+        "a dry run under the bound",
+        &dry_run,
+        "Message",
+        Some(&format!(
+            "Schedule interval {one_under} is less than minimum interval of {floor_minutes} minutes"
+        )),
+    );
+}
+
+/// A delete REMOVES the schedule from the store, which is what makes the
+/// deletion observable: the read path serves the schedules the store holds, so a
+/// deleted schedule is absent from every later read, the schedules around it
+/// keep their order, a second delete of it is the modelled not-found refusal,
+/// and its identifier is free for a create again.
+#[tokio::test]
+async fn a_deleted_snapshot_schedule_is_absent_from_every_later_read() {
+    let emulator = Emulator::new();
+    let created = ["schedule-first", "schedule-deleted", "schedule-last"];
+    for identifier in created {
+        let answer = call_with(
+            &emulator,
+            "CreateSnapshotSchedule",
+            &create_params(Some(identifier), &["rate(12 hours)"], None, &[], None, None),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case seeding {identifier}: expected status 200, got {} with body {}",
+            answer.status, answer.body
+        );
+    }
+
+    let deleted = emulator
+        .call(
+            "DeleteSnapshotSchedule",
+            &[("ScheduleIdentifier", "schedule-deleted")],
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case the delete: expected status 200, got {} with body {}",
+        deleted.status, deleted.body
+    );
+
+    // The read of the deleted identifier is SERVED, with no schedule in it.
+    let read_back = describe_one(&emulator, "schedule-deleted").await;
+    assert_eq!(
+        (read_back.status, listed_schedules(&read_back.body)),
+        (200, Vec::new()),
+        "case the read of the deleted schedule: expected an empty list, got {} with body {}",
+        read_back.status,
+        read_back.body
+    );
+    assert!(
+        stored_definitions(&emulator, "schedule-deleted").is_none(),
+        "case the delete: the record left the store"
+    );
+
+    // The schedules around it are untouched, in the order every read walks them.
+    let all = emulator.call("DescribeSnapshotSchedules", &[]).await;
+    assert_eq!(
+        listed_schedules(&all.body),
+        vec!["schedule-first".to_string(), "schedule-last".to_string()],
+        "case the read of the rest: expected the other schedules in creation order, got body {}",
+        all.body
+    );
+    assert_eq!(
+        stored_count(&emulator),
+        2,
+        "case the delete: exactly the one schedule left the store"
+    );
+
+    // Deleting it a second time names a schedule this account no longer holds.
+    let again = emulator
+        .call(
+            "DeleteSnapshotSchedule",
+            &[("ScheduleIdentifier", "schedule-deleted")],
+        )
+        .await;
+    assert_refused("a second delete", &again, 400, "SnapshotScheduleNotFound");
+    // The wording of this refusal: the fixed text "Schedule not found for
+    // schedule identifier " and the identifier the REQUEST spelled, bare — the
+    // sentence the operation whose target IS the schedule words it with.
+    assert_text(
+        "a second delete",
+        &again,
+        "Message",
+        Some("Schedule not found for schedule identifier schedule-deleted"),
+    );
+
+    // A delete naming a schedule nothing ever created is the same refusal.
+    let unknown = emulator
+        .call(
+            "DeleteSnapshotSchedule",
+            &[("ScheduleIdentifier", "schedule-never-created")],
+        )
+        .await;
+    assert_refused(
+        "a delete naming no schedule",
+        &unknown,
+        400,
+        "SnapshotScheduleNotFound",
+    );
+
+    // The identifier the delete freed takes a create again, with definitions of
+    // its own: the deletion freed the identity, not just the record.
+    let recreated = call_with(
+        &emulator,
+        "CreateSnapshotSchedule",
+        &create_params(
+            Some("schedule-deleted"),
+            &["rate(6 hours)"],
+            None,
+            &[],
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        recreated.status, 200,
+        "case the create after the delete: expected status 200, got {} with body {}",
+        recreated.status, recreated.body
+    );
+    assert_eq!(
+        stored_definitions(&emulator, "schedule-deleted").as_deref(),
+        Some(["rate(6 hours)".to_string()].as_slice()),
+        "case the create after the delete: expected the new definitions stored"
+    );
+}
+
+/// A cluster associated with a schedule takes its snapshots on it, so the
+/// schedule cannot be dropped out from under it: the delete is refused with the
+/// modelled `InvalidClusterSnapshotScheduleState` and the record stays. Once the
+/// cluster is released from the schedule, the delete goes through.
+#[tokio::test]
+async fn a_schedule_a_cluster_takes_its_snapshots_on_cannot_be_deleted() {
+    let emulator = Emulator::new();
+    for identifier in ["schedule-in-use", "schedule-free"] {
+        let answer = call_with(
+            &emulator,
+            "CreateSnapshotSchedule",
+            &create_params(Some(identifier), &["rate(12 hours)"], None, &[], None, None),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case seeding {identifier}: expected status 200, got {} with body {}",
+            answer.status, answer.body
+        );
+    }
+    let cluster = emulator
+        .call(
+            "CreateCluster",
+            &[
+                ("ClusterIdentifier", "cluster-on-the-schedule"),
+                ("NodeType", "ra3.xlplus"),
+                ("MasterUsername", "admin"),
+                ("SnapshotScheduleIdentifier", "schedule-in-use"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        cluster.status, 200,
+        "case seeding the cluster: expected status 200, got {} with body {}",
+        cluster.status, cluster.body
+    );
+
+    let refused = emulator
+        .call(
+            "DeleteSnapshotSchedule",
+            &[("ScheduleIdentifier", "schedule-in-use")],
+        )
+        .await;
+    assert_refused(
+        "a schedule a cluster is associated with",
+        &refused,
+        400,
+        "InvalidClusterSnapshotScheduleState",
+    );
+    assert_text(
+        "a schedule a cluster is associated with",
+        &refused,
+        "Message",
+        Some(&state::snapshot_schedule_in_use_message(
+            "schedule-in-use",
+            &["cluster-on-the-schedule".to_string()],
+        )),
+    );
+    assert_eq!(
+        stored_definitions(&emulator, "schedule-in-use").as_deref(),
+        Some(["rate(12 hours)".to_string()].as_slice()),
+        "case a schedule a cluster is associated with: the refused delete removed nothing"
+    );
+
+    // A schedule no cluster names has nothing standing in the way of its
+    // deletion, whatever the other schedule's associations are.
+    let free = emulator
+        .call(
+            "DeleteSnapshotSchedule",
+            &[("ScheduleIdentifier", "schedule-free")],
+        )
+        .await;
+    assert_eq!(
+        free.status, 200,
+        "case a schedule no cluster names: expected status 200, got {} with body {}",
+        free.status, free.body
+    );
+
+    // Releasing the cluster from the schedule takes the association away, and
+    // with it the only thing that refused the delete.
+    let released = emulator
+        .call(
+            "ModifyClusterSnapshotSchedule",
+            &[
+                ("ClusterIdentifier", "cluster-on-the-schedule"),
+                ("DisassociateSchedule", "true"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        released.status, 200,
+        "case the release: expected status 200, got {} with body {}",
+        released.status, released.body
+    );
+    let deleted = emulator
+        .call(
+            "DeleteSnapshotSchedule",
+            &[("ScheduleIdentifier", "schedule-in-use")],
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case the delete after the release: expected status 200, got {} with body {}",
+        deleted.status, deleted.body
+    );
+    assert_eq!(
+        stored_count(&emulator),
+        0,
+        "case the delete after the release: no schedule is left in the store"
+    );
 }

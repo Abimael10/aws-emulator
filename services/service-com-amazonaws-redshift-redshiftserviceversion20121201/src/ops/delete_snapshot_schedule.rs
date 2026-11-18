@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSnapshotSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSnapshotSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSnapshotSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a snapshot schedule from this service's store, which is what makes
+//! the deletion observable: every later `DescribeSnapshotSchedules` reports the
+//! identifier absent, and a create may mint a schedule under it again. A
+//! request naming a schedule this account does not hold is refused with
+//! `SnapshotScheduleNotFoundFault` and removes nothing.
+//!
+//! A cluster associated with the schedule takes its snapshots on it, so a
+//! schedule any cluster the store holds names cannot be dropped out from under
+//! it: that is refused with `InvalidClusterSnapshotScheduleStateFault`, and the
+//! record stays.
 //!
 //! ## Shape of an operation
 //!
@@ -62,6 +64,8 @@
 //!   state is not valid.
 //! * `SnapshotScheduleNotFoundFault` (HTTP 400) — We could not find the specified snapshot
 //!   schedule.
+//! * `DependentServiceUnavailableFault` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): the shared store this service's records live in could not be reached.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -95,12 +99,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteSnapshotScheduleOu
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `DeleteSnapshotScheduleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteSnapshotSchedule")]
+// to construct until the model says otherwise. The server-side fault for an
+// unreachable shared store — which this SERVICE models and this operation's own
+// error list omits — is widened in through `extra_errors`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteSnapshotSchedule",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteSnapshotScheduleErrorModeled {
     InvalidClusterSnapshotScheduleStateFault(InvalidClusterSnapshotScheduleStateFault),
     SnapshotScheduleNotFoundFault(SnapshotScheduleNotFoundFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -149,23 +159,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_SNAPSHOT_SCHEDULE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Drop the snapshot schedule the request names.
+    ///
+    /// A MUTATION: "deletes a snapshot schedule". The RECORD leaving the store
+    /// is what makes the deletion observable — the read path serves the
+    /// schedules the store holds, so a schedule that is gone from it is absent
+    /// from every later read and its identifier is free for a create again.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSnapshotSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSnapshotScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSnapshotSchedule"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeleteSnapshotScheduleErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The clock already owed these transitions at this instant, so applying
+        // them here shows nothing a later caller could not already have seen —
+        // and whether a cluster is serving decides the association state a
+        // schedule reports.
+        store.settle(::service_common::clock::now(&*self.engine));
+
+        // The identifier is resolved exactly as the create stored it and as the
+        // read resolves it, so the three can never disagree on which schedule a
+        // request names. One that names none is the modelled refusal, worded
+        // through the one function that words this fault for the whole service.
+        let Some(position) = store.snapshot_schedule_position(&input.schedule_identifier) else {
+            return Err(
+                DeleteSnapshotScheduleErrorModeled::SnapshotScheduleNotFoundFault(
+                    SnapshotScheduleNotFoundFault {
+                        message: Some(st::snapshot_schedule_not_found_message(
+                            st::SnapshotScheduleNotFoundWording::ScheduleNotFoundForIdentifier,
+                            &input.schedule_identifier,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A cluster associated with the schedule takes its snapshots on it, so
+        // dropping the schedule under that cluster is refused and nothing is
+        // removed.
+        let held_by = store.clusters_holding_snapshot_schedule(&input.schedule_identifier);
+        if !held_by.is_empty() {
+            return Err(
+                DeleteSnapshotScheduleErrorModeled::InvalidClusterSnapshotScheduleStateFault(
+                    InvalidClusterSnapshotScheduleStateFault {
+                        message: Some(st::snapshot_schedule_in_use_message(
+                            &input.schedule_identifier,
+                            &held_by,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `remove` keeps the insertion order the `Marker` cursor pages over,
+        // so the schedules around this one keep the order every read walks
+        // them in.
+        store.snapshot_schedules.remove(position);
+
+        Ok(DeleteSnapshotScheduleOutput)
     }
 }

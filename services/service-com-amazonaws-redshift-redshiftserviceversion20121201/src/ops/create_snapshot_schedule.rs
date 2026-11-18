@@ -11,11 +11,14 @@
 //! overwrites nothing.
 //!
 //! Every definition is read as the schedule it states BEFORE anything is
-//! written ([`crate::state::parse_schedule_definition`]): a definition written
+//! written ([`crate::state::check_schedule_definition`]): a definition written
 //! in an expression type this service reads no schedule from is refused with
 //! `ScheduleDefinitionTypeUnsupportedFault`, and one of an offered type that
-//! states no schedule with `InvalidScheduleFault` — so no stored schedule
-//! carries a definition nothing can be computed from.
+//! states no schedule — or states one whose invocations are closer together
+//! than the shortest interval a snapshot schedule takes snapshots at
+//! ([`crate::state::MIN_SCHEDULE_INTERVAL`]) — with `InvalidScheduleFault`, so
+//! no stored schedule carries a definition nothing can be computed from or a
+//! cadence no schedule fires at.
 //!
 //! A request whose `DryRun` asks for the create to be CHECKED rather than
 //! performed is answered with the schedule it describes, invocation times
@@ -230,6 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // STORED definitions are the record, and the invocation times a response
         // reports are computed from them by the one reading both paths share.
         let definitions = input.schedule_definitions.clone().unwrap_or_default();
+        let now = ::std::time::SystemTime::now();
         // How many definitions one schedule may carry: every one of them is read
         // and evaluated on every request that reports the schedule, so the
         // number is bounded before any of them is read.
@@ -242,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         for definition in &definitions {
-            if let Err(refusal) = st::parse_schedule_definition(definition) {
+            if let Err(refusal) = st::check_schedule_definition(definition, now) {
                 return Err(definition_refusal(refusal));
             }
         }
@@ -319,7 +323,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // change to reach.
             update_due: None,
         };
-        let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
         // The clock already owed these transitions at this instant, so applying

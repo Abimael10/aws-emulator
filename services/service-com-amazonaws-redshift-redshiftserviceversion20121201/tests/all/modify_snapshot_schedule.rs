@@ -63,16 +63,16 @@ const MODIFY_CASES: &[ModifyCase] = &[
     ModifyCase {
         case: "a calendar expression replaced by a rate",
         created: &["cron(15 * * * ?)"],
-        modified: &["rate(30 minutes)"],
+        modified: &["rate(90 minutes)"],
     },
     ModifyCase {
         case: "one definition replaced by three",
         created: &["rate(12 hours)"],
-        modified: &["rate(12 hours)", "cron(0 0 * * ? *)", "rate(45 minutes)"],
+        modified: &["rate(12 hours)", "cron(0 0 * * ? *)", "rate(100 minutes)"],
     },
     ModifyCase {
         case: "three definitions replaced by one",
-        created: &["rate(12 hours)", "cron(0 0 * * ? *)", "rate(45 minutes)"],
+        created: &["rate(12 hours)", "cron(0 0 * * ? *)", "rate(100 minutes)"],
         modified: &["cron(30 12 *)"],
     },
     ModifyCase {
@@ -489,7 +489,12 @@ async fn a_schedule_this_account_does_not_hold_cannot_be_changed() {
             &answer,
             400,
             "SnapshotScheduleNotFound",
-            Some(&state::snapshot_schedule_not_found_message(named)),
+            // The wording this operation words the fault with: the fixed text
+            // "No snapshot schedule found for schedule identifier " and the
+            // identifier the REQUEST spelled, bare.
+            Some(&format!(
+                "No snapshot schedule found for schedule identifier {named}"
+            )),
         );
         assert_eq!(
             stored_definitions(&emulator, named),
@@ -677,4 +682,110 @@ async fn a_schedule_a_cluster_is_associated_with_takes_its_change_asynchronously
         "case {case}: expected the store to hold the next change, got {:?}",
         stored_definitions(&emulator, identifier)
     );
+}
+
+/// A change is held to the SAME definition rule the create is: a snapshot
+/// schedule takes at most one snapshot an hour, so a definition whose
+/// invocations are closer together than [`state::MIN_SCHEDULE_INTERVAL`] is
+/// refused with the modelled `InvalidSchedule`, naming the definition it was
+/// given, and the schedule keeps the definitions it had.
+///
+/// The table spans the bound rather than one definition: the bound itself, one
+/// step under it, the units a rate states an interval in, and the calendar
+/// expressions whose named instants fall that close together.
+#[tokio::test]
+async fn a_change_to_a_definition_under_the_minimum_interval_is_refused() {
+    let emulator = Emulator::new();
+    let identifier = "schedule-interval-change";
+    let held = ["rate(12 hours)"];
+    create_schedule(
+        &emulator,
+        "the schedule a change under the bound names",
+        identifier,
+        &held,
+        None,
+        &[],
+    )
+    .await;
+
+    // The bound is read off the service's own constant rather than spelled here,
+    // so the row at it and the row under it follow the rule and not a number.
+    let floor_minutes = state::MIN_SCHEDULE_INTERVAL.as_secs() / 60;
+    let at_the_bound = format!("rate({floor_minutes} minutes)");
+    let one_under = format!("rate({} minutes)", floor_minutes - 1);
+    // Each row: the case, the definitions the change carries, and which of them
+    // the refusal names — `None` for a change the service takes.
+    let rows: Vec<(&str, Vec<String>, Option<usize>)> = vec![
+        ("one minute under the bound", vec![one_under.clone()], Some(0)),
+        ("a rate of a single minute", owned(&["rate(1 minute)"]), Some(0)),
+        ("half the bound", owned(&["rate(30 minutes)"]), Some(0)),
+        (
+            "a calendar definition firing every minute",
+            owned(&["cron(* * * * ?)"]),
+            Some(0),
+        ),
+        (
+            "a calendar definition firing twice an hour",
+            owned(&["cron(0,30 * * * ?)"]),
+            Some(0),
+        ),
+        (
+            "a definition over the bound beside one under it",
+            vec!["rate(12 hours)".to_string(), one_under.clone()],
+            Some(1),
+        ),
+        ("the bound itself, stated in minutes", vec![at_the_bound.clone()], None),
+        ("the bound stated in hours", owned(&["rate(1 hour)"]), None),
+        (
+            "a calendar definition firing once an hour",
+            owned(&["cron(15 * * * ?)"]),
+            None,
+        ),
+    ];
+
+    for (case, definitions, offending) in &rows {
+        let answer = modify_schedule(&emulator, identifier, definitions).await;
+        match offending {
+            Some(position) => {
+                assert_refused(
+                    case,
+                    &answer,
+                    400,
+                    "InvalidSchedule",
+                    Some(&format!(
+                        "Schedule interval {} is less than minimum interval of {floor_minutes} \
+                         minutes",
+                        definitions[*position]
+                    )),
+                );
+                assert_eq!(
+                    stored_definitions(&emulator, identifier).as_deref(),
+                    Some(&owned(&held)[..]),
+                    "case {case}: expected the schedule to keep {held:?}, got {:?}",
+                    stored_definitions(&emulator, identifier)
+                );
+            }
+            None => {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case}: expected {definitions:?} served with 200, got {} with body {}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    stored_definitions(&emulator, identifier).as_deref(),
+                    Some(&definitions[..]),
+                    "case {case}: expected {definitions:?} stored, got {:?}",
+                    stored_definitions(&emulator, identifier)
+                );
+                // The next refused row has to find the schedule as it was left,
+                // so the definitions it keeps are these from here on.
+                let change_back = modify_schedule(&emulator, identifier, &owned(&held)).await;
+                assert_eq!(
+                    change_back.status, 200,
+                    "case {case}: expected the schedule put back to {held:?}, got {} with body {}",
+                    change_back.status, change_back.body
+                );
+            }
+        }
+    }
 }

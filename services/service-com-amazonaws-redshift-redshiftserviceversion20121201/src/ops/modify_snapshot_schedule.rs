@@ -11,10 +11,13 @@
 //! `SnapshotScheduleNotFoundFault` and writes nothing.
 //!
 //! Every definition is read as the schedule it states BEFORE anything is
-//! written ([`crate::state::parse_schedule_definition`]): a definition nothing
-//! can be computed from is refused with `InvalidScheduleFault`, the one fault
-//! this operation declares for it — so no stored schedule carries a definition
-//! nothing can be computed from.
+//! written ([`crate::state::check_schedule_definition`]): a definition nothing
+//! can be computed from, and one stating invocations closer together than the
+//! shortest interval a snapshot schedule takes snapshots at
+//! ([`crate::state::MIN_SCHEDULE_INTERVAL`]), are refused with
+//! `InvalidScheduleFault`, the one fault this operation declares for it — so a
+//! change leaves the schedule no definition the create path would not have
+//! stored.
 //!
 //! "Any schedule associated with a cluster is modified asynchronously": a
 //! schedule a cluster is associated with carries the change for the span it
@@ -242,14 +245,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        let wall = ::std::time::SystemTime::now();
         for definition in &definitions {
-            if let Err(refusal) = st::parse_schedule_definition(definition) {
+            if let Err(refusal) = st::check_schedule_definition(definition, wall) {
                 return Err(definition_refusal(refusal));
             }
         }
 
-        let wall = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
         let now = ::service_common::clock::now(&*self.engine);
         // The clock already owed these transitions at this instant, so applying
         // them here shows nothing a later caller could not already have seen —
@@ -268,6 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ModifySnapshotScheduleErrorModeled::SnapshotScheduleNotFoundFault(
                     SnapshotScheduleNotFoundFault {
                         message: Some(st::snapshot_schedule_not_found_message(
+                            st::SnapshotScheduleNotFoundWording::NoSnapshotScheduleForIdentifier,
                             &input.schedule_identifier,
                         )),
                     },

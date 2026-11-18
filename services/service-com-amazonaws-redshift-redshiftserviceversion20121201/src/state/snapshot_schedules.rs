@@ -46,6 +46,29 @@ pub const SNAPSHOT_SCHEDULE_QUOTA: usize = 10_000;
 /// work one request can ask for.
 pub const MAX_SCHEDULE_DEFINITIONS: usize = 100;
 
+/// The shortest interval a snapshot schedule may take its snapshots at.
+///
+/// A snapshot schedule is "a regular interval for creating snapshots of a
+/// cluster", and Amazon Redshift takes at most one snapshot of a cluster an
+/// hour: a definition stating invocations closer together than this is refused
+/// with the modelled `InvalidScheduleFault` and nothing is written. The model
+/// bounds `ScheduleDefinitions` nowhere (a list of plain strings, with no
+/// `@length` and no `@pattern`), so the floor is enforced here, on the interval
+/// the definition STATES rather than on its spelling — which is why it holds
+/// for every expression type a schedule may be written in.
+pub const MIN_SCHEDULE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// How many consecutive invocations of a CALENDAR definition are compared to
+/// find the shortest interval it fires at (see
+/// [`SnapshotScheduleDefinition::shortest_interval`]).
+///
+/// A rate expression states its interval outright; a cron one names calendar
+/// instants, so the interval it states is the smallest gap between the instants
+/// it names. A day's worth of consecutive invocations covers every pattern the
+/// minute and hour fields can repeat within a day, and bounds the walk one
+/// definition can ask for.
+const CRON_INTERVAL_SAMPLE: usize = 24;
+
 /// How long after the `ModifySnapshotSchedule` call that starts it the change to
 /// a schedule a cluster is associated with falls due.
 ///
@@ -251,6 +274,26 @@ impl SnapshotScheduleDefinition {
             }
         }
     }
+
+    /// The shortest interval between two consecutive invocations of this
+    /// definition, and `None` when it fires too rarely for the sample to see
+    /// two of them.
+    ///
+    /// A rate expression states the interval outright. A cron one names
+    /// calendar instants, so the interval it states is the smallest gap between
+    /// consecutive instants it names, taken over a bounded sample of them
+    /// ([`CRON_INTERVAL_SAMPLE`]) from `after`.
+    #[must_use]
+    pub fn shortest_interval(&self, after: SystemTime) -> Option<Duration> {
+        match self {
+            Self::Rate(interval) => Some(*interval),
+            Self::Cron(_) => self
+                .upcoming(after, CRON_INTERVAL_SAMPLE)
+                .windows(2)
+                .filter_map(|pair| pair[1].duration_since(pair[0]).ok())
+                .min(),
+        }
+    }
 }
 
 /// Why an expression is not one this service reads a schedule from, or not one
@@ -314,6 +357,34 @@ pub fn parse_schedule_definition(
     Err(ScheduleDefinitionRefusal::Unsupported(
         unsupported_schedule_definition_message(expression),
     ))
+}
+
+/// One definition of a snapshot schedule as the schedule it states, accepted
+/// only when that schedule is one this service takes snapshots on.
+///
+/// What every path that ACCEPTS a definition reads it through, so the create
+/// path, its dry-run form and the modify path hold a definition to the same
+/// rule: it is read as the schedule it states
+/// ([`parse_schedule_definition`]), and a schedule whose invocations are
+/// closer together than [`MIN_SCHEDULE_INTERVAL`] states a cadence no snapshot
+/// schedule takes snapshots at, which is [`ScheduleDefinitionRefusal::Invalid`].
+///
+/// `now` is the instant the calendar sample of a cron definition starts from
+/// (see [`SnapshotScheduleDefinition::shortest_interval`]).
+pub fn check_schedule_definition(
+    definition: &str,
+    now: SystemTime,
+) -> Result<SnapshotScheduleDefinition, ScheduleDefinitionRefusal> {
+    let schedule = parse_schedule_definition(definition)?;
+    if schedule
+        .shortest_interval(now)
+        .is_some_and(|interval| interval < MIN_SCHEDULE_INTERVAL)
+    {
+        return Err(ScheduleDefinitionRefusal::Invalid(
+            schedule_interval_too_short_message(definition.trim()),
+        ));
+    }
+    Ok(schedule)
 }
 
 /// A `rate(value unit)` body as the interval it states.
@@ -420,16 +491,29 @@ pub fn too_many_schedule_definitions_message(carried: usize) -> String {
     )
 }
 
+/// Why a definition stating a cadence faster than [`MIN_SCHEDULE_INTERVAL`] is
+/// refused, naming the definition the request sent.
+///
+/// The fixed text is how the service words this class of `InvalidSchedule`
+/// refusal — the interval it was given, then the minimum it holds every
+/// schedule to — and the definition the request carried is the one variable
+/// part. The bound itself is the rule, so it is stated in minutes whatever unit
+/// the definition is written in.
+pub fn schedule_interval_too_short_message(definition: &str) -> String {
+    format!(
+        "Schedule interval {definition} is less than minimum interval of {} minutes",
+        MIN_SCHEDULE_INTERVAL.as_secs() / 60
+    )
+}
+
 /// Why a create under an identifier the account already holds a snapshot
 /// schedule under is refused, naming the schedule the request asked for.
 ///
 /// The IDENTIFIER is what an account's schedules are unique on, so the refusal
-/// names it — single-quoted, as this family words an identifier it reports back
-/// inside a sentence (see [`snapshot_copy_grant_already_exists_message`]).
+/// names it: the fixed text is "Snapshot schedule " and " already exists.", and
+/// the identifier the request spelled is the one variable part.
 pub fn snapshot_schedule_already_exists_message(identifier: &str) -> String {
-    format!(
-        "Cannot create the snapshot schedule because a schedule with the identifier '{identifier}' already exists."
-    )
+    format!("Snapshot schedule {identifier} already exists.")
 }
 
 /// Why a change to a schedule whose last change is still being applied is
@@ -440,7 +524,7 @@ pub fn snapshot_schedule_already_exists_message(identifier: &str) -> String {
 /// — "The specified snapshot schedule is already being updated"), with the
 /// identifier the request named single-quoted inside it, the way this family
 /// words an identifier it reports back in a sentence (see
-/// [`snapshot_schedule_not_found_message`]).
+/// [`snapshot_copy_grant_already_exists_message`]).
 pub fn snapshot_schedule_update_in_progress_message(identifier: &str) -> String {
     format!("The specified snapshot schedule '{identifier}' is already being updated.")
 }
@@ -452,16 +536,48 @@ pub fn snapshot_schedule_quota_message() -> String {
     )
 }
 
-/// Why a request naming a `ScheduleIdentifier` this account holds no snapshot
-/// schedule under is refused, naming the schedule it asked for.
+/// Which sentence a `SnapshotScheduleNotFoundFault` is worded with.
 ///
+/// The same split as [`SnapshotCopyGrantNotFoundWording`]: the fault's status
+/// (400) and awsQuery code (`SnapshotScheduleNotFound`) are what the model
+/// fixes, while the fixed text around the `ScheduleIdentifier` is an attribute
+/// of the OPERATION. Neither sentence quotes the identifier and neither ends in
+/// a period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotScheduleNotFoundWording {
+    /// `No snapshot schedule found for schedule identifier <ScheduleIdentifier>`
+    /// — what the operations that DEREFERENCE a schedule answer: the change to
+    /// the schedule's definitions (`ModifySnapshotSchedule`) and the cluster
+    /// write that associates a cluster with one
+    /// (`ModifyClusterSnapshotSchedule`).
+    NoSnapshotScheduleForIdentifier,
+    /// `Schedule not found for schedule identifier <ScheduleIdentifier>` — what
+    /// the operation whose TARGET is the schedule itself,
+    /// `DeleteSnapshotSchedule`, answers.
+    ScheduleNotFoundForIdentifier,
+}
+
+/// Why a request naming a `ScheduleIdentifier` this account holds no snapshot
+/// schedule under is refused, naming the schedule it asked for in the sentence
+/// `wording` words.
+///
+/// The identifier the REQUEST spelled is the one variable part of either
+/// sentence. (The model's own sentence for the shape,
 /// `smithy_query(query="shape", shape="SnapshotScheduleNotFoundFault")` — "We
-/// could not find the specified snapshot schedule" — which is the fixed text; the
-/// identifier the request named is the variable part, single-quoted the way this
-/// family words an identifier it reports back inside a sentence (see
-/// [`snapshot_schedule_already_exists_message`]).
-pub fn snapshot_schedule_not_found_message(identifier: &str) -> String {
-    format!("We could not find the specified snapshot schedule '{identifier}'.")
+/// could not find the specified snapshot schedule" — is the shape's
+/// documentation, not the wire message.)
+pub fn snapshot_schedule_not_found_message(
+    wording: SnapshotScheduleNotFoundWording,
+    identifier: &str,
+) -> String {
+    match wording {
+        SnapshotScheduleNotFoundWording::NoSnapshotScheduleForIdentifier => {
+            format!("No snapshot schedule found for schedule identifier {identifier}")
+        }
+        SnapshotScheduleNotFoundWording::ScheduleNotFoundForIdentifier => {
+            format!("Schedule not found for schedule identifier {identifier}")
+        }
+    }
 }
 
 /// Why asking for a cluster to be released from a snapshot schedule it is not on
@@ -475,6 +591,23 @@ pub fn cluster_holds_no_snapshot_schedule_message(cluster_identifier: &str) -> S
     format!(
         "The cluster snapshot schedule state is not valid: cluster {cluster_identifier} is not \
          associated with a snapshot schedule."
+    )
+}
+
+/// Why dropping a snapshot schedule a cluster still takes its snapshots on is
+/// refused, naming the schedule and the clusters that hold it.
+///
+/// `smithy_query(query="shape", shape="InvalidClusterSnapshotScheduleStateFault")`
+/// — "The cluster snapshot schedule state is not valid" — which is the fixed
+/// text, and the schedule the request named with the clusters whose association
+/// stands in the way are the variable parts: a cluster associated with a
+/// schedule takes its snapshots on it, so the schedule cannot be dropped out
+/// from under it.
+pub fn snapshot_schedule_in_use_message(identifier: &str, clusters: &[String]) -> String {
+    format!(
+        "The cluster snapshot schedule state is not valid: snapshot schedule {identifier} is \
+         associated with cluster(s) {}.",
+        clusters.join(", ")
     )
 }
 
@@ -610,6 +743,39 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.snapshot_schedules
             .iter()
             .find(|schedule| schedule.schedule_identifier == identifier)
+    }
+
+    /// Where the stored snapshot schedule with this `ScheduleIdentifier` is, if
+    /// the store holds one.
+    ///
+    /// The identifier is compared exactly as [`Self::snapshot_schedule`]
+    /// compares it. A position rather than a reference, because the delete
+    /// needs to REMOVE the record it finds, and `remove` keeps the insertion
+    /// order the `Marker` cursor pages over.
+    pub fn snapshot_schedule_position(&self, identifier: &str) -> Option<usize> {
+        self.snapshot_schedules
+            .iter()
+            .position(|schedule| schedule.schedule_identifier == identifier)
+    }
+
+    /// The identifier of every cluster this store holds that takes its
+    /// snapshots on the schedule this `ScheduleIdentifier` names, in creation
+    /// order.
+    ///
+    /// A cluster is associated with a schedule by naming it
+    /// (`Cluster$SnapshotScheduleIdentifier`), so that membership is the whole
+    /// of what being associated with a schedule can mean for this store. The
+    /// list is not cut at [`MAX_REPORTED_ASSOCIATED_CLUSTERS`]: unlike
+    /// [`Self::clusters_associated_to_schedule`], which renders the hundred
+    /// clusters a response reports, this is what the service DECIDES on.
+    pub fn clusters_holding_snapshot_schedule(&self, identifier: &str) -> Vec<String> {
+        self.clusters
+            .iter()
+            .filter(|stored| {
+                stored.cluster.snapshot_schedule_identifier.as_deref() == Some(identifier)
+            })
+            .filter_map(|stored| stored.cluster.cluster_identifier.clone())
+            .collect()
     }
 
     /// The clusters associated with the schedule this `ScheduleIdentifier`
