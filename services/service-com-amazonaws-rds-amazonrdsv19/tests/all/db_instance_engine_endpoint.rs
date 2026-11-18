@@ -610,6 +610,37 @@ fn postgres_refusal(body: &[u8]) -> Refusal {
     refusal
 }
 
+/// One session on a PostgreSQL instance's endpoint, logged in over TLS as the master user
+/// every instance of these suites is created with, against the database it was created
+/// with — the login a suite that is not ABOUT the login itself opens.
+///
+/// `case` is the row of the caller's table, so a login that is refused names the case that
+/// needed it.
+pub(crate) async fn master_session(case: &str, address: &str, port: u16) -> PostgresSession {
+    postgres_login(
+        address,
+        port,
+        Transport::Tls,
+        MASTER_USER,
+        MASTER_PASSWORD,
+        Some(DATABASE),
+    )
+    .await
+    .unwrap_or_else(|refusal| {
+        panic!("case {case:?}: the master user must be admitted, got {refusal:?}")
+    })
+}
+
+/// Run one statement of `case`'s that must succeed — the seeding and the setting a suite
+/// runs before the statement it is about.
+pub(crate) async fn must_run(case: &str, session: &mut PostgresSession, sql: &str) {
+    let answer = session.query(sql).await;
+    assert!(
+        answer.is_ok(),
+        "case {case:?}: {sql:?} must run, got {answer:?}"
+    );
+}
+
 /// The value of one FIELD of an `ErrorResponse`, by its field code.
 pub(crate) fn postgres_error_field(body: &[u8], field: u8) -> Option<String> {
     let mut at = 0usize;

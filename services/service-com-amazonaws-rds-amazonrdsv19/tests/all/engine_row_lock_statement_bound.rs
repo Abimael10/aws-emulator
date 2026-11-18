@@ -25,10 +25,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::db_instance_engine_endpoint::{
-    available_instance, postgres_login, PostgresSession, Transport, DATABASE, MASTER_PASSWORD,
-    MASTER_USER,
-};
+use crate::db_instance_engine_endpoint::{available_instance, master_session, must_run};
 use crate::db_instances::emulator;
 
 /// The session timeout every statement below is run under: long enough that reaching the
@@ -44,31 +41,6 @@ const PREDICATE_WAIT: &str = "5";
 /// well over [`STATEMENT_TIMEOUT_MS`].
 const CANCELLED_WITHIN: Duration = Duration::from_millis(2_500);
 
-/// One session on the instance's endpoint, logged in as its master user.
-async fn session(case: &str, address: &str, port: u16) -> PostgresSession {
-    postgres_login(
-        address,
-        port,
-        Transport::Tls,
-        MASTER_USER,
-        MASTER_PASSWORD,
-        Some(DATABASE),
-    )
-    .await
-    .unwrap_or_else(|refusal| {
-        panic!("case {case:?}: the master user must be admitted, got {refusal:?}")
-    })
-}
-
-/// Run one statement that must succeed.
-async fn must_run(case: &str, session: &mut PostgresSession, sql: &str) {
-    let answer = session.query(sql).await;
-    assert!(
-        answer.is_ok(),
-        "case {case:?}: {sql:?} must run, got {answer:?}"
-    );
-}
-
 /// A statement whose row predicate waits far past its OWN session's `statement_timeout` is
 /// cancelled on that timeout, even when the session that ran last on the endpoint had the
 /// timeout disabled.
@@ -83,7 +55,7 @@ async fn a_locking_statement_does_not_inherit_another_sessions_budget() {
     )
     .await;
 
-    let mut seeding = session("seed", &address, port).await;
+    let mut seeding = master_session("seed", &address, port).await;
     must_run(
         "seed",
         &mut seeding,
@@ -114,11 +86,11 @@ async fn a_locking_statement_does_not_inherit_another_sessions_budget() {
         // ANOTHER session runs last with its timeout disabled, so the budget most recently
         // in force on this endpoint is the long one. The statement below must still be
         // cancelled on its OWN session's timeout.
-        let mut unbounded = session(case, &address, port).await;
+        let mut unbounded = master_session(case, &address, port).await;
         must_run(case, &mut unbounded, "SET statement_timeout = 0").await;
         must_run(case, &mut unbounded, "SELECT 1").await;
 
-        let mut bounded = session(case, &address, port).await;
+        let mut bounded = master_session(case, &address, port).await;
         must_run(
             case,
             &mut bounded,
