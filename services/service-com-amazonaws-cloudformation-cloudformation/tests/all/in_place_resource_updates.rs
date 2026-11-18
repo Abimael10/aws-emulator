@@ -1592,3 +1592,251 @@ fn output_of(outputs: &[(String, String)], key: &str) -> String {
         .map(|(_, value)| value.clone())
         .unwrap_or_default()
 }
+
+// ---------------------------------------------------------------------------
+// The attributes a revision REPUBLISHES
+// ---------------------------------------------------------------------------
+
+/// Which call deploys a revision: both are deployments of the same stack, and an attribute
+/// follows the declaration either way.
+#[derive(Clone, Copy, Debug)]
+enum Deployed {
+    UpdateStack,
+    ExecuteChangeSet,
+}
+
+/// One row of the republished-attribute table: the stack, the template it deploys (with
+/// `STACK` standing for the stack's name and `VALUE` for the row's declared value), how the
+/// row's value reaches the template, and what the subject must then publish.
+///
+/// The attribute under test is `AWS::SSM::Parameter`'s `Value` — "Fn::GetAtt … Value: the
+/// parameter value", one of the two return values that type publishes
+/// (`smithy_query(query="doc", shape="PutParameter", member="Value")` for the member the
+/// declaration states, and the type's own Return values section for the attribute).
+struct Republished {
+    case: &'static str,
+    stack: &'static str,
+    template: &'static str,
+    /// The template `Parameter` the row's value is supplied through, where it reaches the
+    /// template that way rather than being written into the body.
+    supplied_through: Option<&'static str>,
+    /// `(the value the revision states, the value the attribute must then publish)`.
+    first: (&'static str, &'static str),
+    revised: (&'static str, &'static str),
+    deployed_by: Deployed,
+}
+
+/// A template whose subject publishes the row's value as an attribute, read on two surfaces:
+/// an OUTPUT of the stack, and the PROPERTY of another resource the stack really creates in
+/// the service that owns it.
+const LITERAL_VALUE: &str = r#"{"Resources":{
+    "Subject":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":"VALUE"}},
+    "Reader":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"STACK-reader",
+      "DisplayName":{"Fn::GetAtt":["Subject","Value"]}}}},
+    "Outputs":{"Published":{"Value":{"Fn::GetAtt":["Subject","Value"]}},
+      "Identity":{"Value":{"Ref":"Subject"}},
+      "ReaderArn":{"Value":{"Ref":"Reader"}}}}"#;
+
+/// The same, with the subject's value COMPOSED by an intrinsic over a template parameter the
+/// revision re-values: the template text is identical across the two deployments, and only
+/// the supplied value differs.
+const COMPOSED_VALUE: &str = r#"{"Parameters":{"Supplied":{"Type":"String"}},
+    "Resources":{
+    "Subject":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String",
+      "Value":{"Fn::Join":["-",["head",{"Ref":"Supplied"}]]}}},
+    "Reader":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"STACK-reader",
+      "DisplayName":{"Fn::GetAtt":["Subject","Value"]}}}},
+    "Outputs":{"Published":{"Value":{"Fn::GetAtt":["Subject","Value"]}},
+      "Identity":{"Value":{"Ref":"Subject"}},
+      "ReaderArn":{"Value":{"Ref":"Reader"}}}}"#;
+
+/// The class the rule covers: the rows differ along HOW the declared value is stated (a
+/// literal in the body, an intrinsic over a supplied parameter), the number of characters and
+/// the characters it carries, and WHICH call deploys the revision.
+fn republished_rows() -> Vec<Republished> {
+    vec![
+        Republished {
+            case: "a literal value re-stated by UpdateStack",
+            stack: "republished-literal",
+            template: LITERAL_VALUE,
+            supplied_through: None,
+            first: ("first-value", "first-value"),
+            revised: ("second-value", "second-value"),
+            deployed_by: Deployed::UpdateStack,
+        },
+        Republished {
+            case: "a literal value re-stated by executing a change set",
+            stack: "republished-change-set",
+            template: LITERAL_VALUE,
+            supplied_through: None,
+            first: ("1", "1"),
+            revised: ("a much longer value 2", "a much longer value 2"),
+            deployed_by: Deployed::ExecuteChangeSet,
+        },
+        Republished {
+            case: "a value composed by an intrinsic over a parameter the revision re-values",
+            stack: "republished-composed",
+            template: COMPOSED_VALUE,
+            supplied_through: Some("Supplied"),
+            first: ("one", "head-one"),
+            revised: ("two", "head-two"),
+            deployed_by: Deployed::UpdateStack,
+        },
+    ]
+}
+
+/// Deploy one revision of a row's stack and wait past the instant its operation settles.
+async fn deploy_republished(
+    router: &MultiServiceRouter,
+    row: &Republished,
+    value: &str,
+    creating: bool,
+) {
+    let template = row
+        .template
+        .replace("STACK", row.stack)
+        .replace("VALUE", value);
+    let mut extra = Vec::new();
+    if let Some(key) = row.supplied_through {
+        extra.push(member("Parameters.member.1.ParameterKey", key));
+        extra.push(member("Parameters.member.1.ParameterValue", value));
+    }
+    let case = row.case;
+    if creating {
+        let (code, body) = create_stack(router, row.stack, &template, &extra).await;
+        assert_eq!(
+            code, 200,
+            "case {case:?}: CreateStack({}) must be accepted, got {code} {body}",
+            row.stack
+        );
+        wait_for_the_transition().await;
+        return;
+    }
+    match row.deployed_by {
+        Deployed::UpdateStack => {
+            let mut members = vec![
+                member("StackName", row.stack),
+                member("TemplateBody", &template),
+            ];
+            members.extend(extra);
+            let (code, body) = call(router, "UpdateStack", &members).await;
+            assert_eq!(
+                code, 200,
+                "case {case:?}: UpdateStack({}) must be accepted, got {code} {body}",
+                row.stack
+            );
+        }
+        Deployed::ExecuteChangeSet => {
+            let change_set = format!("{}-revision", row.stack);
+            let mut members = vec![
+                member("StackName", row.stack),
+                member("ChangeSetName", &change_set),
+                member("TemplateBody", &template),
+            ];
+            members.extend(extra);
+            let (code, body) = call(router, "CreateChangeSet", &members).await;
+            assert_eq!(
+                code, 200,
+                "case {case:?}: CreateChangeSet({}) must be accepted, got {code} {body}",
+                row.stack
+            );
+            wait_for_the_transition().await;
+            let (code, body) = call(
+                router,
+                "ExecuteChangeSet",
+                &[
+                    member("StackName", row.stack),
+                    member("ChangeSetName", &change_set),
+                ],
+            )
+            .await;
+            assert_eq!(
+                code, 200,
+                "case {case:?}: ExecuteChangeSet({}) must be accepted, got {code} {body}",
+                row.stack
+            );
+        }
+    }
+    wait_for_the_transition().await;
+}
+
+/// What the subject publishes right now, on both surfaces: the stack's own output, and the
+/// property the reader was really created with in the service that owns it.
+async fn published_on_both_surfaces(
+    case: &str,
+    router: &MultiServiceRouter,
+    stack: &str,
+) -> (String, String, String) {
+    let outputs = outputs_of(router, stack).await;
+    let reader = output_of(&outputs, "ReaderArn");
+    let display_name = topic_attributes(case, router, &reader)
+        .await
+        .into_iter()
+        .find(|(key, _)| key == "DisplayName")
+        .map(|(_, value)| value)
+        .unwrap_or_default();
+    (
+        output_of(&outputs, "Published"),
+        display_name,
+        output_of(&outputs, "Identity"),
+    )
+}
+
+/// RULE: an attribute a resource publishes STRAIGHT FROM one of its own declared properties
+/// is a function of the template being deployed, so a revision that states that property
+/// differently republishes it — every `Fn::GetAtt` reading it, in an output of the stack or in
+/// another resource's property, carries the value the revision stated, while the resource
+/// keeps the identity it already had.
+#[tokio::test]
+async fn a_revision_republishes_the_attributes_its_declaration_states() {
+    for row in republished_rows() {
+        let case = row.case;
+        let router = router();
+        deploy_republished(&router, &row, row.first.0, true).await;
+        assert_eq!(
+            status_of(&router, row.stack).await,
+            status::CREATE_COMPLETE,
+            "case {case:?}: expected the create to complete, reason {:?}",
+            reason_of(&router, row.stack).await
+        );
+        let (published, consumed, identity) =
+            published_on_both_surfaces(case, &router, row.stack).await;
+        assert_eq!(
+            published, row.first.1,
+            "case {case:?}: expected the created stack to publish {:?}, got {published:?}",
+            row.first.1
+        );
+        assert_eq!(
+            consumed, row.first.1,
+            "case {case:?}: expected the reader to be created with {:?}, got {consumed:?}",
+            row.first.1
+        );
+
+        deploy_republished(&router, &row, row.revised.0, false).await;
+        assert_eq!(
+            status_of(&router, row.stack).await,
+            status::UPDATE_COMPLETE,
+            "case {case:?}: expected the revision to complete, reason {:?}",
+            reason_of(&router, row.stack).await
+        );
+        let (republished, reconsumed, same_identity) =
+            published_on_both_surfaces(case, &router, row.stack).await;
+        assert_eq!(
+            republished, row.revised.1,
+            "case {case:?}: expected the revision to publish {:?}, got {republished:?}",
+            row.revised.1
+        );
+        assert_eq!(
+            reconsumed, row.revised.1,
+            "case {case:?}: expected the reader to hold {:?} in the owning service, got \
+             {reconsumed:?}",
+            row.revised.1
+        );
+        // The resource was updated in place: what it publishes moved, its identity did not.
+        assert_eq!(
+            same_identity, identity,
+            "case {case:?}: expected the subject to keep the identity {identity:?}, got \
+             {same_identity:?}"
+        );
+    }
+}

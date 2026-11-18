@@ -2245,6 +2245,20 @@ pub async fn reconcile(
             // its identity, so nothing is created again; what the owning service reported
             // about it, and the configuration it really has, are carried forward.
             let declared_properties = resource.properties.clone();
+            // What THIS declaration publishes for the resource: the attributes it states
+            // itself ([`super::stack::published_from_a_declared_property`] is the one reading of
+            // which those are), which are what a reference to the resource reads once the
+            // owning service has applied the change below. Read before the record in force is
+            // carried forward over them.
+            let declared_attributes: ::std::collections::BTreeMap<String, String> = {
+                let states_them = super::stack::published_from_a_declared_property(&resource);
+                resource
+                    .attributes
+                    .iter()
+                    .filter(|(name, _)| states_them.contains(name.as_str()))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            };
             let changed = declared_properties != existing.properties;
             carry_forward(existing, &mut resource);
             if changed {
@@ -2478,9 +2492,19 @@ pub async fn reconcile(
                             }
                             _ => None,
                         };
-                        // The values the resource published BEFORE this change, which are the
-                        // ones every declaration of this deployment was resolved against.
+                        // The change is in force, so what the resource publishes follows from
+                        // the declaration that was applied: "Fn::GetAtt returns the value of
+                        // an attribute from a resource in the template", and an attribute
+                        // whose value is one of that resource's declared properties moves with
+                        // it.
+                        resource.attributes.extend(declared_attributes.clone());
+                        // The values the resource published BEFORE the owning service
+                        // answered, which are the ones every declaration of this deployment
+                        // was resolved against: the ones the declaration itself publishes,
+                        // just installed, over what the record in force carried.
                         let published_before = resource.attributes.clone();
+                        // ...and the values that service reports for the resource, which are
+                        // the ones it decides rather than the template.
                         resource.attributes.extend(updated.attributes);
                         resource.properties = declared_properties.clone();
                         if let Some(replaced) = superseded {

@@ -27,6 +27,7 @@
 use service_com_amazonaws_cloudformation_cloudformation::state::status;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{list_imports_ok, REGION};
 use crate::stack_lifecycle::{
     call, deploy, describe_stack, member, router, wait_for_the_transition, xml_text, xml_texts,
 };
@@ -407,6 +408,193 @@ async fn a_deployment_that_withdraws_nothing_in_use_completes() {
     assert_eq!(
         still_held, "kept-value",
         "case {case:?}: expected the in-use export untouched, got {still_held:?}"
+    );
+}
+
+/// The export name a cross-stack reference is published under by a deploy tool that names it
+/// after the publishing stack and the reference it stands for.
+const ATTRIBUTE_EXPORT: &str = "attr-producer:ExportsOutputFnGetAttSharedValue";
+
+/// A producer whose exported value is an ATTRIBUTE of a resource the stack really creates,
+/// rather than a literal or a parameter: the export republishes whatever the declaration's
+/// property says, so a revision of that property is a revision of the export.
+fn attribute_exporter(value: &str) -> String {
+    format!(
+        r#"{{"Resources":{{"Shared":{{"Type":"AWS::SSM::Parameter",
+            "Properties":{{"Type":"String","Value":"{value}"}}}}}},
+            "Outputs":{{"Exported":{{"Value":{{"Fn::GetAtt":["Shared","Value"]}},
+              "Export":{{"Name":"{ATTRIBUTE_EXPORT}"}}}}}}}}"#
+    )
+}
+
+/// The consumer: a resource property really written in the owning service, fed by the import.
+fn attribute_importer() -> String {
+    format!(
+        r#"{{"Resources":{{"Echo":{{"Type":"AWS::SSM::Parameter",
+            "Properties":{{"Type":"String",
+              "Value":{{"Fn::ImportValue":"{ATTRIBUTE_EXPORT}"}}}}}}}}}}"#
+    )
+}
+
+/// Deploy `template` onto `stack` by executing a change set, as a deploy tool does: the
+/// change set is created, its creation is waited out, and it is then executed.
+async fn deploy_by_change_set(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+    change_set: &str,
+    template: &str,
+    creating: bool,
+) {
+    let mut members = vec![
+        member("StackName", stack),
+        member("ChangeSetName", change_set),
+        member("TemplateBody", template),
+    ];
+    if creating {
+        members.push(member("ChangeSetType", "CREATE"));
+    }
+    let (code, body) = call(router, "CreateChangeSet", &members).await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: CreateChangeSet({stack}) must be accepted, got {code} {body}"
+    );
+    wait_for_the_transition().await;
+    let (code, body) = call(
+        router,
+        "ExecuteChangeSet",
+        &[
+            member("StackName", stack),
+            member("ChangeSetName", change_set),
+        ],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: ExecuteChangeSet({stack}) must be accepted, got {code} {body}"
+    );
+    wait_for_the_transition().await;
+}
+
+#[tokio::test]
+async fn an_attribute_sourced_export_deployed_by_change_sets_is_pinned_alike() {
+    let case = "both stacks deployed by executing a change set, the export an attribute";
+    let router = router();
+    deploy_by_change_set(
+        &router,
+        case,
+        "attr-producer",
+        "attr-producer-create",
+        &attribute_exporter("v1"),
+        true,
+    )
+    .await;
+    let (settled, reason) = stack_status(&router, case, "attr-producer").await;
+    assert_eq!(
+        settled,
+        status::CREATE_COMPLETE,
+        "case {case:?}: expected the producer to be created, got {settled:?} ({reason:?})"
+    );
+    deploy_by_change_set(
+        &router,
+        case,
+        "attr-consumer",
+        "attr-consumer-create",
+        &attribute_importer(),
+        true,
+    )
+    .await;
+    let (settled, reason) = stack_status(&router, case, "attr-consumer").await;
+    assert_eq!(
+        settled,
+        status::CREATE_COMPLETE,
+        "case {case:?}: expected the consumer to be created, got {settled:?} ({reason:?})"
+    );
+
+    // Both halves of the relation, before the revision: the export is published, and the
+    // consumer is on record as importing it.
+    let published = exported_value(&router, case, ATTRIBUTE_EXPORT).await;
+    assert_eq!(
+        published, "v1",
+        "case {case:?}: expected the attribute-sourced export to publish the declared value, \
+         got {published:?}"
+    );
+    let (importers, _) = list_imports_ok(case, &router, REGION, ATTRIBUTE_EXPORT, None).await;
+    assert_eq!(
+        importers,
+        vec!["attr-consumer".to_string()],
+        "case {case:?}: expected the import index to name the consumer, got {importers:?}"
+    );
+
+    // The revision changes only the declared property the export republishes.
+    deploy_by_change_set(
+        &router,
+        case,
+        "attr-producer",
+        "attr-producer-revision",
+        &attribute_exporter("v2"),
+        false,
+    )
+    .await;
+    wait_for_the_transition().await;
+    let still_published = exported_value(&router, case, ATTRIBUTE_EXPORT).await;
+    let (settled, reason) = stack_status(&router, case, "attr-producer").await;
+    assert_eq!(
+        still_published, "v1",
+        "case {case:?}: expected the export to go on publishing the resolved value, got \
+         {still_published:?} with {settled:?} ({reason:?})"
+    );
+    assert_eq!(
+        settled,
+        status::UPDATE_ROLLBACK_COMPLETE,
+        "case {case:?}: expected the pinned revision to be rolled back, got {settled:?} \
+         ({reason:?})"
+    );
+    assert_eq!(
+        reason,
+        in_use_reason(ATTRIBUTE_EXPORT, "attr-consumer"),
+        "case {case:?}: unexpected StackStatusReason {reason:?}"
+    );
+
+    // ...and the same pin cancels the DELETION of the publisher, from the status that
+    // cancelled revision left it in.
+    let (code, body) = call(
+        &router,
+        "DeleteStack",
+        &[member("StackName", "attr-producer")],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: DeleteStack(attr-producer) must be accepted, got {code} {body}"
+    );
+    wait_for_the_transition().await;
+    let (settled, reason) = stack_status(&router, case, "attr-producer").await;
+    assert_eq!(
+        reason,
+        format!(
+            "Delete canceled. Cannot delete export {ATTRIBUTE_EXPORT} as it is in use by \
+             attr-consumer."
+        ),
+        "case {case:?}: expected the deletion to be cancelled, got {settled:?} ({reason:?})"
+    );
+    // ...and the cancellation is in the stack's EVENT STREAM too, which is where a client
+    // polling the deletion reads what became of it: the attempt's own event says it was
+    // taken, and the event that closes it says why it was cancelled.
+    let (code, body) = call(
+        &router,
+        "DescribeStackEvents",
+        &[member("StackName", "attr-producer")],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: DescribeStackEvents must answer 200, got {code} {body}"
+    );
+    let reported = xml_texts(&body, "ResourceStatusReason");
+    assert!(
+        reported.contains(&reason),
+        "case {case:?}: expected an event carrying {reason:?}, got {reported:?}"
     );
 }
 

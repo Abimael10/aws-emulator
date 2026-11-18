@@ -1844,6 +1844,11 @@ impl StoredStack {
         // resource ([`Self::drain_resource_timeline`], flushed just above) — so by now the
         // only event still owed is the stack's own terminal one, which closes the operation
         // after them.
+        //
+        // The status the operation was RUNNING in is read before the terminal one replaces
+        // it: it says WHICH operation is settling, which is what decides whether its reason
+        // has already been reported ([`is_rolling_back`]).
+        let ran_in = self.status.clone();
         self.status = pending.status;
         // "A last known stable state includes any status in a *_COMPLETE": the operation
         // that just concluded settled the stack in one, so that status is what a later
@@ -1905,14 +1910,22 @@ impl StoredStack {
         }
         let status = self.status.clone();
         // What the EVENT for this terminal status says. One failure is explained ONCE in the
-        // event stream, by the transition that accounts for it: a rollback's reason is
+        // event stream, by the transition that accounts for it: a ROLLBACK's reason is
         // carried by the event that OPENED that rollback ([`Self::begin_rollback`],
         // [`Self::begin_update_rollback`]), so the terminal status it settles into adds no
         // second copy of it — a client counting the events that carry a failure reads one
         // failure, not one per transition that observed it. The stack's own
         // `StackStatusReason` keeps the reason either way, which is where a client reads why
         // the stack is in the status it rests in.
-        let reason = if concludes_a_rollback(&status) {
+        //
+        // Only the ROLLBACK ITSELF is the transition that already reported it, which is why
+        // the status the operation RAN IN decides this and not the one it settles into: an
+        // operation CloudFormation cancelled is restored to the status the stack held before
+        // it ([`Self::begin_canceled_deletion`]), and that status can be a rollback's own
+        // without any event of this operation having carried its reason — the event that
+        // opened it reported the attempt ("User Initiated"). Dropping it there would leave
+        // the cancellation nowhere in the event stream at all.
+        let reason = if concludes_a_rollback(&status) && is_rolling_back(&ran_in) {
             None
         } else {
             pending.status_reason
@@ -4244,6 +4257,39 @@ pub(crate) fn declared_name(resource: &StoredResource) -> Option<String> {
         })
 }
 
+/// The attributes a record publishes STRAIGHT FROM its own declaration: the attribute names
+/// the resource also declares a property for, whose stated value is exactly what the record
+/// publishes under that name.
+///
+/// Several types publish a declared property back as a return value — a parameter's `Value`
+/// and `Type`, a queue's `QueueName` — and such an attribute is a function of the template:
+/// the deployment computes it from the declaration it is deploying
+/// ([`template::published_attribute_names`] catalogues what each type publishes), so a
+/// revision that states the property differently publishes the new value. Every other
+/// attribute a record carries is one no rule here can recompute — an identifier, ARN,
+/// endpoint or version the OWNING SERVICE assigned — which is why a re-deploy carries those
+/// forward from the record in force instead ([`adopt_identities_in_force`],
+/// [`provisioning::reconcile`]).
+///
+/// A declared value is read as the one text its scalar spells, through the crate's single
+/// reading of that ([`super::scalar_text`]), so what this compares and what a deployment
+/// really sends the owning service cannot disagree.
+pub(super) fn published_from_a_declared_property(resource: &StoredResource) -> BTreeSet<String> {
+    resource
+        .attributes
+        .iter()
+        .filter(|(name, published)| {
+            resource
+                .properties
+                .get(name.as_str())
+                .and_then(super::scalar_text)
+                .as_ref()
+                == Some(*published)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// How many times a deployment takes over the identities in force and resolves its
 /// declarations against them ([`adopt_identities_in_force`]): enough passes for a chain of
 /// resources that NAME one another — an api, the integration inside it, the route wired to
@@ -4352,7 +4398,23 @@ fn adopt_identities_in_force(
                 }
                 resource.physical_resource_id = existing.physical_resource_id.clone();
             }
+            // ...and what the owning service reported about it, EXCEPT the values this
+            // deployment's own declaration publishes.
+            //
+            // "Fn::GetAtt returns the value of an attribute from a resource in the
+            // template": an attribute a type publishes STRAIGHT FROM a declared property of
+            // the resource ([`published_from_a_declared_property`]) is a function of the
+            // template being deployed, so the deployment republishes it — a revision that
+            // states that property differently publishes the new value, and every reference
+            // to it (another resource's property, an output, the export that output
+            // declares) reads it. Every other attribute is one no rule here recomputes — an
+            // identifier, ARN, endpoint or version the owning service assigned — and the
+            // record in force is what publishes it.
+            let publishes_its_declaration = published_from_a_declared_property(resource);
             for (name, value) in &existing.attributes {
+                if publishes_its_declaration.contains(name) {
+                    continue;
+                }
                 resource.attributes.insert(name.clone(), value.clone());
             }
         }
@@ -4439,6 +4501,23 @@ fn concludes_a_rollback(terminal: &str) -> bool {
         status::ROLLBACK_COMPLETE
             | status::UPDATE_ROLLBACK_COMPLETE
             | status::IMPORT_ROLLBACK_COMPLETE
+    )
+}
+
+/// Whether the status an operation is RUNNING in is a rollback's own: the in-progress status
+/// a rollback carries, and the documented cleanup phase it reaches before its terminal one.
+///
+/// A rollback reports its reason on the event that OPENS it, so its terminal event adds no
+/// second copy ([`concludes_a_rollback`]). Every other operation that settles into one of
+/// those statuses — a deletion CloudFormation CANCELLED, which puts the stack back in the
+/// status it held — has reported no reason yet, so its own terminal event is the one that
+/// carries it.
+fn is_rolling_back(running_in: &str) -> bool {
+    matches!(
+        running_in,
+        status::ROLLBACK_IN_PROGRESS
+            | status::UPDATE_ROLLBACK_IN_PROGRESS
+            | status::UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS
     )
 }
 
