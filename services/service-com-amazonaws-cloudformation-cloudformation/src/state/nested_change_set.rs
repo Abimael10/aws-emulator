@@ -29,6 +29,14 @@
 //! `Parameters` that declaration passes it, against the revision the child stack carries. It
 //! is therefore the plan an execution of the hierarchy would carry out on that child.
 //!
+//! The declarations the hierarchy is read from are the ones of the template the change set
+//! would DEPLOY — the submitted body where the request submits one and the stack's own where
+//! it reuses it (`UsePreviousTemplate`) — and each of them is EVALUATED under the parameter
+//! values that change set would deploy with ([`declared_children`]), since a `TemplateURL` a
+//! declaration states as an expression addresses whatever those values make of it. So a
+//! hierarchy whose child templates are chosen by parameter is expanded from the values this
+//! request puts in force rather than from the template's text.
+//!
 //! Only a child stack that EXISTS has a revision to plan against, so only a change on one is
 //! expanded: a child a change set would create does not exist to hold a change set of its
 //! own, and a declaration whose `TemplateURL` is not a readable object has no template to
@@ -120,26 +128,86 @@ pub type Children = BTreeMap<String, PlannedChild>;
 /// declares it under, the `TemplateURL` it addresses and the values it passes the child.
 type Declaration = (String, String, Vec<StoredParameter>);
 
+/// What the declarations of one template are EVALUATED in: the identity of the stack that
+/// template is in force on, which is what a pseudo parameter in one of them stands for.
+///
+/// `stack_name` and `stack_id` are empty where the stack they would name is not known at the
+/// point the hierarchy is read — a stack this call would create, and every stack BELOW the one
+/// the request named, whose own identity this service only mints when the hierarchy is
+/// deployed. An empty one resolves to nothing rather than to a value this service invented, so
+/// a declaration built from it addresses no readable object and that child is simply not
+/// expanded.
+#[derive(Debug, Clone, Copy)]
+pub struct PlanningScope<'a> {
+    pub region: &'a str,
+    pub stack_name: &'a str,
+    pub stack_id: &'a str,
+    /// The Amazon SNS topics in force on that stack, which is what `AWS::NotificationARNs`
+    /// stands for.
+    pub notification_arns: &'a [String],
+}
+
 /// The nested-stack declarations one template carries: the logical id of each, the
 /// `TemplateURL` it addresses and the parameter values it passes.
 ///
-/// A declaration whose `TemplateURL` is not plain text addresses nothing this can read — the
-/// property's value is still an unevaluated expression — and is left out, as is one that
-/// states no `TemplateURL` at all: there is no child template to plan from either way.
-fn declared_children(declared: &template::Template) -> Vec<Declaration> {
+/// Each declaration is EVALUATED first, against `values` — the parameter values in force on
+/// the stack that template is the revision of — because what a property declares and what it
+/// DEPLOYS are two different things: a `TemplateURL` stated as `!Ref ChildTemplate` addresses
+/// whatever those values make of it, and a hierarchy whose child templates are chosen by
+/// parameter is read from the values rather than from the template's text. A declaration this
+/// cannot evaluate at all is read as it stands — that text is what is known about it.
+///
+/// A declaration whose `TemplateURL` does not evaluate to text addresses nothing this can
+/// read, and is left out, as is one that states no `TemplateURL` at all: there is no child
+/// template to plan from either way.
+fn declared_children(
+    declared: &template::Template,
+    scope: PlanningScope<'_>,
+    values: &BTreeMap<String, String>,
+) -> Vec<Declaration> {
+    let parameter_types = super::ssm_parameters::parameter_types_in_force(declared);
+    // A declaration is evaluated for the ONE property that addresses a template, so it is
+    // evaluated against the parameters and the stack's own identity alone: the resources of
+    // this template are not deployed yet (the hierarchy is a PLAN), and neither an export nor
+    // another stack's output is something this reading claims to know. A `TemplateURL` built
+    // from one of them therefore resolves to nothing, exactly as one stated as an expression
+    // this service cannot evaluate does.
+    let no_resources = BTreeMap::new();
+    let no_imports = BTreeMap::new();
+    let no_stack_outputs = super::stack_outputs::Values::new();
+    let evaluated = template::Scope {
+        stack: template::StackScope {
+            region: scope.region,
+            stack_name: scope.stack_name,
+            stack_id: scope.stack_id,
+            notification_arns: scope.notification_arns,
+        },
+        parameters: values,
+        parameter_types: &parameter_types,
+        resources: &no_resources,
+        mappings: &declared.mappings,
+        conditions: &declared.conditions,
+        imports: &no_imports,
+        stack_outputs: &no_stack_outputs,
+    };
+    // ONE budget for the whole template, as a deployment evaluates a whole template out of
+    // one: the work one template's declarations can ask for is bounded, not each child's.
+    let mut budget = template::Budget::new();
     declared
         .resources
         .iter()
         .filter(|resource| resource.resource_type == STACK_RESOURCE_TYPE)
         .filter_map(|resource| {
-            let url = match resource.properties.get(TEMPLATE_URL) {
+            let properties = template::resolve(&resource.properties, &evaluated, &mut budget)
+                .unwrap_or_else(|| resource.properties.clone());
+            let url = match properties.get(TEMPLATE_URL) {
                 Some(Value::String(url)) if !url.is_empty() => url.clone(),
                 _ => return None,
             };
             Some((
                 resource.logical_id.clone(),
                 url,
-                declared_parameters(&resource.properties),
+                declared_parameters(&properties),
             ))
         })
         .collect()
@@ -177,15 +245,22 @@ fn declared_parameters(properties: &Value) -> Vec<StoredParameter> {
 /// reference resolution every template submitted by reference goes through
 /// ([`super::template_url::fetch`]).
 ///
+/// `declared` is the template the change set would DEPLOY — the submitted body where the
+/// request submits one and the stack's own where it reuses it — and `values` the parameter
+/// values it would deploy with, which is what its declarations are evaluated against
+/// ([`declared_children`]).
+///
 /// Read HERE, before the store is locked, for the reason the parent's own template is: a
 /// caller-sized object is read outside the lock. A child whose template cannot be read is
 /// simply not expanded — nothing of it is planned, so nothing reports a change set for it.
 pub async fn fetched_children<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
+    scope: PlanningScope<'_>,
     declared: Option<&template::Template>,
+    values: &BTreeMap<String, String>,
 ) -> Children {
+    let region = scope.region;
     let mut children = Children::new();
     let Some(declared) = declared else {
         return children;
@@ -193,8 +268,10 @@ pub async fn fetched_children<Eng: Send + Sync + 'static>(
     // The frontier of the walk: the declarations of one template, under the path that reaches
     // it. Breadth-first, so the children of the planned stack are read before any level below
     // them and the count bound is spent on the nearest ones.
-    let mut frontier: Vec<(String, Vec<Declaration>)> =
-        vec![(String::new(), declared_children(declared))];
+    let mut frontier: Vec<(String, Vec<Declaration>)> = vec![(
+        String::new(),
+        declared_children(declared, scope, values),
+    )];
     for _ in 0..MAX_NESTED_DEPTH {
         let mut below = Vec::new();
         for (prefix, declarations) in frontier {
@@ -215,8 +292,22 @@ pub async fn fetched_children<Eng: Send + Sync + 'static>(
                     .body(&body)
                     .and_then(super::declared_template)
                     .unwrap_or_default();
-                let declared_below = declared_children(&declared);
                 let parameters_in_force = parameters_in_force(&body, parameters.clone());
+                // The level below this child is read from ITS revision under ITS values: the
+                // parameter set the declaration above puts in force on it, with that
+                // template's own defaults for the rest. The child stack's own name and id are
+                // not known until the hierarchy is deployed, so the scope below carries
+                // neither ([`PlanningScope`]).
+                let declared_below = declared_children(
+                    &declared,
+                    PlanningScope {
+                        region,
+                        stack_name: "",
+                        stack_id: "",
+                        notification_arns: &[],
+                    },
+                    &supplied_values(&parameters_in_force),
+                );
                 children.insert(
                     path.clone(),
                     PlannedChild {
@@ -545,39 +636,85 @@ mod tests {
     use super::*;
 
     /// RULE: the children a template declares are the resources of the nested-stack type
-    /// whose declaration addresses a template, each with the values it passes.
+    /// whose declaration addresses a template, each with the values it passes — and a
+    /// declaration is read as the parameter values in force make it, not as its text stands.
     #[test]
     fn the_declared_children_are_the_nested_stacks_the_template_addresses() {
-        let body = r#"{"Resources":{
+        let body = r#"{"Parameters":{"ChildTemplate":{"Type":"String"},
+                "Assets":{"Type":"String","Default":"assets"}},
+            "Resources":{
             "Child":{"Type":"AWS::CloudFormation::Stack","Properties":{
                 "TemplateURL":"https://assets.s3.us-east-1.amazonaws.com/child.json",
                 "Parameters":{"Size":"small","Count":3}}},
-            "Expressed":{"Type":"AWS::CloudFormation::Stack","Properties":{
-                "TemplateURL":{"Fn::Sub":"https://${Bucket}/child.json"}}},
+            "Chosen":{"Type":"AWS::CloudFormation::Stack","Properties":{
+                "TemplateURL":{"Ref":"ChildTemplate"},
+                "Parameters":{"Size":{"Ref":"Assets"}}}},
+            "Built":{"Type":"AWS::CloudFormation::Stack","Properties":{
+                "TemplateURL":{"Fn::Sub":
+                    "https://${Assets}.s3.${AWS::Region}.amazonaws.com/built.json"}}},
+            "Unknowable":{"Type":"AWS::CloudFormation::Stack","Properties":{
+                "TemplateURL":{"Fn::GetAtt":["Bucket","WebsiteURL"]}}},
             "NoTemplate":{"Type":"AWS::CloudFormation::Stack","Properties":{}},
             "Bucket":{"Type":"AWS::S3::Bucket","Properties":{}}}}"#;
         let declared = super::super::declared_template(body).expect("a readable template");
-        let children = declared_children(&declared);
-        let named: Vec<&str> = children
+        let scope = PlanningScope {
+            region: "us-east-1",
+            stack_name: "parent",
+            stack_id: "",
+            notification_arns: &[],
+        };
+        let values: BTreeMap<String, String> = [
+            ("ChildTemplate", "https://assets.s3.us-east-1.amazonaws.com/v2.json"),
+            ("Assets", "assets"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let children = declared_children(&declared, scope, &values);
+        let addressed: Vec<(&str, &str)> = children
             .iter()
-            .map(|(logical_id, _, _)| logical_id.as_str())
+            .map(|(logical_id, url, _)| (logical_id.as_str(), url.as_str()))
             .collect();
         assert_eq!(
-            named,
-            vec!["Child"],
-            "case \"one readable child among four resources\": expected [\"Child\"], got \
-             {named:?}"
+            addressed,
+            vec![
+                (
+                    "Built",
+                    "https://assets.s3.us-east-1.amazonaws.com/built.json"
+                ),
+                ("Child", "https://assets.s3.us-east-1.amazonaws.com/child.json"),
+                ("Chosen", "https://assets.s3.us-east-1.amazonaws.com/v2.json"),
+            ],
+            "case \"a stated, a parameterised and a built URL among six resources\": \
+             expected each addressed as the values in force make it, got {addressed:?}"
         );
-        let values: Vec<(&str, &str)> = children[0]
+        let passed: Vec<(&str, &str)> = children
+            .iter()
+            .find(|(logical_id, _, _)| logical_id == "Child")
+            .expect("the stated child")
             .2
             .iter()
             .map(|parameter| (parameter.key.as_str(), parameter.value.as_str()))
             .collect();
         assert_eq!(
-            values,
+            passed,
             vec![("Count", "3"), ("Size", "small")],
             "case \"the values the declaration passes\": expected every member as text, got \
-             {values:?}"
+             {passed:?}"
+        );
+        let resolved: Vec<(&str, &str)> = children
+            .iter()
+            .find(|(logical_id, _, _)| logical_id == "Chosen")
+            .expect("the parameterised child")
+            .2
+            .iter()
+            .map(|parameter| (parameter.key.as_str(), parameter.value.as_str()))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![("Size", "assets")],
+            "case \"a value the declaration passes as an expression\": expected the value in \
+             force, got {resolved:?}"
         );
     }
 

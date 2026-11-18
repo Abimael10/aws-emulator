@@ -514,22 +514,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             values.extend(supplied.clone());
             values
         });
-        // "If you create a change set for a stack that contains nested stacks, set
-        // IncludeNestedStacks to True to create the change set for the entire stack
-        // hierarchy": each child stack of that hierarchy is planned too, so the template the
-        // submitted declaration addresses for each of them is read HERE, before the lock,
-        // exactly as this request's own template was ([`crate::state::nested_change_set`]).
-        let nested_children = if input.include_nested_stacks == Some(true) {
-            crate::state::nested_change_set::fetched_children(
-                &*self.engine,
-                ctx,
-                &region,
-                declared_submitted.as_ref(),
-            )
-            .await
-        } else {
-            crate::state::nested_change_set::Children::new()
-        };
         // The PARAMETER RESOLUTION stage: a template parameter whose type puts its value in
         // AWS Systems Manager Parameter Store carries the NAME of a parameter there, and
         // CloudFormation resolves it while it computes the plan — so the plan is computed
@@ -546,7 +530,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the ones the request supplies — in that order of precedence, which is the set
         // `merged_parameters` and `parameters_in_force` resolve to under the lock below. The
         // stack's half is read under a lock of its own, released before the reads.
-        let (stack_template, stack_parameters, stack_notification_arns) = {
+        let (stack_template, stack_processed, stack_parameters, stack_notification_arns) = {
             let store = state.lock();
             match store
                 .resolve(&region, &input.stack_name)
@@ -554,13 +538,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 Some(stack) => (
                     stack.template_body.clone(),
+                    stack.processed_template.clone(),
                     stack.parameters.clone(),
                     stack.notification_arns.clone(),
                 ),
-                None => (None, Vec::new(), Vec::new()),
+                None => (
+                    None,
+                    crate::state::template::Processed::Same,
+                    Vec::new(),
+                    Vec::new(),
+                ),
             }
         };
-        let resolution_body = input.template_body.clone().or(stack_template);
+        let resolution_body = input.template_body.clone().or(stack_template.clone());
         let addressed_values = resolution_body.as_deref().map(|body| {
             let mut values = crate::state::declared_template(body)
                 .map(|declared| declared.parameter_defaults())
@@ -571,6 +561,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             values.extend(supplied.clone());
             values
         });
+        // The topics this change set would put in force, read the same way the record below
+        // reads them: the ones the request STATES, and the stack's own where it states none.
+        // One rule for both stages, so a name built from `AWS::NotificationARNs` resolves
+        // here to what the execution would deploy with.
+        let topics_in_force: &[String] = match input.notification_ar_ns.as_deref() {
+            Some(stated) => stated,
+            None => &stack_notification_arns,
+        };
+        // The template this change set would DEPLOY, at its processed stage and as the plan
+        // reads it: the submitted body where the request submits one, and the stack's own
+        // revision where it reuses it (`UsePreviousTemplate`) — "whether to reuse the template
+        // that's associated with the stack to create the change set". The two are the same
+        // document to everything below, so what a reused revision DECLARES is read exactly as
+        // a submitted one is.
+        let declared_in_force = match declared_submitted.clone() {
+            Some(declared) => Some(declared),
+            None => stack_template
+                .as_deref()
+                .and_then(|body| stack_processed.body(body))
+                .and_then(crate::state::declared_template),
+        };
+        // "If you create a change set for a stack that contains nested stacks, set
+        // IncludeNestedStacks to True to create the change set for the entire stack
+        // hierarchy": each child stack of that hierarchy is planned too, so the template the
+        // declaration in force addresses for each of them is read HERE, before the lock,
+        // exactly as this request's own template was ([`crate::state::nested_change_set`]).
+        // The declarations are read from the revision this change set would deploy and
+        // EVALUATED under the parameter values it would deploy with, so a hierarchy whose
+        // child templates are chosen by parameter is expanded from those values.
+        let nested_children = if input.include_nested_stacks == Some(true) {
+            crate::state::nested_change_set::fetched_children(
+                &*self.engine,
+                ctx,
+                crate::state::nested_change_set::PlanningScope {
+                    region: &region,
+                    stack_name: &input.stack_name,
+                    // The stack's ID exists only once the stack does, so a declaration built
+                    // from it resolves to nothing here.
+                    stack_id: "",
+                    notification_arns: topics_in_force,
+                },
+                declared_in_force.as_ref(),
+                addressed_values.as_ref().unwrap_or(&supplied),
+            )
+            .await
+        } else {
+            crate::state::nested_change_set::Children::new()
+        };
         let resolved_parameters = match (resolution_body.as_deref(), &addressed_values) {
             (Some(body), Some(values)) => {
                 crate::state::ssm_parameters::resolve_in_force(ctx, &region, body, values)
@@ -610,14 +648,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stack's ID exists only once the stack does, so a name built from it resolves to
         // nothing here and that resource is simply not asked about — a name no service holds
         // is never reported as taken.
-        // The topics this change set would put in force, read the same way the record below
-        // reads them: the ones the request STATES, and the stack's own where it states none.
-        // One rule for both stages, so a name built from `AWS::NotificationARNs` resolves
-        // here to what the execution would deploy with.
-        let topics_in_force: &[String] = match input.notification_ar_ns.as_deref() {
-            Some(stated) => stated,
-            None => &stack_notification_arns,
-        };
         let named_resources = match (&declared_submitted, &values_in_force) {
             (Some(declared), Some(values)) => early_validation::named_resources(
                 declared,
