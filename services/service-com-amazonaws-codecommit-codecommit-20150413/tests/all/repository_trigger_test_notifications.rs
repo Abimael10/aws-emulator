@@ -36,7 +36,8 @@
 //! names (none, an empty list, one branch, several, one the repository does not hold),
 //! whether the repository holds real data at all, whether the trigger carries custom
 //! data, how many triggers one request submits, and — for a reference write — the class
-//! of write and the operation that makes it, rather than one recorded request.
+//! of write and the operation that makes it — every operation that writes one, the four
+//! merges included — rather than one recorded request.
 //!
 //! Everything is driven over the real wire path: this service, Amazon SNS, Amazon SQS
 //! and Lambda are mounted on ONE shared engine, the topic, its queue subscription and
@@ -56,7 +57,9 @@ use service_com_amazonaws_codecommit_codecommit_20150413::state::trigger_notific
 
 use crate::harness::error_with_message;
 use crate::repository_lifecycle::{base64, is_object_id, is_uuid, ok, string_at, REGION};
-use crate::wire::{caller_arn, hold_long_term_key, DEFAULT_ACCESS_KEY_ID};
+use crate::wire::{
+    caller_arn, fresh_client_request_token, hold_long_term_key, DEFAULT_ACCESS_KEY_ID,
+};
 
 /// The caller the CONSUMER side — Amazon SNS, Amazon SQS and Lambda — is driven as: the
 /// account's own credential, which is the principal an emulator publishes for its
@@ -293,7 +296,12 @@ fn function_arn(name: &str) -> String {
 }
 
 /// Receive everything waiting on the queue at `url`, parsing each delivery's SNS
-/// envelope into the record this service sent.
+/// envelope into the record this service sent, and DELETING what was received.
+///
+/// A consumer that does not delete a message it received sees it again once the queue's
+/// visibility timeout passes, which would report a record that arrived once as two. What
+/// this look received is deleted, so what a later look reports is exactly what arrived
+/// SINCE however long the caller took between looks.
 async fn drain_into(router: &MultiServiceRouter, url: &str, records: &mut Vec<Value>) {
     let received = sqs(
         router,
@@ -311,15 +319,23 @@ async fn drain_into(router: &MultiServiceRouter, url: &str, records: &mut Vec<Va
             panic!("a published notification is not a JSON document ({error}): {published}")
         });
         records.push(record);
+        sqs(
+            router,
+            "DeleteMessage",
+            &json!({
+                "QueueUrl": url,
+                "ReceiptHandle": message["ReceiptHandle"].as_str().unwrap_or_default(),
+            }),
+        )
+        .await;
     }
 }
 
 /// Poll the queue at `url` until `records` holds `expected` records in all.
 ///
-/// The accumulator is the caller's, because a received message stays invisible for the
-/// queue's visibility timeout: a second look reports what has arrived SINCE, so a case
-/// that waits twice folds both looks into one accumulator rather than waiting out that
-/// timeout.
+/// The accumulator is the caller's, because each look reports what arrived SINCE the one
+/// before it ([`drain_into`] deletes what it received): a case that waits twice folds both
+/// looks into one accumulator.
 async fn await_records(
     router: &MultiServiceRouter,
     url: &str,
@@ -1528,5 +1544,304 @@ async fn a_tested_trigger_is_labelled_a_probe_and_a_real_write_is_not() {
         Some("everything"),
         "case {case:?}: the record must name the trigger that ran, got {:?}",
         changed[0]
+    );
+}
+
+/// The repository the merge rows are made in.
+const MERGE_REPOSITORY: &str = "merge-reference-change-triggers";
+
+/// One commit on `branch` adding `path`, through `CreateCommit`; answers its id.
+///
+/// Each side of each merge writes a path of its OWN, so the two sides of a merge have
+/// something to merge and nothing to conflict on.
+async fn commit_adding(
+    router: &MultiServiceRouter,
+    branch: &str,
+    parent: &str,
+    path: &str,
+) -> String {
+    string_at(
+        &ok(
+            router,
+            "CreateCommit",
+            &json!({
+                "repositoryName": MERGE_REPOSITORY,
+                "branchName": branch,
+                "parentCommitId": parent,
+                "commitMessage": format!("{path} on {branch}"),
+                "putFiles": [{ "filePath": path, "fileContent": base64(path.as_bytes()) }],
+            }),
+        )
+        .await,
+        "/commitId",
+    )
+}
+
+/// The commit `branch` points at, read back through `GetBranch`.
+async fn merge_branch_tip(router: &MultiServiceRouter, branch: &str) -> String {
+    string_at(
+        &ok(
+            router,
+            "GetBranch",
+            &json!({ "repositoryName": MERGE_REPOSITORY, "branchName": branch }),
+        )
+        .await,
+        "/branch/commitId",
+    )
+}
+
+/// A branch merge's request: the two sides it names and the branch it is applied to.
+fn branch_merge(side: &str) -> Value {
+    json!({
+        "repositoryName": MERGE_REPOSITORY,
+        "sourceCommitSpecifier": format!("{side}-source"),
+        "destinationCommitSpecifier": format!("{side}-target"),
+        "targetBranch": format!("{side}-target"),
+    })
+}
+
+/// One row of [`a_merge_that_moves_a_reference_runs_the_triggers_in_scope`]: the merge, the
+/// reference it leaves at the merged commit, and the triggers that owe a record for it.
+struct MergeRow {
+    case: &'static str,
+    operation: &'static str,
+    body: Value,
+    /// The branch the merge writes.
+    branch: &'static str,
+    /// The commit that branch must hold once the merge is made, for an operation whose
+    /// answer reports no `commitId` of its own; `None` reads it off the answer.
+    commit: Option<String>,
+    /// The `name` of every trigger that must send one record for this merge, sorted the
+    /// way [`triggers_that_ran`] answers them.
+    expected: Vec<&'static str>,
+}
+
+/// The merge write paths run the triggers in scope for the reference they move, exactly as
+/// `PutFile` and the other reference writes do.
+///
+/// The rows span the four operations that merge into a reference, the two shapes such a
+/// merge takes (advancing the reference to a commit that already existed, and writing a
+/// merge commit of its own), a request that moves no reference at all, and — across the
+/// stored configuration's four triggers — the branch scopes and event classes the rule
+/// reads.
+#[tokio::test]
+async fn a_merge_that_moves_a_reference_runs_the_triggers_in_scope() {
+    let router = emulator();
+    ok(
+        &router,
+        "CreateRepository",
+        &json!({ "repositoryName": MERGE_REPOSITORY }),
+    )
+    .await;
+    let repository_arn = format!(
+        "arn:aws:codecommit:{REGION}:{}:{MERGE_REPOSITORY}",
+        engine::emulator_account_id()
+    );
+    let (destination, queue) = given_topic(&router, "merge-reference-changes").await;
+
+    // The base every side branches off, and one commit on each source so the two sides of
+    // each merge differ. All of it is written BEFORE any trigger is stored, so the records
+    // the rows read are the merges' own.
+    let base = put_file(&router, MERGE_REPOSITORY, "main", None, b"# base\n").await;
+    let mut pr_source_tip: Option<String> = None;
+    for side in ["ff", "squash", "three-way", "pr"] {
+        let target = format!("{side}-target");
+        let source = format!("{side}-source");
+        create_branch(&router, MERGE_REPOSITORY, &target, &base).await;
+        create_branch(&router, MERGE_REPOSITORY, &source, &base).await;
+        let tip = commit_adding(&router, &source, &base, &format!("{side}-source.txt")).await;
+        if side == "pr" {
+            // The pull-request merge answers the pull request rather than a commit id, so
+            // the commit its row expects on the destination is the source tip it is
+            // fast-forwarded to.
+            pr_source_tip = Some(tip);
+        }
+        // The two strategies that write a merge commit are given a destination that moved
+        // too, so they have two sides to merge rather than a reference to advance.
+        if side == "squash" || side == "three-way" {
+            commit_adding(&router, &target, &base, &format!("{side}-target.txt")).await;
+        }
+    }
+    let pr_source_tip = pr_source_tip.expect("the pull request's source branch holds a tip");
+    let pull_request_id = string_at(
+        &ok(
+            &router,
+            "CreatePullRequest",
+            &json!({
+                "title": "the pull request a merge closes",
+                "targets": [{
+                    "repositoryName": MERGE_REPOSITORY,
+                    "sourceReference": "pr-source",
+                    "destinationReference": "pr-target",
+                }],
+                "clientRequestToken": fresh_client_request_token(),
+            }),
+        )
+        .await,
+        "/pullRequest/pullRequestId",
+    );
+
+    // Four triggers of ONE configuration on the same topic, differing in the scope the
+    // rule reads: the branches they name and the events they name.
+    let configuration_id = put_triggers(
+        &router,
+        MERGE_REPOSITORY,
+        &json!([
+            // No `branches` member at all: the trigger applies to every branch.
+            {"name": "every-branch", "destinationArn": destination, "events": ["all"]},
+            {
+                "name": "fast-forward-target",
+                "destinationArn": destination,
+                "branches": ["ff-target"],
+                "events": ["updateReference"],
+            },
+            // In scope for a branch a row merges into, but for a class of write no row is:
+            // every merge below moves a reference the repository already holds.
+            {
+                "name": "pull-request-target-creates",
+                "destinationArn": destination,
+                "branches": ["pr-target"],
+                "events": ["createReference"],
+            },
+            // In scope for every event, on a branch no row merges into.
+            {
+                "name": "another-branch",
+                "destinationArn": destination,
+                "branches": ["squash-source"],
+                "events": ["all"],
+            },
+        ]),
+    )
+    .await;
+
+    let mut records: Vec<Value> = Vec::new();
+    drain_into(&router, &queue, &mut records).await;
+    assert!(
+        records.is_empty(),
+        "setup: every write so far was made before a configuration was stored, so nothing \
+         was owed, got {records:?}"
+    );
+
+    let rows: Vec<MergeRow> = vec![
+        MergeRow {
+            case: "a fast-forward advances the destination reference to the source tip",
+            operation: "MergeBranchesByFastForward",
+            body: branch_merge("ff"),
+            branch: "ff-target",
+            commit: None,
+            expected: vec!["every-branch", "fast-forward-target"],
+        },
+        MergeRow {
+            case: "the same fast-forward again moves no reference, so it owes nothing",
+            operation: "MergeBranchesByFastForward",
+            body: branch_merge("ff"),
+            branch: "ff-target",
+            commit: None,
+            expected: Vec::new(),
+        },
+        MergeRow {
+            case: "a squash merge writes its merge commit onto the destination reference",
+            operation: "MergeBranchesBySquash",
+            body: branch_merge("squash"),
+            branch: "squash-target",
+            commit: None,
+            expected: vec!["every-branch"],
+        },
+        MergeRow {
+            case: "a three-way merge writes its merge commit onto the destination reference",
+            operation: "MergeBranchesByThreeWay",
+            body: branch_merge("three-way"),
+            branch: "three-way-target",
+            commit: None,
+            expected: vec!["every-branch"],
+        },
+        MergeRow {
+            case: "a pull request merged by fast-forward moves the destination reference",
+            operation: "MergePullRequestByFastForward",
+            body: json!({
+                "repositoryName": MERGE_REPOSITORY,
+                "pullRequestId": pull_request_id,
+            }),
+            branch: "pr-target",
+            commit: Some(pr_source_tip),
+            expected: vec!["every-branch"],
+        },
+    ];
+
+    for row in rows {
+        let MergeRow {
+            case,
+            operation,
+            body,
+            branch,
+            commit,
+            expected,
+        } = row;
+        let answered = ok(&router, operation, &body).await;
+        let commit = commit.unwrap_or_else(|| string_at(&answered, "/commitId"));
+        // The record and a later read of the same repository report ONE fact: the
+        // reference a record names is the reference the merge left at that commit.
+        let tip = merge_branch_tip(&router, branch).await;
+        assert_eq!(
+            tip, commit,
+            "case {case:?}: the merge must leave {branch} at {commit}, got {tip:?}"
+        );
+
+        // Every row reads into ONE accumulator and asserts over what arrived since the
+        // row before it.
+        let already = records.len();
+        await_records(&router, &queue, &mut records, already + expected.len()).await;
+        let arrived = records[already..].to_vec();
+        let ran = triggers_that_ran(&arrived);
+        let wanted: Vec<String> = expected.iter().map(|name| (*name).to_string()).collect();
+        assert_eq!(
+            ran, wanted,
+            "case {case:?}: expected the triggers {wanted:?} to run, got {ran:?} from {arrived:?}"
+        );
+        // A further look finds nothing more: a trigger out of scope for the branch or for
+        // the class of write, and a request that moved nothing, sent no record.
+        let total = records.len();
+        drain_into(&router, &queue, &mut records).await;
+        assert_eq!(
+            records.len(),
+            total,
+            "case {case:?}: only the triggers in scope run, got the further records {:?}",
+            &records[total..]
+        );
+        let reference = format!("refs/heads/{branch}");
+        for record in &arrived {
+            assert_reference_record(
+                case,
+                record,
+                &repository_arn,
+                &configuration_id,
+                &reference,
+                &commit,
+            );
+        }
+    }
+
+    // A FENCE, not a wait: one more write — on a branch only the trigger that covers every
+    // branch is in scope for — that must deliver exactly one record. A record no row above
+    // owed would have to arrive before or with it, so the count and the set here catch a
+    // delivery that came late without this test waiting out any clock.
+    let case = "a write after the merges, fencing the records they owed";
+    let fenced = put_file(&router, MERGE_REPOSITORY, "main", Some(&base), b"# fence\n").await;
+    let already = records.len();
+    await_records(&router, &queue, &mut records, already + 1).await;
+    let arrived = records[already..].to_vec();
+    assert_eq!(
+        triggers_that_ran(&arrived),
+        vec!["every-branch".to_string()],
+        "case {case:?}: the one trigger in scope must be the only one that ran, got \
+         {arrived:?}"
+    );
+    assert_reference_record(
+        case,
+        &arrived[0],
+        &repository_arn,
+        &configuration_id,
+        "refs/heads/main",
+        &fenced,
     );
 }
