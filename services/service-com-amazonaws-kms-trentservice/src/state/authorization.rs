@@ -553,9 +553,10 @@ pub fn authorize_account_action(
 /// ([`no_resource_policy_message`]), leaving the key as it was.
 ///
 /// Which calls those are is what the key record holds: a call that writes the key's key
-/// state, its key material, its key policy, its description, its tags or its multi-Region
-/// layout administers it, while reading its metadata and using it in a cryptographic
-/// operation do not and are decided by [`authorize_use`] like any other use.
+/// state, its key material, its rotation schedule, its key policy, its description, its
+/// tags or its multi-Region layout administers it, while reading its metadata and using
+/// it in a cryptographic operation do not and are decided by [`authorize_use`] like any
+/// other use.
 ///
 /// A key the CUSTOMER manages is administered by the account that created it, so this
 /// refuses nothing on one. One function for every operation that administers a key, so no

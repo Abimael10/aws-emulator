@@ -362,8 +362,8 @@ async fn a_predefined_alias_is_regional_and_scoped_to_this_account() {
 }
 
 /// An Amazon Web Services managed key is managed by Amazon Web Services: KMS rotates
-/// its key material every year from the moment it exists, a caller cannot enable or
-/// disable that rotation, and a key the caller creates is untouched by all of it.
+/// its key material every year from the moment it exists, a caller holds no permission
+/// to configure that rotation, and a key the caller creates is untouched by all of it.
 #[tokio::test]
 async fn an_aws_managed_key_rotates_yearly_and_its_rotation_is_not_configurable() {
     let router = router();
@@ -393,10 +393,13 @@ async fn an_aws_managed_key_rotates_yearly_and_its_rotation_is_not_configurable(
         "case managed: expected the key ARN {arn}, got {report}"
     );
 
-    // Rows: the two operations that configure automatic rotation, neither of which a
-    // caller may use on a key Amazon Web Services manages. Each names the key by its key
-    // ARN, the form their own `KeyId` takes ("Specify the key ID or key ARN of the KMS
-    // key"), so what the refusal is about is the key and not the identifier's kind.
+    // Rows: the two operations that configure automatic rotation. Each CHANGES the key, so
+    // on a key Amazon Web Services manages it is refused by that key's own policy for want
+    // of permission — the suite beside this one
+    // ([`super::aws_managed_key_administration`]) spans that refusal's wording over every
+    // administration call. Each names the key by its key ARN, the form their own `KeyId`
+    // takes ("Specify the key ID or key ARN of the KMS key"), so what the refusal is about
+    // is the key and not the identifier's kind.
     for operation in ["EnableKeyRotation", "DisableKeyRotation"] {
         let (status, code) = failure(&router, operation, &json!({"KeyId": arn.clone()})).await;
         assert_eq!(
@@ -404,8 +407,8 @@ async fn an_aws_managed_key_rotates_yearly_and_its_rotation_is_not_configurable(
             "case {operation}: expected HTTP 400, got {status} ({code})"
         );
         assert_eq!(
-            code, "UnsupportedOperationException",
-            "case {operation}: expected UnsupportedOperationException, got {code}"
+            code, "AccessDeniedException",
+            "case {operation}: expected AccessDeniedException, got {code}"
         );
     }
 

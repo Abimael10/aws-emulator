@@ -2764,9 +2764,10 @@ impl Cmk {
     /// caller: KMS "always rotates the key material of Amazon Web Services managed
     /// keys every year" (`smithy_query(query="doc",shape="EnableKeyRotation")`), so
     /// the key carries that rotation schedule from the instant it exists — and the
-    /// same sentence is why [`check_rotation_configurable`] refuses to let a caller
-    /// enable or disable it. No description is invented: the per-service wording KMS
-    /// gives these keys is not in the model.
+    /// key is one no caller of this account administers, so a call that would change
+    /// that schedule holds no permission for it
+    /// ([`authorization::authorize_key_administration`]). No description is invented:
+    /// the per-service wording KMS gives these keys is not in the model.
     pub fn aws_managed(key_id: String, region: String, material: KeyMaterial) -> Self {
         let mut key = Self::new(
             key_id,
@@ -3391,14 +3392,17 @@ pub fn multi_region_replica_message(key_arn: &str, operation: &str) -> String {
 /// clear, and which refusal reports it when it is not.
 ///
 /// The partition is the documented one: automatic rotation is configurable on a
-/// customer managed symmetric encryption KMS key whose key material KMS generated,
-/// in a compatible key state, and on the PRIMARY key of a multi-Region key set
-/// rather than on a replica — "you cannot enable automatic rotation of asymmetric
-/// KMS keys, HMAC KMS keys, KMS keys with imported key material, or KMS keys in a
-/// custom key store. To enable or disable automatic rotation of a set of related
-/// multi-Region keys, set the property on the primary key. ... You cannot enable or
-/// disable automatic rotation of Amazon Web Services managed KMS keys"
-/// (`smithy_query(query="doc",shape="EnableKeyRotation")`).
+/// symmetric encryption KMS key whose key material KMS generated, in a compatible key
+/// state, and on the PRIMARY key of a multi-Region key set rather than on a replica —
+/// "you cannot enable automatic rotation of asymmetric KMS keys, HMAC KMS keys, KMS
+/// keys with imported key material, or KMS keys in a custom key store. To enable or
+/// disable automatic rotation of a set of related multi-Region keys, set the property
+/// on the primary key" (`smithy_query(query="doc",shape="EnableKeyRotation")`).
+///
+/// This is the CAPABILITY half of the decision only: whether the caller holds
+/// permission to change the key is the separate authorization decision
+/// ([`authorization::authorize_key_administration`]), which the handler takes first, so
+/// a key withheld by its own key policy never reaches this gate.
 ///
 /// `operation` is the operation asking, which is what its refusal of a replica key of
 /// a multi-Region set names.
@@ -3408,15 +3412,6 @@ pub fn check_rotation_configurable(
     key: &Cmk,
     operation: &str,
 ) -> Result<(), RotationConfigRefusal> {
-    // "You cannot enable or disable automatic rotation of Amazon Web Services
-    // managed KMS keys. KMS always rotates the key material of Amazon Web Services
-    // managed keys every year."
-    if key.key_manager != KEY_MANAGER_CUSTOMER {
-        return Err(RotationConfigRefusal::Unsupported(
-            unsupported_rotation_message(),
-        ));
-    }
-
     // Which keys cannot rotate automatically follows from the key's own kind and the
     // origin of its material, never from one spec's name: an asymmetric key and an
     // HMAC key are not symmetric encryption keys, and a key whose material did not

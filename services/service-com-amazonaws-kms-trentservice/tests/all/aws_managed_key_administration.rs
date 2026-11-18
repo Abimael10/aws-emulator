@@ -26,12 +26,14 @@
 //! of that key itself (its single-Region layout, or the KMS-generated material an import
 //! cannot replace).
 //!
-//! The two rotation-configuration operations are deliberately NOT in this table: KMS "always
-//! rotates the key material of Amazon Web Services managed keys every year" and "you cannot
-//! enable or disable automatic rotation of Amazon Web Services managed KMS keys"
-//! (`smithy_query(query="doc",shape="EnableKeyRotation")`), which is a documented
-//! `UnsupportedOperationException` rather than an authorization failure — the suite beside
-//! this one ([`super::aws_managed_keys`]) spans it.
+//! The calls that configure a key's ROTATION sit in that table beside the rest: setting a
+//! key's automatic rotation schedule, clearing it, and rotating its key material on demand
+//! each WRITE the key, so each administers it and is decided by the key's own policy like
+//! every other one. KMS "always rotates the key material of Amazon Web Services managed keys
+//! every year" (`smithy_query(query="doc",shape="EnableKeyRotation")`) — that schedule is the
+//! owning service's to keep — and what the account may still do with it is READ it, which is
+//! the rotation report the refusals leave untouched
+//! ([`an_aws_managed_keys_rotation_is_not_the_accounts_to_configure`]).
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kms_trentservice::state;
@@ -106,7 +108,7 @@ fn request(operation: &str, key_id: &str) -> Value {
 /// control is not served are refused for a reason of their own on a plain single-Region key
 /// whose material KMS generated: there is no deletion to cancel, no set to replicate or
 /// re-designate, and no imported material to install or delete.
-const ADMINISTRATION: [(&str, bool); 12] = [
+const ADMINISTRATION: [(&str, bool); 15] = [
     ("DisableKey", true),
     ("EnableKey", true),
     ("ScheduleKeyDeletion", true),
@@ -119,6 +121,9 @@ const ADMINISTRATION: [(&str, bool); 12] = [
     ("UpdatePrimaryRegion", false),
     ("ImportKeyMaterial", false),
     ("DeleteImportedKeyMaterial", false),
+    ("EnableKeyRotation", true),
+    ("DisableKeyRotation", true),
+    ("RotateKeyOnDemand", true),
 ];
 
 /// The managed key behind `alias`, as `(key id, key ARN)` — materialised and asserted to be
@@ -245,6 +250,166 @@ async fn a_customer_managed_key_is_never_refused_administration_for_want_of_perm
             ACCESS_DENIED,
             "case {operation}: a customer managed key is never refused administration for want \
              of permission, got {payload}"
+        );
+    }
+}
+
+/// The three calls that change a key's rotation, over an Amazon Web Services managed key.
+///
+/// The rows differ along the OPERATION (set a schedule, clear it, rotate the material now),
+/// along the REQUEST SHAPE (the optional `RotationPeriodInDays` absent, at the low end of its
+/// modelled `range 90..2560` and at the high end —
+/// `smithy_query(query="operation",operation="EnableKeyRotation")`), and along the
+/// IDENTIFIER FORM the request names the key by, since what the refusal is about is the key
+/// rather than how it was spelled: "specify the key ID or key ARN of the KMS key"
+/// (`smithy_query(query="doc",shape="EnableKeyRotationRequest",member="KeyId")`).
+fn rotation_rows(key_id: &str, key_arn: &str) -> Vec<(String, &'static str, Value)> {
+    let mut rows = Vec::new();
+    for (form, identifier) in [("key id", key_id), ("key ARN", key_arn)] {
+        rows.push((
+            format!("EnableKeyRotation by {form}"),
+            "EnableKeyRotation",
+            json!({"KeyId": identifier}),
+        ));
+        rows.push((
+            format!("EnableKeyRotation by {form} at the shortest modelled period"),
+            "EnableKeyRotation",
+            json!({"KeyId": identifier, "RotationPeriodInDays": 90}),
+        ));
+        rows.push((
+            format!("EnableKeyRotation by {form} at the longest modelled period"),
+            "EnableKeyRotation",
+            json!({"KeyId": identifier, "RotationPeriodInDays": 2560}),
+        ));
+        rows.push((
+            format!("DisableKeyRotation by {form}"),
+            "DisableKeyRotation",
+            json!({"KeyId": identifier}),
+        ));
+        rows.push((
+            format!("RotateKeyOnDemand by {form}"),
+            "RotateKeyOnDemand",
+            json!({"KeyId": identifier}),
+        ));
+    }
+    rows
+}
+
+/// The rotation report `GetKeyRotationStatus` answers for `identifier`.
+async fn rotation_status(router: &MultiServiceRouter, identifier: &str) -> Value {
+    ok(router, "GetKeyRotationStatus", &json!({"KeyId": identifier})).await
+}
+
+/// An Amazon Web Services managed key's rotation is the owning service's to change, not the
+/// account's: every call that would configure or perform it is refused for want of
+/// permission, and the rotation the account may READ is left exactly as it was.
+#[tokio::test]
+async fn an_aws_managed_keys_rotation_is_not_the_accounts_to_configure() {
+    let router = router();
+
+    for alias in MANAGED_ALIASES {
+        let (key_id, key_arn) = managed_key(&router, alias).await;
+        let before = rotation_status(&router, &key_arn).await;
+        let described = describe(&router, &key_arn).await;
+
+        for (case, operation, body) in rotation_rows(&key_id, &key_arn) {
+            let case = format!("{alias}/{case}");
+            let (status, code, message) = refused(&router, REGION, operation, &body).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} ({code}: {message})"
+            );
+            assert_eq!(
+                code, ACCESS_DENIED,
+                "case {case:?}: expected {ACCESS_DENIED}, got {code} ({message})"
+            );
+            // The denial sentence's variable parts are the caller the request spoke for and
+            // the key's own ARN — the resource the policy withholds — whichever identifier
+            // form the request named it by.
+            let expected = format!(
+                "User: {} is not authorized to perform: kms:{operation} on resource: {key_arn} \
+                 because no resource-based policy allows the kms:{operation} action",
+                caller()
+            );
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected AWS's denial sentence, got {message:?}"
+            );
+
+            let after = rotation_status(&router, &key_arn).await;
+            assert_eq!(
+                after, before,
+                "case {case:?}: a refused rotation call must leave the rotation status as it \
+                 was ({before}), got {after}"
+            );
+        }
+
+        let after_described = describe(&router, &key_arn).await;
+        assert_eq!(
+            after_described, described,
+            "case {alias}: the refused rotation calls must change nothing about the key, got \
+             {after_described}"
+        );
+    }
+}
+
+/// The control for every row above: the identical calls on a key the CUSTOMER manages are
+/// served, and each takes effect — which is what makes the refusals above a statement about
+/// the key's manager rather than about the operations.
+#[tokio::test]
+async fn a_customer_managed_keys_rotation_is_the_accounts_to_configure() {
+    let router = router();
+
+    // Rows: the rotation period the schedule is set with — absent (the documented default of
+    // one year), and each end of the modelled `range 90..2560`.
+    for period in [None, Some(90), Some(2560)] {
+        let case = format!("rotation period {period:?}");
+        let metadata = create_key(&router, &json!({"Description": case.clone()})).await;
+        let key_arn = text(&case, &metadata, "Arn");
+
+        let mut request = json!({"KeyId": key_arn.clone()});
+        if let Some(days) = period {
+            request["RotationPeriodInDays"] = json!(days);
+        }
+        ok(&router, "EnableKeyRotation", &request).await;
+        let enabled = rotation_status(&router, &key_arn).await;
+        assert_eq!(
+            enabled["KeyRotationEnabled"],
+            json!(true),
+            "case {case:?}: EnableKeyRotation on a customer managed key must enable rotation, \
+             got {enabled}"
+        );
+        // "If no value is specified, the default value is 365 days"
+        // (`smithy_query(query="doc",shape="EnableKeyRotationRequest",member="RotationPeriodInDays")`).
+        assert_eq!(
+            enabled["RotationPeriodInDays"],
+            json!(period.unwrap_or(365)),
+            "case {case:?}: expected the configured rotation period, got {enabled}"
+        );
+
+        let rotated = ok(
+            &router,
+            "RotateKeyOnDemand",
+            &json!({"KeyId": key_arn.clone()}),
+        )
+        .await;
+        assert_eq!(
+            rotated["KeyId"],
+            json!(key_arn),
+            "case {case:?}: RotateKeyOnDemand must answer the key ARN, got {rotated}"
+        );
+
+        ok(
+            &router,
+            "DisableKeyRotation",
+            &json!({"KeyId": key_arn.clone()}),
+        )
+        .await;
+        let disabled = rotation_status(&router, &key_arn).await;
+        assert_eq!(
+            disabled["KeyRotationEnabled"],
+            json!(false),
+            "case {case:?}: DisableKeyRotation must clear the schedule, got {disabled}"
         );
     }
 }

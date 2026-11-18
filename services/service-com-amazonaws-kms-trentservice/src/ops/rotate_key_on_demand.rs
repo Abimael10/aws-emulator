@@ -214,6 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Who the request speaks for, read BEFORE this service's store is locked: the
+        // stores that answer for a caller belong to other services.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
 
@@ -252,13 +256,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // "You can perform on-demand rotation of the key material in customer managed
-        // KMS keys" and "You cannot initiate on-demand rotation of Amazon Web Services
-        // managed KMS keys": a key KMS manages is a resource this operation is not
-        // valid for, which is what `UnsupportedOperationException` reports.
-        if key.key_manager != crate::state::KEY_MANAGER_CUSTOMER {
-            return Err(unsupported());
-        }
+        // Rotating a key's material CHANGES the key, so it is an administration of it: a
+        // key Amazon Web Services manages is administered by the service that owns it
+        // rather than by this account, whose calls its key policy allows none of, so the
+        // request holds no permission for it and the key material is left as it was
+        // (`crate::state::authorization::authorize_key_administration`). Judged before
+        // anything about the key's kind or key state.
+        crate::state::authorization::check_key_administration(&caller, key, Self::NAME)?;
 
         // "On-demand key rotation is supported only on symmetric encryption KMS keys.
         // You cannot perform on-demand rotation of asymmetric KMS keys, HMAC KMS keys,

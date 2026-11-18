@@ -198,6 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Who the request speaks for, read BEFORE this service's store is locked: the
+        // stores that answer for a caller belong to other services.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
 
@@ -235,6 +239,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         };
+
+        // Clearing a key's automatic rotation schedule CHANGES the key, so it is an
+        // administration of it, decided the same way `EnableKeyRotation` decides setting
+        // one (`crate::state::authorization::authorize_key_administration`): a key Amazon
+        // Web Services manages is administered by the service that owns it, so the
+        // account's call holds no permission for it and the schedule stays as it was.
+        crate::state::authorization::check_key_administration(&caller, key, Self::NAME)?;
 
         // The keys whose automatic rotation a caller may turn OFF are exactly those it
         // may turn on, so both operations read the same gate.
