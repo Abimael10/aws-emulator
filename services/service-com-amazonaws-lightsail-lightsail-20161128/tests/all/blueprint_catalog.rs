@@ -74,9 +74,15 @@ const PLATFORMS: &[&str] = &["LINUX_UNIX", "WINDOWS"];
 /// read off the crate, so the host is pinned by this suite.
 const AWS_PRODUCT_PAGE_PREFIX: &str = "https://aws.amazon.com/";
 
-/// Where a published blueprint's `licenseUrl` leads: the end-user licence
-/// agreement AWS serves for the image.
+/// Where a published blueprint's `licenseUrl` leads when AWS serves the
+/// agreement as a document of its own: the AWS licence host. An image whose terms
+/// AWS publishes on its Marketplace listing instead links that listing's usage
+/// section ([`LISTING_USAGE_TERMS_FRAGMENT`]).
 const LICENSE_AGREEMENT_PREFIX: &str = "https://d7umqicpi7263.cloudfront.net/eula/product/";
+
+/// The section of a Marketplace listing that carries an image's usage terms,
+/// which `licenseUrl` names where AWS publishes the terms on the listing.
+const LISTING_USAGE_TERMS_FRAGMENT: &str = "#pdp-usage";
 
 /// One expected catalog entry.
 ///
@@ -533,17 +539,30 @@ async fn every_reported_blueprint_derives_its_members_from_its_catalog_entry() {
             !member(blueprint, "versionCode").is_empty(),
             "case {case:?}: expected the published versionCode, got {blueprint:?}"
         );
-        for (link, prefix) in [
-            ("productUrl", AWS_PRODUCT_PAGE_PREFIX),
-            ("licenseUrl", LICENSE_AGREEMENT_PREFIX),
-        ] {
-            if let Some(url) = blueprint[link].as_str() {
-                assert!(
-                    url.starts_with(prefix) && url.len() > prefix.len(),
-                    "case {case:?}: {link} must be the service's own {prefix}… URL for the \
-                     image, got {url:?}"
-                );
-            }
+        if let Some(url) = blueprint["productUrl"].as_str() {
+            assert!(
+                url.starts_with(AWS_PRODUCT_PAGE_PREFIX)
+                    && url.len() > AWS_PRODUCT_PAGE_PREFIX.len(),
+                "case {case:?}: productUrl must be the AWS page this service serves for the \
+                 image, got {url:?}"
+            );
+        }
+        // The licence link leads to the agreement AWS publishes for the image, in
+        // whichever of the two published forms carries it: the agreement document
+        // on the AWS licence host, or the usage section of THIS image's own
+        // Marketplace listing.
+        if let Some(url) = blueprint["licenseUrl"].as_str() {
+            let on_license_host = url.starts_with(LICENSE_AGREEMENT_PREFIX)
+                && url.len() > LICENSE_AGREEMENT_PREFIX.len();
+            let own_listing_terms = blueprint["productUrl"]
+                .as_str()
+                .is_some_and(|page| url == format!("{page}{LISTING_USAGE_TERMS_FRAGMENT}"));
+            assert!(
+                on_license_host || own_listing_terms,
+                "case {case:?}: licenseUrl must be the agreement AWS publishes for this image \
+                 — a document under {LICENSE_AGREEMENT_PREFIX}… or this image's own listing \
+                 with {LISTING_USAGE_TERMS_FRAGMENT} — got {url:?}"
+            );
         }
         assert!(
             blueprint["appCategory"].is_null(),
@@ -906,7 +925,7 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         description: "A synthetic operating-system image, for the slice and paging rules.",
         version: "1.0",
         product_page: "",
-        license_agreement: "",
+        license: state::BlueprintLicense::NotPublished,
     },
     state::BlueprintSpec {
         blueprint_id: "synthetic_os_2",
@@ -918,7 +937,7 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         description: "A synthetic retired operating-system image.",
         version: "2.0",
         product_page: "",
-        license_agreement: "",
+        license: state::BlueprintLicense::NotPublished,
     },
     state::BlueprintSpec {
         blueprint_id: "synthetic_app",
@@ -931,7 +950,7 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
                       listing and licence agreement.",
         version: "4.0",
         product_page: "marketplace/pp/prodview-synthetic1",
-        license_agreement: "synthetic-product/synthetic-agreement.txt",
+        license: state::BlueprintLicense::Agreement("synthetic-product/synthetic-agreement.txt"),
     },
     state::BlueprintSpec {
         blueprint_id: "windows_synthetic_2030",
@@ -943,7 +962,7 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         description: "A synthetic Windows operating-system image.",
         version: "2030.01.01",
         product_page: "",
-        license_agreement: "",
+        license: state::BlueprintLicense::NotPublished,
     },
     state::BlueprintSpec {
         blueprint_id: "synthetic_retired_3",
@@ -955,7 +974,7 @@ const SYNTHETIC: &[state::BlueprintSpec] = &[
         description: "A synthetic retired application image.",
         version: "3.0",
         product_page: "",
-        license_agreement: "",
+        license: state::BlueprintLicense::NotPublished,
     },
 ];
 

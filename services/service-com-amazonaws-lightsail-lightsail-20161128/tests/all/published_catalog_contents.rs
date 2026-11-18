@@ -364,7 +364,7 @@ const PLANS: &[Plan] = &[
         power: 4_000,
         linux_price: 84.0,
         windows: Some(WindowsColumn {
-            price: 140.0,
+            price: 124.0,
             power: 4_000,
         }),
     },
@@ -375,7 +375,7 @@ const PLANS: &[Plan] = &[
         power: 5_000,
         linux_price: 164.0,
         windows: Some(WindowsColumn {
-            price: 260.0,
+            price: 244.0,
             power: 5_000,
         }),
     },
@@ -386,7 +386,7 @@ const PLANS: &[Plan] = &[
         power: 6_000,
         linux_price: 384.0,
         windows: Some(WindowsColumn {
-            price: 500.0,
+            price: 574.0,
             power: 6_000,
         }),
     },
@@ -396,7 +396,11 @@ const PLANS: &[Plan] = &[
         cpu_count: 32,
         power: 7_000,
         linux_price: 884.0,
-        windows: None,
+        // The plan the Windows column ends at, published on both platforms.
+        windows: Some(WindowsColumn {
+            price: 1_254.0,
+            power: 7_000,
+        }),
     },
     Plan {
         size: "12xlarge",

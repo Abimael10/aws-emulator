@@ -185,7 +185,21 @@ const EXPECTED: &[Expected] = &[
         disk_size_in_gb: 320,
         transfer_per_month_in_gb: 6_144,
         power: 4_000,
-        price: 140.0,
+        price: 124.0,
+    },
+    // The size the plan table's Windows column ends at: published on Windows
+    // too, at that column's own monthly price.
+    Expected {
+        bundle_id: "8xlarge_win_3_0",
+        instance_type: "8xlarge",
+        name: "8Xlarge",
+        platform: WINDOWS,
+        cpu_count: 32,
+        ram_size_in_gb: 128.0,
+        disk_size_in_gb: 1_280,
+        transfer_per_month_in_gb: 9_216,
+        power: 7_000,
+        price: 1_254.0,
     },
 ];
 

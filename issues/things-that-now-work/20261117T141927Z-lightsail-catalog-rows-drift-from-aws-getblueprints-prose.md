@@ -68,3 +68,13 @@ Cause 2: call ls.get_bundles().
   (b) Row set: assert the catalog is deep enough to cover the positions the recording asserts (through index 99) and that each bundleId AWS publishes is present. Observed every position from index 19 onward reported with no matching row served.
 
 Both causes must be closed before submitting. Re-replay to confirm: lightsail-catalog-get-blueprints#task#1 and lightsail-catalog-get-bundles#task#1.
+
+## Resolution
+
+Fixed in the lightsail crate's published catalog tables (`src/state/blueprints.rs`, `src/state/bundles.rs`):
+
+- Cause 1 (a): the Windows Server paragraph is AWS's in full, on all four releases the catalog publishes, not only the cited row.
+- Cause 1 (b): `productUrl` and `licenseUrl` are now the page and the agreement AWS publishes for the row, for every row a recorded answer names them for - the Windows Server releases' listings (including the older product-code path form), the one agreement that covers the Windows Server family, and the Windows SQL Server images' own listing usage section. The licence column became a typed two-form column (`BlueprintLicense`), so a row whose terms AWS publishes on its listing is expressible at all.
+- Cause 2 (a): the plan table's Windows column is priced 124 / 244 / 574 for the 16 / 32 / 64 GB plans, and the 128 GB plan is published on Windows too (1,254, SSD 1,280 GB, power 7,000). Replay: `$.bundles[0]` .. `$.bundles[19]` all match; the first divergence moved from `$.bundles[16]` to `$.bundles[20]`.
+
+STILL OPEN - the row-set halves of both causes, cause 1 (c) and cause 2 (b): the recorded answers carry catalog rows whose ids, text, links, specs and prices are named nowhere in this report, in the replay detail or in the repository - six blueprints after `plesk_ubuntu_18_0_35`, and bundle positions from 20 to the 99 the fixture asserts (the first 20 now match, so these are further plan rows, most likely retired plan generations). The emulator has no egress to read AWS's catalog, and writing those rows from guesswork would be the same locally authored catalog data this report is about, besides making `CreateInstances` accept images and plans the service does not publish. They are left for a round that has the recorded rows: file them against the tables named above when a replay reports their expected contents.

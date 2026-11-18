@@ -195,7 +195,7 @@ const PLAN_TABLE: &[PlanRow] = &[
         power: 4_000,
         linux_price: 84.0,
         windows: Some(WindowsColumn {
-            price: 140.0,
+            price: 124.0,
             disk_size_in_gb: 320,
             power: 4_000,
         }),
@@ -209,7 +209,7 @@ const PLAN_TABLE: &[PlanRow] = &[
         power: 5_000,
         linux_price: 164.0,
         windows: Some(WindowsColumn {
-            price: 260.0,
+            price: 244.0,
             disk_size_in_gb: 640,
             power: 5_000,
         }),
@@ -223,7 +223,7 @@ const PLAN_TABLE: &[PlanRow] = &[
         power: 6_000,
         linux_price: 384.0,
         windows: Some(WindowsColumn {
-            price: 500.0,
+            price: 574.0,
             disk_size_in_gb: 1_280,
             power: 6_000,
         }),
@@ -238,7 +238,13 @@ const PLAN_TABLE: &[PlanRow] = &[
         transfer_per_month_in_gb: 9_216,
         power: 7_000,
         linux_price: 884.0,
-        windows: None,
+        // The plan the Windows column ends at: it is published on both platforms,
+        // at the Windows column's own monthly price.
+        windows: Some(WindowsColumn {
+            price: 1_254.0,
+            disk_size_in_gb: 1_280,
+            power: 7_000,
+        }),
     },
     PlanRow {
         size: "12xlarge",

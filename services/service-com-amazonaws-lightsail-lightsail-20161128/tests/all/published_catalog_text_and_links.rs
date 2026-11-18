@@ -70,12 +70,38 @@ const AWS_PRODUCT_PAGE_PREFIX: &str = "https://aws.amazon.com/";
 /// Marketplace listing is published at.
 const MARKETPLACE_LISTING_PATH: &str = "marketplace/pp/prodview-";
 
-/// Where a published blueprint's `licenseUrl` leads: the end-user licence
-/// agreement AWS serves for the image, at
+/// Where a published blueprint's `licenseUrl` leads when AWS serves the
+/// agreement as a document of its own: the AWS licence host, at
 /// `<host>/eula/product/<product>/<agreement>.txt`.
 ///
 /// SOURCE: the `licenseUrl` values the recorded answer reports.
 const LICENSE_AGREEMENT_PREFIX: &str = "https://d7umqicpi7263.cloudfront.net/eula/product/";
+
+/// The section of a Marketplace listing that carries an image's usage terms,
+/// which `licenseUrl` names where AWS publishes the terms ON the listing rather
+/// than as an agreement document of its own.
+///
+/// SOURCE: the `licenseUrl` the recorded answer reports for a Windows SQL Server
+/// application image — that image's own listing with this fragment.
+const LISTING_USAGE_TERMS_FRAGMENT: &str = "#pdp-usage";
+
+/// Whether `license_url` is the agreement AWS publishes for the entry `reported`:
+/// a `<product>/<agreement>.txt` document on the AWS licence host, or the usage
+/// section of THAT entry's own Marketplace listing — never another entry's page.
+fn is_agreement_published_for(reported: &Value, license_url: &str) -> bool {
+    if let Some(agreement) = license_url.strip_prefix(LICENSE_AGREEMENT_PREFIX) {
+        // The agreement path names the product and the revision of the agreement
+        // published for it, as a text document.
+        let parts: Vec<&str> = agreement.split('/').collect();
+        return parts.len() == 2
+            && !parts[0].is_empty()
+            && parts[1].ends_with(".txt")
+            && parts[1].len() > ".txt".len();
+    }
+    reported["productUrl"]
+        .as_str()
+        .is_some_and(|page| license_url == format!("{page}{LISTING_USAGE_TERMS_FRAGMENT}"))
+}
 
 /// Every entry of a reported list, over however many pages it takes.
 async fn listing(emulator: &Emulator, operation: &str, member: &str, request: Value) -> Vec<Value> {
@@ -289,24 +315,11 @@ async fn every_published_image_links_to_the_pages_this_service_serves() {
             want.publishes_license
         );
         if let Some(license_url) = license_url {
-            let agreement = license_url
-                .strip_prefix(LICENSE_AGREEMENT_PREFIX)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "case {case}: licenseUrl must be the agreement AWS serves for the image, \
-                         got {license_url:?}"
-                    )
-                });
-            // The agreement path names the product and the revision of the
-            // agreement published for it, as a text document.
-            let parts: Vec<&str> = agreement.split('/').collect();
             assert!(
-                parts.len() == 2
-                    && !parts[0].is_empty()
-                    && parts[1].ends_with(".txt")
-                    && parts[1].len() > ".txt".len(),
-                "case {case}: expected a <product>/<agreement>.txt agreement path, got \
-                 {agreement:?}"
+                is_agreement_published_for(&reported, &license_url),
+                "case {case}: licenseUrl must be the agreement AWS publishes for the image — a \
+                 <product>/<agreement>.txt document under {LICENSE_AGREEMENT_PREFIX}… or this \
+                 image's own listing with {LISTING_USAGE_TERMS_FRAGMENT} — got {license_url:?}"
             );
         }
     }
@@ -330,10 +343,10 @@ async fn every_published_image_links_to_the_pages_this_service_serves() {
         );
         let license_url = text(blueprint, "licenseUrl");
         assert!(
-            license_url.starts_with(LICENSE_AGREEMENT_PREFIX)
-                && license_url.len() > LICENSE_AGREEMENT_PREFIX.len(),
-            "case {case}: licenseUrl must be under {LICENSE_AGREEMENT_PREFIX}, got \
-             {license_url:?}"
+            is_agreement_published_for(blueprint, &license_url),
+            "case {case}: licenseUrl must be the agreement AWS publishes for this image — a \
+             document under {LICENSE_AGREEMENT_PREFIX}… or this image's own listing with \
+             {LISTING_USAGE_TERMS_FRAGMENT} — got {license_url:?}"
         );
     }
 }
@@ -865,7 +878,23 @@ const PLAN_PRICES: &[PlanPrice] = &[
     PlanPrice {
         bundle_id: "xlarge_win_3_0",
         platform: WINDOWS,
-        price: 140.0,
+        price: 124.0,
+    },
+    PlanPrice {
+        bundle_id: "2xlarge_win_3_0",
+        platform: WINDOWS,
+        price: 244.0,
+    },
+    PlanPrice {
+        bundle_id: "4xlarge_win_3_0",
+        platform: WINDOWS,
+        price: 574.0,
+    },
+    // The plan the Windows column ends at, published on both platforms.
+    PlanPrice {
+        bundle_id: "8xlarge_win_3_0",
+        platform: WINDOWS,
+        price: 1_254.0,
     },
 ];
 
@@ -1315,5 +1344,192 @@ async fn the_catalog_text_of_an_image_is_the_paragraph_aws_publishes_for_it() {
                 "case {blueprint_id}: expected AWS's wording {phrase:?}, got {description:?}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GetBlueprints — AWS's paragraph in full, and the links published per image
+// ---------------------------------------------------------------------------
+
+/// AWS's catalog paragraph for a Windows Server operating-system image, as a
+/// template naming the `release` the image installs.
+///
+/// SOURCE: the paragraph a recorded `GetBlueprints` answer reports for the
+/// Windows Server images — one paragraph for the family, naming the release, and
+/// carried WHOLE: its second sentence opens with the clause "For business IT
+/// applications, ", so a paragraph with that clause left out is no longer the
+/// text AWS publishes.
+fn windows_paragraph(release: &str) -> String {
+    format!(
+        "Amazon Lightsail helps you build, deploy, scale, and manage Microsoft applications \
+         quickly, easily, and cost effectively with {release}. For business IT applications, \
+         Lightsail runs Windows-based solutions in a secure, easily managed, and performant \
+         cloud environment. Common Windows use cases include Enterprise Windows-based \
+         application hosting, website and web-service hosting, data processing, distributed \
+         testing, ASP.NET application hosting, and running any other application requiring \
+         Windows software."
+    )
+}
+
+#[tokio::test]
+async fn aws_s_paragraph_for_a_windows_image_is_reported_whole() {
+    let emulator = Emulator::new();
+    let catalog = blueprint_catalog(&emulator).await;
+
+    // Every release of the family, not only the one a recorded answer quotes:
+    // the paragraph is the family's, so each entry reports it entire with its own
+    // release named in it.
+    for (blueprint_id, release) in WINDOWS_RELEASES {
+        let description = text(&image_of(&catalog, blueprint_id), "description");
+        assert_eq!(
+            description,
+            windows_paragraph(release),
+            "case {blueprint_id}: expected AWS's paragraph for this image in full, got \
+             {description:?}"
+        );
+    }
+}
+
+/// The form the agreement AWS publishes for an image takes.
+enum ExpectedLicense {
+    /// A document AWS serves on its licence host, named by the
+    /// `<product>/<agreement>.txt` path it is served at.
+    Agreement(&'static str),
+    /// The usage terms published on the image's OWN Marketplace listing, which
+    /// `licenseUrl` names as that listing with the usage-terms fragment.
+    ListingUsageTerms,
+}
+
+/// One published image, the AWS page the catalog links it to and the agreement
+/// AWS publishes for it.
+///
+/// SOURCE: the `productUrl` and `licenseUrl` values a recorded `GetBlueprints`
+/// answer reports.
+///
+/// The rows span what the rule generalises over: both path forms a Marketplace
+/// listing is published at (a `prodview-<id>` product view and an older listing's
+/// product code), a product page AWS keeps for an operating system of its own,
+/// the releases of one family that share its agreement, and the images whose
+/// terms AWS publishes on the listing itself. Only one of them
+/// (`windows_server_2025`) is a row a recorded answer already agreed with.
+struct ImageLinks {
+    blueprint_id: &'static str,
+    product_url: &'static str,
+    license: ExpectedLicense,
+}
+
+/// The one agreement AWS publishes for the Windows Server operating-system
+/// images: the family's, so every release of it links this document.
+const WINDOWS_SERVER_AGREEMENT: &str =
+    "b0e459f5-2c38-4939-ad2a-d9784ecab690/0e7c7387-f24a-45b5-9206-e5ab5ff5fd9c.txt";
+
+const IMAGE_LINKS: &[ImageLinks] = &[
+    ImageLinks {
+        blueprint_id: "windows_server_2025",
+        product_url: "https://aws.amazon.com/marketplace/pp/prodview-g76csvka4r3by",
+        license: ExpectedLicense::Agreement(WINDOWS_SERVER_AGREEMENT),
+    },
+    ImageLinks {
+        blueprint_id: "windows_server_2022",
+        product_url: "https://aws.amazon.com/marketplace/pp/prodview-dq4sxno5vuy7m",
+        license: ExpectedLicense::Agreement(WINDOWS_SERVER_AGREEMENT),
+    },
+    ImageLinks {
+        blueprint_id: "windows_server_2019",
+        product_url: "https://aws.amazon.com/marketplace/pp/B07QZ4XZ8F",
+        license: ExpectedLicense::Agreement(WINDOWS_SERVER_AGREEMENT),
+    },
+    ImageLinks {
+        blueprint_id: "windows_server_2016",
+        product_url: "https://aws.amazon.com/marketplace/pp/B01M7SJEU7",
+        license: ExpectedLicense::Agreement(WINDOWS_SERVER_AGREEMENT),
+    },
+    ImageLinks {
+        blueprint_id: "windows_server_2022_sql_2022_express",
+        product_url: "https://aws.amazon.com/marketplace/pp/prodview-c2jz4lr4h2yc6",
+        license: ExpectedLicense::ListingUsageTerms,
+    },
+    ImageLinks {
+        blueprint_id: "windows_server_2022_sql_2019_express",
+        product_url: "https://aws.amazon.com/marketplace/pp/prodview-xbikutlmywslu",
+        license: ExpectedLicense::ListingUsageTerms,
+    },
+    ImageLinks {
+        blueprint_id: "amazon_linux_2023",
+        product_url: "https://aws.amazon.com/linux/amazon-linux-2023",
+        license: ExpectedLicense::Agreement(
+            "f37c8255-1ff9-48bd-b5da-b5046f4fee68/17864b80-f5b6-4f0a-aa26-7346ef135ebc.txt",
+        ),
+    },
+];
+
+#[tokio::test]
+async fn every_published_image_links_to_the_listing_and_agreement_published_for_it() {
+    let emulator = Emulator::new();
+    let catalog = blueprint_catalog(&emulator).await;
+
+    for want in IMAGE_LINKS {
+        let case = want.blueprint_id;
+        let reported = image_of(&catalog, case);
+        assert_eq!(
+            text(&reported, "productUrl"),
+            want.product_url,
+            "case {case}: expected the AWS page published for THIS image, got {reported:?}"
+        );
+        let expected = match want.license {
+            ExpectedLicense::Agreement(agreement) => {
+                format!("{LICENSE_AGREEMENT_PREFIX}{agreement}")
+            }
+            ExpectedLicense::ListingUsageTerms => {
+                format!("{}{LISTING_USAGE_TERMS_FRAGMENT}", want.product_url)
+            }
+        };
+        assert_eq!(
+            text(&reported, "licenseUrl"),
+            expected,
+            "case {case}: expected the agreement AWS publishes for THIS image, {expected:?}, \
+             got {reported:?}"
+        );
+    }
+
+    // Catalog-wide: an agreement document is the FAMILY's, so the releases of one
+    // family link one document, while two families do not share one.
+    let agreement_of = |blueprint_id: &str| -> String {
+        text(&image_of(&catalog, blueprint_id), "licenseUrl")
+    };
+    let windows_agreements: BTreeSet<String> = WINDOWS_RELEASES
+        .iter()
+        .map(|(blueprint_id, _)| agreement_of(blueprint_id))
+        .collect();
+    assert_eq!(
+        windows_agreements.len(),
+        1,
+        "case the Windows Server family: one agreement covers its releases, got \
+         {windows_agreements:?}"
+    );
+    assert!(
+        !windows_agreements.contains(&agreement_of("amazon_linux_2023")),
+        "case the whole catalog: two families do not share an agreement, got \
+         {windows_agreements:?}"
+    );
+
+    // And a licence link that points at a listing points at the entry's OWN
+    // listing, so following it from any row presents that row's terms.
+    let pages: BTreeSet<String> = catalog
+        .iter()
+        .map(|blueprint| text(blueprint, "productUrl"))
+        .collect();
+    for blueprint in &catalog {
+        let case = text(blueprint, "blueprintId");
+        let license_url = text(blueprint, "licenseUrl");
+        let Some(listing) = license_url.strip_suffix(LISTING_USAGE_TERMS_FRAGMENT) else {
+            continue;
+        };
+        assert_eq!(
+            listing,
+            text(blueprint, "productUrl"),
+            "case {case}: the terms on a listing are this image's own listing's, and \
+             {pages:?} are the catalog's pages"
+        );
     }
 }

@@ -124,17 +124,18 @@ pub struct WindowsPlan {
 /// modelled `Blueprint$minPower` documentation's own example names) and then a
 /// further 1000 per doubling step, 500 where a plan adds half a step of hardware.
 ///
-/// The sizes ABOVE the 64 GB plan are Linux/Unix only: the plan table's Windows
+/// The sizes ABOVE the 128 GB plan are Linux/Unix only: the plan table's Windows
 /// column ends at that plan, so those entries carry no Windows plan (see
 /// [`BundleSpec::windows`]); the sizes it does cover carry that column's own
 /// price, SSD size and power ([`WindowsPlan`]).
 ///
 /// The two price columns are PUBLISHED independently of each other: the Windows
 /// column's monthly prices are the figures the table lists for the Windows plans
-/// ($9.50, $14, $22, $44 and $74 for the plans up to 8 GB of RAM, and the larger
-/// plans' own figures above them), never the Linux/Unix price of the size plus a
-/// licence markup — the 4 GB Windows plan and the 8 GB Linux/Unix plan are
-/// published at the same monthly price, which no per-size markup produces.
+/// ($9.50, $14, $22, $44, $74, $124, $244, $574 and $1,254 from the smallest plan
+/// up), never the Linux/Unix price of the size plus a licence markup — the 4 GB
+/// Windows plan and the 8 GB Linux/Unix plan are published at the same monthly
+/// price, and the step from one Windows plan to the next is not the step between
+/// their Linux/Unix rows, neither of which any per-size markup produces.
 ///
 /// Lightsail has retired none of these sizes, so every entry is active.
 pub const BUNDLE_SPECS: &[BundleSpec] = &[
@@ -229,7 +230,7 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         power: 4_000,
         price_usd_per_month: 84.0,
         windows: Some(WindowsPlan {
-            price_usd_per_month: 140.0,
+            price_usd_per_month: 124.0,
             disk_size_in_gb: 320,
             power: 4_000,
         }),
@@ -245,7 +246,7 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         power: 5_000,
         price_usd_per_month: 164.0,
         windows: Some(WindowsPlan {
-            price_usd_per_month: 260.0,
+            price_usd_per_month: 244.0,
             disk_size_in_gb: 640,
             power: 5_000,
         }),
@@ -261,7 +262,7 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         power: 6_000,
         price_usd_per_month: 384.0,
         windows: Some(WindowsPlan {
-            price_usd_per_month: 500.0,
+            price_usd_per_month: 574.0,
             disk_size_in_gb: 1_280,
             power: 6_000,
         }),
@@ -278,7 +279,13 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         transfer_gb_per_month: 9_216,
         power: 7_000,
         price_usd_per_month: 884.0,
-        windows: None,
+        // The Windows column reaches this plan: the table publishes it at its own
+        // monthly price, with the SSD size and power this size's rows carry.
+        windows: Some(WindowsPlan {
+            price_usd_per_month: 1_254.0,
+            disk_size_in_gb: 1_280,
+            power: 7_000,
+        }),
         is_active: true,
         app_categories: &[],
     },
