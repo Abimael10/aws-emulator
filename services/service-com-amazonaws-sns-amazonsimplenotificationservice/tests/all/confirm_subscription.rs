@@ -27,8 +27,8 @@
 //! so nothing but persisted state carries information between calls.
 
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
-    CONFIRMATION_TOKEN_HEX_CHARS, INVALID_CONFIRMATION_TOKEN_REFUSAL, PENDING_CONFIRMATION_LISTED,
-    TOPIC_DOES_NOT_EXIST,
+    confirmation_token::malformed_confirmation_token_refusal, CONFIRMATION_TOKEN_HEX_CHARS,
+    INVALID_CONFIRMATION_TOKEN_REFUSAL, PENDING_CONFIRMATION_LISTED, TOPIC_DOES_NOT_EXIST,
 };
 
 use super::topics_subscriptions_publish::{attribute_map, Answer, Sns};
@@ -145,11 +145,11 @@ async fn the_token_minted_for_a_subscription_confirms_it_and_the_call_is_idempot
 
         let token = token_of(&sns, &case, &arn);
         assert_eq!(
-            token.len(),
+            token.chars().count(),
             CONFIRMATION_TOKEN_HEX_CHARS,
             "case {case:?}: expected a {CONFIRMATION_TOKEN_HEX_CHARS}-character token, \
              got {} characters",
-            token.len()
+            token.chars().count()
         );
         assert!(
             token.chars().all(|c| c.is_ascii_hexdigit()),
@@ -315,12 +315,14 @@ async fn each_token_confirms_only_the_subscription_it_was_minted_for() {
 }
 
 /// A token no endpoint of the named topic was sent is refused as bad input, with the
-/// service's sentence for the member, and leaves every subscription exactly as it was.
+/// sentence its own condition carries, and leaves every subscription exactly as it was.
 ///
-/// The rows are the shapes a wrong token takes: a word, whitespace, a well-formed token
-/// of the right width that was never minted, the token of a subscription of ANOTHER
-/// topic, the minted token with one character changed (the value is opaque, so only
-/// equality against it counts), and the subscription's own ARN.
+/// The rows are the shapes a wrong token takes, on both sides of the FORM boundary: values
+/// that are no confirmation token's form at all (a word, whitespace, the subscription's own
+/// ARN) carry the member's parameter sentence, while values OF that form which confirm
+/// nothing (a token-width run never minted, the token of a subscription of ANOTHER topic, the
+/// minted token with one character changed — the value is opaque, so only equality against it
+/// counts) carry the fixed invalid-token sentence.
 #[tokio::test]
 async fn a_token_no_endpoint_of_the_topic_was_sent_is_refused() {
     let sns = Sns::new();
@@ -354,16 +356,34 @@ async fn a_token_no_endpoint_of_the_topic_was_sent_is_refused() {
         characters.into_iter().collect()
     };
     let never_minted = "f".repeat(CONFIRMATION_TOKEN_HEX_CHARS);
-    let cases: Vec<(&str, &str)> = vec![
-        ("not a token at all", "bogus"),
-        ("whitespace", " "),
-        ("the right width, never minted", never_minted.as_str()),
-        ("another topic's token", other_token.as_str()),
-        ("the minted token with one character changed", altered.as_str()),
-        ("the subscription's own ARN", arn.as_str()),
+    let malformed = malformed_confirmation_token_refusal();
+    // (case, the value presented, the sentence it is refused with)
+    let cases: Vec<(&str, &str, &str)> = vec![
+        ("not a token at all", "bogus", malformed.as_str()),
+        ("whitespace", " ", malformed.as_str()),
+        (
+            "the subscription's own ARN",
+            arn.as_str(),
+            malformed.as_str(),
+        ),
+        (
+            "the right width, never minted",
+            never_minted.as_str(),
+            INVALID_CONFIRMATION_TOKEN_REFUSAL,
+        ),
+        (
+            "another topic's token",
+            other_token.as_str(),
+            INVALID_CONFIRMATION_TOKEN_REFUSAL,
+        ),
+        (
+            "the minted token with one character changed",
+            altered.as_str(),
+            INVALID_CONFIRMATION_TOKEN_REFUSAL,
+        ),
     ];
 
-    for (case, presented) in &cases {
+    for (case, presented, expected) in &cases {
         let before = held(&sns);
         let answer = confirm(&sns, &[("TopicArn", &topic), ("Token", presented)]).await;
         assert_eq!(
@@ -379,8 +399,8 @@ async fn a_token_no_endpoint_of_the_topic_was_sent_is_refused() {
         );
         assert_eq!(
             answer.element("Message").as_deref(),
-            Some(INVALID_CONFIRMATION_TOKEN_REFUSAL),
-            "case {case:?}: expected the member's refusal sentence, got {}",
+            Some(*expected),
+            "case {case:?}: expected the condition's refusal sentence, got {}",
             answer.body
         );
         assert_eq!(

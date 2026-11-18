@@ -63,6 +63,9 @@ pub mod destination_number;
 /// Which values this service ADMITS as a phone number at all, from the pattern it publishes
 /// for its one constrained phone-number shape.
 pub mod phone_number_form;
+/// What a subscription confirmation token LOOKS like, which is what tells the two refusals of
+/// `ConfirmSubscription` apart.
+pub mod confirmation_token;
 mod message_structure;
 /// The rules a topic's TAG set is held to, shared by the operations that write one.
 mod tags;
@@ -184,28 +187,32 @@ pub fn is_pending_confirmation_sentinel(value: &str) -> bool {
     value == PENDING_CONFIRMATION_REPORTED || value == PENDING_CONFIRMATION_LISTED
 }
 
-/// How many hexadecimal characters a confirmation token this service mints carries —
-/// one SHA-256 digest's worth, which is the most
-/// [`ComAmazonawsSnsAmazonsimplenotificationserviceState::next_confirmation_token`]
-/// encodes.
+/// How many hexadecimal characters a confirmation token carries — the width of the tokens
+/// SNS sends in the `SubscriptionConfirmation` message it posts to a subscribed endpoint, and
+/// so the width
+/// [`ComAmazonawsSnsAmazonsimplenotificationserviceState::next_confirmation_token`] mints.
 ///
 /// `smithy_query(query="shape", shape="token")` reports a plain string with no length
 /// or pattern, and `ConfirmSubscriptionInput$Token` documents only "Short-lived token
 /// sent to an endpoint during the Subscribe action", so the token is opaque: nothing
-/// but equality against the minted value is read off it, and this width only has to
-/// make a guess hopeless.
-pub const CONFIRMATION_TOKEN_HEX_CHARS: usize = 64;
+/// but equality against the minted value is read off it. The width is still part of the
+/// token's FORM, which is what [`confirmation_token::is_confirmation_token_form`] judges a
+/// presented value by — and it is far more than one digest's worth, so a short run of
+/// hexadecimal characters is not a token at all.
+pub const CONFIRMATION_TOKEN_HEX_CHARS: usize = 320;
 
-/// The sentence a `ConfirmSubscription` carrying a token that is not the one sent to
-/// one of the topic's awaiting endpoints is refused with.
+/// The sentence a `ConfirmSubscription` carrying a token OF A TOKEN'S FORM that is not the
+/// one sent to any of the topic's awaiting endpoints is refused with — an expired,
+/// already-superseded or foreign confirmation link.
 ///
 /// WHOLLY FIXED text: the token is opaque and secret, so the sentence reproduces NEITHER
 /// the token the caller sent nor the one that was sent to the endpoint, and it states no
 /// reason clause either — nothing about an opaque token is readable enough to report. The
 /// sentence names the token rather than the member, which is how this operation words the
-/// condition: recorded evidence has `ConfirmSubscription` with a token that is not a
-/// confirmation token of the topic answering `400 InvalidParameter` with exactly this
-/// sentence.
+/// condition: recorded evidence has `ConfirmSubscription` with a well-formed token that is
+/// not a confirmation token of the topic answering `400 InvalidParameter` with exactly this
+/// sentence. A value that is not of a token's form at all is the OTHER condition, and is
+/// refused with [`confirmation_token::malformed_confirmation_token_refusal`].
 pub const INVALID_CONFIRMATION_TOKEN_REFUSAL: &str = "Invalid token";
 
 /// The attribute names SNS defines for a subscription, from the `Subscribe` /
@@ -4367,13 +4374,18 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
     pub fn next_confirmation_token(&mut self) -> String {
         let seed = self.next_unique_id();
         // The width comes from the constant, not from the digest: a token is as many
-        // hexadecimal characters as the constant names, capped by the digest it is
-        // encoded from, so raising or lowering the constant cannot leave the token
-        // disagreeing with its own documented width.
-        let bytes: Vec<u8> = Sha256::digest(seed.as_bytes())
-            .into_iter()
-            .take(CONFIRMATION_TOKEN_HEX_CHARS / 2)
-            .collect();
+        // hexadecimal characters as the constant names, and a token wider than one digest
+        // takes as many digests as it has blocks — each the seed digested together with the
+        // block's own index — so raising or lowering the constant cannot leave the token
+        // disagreeing with its own width.
+        let width = CONFIRMATION_TOKEN_HEX_CHARS.div_ceil(2);
+        let mut bytes: Vec<u8> = Vec::with_capacity(width);
+        let mut block = 0usize;
+        while bytes.len() < width {
+            bytes.extend(Sha256::digest(format!("{seed}:{block}").as_bytes()));
+            block += 1;
+        }
+        bytes.truncate(width);
         hex::encode(bytes)
     }
 

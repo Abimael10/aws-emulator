@@ -18,8 +18,14 @@
 //! the members that name such a number say so ("the destination phone number to verify … that
 //! you can send SMS messages to", the SMS sandbox trio's `PhoneNumber`). The opt-out pair's
 //! `phoneNumber` names no destination — "the phone number for which you want to check the opt
-//! out status" — so it admits every value the published pattern admits. The narrower rule
-//! stays where a message is sent; this one decides whether a value is a phone number at all.
+//! out status" — so the operation that ACTS on its record admits every value the published
+//! pattern admits. The narrower rule stays where a message is sent; this one decides whether a
+//! value is a number the record may be written for.
+//!
+//! Wider again is [`is_written_as_phone_number`]: whether a value is a phone number AT ALL,
+//! which is all an operation that only REPORTS on this account's record asks of its member.
+//! The three judgements NEST — written ⊇ published ⊇ destination — so the operations of one
+//! number never disagree about whether it is one.
 
 use super::*;
 
@@ -64,4 +70,53 @@ pub fn is_phone_number_form(value: &str) -> bool {
 /// ([`invalid_phone_number_message`]), whichever branch of the pattern the value missed.
 pub fn phone_number_form_refusal(value: &str) -> Option<String> {
     (!is_phone_number_form(value)).then(invalid_phone_number_message)
+}
+
+/// The characters a phone number is conventionally WRITTEN with beside its digits: the
+/// grouping separators a caller's number arrives carrying when it was typed or copied
+/// rather than normalised.
+pub const PHONE_NUMBER_SEPARATORS: &str = " -.()";
+
+/// How many digits `value` carries when it is WRITTEN as a phone number — an optional
+/// leading `+`, then digits and [`PHONE_NUMBER_SEPARATORS`] and nothing else — or `None`
+/// when it carries a character no phone number is written with.
+///
+/// The WIDEST of this service's phone-number judgements: it decides whether a value is a
+/// phone number AT ALL, and leaves how many digits one needs to its callers, because that
+/// is what differs between a number a message is carried to and a number a record is
+/// merely kept under.
+pub fn written_phone_number_digits(value: &str) -> Option<usize> {
+    let body = value.strip_prefix('+').unwrap_or(value);
+    body.chars()
+        .all(|character| character.is_ascii_digit() || PHONE_NUMBER_SEPARATORS.contains(character))
+        .then(|| body.chars().filter(char::is_ascii_digit).count())
+}
+
+/// Whether `value` is written as a phone number at all: [`written_phone_number_digits`]
+/// reads at least one digit off it, and it is no longer than a phone number gets
+/// ([`MAX_PHONE_NUMBER_CHARS`]).
+///
+/// What an operation that only REPORTS on this account's record of a number is held to: it
+/// states a property of the record rather than acting on the number, so it refuses only a
+/// value that could not be a phone number anywhere — a word, a URL, an extension suffix, a
+/// value carrying no digit — and reports on every value that could be one, including the
+/// national and separator-written forms the published pattern's own branches do not take.
+///
+/// Wider than [`is_phone_number_form`], which is wider again than
+/// [`super::destination_number::destination_number_fault`]: a value either of the narrower
+/// rules admits is written as a phone number too, so the three judgements nest and no
+/// operation refuses a value that the one beside it acts on.
+pub fn is_written_as_phone_number(value: &str) -> bool {
+    value.chars().count() <= MAX_PHONE_NUMBER_CHARS
+        && written_phone_number_digits(value).is_some_and(|digits| digits > 0)
+}
+
+/// The message a phone-number member holding `value` is refused with when the value is not
+/// written as a phone number at all ([`is_written_as_phone_number`]), or `None` when it is.
+///
+/// The sentence is the one SNS states for a phone-number parameter it cannot read
+/// ([`invalid_phone_number_message`]) — the same wording whichever judgement refused the
+/// value, since all of them fault the FORM of the member.
+pub fn written_phone_number_refusal(value: &str) -> Option<String> {
+    (!is_written_as_phone_number(value)).then(invalid_phone_number_message)
 }

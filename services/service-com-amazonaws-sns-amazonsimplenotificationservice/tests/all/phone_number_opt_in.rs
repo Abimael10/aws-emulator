@@ -12,8 +12,9 @@
 //!    wherever the operation ACTS on the number: the opt-in is refused a value that is
 //!    neither (400 `InvalidParameter`) before any state is read or written, while a value
 //!    that form admits is served even where the narrower DESTINATION rule would refuse it.
-//!    The CHECK beside it holds its member to no form at all, since it only reports on this
-//!    account's record (`opt_out_check_reports_every_number`);
+//!    The CHECK beside it only REPORTS on this account's record, so it asks less: every
+//!    value that is WRITTEN as a phone number is reported on, and only a value that is no
+//!    phone number at all is refused (`opt_out_check_reports_every_number`);
 //! 2. the opt-out state a check reports is the one the number's record HOLDS, and an
 //!    opt-in is what clears it: a number with no record, and a number opted back in,
 //!    both report `false`;
@@ -34,8 +35,8 @@ use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
     invalid_phone_number_message, opt_in_too_soon_message,
-    phone_number_form::MIN_INTERNATIONAL_DIGITS, PhoneNumberRecord, MAX_E164_DIGITS,
-    MIN_E164_DIGITS, OPT_IN_INTERVAL,
+    phone_number_form::{MAX_PHONE_NUMBER_CHARS, MIN_INTERNATIONAL_DIGITS},
+    PhoneNumberRecord, MAX_E164_DIGITS, MIN_E164_DIGITS, OPT_IN_INTERVAL,
 };
 
 use super::topics_subscriptions_publish::{Answer, Sns};
@@ -69,28 +70,63 @@ pub(crate) fn e164_numbers() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Values that are no phone number in ANY form this service admits — one row per branch of
-/// the published pattern they miss: a national form written with more digits than the
-/// pattern's digits-only branch takes, forms carrying separators or text, an empty value, the
-/// `+` alone and an international form one digit below the pattern's own floor.
+/// Values that are no phone number in ANY form this service admits, although each of them is
+/// still WRITTEN as a phone number — digits, optionally introduced by a `+` and grouped with
+/// the usual separators: a national form written with more digits than the pattern's
+/// digits-only branch takes, forms carrying separators, and an international form one digit
+/// below the pattern's own floor.
+///
+/// The operation that ACTS on the record refuses every one of them; the one that only REPORTS
+/// on it answers each, which is why the two catalogs are kept apart.
 ///
 /// `pub(crate)` so the sibling suite that drives the opt-out CHECK over the same values
 /// reads them from this one catalog.
-pub(crate) fn not_phone_number_values() -> Vec<(&'static str, String)> {
+pub(crate) fn written_but_not_admitted_values() -> Vec<(&'static str, String)> {
     vec![
         ("no plus prefix", "12065550100".to_string()),
         ("national form with separators", "+1-206-555-0100".to_string()),
         ("spaces between groups", "+1 206 555 0100".to_string()),
-        ("not a number at all", "not-a-phone-number".to_string()),
         ("parenthesised national form", "(206) 555-0100".to_string()),
-        ("empty", String::new()),
-        ("the plus alone", "+".to_string()),
-        ("trailing extension text", "+12065550100x42".to_string()),
         (
             "one digit below the published minimum",
             format!("+{}", "9".repeat(MIN_INTERNATIONAL_DIGITS - 1)),
         ),
     ]
+}
+
+/// Values that are not WRITTEN as a phone number at all: text, a value carrying no digit, a
+/// number with an extension suffix, digits with a letter among them, a URL, and a run of
+/// digits longer than a phone number is ever written
+/// ([`MAX_PHONE_NUMBER_CHARS`]). Every phone-number member of this service refuses each of
+/// them, the reporting ones included.
+///
+/// `pub(crate)` for the same reason the catalog above is.
+pub(crate) fn not_written_as_phone_number_values() -> Vec<(&'static str, String)> {
+    vec![
+        ("not a number at all", "not-a-phone-number".to_string()),
+        ("a word", "not-a-phone".to_string()),
+        ("empty", String::new()),
+        ("the plus alone", "+".to_string()),
+        ("trailing extension text", "+12065550100x42".to_string()),
+        ("digits with a letter", "1206555010A".to_string()),
+        ("shaped like a URL", "https://example.test/sms".to_string()),
+        (
+            "longer than a phone number is written",
+            format!("+{}", "1".repeat(MAX_PHONE_NUMBER_CHARS)),
+        ),
+    ]
+}
+
+/// Values that are no phone number in ANY form this service admits — one row per branch of
+/// the published pattern they miss, whether or not they are written as a number at all: the
+/// two catalogs above together, which is what the operation that ACTS on the record refuses.
+///
+/// `pub(crate)` so the sibling suite that drives the opt-out CHECK over the same values
+/// reads them from this one catalog.
+pub(crate) fn not_phone_number_values() -> Vec<(&'static str, String)> {
+    let mut values = written_but_not_admitted_values();
+    values.extend(not_written_as_phone_number_values());
+    values
 }
 
 /// Values the published phone-number pattern ADMITS although the destination rule refuses

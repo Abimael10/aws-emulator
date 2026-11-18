@@ -3,18 +3,23 @@
 //! End-to-end cover for which numbers `CheckIfPhoneNumberIsOptedOut` reports on, and
 //! what it reports for them.
 //!
-//! The RULE asserted here: the opt-out check holds its phone-number member to no form at
-//! all — the model constrains it in no way and its documentation asks nothing of it — so every
-//! value is REPORTED ON rather than refused: what the operation states is a property of this
-//! account's record. A number no opt-out was recorded for is reported as opted IN —
-//! `isOptedOut` is the modelled boolean whose default is `false`, documented "false – The
-//! phone number is opted in" — a number the record says opted out reports `true`, and the
-//! read changes nothing either way.
+//! The RULE asserted here: the opt-out check only REPORTS on this account's record of a
+//! number, so it asks of its member just that the value be a phone number AT ALL — digits,
+//! optionally introduced by a `+` and grouped with the usual separators — and reports on every
+//! such value, however it is written: what the operation states is a property of the record,
+//! not a verdict on the number's form. A number no opt-out was recorded for is reported as
+//! opted IN — `isOptedOut` is the modelled boolean whose default is `false`, documented
+//! "false – The phone number is opted in" — a number the record says opted out reports `true`,
+//! and the read changes nothing either way. A value that is NO phone number is not a record
+//! this account could hold: it is refused as the malformed member it is, HTTP 400 /
+//! `InvalidParameter` with the service's fixed badly-formatted-number sentence and none of
+//! the (sensitive) value echoed back.
 //!
 //! The rows differ along what the rule generalises over: the FORM of the value (country codes
 //! of one, two and three digits, both published E.164 digit bounds, a short code, a country
 //! code beginning with zero, one digit past the E.164 maximum, national forms with
-//! separators, a value that is no number at all and an empty one) and the
+//! separators, and — on the refusal side — text, an empty value, a `+` alone, an extension
+//! suffix, a URL and a run longer than a phone number is written) and the
 //! opt-out state the record holds. The forms come from the opt-in suite's own catalogs,
 //! so the two suites cannot drift on which value is which.
 //!
@@ -23,8 +28,11 @@
 
 use std::time::SystemTime;
 
+use service_com_amazonaws_sns_amazonsimplenotificationservice::state::invalid_phone_number_message;
+
 use super::phone_number_opt_in::{
-    admitted_but_not_e164_values, e164_numbers, not_phone_number_values, seed_opted_out_at,
+    admitted_but_not_e164_values, e164_numbers, not_written_as_phone_number_values,
+    seed_opted_out_at, written_but_not_admitted_values,
 };
 use super::topics_subscriptions_publish::{Answer, Sns};
 
@@ -119,25 +127,25 @@ async fn an_opted_out_number_is_reported_opted_out() {
     );
 }
 
-/// Every value is REPORTED ON by the check, whatever form it takes: the operation states a
-/// property of this account's record, so a value no record was ever written for is reported
-/// opted IN rather than refused — and the read still writes nothing.
+/// Every value that COULD be a phone number is REPORTED ON by the check, however it is
+/// written: the operation states a property of this account's record, so a value no record was
+/// ever written for is reported opted IN rather than refused — and the read still writes
+/// nothing.
 #[tokio::test]
-async fn a_value_of_any_form_is_reported_on_by_the_check() {
+async fn a_value_written_as_a_phone_number_is_reported_on_by_the_check() {
     let sns = Sns::new();
     // One number the record says opted out, so the reports below are told apart from a
     // store the calls emptied.
     let opted_out = "+447700900123";
     seed_opted_out_at(&sns, opted_out, SystemTime::now(), None);
 
-    let mut rows: Vec<(String, String)> = not_phone_number_values()
+    // The forms the published pattern does NOT admit although they are written as a number,
+    // and the forms it admits although the destination rule refuses them: the check asks only
+    // that the value be a phone number, so each of them is reported on.
+    let mut rows: Vec<(String, String)> = written_but_not_admitted_values()
         .into_iter()
         .map(|(case, value)| (case.to_string(), value))
         .collect();
-    // A bare word of digits and letters mixed, and the forms the published pattern admits
-    // although the destination rule refuses them: the check holds its member to no form at
-    // all, so each of them is reported on.
-    rows.push(("digits with a letter".to_string(), "1206555010A".to_string()));
     rows.extend(
         admitted_but_not_e164_values()
             .into_iter()
@@ -166,6 +174,68 @@ async fn a_value_of_any_form_is_reported_on_by_the_check() {
     assert!(
         served("the seeded number", &answer),
         "expected the seeded opt-out to survive every report, got {}",
+        answer.body
+    );
+}
+
+/// The other side of the boundary: a value that is NOT written as a phone number addresses no
+/// record at all, so the check refuses it as bad input rather than reporting "opted in" for
+/// it — HTTP 400, `InvalidParameter`, the service's fixed badly-formatted-number sentence,
+/// none of the (sensitive) value echoed, no `isOptedOut` member, and nothing written.
+#[tokio::test]
+async fn a_value_that_is_no_phone_number_is_refused_by_the_check() {
+    let sns = Sns::new();
+    let opted_out = "+12065550100";
+    seed_opted_out_at(&sns, opted_out, SystemTime::now(), None);
+
+    for (case, value) in not_written_as_phone_number_values() {
+        let answer = check(&sns, &value).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected the refusal, got {} / {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.code(),
+            "InvalidParameter",
+            "case {case:?}: expected the InvalidParameter code, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.element("Message"),
+            Some(invalid_phone_number_message()),
+            "case {case:?}: expected the fixed badly-formatted-number sentence, got {}",
+            answer.body
+        );
+        assert!(
+            answer
+                .element("isOptedOut")
+                .or_else(|| answer.element("IsOptedOut"))
+                .is_none(),
+            "case {case:?}: a refused check must report no opt-out state, got {}",
+            answer.body
+        );
+        if !value.is_empty() {
+            assert!(
+                !answer.body.contains(value.as_str()),
+                "case {case:?}: the refusal must not echo the sensitive value, got {}",
+                answer.body
+            );
+        }
+    }
+
+    // The refusals touched nothing, and the record a plausible number does address is still
+    // read back over the wire.
+    assert_eq!(
+        sns.state().lock().phone_numbers.len(),
+        1,
+        "the refused checks must not write a record, got {:?}",
+        sns.state().lock().phone_numbers
+    );
+    let answer = check(&sns, opted_out).await;
+    assert!(
+        served("the seeded number", &answer),
+        "expected the seeded opt-out to survive every refusal, got {}",
         answer.body
     );
 }

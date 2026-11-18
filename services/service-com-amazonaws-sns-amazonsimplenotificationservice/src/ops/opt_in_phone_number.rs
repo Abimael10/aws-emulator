@@ -176,7 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The form of the number, before the store is consulted. This member names no
         // DESTINATION — the opt-out pair's `phoneNumber` is the number whose opt-out record
         // is addressed — so it is admitted by the phone-number pattern this service publishes
-        // rather than by the narrower destination rule, exactly as the check beside it is.
+        // rather than by the narrower destination rule. This call ACTS on the record, which
+        // is what holds it to the published form: the check beside it only REPORTS, and asks
+        // no more than that the value be written as a phone number.
         if let Some(message) =
             state::phone_number_form::phone_number_form_refusal(&input.phone_number)
         {

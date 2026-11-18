@@ -142,17 +142,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// `false` otherwise — which is every number no opt-out was ever recorded for and
     /// every number `OptInPhoneNumber` opted back in.
     ///
-    /// A REPORT, and one with nothing to refuse: it reads the record and writes nothing, so
-    /// two reads of one number answer the same thing. The member carries no constraint at all
+    /// A REPORT: it reads the record and writes nothing, so two reads of one number answer
+    /// the same thing. What it refuses is bad INPUT and nothing else — a value that is not
+    /// written as a phone number at all is no number this account could hold a record for,
+    /// so it is refused as the malformed member it is
+    /// ([`state::phone_number_form::is_written_as_phone_number`]), before the store is
+    /// consulted and with none of the (`@sensitive`) value echoed back.
+    ///
+    /// Everything that COULD be a phone number is reported on, however it is written: the
+    /// member carries no constraint at all
     /// (`smithy_query(query="operation",operation="CheckIfPhoneNumberIsOptedOut")` reports
     /// `phoneNumber` targeting the plain, unconstrained `PhoneNumber` shape) and its own
-    /// documentation asks for nothing of its form — "the phone number for which you want to
-    /// check the opt out status" — so every value is reported ON rather than refused: what
-    /// this operation states is a property of the ACCOUNT's record, and a value the account
-    /// holds no record for is settled by the output's documented default, "false – The phone
-    /// number is opted in". The operations that ACT on a number (the opt-in, the sandbox
-    /// registration, a publish) are the ones that hold their member to a form, because what
-    /// they do needs one.
+    /// documentation asks only for "the phone number for which you want to check the opt out
+    /// status", so a national or separator-written form is answered just as an E.164 one is,
+    /// and a number the account holds no record for is settled by the output's documented
+    /// default, "false – The phone number is opted in". The operations that ACT on a number
+    /// (the opt-in, which is held to the form the service publishes) and those that address a
+    /// DESTINATION (the sandbox registrations, held to E.164) ask more of the same member,
+    /// because what they do needs more.
     async fn handle(
         &self,
         input: Self::Input,
@@ -168,6 +175,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CheckIfPhoneNumberIsOptedOutErrorModeled::AuthorizationErrorException(
                     AuthorizationErrorException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The form of the member, before the store is consulted: a value that is not a phone
+        // number at all addresses no record, and the absence of a record is not what SNS
+        // states about it — it states that the request was malformed.
+        if let Some(message) =
+            state::phone_number_form::written_phone_number_refusal(&input.phone_number)
+        {
+            return Err(
+                CheckIfPhoneNumberIsOptedOutErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
                         message: Some(message),
                     },
                 )

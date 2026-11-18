@@ -212,15 +212,13 @@ fn is_email_address(endpoint: &str) -> bool {
     well_formed(local) && labels.len() >= 2 && labels.iter().all(|label| well_formed(label))
 }
 
-/// Whether `endpoint` is a phone number of an SMS-enabled device: [`MIN_PHONE_DIGITS`]
-/// to [`MAX_PHONE_DIGITS`] digits, optionally written with a leading `+` and the usual
-/// separators.
+/// Whether `endpoint` is a phone number of an SMS-enabled device: written as a phone
+/// number at all ([`state::phone_number_form::written_phone_number_digits`], which takes
+/// an optional leading `+` and the usual separators), carrying [`MIN_PHONE_DIGITS`] to
+/// [`MAX_PHONE_DIGITS`] digits.
 fn is_phone_number(endpoint: &str) -> bool {
-    let body = endpoint.strip_prefix('+').unwrap_or(endpoint);
-    let digits = body.chars().filter(char::is_ascii_digit).count();
-    body.chars()
-        .all(|c| c.is_ascii_digit() || " -.()".contains(c))
-        && (MIN_PHONE_DIGITS..=MAX_PHONE_DIGITS).contains(&digits)
+    state::phone_number_form::written_phone_number_digits(endpoint)
+        .is_some_and(|digits| (MIN_PHONE_DIGITS..=MAX_PHONE_DIGITS).contains(&digits))
 }
 
 /// Whether `endpoint` has the form the `SubscribeInput$Endpoint` doc gives for
