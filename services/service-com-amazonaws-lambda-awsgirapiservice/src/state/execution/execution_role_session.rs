@@ -47,9 +47,11 @@
 //! every other in-process call between two emulated services presents. Refusing on a role
 //! this emulator knows nothing about would deny calls AWS permits.
 //!
-//! The credential never reaches the guest: it is held by host code, put on the request's
-//! `Authorization` and session-token headers ([`super::aws_api`]), and in no response, log
-//! or environment variable of the run.
+//! The credential is held by host code: it is put on the request's `Authorization` and
+//! session-token headers ([`super::aws_api`]) and exported to the run in the three reserved
+//! credential variables a managed runtime sets for its handler
+//! ([`super::runtime_environment`]), which is where an SDK's default credential chain inside
+//! the handler reads it. It reaches no response and no log of this emulator's.
 
 use ::std::collections::BTreeMap;
 use ::std::time::{Duration, SystemTime};

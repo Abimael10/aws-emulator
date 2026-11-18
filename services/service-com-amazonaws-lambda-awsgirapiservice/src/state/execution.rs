@@ -1602,11 +1602,60 @@ pub fn run_heap_bytes(memory_size: i32) -> usize {
     usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
-/// The ENVIRONMENT one run sees: the function's own variables, plus the ones the runtime
-/// sets for a handler to read its own identity out of.
+/// The three RESERVED environment variables a managed runtime exports the invocation's own
+/// credentials in, in the order a credential's parts are named: "AWS_ACCESS_KEY_ID … the
+/// access key for your Lambda function's execution role", "AWS_SECRET_ACCESS_KEY … the secret
+/// access key" and "AWS_SESSION_TOKEN … the session token" (the Lambda Developer Guide's
+/// reserved runtime environment variables, which is also where
+/// [`crate::state::RESERVED_ENVIRONMENT_KEYS`] reads them from).
 ///
-/// This is the whole environment: no host environment variable is in it, and no credential
-/// of this emulator is either.
+/// They are what an AWS SDK's DEFAULT credential chain inside a handler signs with, so a
+/// handler that builds a client with no credentials of its own calls as the function's
+/// execution role without reading anything itself.
+const CREDENTIAL_VARIABLES: &[&str] = &[
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+];
+
+/// What those three variables carry for one run: the TEMPORARY credentials of the session of
+/// the function's execution role this invocation's calls are signed as
+/// ([`execution_role_session`]).
+///
+/// Empty — so the run carries none of the three — for a run with no such session: this
+/// emulator holds no record of the function's role, or there is no token service to mint a
+/// session with, which is exactly where nothing can be shown about the role at all. Empty too
+/// for a credential missing any of its three parts, because AWS vends no part of a temporary
+/// credential: a handler reading one variable and not the others would sign with something no
+/// service can resolve.
+fn credential_variables(
+    session: Option<&aws_api::CallerIdentity>,
+) -> Vec<(&'static str, String)> {
+    let Some(session) = session else {
+        return Vec::new();
+    };
+    let parts = [
+        session.access_key_id.clone(),
+        session.secret_access_key.clone(),
+        session.session_token.clone(),
+    ];
+    if parts.iter().any(String::is_empty) {
+        return Vec::new();
+    }
+    CREDENTIAL_VARIABLES
+        .iter()
+        .copied()
+        .zip(parts)
+        .collect()
+}
+
+/// The ENVIRONMENT one run sees: the function's own variables, plus the ones the runtime
+/// sets for a handler to read its own identity and its own credentials out of.
+///
+/// This is the whole environment: no host environment variable is in it, and the only
+/// credential in it is the session of the function's own execution role
+/// ([`credential_variables`]) — never the credential the framework hands this emulator's
+/// handlers.
 fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap<String, String> {
     let mut environment = invocation.variables.clone();
     let reserved: &[(&str, String)] = &[
@@ -1675,6 +1724,17 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
     ];
     for (name, value) in reserved {
         environment.insert((*name).to_string(), value.clone());
+    }
+    // The run's own CREDENTIALS, under the three names a managed runtime exports them as.
+    // They are the runtime's to set, so whatever the environment held under those names is
+    // given up first: a run no session was minted for carries none of them at all, rather
+    // than a value this emulator did not mint for the function's role.
+    for name in CREDENTIAL_VARIABLES {
+        environment.remove(*name);
+    }
+    let session = invocation.aws.as_ref().and_then(AwsAccess::identity);
+    for (name, value) in credential_variables(session) {
+        environment.insert(name.to_string(), value);
     }
     // "`_X_AMZN_TRACE_ID` – The X-Ray tracing header", which "changes with each
     // invocation": the trace context of THIS invocation ([`trace_context`]). It is one of
@@ -2372,10 +2432,11 @@ mod tests {
                 "case {name}: expected {expected:?}, got {actual:?}"
             );
         }
-        for absent in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "PATH", "HOME"] {
+        for absent in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "PATH", "HOME"] {
             assert!(
                 !environment.contains_key(absent),
-                "case {absent}: no host or credential variable reaches a run, got {:?}",
+                "case {absent}: no host variable reaches a run, and no credential variable \
+                 reaches one no execution-role session was minted for, got {:?}",
                 environment.get(absent)
             );
         }
@@ -2387,6 +2448,85 @@ mod tests {
             stream, "1970/01/01/[7]11111111222233334444555555555555",
             "expected the stream to name the date, the version and the invocation, got {stream:?}"
         );
+    }
+
+    /// RULE: a run is given the three reserved credential variables at the values of the
+    /// session of its function's execution role, and a run with no such session — or one
+    /// whose credential is missing a part, which is no temporary credential — is given none
+    /// of them, because AWS vends no part of one.
+    ///
+    /// The rows differ along WHICH part the credential is missing, which is what the rule
+    /// generalises over.
+    #[test]
+    fn a_run_is_given_the_whole_execution_role_session_credential_or_none_of_it() {
+        let whole = aws_api::CallerIdentity {
+            access_key_id: "ASIAEXECUTIONROLESESSION".to_string(),
+            secret_access_key: "a-secret-no-response-carries".to_string(),
+            session_token: "a-session-token-of-the-execution-role".to_string(),
+        };
+        let without = |part: usize| {
+            let mut held = whole.clone();
+            match part {
+                0 => held.access_key_id.clear(),
+                1 => held.secret_access_key.clear(),
+                _ => held.session_token.clear(),
+            }
+            held
+        };
+        /// One row: the credential the run signs with, and what the run is then given under
+        /// the three reserved names.
+        struct Row<'r> {
+            case: &'static str,
+            session: Option<aws_api::CallerIdentity>,
+            given: Vec<(&'static str, &'r str)>,
+        }
+        let rows: Vec<Row<'_>> = vec![
+            Row {
+                case: "a run no session was minted for",
+                session: None,
+                given: Vec::new(),
+            },
+            Row {
+                case: "a run signing as a session of its execution role",
+                session: Some(whole.clone()),
+                given: vec![
+                    ("AWS_ACCESS_KEY_ID", whole.access_key_id.as_str()),
+                    ("AWS_SECRET_ACCESS_KEY", whole.secret_access_key.as_str()),
+                    ("AWS_SESSION_TOKEN", whole.session_token.as_str()),
+                ],
+            },
+            Row {
+                case: "a credential with no access key id",
+                session: Some(without(0)),
+                given: Vec::new(),
+            },
+            Row {
+                case: "a credential with no secret",
+                session: Some(without(1)),
+                given: Vec::new(),
+            },
+            Row {
+                case: "a credential with no session token",
+                session: Some(without(2)),
+                given: Vec::new(),
+            },
+        ];
+        for Row {
+            case,
+            session,
+            given,
+        } in rows
+        {
+            let exported = credential_variables(session.as_ref());
+            let actual: Vec<(&str, &str)> = exported
+                .iter()
+                .map(|(name, value)| (*name, value.as_str()))
+                .collect();
+            assert_eq!(
+                actual, given,
+                "case {case:?}: expected the run to be given {given:?}, got {actual:?}"
+            );
+        }
     }
 
     /// One row of the table below: the invocation's trace context, what the function's own

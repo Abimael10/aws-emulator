@@ -1638,10 +1638,13 @@ pub fn reachable_services() -> Vec<&'static str> {
 
 /// The CREDENTIAL one invocation's calls are signed with.
 ///
-/// Held by the host and never reachable from guest code: it reaches the request's
-/// `Authorization` and `x-amz-security-token` headers and nothing else — no response, no
-/// log and no environment variable of the run ([`super::runtime_environment`] puts no
-/// credential in a run's environment).
+/// It is the session of the function's own execution role, so it is the credential a managed
+/// runtime hands the handler it runs: it reaches the request's `Authorization` and
+/// `x-amz-security-token` headers, and the three reserved credential variables of the run's
+/// own environment, which is where the SDK's default chain inside the handler reads it
+/// ([`super::runtime_environment`]). It reaches no response and no log of this emulator's,
+/// and the credential the FRAMEWORK hands this emulator's handlers is never one of these:
+/// where no session could be minted, a run is given no credential at all.
 #[derive(Clone)]
 pub struct CallerIdentity {
     /// The access key id, which is where the service serving a call reads WHO made it.
@@ -1883,6 +1886,18 @@ impl AwsAccess {
     pub fn signing_as(mut self, identity: Option<CallerIdentity>) -> Self {
         self.identity = identity;
         self
+    }
+
+    /// The credential every call of this access is signed with, where one was minted for the
+    /// run: the session of the function's execution role.
+    ///
+    /// It is read for the run's own ENVIRONMENT ([`super::runtime_environment`]), because the
+    /// credential a managed runtime signs a handler's calls with is the one it exports to the
+    /// handler. `None` where no session was minted, in which case the run is given no
+    /// credential variable at all rather than one this emulator did not mint for the role.
+    #[must_use]
+    pub fn identity(&self) -> Option<&CallerIdentity> {
+        self.identity.as_ref()
     }
 
     /// The same access, stamping `trace_header` on every call it makes — the tracing header

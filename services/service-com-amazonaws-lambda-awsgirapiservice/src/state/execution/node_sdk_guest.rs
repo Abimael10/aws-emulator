@@ -24,6 +24,12 @@
 //!   operation's input and answering a promise of its output (or calling a node callback when
 //!   one is passed). A method of it sends the very command `send` takes, so a handler written
 //!   either way makes one call made one way.
+//! * A client's `config.credentials` is the PROVIDER a v3 client normalises whatever it was
+//!   built with into — an async function answering the credentials its calls are signed with,
+//!   which for a client built with none is the default chain's: the reserved credential
+//!   variables the runtime exported to the run ([`super::runtime_environment`]). What a call
+//!   is signed with is still decided from what the client was built with, so reading the
+//!   provider changes nothing about the call.
 //! * A refusal is thrown as an instance of the error class the service's own model names for
 //!   it, with the `$metadata` the answer carried — the shape a v3 client throws — so a
 //!   handler that catches one by its class or by its name reads the emulated service's own
@@ -507,13 +513,61 @@ function Client(configuration) {
     var held = configuration === undefined || configuration === null ? {} : configuration;
     this.config = {
         region: held.region === undefined ? globalThis.process.env.AWS_REGION : held.region,
-        credentials: held.credentials,
+        credentials: credentialProvider(held.credentials),
         endpoint: held.endpoint,
         serviceId: SERVICE
     };
+    // The credentials the client was built WITH, exactly as they were given: what a call is
+    // signed with is decided from these ([`signedWith`]), and not from the provider above,
+    // which a handler may read and which resolves the environment's for a client built with
+    // none.
+    this.builtWith = held.credentials;
 }
 
 Object.defineProperty(Client, 'name', { value: '__CLIENT_NAME__' });
+
+// The three reserved variables a managed runtime exports the invocation's own credentials in,
+// which is where the SDK's DEFAULT credential chain reads them.
+var CREDENTIAL_VARIABLES = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN'];
+
+// WHAT `client.config.credentials` IS: a v3 client normalises whatever it was built with into
+// a PROVIDER — an async function answering the credentials the client signs with — so a
+// handler reads its own identity by calling it. A client built with a credentials object is
+// given a provider answering that object; one built with a provider function keeps it; and one
+// built with NONE is given the default chain's, which in a Lambda execution environment is the
+// three reserved environment variables the runtime exported.
+//
+// A chain with no credentials to find answers the error the SDK's own chain answers for an
+// environment holding none, rather than an empty credential a call would be signed with.
+//
+// The environment it reads is the RUN's own — the map the runtime built for this invocation
+// ([`super::runtime_environment`]), which is all a guest has — and never this host's process
+// environment, which no code here can reach.
+function credentialProvider(credentials) {
+    if (typeof credentials === 'function') {
+        return credentials;
+    }
+    if (credentials !== undefined && credentials !== null) {
+        return function () { return Promise.resolve(credentials); };
+    }
+    return function () {
+        var environment = globalThis.process.env;
+        var keyId = environment[CREDENTIAL_VARIABLES[0]];
+        var secret = environment[CREDENTIAL_VARIABLES[1]];
+        if (typeof keyId !== 'string' || keyId === ''
+            || typeof secret !== 'string' || secret === '') {
+            var missing = new Error('Could not load credentials from any providers');
+            missing.name = 'CredentialsProviderError';
+            return Promise.reject(missing);
+        }
+        var resolved = { accessKeyId: keyId, secretAccessKey: secret };
+        var token = environment[CREDENTIAL_VARIABLES[2]];
+        if (typeof token === 'string' && token !== '') {
+            resolved.sessionToken = token;
+        }
+        return Promise.resolve(resolved);
+    };
+}
 
 // WHICH CREDENTIALS a client's calls are signed with, as the document the runtime signs with:
 // the ones the client was built with (`new Client({ credentials: { accessKeyId,
@@ -585,7 +639,7 @@ Client.prototype.send = function (command) {
                 operation,
                 region,
                 JSON.stringify(sentInput(command.input === undefined ? {} : command.input)),
-                signedWith(self.config.credentials),
+                signedWith(self.builtWith),
                 addressedAt(self.config.endpoint)
             ));
         } catch (error) {
