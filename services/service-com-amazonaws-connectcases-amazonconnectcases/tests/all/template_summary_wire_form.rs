@@ -23,6 +23,12 @@
 //! as it is stored NOW, so an update that adds, replaces or empties the
 //! tag-propagation list — or that moves the other members a summary reports —
 //! shows up in the next listing, an emptied list still as `[]`.
+//!
+//! A third table reads the same rows back the way a client does: it pins the
+//! member set a summary carries (none missing, none invented) and then resolves
+//! the listed template through the identity the summary alone reported — the
+//! `id` and the `arn` — so a summary that reported an identity nothing resolves
+//! would fail here.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::{
@@ -459,6 +465,137 @@ async fn a_summary_reports_the_stored_template_after_an_update() {
              left stored ({:?}), got {read:?}",
             row.case, row.expected_configurations
         );
+    }
+}
+
+/// Every member a template summary carries on the wire: the modelled
+/// `templateId`/`templateArn`/`name`/`status`/`tagPropagationConfigurations`
+/// (`smithy_query(query="shape", shape="TemplateSummary")`) plus the `id` and
+/// `arn` names the service reports the same identity by. A summary carries
+/// these and nothing besides them.
+const SUMMARY_MEMBERS: [&str; 7] = [
+    "templateId",
+    "templateArn",
+    "name",
+    "status",
+    "tagPropagationConfigurations",
+    "id",
+    "arn",
+];
+
+/// The `(domainId, templateId)` an ARN addresses — what a client holding only
+/// the `arn` a summary reported reads out of it to call the single-template
+/// operations.
+fn identity_in(case: &str, arn: &str) -> (String, String) {
+    let (domain_id, template_id) = arn
+        .split_once(":domain/")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once("/template/"))
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the arn must address a domain's template, got {arn:?}")
+        });
+    (domain_id.to_string(), template_id.to_string())
+}
+
+/// A listed template is identifiable and resolvable from its summary alone: the
+/// summary carries exactly the member set the service reports, its identity
+/// agrees under both names it is reported by, the ARN addresses the domain the
+/// template was created in, and the identity read off the summary — the `id` and
+/// the `arn`, not the ids the test minted the template with — reaches the
+/// template through `GetTemplate`.
+///
+/// The rows span the class the rule generalises over (tag-propagation shape,
+/// status, the region the ARN is scoped to) and each is created in two different
+/// domains, so an ARN that did not name the template's own domain would fail
+/// here.
+#[tokio::test]
+async fn a_listed_template_is_resolvable_through_the_identity_its_summary_reports() {
+    for region in ["us-east-1", "eu-central-1"] {
+        let emulator = Emulator::in_region(region);
+        let rows = rows();
+        for domain_index in 0..2 {
+            let domain_id = domain(&emulator, &format!("identity-domain-{domain_index}")).await;
+
+            let mut created: Vec<(String, String)> = Vec::new();
+            for (index, row) in rows.iter().enumerate() {
+                let name = format!("identity-template-{domain_index}-{index:03}");
+                let case = format!("{} in {region}, domain {domain_index}", row.case);
+                let (template_id, _) = create(&emulator, &case, &domain_id, &name, row).await;
+                created.push((template_id, name));
+            }
+
+            let answer = list(&emulator, "every template", &domain_id, "").await;
+            for (row, (template_id, name)) in rows.iter().zip(created.iter()) {
+                let case = format!("{} in {region}, domain {domain_index}", row.case);
+                let summary = summary_of(&case, &answer, template_id);
+
+                // Exactly the member set the service reports: none missing, none
+                // invented.
+                let members: Vec<&String> = summary
+                    .as_object()
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: a summary must be an object, got {summary:?}")
+                    })
+                    .keys()
+                    .collect();
+                for member in SUMMARY_MEMBERS {
+                    assert!(
+                        members.iter().any(|carried| *carried == member),
+                        "case {case:?}: a summary must carry {member}, got {members:?}"
+                    );
+                }
+                assert_eq!(
+                    members.len(),
+                    SUMMARY_MEMBERS.len(),
+                    "case {case:?}: a summary must carry only {SUMMARY_MEMBERS:?}, got {members:?}"
+                );
+
+                // The identity under both names, and the ARN pointing back at
+                // the template's own domain and id.
+                let id = string_at(&summary, "id", &case);
+                let arn = string_at(&summary, "arn", &case);
+                assert_eq!(
+                    id,
+                    string_at(&summary, "templateId", &case),
+                    "case {case:?}: the summary's id and templateId must be the same identity, \
+                     got {summary:?}"
+                );
+                assert_eq!(
+                    arn,
+                    string_at(&summary, "templateArn", &case),
+                    "case {case:?}: the summary's arn and templateArn must be the same identity, \
+                     got {summary:?}"
+                );
+                let (addressed_domain, addressed_template) = identity_in(&case, &arn);
+                assert_eq!(
+                    addressed_domain, domain_id,
+                    "case {case:?}: the summary's arn must address the domain the template was \
+                     created in ({domain_id}), got {arn}"
+                );
+                assert_eq!(
+                    addressed_template, id,
+                    "case {case:?}: the summary's arn must address the template its id names \
+                     ({id}), got {arn}"
+                );
+
+                // List-then-use: the identity the summary reported is enough to
+                // read the template back, with no second lookup to resolve it.
+                let record =
+                    get_template(&emulator, &case, &addressed_domain, &addressed_template).await;
+                assert_eq!(
+                    string_at(&record, "name", &case),
+                    *name,
+                    "case {case:?}: the identity the summary reported must reach the template it \
+                     listed, got {record:?}"
+                );
+                assert_eq!(
+                    string_at(&record, "status", &case),
+                    row.status.unwrap_or("Active"),
+                    "case {case:?}: the template reached through the summary's identity must \
+                     carry the stored status, got {record:?}"
+                );
+            }
+        }
     }
 }
 
