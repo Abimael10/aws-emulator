@@ -1001,3 +1001,200 @@ async fn a_rule_pattern_on_the_direction_separates_scale_in_from_scale_out() {
         "case {case:?}: the scale-in rule must receive only terminations, got {in_buffer:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Filtering by the GROUP a step belongs to.
+//
+// The RULE: a lifecycle event's `detail` names the group whose step it reports in
+// `AutoScalingGroupName`, so a rule whose `EventPattern` filters on that member receives
+// every step of the group it names — launches and terminations alike, whichever door moved
+// the capacity — and no step of any other group. The member carries the group's own name,
+// so a pattern naming a group the account does not hold matches nothing.
+//
+// The rows span what the rule generalises over: WHICH of several groups a pattern names,
+// how the pattern names it (the whole name, or a prefix of it), which OTHER envelope fields
+// the pattern constrains beside the group (both detail types, neither, the source alone),
+// and a name no group answers to at all.
+
+/// The two groups that scale while the rules below watch, and the name no group carries.
+const GROUP_ALPHA: &str = "lifecycle-alpha";
+const GROUP_BETA: &str = "lifecycle-beta";
+const GROUP_ABSENT: &str = "lifecycle-gamma";
+
+/// How the capacity of each group moves: `ALPHA` launches two instances and scales one in,
+/// `BETA` launches one and scales it in, so each group owes a different number of events of
+/// each step and a leak between the two queues is visible as a count.
+const ALPHA_CREATED_WITH: i32 = 2;
+const ALPHA_SCALED_TO: i32 = 1;
+const BETA_CREATED_WITH: i32 = 1;
+const BETA_SCALED_TO: i32 = 0;
+
+/// One row of the group-filter table: the pattern a rule carries, and the steps of which
+/// group that rule must therefore receive.
+struct GroupFilterRow {
+    case: &'static str,
+    /// The whole `EventPattern` the rule is put with.
+    pattern: fn() -> Value,
+    /// The group whose steps the rule must receive, when it receives any.
+    group: Option<&'static str>,
+}
+
+const GROUP_FILTER_ROWS: &[GroupFilterRow] = &[
+    GroupFilterRow {
+        case: "a rule naming the whole name of the two-instance group, beside both steps",
+        pattern: || {
+            json!({
+                "source": [EVENT_SOURCE],
+                "detail-type": [LAUNCH_SUCCESSFUL, TERMINATE_SUCCESSFUL],
+                "detail": { "AutoScalingGroupName": [GROUP_ALPHA] },
+            })
+        },
+        group: Some(GROUP_ALPHA),
+    },
+    GroupFilterRow {
+        case: "a rule naming the whole name of the one-instance group, beside the source",
+        pattern: || {
+            json!({
+                "source": [EVENT_SOURCE],
+                "detail": { "AutoScalingGroupName": [GROUP_BETA] },
+            })
+        },
+        group: Some(GROUP_BETA),
+    },
+    GroupFilterRow {
+        case: "a rule naming the group and nothing else",
+        pattern: || json!({ "detail": { "AutoScalingGroupName": [GROUP_ALPHA] } }),
+        group: Some(GROUP_ALPHA),
+    },
+    GroupFilterRow {
+        case: "a rule naming a prefix only the two-instance group carries",
+        pattern: || {
+            json!({
+                "source": [EVENT_SOURCE],
+                "detail": { "AutoScalingGroupName": [{ "prefix": "lifecycle-al" }] },
+            })
+        },
+        group: Some(GROUP_ALPHA),
+    },
+    GroupFilterRow {
+        case: "a rule naming a group the account does not hold",
+        pattern: || {
+            json!({
+                "source": [EVENT_SOURCE],
+                "detail": { "AutoScalingGroupName": [GROUP_ABSENT] },
+            })
+        },
+        group: None,
+    },
+];
+
+/// How many launches and how many terminations the group `name` owes over the whole run.
+///
+/// A count this table could not state is a mistake in the table, so it panics rather than
+/// standing in a zero: an expectation of no event at all would be met by a bus that
+/// delivered nothing.
+fn owed_steps(name: &str) -> (usize, usize) {
+    let (created_with, scaled_to) = match name {
+        GROUP_ALPHA => (ALPHA_CREATED_WITH, ALPHA_SCALED_TO),
+        GROUP_BETA => (BETA_CREATED_WITH, BETA_SCALED_TO),
+        other => panic!("{other} is not one of this table's groups"),
+    };
+    (
+        usize::try_from(created_with).expect("a group is created with a non-negative capacity"),
+        usize::try_from(created_with - scaled_to).expect("the row scales the group in, not out"),
+    )
+}
+
+#[tokio::test]
+async fn a_rule_filtered_on_the_group_name_receives_that_groups_steps_only() {
+    let case = "rules keyed on detail.AutoScalingGroupName";
+    let (router, engine) = emulator();
+    let subnet = given_launch_source(&router, &engine).await;
+
+    // One queue per row, each behind a rule whose pattern names its own group, and all of
+    // them in place BEFORE any capacity moves: a client that watches a group through
+    // EventBridge arms its rule first and then makes no further Auto Scaling call.
+    let mut queues: Vec<(String, String)> = Vec::new();
+    for (at, row) in GROUP_FILTER_ROWS.iter().enumerate() {
+        let (url, queue_arn) = given_queue(&router, row.case, &format!("group-filter-{at}")).await;
+        given_rule(
+            &router,
+            row.case,
+            &format!("group-filter-rule-{at}"),
+            &(row.pattern)(),
+            &queue_arn,
+        )
+        .await;
+        grant_delivery(&router, row.case, &url, &queue_arn).await;
+        queues.push((url, queue_arn));
+    }
+
+    let alpha_arn = given_group(&router, case, GROUP_ALPHA, &subnet, ALPHA_CREATED_WITH).await;
+    let beta_arn = given_group(&router, case, GROUP_BETA, &subnet, BETA_CREATED_WITH).await;
+    set_desired_capacity(&router, case, GROUP_ALPHA, ALPHA_SCALED_TO).await;
+    set_desired_capacity(&router, case, GROUP_BETA, BETA_SCALED_TO).await;
+
+    for (at, row) in GROUP_FILTER_ROWS.iter().enumerate() {
+        let (url, _) = &queues[at];
+        let Some(group) = row.group else {
+            // The negative half: a pattern naming a group the account does not hold
+            // receives nothing, which is only distinguishable from a broken bus because
+            // every other row's queue did receive.
+            tokio::time::sleep(quiet_budget()).await;
+            let late = drain(&router, row.case, url).await;
+            assert!(
+                late.is_empty(),
+                "case {:?}: a rule naming {GROUP_ABSENT} must receive nothing, got {late:?}",
+                row.case
+            );
+            continue;
+        };
+        let arn = match group {
+            GROUP_ALPHA => &alpha_arn,
+            GROUP_BETA => &beta_arn,
+            other => panic!("{other} is not one of this table's groups"),
+        };
+        let (launches_owed, terminations_owed) = owed_steps(group);
+        let mut buffer: Vec<Value> = Vec::new();
+        let launches = poll_for_detail_type(
+            &router,
+            row.case,
+            url,
+            LAUNCH_SUCCESSFUL,
+            launches_owed,
+            &mut buffer,
+        )
+        .await;
+        let terminations = poll_for_detail_type(
+            &router,
+            row.case,
+            url,
+            TERMINATE_SUCCESSFUL,
+            terminations_owed,
+            &mut buffer,
+        )
+        .await;
+        assert_eq!(
+            (launches.len(), terminations.len()),
+            (launches_owed, terminations_owed),
+            "case {:?}: expected {launches_owed} launch and {terminations_owed} terminate \
+             event(s) of {group}, got {buffer:?}",
+            row.case
+        );
+        for event in &launches {
+            assert_envelope(row.case, event, LAUNCH_SUCCESSFUL, group, arn);
+        }
+        for event in &terminations {
+            assert_envelope(row.case, event, TERMINATE_SUCCESSFUL, group, arn);
+        }
+        // Nothing of the OTHER group reached this rule: the filter is the group's own name.
+        for event in &buffer {
+            assert_eq!(
+                event["detail"]["AutoScalingGroupName"],
+                json!(group),
+                "case {:?}: only the steps of {group} may reach this rule, got {event}",
+                row.case
+            );
+        }
+    }
+}

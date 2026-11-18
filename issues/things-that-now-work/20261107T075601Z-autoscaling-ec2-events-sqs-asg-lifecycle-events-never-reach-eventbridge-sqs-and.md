@@ -39,3 +39,31 @@ From the behavioral replay:
 
 ## Steps to Reproduce
 Replay the behavioral suite and re-run the checks in trace_ids: create an ASG, an EventBridge rule filtered on the group name with an SQS target, then scale the group out and in and poll the queue for the launch/terminate events; also call SetDesiredCapacity above MaxSize and compare the ValidationError message.
+
+## Resolution
+Cause 2 is fixed: SetDesiredCapacity now refuses a capacity outside the group's own bounds
+with one shared sentence that names the requested value and the bound it crossed and ends
+at "for the AutoScalingGroup." (the group's name is not part of it), pinned by the
+capacity-bound table in
+services/service-com-amazonaws-autoscaling-autoscaling-2011-01-01/tests/all/group_size_and_health_check_refusal_wording.rs.
+
+Cause 1's behaviour holds in the current tree: an instance a group launches or scales in is
+published onto the default event bus (source aws.autoscaling, detail-type "EC2 Instance
+Launch Successful"/"EC2 Instance Terminate Successful", the group and the instance in the
+detail) and EventBridge delivers it to the SQS target of a rule whose pattern filters on
+detail.AutoScalingGroupName. Pinned by the group-filter table in
+services/service-com-amazonaws-autoscaling-autoscaling-2011-01-01/tests/all/instance_lifecycle_events.rs
+(every filter form, both steps, two groups, and a group the account does not hold), and by
+the two replayed units that now pass —
+events-ec2-lifecycle-asg-desired-above-max-rejected-then-launch-event-names-group and
+xsvc-autoscaling-1-scale-in-terminate-event.
+
+Surviving replay key, NOT the behaviour above and not owned by this service any more:
+`xsvc-autoscaling-1-filtered-by-group-name|_drain_raw#20|Timeout` still ends "Check timed
+out after 60.0s" while its sibling in the same fixture, which asserts exactly the reported
+delivery, passes; no form of the group-name filter could be made to fail. The event-path
+capabilities that cross-service fixture can still be waiting on belong to other reports:
+the EC2 crate publishes no `aws.ec2` "EC2 Instance State-change Notification" at all
+(20261110T160612Z-ec2-events-sqs-ec2-instance-state-change-notifications.md), and the
+lifecycle-hook event family has no path while CompleteLifecycleAction and
+RecordLifecycleActionHeartbeat are scaffold stubs.

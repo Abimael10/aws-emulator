@@ -213,6 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cooldown_until = group.cooldown_until;
         let in_cooldown = group.in_cooldown(now);
 
+        // A capacity outside the group's own bounds is refused in the ONE wording this
+        // service states for both of them
+        // ([`crate::state::capacity_outside_bounds_message`]): the sentence names what was
+        // asked for and the bound it crossed and ends there.
         if desired_capacity < min_size {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 crate::state::capacity_outside_bounds_message(
