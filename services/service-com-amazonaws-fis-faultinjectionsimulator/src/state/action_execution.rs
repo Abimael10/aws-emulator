@@ -102,6 +102,13 @@ pub const MAX_ACTION_EFFECT_RESOURCES: usize = 32;
 /// experiment, the action or its resources in it.
 pub const ACTION_WAS_STOPPED: &str = "Action was stopped.";
 
+/// The `ExperimentActionState$reason` of an action the run carried out to the end of its
+/// own span: FIS's own sentence for that status, fixed text with nothing of the
+/// experiment, the action or its resources in it — the same contract
+/// [`ACTION_WAS_STOPPED`] and the experiment's own terminal reason
+/// ([`super::COMPLETED_REASON`]) hold, final period included.
+pub const ACTION_WAS_COMPLETED: &str = "Action was completed.";
+
 /// How far one action of a run has got.
 ///
 /// The values are `ExperimentActionStatus`'s (modelled
@@ -179,13 +186,15 @@ pub struct ActionRun {
 impl ActionRun {
     /// The `ExperimentActionState` this action reports.
     ///
-    /// The reason of an action a STOP ended is FIS's own sentence for that cause
-    /// ([`ACTION_WAS_STOPPED`]) — fixed text, with nothing of the experiment, the action or
-    /// the resources substituted into it, exactly as the experiment's own halt reason is
-    /// ([`super::STOPPED_BY_STOP_CONDITION`]). FIS documents no wording for the other
-    /// statuses of `ExperimentActionState$reason` ("the reason for the state") and none is
-    /// recorded, so those stay explanatory strings of this emulator's own — the same choice
-    /// [`super::ActionSkip::to_state`] makes — while the status is the modelled value.
+    /// The reason of an action the run CARRIED OUT ([`ACTION_WAS_COMPLETED`]) and of one a
+    /// STOP ended ([`ACTION_WAS_STOPPED`]) are FIS's own sentences for those statuses —
+    /// fixed text, with nothing of the experiment, the action or the resources substituted
+    /// into it, exactly as the experiment's own terminal reasons are
+    /// ([`super::COMPLETED_REASON`], [`super::STOPPED_BY_STOP_CONDITION`]). FIS documents
+    /// no wording for the remaining statuses of `ExperimentActionState$reason` ("the reason
+    /// for the state") and none is recorded, so those stay explanatory strings of this
+    /// emulator's own — the same choice [`super::ActionSkip::to_state`] makes — while the
+    /// status is the modelled value.
     pub fn to_state(&self) -> ExperimentActionState {
         ExperimentActionState {
             status: Some(self.status.as_wire().to_string()),
@@ -193,7 +202,7 @@ impl ActionRun {
                 match self.status {
                     ActionRunStatus::Pending => "The action has not started yet",
                     ActionRunStatus::Running => "The action is running",
-                    ActionRunStatus::Completed => "The action was completed",
+                    ActionRunStatus::Completed => ACTION_WAS_COMPLETED,
                     ActionRunStatus::Stopped => ACTION_WAS_STOPPED,
                     ActionRunStatus::Cancelled => {
                         "The action was cancelled because the experiment was stopped before it \
@@ -448,8 +457,11 @@ impl ExperimentRecord {
                 continue;
             };
             action.state = Some(run.to_state());
-            action.start_time = run.start_time.map(::aws_smithy_types::DateTime::from);
-            action.end_time = run.end_time.map(::aws_smithy_types::DateTime::from);
+            // Both at the granularity every instant this service reports is projected at
+            // ([`super::reported_time`]), so an action's window is reported in the same
+            // terms as the run's own.
+            action.start_time = run.start_time.map(super::reported_time);
+            action.end_time = run.end_time.map(super::reported_time);
         }
         actions
     }

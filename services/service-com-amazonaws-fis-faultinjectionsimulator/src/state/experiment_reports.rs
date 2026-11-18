@@ -39,7 +39,10 @@ pub fn report_object_arn(bucket: &str, key: &str) -> String {
 /// the record does not carry (an `endTime` is absent until the experiment ends).
 pub(super) fn report_timestamp(at: Option<SystemTime>) -> Option<String> {
     at.and_then(|at| {
-        ::aws_smithy_types::DateTime::from(at)
+        // The same instant the API reports for this member, at the same granularity
+        // ([`super::reported_time`]), so the document and the record's own responses cannot
+        // state one instant two ways.
+        super::reported_time(at)
             .fmt(::aws_smithy_types::date_time::Format::DateTime)
             .ok()
     })

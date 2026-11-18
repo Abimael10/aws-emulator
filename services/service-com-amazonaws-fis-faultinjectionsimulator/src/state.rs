@@ -175,6 +175,9 @@ pub mod action_progress;
 /// that service reads them ([`api_fault_injection`]).
 pub mod api_fault_injection;
 pub mod experiment_logs;
+/// The granularity every instant this service reports is projected at
+/// ([`reported_time`]).
+pub mod reported_time;
 pub mod stop_conditions;
 mod catalog;
 mod experiment_reports;
@@ -188,6 +191,7 @@ pub use action_progress::*;
 pub use api_fault_injection::*;
 pub use template_validation::*;
 pub use experiment_reports::*;
+pub use reported_time::*;
 pub use catalog::*;
 
 /// The IAM store this service resolves an execution role against.
@@ -614,9 +618,16 @@ pub const EXPERIMENT_STATUS_REASON_CEILING: usize = 512;
 /// this is an explanatory string rather than a reproduction of the service's own text.
 pub const STOPPED_BY_REQUEST: &str = "Stopped by a StopExperiment request";
 
-/// The `state.reason` an experiment carries once its actions have run to the end. Chosen
-/// here for the same reason [`STOPPED_BY_REQUEST`] is.
-pub const COMPLETED_REASON: &str = "Experiment completed";
+/// The `state.reason` an experiment carries once its actions have run to the end.
+///
+/// FIS's own sentence for that status, and the WHOLE of it: the reason a run that reached
+/// the terminal `completed` status reports carries no value from the request, the template
+/// or the resources it acted on — no experiment id, no template id and no action name is
+/// substituted into it — so a client comparing the reason it was given against the one FIS
+/// reports for a completed run matches it exactly, final period included. The same
+/// contract [`STOPPED_BY_STOP_CONDITION`] and
+/// [`ACTION_WAS_COMPLETED`](action_execution::ACTION_WAS_COMPLETED) hold.
+pub const COMPLETED_REASON: &str = "Experiment completed.";
 
 /// The `state.reason` a freshly accepted experiment carries, before its run begins.
 ///
@@ -1510,8 +1521,8 @@ impl ExperimentTemplateRecord {
             targets: Some(self.targets.clone()),
             actions: Some(self.actions.clone()),
             stop_conditions: Some(self.stop_conditions.clone()),
-            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
-            last_update_time: Some(::aws_smithy_types::DateTime::from(self.last_update_time)),
+            creation_time: Some(reported_time(self.creation_time)),
+            last_update_time: Some(reported_time(self.last_update_time)),
             role_arn: Some(self.role_arn.clone()),
             tags: Some(self.tags.clone()),
             log_configuration: self.log_configuration.clone(),
@@ -1527,8 +1538,8 @@ impl ExperimentTemplateRecord {
             id: Some(self.id.clone()),
             arn: Some(self.arn.clone()),
             description: Some(self.description.clone()),
-            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
-            last_update_time: Some(::aws_smithy_types::DateTime::from(self.last_update_time)),
+            creation_time: Some(reported_time(self.creation_time)),
+            last_update_time: Some(reported_time(self.last_update_time)),
             tags: Some(self.tags.clone()),
         }
     }
@@ -2125,9 +2136,9 @@ impl ExperimentRecord {
             // [`ExperimentRecord::reported_actions`].
             actions: Some(self.reported_actions()),
             stop_conditions: Some(self.stop_conditions.clone()),
-            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
-            start_time: Some(::aws_smithy_types::DateTime::from(self.start_time)),
-            end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
+            creation_time: Some(reported_time(self.creation_time)),
+            start_time: Some(reported_time(self.start_time)),
+            end_time: self.end_time.map(reported_time),
             tags: Some(self.tags.clone()),
             log_configuration: self.log_configuration.clone(),
             experiment_options: Some(self.experiment_options.clone()),
@@ -2150,7 +2161,7 @@ impl ExperimentRecord {
             arn: Some(self.arn.clone()),
             experiment_template_id: Some(self.experiment_template_id.clone()),
             state: Some(self.to_state()),
-            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
+            creation_time: Some(reported_time(self.creation_time)),
             tags: Some(self.tags.clone()),
             experiment_options: Some(self.experiment_options.clone()),
         }

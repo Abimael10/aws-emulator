@@ -23,10 +23,11 @@
 //! duration they add up to.
 //!
 //! Two things are read off the RECORD rather than off the wall clock, which is what makes
-//! them exact: `endTime - startTime` is the span the service itself planned for the run
-//! (the transition the start owes plus the compressed run span), so a run that carried out
-//! no action reports the compressed FLOOR while one that carried out an eight-minute
-//! action reports the compressed eight minutes. Nothing here waits out a modelled duration.
+//! them exact to the second they are reported at: `endTime - startTime` is the span the
+//! service itself planned for the run (the transition the start owes plus the compressed
+//! run span), so a run that carried out no action reports the compressed FLOOR while one
+//! that carried out an eight-minute action reports the compressed eight minutes. Nothing
+//! here waits out a modelled duration.
 //!
 //! What a skipped action does NOT claim: `startTime`, `endTime` and any effect on another
 //! service. `skipped` is the decision the options made about the action, which is known at
@@ -63,11 +64,11 @@ const TRANSITION_DELAY: Duration = Duration::from_millis(500);
 /// reports at most this.
 const FLOOR_SPAN_SECONDS: f64 = MIN_RUN_SPAN.as_secs_f64() + TRANSITION_DELAY.as_secs_f64();
 
-/// The tolerance the span comparisons allow. The stamps are reported as epoch seconds, so
-/// subtracting two of them loses the last digits of a value around 1.7e9 — far below this,
-/// and far below the seconds that separate a floor run from one that carried out
-/// [`LONG_DURATION`].
-const SPAN_SLACK: f64 = 0.25;
+/// The tolerance the span comparisons allow. The stamps are reported as epoch seconds with
+/// no sub-second part, so a span computed from two of them is the planned one give or take
+/// one second of that granularity — far below the seconds that separate a floor run from
+/// one that carried out [`LONG_DURATION`].
+const SPAN_SLACK: f64 = 1.25;
 
 /// `ExperimentActionStatus`'s published values
 /// (`smithy_query(query="shape",shape="ExperimentActionStatus")`), so an action's reported

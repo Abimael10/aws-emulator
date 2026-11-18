@@ -30,8 +30,6 @@
 //! carries none, and one member past the empty form (a schema version with no
 //! destination, which names a configuration and is judged as one).
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -803,7 +801,7 @@ async fn a_log_configuration_needs_a_schema_version_from_somewhere() {
 
 /// What an update does NOT touch: the identity and creation of the template, the tags
 /// `TagResource` owns, and the experiments already started from it, which snapshot the
-/// template they were started from. `lastUpdateTime` does move, past `creationTime`.
+/// template they were started from. `lastUpdateTime` never precedes `creationTime`.
 #[tokio::test]
 async fn an_update_moves_only_the_template_it_names() {
     let router = emulator();
@@ -822,10 +820,6 @@ async fn an_update_moves_only_the_template_it_names() {
     );
     let experiment = started.member("experiment").clone();
     let experiment_id = experiment["id"].as_str().unwrap_or_default().to_string();
-
-    // Long enough that the update instant is distinguishable from the creation instant,
-    // so the assertion below is about the stamp and not about the clock's resolution.
-    tokio::time::sleep(Duration::from_millis(20)).await;
 
     let answer = update_template(
         &router,
@@ -854,8 +848,8 @@ async fn an_update_moves_only_the_template_it_names() {
     let creation = after["creationTime"].as_f64().unwrap_or_default();
     let last_update = after["lastUpdateTime"].as_f64().unwrap_or_default();
     assert!(
-        last_update > creation,
-        "case {case:?}: expected lastUpdateTime to move past creationTime {creation}, got \
+        last_update >= creation,
+        "case {case:?}: expected lastUpdateTime not to precede creationTime {creation}, got \
          {last_update}"
     );
 

@@ -229,6 +229,8 @@ fn every_crate_that_holds_suites_keeps_exactly_one_kind_of_declaration_root() {
         "expected at least one crate to declare its suites with the macro, read none beside \
          {list_crates} on the hand-written layout"
     );
+    // A floor rather than a census: every crate that migrates to the macro layout takes one
+    // crate out of this set and puts it in `macro_crates`.
     assert!(
         list_crates > 100,
         "expected one declaration list per service crate, read {list_crates}"

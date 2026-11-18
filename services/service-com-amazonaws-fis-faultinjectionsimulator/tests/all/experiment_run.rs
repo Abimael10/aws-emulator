@@ -49,8 +49,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::experiment_lifecycle::{
-    create_template, emulator, get_experiment, send, start_experiment, stop_experiment, token,
-    FALLBACK_REGION,
+    create_template, emulator, get_experiment, poll_until_resolution_ends, send, start_experiment,
+    stop_experiment, token, FALLBACK_REGION, RESOLUTION_BUDGET,
 };
 
 /// The window the emulator compresses a modelled run into, and the span it owes a
@@ -61,6 +61,11 @@ const MIN_RUN_SPAN: Duration = Duration::from_secs(5);
 const MAX_RUN_SPAN: Duration = Duration::from_secs(15);
 /// See [`MIN_RUN_SPAN`].
 const TRANSITION_DELAY: Duration = Duration::from_millis(500);
+
+/// The granularity FIS reports a timestamp at: its members are epoch-seconds numbers with
+/// no sub-second part, so a span computed from two reported stamps is the planned one give
+/// or take this much.
+const REPORTED_GRANULARITY: Duration = Duration::from_secs(1);
 
 /// How long after the start the move to `running` must have been materialised: past
 /// [`TRANSITION_DELAY`] and well inside [`MIN_RUN_SPAN`], so every row is still running
@@ -240,23 +245,20 @@ async fn a_started_experiment_runs_and_reaches_a_terminal_status_on_the_compress
 
     // The transient `running` status is observable for EVERY row, whatever its actions
     // are: the run is at least the compressed floor long, so a client that polls a started
-    // experiment sees it.
-    tokio::time::sleep(PAST_TRANSITION).await;
+    // experiment sees it. The wait ends on the CONDITION — the start-up window closing —
+    // rather than after a fixed span, so how fast the host runs cannot decide it.
     for (row, id) in &experiments {
-        let answer = get_experiment(&router, id).await;
-        let experiment = answer.member("experiment");
+        let experiment = poll_until_resolution_ends(&router, id, RESOLUTION_BUDGET).await;
         assert_eq!(
             experiment["state"]["status"].as_str().unwrap_or_default(),
             "running",
-            "case {:?}: expected the experiment to be running, got {:?}",
-            row.case,
-            answer.body
+            "case {:?}: expected the experiment to be running, got {experiment:?}",
+            row.case
         );
         assert!(
             experiment["endTime"].is_null(),
-            "case {:?}: a running experiment has not ended, got {:?}",
-            row.case,
-            answer.body
+            "case {:?}: a running experiment has not ended, got {experiment:?}",
+            row.case
         );
     }
 
@@ -305,7 +307,9 @@ async fn a_started_experiment_runs_and_reaches_a_terminal_status_on_the_compress
         }
 
         // The stamps come from the record, not from whoever looked: the run ended at the
-        // end of the compressed span after the start, and never before it began.
+        // end of the compressed span after the start, and never before it began. Both
+        // stamps are reported in whole seconds, so the difference of two of them carries up
+        // to one second of that granularity.
         let span = stamp(&experiment, "endTime") - stamp(&experiment, "startTime");
         assert!(
             span > 0.0,
@@ -313,7 +317,7 @@ async fn a_started_experiment_runs_and_reaches_a_terminal_status_on_the_compress
              in {experiment:?}",
             row.case
         );
-        let ceiling = (MAX_RUN_SPAN + TRANSITION_DELAY).as_secs_f64();
+        let ceiling = (MAX_RUN_SPAN + TRANSITION_DELAY + REPORTED_GRANULARITY).as_secs_f64();
         assert!(
             span <= ceiling,
             "case {:?}: expected the reported run to be at most {ceiling}s, got {span}s \
