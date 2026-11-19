@@ -34,22 +34,10 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_xray_awsxray::ops::get_trace_summaries::TRACE_SUMMARIES_PAGE_SIZE;
-use service_com_amazonaws_xray_awsxray::state::TRACE_PAGE_SECONDS;
 
-use super::xray_wire::{reported, reported_trace_ids, root_document, trace_id, Answer, Xray};
-
-/// One step of a query's window in the epoch seconds every instant on this wire
-/// travels as, read from the service's own statement of it so the test cannot
-/// drift from the implementation.
-#[allow(clippy::cast_precision_loss)]
-const HOUR: f64 = TRACE_PAGE_SECONDS as f64;
-
-/// An instant well in the past that falls exactly on the absolute hour grid
-/// (1_700_002_800 = 472_223 * 3600), so a case can place a window's bounds on a
-/// boundary of that grid or deliberately off it — which is what shows the pages
-/// no longer follow it. Far enough behind the clock that no window below reaches
-/// the skew allowance the window check applies.
-const ALIGNED: f64 = 1_700_002_800.0;
+use super::xray_wire::{
+    reported, reported_trace_ids, root_document, trace_id, Answer, Xray, ALIGNED, HOUR,
+};
 
 /// The refusal message of an answer, or the empty string.
 fn said(answer: &Answer) -> &str {

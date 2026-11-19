@@ -17,6 +17,7 @@ use service_com_amazonaws_xray_awsxray::state::destination_switch::{
     SPANS_DELIVERY_ACTION, XRAY_SERVICE_PRINCIPAL,
 };
 use service_com_amazonaws_xray_awsxray::state::span_delivery::SPANS_LOG_GROUP;
+use service_com_amazonaws_xray_awsxray::state::TRACE_PAGE_SECONDS;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// One emulator with an empty store.
@@ -32,6 +33,24 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// neither STS nor IAM holds a record for, which is the position the account's own
 /// published credential is in.
 pub const DEFAULT_ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
+
+/// One step of a trace query's window, in the epoch seconds every instant on
+/// this wire travels as, read from the service's own statement of it so no
+/// suite can drift from the implementation.
+#[allow(clippy::cast_precision_loss)]
+pub const HOUR: f64 = TRACE_PAGE_SECONDS as f64;
+
+/// An instant well in the past that falls exactly on the absolute hour grid
+/// (1_700_002_800 = 472_223 * 3600), so a case can place a window's bounds on a
+/// boundary of that grid or deliberately off it. Far enough behind the clock
+/// that no window a suite builds from it reaches the skew allowance the window
+/// check applies.
+///
+/// A window built from this instant is read from NO clock, so a query over it is
+/// the same query however long the host takes between two calls — which is what
+/// a walk of its pages needs, a pagination token being a cursor into the query
+/// that issued it, the window included.
+pub const ALIGNED: f64 = 1_700_002_800.0;
 
 /// What one call answered.
 #[derive(Debug)]

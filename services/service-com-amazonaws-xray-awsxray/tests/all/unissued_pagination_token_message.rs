@@ -21,6 +21,13 @@
 //! string). A token the service DID issue still pages, so the refusal is about
 //! tokens this service cannot interpret and not about paging at all.
 //!
+//! That last part is asserted over a query whose window is a FIXED pair of
+//! instants reused on every page, because a token of this read is a cursor into
+//! the query that issued it — the window included. A walk that re-reads the
+//! clock for each page asks about a window that has moved, which is a different
+//! query, so what it gets back would depend on how much time passed between two
+//! calls rather than on the rule.
+//!
 //! `BatchGetTraces` is not a row: it serves every id one call carries, so it
 //! hands out no cursor and refuses ANY token for being a token at all rather
 //! than for not being one it issued (see `trace_id_list_reads.rs`).
@@ -30,7 +37,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_xray_awsxray::ops::get_trace_summaries::TRACE_SUMMARIES_PAGE_SIZE;
 use service_com_amazonaws_xray_awsxray::state::invalid_next_token_message;
 
-use super::xray_wire::{array, root_document, trace_id, Answer, Xray};
+use super::xray_wire::{
+    reported, reported_trace_ids, root_document, summaries_body, trace_id, Answer, Xray, ALIGNED,
+    HOUR,
+};
 
 /// Now, in the epoch seconds every timestamp on this wire travels as.
 fn now() -> f64 {
@@ -321,56 +331,139 @@ async fn a_cursor_shaped_token_outside_the_query_is_worded_the_same_way() {
 // 4. A token this service DID issue still pages
 // =============================================================================
 
-#[tokio::test]
-async fn a_token_this_service_issued_still_resumes_the_query() {
-    let xray = Xray::new();
+/// The `EndTime` every case below queries, and the instant the traces it seeds
+/// are placed relative to: the harness's fixed instant plus ten minutes, so the
+/// window a case asks about falls off the absolute hour grid as well as off the
+/// clock.
+///
+/// Read from no clock, so one query's window is the same window on every one of
+/// its pages — which is what a paginator sends, since a token is a cursor into
+/// the query that issued it — and what the walk below yields is a function of
+/// the window and the stored traces alone, never of how much time passed
+/// between two calls.
+const QUERY_END: f64 = ALIGNED + 600.0;
 
-    // One more trace than a page carries, so the first page is truncated and
-    // the service issues a token of its own.
-    let total = TRACE_SUMMARIES_PAGE_SIZE + 2;
-    let mut expected: Vec<String> = Vec::new();
-    for index in 1..=total {
-        let id = trace_id(u32::try_from(index).expect("the index fits"));
-        let document = root_document(
-            &format!("{index:016x}"),
-            &id,
-            "svc",
-            now() - 60.0,
-            Some(now() - 59.0),
-        )
-        .to_string();
-        let put = xray.put_segments(&[document]).await;
-        assert_eq!(
-            put.status, 200,
-            "case {id:?}: seeding the trace must succeed, got {put:?}"
-        );
-        expected.push(id);
-    }
-    expected.sort();
+/// One query whose pages are walked with the tokens the service itself issued.
+struct PagingCase {
+    label: &'static str,
+    /// How many traces each STEP of the window holds, counted back from the end
+    /// of the window: `per_step[0]` is the step the window ends in, which is
+    /// the first page. Its length is how many steps wide the window is.
+    per_step: Vec<usize>,
+}
 
-    let mut seen: Vec<String> = Vec::new();
-    let mut token: Option<String> = None;
-    let mut pages = 0;
-    loop {
-        let page = xray.summaries(now() - 3_600.0, now(), token.as_deref()).await;
-        assert_eq!(
-            page.status, 200,
-            "case page {pages}: an issued token must resume the query, got {page:?}"
-        );
-        seen.extend(
-            array(&page.body, "TraceSummaries")
-                .iter()
-                .filter_map(|summary| summary.get("Id").and_then(Value::as_str))
-                .map(str::to_string),
-        );
-        token = page.get("NextToken").as_str().map(str::to_string);
-        pages += 1;
-        if token.is_none() || pages > total {
-            break;
+/// The queries walked below. The rows differ along what the rule generalises
+/// over: how many traces one step holds relative to the page the service serves
+/// a step in ([`TRACE_SUMMARIES_PAGE_SIZE`]) — fewer, exactly a page, one more,
+/// more than two pages — how many STEPS the window is wide, and therefore which
+/// kind of token the walk resumes from: a cursor inside a step, a step before
+/// the one just served, or both in one walk.
+fn paging_cases() -> Vec<PagingCase> {
+    vec![
+        PagingCase {
+            label: "one step holding fewer traces than a page",
+            per_step: vec![TRACE_SUMMARIES_PAGE_SIZE - 1],
+        },
+        PagingCase {
+            label: "one step holding exactly a page",
+            per_step: vec![TRACE_SUMMARIES_PAGE_SIZE],
+        },
+        PagingCase {
+            label: "one step holding one trace more than a page",
+            per_step: vec![TRACE_SUMMARIES_PAGE_SIZE + 1],
+        },
+        PagingCase {
+            label: "one step holding more than two pages",
+            per_step: vec![TRACE_SUMMARIES_PAGE_SIZE * 2 + 1],
+        },
+        PagingCase {
+            label: "three steps, one of them holding more than a page",
+            per_step: vec![2, TRACE_SUMMARIES_PAGE_SIZE + 2, 1],
+        },
+        PagingCase {
+            label: "three steps, the middle one holding nothing",
+            per_step: vec![1, 0, TRACE_SUMMARIES_PAGE_SIZE],
+        },
+    ]
+}
+
+/// How many pages the walk takes: one per step of the window — the query pages
+/// on through a step that held nothing — and as many as it takes for a step
+/// holding more summaries than one page carries.
+fn expected_pages(per_step: &[usize]) -> usize {
+    per_step
+        .iter()
+        .map(|held| held.div_ceil(TRACE_SUMMARIES_PAGE_SIZE).max(1))
+        .sum()
+}
+
+/// Store the traces `case` describes, and answer their ids in the order the
+/// pages of its query must report them: step by step from the end of the window
+/// backwards, and inside one step in trace-id order.
+///
+/// Ids are handed out in that same order, so the expectation is the seeding
+/// order; each trace sits half a minute before the end of its own step, well
+/// clear of both boundaries of it.
+async fn seed_steps(xray: &Xray, case: &PagingCase) -> Vec<String> {
+    let mut stored: Vec<String> = Vec::new();
+    for (step, held) in case.per_step.iter().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        let start = QUERY_END - (step as f64) * HOUR - 30.0;
+        for _ in 0..*held {
+            let index = stored.len() + 1;
+            let id = trace_id(u32::try_from(index).expect("the index fits"));
+            let document =
+                root_document(&format!("{index:016x}"), &id, "svc", start, Some(start + 0.5))
+                    .to_string();
+            let put = xray.put_segments(&[document]).await;
+            assert_eq!(
+                put.status,
+                200,
+                "case {:?}: seeding {id:?} at {start} must succeed, got {put:?}",
+                case.label
+            );
+            stored.push(id);
         }
     }
-    assert_eq!(
-        seen, expected,
-        "paging with the tokens this service issued must yield every trace once, got {seen:?}"
-    );
+    stored
+}
+
+#[tokio::test]
+async fn a_token_this_service_issued_still_resumes_the_query() {
+    for case in paging_cases() {
+        let label = case.label;
+        let xray = Xray::new();
+        let stored = seed_steps(&xray, &case).await;
+        #[allow(clippy::cast_precision_loss)]
+        let start = QUERY_END - (case.per_step.len() as f64) * HOUR;
+
+        // Every page of the walk asks about THAT window, with only the token
+        // the previous page handed out changing, and the walk stops when the
+        // service stops issuing one.
+        let pages = xray
+            .trace_summary_pages(&summaries_body(start, QUERY_END, None))
+            .await;
+
+        let seen = reported_trace_ids(&pages);
+        assert_eq!(
+            seen, stored,
+            "case {label:?}: paging with the tokens this service issued must yield every trace \
+             once, got {seen:?}"
+        );
+        let due = expected_pages(&case.per_step);
+        assert_eq!(
+            pages.len(),
+            due,
+            "case {label:?}: expected {due} pages, got {}",
+            pages.len()
+        );
+        for (position, page) in pages.iter().enumerate() {
+            let ids = reported(page);
+            assert!(
+                ids.len() <= TRACE_SUMMARIES_PAGE_SIZE,
+                "case {label:?}: page {position} carries at most {TRACE_SUMMARIES_PAGE_SIZE} \
+                 summaries, got {ids:?}"
+            );
+        }
+    }
 }
