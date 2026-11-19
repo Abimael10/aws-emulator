@@ -34,6 +34,11 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDTEST/20260101/us-east-1/iotdata/aws4_request, \
      SignedHeaders=host, Signature=0000";
 
+/// The envelope member carrying the per-request correlation id this data plane mints for
+/// every response it writes. Minted per call, so it is the one member of a response that
+/// no assertion may read a request value, a byte count or a bound out of.
+pub(crate) const TRACE_ID: &str = "traceId";
+
 /// One HTTP answer, reduced to what these tests assert on. Shared with the sibling
 /// suites in this target, which drive the same service over the same router.
 pub(crate) struct Answer {
@@ -55,6 +60,27 @@ impl Answer {
                 String::from_utf8_lossy(&self.body)
             )
         })
+    }
+
+    /// This response body, rendered WITHOUT the per-request correlation id — what to
+    /// assert the ABSENCE of a value against.
+    ///
+    /// `traceId` is minted per call and is not a function of the request (see the
+    /// envelope suite), so it may carry any decimal or hexadecimal string by chance: it
+    /// is 32 hexadecimal characters, and every decimal digit is one of them. A
+    /// whole-body substring search for a number — a byte count, a bound, a value the
+    /// request carried — therefore passes or fails by which id the call happened to
+    /// mint, which is not the behaviour under test. The members the SERVICE composes
+    /// (`__type` and `message`) are what such an assertion belongs on, and they are
+    /// what this renders.
+    pub(crate) fn body_without_trace_id(&self) -> String {
+        match self.json() {
+            Value::Object(mut members) => {
+                members.remove(TRACE_ID);
+                Value::Object(members).to_string()
+            }
+            other => other.to_string(),
+        }
     }
 
     /// The modelled error code, which restJson1 carries in `__type`.

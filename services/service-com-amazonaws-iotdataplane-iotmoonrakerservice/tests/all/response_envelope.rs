@@ -20,6 +20,13 @@
 //!   spaced the request out with, change neither the size reported nor the verdict. The
 //!   verdict on a document's size is the SERVICE's at every size: no ceiling of the
 //!   emulator's own answers it first, however far past the quota the entity is.
+//! * The envelope is a function of the request and the stored state ALONE, except for
+//!   `traceId`: the same request answered again carries the same `message`, and only
+//!   the id differs. So what the service reports — and what it must NOT report — is
+//!   asserted on the members it composes (`__type`, `message`), never searched for
+//!   across the whole body: the id is minted per call out of 32 hexadecimal
+//!   characters, and every decimal digit is one, so a number looked for in the whole
+//!   body is also being looked for in an id that is different on every call.
 //!
 //! Each table row varies what the rule generalises over — operation, status, condition,
 //! shadow naming, topic form, payload form, document size, whitespace — and no row is
@@ -429,10 +436,12 @@ async fn every_modelled_failure_answers_in_the_service_message_and_trace_id_enve
             &case.message,
         );
         // Nothing the emulator knows internally leaks into the service's text: no
-        // parser diagnostic, no stored version, no store capacity.
+        // parser diagnostic, no stored version, no store capacity. Asserted on the
+        // members the service composed, not on the whole body (see
+        // `Answer::body_without_trace_id`).
         for leak in ["line 1", "column", "expects version", "this emulator"] {
             assert!(
-                !case.message.contains(leak) && !answer.json().to_string().contains(leak),
+                !case.message.contains(leak) && !answer.body_without_trace_id().contains(leak),
                 "case {:?}: the message leaks {leak:?}: {}",
                 case.name,
                 String::from_utf8_lossy(&answer.body)
@@ -675,29 +684,34 @@ fn state_bytes(document: &Value) -> usize {
         .sum()
 }
 
-/// The document `form` renders whose STATE is exactly `bytes` long.
-fn document_with_state_bytes(form: &DocumentForm, bytes: usize) -> Value {
-    let base = state_bytes(&(form.render)(0));
-    assert!(
-        bytes >= base,
-        "form {:?}: a document's state cannot be smaller than its own frame ({base} bytes)",
-        form.name
-    );
-    let document = (form.render)(bytes - base);
-    assert_eq!(
-        state_bytes(&document),
-        bytes,
-        "form {:?}: the test document's state must be {bytes} bytes",
-        form.name
-    );
-    document
+/// The size the over-size rejection REPORTS, read out of the `message` member the
+/// service composed — the one member that carries the service's own text. The template
+/// is `Json document too large.  Size is <size>, max allowed: <max>`, so the size is the
+/// number between the two fixed halves of it.
+fn reported_document_size(case: &str, answer: &Answer) -> usize {
+    let message = answer
+        .json()
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: the body carries no message: {}", answer.json()))
+        .to_string();
+    let reported = message
+        .split_once("Size is ")
+        .and_then(|(_, tail)| tail.split_once(','))
+        .map(|(size, _)| size.to_string())
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected the over-size template, got {message:?}")
+        });
+    reported.parse().unwrap_or_else(|error| {
+        panic!("case {case:?}: expected a size in {message:?}, got {reported:?}: {error}")
+    })
 }
 
-#[tokio::test]
-async fn the_reported_document_size_is_the_state_the_document_carries() {
-    let harness = Harness::new();
-
-    let forms = [
+/// Every form a client may send one state document in, each putting a DIFFERENT number
+/// of bytes on the wire for the same state: one section, both, a nested one, framing
+/// beside the state, and the same document spaced out.
+fn document_forms() -> [DocumentForm; 5] {
+    [
         DocumentForm {
             name: "one state section",
             render: one_section,
@@ -723,7 +737,32 @@ async fn the_reported_document_size_is_the_state_the_document_carries() {
             render: one_section,
             serialize: pretty,
         },
-    ];
+    ]
+}
+
+/// The document `form` renders whose STATE is exactly `bytes` long.
+fn document_with_state_bytes(form: &DocumentForm, bytes: usize) -> Value {
+    let base = state_bytes(&(form.render)(0));
+    assert!(
+        bytes >= base,
+        "form {:?}: a document's state cannot be smaller than its own frame ({base} bytes)",
+        form.name
+    );
+    let document = (form.render)(bytes - base);
+    assert_eq!(
+        state_bytes(&document),
+        bytes,
+        "form {:?}: the test document's state must be {bytes} bytes",
+        form.name
+    );
+    document
+}
+
+#[tokio::test]
+async fn the_reported_document_size_is_the_state_the_document_carries() {
+    let harness = Harness::new();
+
+    let forms = document_forms();
 
     for (form_index, form) in forms.iter().enumerate() {
         // The published bound, one byte either side of it, and well past it. Each form
@@ -780,15 +819,23 @@ async fn the_reported_document_size_is_the_state_the_document_carries() {
                          {MAX_DOCUMENT_BYTES}"
                     ),
                 );
-                // The framing the document was sent in is not part of the size.
+                // The framing the document was sent in is not part of the size: the
+                // number the service reports is the state it measured, whatever number
+                // of bytes that state arrived in. Read from the `message` member the
+                // service composed — never searched for across the whole body, which
+                // also carries the correlation id the call minted.
+                let reported = reported_document_size(&case, &answer);
+                assert_eq!(
+                    reported, state_size,
+                    "case {case:?}: expected the reported size to be the state's \
+                     {state_size} bytes, got {reported}"
+                );
                 assert!(
                     entity_bytes == state_size
-                        || !answer
-                            .json()
-                            .to_string()
-                            .contains(&entity_bytes.to_string()),
+                        || !answer.body_without_trace_id().contains(&entity_bytes.to_string()),
                     "case {case:?}: the reported size must not be the entity's {entity_bytes} \
-                     bytes"
+                     bytes, got {reported} in body {}",
+                    answer.body_without_trace_id()
                 );
             }
         }
@@ -851,5 +898,77 @@ async fn the_reported_document_size_is_the_state_the_document_carries() {
         Some(1),
         "expected the refused update to have changed nothing, got {}",
         read.json()
+    );
+}
+
+/// How many times each framing is sent again below. Enough repeats that the ids this
+/// data plane mints differ widely across the run, so an envelope that varied with the
+/// id — rather than with the state the service measured — is caught.
+const REPEATS: usize = 8;
+
+#[tokio::test]
+async fn the_over_size_envelope_varies_only_in_the_id_the_call_mints() {
+    let harness = Harness::new();
+
+    // Every framing carries the SAME state, one byte past the quota: a different number
+    // of bytes on the wire, a different node layout, a different amount of whitespace —
+    // and the same state for the service to measure.
+    let forms = document_forms();
+    let state_size = MAX_DOCUMENT_BYTES + 1;
+    let expected = format!(
+        "Json document too large.  Size is {state_size}, max allowed: {MAX_DOCUMENT_BYTES}"
+    );
+
+    let mut trace_ids: Vec<String> = Vec::new();
+    let mut composed: Option<String> = None;
+    for form in &forms {
+        let body = (form.serialize)(&document_with_state_bytes(form, state_size));
+        for repeat in 0..REPEATS {
+            let case = format!("{}, sent again ({repeat})", form.name);
+            let answer = harness
+                .update("over-size-thing", None, body.clone())
+                .await;
+            trace_ids.push(assert_failure_envelope(
+                &case,
+                &answer,
+                413,
+                "RequestEntityTooLargeException",
+                &expected,
+            ));
+            // What the service COMPOSED is a function of the state it measured: the
+            // same two members, byte for byte, for every framing of that state and on
+            // every call. Only the id the call minted is new, and it is the one member
+            // left out of this comparison.
+            let members = answer.body_without_trace_id();
+            match &composed {
+                None => composed = Some(members),
+                Some(first) => assert_eq!(
+                    &members, first,
+                    "case {case:?}: expected the envelope the service composed to be \
+                     {first}, got {members}"
+                ),
+            }
+        }
+    }
+
+    // The ids are the one thing that does differ: one per call, never repeated.
+    let mut distinct = trace_ids.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        trace_ids.len(),
+        "expected one distinct traceId per call, got {} for {} calls",
+        distinct.len(),
+        trace_ids.len()
+    );
+
+    // None of it was stored: a refused update leaves the shadow name holding nothing.
+    let read = harness.get_shadow("over-size-thing", None).await;
+    assert_eq!(
+        read.status, 404,
+        "expected the refused updates to have stored no shadow, got {} with body {}",
+        read.status,
+        String::from_utf8_lossy(&read.body)
     );
 }

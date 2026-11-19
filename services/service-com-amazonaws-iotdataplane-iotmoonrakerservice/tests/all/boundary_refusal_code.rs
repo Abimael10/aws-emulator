@@ -25,7 +25,10 @@
 //!   every operation.
 //! * No refusal carries anything of the request: not the member at fault, not the bound it
 //!   crossed, and not the value the caller sent. Every one of them carries the `traceId`
-//!   member beside `message`.
+//!   member beside `message`. That absence is asserted on the members the service COMPOSED,
+//!   not on the whole body: `traceId` is minted per call out of 32 hexadecimal characters,
+//!   and every decimal digit is one, so a short value looked for in the whole body is also
+//!   being looked for in an id that is different on every call.
 //!
 //! The table spans what the rules generalise over — which operation, which member, how the
 //! member is bound (path label, query parameter), and which kind of constraint (length,
@@ -561,8 +564,11 @@ async fn a_constraint_refusal_carries_this_services_own_error_code() {
             case.code,
             answer.error_type
         );
+        // Asserted on the members the service composed, not on the whole body: the
+        // body also carries the id this call minted, which no absence assertion may
+        // read a value out of (see `Answer::body_without_trace_id`).
         assert!(
-            !String::from_utf8_lossy(&answer.body).contains("ValidationException"),
+            !answer.body_without_trace_id().contains("ValidationException"),
             "case {:?}: ValidationException is not a shape this service returns, got {}",
             case.name,
             String::from_utf8_lossy(&answer.body)
@@ -581,10 +587,10 @@ async fn a_constraint_refusal_carries_this_services_own_error_code() {
         );
         if let Some(value) = &case.value {
             assert!(
-                !String::from_utf8_lossy(&answer.body).contains(value.as_str()),
+                !answer.body_without_trace_id().contains(value.as_str()),
                 "case {:?}: the refusal must not echo the value the request carried, got {}",
                 case.name,
-                String::from_utf8_lossy(&answer.body)
+                answer.body_without_trace_id()
             );
         }
         // Every refusal body carries the correlation id this plane writes beside `message`,
