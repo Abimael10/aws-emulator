@@ -16,6 +16,12 @@
 //! the pro forma amount; it writes nothing, so a later read sees exactly what the first
 //! one saw.
 //!
+//! Every group of that breakdown the request itself enumerates is a row: the billing group
+//! as a whole when `GroupBy` names nothing, and each billing period the range covers when
+//! it names `BILLING_PERIOD` — reported with its all-zero amounts where the group holds no
+//! charge there. The products the charges are presented under are the one attribute nothing
+//! enumerates, so that breakdown has the rows the stored charges name.
+//!
 //! The rows span what the rule generalises over rather than one call: the charge kind of
 //! an item (flat / percentage / a percentage of a percentage / a percentage of the
 //! billing group), its type (fee / credit), its value (zero, fractional, whole), how many
@@ -624,8 +630,8 @@ async fn the_proforma_cost_is_the_signed_sum_of_the_custom_line_items_in_effect(
 }
 
 /// RULE: a report grouped by billing period reports one row per period of the requested
-/// range that the group has a charge in, each carrying that period's own charges and the
-/// period as its attribute in the canonical spelling.
+/// range — the periods the half-open range enumerates — each carrying that period's own
+/// charges and the period as its attribute in the canonical spelling.
 #[tokio::test]
 async fn a_report_grouped_by_billing_period_reports_each_period_of_the_range() {
     let em = Emulator::new();
@@ -1098,4 +1104,344 @@ async fn a_report_writes_nothing_so_a_later_read_sees_the_same_summary() {
         "case after four reads: expected the group's one row, got {rows:?}"
     );
     assert_summary(&rows[0], &group, 72.0, "after four reads");
+}
+
+/// One row of the table of [`a_billing_period_breakdown_reports_every_period_of_the_range`]:
+/// what the billing group holds, the range the report is asked over, and the pro forma cost
+/// each period of that range carries.
+struct PeriodRowsCase {
+    case: &'static str,
+    /// The group's name, in the characters the modelled `BillingGroupName` pattern
+    /// `^[a-zA-Z0-9_\+=\.\-@]+$` allows
+    /// (`smithy_query(query="shape",shape="BillingGroupName")`).
+    name: &'static str,
+    /// The create of each custom line item the group holds, beside the members every
+    /// create needs.
+    items: Vec<Value>,
+    /// The range the request names, or `None` for a request that names none and so asks
+    /// about the billing period the call is made in.
+    range: Option<(String, String)>,
+    /// `(the billing period the row is for, its pro forma cost)` — one entry per period
+    /// the requested range covers, in the order the rows are due.
+    expected: Vec<(String, f64)>,
+}
+
+/// A report request naming `group`, the range `range` (no range at all when it is `None`)
+/// and the breakdown `group_by` (no breakdown at all when it is empty).
+fn period_report(group: &str, range: Option<&(String, String)>, group_by: &[&str]) -> Value {
+    let mut request = json!({ "Arn": group });
+    if let Some((start, end)) = range {
+        request["BillingPeriodRange"] = json!({
+            "InclusiveStartBillingPeriod": start,
+            "ExclusiveEndBillingPeriod": end,
+        });
+    }
+    if !group_by.is_empty() {
+        request["GroupBy"] = json!(group_by);
+    }
+    request
+}
+
+/// The create of a flat custom line item worth `value` of type `charge_type`, in effect over
+/// the half-open billing period range `[start, end)` — from `start` on when `end` is `None`,
+/// and over every period from the create on when `start` is `None` too.
+fn flat_item(charge_type: &str, value: f64, start: Option<&str>, end: Option<&str>) -> Value {
+    let mut create = json!({
+        "ChargeDetails": { "Type": charge_type, "Flat": { "ChargeValue": value } },
+    });
+    if let Some(start) = start {
+        let mut range = json!({ "InclusiveStartBillingPeriod": start });
+        if let Some(end) = end {
+            range["ExclusiveEndBillingPeriod"] = json!(end);
+        }
+        create["BillingPeriodRange"] = range;
+    }
+    create
+}
+
+/// RULE: every group of the requested breakdown whose members the REQUEST itself enumerates
+/// is a row of the margin summary, carrying the summary it has whether or not the billing
+/// group holds a charge there — so a breakdown by billing period reports one row per period
+/// of the range, a period with no custom line item in effect being the row whose amounts are
+/// all zero, and those rows add up to the one row the same range answers with no breakdown.
+///
+/// The rows span what the rule generalises over: how many periods the range covers (one,
+/// two, three, the published maximum of twelve), where the periods carrying a charge fall in
+/// it (none of them, the first only, the last only, every one, one whose fee and credit
+/// cancel), whether the group holds any custom line item at all, whether the request names a
+/// range or leaves it implicit, how a month is spelled and whether the attribute is named
+/// once or twice.
+#[tokio::test]
+async fn a_billing_period_breakdown_reports_every_period_of_the_range() {
+    let em = Emulator::new();
+
+    // Twelve months is the longest range the model publishes ("You can specify up to 12
+    // months",
+    // `smithy_query(query="doc",shape="GetBillingGroupCostReportInput",member="BillingPeriodRange")`),
+    // and a custom line item may be created no earlier than the previous billing period, so
+    // the longest range here runs from that period on.
+    let twelve_months = Some((period(-1), period(11)));
+
+    let cases: Vec<PeriodRowsCase> = vec![
+        PeriodRowsCase {
+            case: "a group with no custom line item at all, over one month",
+            name: "Bare_One",
+            items: Vec::new(),
+            range: Some((period(0), period(1))),
+            expected: vec![(period(0), 0.0)],
+        },
+        PeriodRowsCase {
+            case: "a group with no custom line item at all, over no range at all",
+            name: "Bare_Implicit",
+            items: Vec::new(),
+            range: None,
+            expected: vec![(period(0), 0.0)],
+        },
+        PeriodRowsCase {
+            case: "a group with no custom line item at all, over the maximum twelve months",
+            name: "Bare_Twelve",
+            items: Vec::new(),
+            range: twelve_months.clone(),
+            expected: (-1..11).map(|month| (period(month), 0.0)).collect(),
+        },
+        PeriodRowsCase {
+            case: "a charge in the first of twelve periods, so eleven carry none",
+            name: "First_Only",
+            items: vec![flat_item("FEE", 10.0, Some(&period(-1)), Some(&period(0)))],
+            range: twelve_months.clone(),
+            expected: std::iter::once((period(-1), 10.0))
+                .chain((0..11).map(|month| (period(month), 0.0)))
+                .collect(),
+        },
+        PeriodRowsCase {
+            case: "a charge in the last of two periods, so the first carries none",
+            name: "Last_Only",
+            items: vec![flat_item("FEE", 7.5, None, None)],
+            range: Some((period(-1), period(1))),
+            expected: vec![(period(-1), 0.0), (period(0), 7.5)],
+        },
+        PeriodRowsCase {
+            case: "a charge in every one of three periods",
+            name: "Every_Period",
+            items: vec![flat_item("FEE", 3.0, Some(&period(-1)), None)],
+            range: Some((period(-1), period(2))),
+            expected: vec![(period(-1), 3.0), (period(0), 3.0), (period(1), 3.0)],
+        },
+        PeriodRowsCase {
+            case: "a period whose fee and credit cancel, beside one with no charge at all",
+            name: "Cancelled.Charge",
+            items: vec![
+                flat_item("FEE", 5.0, Some(&period(-1)), Some(&period(0))),
+                flat_item("CREDIT", 5.0, Some(&period(-1)), Some(&period(0))),
+            ],
+            range: Some((period(-1), period(1))),
+            expected: vec![(period(-1), 0.0), (period(0), 0.0)],
+        },
+        PeriodRowsCase {
+            case: "a range whose months are spelled without their leading zero",
+            name: "One@Digit",
+            items: vec![flat_item("FEE", 4.0, Some(&period(-1)), Some(&period(0)))],
+            range: Some((one_digit_month(&period(-1)), one_digit_month(&period(2)))),
+            expected: vec![(period(-1), 4.0), (period(0), 0.0), (period(1), 0.0)],
+        },
+    ];
+
+    for case in cases {
+        let group = em.billing_group(case.name).await;
+        for (index, create) in case.items.iter().enumerate() {
+            em.custom_line_item(
+                &group,
+                &format!("{}item{index}", case.name),
+                create.clone(),
+            )
+            .await;
+        }
+
+        // Naming the attribute twice breaks the summary down no further, so both spellings
+        // of this breakdown are due the same rows.
+        for group_by in [
+            vec!["BILLING_PERIOD"],
+            vec!["BILLING_PERIOD", "BILLING_PERIOD"],
+        ] {
+            let label = format!("{} grouped by {} attribute(s)", case.case, group_by.len());
+            let request = period_report(&group, case.range.as_ref(), &group_by);
+            let rows = em.rows(&label, request.clone()).await;
+            assert_eq!(
+                rows.len(),
+                case.expected.len(),
+                "case {label:?}: expected one row per period of the requested range, got \
+                 {rows:?}"
+            );
+            for (row, (billing_period, proforma)) in rows.iter().zip(&case.expected) {
+                let row_case = format!("{label}: the {billing_period} row");
+                assert_eq!(
+                    attributes(row),
+                    vec![("BILLING_PERIOD".to_string(), billing_period.clone())],
+                    "case {row_case:?}: expected the canonical period as the row's one \
+                     attribute, got {row}"
+                );
+                assert_summary(row, &group, *proforma, &row_case);
+            }
+
+            // The rows a period with no charge is reported with are not state: the read
+            // writes nothing, so the same request answers the same thing again.
+            let (first_status, first) = em.report(request.clone()).await;
+            let (second_status, second) = em.report(request).await;
+            assert_eq!(
+                (first_status, &first),
+                (second_status, &second),
+                "case {label:?}: the report writes nothing, so a second read must answer \
+                 the same; got {first_status} with {first} then {second_status} with \
+                 {second}"
+            );
+        }
+
+        // The same range with NO breakdown is the ONE row those period rows add up to.
+        let label = format!("{} with no breakdown", case.case);
+        let whole = em
+            .rows(&label, period_report(&group, case.range.as_ref(), &[]))
+            .await;
+        assert_eq!(
+            whole.len(),
+            1,
+            "case {label:?}: a report asking for no breakdown is one row, got {whole:?}"
+        );
+        let total: f64 = case.expected.iter().map(|(_, proforma)| proforma).sum();
+        assert_summary(&whole[0], &group, total, &label);
+    }
+}
+
+/// One expected row of a breakdown: its `Attributes` as `(Key, Value)` pairs in response
+/// order, and the pro forma cost it carries.
+type ExpectedRow = (Vec<(String, String)>, f64);
+
+/// One row of the table of
+/// [`a_product_breakdown_reports_only_the_products_the_charges_name`]: the billing group
+/// read, the breakdown it is read under and the rows that breakdown is due.
+struct ProductRowsCase {
+    case: &'static str,
+    group: String,
+    group_by: Vec<&'static str>,
+    expected: Vec<ExpectedRow>,
+}
+
+/// RULE's boundary: the products charges are presented under are the one breakdown attribute
+/// a request does NOT enumerate, so a breakdown naming `PRODUCT_NAME` reports exactly the
+/// products the stored charges name — no row for a period that holds no charge, and no row
+/// at all for a group that holds none — while the same range under `BILLING_PERIOD` alone
+/// still reports every period of it.
+#[tokio::test]
+async fn a_product_breakdown_reports_only_the_products_the_charges_name() {
+    let em = Emulator::new();
+
+    // Two groups over the same two-month range: one holding nothing at all, one charged in
+    // the FIRST of the two periods under the product its presentation details name.
+    let bare = em.billing_group("productsbare").await;
+    let charged = em.billing_group("productscharged").await;
+    em.custom_line_item(
+        &charged,
+        "storageonce",
+        json!({
+            "ChargeDetails": { "Type": "FEE", "Flat": { "ChargeValue": 9.0 } },
+            "PresentationDetails": { "Service": "S3" },
+            "BillingPeriodRange": {
+                "InclusiveStartBillingPeriod": period(-1),
+                "ExclusiveEndBillingPeriod": period(0),
+            },
+        }),
+    )
+    .await;
+    let range = Some((period(-1), period(1)));
+
+    let cases: Vec<ProductRowsCase> = vec![
+        ProductRowsCase {
+            case: "a chargeless group broken down by product name",
+            group: bare.clone(),
+            group_by: vec!["PRODUCT_NAME"],
+            expected: Vec::new(),
+        },
+        ProductRowsCase {
+            case: "a chargeless group broken down by billing period and product name",
+            group: bare.clone(),
+            group_by: vec!["BILLING_PERIOD", "PRODUCT_NAME"],
+            expected: Vec::new(),
+        },
+        ProductRowsCase {
+            case: "a chargeless group broken down by billing period",
+            group: bare.clone(),
+            group_by: vec!["BILLING_PERIOD"],
+            expected: vec![
+                (vec![("BILLING_PERIOD".to_string(), period(-1))], 0.0),
+                (vec![("BILLING_PERIOD".to_string(), period(0))], 0.0),
+            ],
+        },
+        ProductRowsCase {
+            case: "a group charged in one period, broken down by product name",
+            group: charged.clone(),
+            group_by: vec!["PRODUCT_NAME"],
+            expected: vec![(vec![("PRODUCT_NAME".to_string(), "S3".to_string())], 9.0)],
+        },
+        ProductRowsCase {
+            case: "a group charged in one period, broken down by period and product name",
+            group: charged.clone(),
+            group_by: vec!["BILLING_PERIOD", "PRODUCT_NAME"],
+            expected: vec![(
+                vec![
+                    ("BILLING_PERIOD".to_string(), period(-1)),
+                    ("PRODUCT_NAME".to_string(), "S3".to_string()),
+                ],
+                9.0,
+            )],
+        },
+        ProductRowsCase {
+            case: "a group charged in one period, broken down by billing period",
+            group: charged.clone(),
+            group_by: vec!["BILLING_PERIOD"],
+            expected: vec![
+                (vec![("BILLING_PERIOD".to_string(), period(-1))], 9.0),
+                (vec![("BILLING_PERIOD".to_string(), period(0))], 0.0),
+            ],
+        },
+    ];
+
+    for case in cases {
+        let rows = em
+            .rows(
+                case.case,
+                period_report(&case.group, range.as_ref(), &case.group_by),
+            )
+            .await;
+        assert_eq!(
+            rows.len(),
+            case.expected.len(),
+            "case {:?}: expected {} row(s), got {rows:?}",
+            case.case,
+            case.expected.len()
+        );
+        for (row, (row_attributes, proforma)) in rows.iter().zip(&case.expected) {
+            let row_case = format!("{}: the {row_attributes:?} row", case.case);
+            assert_eq!(
+                &attributes(row),
+                row_attributes,
+                "case {row_case:?}: expected those attributes in the requested order, got \
+                 {row}"
+            );
+            assert_summary(row, &case.group, *proforma, &row_case);
+        }
+    }
+
+    // The product an item with no presentation details of its own presents its charges
+    // under is this service's own; the chargeless group has no item naming it, and the
+    // universe of products is not enumerated, so no row is invented for it.
+    let bare_products = em
+        .rows(
+            "a chargeless group's products",
+            period_report(&bare, range.as_ref(), &["PRODUCT_NAME"]),
+        )
+        .await;
+    assert!(
+        bare_products.is_empty(),
+        "case a chargeless group's products: no charge names {OWN_PRODUCT_NAME} or any \
+         other product, so no product row is due; got {bare_products:?}"
+    );
 }

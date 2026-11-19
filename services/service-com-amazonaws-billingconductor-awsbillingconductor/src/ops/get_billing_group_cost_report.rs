@@ -6,6 +6,11 @@
 //! billing periods the request's range covers — the actual Amazon Web Services charges of
 //! the group, the pro forma charges computed from the custom line items the store holds
 //! for it, and the margin between them — broken down by the attributes `GroupBy` names.
+//! Every group of that breakdown the request itself enumerates — the billing group as a
+//! whole when `GroupBy` names nothing, each billing period of the range when it names
+//! `BILLING_PERIOD` — is a row, carrying the summary it has whether or not the group holds
+//! a charge there; only the products charges are presented under, which no request
+//! enumerates, are read off the stored charges.
 //! The subject is a group that was billing in one of those periods, so a group a delete
 //! has since removed is still reported on for the periods before that delete took effect
 //! (`crate::state::billing_groups_in`).
@@ -325,13 +330,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let by_billing_period = group_by.contains(&GROUP_BY_BILLING_PERIOD);
         let by_product_name = group_by.contains(&GROUP_BY_PRODUCT_NAME);
 
-        // One row per group of the requested breakdown, ordered by its cursor key. A
-        // request that asks for no breakdown is asking about the billing group itself over
-        // the whole range, which is ONE row — reported even when the group has no charge
-        // in any of those periods, because the group's own cost is what the report is of.
+        // One row per group of the requested breakdown, ordered by its cursor key.
+        //
+        // Every group of the breakdown the REQUEST itself enumerates is one the report has
+        // an answer about, so it is reported carrying that answer — a zero amount of this
+        // service being reported as the amount it is rather than withheld
+        // (`crate::state::METERED_AWS_COST`). A request that asks for no breakdown is
+        // asking about the billing group itself over the whole range, which is ONE row;
+        // a breakdown by billing period is asking about each period of the range, which
+        // the range enumerates (`crate::state::billing_periods_in_range`), so every one of
+        // them is a row whether or not the group has a charge in it. The products charges
+        // are presented under are the one attribute a request does NOT enumerate — nothing
+        // bounds the products a group might be charged for — so a breakdown that names
+        // `PRODUCT_NAME` has the rows the stored charges name and no others.
         let mut rows: BTreeMap<String, ReportRow> = BTreeMap::new();
-        if group_by.is_empty() {
-            rows.insert(row_key(None, None), ReportRow::default());
+        if !by_product_name {
+            if by_billing_period {
+                for billing_period in &billing_periods {
+                    rows.insert(
+                        row_key(Some(billing_period), None),
+                        ReportRow {
+                            attributes: vec![Attribute {
+                                key: Some(GROUP_BY_BILLING_PERIOD.to_string()),
+                                value: Some(billing_period.clone()),
+                            }],
+                            proforma_cost: 0.0,
+                        },
+                    );
+                }
+            } else {
+                rows.insert(row_key(None, None), ReportRow::default());
+            }
         }
         for billing_period in &billing_periods {
             for (product_name, charge) in
