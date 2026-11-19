@@ -778,6 +778,25 @@ pub(super) enum Provisioner {
     /// `capacityProviderStrategy` entry each name a provider by it
     /// ([`ecs_capacity_providers`]).
     EcsCapacityProvider,
+    /// `AWS::ECS::ClusterCapacityProviderAssociations`: the capacity-provider configuration OF
+    /// one cluster, which Amazon ECS's own `PutClusterCapacityProviders` sets — the call that
+    /// "is used to associate a capacity provider with a cluster", without which no
+    /// `capacityProviderStrategy` may name one. "Ref returns the cluster name": the resource IS
+    /// that cluster's configuration, so its physical id is the cluster
+    /// ([`ecs_cluster_capacity_providers`]).
+    EcsClusterCapacityProviderAssociations,
+    /// `AWS::ECS::TaskSet`: the task set Amazon ECS's own `CreateTaskSet` creates in a service
+    /// whose deployment controller is not the ECS scheduler, `UpdateTaskSet` scales and
+    /// `DeleteTaskSet` removes. Its identity is the TRIPLE that service addresses one by — the
+    /// cluster, the service and the `id` it minted — and `Fn::GetAtt Id` reads that id, which
+    /// is the only handle every call on a task set takes ([`ecs_task_sets`]).
+    EcsTaskSet,
+    /// `AWS::ECS::PrimaryTaskSet`: which of a service's task sets "is the primary task set",
+    /// the one serving production traffic, which Amazon ECS's own
+    /// `UpdateServicePrimaryTaskSet` decides. There is one per service, so the resource's
+    /// identity is the cluster-and-service pair it is the primary task set OF
+    /// ([`ecs_task_sets`]).
+    EcsPrimaryTaskSet,
     SqsQueue,
     /// `AWS::SQS::QueuePolicy` and `AWS::SQS::QueueInlinePolicy`, which are not resources
     /// of Amazon SQS's own: each is the `Policy` ATTRIBUTE of the queues it names, so both
@@ -1326,6 +1345,11 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
         ECS_SERVICE => Some(Provisioner::EcsService),
         ecs_capacity_providers::ECS_CAPACITY_PROVIDER => Some(Provisioner::EcsCapacityProvider),
+        ecs_cluster_capacity_providers::ECS_CLUSTER_CAPACITY_PROVIDER_ASSOCIATIONS => {
+            Some(Provisioner::EcsClusterCapacityProviderAssociations)
+        }
+        ecs_task_sets::ECS_TASK_SET => Some(Provisioner::EcsTaskSet),
+        ecs_task_sets::ECS_PRIMARY_TASK_SET => Some(Provisioner::EcsPrimaryTaskSet),
         SQS_QUEUE => Some(Provisioner::SqsQueue),
         SQS_QUEUE_POLICY | SQS_QUEUE_INLINE_POLICY => Some(Provisioner::SqsQueuePolicy),
         SAGEMAKER_MODEL_PACKAGE_GROUP => Some(Provisioner::SageMakerModelPackageGroup),
@@ -1645,6 +1669,27 @@ impl Provisioner {
             // CloudFormation gives it beside the ones the declaration asks for.
             Self::EcsCapacityProvider => {
                 create_ecs_capacity_provider(ctx, region, resource, propagated).await
+            }
+            // `AWS::ECS::ClusterCapacityProviderAssociations` publishes no `Tags` property at
+            // all — the configuration is the CLUSTER's, and the cluster carries the tags — so
+            // no tags are propagated to one. The create IS the put: that one call sets the
+            // whole configuration of the cluster it addresses.
+            Self::EcsClusterCapacityProviderAssociations => {
+                put_cluster_capacity_providers(ctx, region, resource, &resource.properties).await
+            }
+            // `CreateTaskSet` takes a `tags` list of its own, so a task set a stack creates
+            // carries the tags CloudFormation gives it beside the ones the declaration asks
+            // for.
+            // BOXED, for the reason the other heavy arms of this match are: the call's future
+            // is the owning service's whole handler, which places the task set's tasks.
+            Self::EcsTaskSet => {
+                Box::pin(create_ecs_task_set(ctx, region, resource, propagated)).await
+            }
+            // `AWS::ECS::PrimaryTaskSet` publishes no `Tags` property and
+            // `UpdateServicePrimaryTaskSet` takes none: the resource is which task set of a
+            // service serves production traffic, so no tags are propagated to one.
+            Self::EcsPrimaryTaskSet => {
+                update_service_primary_task_set(ctx, region, resource, &resource.properties).await
             }
             Self::SqsQueue => create_queue(ctx, region, resource, propagated).await,
             // Neither policy type publishes a `Tags` property — a policy is an attribute of
@@ -2371,6 +2416,9 @@ impl Provisioner {
                 // that same check, so a capacity provider carries the stack's own tags
                 // without the three.
                 | Self::EcsCapacityProvider
+                // And on `CreateTaskSet`'s `tags` list too, in that same check, so a task set
+                // carries the stack's own tags without the three.
+                | Self::EcsTaskSet
                 | Self::EcrPublicRepository
                 // Amazon ECR refuses a tag key in the reserved namespace on every call
                 // that takes tags — `CreateRepository`'s `tags` and `TagResource` alike —
@@ -2768,6 +2816,14 @@ impl Provisioner {
             // read ends the wait at once.
             Self::EcsCapacityProvider => {
                 ecs_capacity_provider_readiness(ctx, region, physical_resource_id).await
+            }
+            // `PutClusterCapacityProviders` leaves the cluster's attachments
+            // `UPDATE_IN_PROGRESS` — "the available capacity or capacity providers are
+            // updating", the state a second association of the same cluster is refused in —
+            // so the resource is held open until Amazon ECS reports the update finished
+            // ([`ecs_cluster_capacity_providers::cluster_capacity_providers_readiness`]).
+            Self::EcsClusterCapacityProviderAssociations => {
+                cluster_capacity_providers_readiness(ctx, region, physical_resource_id).await
             }
             // `CreateGraph` answers the graph `CREATING` — a graph serves no query and
             // publishes no endpoint in it — and `CreateGraphSnapshot` answers the snapshot
@@ -3426,6 +3482,28 @@ impl Provisioner {
             Self::EcsService => Box::pin(update_ecs_service(ctx, region, resource, declared))
                 .await
                 .map(Some),
+            // `PutClusterCapacityProviders` sets the WHOLE capacity-provider configuration of
+            // the cluster it addresses, so a declaration stating different providers or a
+            // different default strategy is that same call with the lists the template now
+            // states — the type's update and its create alike.
+            Self::EcsClusterCapacityProviderAssociations => {
+                put_cluster_capacity_providers(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
+            // `UpdateTaskSet` changes the one property of a task set that is not fixed when it
+            // is made, which is the scale its tasks are kept at
+            // ([`ecs_task_sets::update_ecs_task_set`]).
+            Self::EcsTaskSet => {
+                Box::pin(update_ecs_task_set(ctx, region, resource, declared)).await
+            }
+            // There is one primary task set per service, so a declaration naming a different
+            // task set is `UpdateServicePrimaryTaskSet` again with the one it now names.
+            Self::EcsPrimaryTaskSet => {
+                update_service_primary_task_set(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
             // CloudWatch's own `PutMetricAlarm` is documented "Creates or updates an alarm",
             // so a changed declaration reaches that service as the configuration the
             // template now declares, under the name the alarm was created with.
@@ -3890,6 +3968,21 @@ impl Provisioner {
             Self::EcsCapacityProvider => {
                 delete_ecs_capacity_provider(ctx, region, resource).await
             }
+            // The association is REMOVED by the same put with nothing associated: "any
+            // existing capacity providers that are associated with a cluster that are omitted
+            // from a PutClusterCapacityProviders API call will be disassociated with the
+            // cluster".
+            Self::EcsClusterCapacityProviderAssociations => {
+                disassociate_cluster_capacity_providers(ctx, region, resource).await
+            }
+            // The task set is deleted by the triple Amazon ECS addresses one by, whose id is
+            // the last part of this resource's physical id.
+            Self::EcsTaskSet => Box::pin(delete_ecs_task_set(ctx, region, resource)).await,
+            // A service HAS a primary task set for as long as it has task sets at all:
+            // Amazon ECS publishes no call that un-sets one, and the task sets a stack
+            // deletes are what take it away, so there is nothing to ask of that service for
+            // the record going away.
+            Self::EcsPrimaryTaskSet => Ok(()),
             Self::SqsQueue => delete_queue(ctx, region, physical_resource_id).await,
             Self::SqsQueuePolicy => delete_queue_policy(ctx, region, resource).await,
             Self::SageMakerModelPackageGroup => {
@@ -4468,6 +4561,17 @@ mod ecs_services;
 /// service has: visible to the rest of this service's state because the type's own NAME lives
 /// here, beside the arms that provision it.
 pub(in crate::state) mod ecs_capacity_providers;
+/// The Amazon ECS CLUSTER CAPACITY PROVIDER ASSOCIATION arms: the configuration an
+/// `AWS::ECS::ClusterCapacityProviderAssociations` declares between a cluster and the providers
+/// that run its tasks. Visible to the rest of this service's state because the type's own NAME
+/// and the property its identity IS live here, beside the arms that apply it.
+pub(in crate::state) mod ecs_cluster_capacity_providers;
+/// The Amazon ECS TASK SET arms: the task set an `AWS::ECS::TaskSet` creates in a service whose
+/// deployment controller is not the ECS scheduler, and the promotion of one an
+/// `AWS::ECS::PrimaryTaskSet` declares. Visible to the rest of this service's state because the
+/// type NAMES and the identities they are known by live here, beside the arms that provision
+/// them.
+pub(in crate::state) mod ecs_task_sets;
 mod event_pipes;
 /// The Amazon EventBridge EVENT BUS arms: the bus an `AWS::Events::EventBus` declares, which
 /// the rules, policies and rule targets of the same stack resolve by name, and the grant an
@@ -4667,6 +4771,8 @@ use cloudwatch_alarms::*;
 use cloudwatch_composite_alarms::*;
 use ecs_services::*;
 use ecs_capacity_providers::*;
+use ecs_cluster_capacity_providers::*;
+use ecs_task_sets::*;
 use config_recording::*;
 use bedrock_guardrails::*;
 use bedrock_knowledge_bases::*;

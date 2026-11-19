@@ -267,6 +267,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
             "VpcId",
         ],
         ECS_SERVICE => &["Name"],
+        // "Fn::GetAtt … Id: the ID of the task set" — the `ecs-svc/` identifier Amazon ECS
+        // mints, which is the only handle every call on a task set takes. (`Ref` returns the
+        // triple that service addresses one by, not this attribute.)
+        crate::state::provisioner::ecs_task_sets::ECS_TASK_SET => {
+            &[crate::state::provisioner::ecs_task_sets::ID_ATTRIBUTE]
+        }
         ELB_LISTENER => &["ListenerArn"],
         ELB_LISTENER_RULE => &["IsDefault", "RuleArn"],
         BEDROCK_GUARDRAIL => &["GuardrailArn", "GuardrailId", "Version"],
@@ -589,6 +595,18 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // and "Ref returns the association ARN" — a template declares the cluster, the
         // namespace, the service account and the role, never the association's own id.
         || resource_type == EKS_POD_IDENTITY_ASSOCIATION
+        // An Amazon ECS TASK SET is one more: `CreateTaskSet` takes no identifier for the task
+        // set — a declaration states the cluster, the service, the task definition and the
+        // scale — and answers the `TaskSet$id` that service minted, an `ecs-svc/` identifier no
+        // naming rule could compute. That id is the last part of this type's own primary
+        // identifier, which is what its `Ref` returns
+        // ([`crate::state::provisioner::ecs_task_sets::ecs_task_set_identity`]), and the handle
+        // `DescribeTaskSets`, `UpdateTaskSet`, `DeleteTaskSet` and
+        // `UpdateServicePrimaryTaskSet$primaryTaskSet` each take. (An
+        // `AWS::ECS::PrimaryTaskSet` and an `AWS::ECS::ClusterCapacityProviderAssociations` are
+        // NOT: every part of each one's identity is a value its own declaration states, so
+        // [`composite_identity`] computes it.)
+        || resource_type == crate::state::provisioner::ecs_task_sets::ECS_TASK_SET
         // A State Manager association is one more: `CreateAssociation` takes no identifier
         // for the association — the `Name` a declaration states names the DOCUMENT the
         // association applies, and Systems Manager would refuse it as an association id —
@@ -1162,6 +1180,25 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
             APPCONFIG_VERSION_NUMBER_ATTRIBUTE,
         ],
         APPCONFIG_DEPLOYMENT => &["ApplicationId", "EnvironmentId", "DeploymentNumber"],
+        // The three Amazon ECS types whose resource is not a named entity of its own but a
+        // BINDING, each identified by the values that service's own API addresses one by: the
+        // capacity-provider configuration of a cluster by that cluster (there is one per
+        // cluster, and `PutClusterCapacityProviders` takes nothing else to address it), the
+        // primary task set of a service by the cluster and the service whose primary task set
+        // it is, and a TASK SET by the cluster, the service and the `id` Amazon ECS minted —
+        // the last of which that service mints, so [`composite_identity`] answers `None` for
+        // one (the declaration carries no `Id` to join) and the identity is built from what
+        // the create answered instead
+        // ([`crate::state::provisioner::ecs_task_sets::ecs_task_set_identity`]).
+        crate::state::provisioner::ecs_cluster_capacity_providers::ECS_CLUSTER_CAPACITY_PROVIDER_ASSOCIATIONS => {
+            crate::state::provisioner::ecs_cluster_capacity_providers::ECS_CLUSTER_CAPACITY_PROVIDER_ASSOCIATIONS_IDENTITY
+        }
+        crate::state::provisioner::ecs_task_sets::ECS_PRIMARY_TASK_SET => {
+            crate::state::provisioner::ecs_task_sets::ECS_PRIMARY_TASK_SET_IDENTITY
+        }
+        crate::state::provisioner::ecs_task_sets::ECS_TASK_SET => {
+            crate::state::provisioner::ecs_task_sets::ECS_TASK_SET_IDENTITY
+        }
         _ => &[],
     }
 }

@@ -3051,6 +3051,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     ECS_CLUSTER,
     ECS_SERVICE,
     ECS_TASK_DEFINITION,
+    crate::state::provisioner::ecs_task_sets::ECS_TASK_SET,
     EKS_CLUSTER,
     EKS_ADDON,
     EKS_NODEGROUP,

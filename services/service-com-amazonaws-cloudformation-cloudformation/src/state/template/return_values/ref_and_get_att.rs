@@ -1424,6 +1424,25 @@ pub(crate) fn return_values(
                 attributes,
             )
         }
+        // "Ref returns the ID of the task set" — which for this type is the TRIPLE Amazon ECS
+        // addresses one by, the cluster and the service it lives in and the `id` that service
+        // minted (`crate::state::provisioner::ecs_task_sets`); Fn::GetAtt: Id, that id itself.
+        // The id is Amazon ECS's own to mint — `CreateTaskSet` takes none and answers the one
+        // it assigned — so what the naming rules give the resource is the STAND-IN both are
+        // resolved against until that create has answered, exactly as the AppConfig rollout
+        // types' numbers are ([`identity_is_service_assigned`] names this type, and
+        // `super::provisioning` re-points the identity and the attribute at what Amazon ECS
+        // really answered).
+        crate::state::provisioner::ecs_task_sets::ECS_TASK_SET => {
+            attributes.insert(
+                crate::state::provisioner::ecs_task_sets::ID_ATTRIBUTE.to_string(),
+                service_assigned_document(
+                    name,
+                    crate::state::provisioner::ecs_task_sets::ID_ATTRIBUTE,
+                ),
+            );
+            (name.to_string(), attributes)
+        }
         // "Ref returns the ARN of the listener"; Fn::GetAtt: ListenerArn. A listener's ARN
         // nests inside the ARN of the load balancer its declaration names
         // (`listener/<type>/<lb>/<lb id>/<listener id>`), so it is resolved once that load

@@ -133,6 +133,19 @@ impl Provisioner {
             Self::EcsCapacityProvider => {
                 describe_ecs_capacity_provider(ctx, region, physical_resource_id).await
             }
+            // The association is the capacity-provider configuration of ONE cluster, so what
+            // is read back is that cluster — the resource's own physical id — as Amazon ECS
+            // reports it.
+            Self::EcsClusterCapacityProviderAssociations => {
+                describe_cluster_capacity_providers(ctx, region, physical_resource_id).await
+            }
+            // Amazon ECS's own read of the task set the stack created, by the triple that
+            // service addresses one by, and of the task set a service reports as its primary
+            // one.
+            Self::EcsTaskSet => Box::pin(describe_ecs_task_set(ctx, region, resource)).await,
+            Self::EcsPrimaryTaskSet => {
+                Box::pin(describe_service_primary_task_set(ctx, region, resource)).await
+            }
             Self::SqsQueue => describe_queue(ctx, region, physical_resource_id).await,
             // A policy resource's configuration is the `Policy` attribute of the queues it
             // names, which is read back from Amazon SQS as the document those queues carry
