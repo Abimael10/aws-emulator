@@ -19,6 +19,12 @@
 //! in the words every reader of an archive uses
 //! ([`crate::state::no_such_archive`]).
 //!
+//! A `KmsKeyIdentifier` is judged before any of it is applied: the key's own
+//! policy has to let this service have a data key generated under it for the
+//! archive, or the update is refused and the archive is left exactly as it was
+//! ([`crate::state::archive_encryption`]) — the same check `CreateArchive`
+//! makes.
+//!
 //! The update settles the archive as it applies it, so the call answers the
 //! archive in [`crate::state::ARCHIVE_STATE_ENABLED`] and `DescribeArchive` and
 //! `ListArchives` report that same stored state: a client waiting for a terminal
@@ -190,11 +196,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // The archive is resolved BEFORE its key is judged, so a caller naming an
+        // archive that is gone reads that rather than a verdict on the key the
+        // request carries — and the lookup gives the resource the KMS decision is
+        // taken for. The guard is taken for the lookup alone, because that
+        // decision reaches another service's store. What the clock already owed
+        // every archive — the expiry of what its retention no longer covers — is
+        // settled under the same guard, so this update is applied to the archive
+        // as it stands at this instant.
+        let resolved = {
+            let mut store = state.lock();
+            store.settle_archives(now);
+            store
+                .archive(&input.archive_name)
+                .map(|archive| (archive.arn.clone(), archive.event_source_arn.clone()))
+        };
+        let Some((archive_arn, event_source_arn)) = resolved else {
+            return Err(UpdateArchiveErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::no_such_archive(&input.archive_name)),
+                },
+            )
+            .into());
+        };
+
+        // An archive that names a customer managed key has everything it keeps
+        // encrypted under that key BY THIS SERVICE, so a key whose own policy does
+        // not admit this service is an archive that could never keep an event: the
+        // configuration is refused here rather than written and reported back as
+        // encrypted. The same check `CreateArchive` makes, so both writers of an
+        // archive's key admit exactly the same keys
+        // (`crate::state::archive_encryption`). Asked with no store of this
+        // service locked, because the decision is taken in the KMS store — and
+        // before any member of the request is applied, so a refused update leaves
+        // the archive exactly as it was.
+        if let Some(message) = input
+            .kms_key_identifier
+            .as_deref()
+            .filter(|identifier| !identifier.is_empty())
+            .and_then(|identifier| {
+                crate::state::archive_encryption::archive_key_denial(
+                    &*self.engine,
+                    &region,
+                    &crate::state::kms_key_identifier(&region, identifier),
+                    &archive_arn,
+                    &event_source_arn,
+                )
+            })
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         let mut store = state.lock();
-        // What the clock already owed every archive — the expiry of what its
-        // retention no longer covers — is settled first, so this update is
-        // applied to the archive as it stands at this instant.
-        store.settle_archives(now);
 
         let Some(archive) = store.archive_mut(&input.archive_name) else {
             return Err(UpdateArchiveErrorModeled::ResourceNotFoundException(

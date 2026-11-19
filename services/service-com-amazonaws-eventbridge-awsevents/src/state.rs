@@ -4920,6 +4920,11 @@ pub mod ecs_target;
 /// `KmsKeyIdentifier`.
 pub mod bus_encryption;
 
+/// The customer managed key an ARCHIVE is configured with, and whether that key's
+/// own policy lets this service use it — asked by every writer of an archive's
+/// `KmsKeyIdentifier`.
+pub mod archive_encryption;
+
 /// The order this service lists an enumerated type's admissible values in when a HANDLER
 /// refuses a value outside that type, beside the other refusal wording above.
 pub mod enum_value_set;
