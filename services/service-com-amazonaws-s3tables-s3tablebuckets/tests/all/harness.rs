@@ -19,6 +19,7 @@
 // reached yet is still part of the contract this file states.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aws_smithy_types::date_time::Format;
@@ -1268,6 +1269,59 @@ pub fn assert_served(reply: &Reply, operation: &str, case: &str) {
 pub fn served(reply: Reply, operation: &str, case: &str) -> Reply {
     assert_served(&reply, operation, case);
     reply
+}
+
+/// The value a tag key carries in a suite that tags a resource, derived from the
+/// key so a surviving tag's value is visibly its own. This and the three items
+/// below are the harness's ONE copy of how a suite drives and reads this
+/// service's tag surface; a suite still carrying its own copy is left to migrate
+/// with its next edit, as `table_bucket_lifecycle.rs` is for the bootstrap above.
+pub fn tag_value_of(key: &str) -> String {
+    format!("value-for-{key}")
+}
+
+/// `keys` as the tag map a write applies, and as the map a read must report.
+/// Generic over how a suite holds its keys, so one copy serves both a borrowed
+/// catalogue and an owned one.
+pub fn tag_map<Key: AsRef<str>>(keys: &[Key]) -> BTreeMap<String, String> {
+    keys.iter()
+        .map(|key| (key.as_ref().to_string(), tag_value_of(key.as_ref())))
+        .collect()
+}
+
+/// A tag map as the `tags` member of a `TagResource` request.
+pub fn tags_body(tags: &BTreeMap<String, String>) -> Value {
+    Value::Object(
+        tags.iter()
+            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+            .collect::<serde_json::Map<String, Value>>(),
+    )
+}
+
+/// The tags `ListTagsForResource` reports for `resource_arn`: the authoritative
+/// view of the resource's tag set, as a map a suite can compare whole. A resource
+/// carrying none reports no `tags` member at all, which is the empty map.
+pub async fn listed_tags(
+    emulator: &Emulator,
+    region: &str,
+    resource_arn: &str,
+    case: &str,
+) -> BTreeMap<String, String> {
+    let listed = served(
+        emulator.list_tags_for_resource(region, resource_arn).await,
+        "ListTagsForResource",
+        case,
+    );
+    listed
+        .body
+        .get("tags")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn now_seconds() -> f64 {

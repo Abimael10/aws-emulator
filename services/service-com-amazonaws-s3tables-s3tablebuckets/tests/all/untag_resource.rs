@@ -33,9 +33,9 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{json, Map, Value};
+use serde_json::json;
 
-use crate::harness::{expected_bucket_arn, Emulator, Reply};
+use crate::harness::{expected_bucket_arn, listed_tags, tag_map, tags_body, Emulator, Reply};
 
 const REGION: &str = "us-east-1";
 
@@ -165,28 +165,6 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// The value a key carries, derived from the key so a surviving tag's value is
-/// visibly its own.
-fn value_of(key: &str) -> String {
-    format!("value-for-{key}")
-}
-
-/// `keys` as the tag map a write applies, and as the map a read must report.
-fn tag_map(keys: &[String]) -> BTreeMap<String, String> {
-    keys.iter()
-        .map(|key| (key.clone(), value_of(key)))
-        .collect()
-}
-
-/// A tag map as the `tags` member of a `TagResource` request.
-fn tags_body(tags: &BTreeMap<String, String>) -> Value {
-    Value::Object(
-        tags.iter()
-            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
-            .collect::<Map<String, Value>>(),
-    )
-}
-
 /// Assert a setup call was served, and hand the reply on: the suites' one copy of that
 /// assertion, named for what this suite calls.
 fn served(reply: Reply, case: &str) -> Reply {
@@ -222,36 +200,6 @@ async fn resources(emulator: &Emulator, bucket: &str) -> (String, String) {
     )
     .text("tableARN");
     (bucket_arn, table_arn)
-}
-
-/// The tags `ListTagsForResource` reports for `resource_arn`.
-async fn listed_tags(
-    emulator: &Emulator,
-    resource_arn: &str,
-    case: &str,
-) -> BTreeMap<String, String> {
-    let listed = emulator.list_tags_for_resource(REGION, resource_arn).await;
-    assert_eq!(
-        listed.status, 200,
-        "case {case:?}: the read of {resource_arn} must be served, got {status} {body}",
-        status = listed.status,
-        body = listed.body
-    );
-    listed
-        .body
-        .get("tags")
-        .and_then(Value::as_object)
-        .map(|map| {
-            map.iter()
-                .map(|(key, value)| {
-                    (
-                        key.clone(),
-                        value.as_str().unwrap_or_default().to_string(),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Apply `tags` to `resource_arn`, asserting the write is served.
@@ -328,13 +276,13 @@ async fn untag_removes_only_the_named_keys_and_repeating_it_changes_nothing() {
             );
 
             let expected = tag_map(&test_case.expected);
-            let after = listed_tags(&emulator, &subject, &label).await;
+            let after = listed_tags(&emulator, REGION, &subject, &label).await;
             assert_eq!(
                 after, expected,
                 "case {label:?}: only the named keys may go, got {after:?}"
             );
 
-            let untouched = listed_tags(&emulator, &bystander, &label).await;
+            let untouched = listed_tags(&emulator, REGION, &bystander, &label).await;
             assert_eq!(
                 untouched, resident,
                 "case {label:?}: another resource's tags must be left alone, got {untouched:?}"
@@ -349,7 +297,7 @@ async fn untag_removes_only_the_named_keys_and_repeating_it_changes_nothing() {
                 status = again.status,
                 body = again.body
             );
-            let after_again = listed_tags(&emulator, &subject, &label).await;
+            let after_again = listed_tags(&emulator, REGION, &subject, &label).await;
             assert_eq!(
                 after_again, after,
                 "case {label:?}: a repeated removal must change nothing, got {after_again:?}"
@@ -458,7 +406,7 @@ async fn an_untag_whose_arn_reaches_no_resource_is_refused_and_removes_nothing()
 
     // Every live resource still carries the tags the refused calls named.
     for resource in [&bucket_arn, &table_arn] {
-        let after = listed_tags(&emulator, resource, "the live resources").await;
+        let after = listed_tags(&emulator, REGION, resource, "the live resources").await;
         assert_eq!(
             after, resident,
             "a refused removal must leave a live resource's tags as they were, got {after:?}"
@@ -504,7 +452,7 @@ async fn a_caller_may_not_remove_a_tag_in_the_reserved_namespace_but_the_service
                 .untag_resource(REGION, resource, &[reserved, "owner"])
                 .await;
             assert_refusal(&together, 400, "BadRequestException", RESERVED_KEY, &label);
-            let after = listed_tags(&emulator, resource, &label).await;
+            let after = listed_tags(&emulator, REGION, resource, &label).await;
             assert_eq!(
                 after.get(reserved).map(String::as_str),
                 Some("the-service"),
@@ -527,7 +475,7 @@ async fn a_caller_may_not_remove_a_tag_in_the_reserved_namespace_but_the_service
                 status = removed.status,
                 body = removed.body
             );
-            let after = listed_tags(&emulator, resource, &label).await;
+            let after = listed_tags(&emulator, REGION, resource, &label).await;
             assert!(
                 !after.contains_key(reserved),
                 "case {label:?}: the in-process removal must take the service's key, got {after:?}"
