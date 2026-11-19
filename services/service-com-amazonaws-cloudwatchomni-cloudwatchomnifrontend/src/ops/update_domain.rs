@@ -164,15 +164,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A rename onto a name another domain already holds is the conflict; a request
-        // naming the name this domain already carries is not a conflict with itself.
+        // naming the name this domain already carries is not a conflict with itself. The
+        // records themselves answer it: an account holds at most one account-scoped
+        // domain, so there is nothing to keep a second index of names in step with.
         let conflicting = input
             .name
             .as_deref()
             .and_then(|requested| {
                 store
-                    .domain_name_index
-                    .get(requested)
-                    .map(|existing_id| (requested.to_string(), existing_id.clone()))
+                    .domains
+                    .values()
+                    .find(|held| held.domain.name.as_deref() == Some(requested))
+                    .map(|held| (requested.to_string(), held.domain.domain_id.clone()))
             })
             .filter(|(_, existing_id)| *existing_id != input.domain_id);
 
@@ -206,7 +209,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // omits it. Every other member — the id, the ARN, the region, the status and
         // `createdAt` — is not in this operation's input at all, so it comes through the
         // patch untouched.
-        let previous_name = stored.domain.name.clone();
         let name = input.name.or_else(|| stored.domain.name.clone());
         let identity_providers = input
             .identity_providers
@@ -266,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         stored.domain = Domain {
-            name: name.clone(),
+            name,
             identity_providers,
             identity_provider_configuration,
             custom_endpoint_urls,
@@ -275,18 +277,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ..stored.domain.clone()
         };
         let domain = stored.domain.clone();
-
-        // The name index is what makes a duplicate name a conflict, so a rename moves the
-        // domain's entry with it: the name it released is free to be taken again, and the
-        // name it took now resolves to this domain.
-        if name != previous_name {
-            if let Some(released) = previous_name {
-                store.domain_name_index.remove(&released);
-            }
-            if let Some(taken) = name {
-                store.domain_name_index.insert(taken, input.domain_id);
-            }
-        }
 
         Ok(UpdateDomainOutput { domain })
     }

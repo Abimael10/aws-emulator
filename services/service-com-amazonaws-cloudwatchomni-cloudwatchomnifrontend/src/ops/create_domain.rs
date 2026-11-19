@@ -131,6 +131,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A domain is the ACCOUNT's single account-scoped resource, and this create is
+        // admitted only WITH the idempotency token that makes it replayable: a request
+        // that carries none is refused here, before the store is even reached, so a
+        // caller that relied on the service to reject a non-idempotent create is not
+        // left holding a domain it cannot retry for. `clientToken` is modelled optional
+        // (`@idempotencyToken`), so the boundary cannot refuse its absence and this is
+        // the only place that can.
+        let Some(client_token) = input.client_token else {
+            return Err(CreateDomainErrorModeled::ValidationException(ValidationException {
+                message: crate::state::client_token_required_message(Self::NAME),
+                error_code: None,
+            })
+            .into());
+        };
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateDomainError::from(CreateDomainErrorModeled::InternalServerException(
                 InternalServerException {
@@ -160,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // @idempotencyToken: a replay returns the record the token already created
-        // rather than minting a second one — checked BEFORE the duplicate-name
+        // rather than minting a second one — checked BEFORE the account-singleton
         // conflict, so replaying the original request is not a conflict with itself.
         //
         // The token alone decides: the rest of the request is NOT compared against the
@@ -168,41 +183,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // different members (`ClientToken`'s doc says only "Repeated requests with the
         // same token return the original result instead of creating a duplicate"), and
         // inventing one would refuse a request AWS answers.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(existing) = store
-                .create_domain_tokens
-                .get(token)
-                .and_then(|domain_id| store.domains.get(domain_id))
-            {
-                return Ok(CreateDomainOutput {
-                    domain: existing.domain.clone(),
-                });
-            }
+        if let Some(existing) = store
+            .create_domain_tokens
+            .get(&client_token)
+            .and_then(|domain_id| store.domains.get(domain_id))
+        {
+            return Ok(CreateDomainOutput {
+                domain: existing.domain.clone(),
+            });
         }
 
-        if let Some(existing_id) = store.domain_name_index.get(&input.name) {
+        // An account holds at most ONE account-scoped domain, so a create while it
+        // already holds one conflicts with that domain rather than minting a second —
+        // whatever name it asks for, and whichever Region it is signed for. The
+        // conflict is with the account's domain, so the refusal names no resource.
+        if !store.domains.is_empty() {
             return Err(CreateDomainErrorModeled::ConflictException(ConflictException {
-                message: format!("A domain named '{}' already exists.", input.name),
-                conflict_type: Some("ALREADY_EXISTS".to_string()),
-                resource_id: Some(existing_id.clone()),
-                resource_type: Some("Domain".to_string()),
+                message: crate::state::DOMAIN_ALREADY_EXISTS_FOR_ACCOUNT.to_string(),
+                conflict_type: None,
+                resource_id: None,
+                resource_type: None,
                 error_code: None,
             })
-            .into());
-        }
-
-        // The store is bounded: past its quota a create is refused rather than adding
-        // another record. `ServiceQuotaExceededException` is the modelled refusal for
-        // exactly this.
-        if store.domains.len() >= crate::state::DOMAIN_QUOTA {
-            return Err(CreateDomainErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "this account already holds the maximum of {} domains",
-                        crate::state::DOMAIN_QUOTA
-                    ),
-                },
-            )
             .into());
         }
 
@@ -230,11 +232,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         store
-            .domain_name_index
-            .insert(input.name, domain_id.clone());
-        if let Some(token) = input.client_token {
-            store.create_domain_tokens.insert(token, domain_id.clone());
-        }
+            .create_domain_tokens
+            .insert(client_token, domain_id.clone());
         store.domains.insert(
             domain_id,
             crate::state::StoredDomain {

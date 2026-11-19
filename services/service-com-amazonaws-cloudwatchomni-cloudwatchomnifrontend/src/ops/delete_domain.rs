@@ -142,12 +142,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if let Some(removed) = store.domains.remove(&input.domain_id) {
-            // Free the name for reuse, and drop the create token that minted it so a
-            // later replay of that create mints a new domain.
-            if let Some(name) = removed.domain.name.as_deref() {
-                store.domain_name_index.remove(name);
-            }
+        if store.domains.remove(&input.domain_id).is_some() {
+            // Drop the create token that minted the domain, so a later replay of that
+            // create mints a new one and the account is free to hold a domain again.
             store
                 .create_domain_tokens
                 .retain(|_, domain_id| *domain_id != input.domain_id);

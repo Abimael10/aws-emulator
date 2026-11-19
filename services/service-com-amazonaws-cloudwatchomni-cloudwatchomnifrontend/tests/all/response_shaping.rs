@@ -239,6 +239,10 @@ impl Omni {
                 CreateDomainInput {
                     name: format!("omni-{name}"),
                     identity_providers: vec!["IAM".to_string()],
+                    // The create is admitted only WITH the `clientToken` the model
+                    // declares for it; the name it is derived from is unique per
+                    // emulator, and an account holds one domain.
+                    client_token: Some(format!("token-{name}")),
                     ..Default::default()
                 },
                 &self.ctx(),
@@ -827,21 +831,25 @@ async fn a_resources_own_aggregate_members_are_reported_empty_rather_than_omitte
     ];
     for (index, (case, providers, configuration)) in domain_rows.into_iter().enumerate() {
         let name = format!("omni-agg-domain-{index}");
-        let created = CreateDomain::new(Arc::clone(&omni.engine))
+        // An account holds at most one domain, so each row's domain lives in an
+        // account of its own.
+        let account = Omni::new();
+        let created = CreateDomain::new(Arc::clone(&account.engine))
             .handle(
                 CreateDomainInput {
                     name: name.clone(),
                     identity_providers: providers.iter().map(|p| (*p).to_string()).collect(),
                     identity_provider_configuration: configuration.clone(),
+                    client_token: Some(format!("token-agg-domain-{index}")),
                     ..Default::default()
                 },
-                &omni.ctx(),
+                &account.ctx(),
             )
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: CreateDomain failed: {error:?}"))
             .domain;
 
-        let (status, body) = omni
+        let (status, body) = account
             .over_the_wire(
                 "GetDomain",
                 GET_DOMAIN_INPUT_SCHEMA,

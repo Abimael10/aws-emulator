@@ -132,12 +132,16 @@ impl Omni {
     }
 
     /// A domain to hang the suite's spaces off.
+    ///
+    /// The create carries the `clientToken` it is admitted only with, derived from the
+    /// domain's own name.
     async fn domain(&self, name: &str) -> String {
         CreateDomain::new(Arc::clone(&self.engine))
             .handle(
                 CreateDomainInput {
                     name: name.to_string(),
                     identity_providers: vec!["IAM".to_string()],
+                    client_token: Some(format!("token-{name}")),
                     ..Default::default()
                 },
                 &self.ctx(),

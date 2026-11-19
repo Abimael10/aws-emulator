@@ -183,12 +183,16 @@ impl Omni {
     }
 
     /// A domain, through the handler that owns it.
+    ///
+    /// The create carries the `clientToken` it is admitted only with, derived from the
+    /// domain's own name.
     async fn domain(&self, case: &str, name: &str) -> String {
         CreateDomain::new(Arc::clone(&self.engine))
             .handle(
                 CreateDomainInput {
                     name: format!("omni-{name}"),
                     identity_providers: vec!["IAM".to_string()],
+                    client_token: Some(format!("token-{name}")),
                     ..Default::default()
                 },
                 &self.ctx(),
@@ -715,10 +719,10 @@ async fn create_access_grant_persists_a_record_get_access_grant_returns_it() {
 async fn a_grant_is_created_in_a_space_of_a_domain_the_store_holds() {
     let omni = Omni::new();
     let (domain_id, space_id) = omni.domain_and_space("home", "grant-home").await;
-    let other_domain_id = omni.domain("other", "grant-other").await;
-    let other_space_id = omni
-        .space("other", &other_domain_id, "grant-other-space")
-        .await;
+    // A second space of the SAME domain: an account holds at most one domain, so a
+    // space under another domain cannot exist beside this one, and the rows below
+    // name a domain the store does not hold instead.
+    let other_space_id = omni.space("other", &domain_id, "grant-other-space").await;
 
     // The pair the store holds resolves.
     omni.create_access_grant(&create_input(&domain_id, &space_id, "resolves"))
@@ -730,14 +734,9 @@ async fn a_grant_is_created_in_a_space_of_a_domain_the_store_holds() {
         ("a domain the store does not hold", MISSING_DOMAIN_ID, space_id.as_str()),
         ("a space the store does not hold", domain_id.as_str(), MISSING_SPACE_ID),
         (
-            "a known space under another domain",
-            domain_id.as_str(),
+            "a domain the store does not hold with a space it does",
+            MISSING_DOMAIN_ID,
             other_space_id.as_str(),
-        ),
-        (
-            "a known domain with a space of another domain",
-            other_domain_id.as_str(),
-            space_id.as_str(),
         ),
     ] {
         expect_modelled_error(

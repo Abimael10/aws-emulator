@@ -72,23 +72,14 @@ pub const IDENTITY_PROVIDER_IDC: &str = "IDC";
 /// page. Defaults to 100." That is also the maximum its `@range(min: 1, max: 100)` allows.
 pub const DEFAULT_MAX_RESULTS: i32 = 100;
 
-/// How many domains the store holds before `CreateDomain` refuses with the modelled
-/// `ServiceQuotaExceededException`.
-///
-/// CloudWatchOmni publishes an adjustable quota on domains per account per Region, and
-/// this emulator models neither Service Quotas nor an account's adjustments — so this
-/// is the emulator's OWN bound on the store rather than a claim about any account's
-/// limit. It is set far above any workflow an emulator serves, and it is what stops
-/// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::domains`] growing without
-/// end. It bounds `domain_name_index` and `create_domain_tokens` with it: both are
-/// keyed one-to-one to a live domain and are forgotten by `DeleteDomain`, so neither
-/// can outgrow this number.
-pub const DOMAIN_QUOTA: usize = 1_000;
-
 /// How many spaces the store holds before `CreateSpace` refuses with the modelled
 /// `ServiceQuotaExceededException`.
 ///
-/// The emulator's OWN bound, for the same reason as [`DOMAIN_QUOTA`]. It bounds
+/// CloudWatchOmni publishes adjustable quotas on a space-like resource per account per
+/// Region, and this emulator models neither Service Quotas nor an account's adjustments
+/// — so this is the emulator's OWN bound on the store rather than a claim about any
+/// account's limit. It is set far above any workflow an emulator serves, and it is what
+/// stops the store growing without end. It bounds
 /// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::spaces`] and, with it,
 /// `create_space_tokens` (one entry per live space, forgotten by `DeleteSpace`) — and
 /// therefore also the per-request work [`spaces_after`] and [`domain_has_spaces`] do
@@ -101,7 +92,7 @@ pub const SPACE_QUOTA: usize = 10_000;
 /// How many access profiles the store holds before `CreateAccessProfile` refuses with
 /// the modelled `ServiceQuotaExceededException`.
 ///
-/// The emulator's OWN bound, for the same reason as [`DOMAIN_QUOTA`]. It bounds
+/// The emulator's OWN bound, for the same reason as [`SPACE_QUOTA`]. It bounds
 /// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::access_profiles`] and, with
 /// it, `create_access_profile_tokens` (one entry per live profile) — and therefore the
 /// per-request work [`access_profile_named`] does under the store lock, which is linear
@@ -156,7 +147,7 @@ pub const ACCESS_PROFILE_RESOURCE_TYPE: &str = "AccessProfile";
 /// How many access grants the store holds before `CreateAccessGrant` refuses with the
 /// modelled `ServiceQuotaExceededException`.
 ///
-/// The emulator's OWN bound, for the same reason as [`DOMAIN_QUOTA`]. It bounds
+/// The emulator's OWN bound, for the same reason as [`SPACE_QUOTA`]. It bounds
 /// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::access_grants`] and, with
 /// it, `create_access_grant_tokens` (one entry per live grant) — and therefore the
 /// per-request work [`access_grant_named`] and [`access_profiles_scoped_by`] do under
@@ -174,7 +165,7 @@ pub const OMNI_DASHBOARD_ARN_RESOURCE_TYPE: &str = "omni-dashboard";
 /// How many dashboards the store holds before `CreateOmniDashboard` refuses with the
 /// modelled `ServiceQuotaExceededException`.
 ///
-/// The emulator's OWN bound, for the same reason as [`DOMAIN_QUOTA`]. It bounds
+/// The emulator's OWN bound, for the same reason as [`SPACE_QUOTA`]. It bounds
 /// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::omni_dashboards`] and, with
 /// it, `create_omni_dashboard_tokens` (one entry per live dashboard) — and therefore the
 /// per-request work [`omni_dashboard_named`] does under the store lock, which is linear
@@ -207,7 +198,7 @@ pub const ALERT_EVALUATION_INTERVALS: &[i32] = &[30, 60, 120, 300, 600, 900, 180
 /// How many alerts the store holds before `CreateAlert` refuses with the modelled
 /// `ServiceQuotaExceededException`.
 ///
-/// The emulator's OWN bound, for the same reason as [`DOMAIN_QUOTA`]. It bounds
+/// The emulator's OWN bound, for the same reason as [`SPACE_QUOTA`]. It bounds
 /// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::alerts`] and, with it,
 /// `create_alert_tokens` (one entry per live alert, forgotten by `DeleteAlert`), so
 /// neither can grow without end.
@@ -228,7 +219,7 @@ pub const VIEW_TYPE_USER: &str = "USER";
 
 /// How many views the store holds before `CreateView` refuses.
 ///
-/// The emulator's OWN bound, for the same reason as [`DOMAIN_QUOTA`]: it bounds
+/// The emulator's OWN bound, for the same reason as [`SPACE_QUOTA`]: it bounds
 /// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::views`] and, with it,
 /// `create_view_tokens` (one entry per live view), so neither can grow without end.
 /// `CreateView` declares no quota error, so the refusal past this bound is its modelled
@@ -358,22 +349,24 @@ pub struct StoredView {
 
 /// Per-service state for com-amazonaws-cloudwatchomni-cloudwatchomnifrontend. A handler reaches it through [`service_state`].
 ///
-/// Every map here is BOUNDED: `domains` (and the two maps keyed one-to-one to a live
-/// domain) by [`DOMAIN_QUOTA`], `spaces` (and the token map keyed to a live space) by
-/// [`SPACE_QUOTA`], `access_profiles` (and the token map keyed to a live profile) by
+/// Every map here is BOUNDED: `domains` (and the token map keyed one-to-one to a live
+/// domain) by the one-domain-per-account rule a create is admitted under
+/// ([`DOMAIN_ALREADY_EXISTS_FOR_ACCOUNT`]), `spaces` (and the token map keyed to a live
+/// space) by [`SPACE_QUOTA`], `access_profiles` (and the token map keyed to a live
+/// profile) by
 /// [`ACCESS_PROFILE_QUOTA`], `access_grants` (and the token map keyed to a live grant)
 /// by [`ACCESS_GRANT_QUOTA`], `omni_dashboards` (and the token map keyed to a live
 /// dashboard) by [`OMNI_DASHBOARD_QUOTA`], `alerts` (and the token map keyed to a live
 /// alert) by [`ALERT_QUOTA`], `views` (and the token map keyed to a live view) by
-/// [`VIEW_QUOTA`]. The creates refuse with the modelled
-/// `ServiceQuotaExceededException` once the bound is reached, and the deletes release
+/// [`VIEW_QUOTA`]. The quota-bounded creates refuse with the modelled
+/// `ServiceQuotaExceededException` once their bound is reached, and the deletes release
 /// records and their tokens together, so nothing in the store grows without end.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
-    /// Every persisted domain, keyed by its `domainId`.
+    /// The account's persisted domain, keyed by its `domainId`. An account holds at
+    /// most one account-scoped domain, so this map holds at most one record — see
+    /// [`DOMAIN_ALREADY_EXISTS_FOR_ACCOUNT`] for the rule that keeps it that way.
     pub domains: HashMap<String, StoredDomain>,
-    /// `name` -> `domainId`, the index behind the duplicate-name `ConflictException`.
-    pub domain_name_index: HashMap<String, String>,
     /// Every persisted space, keyed by its `spaceId`.
     pub spaces: HashMap<String, StoredSpace>,
     /// `CreateDomain` `clientToken` -> the `domainId` that token created.
@@ -1379,6 +1372,13 @@ mod principal_search;
 /// store because every operation that addresses one of those resources reports the same
 /// miss for it.
 mod resource_not_found;
+
+/// The rules a domain create is admitted under, and the text each refusal carries. It
+/// lives beside the store because both rules are facts about the ACCOUNT's domain
+/// rather than about one request.
+mod domain_admission;
+
+pub use domain_admission::{client_token_required_message, DOMAIN_ALREADY_EXISTS_FOR_ACCOUNT};
 
 pub use resource_not_found::{
     dashboard_not_found_message, view_not_found_message, DASHBOARD_NOT_FOUND_RESOURCE,

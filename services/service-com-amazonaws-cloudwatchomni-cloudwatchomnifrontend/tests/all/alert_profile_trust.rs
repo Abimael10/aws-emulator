@@ -154,6 +154,8 @@ struct Omni {
     /// owner may always assume it, so the CALLER's `assumeStatus` is observed through a
     /// principal that owns nothing here.
     other_parts: http::request::Parts,
+    /// The account's one domain, remembered after the first space is created in it.
+    domain: std::sync::Mutex<Option<String>>,
 }
 
 impl Omni {
@@ -170,6 +172,7 @@ impl Omni {
             router,
             parts: signed_request_parts(ACCESS_KEY_ID),
             other_parts: signed_request_parts("AKIDSOMEONEELSE"),
+            domain: std::sync::Mutex::new(None),
         }
     }
 
@@ -181,13 +184,25 @@ impl Omni {
         )
     }
 
-    /// A domain, a space of it and two access profiles of that space.
-    async fn world(&self, case: &str, name: &str) -> World {
-        let domain_id = CreateDomain::new(Arc::clone(&self.engine))
+    /// The account's domain, created on first use.
+    ///
+    /// An account holds at most ONE domain, so every space this suite creates hangs off
+    /// the same one; the create carries the `clientToken` it is admitted only with.
+    async fn domain(&self, case: &str) -> String {
+        if let Some(held) = self
+            .domain
+            .lock()
+            .expect("the domain cell is not poisoned")
+            .clone()
+        {
+            return held;
+        }
+        let created = CreateDomain::new(Arc::clone(&self.engine))
             .handle(
                 CreateDomainInput {
-                    name: format!("omni-{name}"),
+                    name: "omni-alert-profile-trust".to_string(),
                     identity_providers: vec!["IAM".to_string()],
+                    client_token: Some("token-alert-profile-trust".to_string()),
                     ..Default::default()
                 },
                 &self.ctx(),
@@ -196,6 +211,13 @@ impl Omni {
             .unwrap_or_else(|error| panic!("case {case:?}: CreateDomain failed: {error:?}"))
             .domain
             .domain_id;
+        *self.domain.lock().expect("the domain cell is not poisoned") = Some(created.clone());
+        created
+    }
+
+    /// A domain, a space of it and two access profiles of that space.
+    async fn world(&self, case: &str, name: &str) -> World {
+        let domain_id = self.domain(case).await;
         let space_id = CreateSpace::new(Arc::clone(&self.engine))
             .handle(
                 CreateSpaceInput {

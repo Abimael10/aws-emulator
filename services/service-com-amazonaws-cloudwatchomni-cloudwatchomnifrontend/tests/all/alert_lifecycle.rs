@@ -137,6 +137,8 @@ struct Omni {
     service: omni::EmulatedService<engine::InMemoryEngine>,
     router: MultiServiceRouter,
     parts: http::request::Parts,
+    /// The account's one domain, remembered after the first space is created in it.
+    domain: std::sync::Mutex<Option<String>>,
 }
 
 impl Omni {
@@ -152,6 +154,7 @@ impl Omni {
             engine,
             router,
             parts: signed_request_parts(),
+            domain: std::sync::Mutex::new(None),
         }
     }
 
@@ -163,13 +166,25 @@ impl Omni {
         )
     }
 
-    /// A domain, through the handler that owns it.
-    async fn domain(&self, case: &str, name: &str) -> String {
-        CreateDomain::new(Arc::clone(&self.engine))
+    /// The account's domain, created on first use.
+    ///
+    /// An account holds at most ONE domain, so every space this suite creates hangs off
+    /// the same one; the create carries the `clientToken` it is admitted only with.
+    async fn domain(&self, case: &str) -> String {
+        if let Some(held) = self
+            .domain
+            .lock()
+            .expect("the domain cell is not poisoned")
+            .clone()
+        {
+            return held;
+        }
+        let created = CreateDomain::new(Arc::clone(&self.engine))
             .handle(
                 CreateDomainInput {
-                    name: format!("omni-{name}"),
+                    name: "omni-alert-lifecycle".to_string(),
                     identity_providers: vec!["IAM".to_string()],
+                    client_token: Some("token-alert-lifecycle".to_string()),
                     ..Default::default()
                 },
                 &self.ctx(),
@@ -177,7 +192,9 @@ impl Omni {
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: CreateDomain failed: {error:?}"))
             .domain
-            .domain_id
+            .domain_id;
+        *self.domain.lock().expect("the domain cell is not poisoned") = Some(created.clone());
+        created
     }
 
     /// A space of `domain_id`, through the handler that owns it.
@@ -266,7 +283,7 @@ impl Omni {
     /// A space holding an access profile an alert may assume: the domain, the space, the
     /// profile and the trust grant that records it.
     async fn space_with_assumable_profile(&self, case: &str, name: &str) -> (String, String) {
-        let domain_id = self.domain(case, name).await;
+        let domain_id = self.domain(case).await;
         let space_id = self.space(case, &domain_id, name).await;
         let (profile_id, profile_arn) = self.access_profile(case, &space_id, name).await;
         self.trust_grant(case, &domain_id, &space_id, name, &profile_arn)
@@ -719,12 +736,13 @@ fn comparable(alert: &Alert) -> String {
 async fn an_alert_needs_an_access_profile_a_trust_grant_authorizes_assuming() {
     let omni = Omni::new();
     let case = "trust";
-    let domain_id = omni.domain(case, "alert-trust").await;
+    let domain_id = omni.domain(case).await;
     let space_id = omni.space(case, &domain_id, "alert-trust").await;
     let (profile_id, profile_arn) = omni.access_profile(case, &space_id, "untrusted").await;
 
-    // A second space whose profile IS assumable, to show the refusal is about the
-    // profile of THIS request's space rather than about any profile anywhere.
+    // A second space of the SAME domain whose profile IS assumable, to show the refusal
+    // is about the profile of THIS request's space rather than about any profile
+    // anywhere.
     let (other_space, other_profile) = omni
         .space_with_assumable_profile(case, "alert-trust-elsewhere")
         .await;

@@ -24,6 +24,10 @@
 //!   status, encryption configuration) is computed from the stored resource;
 //! * a reader answers `ResourceNotFoundException` for a resource the store does not
 //!   hold, and a delete makes the reader answer that way;
+//! * a create is admitted only WITH the `clientToken` the model declares for it, and an
+//!   account holds at most one domain, so a further create conflicts with the one it
+//!   holds — both refusals before anything is minted, and both with the message AWS
+//!   words them with;
 //! * `@idempotencyToken` replays return the original resource;
 //! * `ListSpaces` pages a stable creation order under every page bound, and its
 //!   token resumes exactly where the previous page stopped;
@@ -32,6 +36,7 @@
 //! Each assertion names its case and the actual value, so a failure identifies the
 //! row of the table that broke.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use aws_smithy_schema::codec::{Codec, FinishSerializer};
@@ -44,7 +49,7 @@ use smithy_server_runtime::{
 
 use service_com_amazonaws_cloudwatchomni_cloudwatchomnifrontend as omni;
 
-use omni::ops::create_domain::{CreateDomain, CreateDomainError};
+use omni::ops::create_domain::{CreateDomain, CreateDomainError, CreateDomainErrorModeled};
 use omni::ops::create_space::{CreateSpace, CreateSpaceError};
 use omni::ops::delete_domain::{DeleteDomain, DeleteDomainError};
 use omni::ops::delete_space::{DeleteSpace, DeleteSpaceError};
@@ -60,7 +65,8 @@ use omni::ops::types::{
     GET_SPACE_INPUT_SCHEMA, LIST_SPACES_INPUT_SCHEMA, UPDATE_DOMAIN_INPUT_SCHEMA,
 };
 use omni::ops::update_domain::{UpdateDomain, UpdateDomainError};
-use omni::state::{DOMAIN_QUOTA, SPACE_QUOTA};
+use omni::scaffolded::Scaffolded;
+use omni::state::SPACE_QUOTA;
 
 /// The region the suite signs for; the handlers record the signed region on each
 /// resource, so every ARN and `region` member below is expected to carry it.
@@ -442,10 +448,25 @@ struct SpaceCase {
     expected_key: Option<&'static str>,
 }
 
+/// A `clientToken` no other call of this suite uses.
+///
+/// `CreateDomain` is admitted only WITH the `@idempotencyToken` the model declares for
+/// it, so every create that is not testing a replay carries a token of its own: sharing
+/// one would turn the next create into a replay of the last. The counter is only a
+/// source of distinct tokens; nothing reads it back.
+fn unique_client_token() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "token-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 fn create_domain_input(name: &str, providers: &[&str]) -> CreateDomainInput {
     CreateDomainInput {
         name: name.to_string(),
         identity_providers: providers.iter().map(|p| (*p).to_string()).collect(),
+        client_token: Some(unique_client_token()),
         ..Default::default()
     }
 }
@@ -511,7 +532,6 @@ async fn paged_space_ids(
 
 #[tokio::test]
 async fn create_domain_persists_a_record_get_domain_returns_it_verbatim() {
-    let omni = Omni::new();
     // Rows differ along the identity-provider set (the model's `IdentityProvider`
     // value set is exactly IAM | IDC, `@length(1..2)` `@uniqueItems`) and along the
     // name's size, including both published bounds of `name`'s `@length(3..63)`.
@@ -529,6 +549,9 @@ async fn create_domain_persists_a_record_get_domain_returns_it_verbatim() {
 
     for (name, providers, with_idc_instance) in cases {
         let case = format!("name={name} providers={providers:?}");
+        // An account holds at most ONE domain, so each row runs against an account of
+        // its own rather than adding a second domain beside the previous row's.
+        let omni = Omni::new();
         let mut input = create_domain_input(&name, &providers);
         if with_idc_instance {
             input.identity_provider_configuration = Some(IdentityProviderConfiguration {
@@ -855,28 +878,322 @@ async fn a_resource_the_store_does_not_hold_is_not_found() {
         .expect("the domain created after the misses is readable");
 }
 
+/// The message a `CreateDomain` carrying no `clientToken` is refused with: fixed text
+/// apart from the name of the operation that required one.
+const CLIENT_TOKEN_REQUIRED: &str = "A clientToken is required for CreateDomain";
+
+/// The message a `CreateDomain` for an account that already holds a domain is refused
+/// with: wholly fixed text, naming neither the held domain nor the requested one.
+const DOMAIN_ALREADY_EXISTS: &str = "A domain already exists for this account";
+
+/// The message the operation's modelled `ValidationException` carries, or a panic naming
+/// what came back instead.
+fn validation_message<O: std::fmt::Debug>(
+    case: &str,
+    result: Result<O, CreateDomainError>,
+) -> String {
+    match result {
+        Ok(output) => panic!("case {case:?}: expected a ValidationException, got Ok({output:?})"),
+        Err(error) => {
+            assert_eq!(
+                error.http_status(),
+                400,
+                "case {case:?}: expected HTTP 400, got {} ({error:?})",
+                error.http_status()
+            );
+            match error {
+                Scaffolded::Modeled(CreateDomainErrorModeled::ValidationException(refusal)) => {
+                    refusal.message
+                }
+                other => panic!(
+                    "case {case:?}: expected the modelled ValidationException, got {other:?}"
+                ),
+            }
+        }
+    }
+}
+
+/// The message the operation's modelled `ConflictException` carries, or a panic naming
+/// what came back instead.
+fn conflict_message<O: std::fmt::Debug>(case: &str, result: Result<O, CreateDomainError>) -> String {
+    match result {
+        Ok(output) => panic!("case {case:?}: expected a ConflictException, got Ok({output:?})"),
+        Err(error) => {
+            assert_eq!(
+                error.http_status(),
+                409,
+                "case {case:?}: expected HTTP 409, got {} ({error:?})",
+                error.http_status()
+            );
+            match error {
+                Scaffolded::Modeled(CreateDomainErrorModeled::ConflictException(refusal)) => {
+                    refusal.message
+                }
+                other => {
+                    panic!("case {case:?}: expected the modelled ConflictException, got {other:?}")
+                }
+            }
+        }
+    }
+}
+
+/// One row of the token-requirement table: an otherwise admissible `CreateDomain` that
+/// carries no `clientToken`.
+struct TokenlessCase {
+    label: &'static str,
+    name: String,
+    providers: Vec<&'static str>,
+    tags: Option<HashMap<String, String>>,
+    identity_center_instance: Option<&'static str>,
+}
+
 #[tokio::test]
-async fn a_duplicate_domain_name_conflicts() {
-    let omni = Omni::new();
-    for name in ["abc", "omni-duplicate-name"] {
-        let case = format!("name={name}");
-        let first = domain(&omni, &case, name, &["IAM"]).await;
-        expect_modelled_error(
-            &case,
-            omni.create_domain(&create_domain_input(name, &["IDC"])).await,
-            409,
-            "ConflictException",
+async fn a_create_domain_without_a_client_token_is_refused_and_mints_nothing() {
+    // Every row is a request the modelled constraints admit and that differs from the
+    // others in everything BUT the missing token — the name's size, the identity
+    // provider set, the optional tags and the optional identity-provider configuration
+    // — because the refusal is about the absent `clientToken` alone.
+    let cases = vec![
+        TokenlessCase {
+            label: "the shortest name the model admits, IAM only",
+            name: "abc".to_string(),
+            providers: vec!["IAM"],
+            tags: None,
+            identity_center_instance: None,
+        },
+        TokenlessCase {
+            label: "a hyphenated name with tags",
+            name: "omni-tokenless-domain".to_string(),
+            providers: vec!["IDC"],
+            tags: Some(HashMap::from([("team".to_string(), "obs".to_string())])),
+            identity_center_instance: None,
+        },
+        TokenlessCase {
+            label: "both providers and an Identity Center instance",
+            name: "omni-tokenless-idc".to_string(),
+            providers: vec!["IAM", "IDC"],
+            tags: None,
+            identity_center_instance: Some("arn:aws:sso:::instance/ssoins-1234567890abcdef"),
+        },
+        TokenlessCase {
+            label: "the longest name the model admits",
+            name: "d".repeat(63),
+            providers: vec!["IDC", "IAM"],
+            tags: Some(HashMap::new()),
+            identity_center_instance: None,
+        },
+    ];
+
+    for TokenlessCase {
+        label,
+        name,
+        providers,
+        tags,
+        identity_center_instance,
+    } in cases
+    {
+        // Each row is its own account, so the create that follows the refusal is the
+        // account's first.
+        let omni = Omni::new();
+        let mut input = create_domain_input(&name, &providers);
+        input.tags = tags;
+        input.identity_provider_configuration =
+            identity_center_instance.map(|arn| IdentityProviderConfiguration {
+                identity_center_configuration: Some(IdentityCenterConfiguration {
+                    identity_center_instance_arn: Some(arn.to_string()),
+                }),
+            });
+        input.client_token = None;
+
+        let message = validation_message(label, omni.create_domain(&input).await);
+        assert_eq!(
+            message, CLIENT_TOKEN_REQUIRED,
+            "case {label:?}: expected {CLIENT_TOKEN_REQUIRED:?}, got {message:?}"
         );
-        // The conflict left the original untouched.
-        let still_there = omni
-            .get_domain(&first.domain_id)
+
+        // The refusal minted nothing: the account is still free, so the SAME request
+        // carrying a token is admitted. Were the refused create to have landed, the
+        // one-domain-per-account rule would refuse this one as a conflict.
+        input.client_token = Some(unique_client_token());
+        let created = omni
+            .create_domain(&input)
             .await
-            .unwrap_or_else(|error| panic!("case {case:?}: GetDomain failed: {error:?}"))
+            .unwrap_or_else(|error| panic!("case {label:?}: the create with a token failed: {error:?}"))
             .domain;
         assert_eq!(
-            still_there.identity_providers,
-            vec!["IAM".to_string()],
-            "case {case:?}: the conflicting create overwrote the original domain"
+            (
+                created.name.as_deref(),
+                created.identity_providers.clone(),
+                created.region.as_str(),
+                created.status.as_str(),
+            ),
+            (
+                Some(name.as_str()),
+                providers
+                    .iter()
+                    .map(|p| (*p).to_string())
+                    .collect::<Vec<String>>(),
+                REGION,
+                "ACTIVE",
+            ),
+            "case {label:?}: the admitted create did not persist the request, got {created:?}"
+        );
+        let fetched = omni
+            .get_domain(&created.domain_id)
+            .await
+            .unwrap_or_else(|error| panic!("case {label:?}: GetDomain failed: {error:?}"))
+            .domain;
+        assert_eq!(
+            format!("{fetched:?}"),
+            format!("{created:?}"),
+            "case {label:?}: GetDomain did not return the record CreateDomain persisted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_domain_for_the_account_conflicts_whatever_it_asks_for() {
+    let omni = Omni::new();
+    let mut held_input = create_domain_input("omni-singleton", &["IAM"]);
+    let held = omni
+        .create_domain(&held_input)
+        .await
+        .expect("the account's first domain is admitted")
+        .domain;
+
+    // Rows differ in everything a create can ask for — the same name as the held domain
+    // and names that differ from it, both published bounds of `name`'s `@length(3..63)`,
+    // every identity-provider set, with and without tags — because the conflict is with
+    // the ACCOUNT's domain rather than with any member of the request.
+    let longest_name = "e".repeat(63);
+    let cases: Vec<(&str, &str, Vec<&str>, bool)> = vec![
+        ("the held domain's own name", "omni-singleton", vec!["IAM"], false),
+        ("a different name", "omni-singleton-two", vec!["IDC"], false),
+        ("a different provider set, with tags", "abc", vec!["IAM", "IDC"], true),
+        ("the longest name the model admits", longest_name.as_str(), vec!["IDC"], false),
+    ];
+
+    for (label, name, providers, with_tags) in cases {
+        let mut input = create_domain_input(name, &providers);
+        if with_tags {
+            input.tags = Some(HashMap::from([("owner".to_string(), "sre".to_string())]));
+        }
+        let message = conflict_message(label, omni.create_domain(&input).await);
+        assert_eq!(
+            message, DOMAIN_ALREADY_EXISTS,
+            "case {label:?}: expected {DOMAIN_ALREADY_EXISTS:?}, got {message:?}"
+        );
+    }
+
+    // Every conflict left the held domain exactly as it was.
+    let still_there = omni
+        .get_domain(&held.domain_id)
+        .await
+        .expect("the refused creates left the held domain in place")
+        .domain;
+    assert_eq!(
+        format!("{still_there:?}"),
+        format!("{held:?}"),
+        "a refused create changed the domain the account holds"
+    );
+
+    // A replay of the create that minted it is not a conflict with itself: the token
+    // returns the original record.
+    let replay = omni
+        .create_domain(&held_input)
+        .await
+        .expect("replaying the original create returns the original domain")
+        .domain;
+    assert_eq!(
+        format!("{replay:?}"),
+        format!("{held:?}"),
+        "the idempotent replay did not return the held domain"
+    );
+
+    // Releasing the domain frees the account to hold one again, so the rule is a rule
+    // about the CURRENT state and not a one-way ratchet.
+    omni.delete_domain(&held.domain_id)
+        .await
+        .expect("an empty domain deletes");
+    held_input.client_token = Some(unique_client_token());
+    let replacement = omni
+        .create_domain(&held_input)
+        .await
+        .expect("a freed account accepts a domain again")
+        .domain;
+    assert_ne!(
+        replacement.domain_id, held.domain_id,
+        "creating after the delete must mint a new domain, not resurrect the old one"
+    );
+}
+
+#[tokio::test]
+async fn the_domain_admission_rules_hold_over_the_rpcv2cbor_wire() {
+    let omni = Omni::new();
+    let codec = CborCodec::default();
+    let decode = |body: &bytes::Bytes| -> CreateDomainOutput {
+        let mut deserializer = codec.create_deserializer(body);
+        CreateDomainOutput::deserialize(&mut deserializer).expect("the output deserializes")
+    };
+
+    // A create with no token is refused 400 with the modelled error code and the
+    // message, over the same wire a client speaks.
+    let mut input = create_domain_input("omni-wire-admission", &["IAM"]);
+    input.client_token = None;
+    let (status, body) = omni
+        .over_the_wire("CreateDomain", CREATE_DOMAIN_INPUT_SCHEMA, &input)
+        .await;
+    let rendered = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(
+        status, 400,
+        "a CreateDomain with no clientToken answered {status}: {rendered:?}"
+    );
+    for expected in ["ValidationException", CLIENT_TOKEN_REQUIRED] {
+        assert!(
+            rendered.contains(expected),
+            "case {expected:?}: the wire refusal does not carry it: {rendered:?}"
+        );
+    }
+
+    // With a token the same request is admitted.
+    input.client_token = Some(unique_client_token());
+    let (status, body) = omni
+        .over_the_wire("CreateDomain", CREATE_DOMAIN_INPUT_SCHEMA, &input)
+        .await;
+    assert_eq!(
+        status,
+        200,
+        "CreateDomain over the wire answered {status}: {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let created = decode(&body).domain;
+    assert_eq!(
+        (
+            created.name.as_deref(),
+            created.region.as_str(),
+            created.status.as_str()
+        ),
+        (Some("omni-wire-admission"), REGION, "ACTIVE"),
+        "the wire create did not report the persisted domain, got {created:?}"
+    );
+
+    // And the next create for the account is refused 409 with the conflict message.
+    let (status, body) = omni
+        .over_the_wire(
+            "CreateDomain",
+            CREATE_DOMAIN_INPUT_SCHEMA,
+            &create_domain_input("omni-wire-second", &["IDC"]),
+        )
+        .await;
+    let rendered = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(
+        status, 409,
+        "a second CreateDomain answered {status}: {rendered:?}"
+    );
+    for expected in ["ConflictException", DOMAIN_ALREADY_EXISTS] {
+        assert!(
+            rendered.contains(expected),
+            "case {expected:?}: the wire conflict does not carry it: {rendered:?}"
         );
     }
 }
@@ -897,14 +1214,17 @@ async fn an_idempotency_token_replay_returns_the_original_resource() {
     for (index, token) in tokens.iter().enumerate() {
         let case = format!("token={token}");
 
+        // The domain replay runs against an account of its own: an account holds at
+        // most one domain, so a row cannot mint its domain beside the previous row's.
+        let account = Omni::new();
         let mut domain_input = create_domain_input(&format!("idem-domain-{index}"), &["IAM"]);
         domain_input.client_token = Some(token.clone());
-        let first = omni
+        let first = account
             .create_domain(&domain_input)
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: CreateDomain failed: {error:?}"))
             .domain;
-        let replay = omni
+        let replay = account
             .create_domain(&domain_input)
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: the replay failed: {error:?}"))
@@ -959,10 +1279,13 @@ async fn list_spaces_pages_a_stable_order_under_every_bound() {
     );
 
     let first = domain(&omni, "first", "omni-first", &["IAM"]).await;
-    let second = domain(&omni, "second", "omni-second", &["IDC"]).await;
 
+    // Seven spaces in the account's one domain. A second domain cannot be created
+    // beside it (an account holds one), so the `domainId` filter is exercised against
+    // the domain that holds them and — in `a_resource_the_store_does_not_hold_is_not_found`
+    // — against a domain id the store does not hold.
     let mut in_first = Vec::new();
-    for index in 0..5 {
+    for index in 0..7 {
         let created = space(
             &omni,
             "seed first",
@@ -972,18 +1295,7 @@ async fn list_spaces_pages_a_stable_order_under_every_bound() {
         .await;
         in_first.push(created.space_id);
     }
-    let mut in_second = Vec::new();
-    for index in 0..2 {
-        let created = space(
-            &omni,
-            "seed second",
-            &format!("second-space-{index}"),
-            &second.domain_id,
-        )
-        .await;
-        in_second.push(created.space_id);
-    }
-    let everything: Vec<String> = in_first.iter().chain(in_second.iter()).cloned().collect();
+    let everything: Vec<String> = in_first.clone();
 
     // Rows differ along the page bound — both published bounds of `maxResults`'s
     // `@range(1..100)`, sizes either side of the collection, and the documented
@@ -992,7 +1304,6 @@ async fn list_spaces_pages_a_stable_order_under_every_bound() {
     let filters: Vec<(Option<&str>, &Vec<String>)> = vec![
         (None, &everything),
         (Some(first.domain_id.as_str()), &in_first),
-        (Some(second.domain_id.as_str()), &in_second),
     ];
 
     for bound in &bounds {
@@ -1014,7 +1325,7 @@ async fn list_spaces_pages_a_stable_order_under_every_bound() {
     assert_eq!(
         page.items.len(),
         2,
-        "a bound of 2 over 5 spaces must fill the page, got {}",
+        "a bound of 2 over 7 spaces must fill the page, got {}",
         page.items.len()
     );
     let token = page
@@ -1118,7 +1429,8 @@ async fn deleting_a_space_removes_it_and_a_domain_refuses_while_it_holds_spaces(
         );
     }
 
-    // With the domain empty the delete goes through, and the name is free again.
+    // With the domain empty the delete goes through, and the account is free to hold a
+    // domain again.
     omni.delete_domain(&parent.domain_id)
         .await
         .expect("an empty domain deletes");
@@ -1131,7 +1443,7 @@ async fn deleting_a_space_removes_it_and_a_domain_refuses_while_it_holds_spaces(
     let reused = domain(&omni, "name reuse", "omni-lifecycle", &["IAM"]).await;
     assert_ne!(
         reused.domain_id, parent.domain_id,
-        "reusing a freed name must mint a new domain, not resurrect the old one"
+        "creating after the delete must mint a new domain, not resurrect the old one"
     );
 
     // DeleteDomain is @idempotent too.
@@ -1237,49 +1549,6 @@ async fn the_modelled_input_constraints_refuse_what_they_declare() {
             "case maxResults={bound}: a value outside @range(1..100) was accepted"
         );
     }
-}
-
-#[tokio::test]
-async fn the_domain_store_is_bounded_and_refuses_past_its_quota() {
-    // The store cannot grow without end: `CreateDomain` refuses with the modelled
-    // `ServiceQuotaExceededException` once `DOMAIN_QUOTA` records are held, and
-    // `DeleteDomain` frees a slot again.
-    let omni = Omni::new();
-    let mut last = String::new();
-    for index in 0..DOMAIN_QUOTA {
-        last = omni
-            .create_domain(&create_domain_input(
-                &format!("quota-domain-{index}"),
-                &["IAM"],
-            ))
-            .await
-            .unwrap_or_else(|error| panic!("domain {index} within the quota failed: {error:?}"))
-            .domain
-            .domain_id;
-    }
-    expect_modelled_error(
-        "one domain past DOMAIN_QUOTA",
-        omni.create_domain(&create_domain_input("quota-domain-overflow", &["IAM"]))
-            .await,
-        402,
-        "ServiceQuotaExceededException",
-    );
-
-    // Releasing a record releases its slot, so the bound is a bound and not a
-    // one-way ratchet.
-    omni.delete_domain(&last)
-        .await
-        .expect("deleting a domain releases its slot");
-    omni.create_domain(&create_domain_input("quota-domain-overflow", &["IAM"]))
-        .await
-        .expect("a freed slot accepts another domain");
-    expect_modelled_error(
-        "full again",
-        omni.create_domain(&create_domain_input("quota-domain-second-overflow", &["IAM"]))
-            .await,
-        402,
-        "ServiceQuotaExceededException",
-    );
 }
 
 #[tokio::test]
@@ -1629,10 +1898,11 @@ fn domain_patch_table() -> Vec<DomainPatch> {
 
 #[tokio::test]
 async fn update_domain_changes_only_the_members_the_request_carries() {
-    let omni = Omni::new();
-
     for row in domain_patch_table() {
         let case = row.case;
+        // An account holds at most ONE domain, so each row patches the domain of an
+        // account of its own.
+        let omni = Omni::new();
         let mut create = create_domain_input(&row.initial_name, &row.initial_providers);
         create.identity_provider_configuration = row.initial_instance.map(idc_configuration);
         let created = omni
@@ -1841,43 +2111,20 @@ async fn the_identity_center_application_follows_the_domains_providers() {
 }
 
 #[tokio::test]
-async fn renaming_a_domain_onto_a_name_another_domain_holds_is_a_conflict() {
+async fn renaming_a_domain_to_the_name_it_holds_is_not_a_conflict_with_itself() {
     let omni = Omni::new();
-    let first = domain(&omni, "conflict", "omni-conflict-first", &["IAM"]).await;
-    let second = domain(&omni, "conflict", "omni-conflict-second", &["IAM"]).await;
-    let before = format!("{second:?}");
-
-    expect_modelled_error(
-        "onto a sibling's name",
-        omni.update_domain(&UpdateDomainInput {
-            domain_id: second.domain_id.clone(),
-            name: first.name.clone(),
-            // The provider change rides along, so the refusal is shown to roll back the
-            // whole patch rather than only the name.
-            identity_providers: Some(providers(&["IDC"])),
-            ..Default::default()
-        })
-        .await,
-        409,
-        "ConflictException",
-    );
-    let after = omni
-        .get_domain(&second.domain_id)
-        .await
-        .expect("the refused domain is still there")
-        .domain;
-    assert_eq!(
-        format!("{after:?}"),
-        before,
-        "a refused UpdateDomain changed the domain"
-    );
+    // An account holds at most one domain, so no SIBLING domain can hold the name a
+    // rename asks for: what is reachable here is the rename of the account's own domain,
+    // and the patch that asks for the name it already carries.
+    let held = domain(&omni, "conflict", "omni-conflict-first", &["IAM"]).await;
+    let before = format!("{held:?}");
 
     // Naming the name the domain already carries is not a conflict with itself, and
     // changes nothing.
     let same = omni
         .update_domain(&UpdateDomainInput {
-            domain_id: second.domain_id.clone(),
-            name: second.name.clone(),
+            domain_id: held.domain_id.clone(),
+            name: held.name.clone(),
             ..Default::default()
         })
         .await
@@ -1889,41 +2136,34 @@ async fn renaming_a_domain_onto_a_name_another_domain_holds_is_a_conflict() {
         "a patch asking for the name the domain holds changed it"
     );
 
-    // A successful rename moves the domain's entry in the name index: the name it
-    // released is free to be taken again, and the name it took is now the conflict.
-    omni.update_domain(&UpdateDomainInput {
-        domain_id: second.domain_id.clone(),
-        name: Some("omni-conflict-third".to_string()),
-        ..Default::default()
-    })
-    .await
-    .expect("the rename succeeds");
-    let reused = omni
-        .create_domain(&create_domain_input("omni-conflict-second", &["IAM"]))
-        .await
-        .expect("the released name can be taken again")
-        .domain;
-    expect_modelled_error(
-        "onto the name a later create took",
-        omni.update_domain(&UpdateDomainInput {
-            domain_id: first.domain_id.clone(),
+    // A rename to another name goes through, and the name it released is free for the
+    // account's next domain once this one is deleted.
+    let renamed = omni
+        .update_domain(&UpdateDomainInput {
+            domain_id: held.domain_id.clone(),
             name: Some("omni-conflict-third".to_string()),
             ..Default::default()
         })
-        .await,
-        409,
-        "ConflictException",
+        .await
+        .expect("the rename succeeds")
+        .domain;
+    assert_eq!(
+        renamed.name.as_deref(),
+        Some("omni-conflict-third"),
+        "the rename did not take the name it asked for, got {:?}",
+        renamed.name
     );
-    expect_modelled_error(
-        "onto the reused name",
-        omni.update_domain(&UpdateDomainInput {
-            domain_id: first.domain_id.clone(),
-            name: reused.name.clone(),
-            ..Default::default()
-        })
-        .await,
-        409,
-        "ConflictException",
+    omni.delete_domain(&held.domain_id)
+        .await
+        .expect("the renamed domain deletes");
+    let reused = omni
+        .create_domain(&create_domain_input("omni-conflict-first", &["IAM"]))
+        .await
+        .expect("the released name can be taken again")
+        .domain;
+    assert_ne!(
+        reused.domain_id, held.domain_id,
+        "taking the released name must mint a new domain, not resurrect the old one"
     );
 }
 

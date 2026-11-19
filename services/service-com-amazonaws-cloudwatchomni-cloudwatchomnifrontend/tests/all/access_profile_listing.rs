@@ -90,6 +90,8 @@ struct Omni {
     service: omni::EmulatedService<engine::InMemoryEngine>,
     router: MultiServiceRouter,
     parts: http::request::Parts,
+    /// The account's one domain, remembered after the first space is created in it.
+    domain: std::sync::Mutex<Option<String>>,
 }
 
 impl Omni {
@@ -105,6 +107,7 @@ impl Omni {
             engine,
             router,
             parts: signed_request_parts(),
+            domain: std::sync::Mutex::new(None),
         }
     }
 
@@ -116,25 +119,45 @@ impl Omni {
         )
     }
 
-    /// A space to create profiles in, through the handlers that own those resources.
-    async fn space(&self, case: &str, name: &str) -> String {
-        let domain = CreateDomain::new(Arc::clone(&self.engine))
+    /// The account's domain, created on first use.
+    ///
+    /// An account holds at most ONE domain, so every space this suite creates hangs off
+    /// the same one; the create carries the `clientToken` it is admitted only with.
+    async fn domain(&self, case: &str) -> String {
+        if let Some(held) = self
+            .domain
+            .lock()
+            .expect("the domain cell is not poisoned")
+            .clone()
+        {
+            return held;
+        }
+        let created = CreateDomain::new(Arc::clone(&self.engine))
             .handle(
                 CreateDomainInput {
-                    name: format!("omni-{name}"),
+                    name: "omni-profile-listing".to_string(),
                     identity_providers: vec!["IAM".to_string()],
+                    client_token: Some("token-profile-listing".to_string()),
                     ..Default::default()
                 },
                 &self.ctx(),
             )
             .await
             .unwrap_or_else(|error| panic!("case {case:?}: CreateDomain failed: {error:?}"))
-            .domain;
+            .domain
+            .domain_id;
+        *self.domain.lock().expect("the domain cell is not poisoned") = Some(created.clone());
+        created
+    }
+
+    /// A space to create profiles in, through the handlers that own those resources.
+    async fn space(&self, case: &str, name: &str) -> String {
+        let domain_id = self.domain(case).await;
         CreateSpace::new(Arc::clone(&self.engine))
             .handle(
                 CreateSpaceInput {
                     name: name.to_string(),
-                    domain_id: domain.domain_id,
+                    domain_id,
                     data_access_role_arn: DATA_ACCESS_ROLE_ARN.to_string(),
                     ..Default::default()
                 },

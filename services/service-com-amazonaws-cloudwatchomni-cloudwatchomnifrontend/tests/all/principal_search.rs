@@ -141,6 +141,9 @@ impl Emulator {
     }
 
     /// A domain configured with `identity_providers`, through the handler that owns it.
+    ///
+    /// The create carries the `clientToken` it is admitted only with, derived from the
+    /// domain's own name so two domains never share one.
     async fn domain(&self, case: &str, name: &str, identity_providers: &[&str]) -> String {
         CreateDomain::new(Arc::clone(&self.engine))
             .handle(
@@ -150,6 +153,7 @@ impl Emulator {
                         .iter()
                         .map(|provider| provider.to_string())
                         .collect(),
+                    client_token: Some(format!("token-{name}")),
                     ..Default::default()
                 },
                 &self.omni_ctx(),
@@ -588,10 +592,6 @@ async fn a_search_changes_nothing_a_later_caller_sees() {
 
 #[tokio::test]
 async fn only_a_domain_configured_with_identity_center_is_searched() {
-    let emulator = Emulator::new();
-    let directory = directory(&emulator, "providers").await;
-    let every = directory.every_principal();
-
     // (case, the domain's identityProviders, whether the search is served)
     // `IdentityProvider` declares exactly IAM and IDC
     // (`smithy_query(query="shape", shape="IdentityProvider")`), so these are every set a
@@ -604,6 +604,11 @@ async fn only_a_domain_configured_with_identity_center_is_searched() {
     ];
 
     for (index, (case, providers, served)) in rows.into_iter().enumerate() {
+        // An account holds at most one domain, so each row runs against an emulator of
+        // its own rather than adding a second domain beside the previous row's.
+        let emulator = Emulator::new();
+        let directory = directory(&emulator, case).await;
+        let every = directory.every_principal();
         let domain_id = emulator
             .domain(case, &format!("providers-{index}"), &providers)
             .await;
