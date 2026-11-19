@@ -155,18 +155,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.expire_deleted_gateways_and_targets(now);
         store.drop_orphaned_resource_policies();
 
-        // A policy is addressed through the resource that carries it, so an ARN
-        // naming no resource this service holds — or one of a type the feature
-        // does not cover — is the modelled 404 for an ARN that resolves to
-        // nothing, which is a different condition from a resource that exists
-        // and carries no document.
-        let target = store
-            .resource_policy_target(&region, &input.resource_arn)
-            .ok_or_else(|| {
-                GetResourcePolicyErrorModeled::ResourceNotFoundException(
+        // A policy is addressed through the resource that carries it, and which
+        // answer the ARN earns is the one classification every resource-policy
+        // operation shares: a policy-carrying resource this service holds is
+        // read, a policy-carrying type naming no such resource is the modelled
+        // 404 (a different condition from a resource that exists and carries no
+        // document), another resource type of this service takes no policy at
+        // all, and an ARN naming no resource type of this service addresses
+        // nothing of this account.
+        let target = match store.resource_policy_target(&region, &input.resource_arn) {
+            crate::state::ResourcePolicyTarget::Resolved(target) => target,
+            crate::state::ResourcePolicyTarget::Absent => {
+                return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
                     crate::state::resource_arn_not_found(),
                 )
-            })?;
+                .into())
+            }
+            crate::state::ResourcePolicyTarget::OutOfScope => {
+                return Err(GetResourcePolicyErrorModeled::ValidationException(
+                    crate::state::resource_policy_unsupported_type(),
+                )
+                .into())
+            }
+            crate::state::ResourcePolicyTarget::Unrecognized => {
+                // Decided with no store guard held: the denial is read off the
+                // signing identity, which lives in another store.
+                drop(store);
+                return Err(GetResourcePolicyErrorModeled::AccessDeniedException(
+                    crate::service::authorization::access_denied(&*self.engine, ctx, Self::NAME),
+                )
+                .into());
+            }
+        };
         let policy = store.resource_policy(&target).map(str::to_string);
         let policy = policy.ok_or_else(|| {
             GetResourcePolicyErrorModeled::ResourceNotFoundException(

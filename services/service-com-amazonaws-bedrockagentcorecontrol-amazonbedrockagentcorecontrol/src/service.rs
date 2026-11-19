@@ -73,7 +73,10 @@
 //! not allow the action is refused before the model's constraints are checked — earlier than
 //! any handler runs, and earlier than the centralized walk's own refusal.
 //! [`StatedPerOperation`] is therefore where that decision is taken too, ahead of the
-//! wording above: [`authorization`] states the rule and words the refusal.
+//! wording above: [`authorization`] states the rule and words the refusal. The account's
+//! ENTITLEMENT to the feature a request addresses is decided in the same place and for the
+//! same reason — it is a fact about the account rather than about the request, so it precedes
+//! every statement about the request: [`entitlement`] states that rule.
 //!
 //! ## This service's other edited seam: the endpoint a gateway publishes
 //!
@@ -98,6 +101,7 @@
 
 pub mod authorization;
 pub mod consent_portal;
+pub mod entitlement;
 pub mod mcp;
 pub(crate) mod validation;
 
@@ -441,8 +445,9 @@ impl<O, Eng> StatedPerOperation<O, Eng> {
 
 /// How this service answers `req` before `O`'s handler runs, when it answers it at all.
 enum PreHandler {
-    /// The authorization decision refused it: the calling principal's own IAM policies do
-    /// not allow the action on the resource the request addresses (see [`authorization`]).
+    /// An access decision refused it: the calling principal's own IAM policies do not allow
+    /// the action on the resource the request addresses (see [`authorization`]), or the
+    /// account is not entitled to the feature the request addresses (see [`entitlement`]).
     /// Rendered at the 403 the protocol gives an authorization refusal.
     Denied(Refused),
     /// It breaks modelled constraints, worded as [`validation`] states them.
@@ -450,16 +455,17 @@ enum PreHandler {
 }
 
 /// This service's pre-handler answer to `req` for the operation `O`: the authorization
-/// refusal first, then the wording of every modelled constraint it breaks. `None` when
-/// neither refuses it — and for a failure that is NOT a refusal (a body the codec cannot
-/// read at all, a member of the wrong type), which the framework's own walk answers in its
-/// own envelope.
+/// refusal first, then the account's entitlement to the feature addressed, then the wording
+/// of every modelled constraint it breaks. `None` when none of them refuses it — and for a
+/// failure that is NOT a refusal (a body the codec cannot read at all, a member of the wrong
+/// type), which the framework's own walk answers in its own envelope.
 ///
-/// The ORDER is the one AWS takes, and the reason the authorization decision is taken here
-/// at all: IAM decides a signed call ahead of the service, so a principal whose policies do
-/// not allow the action is told that rather than told its input is malformed — and the
-/// framework's centralized walk validates the model's constraints before any handler runs,
-/// so no handler could take a decision that precedes it ([`authorization`]).
+/// The ORDER is the one AWS takes, and the reason both access decisions are taken here at
+/// all: IAM decides a signed call ahead of the service, and the service decides what the
+/// account may use ahead of what the request says, so a caller the first two refuse is told
+/// that rather than told its input is malformed — and the framework's centralized walk
+/// validates the model's constraints before any handler runs, so no handler could take a
+/// decision that precedes it ([`authorization`], [`entitlement`]).
 ///
 /// The collecting half of the validation answer is the tree's shared one,
 /// `service_common::validation::refusing_violations_with_lists`: one read of the request
@@ -476,6 +482,11 @@ fn pre_handler<O: Operation, Eng: Send + Sync + 'static>(
     ctx: &OperationContext<'_>,
 ) -> Option<PreHandler> {
     if let Some(denial) = authorization::refusal(engine, ctx, O::NAME) {
+        return Some(PreHandler::Denied(denial));
+    }
+    // And the account's own entitlement to the feature the request addresses, which the
+    // service decides after IAM has let the call through to it ([`entitlement`]).
+    if let Some(denial) = entitlement::refusal(engine, ctx, O::NAME) {
         return Some(PreHandler::Denied(denial));
     }
     let (violations, lists) =

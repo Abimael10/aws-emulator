@@ -2045,6 +2045,10 @@ pub mod consent_portals;
 /// handler names `crate::state::…` for it exactly as it does for the resources
 /// beside it.
 pub mod online_evaluation_configs;
+/// Whether this account may use the AgentCore Registry at all: the entitlement
+/// every registry call is decided by, and the out-of-band grant that is the only
+/// thing which gives an account one.
+pub mod registry_entitlement;
 pub use api_key_credential_providers::*;
 pub use capacity_providers::*;
 pub use consent_portals::*;
@@ -2060,6 +2064,7 @@ pub use memory_strategies::*;
 pub use payment_credential_providers::*;
 pub use payment_managers::*;
 pub use policies::*;
+pub use registry_entitlement::*;
 pub use resource_policies::*;
 pub use runtime_logs::*;
 
@@ -3401,8 +3406,9 @@ impl ConfigurationBundleRecord {
 /// [`MAX_DATASET_EXAMPLES`] the examples one ingestion yields into a dataset and
 /// [`MAX_VERSIONS_PER_DATASET`] the versions one dataset holds,
 /// [`MAX_OAUTH2_CREDENTIAL_PROVIDERS`] the OAuth2 credential providers, the
-/// resource policies are capped by the resources they attach to (one per runtime
-/// or gateway at most, and the entry of a resource that is gone is dropped), and
+/// resource policies are capped by the resources they attach to (one per
+/// policy-carrying resource at most, and the entry of a resource that is gone is
+/// dropped), and
 /// the
 /// idempotency records are capped at [`MAX_REMEMBERED_CLIENT_TOKENS`] with
 /// oldest-first eviction plus removal when the resource they name is deleted.
@@ -3524,6 +3530,10 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::registry_idempotency`] in the order they were first
     /// recorded, so the oldest record is the one evicted at the ceiling.
     registry_idempotency_order: VecDeque<String>,
+    /// Whether this account holds the AgentCore Registry entitlement, which
+    /// every registry call is decided by ([`registry_entitlement`]). An account
+    /// starts without it.
+    registry_entitlement: bool,
     /// Every custom browser, keyed by `browserId` — the identifier every browser
     /// route addresses it by. The key order is the deterministic list order a
     /// browser listing pages over.

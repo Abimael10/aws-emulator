@@ -124,6 +124,43 @@ pub fn action_for(operation: &str) -> String {
     format!("{ACTION_PREFIX}:{operation}")
 }
 
+/// The modelled `AccessDeniedException` for a call this endpoint denies on the resource it
+/// addressed, blaming the principal that signed and the action it asked for.
+///
+/// For the decisions a HANDLER takes rather than this gate: ones that rest on the resource
+/// the request named, which this layer cannot resolve from the request line. The sentence is
+/// the same one ([`not_authorized`]), so a client reads one wording for every denial of this
+/// endpoint whichever layer reached it, and the principal is read from the same place
+/// `sts:GetCallerIdentity` answers from ([`request_principal`]).
+///
+/// Call it with no guard of this service's own store held — it reads the identity stores.
+#[must_use]
+pub fn access_denied<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &OperationContext<'_>,
+    operation: &str,
+) -> crate::ops::types::AccessDeniedException {
+    crate::ops::types::AccessDeniedException {
+        message: Some(not_authorized(
+            &request_principal(engine, ctx),
+            &action_for(operation),
+        )),
+    }
+}
+
+/// The principal this request speaks for, as `sts:GetCallerIdentity` reports it — the value
+/// a refusal of this endpoint blames.
+///
+/// The one resolution this crate has of "who is calling" ([`caller`]), so a handler that
+/// must name the principal names the same one this gate would.
+#[must_use]
+pub fn request_principal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &OperationContext<'_>,
+) -> String {
+    caller(engine, ctx).arn
+}
+
 /// The refusal a request to `operation` gets when the calling principal's IAM policies do
 /// not allow it, and `None` when they do — and for every request whose resource this layer
 /// cannot name from the request line (see the module docs).
@@ -204,7 +241,8 @@ fn withheld(caller: &Caller, request: &iam::Request<'_>, action: &str) -> Option
 /// states ([`Addressed::refused`]); this endpoint's recorded refusal of a runtime read
 /// carries neither clause, so the two fixed fragments here are all of its fixed text and the
 /// only values in it come from the request and the signing identity.
-fn not_authorized(principal: &str, action: &str) -> String {
+#[must_use]
+pub fn not_authorized(principal: &str, action: &str) -> String {
     format!("User: {principal} is not authorized to perform: {action}")
 }
 

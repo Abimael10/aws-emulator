@@ -47,6 +47,47 @@ const POLICY_MISSING: &str = "Resource Policy doesn't exist for requested arn";
 /// policy can attach to (`crate::state::resource_arn_not_found`).
 const RESOURCE_MISSING: &str = "ResourceArn provided in the request does not exist";
 
+/// How every resource-policy operation words a `resourceArn` whose resource type carries no
+/// policy plane (`crate::state::resource_policy_unsupported_type`).
+const UNSUPPORTED_TYPE: &str =
+    "resourceArn: resource policies are not supported for this resource type";
+
+/// Which refusal an unresolvable `resourceArn` earns — decided by what its resource TYPE is,
+/// which is the rule `tests/all/resource_policy_resource_type_scope.rs` spans by type.
+#[derive(Debug, Clone, Copy)]
+enum Refusal {
+    /// A type whose resources carry a policy plane, naming no resource this account holds.
+    NotFound,
+    /// A resource type of this service that carries no policy plane.
+    UnsupportedType,
+    /// An ARN naming no resource type of this service at all.
+    Denied,
+}
+
+impl Refusal {
+    /// The status, the error code and the message `operation` answers this refusal with. The
+    /// denial names the operation's own action and the principal that signed, so it is the
+    /// one row whose sentence differs per operation.
+    fn expected(self, operation: &str) -> (u16, &'static str, String) {
+        match self {
+            Self::NotFound => (
+                404,
+                "ResourceNotFoundException",
+                RESOURCE_MISSING.to_string(),
+            ),
+            Self::UnsupportedType => (400, "ValidationException", UNSUPPORTED_TYPE.to_string()),
+            Self::Denied => (
+                403,
+                "AccessDeniedException",
+                format!(
+                    "User: {} is not authorized to perform: bedrock-agentcore:{operation}",
+                    ::service_common::caller_principal::ambient_user_arn()
+                ),
+            ),
+        }
+    }
+}
+
 /// The retry guidance the gateway and runtime families' resource-lookup refusal carries. No
 /// resource-policy refusal may offer it: the resource-policy plane words its own refusals.
 const GENERIC_LOOKUP_GUIDANCE: &str = "Retry the request with a different resource identifier.";
@@ -494,15 +535,18 @@ async fn a_deleted_resource_carries_no_policy() {
 }
 
 /// What the resource-policy operations refuse, and with which modelled error: an ARN that
-/// names no resource this service holds, one of a resource type the feature does not cover,
-/// one outside the request's own partition, account or Region, a resource carrying no policy,
-/// and a document or a label outside the modelled length range.
+/// names no resource this service holds, one of a resource type that carries no policy plane,
+/// one naming no resource type of this service at all, one outside the request's own
+/// partition, account or Region, a resource carrying no policy, and a document or a label
+/// outside the modelled length range.
 ///
 /// The unresolvable-ARN rows span what the rule generalises over rather than one cited ARN:
-/// the partition, the account, the Region, the resource type (covered-but-absent, a nested
-/// child of a covered resource, a type the feature does not cover, and another service's
-/// namespace), the case of that type, the shape of the resource part, and the label's length
-/// at each published bound of `BedrockAgentcoreResourceArn`.
+/// the partition, the account, the Region, the resource type (policy-carrying-but-absent, a
+/// nested child of a policy-carrying resource, a type of this service that carries no policy
+/// plane, and another service's namespace), the case of that type, the shape of the resource
+/// part, and the label's length at each published bound of `BedrockAgentcoreResourceArn`.
+/// Which refusal each row earns follows its resource TYPE, the rule
+/// `tests/all/resource_policy_resource_type_scope.rs` spans by type.
 #[tokio::test]
 async fn the_resource_policy_operations_refuse_what_the_model_states_they_must() {
     let router = router();
@@ -512,63 +556,74 @@ async fn the_resource_policy_operations_refuse_what_the_model_states_they_must()
     let gateway_id = gateway.rsplit('/').next().unwrap_or_default().to_string();
     let policy = policy_document("Refused", "bedrock-agentcore:InvokeAgentRuntime");
 
-    // (case, the ARN addressed) — each is a well-formed `BedrockAgentcoreResourceArn`
-    // (`len 20..1011`, no pattern), so every refusal below is the handler's and not the
-    // boundary's.
-    let unresolved: Vec<(&str, String)> = vec![
+    // (case, the ARN addressed, the refusal its resource type earns) — each ARN is a
+    // well-formed `BedrockAgentcoreResourceArn` (`len 20..1011`, no pattern), so every
+    // refusal below is the handler's and not the boundary's.
+    let unresolved: Vec<(&str, String, Refusal)> = vec![
         (
             "a runtime ARN naming no stored runtime",
             format!("arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:runtime/absent_runtime-0123456789"),
+            Refusal::NotFound,
         ),
         (
             "a gateway ARN naming no stored gateway",
             format!("arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:gateway/absent-gateway-0123456789"),
+            Refusal::NotFound,
         ),
         (
-            // The feature covers the runtime and the gateway, not an endpoint of a runtime.
+            // An endpoint of a runtime is not the runtime: the resource part is the child's.
             "a runtime-endpoint ARN of a stored runtime",
             format!(
                 "arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:runtime/{runtime_id}/runtime-endpoint/DEFAULT"
             ),
+            Refusal::NotFound,
         ),
         (
-            // A memory is a resource of this service the feature does not cover.
+            // A memory is a resource of this service whose type carries no policy plane.
             "a memory ARN",
             format!("arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:memory/{runtime_id}"),
+            Refusal::UnsupportedType,
         ),
         (
             "a stored gateway's id under another account",
             format!("arn:aws:bedrock-agentcore:{REGION}:210987654321:gateway/{gateway_id}"),
+            Refusal::NotFound,
         ),
         (
             "a stored gateway's id in another Region than the request",
             format!("arn:aws:bedrock-agentcore:eu-west-2:{ACCOUNT}:gateway/{gateway_id}"),
+            Refusal::NotFound,
         ),
         (
             "a stored gateway's id in the China partition",
             format!("arn:aws-cn:bedrock-agentcore:cn-north-1:{ACCOUNT}:gateway/{gateway_id}"),
+            Refusal::NotFound,
         ),
         (
             "a stored runtime's id in the GovCloud partition",
             format!(
                 "arn:aws-us-gov:bedrock-agentcore:us-gov-west-1:{ACCOUNT}:runtime/{runtime_id}"
             ),
+            Refusal::NotFound,
         ),
         (
             // The resource type is matched as this service publishes it, so a differently
-            // cased spelling names nothing.
+            // cased spelling names no resource type of it at all.
             "a stored gateway's id under an upper-cased resource type",
             format!("arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:GATEWAY/{gateway_id}"),
+            Refusal::Denied,
         ),
         (
             // No separator in the resource part at all: nothing names a type and an id.
             "an ARN whose resource part names no type",
             format!("arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:{gateway_id}"),
+            Refusal::Denied,
         ),
         (
             // An ARN of another service's namespace entirely.
             "an S3 bucket ARN",
             "arn:aws:s3:::a-bucket-that-is-not-agentcore".to_string(),
+            Refusal::Denied,
         ),
         ("an ARN at the published minimum length", {
             let arn = "arn:aws:x:r:a:g/abcd".to_string();
@@ -579,43 +634,35 @@ async fn the_resource_policy_operations_refuse_what_the_model_states_they_must()
                 arn.len()
             );
             arn
-        }),
+        }, Refusal::Denied),
         (
             "an ARN at the published maximum length",
             arn_of_length(MAX_ARN_LEN),
+            Refusal::NotFound,
         ),
     ];
 
-    for (case, arn) in unresolved {
-        // Every one of the three asked about a resource that is not there, so each
-        // reports the ARN that resolves to nothing rather than a policy: the remedy is
-        // to address a resource that exists, whichever operation was called.
-        for (operation, expected_message, (status, answer)) in [
+    for (case, arn, refusal) in unresolved {
+        // Every one of the three answers the ARN the same way: the remedy belongs to the
+        // resource type the ARN carries, not to the operation that was called.
+        for (operation, (status, answer)) in [
             (
                 "PutResourcePolicy",
-                RESOURCE_MISSING,
                 put_policy(&router, &arn, &policy, REGION).await,
             ),
-            (
-                "GetResourcePolicy",
-                RESOURCE_MISSING,
-                get_policy(&router, &arn, REGION).await,
-            ),
+            ("GetResourcePolicy", get_policy(&router, &arn, REGION).await),
             (
                 "DeleteResourcePolicy",
-                RESOURCE_MISSING,
                 delete_policy(&router, &arn, REGION).await,
             ),
         ] {
+            let (expected_status, expected_code, expected_message) =
+                refusal.expected(operation);
             assert_eq!(
                 (status, error_code(&answer).as_str(), text(&answer, "message")),
-                (
-                    404,
-                    "ResourceNotFoundException",
-                    expected_message.to_string()
-                ),
-                "case {case:?} ({operation}): expected HTTP 404 ResourceNotFoundException \
-                 {expected_message:?}, got {status} {} ({answer})",
+                (expected_status, expected_code, expected_message.clone()),
+                "case {case:?} ({operation}): expected HTTP {expected_status} \
+                 {expected_code} {expected_message:?}, got {status} {} ({answer})",
                 error_code(&answer)
             );
             // The sentence above is the resource-policy plane's own: it never falls back on

@@ -16,6 +16,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::state;
 use service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::EmulatedService;
 
 /// The region the tests sign for.
@@ -37,6 +38,14 @@ fn client_token(seed: &str) -> String {
 
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    // The registry plane is entitled: an account holds the AgentCore Registry entitlement,
+    // granted out of band, or every registry call is refused before a handler runs
+    // (`tests/all/registry_entitlement_gate.rs` pins that rule). This suite is about the
+    // lifecycle the plane serves once the account may use it, so the account holds it here.
+    assert!(
+        state::grant_registry_entitlement(&*engine),
+        "setup: the shared engine must carry this service's store"
+    );
     let mut router = MultiServiceRouter::default();
     router.register_service(EmulatedService::new(engine));
     router

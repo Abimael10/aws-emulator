@@ -33,6 +33,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::state as agentcore;
 use service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::EmulatedService;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::Role;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
@@ -90,6 +91,15 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        // One family in the table below — the registry — is an ENTITLED plane, refused
+        // before any handler runs for an account that does not hold the AgentCore Registry
+        // entitlement (`tests/all/registry_entitlement_gate.rs` pins that rule). This suite
+        // is about what IAM decides once the account may use the feature, so the account
+        // holds the entitlement here, granted out of band as AWS grants it.
+        assert!(
+            agentcore::grant_registry_entitlement(&*engine),
+            "setup: the shared engine must carry this service's store"
+        );
         let mut router = MultiServiceRouter::default();
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
         Self { router, engine }
