@@ -25,8 +25,8 @@ use service_com_amazonaws_personalizeruntime_amazonpersonalizeruntime::state::{
 };
 
 use crate::support::{
-    actions, entries, ids, items, scores_by_id, Emulator, ACTION_RECOMMENDATIONS, COLUMN_GENRE,
-    COLUMN_YEAR, PERSONALIZE_RANKING, RECOMMENDATIONS,
+    actions, assert_descending_and_bounded, entries, ids, items, scores, scores_by_id, Emulator,
+    ACTION_RECOMMENDATIONS, COLUMN_GENRE, COLUMN_YEAR, PERSONALIZE_RANKING, RECOMMENDATIONS,
 };
 
 /// The dataset group every resource of this suite belongs to. A Personalize dataset
@@ -43,6 +43,10 @@ const OTHER_ITEMS_DATASET: &str =
     "arn:aws:personalize:us-east-1:000000000000:dataset/elsewhere/ITEMS";
 /// The tracking id the group's event tracker is addressed by.
 const TRACKING_ID: &str = "tracker-propagation";
+/// A SECOND event tracker of the same dataset group: one tracker retains only its most
+/// recent [`ingestion::MAX_EVENTS_PER_TRACKER`] events, and a group may hold many, so the
+/// rows a suite needs past that bound are recorded through this one.
+const TRACKING_ID_SECOND: &str = "tracker-propagation-second";
 
 /// A `USER_PERSONALIZATION` campaign of the group, with metadata in recommendations
 /// enabled.
@@ -175,6 +179,28 @@ const SEED_EVENTS: [SeedEvent; 5] = [
     },
 ];
 
+/// The ingestion targets of the group — the event trackers and the datasets — as the
+/// Amazon Personalize CONTROL plane mints them.
+///
+/// A group may hold several trackers, and ONE tracker retains only its most recent
+/// [`ingestion::MAX_EVENTS_PER_TRACKER`] events, so a suite that needs more rows than that
+/// spreads them over the two trackers of this one group.
+fn register_ingestion_targets(engine: &::engine::InMemoryEngine) {
+    let store =
+        engine.state::<ingestion::ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState>();
+    let mut store = store.lock();
+    for tracking_id in [TRACKING_ID, TRACKING_ID_SECOND] {
+        store
+            .register_event_tracker(tracking_id, Some(GROUP.to_string()))
+            .expect("the ingestion store accepts the event tracker");
+    }
+    for dataset in [ITEMS_DATASET, ACTIONS_DATASET, OTHER_ITEMS_DATASET] {
+        store
+            .register_dataset(dataset)
+            .unwrap_or_else(|| panic!("the ingestion store accepts the dataset {dataset}"));
+    }
+}
+
 /// An emulator with both data planes mounted, the group's ingestion targets registered
 /// and the campaigns and filters this suite reads.
 ///
@@ -187,18 +213,7 @@ fn seeded() -> Emulator {
     let emulator = Emulator::with_ingestion();
     let engine = &*emulator.engine;
 
-    {
-        let store = engine.state::<ingestion::ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState>();
-        let mut store = store.lock();
-        store
-            .register_event_tracker(TRACKING_ID, Some(GROUP.to_string()))
-            .expect("the ingestion store accepts the event tracker");
-        for dataset in [ITEMS_DATASET, ACTIONS_DATASET, OTHER_ITEMS_DATASET] {
-            store
-                .register_dataset(dataset)
-                .unwrap_or_else(|| panic!("the ingestion store accepts the dataset {dataset}"));
-        }
-    }
+    register_ingestion_targets(engine);
 
     // Everything the group's campaigns were fitted to was fitted BEFORE this suite
     // records anything, so every interaction it records is one the fitted popularity does
@@ -967,5 +982,481 @@ async fn ingestion_changes_nothing_for_a_campaign_fitted_to_no_dataset_group() {
         (status, code.as_str()),
         (400, "InvalidInputException"),
         "a column no catalog of this campaign holds is still refused, got {status} {code}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// What the fitted instant separates: the interactions a STORED popularity already counted.
+// ---------------------------------------------------------------------------------------
+
+/// The most interactions one `PutEvents` / `PutActionInteractions` call may carry
+/// (`EventList` and `ActionInteractionsList` are both modelled `len 1..10`), so a larger
+/// number of interactions is several calls.
+const EVENTS_PER_CALL: usize = 10;
+
+/// An item id the fitted catalog of every campaign in this suite does NOT hold, so the
+/// fitted popularity counts nothing for it.
+const ADDED_ITEM: &str = "item-added";
+/// A second such id, for the row that drives the catalog bound.
+const PRE_FITTED_ADDED_ITEM: &str = "item-added-before-fitting";
+/// An action id the fitted Actions catalog does not hold.
+const ADDED_ACTION: &str = "action-added";
+
+/// One row of the popularity table: how many interactions were recorded for one entry
+/// BEFORE the instant the campaign was fitted at, and how many after it.
+struct PopularityRow {
+    case: &'static str,
+    before_fitting: usize,
+    after_fitting: usize,
+}
+
+/// The rows the popularity rule is asserted over: no interaction at all, interactions only
+/// before the fitted instant, only after it, split across it, and the same total reached
+/// through different splits — the axes "whenever that interaction arrived" generalises
+/// over.
+const POPULARITY_ROWS: [PopularityRow; 7] = [
+    PopularityRow {
+        case: "no interaction at all",
+        before_fitting: 0,
+        after_fitting: 0,
+    },
+    PopularityRow {
+        case: "one interaction, recorded before the campaign was fitted",
+        before_fitting: 1,
+        after_fitting: 0,
+    },
+    PopularityRow {
+        case: "one interaction, recorded after the campaign was fitted",
+        before_fitting: 0,
+        after_fitting: 1,
+    },
+    PopularityRow {
+        case: "three interactions, all recorded before the campaign was fitted",
+        before_fitting: 3,
+        after_fitting: 0,
+    },
+    PopularityRow {
+        case: "three interactions, two of them before the campaign was fitted",
+        before_fitting: 2,
+        after_fitting: 1,
+    },
+    PopularityRow {
+        case: "three interactions, all recorded after the campaign was fitted",
+        before_fitting: 0,
+        after_fitting: 3,
+    },
+    PopularityRow {
+        case: "more interactions than one call carries, all before the campaign was fitted",
+        before_fitting: EVENTS_PER_CALL + 2,
+        after_fitting: 0,
+    },
+];
+
+/// An emulator with both data planes mounted and the group's ingestion targets registered,
+/// but NO campaign yet.
+///
+/// A suite whose subject is an interaction recorded BEFORE the instant a campaign was
+/// fitted at has to ingest first and register the campaign afterwards, which is the order
+/// a caller streaming into a dataset group before `CreateCampaign` produces.
+fn ingestion_before_fitting() -> Emulator {
+    let emulator = Emulator::with_ingestion();
+    register_ingestion_targets(&emulator.engine);
+    emulator
+}
+
+/// Register the group's ranking and action campaigns, each fitted to the group at
+/// `fitted_at` — what `CreateCampaign` records for the solution version it deploys.
+fn register_campaigns_fitted_at(emulator: &Emulator, fitted_at: SystemTime) {
+    let engine = &*emulator.engine;
+    assert!(
+        registry::register_campaign(
+            engine,
+            Campaign::new(
+                CAMPAIGN_RANKING,
+                "propagation",
+                RecipeType::PersonalizedRanking,
+                items(CATALOG_SIZE)
+            )
+            .fitted_to(GROUP, fitted_at)
+        ),
+        "the campaign seam must register the ranking campaign"
+    );
+    assert!(
+        registry::register_campaign(
+            engine,
+            Campaign::new_actions(
+                CAMPAIGN_ACTIONS,
+                "propagation-actions",
+                actions(ACTION_CATALOG_SIZE)
+            )
+            .fitted_to(GROUP, fitted_at)
+        ),
+        "the campaign seam must register the action campaign"
+    );
+}
+
+/// Record `count` item interactions for `item_id` through `PutEvents` on `tracking_id`,
+/// with `tag` keeping every event id of one fixture distinct.
+async fn record_interactions(
+    emulator: &Emulator,
+    tracking_id: &str,
+    item_id: &str,
+    count: usize,
+    tag: &str,
+) {
+    let mut recorded = 0;
+    let mut batch = 0;
+    while recorded < count {
+        let size = (count - recorded).min(EVENTS_PER_CALL);
+        let events: Vec<Value> = (0..size)
+            .map(|offset| {
+                json!({
+                    "eventType": "watch",
+                    "sentAt": SENT_AT,
+                    "itemId": item_id,
+                    "eventId": format!("{tag}-{batch}-{offset}"),
+                })
+            })
+            .collect();
+        emulator
+            .ingest(
+                EVENTS,
+                json!({
+                    "trackingId": tracking_id,
+                    "sessionId": format!("session-{tag}"),
+                    "userId": "user-1",
+                    "eventList": events,
+                }),
+            )
+            .await;
+        recorded += size;
+        batch += 1;
+    }
+}
+
+/// Record `count` action interactions for `action_id` through `PutActionInteractions`.
+async fn record_action_interactions_for(
+    emulator: &Emulator,
+    action_id: &str,
+    count: usize,
+    tag: &str,
+) {
+    let mut recorded = 0;
+    let mut batch = 0;
+    while recorded < count {
+        let size = (count - recorded).min(EVENTS_PER_CALL);
+        let interactions: Vec<Value> = (0..size)
+            .map(|offset| {
+                json!({
+                    "actionId": action_id,
+                    "sessionId": format!("session-{tag}"),
+                    "userId": "user-1",
+                    "timestamp": SENT_AT,
+                    "eventType": "Taken",
+                    "eventId": format!("{tag}-{batch}-{offset}"),
+                })
+            })
+            .collect();
+        emulator
+            .ingest(
+                ACTION_INTERACTIONS,
+                json!({
+                    "trackingId": TRACKING_ID,
+                    "actionInteractions": interactions,
+                }),
+            )
+            .await;
+        recorded += size;
+        batch += 1;
+    }
+}
+
+/// The score `GetPersonalizedRanking` reports for `item_id` when `row`'s interactions were
+/// recorded around the instant the ranking campaign was fitted at. The request lists the
+/// whole fitted catalog plus [`ADDED_ITEM`], so the reported scores are the shares of the
+/// scored catalog.
+async fn ranked_score(row: &PopularityRow, item_id: &str) -> BTreeMap<String, f64> {
+    let emulator = ingestion_before_fitting();
+    record_interactions(&emulator, TRACKING_ID, item_id, row.before_fitting, "before").await;
+    register_campaigns_fitted_at(&emulator, SystemTime::now());
+    record_interactions(&emulator, TRACKING_ID, item_id, row.after_fitting, "after").await;
+
+    let mut input_list: Vec<String> = items(CATALOG_SIZE)
+        .into_iter()
+        .map(|item| item.item_id)
+        .collect();
+    input_list.push(ADDED_ITEM.to_string());
+    let response = emulator
+        .ok(
+            PERSONALIZE_RANKING,
+            json!({
+                "campaignArn": CAMPAIGN_RANKING,
+                "userId": "user-1",
+                "inputList": input_list,
+            }),
+        )
+        .await;
+    assert_descending_and_bounded(row.case, &scores(&response, "personalizedRanking"));
+    scores_by_id(&response, "personalizedRanking", "itemId")
+}
+
+/// The one score of `item_id` out of [`ranked_score`].
+async fn ranked_score_of(row: &PopularityRow, item_id: &str) -> f64 {
+    let scores = ranked_score(row, item_id).await;
+    *scores.get(item_id).unwrap_or_else(|| {
+        panic!("case {:?}: no score for {item_id} in {scores:?}", row.case)
+    })
+}
+
+#[tokio::test]
+async fn an_added_entry_s_popularity_counts_every_interaction_whenever_it_arrived() {
+    // An entry the fitted catalog holds no popularity for had none of its interactions
+    // counted, so all of them count — which makes its popularity, and therefore its
+    // reported score, a function of HOW MANY interactions it has and not of where the
+    // fitted instant falls among them.
+    let mut by_total: BTreeMap<usize, Vec<(&str, f64)>> = BTreeMap::new();
+    for row in &POPULARITY_ROWS {
+        let score = ranked_score_of(row, ADDED_ITEM).await;
+        by_total
+            .entry(row.before_fitting + row.after_fitting)
+            .or_default()
+            .push((row.case, score));
+    }
+
+    let mut previous: Option<(usize, f64)> = None;
+    for (total, scored) in &by_total {
+        let (reference_case, reference) = scored[0];
+        for (case, score) in scored {
+            assert!(
+                (score - reference).abs() < 1e-12,
+                "case {case:?}: {total} recorded interactions must score what {reference_case:?} \
+                 scores ({reference}), got {score}"
+            );
+        }
+        if *total == 0 {
+            assert_eq!(
+                reference, 0.0,
+                "case {reference_case:?}: an entry nobody interacted with has no popularity, \
+                 got {reference}"
+            );
+        } else {
+            assert!(
+                reference > 0.0,
+                "case {reference_case:?}: {total} recorded interactions are a popularity above \
+                 zero, got {reference}"
+            );
+        }
+        if let Some((previous_total, previous_score)) = previous {
+            assert!(
+                reference > previous_score,
+                "case {reference_case:?}: {total} recorded interactions must score above the \
+                 {previous_score} of {previous_total}, got {reference}"
+            );
+        }
+        previous = Some((*total, reference));
+    }
+}
+
+#[tokio::test]
+async fn a_fitted_entry_counts_only_the_interactions_its_stored_popularity_does_not() {
+    // The other half of the same rule, and the only reason the fitted instant is kept: the
+    // interactions a stored popularity ALREADY counted are not counted again, so rows that
+    // predate the fitted instant leave a fitted entry's score exactly where it was.
+    let fitted_item = format!("item-{}", CATALOG_SIZE - 1);
+    let baseline = ranked_score(&POPULARITY_ROWS[0], &fitted_item).await;
+
+    for row in POPULARITY_ROWS
+        .iter()
+        .filter(|row| row.after_fitting == 0 && row.before_fitting > 0)
+    {
+        let scored = ranked_score(row, &fitted_item).await;
+        assert_eq!(
+            scored, baseline,
+            "case {:?}: an interaction the fitted popularity already counted may not be \
+             counted twice, expected {baseline:?}, got {scored:?}",
+            row.case
+        );
+    }
+
+    let mut previous = *baseline
+        .get(&fitted_item)
+        .unwrap_or_else(|| panic!("no score for {fitted_item} in {baseline:?}"));
+    for row in POPULARITY_ROWS
+        .iter()
+        .filter(|row| row.before_fitting == 0 && row.after_fitting > 0)
+    {
+        let score = ranked_score_of(row, &fitted_item).await;
+        assert!(
+            score > previous,
+            "case {:?}: an interaction recorded since the catalog was fitted must raise the \
+             score above {previous}, got {score}",
+            row.case
+        );
+        previous = score;
+    }
+}
+
+#[tokio::test]
+async fn an_added_action_s_popularity_counts_its_interactions_from_before_the_fitted_instant() {
+    // The same rule over the OTHER entity an inference call recommends: an action the
+    // fitted Actions catalog does not hold, reached through `GetActionRecommendations`.
+    let mut scored: Vec<(&str, f64)> = Vec::new();
+    for (case, before_fitting, after_fitting) in [
+        ("no action interaction at all", 0_usize, 0_usize),
+        ("three before the campaign was fitted", 3, 0),
+        ("three after the campaign was fitted", 0, 3),
+    ] {
+        let emulator = ingestion_before_fitting();
+        record_action_interactions_for(&emulator, ADDED_ACTION, before_fitting, "before").await;
+        register_campaigns_fitted_at(&emulator, SystemTime::now());
+        record_action_interactions_for(&emulator, ADDED_ACTION, after_fitting, "after").await;
+
+        let response = emulator
+            .ok(
+                ACTION_RECOMMENDATIONS,
+                json!({
+                    "campaignArn": CAMPAIGN_ACTIONS,
+                    "userId": "user-1",
+                    "numResults": ACTION_CATALOG_SIZE + 1,
+                }),
+            )
+            .await;
+        let scores = scores_by_id(&response, "actionList", "actionId");
+        scored.push((case, scores.get(ADDED_ACTION).copied().unwrap_or(0.0)));
+    }
+
+    assert_eq!(
+        scored[0].1, 0.0,
+        "case {:?}: an action nobody interacted with is not recommendable, got {}",
+        scored[0].0, scored[0].1
+    );
+    assert!(
+        scored[1].1 > 0.0,
+        "case {:?}: interactions recorded before the campaign was fitted are a popularity \
+         above zero, got {}",
+        scored[1].0,
+        scored[1].1
+    );
+    assert!(
+        (scored[1].1 - scored[2].1).abs() < 1e-12,
+        "case {:?}: the same number of interactions scores the same whenever they arrived, \
+         expected {}, got {}",
+        scored[1].0,
+        scored[2].1,
+        scored[1].1
+    );
+}
+
+#[tokio::test]
+async fn the_catalog_bound_keeps_the_most_interacted_with_added_entries() {
+    // The bound on the entries ingestion may ADD keeps the most interacted-with ones, so a
+    // bounded catalog is the head of the ordering a full one would report: an entry whose
+    // interactions all predate the fitted instant is still more interacted-with than one
+    // with a single interaction, and survives the cut.
+    const PRE_FITTING: usize = 3;
+    let bound = registry::ingested::MAX_LIVE_CATALOG_ENTRIES;
+
+    let emulator = ingestion_before_fitting();
+    record_interactions(
+        &emulator,
+        TRACKING_ID,
+        PRE_FITTED_ADDED_ITEM,
+        PRE_FITTING,
+        "pre",
+    )
+    .await;
+    register_campaigns_fitted_at(&emulator, SystemTime::now());
+
+    // One added entry MORE than the bound keeps, each with a single interaction recorded
+    // after the fitted instant: exactly one added entry is dropped. The ids are
+    // zero-padded, so the order their text settles ties in is their numeric order.
+    let live: Vec<String> = (0..bound).map(|index| format!("item-live-{index:04}")).collect();
+    for (batch, chunk) in live.chunks(EVENTS_PER_CALL).enumerate() {
+        // One tracker retains a bounded number of events, so the rows past that bound are
+        // recorded through the group's second tracker.
+        let tracking_id = if PRE_FITTING + (batch + 1) * EVENTS_PER_CALL
+            <= ingestion::MAX_EVENTS_PER_TRACKER
+        {
+            TRACKING_ID
+        } else {
+            TRACKING_ID_SECOND
+        };
+        let events: Vec<Value> = chunk
+            .iter()
+            .enumerate()
+            .map(|(offset, item_id)| {
+                json!({
+                    "eventType": "watch",
+                    "sentAt": SENT_AT,
+                    "itemId": item_id,
+                    "eventId": format!("live-{batch}-{offset}"),
+                })
+            })
+            .collect();
+        emulator
+            .ingest(
+                EVENTS,
+                json!({
+                    "trackingId": tracking_id,
+                    "sessionId": "session-live",
+                    "userId": "user-1",
+                    "eventList": events,
+                }),
+            )
+            .await;
+    }
+
+    let kept_single = live.first().expect("the table holds ids").clone();
+    let dropped = live.last().expect("the table holds ids").clone();
+    let response = emulator
+        .ok(
+            PERSONALIZE_RANKING,
+            json!({
+                "campaignArn": CAMPAIGN_RANKING,
+                "userId": "user-1",
+                "inputList": [PRE_FITTED_ADDED_ITEM, kept_single, dropped],
+            }),
+        )
+        .await;
+    let scores = scores_by_id(&response, "personalizedRanking", "itemId");
+
+    for (case, item_id) in [
+        (
+            "an entry whose interactions all predate the fitted instant",
+            PRE_FITTED_ADDED_ITEM,
+        ),
+        (
+            "an entry with one interaction, inside the bound",
+            kept_single.as_str(),
+        ),
+    ] {
+        let score = scores
+            .get(item_id)
+            .copied()
+            .unwrap_or_else(|| panic!("case {case:?}: no score for {item_id} in {scores:?}"));
+        assert!(
+            score > 0.0,
+            "case {case:?}: {item_id} must stay in the bounded catalog with a popularity \
+             above zero, got {score}"
+        );
+    }
+    let least = scores
+        .get(&dropped)
+        .copied()
+        .unwrap_or_else(|| panic!("no score for {dropped} in {scores:?}"));
+    assert_eq!(
+        least, 0.0,
+        "the added entry the bound drops is the least interacted-with one, so {dropped} \
+         carries no relevance, got {least}"
+    );
+    let pre_fitted = scores
+        .get(PRE_FITTED_ADDED_ITEM)
+        .copied()
+        .unwrap_or_default();
+    let single = scores.get(&kept_single).copied().unwrap_or_default();
+    assert!(
+        pre_fitted > single,
+        "an entry with {PRE_FITTING} interactions is more interacted-with than one with a \
+         single interaction, got {pre_fitted} against {single}"
     );
 }

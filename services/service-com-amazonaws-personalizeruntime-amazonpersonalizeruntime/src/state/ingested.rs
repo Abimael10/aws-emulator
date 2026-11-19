@@ -29,9 +29,12 @@
 //!   which is what makes an item put after training recommendable at all;
 //! * each entry's metadata columns, with the columns of its ingested record applied over
 //!   the fitted ones (the latest put for a column is what that column holds);
-//! * each entry's popularity: the fitted popularity plus the interactions recorded AFTER
-//!   the catalog was fitted. The interactions the fitted catalog already counted are not
-//!   counted twice, which is the only reason the fitted instant is kept.
+//! * each entry's popularity: the popularity already counted for the entry plus every
+//!   interaction that count does not include. The interactions the fitted catalog already
+//!   counted are not counted twice, which is the only reason the fitted instant is kept —
+//!   so that instant separates the interactions of an entry the fitted catalog HOLDS a
+//!   popularity for, and an entry it holds none for counts every interaction recorded for
+//!   it, whenever that interaction arrived.
 //!
 //! A filter clause over an interaction dataset reads something else entirely — whether
 //! THIS user interacted with the entry — so it reads every recorded interaction of that
@@ -508,21 +511,29 @@ fn recorded(rows: &[Interaction], user_id: &str) -> RecordedInteractions {
 /// ingestion ADDS are appended, most interacted-with first and bounded by
 /// [`MAX_LIVE_CATALOG_ENTRIES`], and every operation orders the result by the score it
 /// computes anyway.
+///
+/// An entry's popularity is what is already counted for it plus every interaction that
+/// count does not include: for an entry `stored` holds, its stored popularity plus the
+/// rows recorded after `fitted_at`; for an entry `stored` holds none for, every recorded
+/// row, since no popularity counted any of them.
 fn merge(
     stored: impl Iterator<Item = (String, f64, BTreeMap<String, String>)>,
     records: &BTreeMap<String, BTreeMap<String, String>>,
     rows: &[Interaction],
     fitted_at: Option<SystemTime>,
 ) -> Vec<(String, f64, BTreeMap<String, String>)> {
-    // The interactions recorded since the catalog was fitted, per entry: the ones it
-    // already counted are part of the stored popularity, so counting them again would
-    // weigh one interaction twice.
+    // Every interaction recorded for an entry, and the ones recorded since the catalog was
+    // fitted. An entry the fitted catalog holds a popularity for counts only the latter:
+    // the earlier ones are part of that stored popularity, so counting them again would
+    // weigh one interaction twice. An entry it holds no popularity for counts all of them,
+    // because none of them was ever counted.
+    let mut recorded_rows: BTreeMap<&str, usize> = BTreeMap::new();
     let mut since_fitted: BTreeMap<&str, usize> = BTreeMap::new();
-    for row in rows
-        .iter()
-        .filter(|row| fitted_at.is_none_or(|fitted_at| row.received_at > fitted_at))
-    {
-        *since_fitted.entry(row.entity_id.as_str()).or_default() += 1;
+    for row in rows {
+        *recorded_rows.entry(row.entity_id.as_str()).or_default() += 1;
+        if fitted_at.is_none_or(|fitted_at| row.received_at > fitted_at) {
+            *since_fitted.entry(row.entity_id.as_str()).or_default() += 1;
+        }
     }
 
     let mut merged: Vec<(String, f64, BTreeMap<String, String>)> = Vec::new();
@@ -548,8 +559,11 @@ fn merge(
         .filter(|id| !held.contains(*id))
         .collect::<BTreeSet<&str>>()
         .into_iter()
-        .map(|id| (id, since_fitted.get(id).copied().unwrap_or_default()))
+        .map(|id| (id, recorded_rows.get(id).copied().unwrap_or_default()))
         .collect();
+    // Ordered by that same popularity, so the entries the bound keeps are the most
+    // interacted-with ones and a bounded catalog is the head of the ordering a full one
+    // would report; the id settles a tie, so the bound always cuts at the same place.
     added.sort_by(|(left_id, left), (right_id, right)| {
         right.cmp(left).then_with(|| left_id.cmp(right_id))
     });
