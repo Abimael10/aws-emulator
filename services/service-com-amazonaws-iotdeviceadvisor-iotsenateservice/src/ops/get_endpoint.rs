@@ -2,11 +2,10 @@
 
 //! @op GetEndpoint
 //!
-//! Reports WHERE a device under test connects: the Device Advisor hostname of this
-//! account and region — the ACCOUNT-LEVEL one for a request that names no device and that
-//! DEVICE's own one for a request that names a device by its thing, its certificate or the
-//! role it assumes. A pure
-//! read: the answer is derived from the request, the account and the device named, by
+//! Reports WHERE a device under test connects: the address THIS emulator answers on, which
+//! is the one endpoint its whole surface — and so every account, region and device under
+//! test — is served at, where AWS vends a hostname per account and per device. A pure
+//! read: the answer is the address this emulator is served at, by
 //! [`crate::state::announced_endpoint`], the single derivation `StartSuiteRun` also reports
 //! its run's endpoint from, so nothing is written and the endpoint a run carries for its
 //! primary device and the one this vends for that device cannot disagree.
@@ -154,8 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The endpoint this operation reports is DERIVED — from the account, the region
-        // the request is signed for and the device it names — the same way an ARN is, so
+        // The endpoint this operation reports is the address THIS emulator answers on, so
         // there is no per-endpoint record to read and none to write. A request that
         // cannot reach this service's store at all is still the modelled server failure
         // rather than a host answered from nowhere.
@@ -177,8 +175,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every ARN the request carries has to BE one, and one of the service the member
         // that carries it names, by the single rule in [`crate::state::device_violation`]
         // every operation accepting a device identity shares. Naming NO device is legal
-        // here — that request asks for the account-level endpoint — so this member's
-        // naming requirement is the optional one.
+        // here — that request asks about the account rather than one device — so this
+        // member's naming requirement is the optional one.
         if let Some(violation) =
             crate::state::device_violation("", &device, crate::state::DeviceNaming::Optional)
         {
@@ -188,18 +186,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `authenticationMethod` says HOW the device connects, not WHICH device it is: the
         // model documents it as "the authentication method used during the device
         // connection" and couples it to none of the three identity members, each of which is
-        // "an optional parameter" on its own. It therefore takes no part in the host this
+        // "an optional parameter" on its own. It therefore takes no part in the address this
         // reports and imposes no requirement on the members the request carries — the only
         // values validated here are the device ARNs above, whose modelled length bounds and
         // enum membership the framework already enforced.
 
-        // The region the host names is the one the request was signed for, the same region
-        // this service scopes a minted ARN to.
-        let region = crate::state::request_region(ctx.parts());
-        // `endpoint` is a modelled Device Advisor hostname, so what is reported is the
-        // host of the account or of the device the request names, never the address this
-        // request happened to reach. See `crate::state::endpoint_addressing`.
-        let endpoint = crate::state::announced_endpoint(&region, &device);
+        // `endpoint` is the connection target the device under test is handed and then
+        // DIALS, so what is reported is the address this emulator answers on. One endpoint
+        // serves every account, region and device here, where AWS vends a hostname per
+        // account and per device: the device named above therefore selects no other address,
+        // and the region the request signs for — which scopes the ARNs this service mints —
+        // names none either. See `crate::state::endpoint_addressing`.
+        let endpoint = crate::state::announced_endpoint(ctx.endpoint().as_str());
         Ok(GetEndpointOutput {
             endpoint: Some(endpoint),
         })

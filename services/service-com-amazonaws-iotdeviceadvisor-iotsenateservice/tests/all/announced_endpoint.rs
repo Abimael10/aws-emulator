@@ -2,23 +2,25 @@
 
 //! WHICH endpoint this service REPORTS, over every way a caller can address the emulator.
 //!
-//! The rule under test is one sentence: `endpoint` is a modelled Device Advisor hostname,
-//! so an operation reporting one reports the host of the account and region asked about —
-//! or of the device the request names — whose single DNS label is an opaque service-minted
-//! one and never an AWS identifier such as the account id, whichever address the asking
-//! request reached this emulator on.
+//! The rule under test is one sentence: `endpoint` is the connection target the device under
+//! test is handed and then dials, so an operation reporting one reports the address THIS
+//! emulator answers on — the `host[:port]` of the one endpoint its whole surface is served
+//! at — and never a host AWS publishes its own endpoints at, whichever address the asking
+//! request reached this emulator on and whichever account, region or device it asks about.
 //!
 //! Both operations that report an endpoint are driven here — `GetEndpoint`, which vends it,
-//! and `StartSuiteRun`, which reports and persists the host its primary device connects to
-//! — so the two cannot drift: a client told a host by the start call is told the same host
-//! when it asks where that device should connect.
+//! and `StartSuiteRun`, which reports and persists where its primary device connects
+//! — so the two cannot drift: a client told an address by the start call is told the same
+//! address when it asks where that device should connect.
 //!
 //! The table spans what the rule generalises over: the form of the address a client
 //! reaches this emulator at (a loopback socket, a loopback address with no port, a loopback
 //! NAME, an IPv6 literal, a private address, an address carried only on the request URI),
 //! the hosts that name a service instead (this service's own endpoint host and an API
 //! endpoint host), and a request that addresses no host at all; each crossed with a request
-//! that names a device and one that names none.
+//! that names a device and one that names none. WHICH address is reported — the endpoint
+//! this process is SERVED at, not the address one request carried — is the
+//! [`served_bases`] table.
 //!
 //! Every case drives real HTTP requests through the same `MultiServiceRouter` the emulator
 //! serves on a socket.
@@ -31,9 +33,11 @@ use super::suite_lifecycle::{Answer, Emulator, ROLE_ARN};
 /// The region every case signs for.
 const REGION: &str = "us-west-2";
 
-/// The suffix the host AWS itself vends carries below its label, for [`REGION`].
-fn aws_host_suffix() -> String {
-    format!(".deviceadvisor.iot.{REGION}.amazonaws.com")
+/// The address this emulator answers on, which is what every endpoint it reports carries:
+/// the `host[:port]` of its own endpoint — the base an emulator served on no port, as the
+/// router this suite drives is, reports.
+fn served_address() -> String {
+    iotdeviceadvisor::state::announced_endpoint(::smithy_server_runtime::UNSERVED_URL_BASE)
 }
 
 /// A thing ARN for a device under test (`arn:aws:iot:<region>:<account>:thing/<name>`).
@@ -172,67 +176,54 @@ fn persisted_run_endpoint(emulator: &Emulator, run_id: &str) -> Option<String> {
     store.runs.get(run_id).map(|run| run.endpoint.clone())
 }
 
-/// Assert `endpoint` is a Device Advisor host: ONE opaque lowercase-alphanumeric DNS
-/// label under this service's endpoint domain, inside the modelled `Endpoint` length
-/// bounds, naming no AWS identifier a caller could read off it. Returns the label.
-fn assert_aws_vended_host(case: &str, endpoint: &str) -> String {
-    let suffix = aws_host_suffix();
-    let label = endpoint.strip_suffix(&suffix).unwrap_or_else(|| {
-        panic!("case {case:?}: expected a host ending in {suffix}, got {endpoint:?}")
-    });
+/// Assert `endpoint` is the address this emulator answers on — the only address a device
+/// handed it can reach — and names no host AWS publishes its own endpoints at, nor any AWS
+/// identifier a caller could read off it.
+fn assert_announced_address(case: &str, endpoint: &str) {
+    let served = served_address();
     assert_eq!(
-        label.len(),
-        iotdeviceadvisor::state::ENDPOINT_LABEL_LENGTH,
-        "case {case:?}: a vended host carries one fixed-length label, got {label:?}"
+        endpoint, served,
+        "case {case:?}: the reported endpoint must be the address this emulator answers on \
+         ({served:?}), got {endpoint:?}"
     );
+    // The zones AWS publishes its own endpoints in, as this tree reads them
+    // (`service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`).
+    for aws_zone in ::service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES {
+        assert!(
+            !endpoint.ends_with(aws_zone),
+            "case {case:?}: the reported endpoint must not name a host AWS serves \
+             ({aws_zone}), got {endpoint:?}"
+        );
+    }
     assert!(
-        label.starts_with(|c: char| c.is_ascii_lowercase())
-            && label
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
-        "case {case:?}: the label must be one lowercase-alphanumeric DNS label starting \
-         with a letter, got {label:?}"
+        !endpoint.contains(emulator_server::emulator_account_id()),
+        "case {case:?}: the reported endpoint is an address, so it carries no account id, \
+         got {endpoint:?}"
     );
-    assert_ne!(
-        label,
-        emulator_server::emulator_account_id(),
-        "case {case:?}: the label is minted by the service, so it must not be the account \
-         id, got {endpoint:?}"
-    );
-    let bounds =
-        iotdeviceadvisor::state::MIN_ENDPOINT_LENGTH..=iotdeviceadvisor::state::MAX_ENDPOINT_LENGTH;
-    assert!(
-        bounds.contains(&endpoint.len()),
-        "case {case:?}: a vended host must satisfy the modelled len 45..75, got \
-         {endpoint:?} ({} chars)",
-        endpoint.len()
-    );
-    label.to_string()
 }
 
-/// Every endpoint this service reports is the Device Advisor host of what the request asks
-/// about, whichever address the request reached this emulator on — whether it names a
+/// Every endpoint this service reports is the address this emulator answers on, whichever
+/// address the request reached this emulator on — whether it names a
 /// device or none, and whichever operation reports it.
 #[tokio::test]
-async fn a_reported_endpoint_is_the_device_advisor_host_whatever_address_the_request_reached() {
+async fn a_reported_endpoint_is_this_emulators_address_whatever_address_the_request_reached() {
     let emulator = Emulator::new();
 
     for addressing in addressings() {
         let case = addressing.case;
         let thing = thing_arn(&format!("announced-{}", case.replace(' ', "-")));
 
-        // The account-level question: a request that names no device.
-        let account_level = get_endpoint(&emulator, &addressing, &[]).await;
+        // The question a request that names no device asks.
+        let no_device = get_endpoint(&emulator, &addressing, &[]).await;
         assert_eq!(
-            account_level.status, 200,
+            no_device.status, 200,
             "case {case:?}: expected HTTP 200 from GetEndpoint, got {} {}",
-            account_level.status, account_level.body
+            no_device.status, no_device.body
         );
-        let account_level = account_level.string("endpoint");
+        let no_device = no_device.string("endpoint");
 
         // The device-level question: the same request naming a device under test.
-        let device_level = get_endpoint(&emulator, &addressing, &[("thingArn", &thing)]).await;
-        assert_eq!(
+        let device_level = get_endpoint(&emulator, &addressing, &[("thingArn", &thing)]).await;        assert_eq!(
             device_level.status, 200,
             "case {case:?}: expected HTTP 200 from GetEndpoint, got {} {}",
             device_level.status, device_level.body
@@ -273,12 +264,13 @@ async fn a_reported_endpoint_is_the_device_advisor_host_whatever_address_the_req
             persisted_run_endpoint(&emulator, &run_id)
         );
 
-        let account_label = assert_aws_vended_host(case, &account_level);
-        let device_label = assert_aws_vended_host(case, &device_level);
-        assert_ne!(
-            account_label, device_label,
-            "case {case:?}: a request that names a device is vended that device's \
-             own host, not the account-level one, got {device_level:?}"
+        assert_announced_address(case, &no_device);
+        assert_announced_address(case, &device_level);
+        assert_eq!(
+            no_device, device_level,
+            "case {case:?}: one endpoint serves every device here, so naming a device must \
+             be answered the address a request naming none is, got {device_level:?} and \
+             {no_device:?}"
         );
     }
 }
@@ -306,7 +298,7 @@ async fn the_reported_endpoint_does_not_follow_the_address_the_request_reached()
             "case {case:?}: asking twice through one address must answer one endpoint, got \
              {announced:?} and {again:?}"
         );
-        assert_aws_vended_host(case, &announced);
+        assert_announced_address(case, &announced);
 
         for (other_case, other) in &seen {
             assert_eq!(
@@ -319,10 +311,11 @@ async fn the_reported_endpoint_does_not_follow_the_address_the_request_reached()
     }
 }
 
-/// The host reported names the region the request was signed for, whichever address the
-/// request reached: the region is part of the Device Advisor domain the member carries.
+/// The address reported names no region: this process serves one endpoint for every region
+/// and resolves each request to the region its credential scope names, so the region a
+/// request signs for moves the ARNs it mints and not where its device connects.
 #[tokio::test]
-async fn a_reported_endpoint_names_the_region_the_request_signs_for() {
+async fn a_reported_endpoint_is_the_same_address_in_every_region() {
     let emulator = Emulator::new();
     let own = Addressing {
         case: "the emulator's own socket",
@@ -340,21 +333,7 @@ async fn a_reported_endpoint_names_the_region_the_request_signs_for() {
             "case {region:?}: expected HTTP 200 from GetEndpoint, got {} {}",
             answer.status, answer.body
         );
-        let endpoint = answer.string("endpoint");
-        let suffix = format!(".deviceadvisor.iot.{region}.amazonaws.com");
-        assert!(
-            endpoint.ends_with(&suffix),
-            "case {region:?}: the endpoint must name the region the request signs for, \
-             expected a host ending in {suffix:?}, got {endpoint:?}"
-        );
-        let bounds = iotdeviceadvisor::state::MIN_ENDPOINT_LENGTH
-            ..=iotdeviceadvisor::state::MAX_ENDPOINT_LENGTH;
-        assert!(
-            bounds.contains(&endpoint.len()),
-            "case {region:?}: the endpoint must satisfy the modelled len 45..75, got \
-             {endpoint:?} ({} chars)",
-            endpoint.len()
-        );
+        assert_announced_address(region, &answer.string("endpoint"));
     }
 }
 
@@ -387,3 +366,240 @@ async fn asking_for_an_endpoint_changes_nothing() {
         store.tags.len()
     );
 }
+
+/// One row of the served-address table: where this emulator ANSWERS, and the address every
+/// endpoint it reports then carries.
+struct ServedBase {
+    /// What this row is called in an assertion message.
+    case: &'static str,
+    /// The base URL `OperationContext::endpoint` reports — what the core records when the
+    /// data port starts — or `None` for an emulator served on no port at all.
+    base: Option<&'static str>,
+    /// The address every endpoint this row reports must carry, written out rather than
+    /// derived, so the table states the rule instead of restating the code.
+    address: &'static str,
+}
+
+/// The bases an emulator can be served at, and the address each makes it report: the
+/// `host[:port]` of that base, with no scheme and no path, because what a reported endpoint
+/// carries is the address a client dials — and the base an emulator served on no port
+/// reports is a host that never resolves (`https://emulator.invalid`, RFC 6761), which is
+/// the honest answer for a process no client can reach over a socket.
+fn served_bases() -> Vec<ServedBase> {
+    vec![
+        ServedBase {
+            case: "served on no port",
+            base: None,
+            address: "emulator.invalid",
+        },
+        ServedBase {
+            case: "a loopback socket",
+            base: Some("https://127.0.0.1:42899"),
+            address: "127.0.0.1:42899",
+        },
+        ServedBase {
+            case: "an IPv6 loopback socket",
+            base: Some("https://[::1]:9297"),
+            address: "[::1]:9297",
+        },
+        ServedBase {
+            case: "a routable address",
+            base: Some("https://192.168.1.10:4566"),
+            address: "192.168.1.10:4566",
+        },
+        ServedBase {
+            case: "the loopback name with a port",
+            base: Some("https://localhost:9297"),
+            address: "localhost:9297",
+        },
+        ServedBase {
+            case: "a name an operator serves it under",
+            base: Some("https://emulator.internal:8443"),
+            address: "emulator.internal:8443",
+        },
+        ServedBase {
+            // No port, so the address names none either: an `https` URL without one is
+            // dialled on 443, which is what a client appending nothing to this address does.
+            case: "a name with no port",
+            base: Some("https://host.docker.internal"),
+            address: "host.docker.internal",
+        },
+    ]
+}
+
+/// This service's emulator, served at the address one row of the table above names.
+struct ServedEmulator {
+    router: ::smithy_server_runtime::MultiServiceRouter,
+}
+
+impl ServedEmulator {
+    /// The emulator answering at `base`, set the way the core sets it when the data port
+    /// starts; `None` leaves it the base an emulator served on no port reports.
+    fn new(base: Option<&str>) -> Self {
+        let engine = ::std::sync::Arc::new(engine::InMemoryEngine::new());
+        let mut router = ::smithy_server_runtime::MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(iotdeviceadvisor::EmulatedService::new(engine));
+        if let Some(base) = base {
+            router.set_url_base(
+                ::smithy_server_runtime::EndpointUrl::parse(base)
+                    .unwrap_or_else(|| panic!("{base:?} is a usable endpoint base")),
+            );
+        }
+        Self { router }
+    }
+
+    /// One request, signed in scope for [`REGION`] (authentication is off) and addressed to
+    /// a socket of this machine, so what moves between rows is only WHERE the emulator
+    /// answers.
+    async fn call(&self, method: &str, path: &str, body: Option<serde_json::Value>) -> Answer {
+        let payload = body.map_or_else(bytes::Bytes::new, |value| {
+            bytes::Bytes::from(serde_json::to_vec(&value).expect("the request body serializes"))
+        });
+        let request = http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "127.0.0.1:9297")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/iotdeviceadvisor/\
+                     aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
+                ),
+            )
+            .body(payload)
+            .expect("the request builds");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let error_code = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        let bytes = response.into_body();
+        let body = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        Answer {
+            status,
+            body,
+            error_code,
+        }
+    }
+
+    /// `GET /endpoint`, naming the device `query` names.
+    async fn endpoint(&self, query: &[(&str, &str)]) -> String {
+        let mut path = "/endpoint".to_string();
+        for (index, (name, value)) in query.iter().enumerate() {
+            path.push(if index == 0 { '?' } else { '&' });
+            path.push_str(name);
+            path.push('=');
+            path.push_str(&percent_encode(value));
+        }
+        let answer = self.call("GET", &path, None).await;
+        assert_eq!(
+            answer.status, 200,
+            "expected HTTP 200 from GetEndpoint, got {} {}",
+            answer.status, answer.body
+        );
+        answer.string("endpoint")
+    }
+}
+
+/// Assert `endpoint` is `address` — where this emulator answers for the row under test —
+/// and names no host AWS publishes its own endpoints at.
+fn assert_reports(case: &str, what: &str, endpoint: &str, address: &str) {
+    assert_eq!(
+        endpoint, address,
+        "case {case:?}: {what} must be the address this emulator answers on ({address:?}), \
+         got {endpoint:?}"
+    );
+    // The zones AWS publishes its own endpoints in, as this tree reads them
+    // (`service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`).
+    for aws_zone in ::service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES {
+        assert!(
+            !endpoint.ends_with(aws_zone),
+            "case {case:?}: {what} must not name a host AWS serves ({aws_zone}), got \
+             {endpoint:?}"
+        );
+    }
+}
+
+/// Every endpoint this service reports is the address this emulator is SERVED at — so a
+/// device handed one is pointed back at this process — whichever address that is, whatever
+/// the request names, and for every operation that reports one.
+#[tokio::test]
+async fn a_reported_endpoint_is_the_address_this_emulator_is_served_at() {
+    for ServedBase {
+        case,
+        base,
+        address,
+    } in served_bases()
+    {
+        let emulator = ServedEmulator::new(base);
+        let thing = thing_arn("served-base-device");
+
+        let no_device = emulator.endpoint(&[]).await;
+        let named_device = emulator.endpoint(&[("thingArn", &thing)]).await;
+
+        let created = emulator
+            .call(
+                "POST",
+                "/suiteDefinitions",
+                Some(json!({
+                    "suiteDefinitionConfiguration": {
+                        "suiteDefinitionName": "served-base-suite",
+                        "rootGroup": "g",
+                        "devicePermissionRoleArn": ROLE_ARN,
+                    }
+                })),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected HTTP 200 from CreateSuiteDefinition, got {} {}",
+            created.status, created.body
+        );
+        let definition_id = created.string("suiteDefinitionId");
+        let started = emulator
+            .call(
+                "POST",
+                &format!("/suiteDefinitions/{definition_id}/suiteRuns"),
+                Some(json!({
+                    "suiteRunConfiguration": { "primaryDevice": { "thingArn": thing } }
+                })),
+            )
+            .await;
+        assert_eq!(
+            started.status, 200,
+            "case {case:?}: expected HTTP 200 from StartSuiteRun, got {} {}",
+            started.status, started.body
+        );
+        let reported = started.string("endpoint");
+
+        assert_reports(case, "the endpoint vended for no device", &no_device, address);
+        assert_reports(
+            case,
+            "the endpoint vended for a named device",
+            &named_device,
+            address,
+        );
+        assert_reports(
+            case,
+            "the endpoint a suite run reports",
+            &reported,
+            address,
+        );
+
+        let again = emulator.endpoint(&[("thingArn", &thing)]).await;
+        assert_eq!(
+            again, named_device,
+            "case {case:?}: asking twice must answer one address, got {named_device:?} and \
+             {again:?}"
+        );
+    }
+}
+

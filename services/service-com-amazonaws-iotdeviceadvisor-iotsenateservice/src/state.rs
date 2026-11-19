@@ -8,23 +8,21 @@
 //! is observable by every later read in the process.
 //!
 //! Besides the records this module owns the handful of rules every handler shares: the ARN
-//! and endpoint shapes, the version-string sequence, and the clock-owed suite-run status
+//! shape, the version-string sequence, and the clock-owed suite-run status
 //! transitions ([`SuiteRun::materialize_due`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
-use sha2::{Digest, Sha256};
-
 use crate::ops::types::{DeviceUnderTest, SuiteDefinitionConfiguration, SuiteRunConfiguration};
 
-// WHICH host an operation that reports an endpoint reports lives in
+// WHICH address an operation that reports an endpoint reports lives in
 // `state/endpoint_addressing.rs`.
 pub mod endpoint_addressing;
 
 pub use endpoint_addressing::announced_endpoint;
 
-/// The region an ARN or endpoint falls back to when the request carries no SigV4 scope.
+/// The region an ARN falls back to when the request carries no SigV4 scope.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// This service's ARN namespace, as the Smithy model's `aws.api#service` trait gives it
@@ -431,8 +429,8 @@ pub struct SuiteRun {
     /// Set only once the status is terminal.
     pub end_at: Option<SystemTime>,
     pub error_reason: Option<String>,
-    /// The Device Advisor endpoint this run's primary device connects to, as
-    /// [`endpoint_for`] derives it from that device.
+    /// Where this run's primary device connects: the address this emulator answered on when
+    /// the run was started, as [`announced_endpoint`] reads it.
     pub endpoint: String,
     /// The instant the next status transition becomes due, while one is owed.
     pub next_transition_at: Option<SystemTime>,
@@ -1248,11 +1246,11 @@ pub fn new_uuid() -> String {
     ::emulator_telemetry::BatchId::random().as_str().to_string()
 }
 
-/// The region to stamp into ARNs and endpoints: the SigV4 credential scope's region when
+/// The region to stamp into ARNs: the SigV4 credential scope's region when
 /// the request is signed and that region has the published shape, else [`DEFAULT_REGION`].
 ///
-/// The scope region is caller-supplied, and it is interpolated into ARNs and into the
-/// endpoint host, where `:` or an extra dotted label would produce a structurally
+/// The scope region is caller-supplied, and it is interpolated into the ARNs this service
+/// mints, where `:` or an extra field separator would produce a structurally
 /// well-formed but fabricated value AWS never mints. AWS resolves the region from the
 /// endpoint it served and only honours a region it publishes, so a region that does not
 /// LOOK like a published one is replaced by the default instead of being reflected back.
@@ -1352,68 +1350,13 @@ impl<'a> ArnScope<'a> {
     }
 }
 
-/// The modelled `Endpoint` length bounds (`smithy_query(query="shape",shape="Endpoint")`
-/// gives `len 45..75`), so every host this module builds can be checked against them.
-pub const MIN_ENDPOINT_LENGTH: usize = 45;
-/// See [`MIN_ENDPOINT_LENGTH`].
-pub const MAX_ENDPOINT_LENGTH: usize = 75;
-
-/// Everything a Device Advisor host carries besides its label and its region.
-const ENDPOINT_FIXED_LENGTH: usize = ".deviceadvisor.iot.".len() + ".amazonaws.com".len();
-
-/// One Device Advisor host: a single label under this service's endpoint domain.
-///
-/// Both endpoints Device Advisor vends — the account-level one and a device-level one —
-/// have this shape, so the LABEL is the only thing that tells them apart.
-fn endpoint_host(label: &str, region: &str) -> String {
-    format!("{label}.deviceadvisor.iot.{region}.amazonaws.com")
-}
-
-/// The region a host whose label is `label_length` characters long can carry while staying
-/// inside [`MAX_ENDPOINT_LENGTH`]: the caller's region, or [`DEFAULT_REGION`] when the
-/// caller's would push the host past it.
-///
-/// Every region AWS publishes fits; a longer one falls back rather than producing an
-/// out-of-range `Endpoint` (the ARN still carries the caller's own region).
-fn host_region(label_length: usize, region: &str) -> &str {
-    if label_length + ENDPOINT_FIXED_LENGTH + region.len() > MAX_ENDPOINT_LENGTH {
-        DEFAULT_REGION
-    } else {
-        region
-    }
-}
-
-/// The subject an ACCOUNT-LEVEL endpoint's label is derived from: the account and the
-/// region, and nothing a caller names.
-const ACCOUNT_ENDPOINT_SUBJECT: &str = "account-endpoint";
-
-/// The ACCOUNT-LEVEL Device Advisor endpoint for this account in `region`.
-///
-/// Device Advisor vends one account-scoped host, and this is the host reported to a caller
-/// that names NO device under test. Its label is an OPAQUE one minted for the account and
-/// region ([`endpoint_label`]) — the same form a device-level host's label has — so it is
-/// derived here rather than stored, and the same account and region always answer the same
-/// host.
-///
-/// An operation that REPORTS an endpoint reaches it through [`announced_endpoint`] rather
-/// than calling this directly, so no two operations can report different hosts for one
-/// device and none announces a host the caller cannot reach.
-pub fn endpoint_for_region(region: &str) -> String {
-    let region = host_region(ENDPOINT_LABEL_LENGTH, region);
-    let label = endpoint_label(
-        ACCOUNT_ENDPOINT_SUBJECT,
-        &[::emulator_server::emulator_account_id(), region],
-    );
-    endpoint_host(&label, region)
-}
-
 /// The device a request names, exactly as it names it.
 ///
 /// Device Advisor lets a caller name the device under test by its thing, by its
 /// certificate, or by the role it assumes, wherever a device appears: on a `GetEndpoint`
 /// request's own members, and inside the `DeviceUnderTest` a suite definition or a suite
 /// run configuration carries. A `GetEndpoint` request that names NONE of them is asking
-/// for the account-level endpoint instead.
+/// about the account rather than about one device, which that operation allows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceIdentity<'a> {
     pub thing_arn: Option<&'a str>,
@@ -1462,8 +1405,8 @@ pub const DEVICE_ROLE_SERVICE: &str = "iam";
 /// The requirement is stated per member: a suite run's primary device "requires a thing ARN
 /// or a certificate ARN" (`SuiteRunConfiguration$primaryDevice`), a device under test of a
 /// suite definition takes "a thing ARN, certificate ARN or device role ARN"
-/// (`DeviceUnderTest`), and a `GetEndpoint` request that names no device is asking for the
-/// account-level endpoint, so naming none is legal there.
+/// (`DeviceUnderTest`), and a `GetEndpoint` request that names no device is asking about the
+/// account rather than about one device, so naming none is legal there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceNaming {
     /// The device is named by its thing or by its certificate.
@@ -1604,117 +1547,6 @@ pub fn definition_configuration_violation(
                 DeviceNaming::AnyDeviceArn,
             )
         })
-}
-
-/// Length of the single DNS label a Device Advisor host carries, account-level and
-/// device-level alike.
-///
-/// The exact length is this emulator's choice — what a caller depends on is that the label
-/// is one stable, opaque, lowercase-alphanumeric DNS label (the form of the AWS IoT
-/// Developer Guide's account-specific endpoint prefix, e.g. `a3qexamplesffut`), and that
-/// the host stays inside the modelled `Endpoint` bounds for every region AWS publishes.
-pub const ENDPOINT_LABEL_LENGTH: usize = 14;
-
-/// The alphabet an endpoint label's FIRST character is drawn from: a hostname label is read
-/// case-insensitively and AWS writes these prefixes in lowercase, and starting with a
-/// letter keeps the label in the preferred form of RFC 1035 §2.3.1.
-const ENDPOINT_LABEL_LEADING_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
-
-/// The alphabet the rest of an endpoint label is drawn from.
-const ENDPOINT_LABEL_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-
-/// The OPAQUE label a Device Advisor host carries for `subject` — the kind of endpoint it
-/// is — and the `fields` that endpoint belongs to.
-///
-/// Every host this service vends carries one such label, so a client is handed an address
-/// and never an AWS identifier it could read an account, a thing or a role out of. It is
-/// DERIVED (the SHA-256 of the domain-separated, length-prefixed subject and fields, mapped
-/// onto the label alphabet) rather than drawn at random or copied out of an identifier:
-/// asking twice for one endpoint answers the same label, two endpoints get two labels, and
-/// nothing is stored per endpoint. Truncating a digest to a single label makes a collision
-/// between two subjects a probability rather than an impossibility; nothing treats the label
-/// as a unique key. The same derivation the `com-amazonaws-iot-awsiotservice` crate uses for
-/// an account's IoT endpoint prefix.
-fn endpoint_label(subject: &str, fields: &[&str]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"iotdeviceadvisor/");
-    hasher.update(subject.as_bytes());
-    hasher.update(b"/");
-    // Every field length-prefixed, so no two different subjects can feed the digest the
-    // same bytes.
-    for field in fields {
-        hasher.update(field.len().to_string().as_bytes());
-        hasher.update(b":");
-        hasher.update(field.as_bytes());
-        hasher.update(b";");
-    }
-    let digest = hasher.finalize();
-    digest
-        .iter()
-        .take(ENDPOINT_LABEL_LENGTH)
-        .enumerate()
-        .map(|(position, byte)| {
-            let alphabet = if position == 0 {
-                ENDPOINT_LABEL_LEADING_ALPHABET
-            } else {
-                ENDPOINT_LABEL_ALPHABET
-            };
-            char::from(alphabet[usize::from(*byte) % alphabet.len()])
-        })
-        .collect()
-}
-
-/// The subject a DEVICE-LEVEL endpoint's label is derived from: the account, the region and
-/// the ARNs the request names the device by.
-const DEVICE_ENDPOINT_SUBJECT: &str = "device-endpoint";
-
-/// The DEVICE-LEVEL Device Advisor endpoint for the device `device` names, in `region`.
-///
-/// Device Advisor vends an endpoint that is unique per device beside the account-level one
-/// (AWS IoT Core Device Advisor developer guide, "Device Advisor endpoints"), so the label
-/// is DERIVED — from the account, the region the host carries, and the ARNs the request
-/// names — by the one [`endpoint_label`] derivation every host this service vends carries:
-/// asking twice for one device answers the same host, and two devices get two hosts, with
-/// nothing stored per device.
-///
-/// This service holds no device registry — only the devices a suite definition or a suite
-/// run points at — so two ARNs naming one real device (a thing and that thing's
-/// certificate) are two identities here, each with its own stable host, rather than one.
-pub fn endpoint_for_device(region: &str, device: &DeviceIdentity<'_>) -> String {
-    let region = host_region(ENDPOINT_LABEL_LENGTH, region);
-    let label = endpoint_label(
-        DEVICE_ENDPOINT_SUBJECT,
-        &[
-            ::emulator_server::emulator_account_id(),
-            region,
-            device.thing_arn.unwrap_or(""),
-            device.certificate_arn.unwrap_or(""),
-            device.device_role_arn.unwrap_or(""),
-        ],
-    );
-    endpoint_host(&label, region)
-}
-
-/// The Device Advisor host AWS ITSELF vends for the device `device` names, in `region`:
-/// the ONE derivation behind every endpoint this service reports.
-///
-/// A caller or a run that names no device is vended the account-level host
-/// ([`endpoint_for_region`]); one that names a device — by its thing, its certificate or the
-/// role it assumes — is vended that device's own host ([`endpoint_for_device`]). Both are
-/// a function of the account, the region and the identity alone, with nothing stored and
-/// nothing per call, so the host a suite run reports for its primary device and the host
-/// `GetEndpoint` vends for that same device are the same string.
-///
-/// This is the host every operation that reports an endpoint reports — `GetEndpoint` and
-/// the suite-run start alike — whichever address the asking request reached this emulator
-/// on: `endpoint` is a modelled Device Advisor hostname (`Endpoint`, `len 45..75`), so the
-/// address a client happens to be configured with is not a value of it.
-pub fn endpoint_for(region: &str, device: &DeviceIdentity<'_>) -> String {
-    if device.names_no_device() {
-        endpoint_for_region(region)
-    } else {
-        endpoint_for_device(region, device)
-    }
 }
 
 /// True when `value` is an Amazon Resource Name of `service`.

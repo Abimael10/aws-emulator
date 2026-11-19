@@ -137,7 +137,9 @@ impl Emulator {
                         started_at: Some(created_at),
                         end_at: Some(created_at + Duration::from_secs(1)),
                         error_reason: None,
-                        endpoint: iotdeviceadvisor::state::endpoint_for_region("us-east-1"),
+                        endpoint: iotdeviceadvisor::state::announced_endpoint(
+                            ::smithy_server_runtime::UNSERVED_URL_BASE,
+                        ),
                         next_transition_at: None,
                     },
                 );
@@ -1018,15 +1020,17 @@ async fn a_suite_run_is_persisted_and_its_status_moves_on_the_clock() {
             "case {case:?}: unexpected suiteRunArn"
         );
         let endpoint = started.string("endpoint");
-        assert!(
-            (45..=75).contains(&endpoint.len()),
-            "case {case:?}: endpoint must satisfy the modelled len 45..75, got {endpoint:?} \
-             ({} chars)",
-            endpoint.len()
+        let served = iotdeviceadvisor::state::announced_endpoint(
+            ::smithy_server_runtime::UNSERVED_URL_BASE,
         );
-        // The run names a primary device, so the host it reports is that DEVICE's host —
-        // the one `GetEndpoint` vends over the wire for the same ARN — and not the
-        // account-level host, which belongs to a caller that names no device.
+        assert_eq!(
+            endpoint, served,
+            "case {case:?}: the endpoint must be the address this emulator answers on \
+             ({served:?}), got {endpoint:?}"
+        );
+        // The endpoint is where the device CONNECTS, so it is this emulator's own address —
+        // the one `GetEndpoint` vends over the wire for the same device, and the one it
+        // vends to a caller that names no device, since one endpoint serves them all here.
         let vended = emulator
             .call(
                 "GET",
@@ -1041,17 +1045,18 @@ async fn a_suite_run_is_persisted_and_its_status_moves_on_the_clock() {
             .string("endpoint");
         assert_eq!(
             endpoint, vended,
-            "case {case:?}: the run must report the host GetEndpoint vends for its primary \
+            "case {case:?}: the run must report the address GetEndpoint vends for its primary \
              device, got {endpoint:?} and {vended:?}"
         );
-        let account_level = emulator
+        let no_device = emulator
             .call("GET", "/endpoint", "us-west-2", None)
             .await
             .string("endpoint");
-        assert_ne!(
-            endpoint, account_level,
-            "case {case:?}: a run naming a primary device must not report the \
-             account-level host, got {endpoint:?}"
+        assert_eq!(
+            endpoint, no_device,
+            "case {case:?}: one endpoint serves every device here, so a run naming a primary \
+             device must report the address a caller naming none is answered, got \
+             {endpoint:?} and {no_device:?}"
         );
 
         let run_path = format!("/suiteDefinitions/{definition_id}/suiteRuns/{run_id}");

@@ -5,9 +5,10 @@
 //!
 //! The rule under test: a resource a call mints under an existing parent is addressed in
 //! the scope the PARENT's stored ARN records — its partition, region and account — and not
-//! in the scope of the request that happened to mint it, so every regional value the child
-//! reports (its ARN and the endpoint it connects through) names the one scope its parent is
-//! in, and the one ARN form that addresses the parent's scope addresses the child too.
+//! in the scope of the request that happened to mint it, so the ARN the child reports names
+//! the one scope its parent is in, and the one ARN form that addresses the parent's scope
+//! addresses the child too. (The address the child's device connects through names no
+//! scope: it is the one address this emulator answers on.)
 //!
 //! The only parent/child pair this service mints is a suite run of a suite definition (a
 //! run's resource portion is `suiterun/<suiteDefinitionId>/<suiteRunId>`, so it is not
@@ -18,6 +19,7 @@
 //! shapes.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_iotdeviceadvisor_iotsenateservice as iotdeviceadvisor;
 
 use super::endpoint::percent_encode;
 use super::suite_lifecycle::{thing_arn, Answer, Emulator, ROLE_ARN};
@@ -149,15 +151,17 @@ async fn a_suite_run_is_minted_in_its_definitions_scope() {
                  {run_arn:?} beside definition {definition_arn:?}"
             );
 
-            // The endpoint the run reports is a host of the run's OWN region, which is its
-            // definition's: a run never announces a host in a region its ARN says it does
-            // not live in.
+            // The endpoint the run reports is the address THIS emulator answers on, which is
+            // one address for every region: a run's own region is carried by its ARN, which
+            // the assertion above pins, and not by the address its device connects to.
             let endpoint = started.string("endpoint");
-            let suffix = format!(".deviceadvisor.iot.{definition_region}.amazonaws.com");
-            assert!(
-                endpoint.ends_with(&suffix),
-                "case {case:?}: the run's endpoint must name its own region, expected a host \
-                 ending in {suffix:?}, got {endpoint:?}"
+            let served = iotdeviceadvisor::state::announced_endpoint(
+                ::smithy_server_runtime::UNSERVED_URL_BASE,
+            );
+            assert_eq!(
+                endpoint, served,
+                "case {case:?}: the run's endpoint must be the address this emulator answers \
+                 on ({served:?}), got {endpoint:?}"
             );
 
             // Round trip: the reader answers the stored ARN, read from either region.

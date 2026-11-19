@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `GetEndpoint` over the wire: which host Device Advisor reports, for which request.
+//! `GetEndpoint` over the wire: which address Device Advisor reports, for which request.
 //!
-//! The rule under test is one sentence: the endpoint is a single DNS label under
-//! `.deviceadvisor.iot.<region>.amazonaws.com`, where the region is the one the request
-//! was signed for, the label is the account's when the request names no device and a
-//! stable per-device one when it names a device, and a device identity whose ARN is not
-//! one for the member carrying it is refused with the modelled `ValidationException`. The
-//! host is a function of the
-//! account, the region and the device identity ALONE, so every operation that reports one —
-//! `GetEndpoint` and the suite-run start that reports the host its primary device connects
-//! to — answers the same host for one device.
+//! The rule under test is one sentence: the endpoint is the connection target the device
+//! under test dials, so it is the address THIS emulator answers on — the `host[:port]` of
+//! the one endpoint its whole surface is served at — for every request that is answered at
+//! all, whichever region the request signs for and whichever device it names, while a device
+//! identity whose ARN is not one for the member carrying it is refused with the modelled
+//! `ValidationException`. One endpoint serves every account, region and device here, where
+//! AWS vends a hostname per account and per device, so every operation that reports one —
+//! `GetEndpoint` and the suite-run start that reports where its primary device connects —
+//! answers that one address.
 //!
 //! Every case below drives a real HTTP request through the same `MultiServiceRouter` the
 //! emulator serves on a socket. The tables span what the rule generalises over: the
@@ -24,9 +24,11 @@ use serde_json::{json, Value};
 use service_com_amazonaws_iotdeviceadvisor_iotsenateservice as iotdeviceadvisor;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The suffix every Device Advisor host carries below its label, for `region`.
-fn host_suffix(region: &str) -> String {
-    format!(".deviceadvisor.iot.{region}.amazonaws.com")
+/// The address this emulator answers on, which is what every endpoint it reports carries:
+/// the `host[:port]` of its own endpoint — the base an emulator served on no port, as the
+/// router this suite drives is, reports.
+fn served_address() -> String {
+    iotdeviceadvisor::state::announced_endpoint(smithy_server_runtime::UNSERVED_URL_BASE)
 }
 
 /// A thing ARN for a device under test (`arn:aws:iot:<region>:<account>:thing/<name>`).
@@ -165,38 +167,30 @@ pub(crate) fn percent_encode(value: &str) -> String {
         .collect()
 }
 
-/// Assert `endpoint` is a Device Advisor host in `region`: one lowercase-alphanumeric DNS
-/// label under the service's endpoint domain, inside the modelled `Endpoint` length
-/// bounds. Returns the label.
-fn assert_host_shape(case: &str, endpoint: &str, region: &str) -> String {
-    let suffix = host_suffix(region);
-    let label = endpoint
-        .strip_suffix(&suffix)
-        .unwrap_or_else(|| panic!("case {case:?}: expected a host ending in {suffix}, got {endpoint:?}"))
-        .to_string();
-    assert!(
-        !label.is_empty()
-            && label
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
-        "case {case:?}: the host's label must be one lowercase-alphanumeric DNS label, \
-         got {label:?} (endpoint {endpoint:?})"
+/// Assert `endpoint` is the address this emulator answers on — the only address a device
+/// handed it can reach — and nothing a client would have to resolve elsewhere.
+fn assert_served_address(case: &str, endpoint: &str) {
+    let served = served_address();
+    assert_eq!(
+        endpoint, served,
+        "case {case:?}: the endpoint must be the address this emulator answers on \
+         ({served:?}), got {endpoint:?}"
     );
-    let bounds = iotdeviceadvisor::state::MIN_ENDPOINT_LENGTH
-        ..=iotdeviceadvisor::state::MAX_ENDPOINT_LENGTH;
-    assert!(
-        bounds.contains(&endpoint.len()),
-        "case {case:?}: the endpoint must satisfy the modelled len 45..75, got {endpoint:?} \
-         ({} chars)",
-        endpoint.len()
-    );
-    label
+    // The zones AWS publishes its own endpoints in, as this tree reads them
+    // (`service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`).
+    for aws_zone in ::service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES {
+        assert!(
+            !endpoint.ends_with(aws_zone),
+            "case {case:?}: the endpoint must not name a host AWS serves ({aws_zone}), got \
+             {endpoint:?}"
+        );
+    }
 }
 
-/// A request that names no device gets the ACCOUNT-level host, in the region it was signed
-/// for, and the same host every time.
+/// A request that names no device is answered the address this emulator answers on, in
+/// every region it can be signed for, and the same address every time.
 #[tokio::test]
-async fn an_account_level_endpoint_names_the_requests_region() {
+async fn a_request_naming_no_device_is_answered_the_served_address() {
     let emulator = Emulator::new();
 
     // Regions of several shapes, including the longest AWS publishes and a GovCloud one.
@@ -215,24 +209,23 @@ async fn an_account_level_endpoint_names_the_requests_region() {
             answer.status, answer.body
         );
         let endpoint = answer.string("endpoint");
-        assert_host_shape(region, &endpoint, region);
+        assert_served_address(region, &endpoint);
 
         let again = emulator.get_endpoint(&[], region).await;
         assert_eq!(
             again.string("endpoint"),
             endpoint,
-            "case {region:?}: the account-level endpoint must be stable across calls"
+            "case {region:?}: the endpoint must be stable across calls"
         );
     }
 }
 
-/// A credential scope that is not a published region shape cannot be reflected into a
-/// hostname, so the host falls back to the default region — the same fallback the ARNs
-/// this service mints use.
+/// A credential scope that is not a published region shape names no region this service
+/// would reflect anywhere; the endpoint is the address this emulator answers on either way,
+/// since that address names no region at all.
 #[tokio::test]
-async fn a_region_that_is_not_one_falls_back_to_the_default_region() {
+async fn a_credential_scope_that_is_not_a_region_is_answered_the_served_address() {
     let emulator = Emulator::new();
-    let default_region = iotdeviceadvisor::state::DEFAULT_REGION;
 
     // (case, the region in the credential scope)
     let rows: Vec<(&str, &str)> = vec![
@@ -251,12 +244,7 @@ async fn a_region_that_is_not_one_falls_back_to_the_default_region() {
             answer.status, answer.body
         );
         let endpoint = answer.string("endpoint");
-        assert!(
-            endpoint.ends_with(&host_suffix(default_region)),
-            "case {case:?}: a region that is not one must fall back to {default_region}, \
-             got {endpoint:?}"
-        );
-        assert_host_shape(case, &endpoint, default_region);
+        assert_served_address(case, &endpoint);
     }
 }
 
@@ -273,16 +261,17 @@ struct RunDeviceRow {
     query: Vec<(&'static str, String)>,
 }
 
-/// The host a suite run reports and PERSISTS for its primary device is the host
-/// `GetEndpoint` vends for that same device: one derivation, so a client told a host by
-/// `StartSuiteRun` is told that host again when it asks where that device connects — and
-/// never the account-level host, which belongs to a request naming no device.
+/// The address a suite run reports and PERSISTS for its primary device is the address
+/// `GetEndpoint` vends for that same device: one derivation, so a client told where to
+/// connect by `StartSuiteRun` is told the same place when it asks `GetEndpoint` — and that
+/// is the address this emulator answers on, which a request naming no device is answered
+/// too, because one endpoint serves every device here.
 ///
 /// The rows span the ways a run's primary device can be named (its thing, its certificate,
 /// both, and a thing beside the role it assumes — `SuiteRunConfiguration$primaryDevice`
 /// "requires a thing ARN or a certificate ARN") and the signing region.
 #[tokio::test]
-async fn a_run_reports_the_host_get_endpoint_vends_for_its_primary_device() {
+async fn a_run_reports_the_address_get_endpoint_vends_for_its_primary_device() {
     let emulator = Emulator::new();
 
     let rows: Vec<RunDeviceRow> = vec![
@@ -368,7 +357,7 @@ async fn a_run_reports_the_host_get_endpoint_vends_for_its_primary_device() {
             started.status, started.body
         );
         let reported = started.string("endpoint");
-        assert_host_shape(case, &reported, region);
+        assert_served_address(case, &reported);
 
         let query: Vec<(&str, &str)> = query
             .iter()
@@ -380,48 +369,48 @@ async fn a_run_reports_the_host_get_endpoint_vends_for_its_primary_device() {
             .string("endpoint");
         assert_eq!(
             reported, vended,
-            "case {case:?}: StartSuiteRun must report the host GetEndpoint vends for the \
+            "case {case:?}: StartSuiteRun must report the address GetEndpoint vends for the \
              run's primary device, got {reported:?} and {vended:?}"
         );
 
-        let account_level = emulator.get_endpoint(&[], region).await.string("endpoint");
-        assert_ne!(
-            reported, account_level,
-            "case {case:?}: a run naming a device reports that device's host, not the \
-             account-level one, got {reported:?}"
+        let no_device = emulator.get_endpoint(&[], region).await.string("endpoint");
+        assert_eq!(
+            reported, no_device,
+            "case {case:?}: one endpoint serves every device here, so a run's address must \
+             be the address a request naming no device is answered, got {reported:?} and \
+             {no_device:?}"
         );
 
         let run_id = started.string("suiteRunId");
         assert_eq!(
             emulator.persisted_run_endpoint(&run_id).as_deref(),
             Some(reported.as_str()),
-            "case {case:?}: the persisted run endpoint must be the host the start call \
+            "case {case:?}: the persisted run endpoint must be the address the start call \
              reported, got {:?}",
             emulator.persisted_run_endpoint(&run_id)
         );
     }
 }
 
-/// A suite run whose configuration names no device at all is reported the ACCOUNT-LEVEL
-/// host, the same one `GetEndpoint` vends for a request naming no device: the two sides of
-/// the one derivation, taken on the other branch.
+/// A suite run whose configuration names no device at all is reported the same address as
+/// every other request: the one this emulator answers on, which is the single derivation
+/// every reporting operation shares.
 #[tokio::test]
-async fn a_run_with_no_primary_device_carries_the_account_level_host() {
+async fn a_run_with_no_primary_device_carries_the_served_address() {
     let emulator = Emulator::new();
     let region = "us-west-2";
 
     // A run with an empty primary device cannot be STARTED over the wire — the member
-    // "requires a thing ARN or a certificate ARN" — so the no-device identity is taken
+    // "requires a thing ARN or a certificate ARN" — so the no-device case is taken
     // straight from the derivation every reporting operation shares.
-    let derived = iotdeviceadvisor::state::endpoint_for(
-        region,
-        &iotdeviceadvisor::state::DeviceIdentity::default(),
+    let derived = iotdeviceadvisor::state::announced_endpoint(
+        smithy_server_runtime::UNSERVED_URL_BASE,
     );
     let vended = emulator.get_endpoint(&[], region).await.string("endpoint");
     assert_eq!(
         derived, vended,
-        "case \"no device\": the host derived for a run naming no device must be the host \
-         GetEndpoint vends for a request naming none, got {derived:?} and {vended:?}"
+        "case \"no device\": the address derived for a run naming no device must be the \
+         address GetEndpoint vends for a request naming none, got {derived:?} and {vended:?}"
     );
 }
 
@@ -432,9 +421,9 @@ struct DeviceRow {
     case: &'static str,
     /// The query members the request carries.
     query: Vec<(&'static str, String)>,
-    /// The DEVICE IDENTITY the row names — the ARNs it carries, and nothing else. Two
-    /// rows with the same identity must get the same host: the authentication method says
-    /// how the device connects, not which device it is.
+    /// The DEVICE IDENTITY the row names — the ARNs it carries, and nothing else. No
+    /// identity selects another address: one endpoint serves every device here, and the
+    /// authentication method says how the device connects rather than which device it is.
     identity: &'static str,
 }
 
@@ -505,15 +494,15 @@ fn device_rows() -> Vec<DeviceRow> {
     ]
 }
 
-/// A request that names a device gets a DEVICE-level host: a well-formed host of this
-/// service's endpoint domain, stable for that device, different from the account-level one
-/// and from every other device's — and unchanged by the authentication method, which says
-/// how the device connects rather than which device it is.
+/// A request that names a device is answered the address this emulator answers on: the same
+/// address a request naming no device gets and the same one every other device gets, since
+/// this process serves one endpoint — stable across calls and unchanged by the
+/// authentication method, which says how the device connects rather than which device it is.
 #[tokio::test]
-async fn a_named_device_gets_its_own_stable_endpoint() {
+async fn a_named_device_is_answered_the_served_address() {
     let emulator = Emulator::new();
     let region = "us-east-1";
-    let account_level = emulator.get_endpoint(&[], region).await.string("endpoint");
+    let no_device = emulator.get_endpoint(&[], region).await.string("endpoint");
 
     // Every row already asserted, so a later row can be compared with it.
     let mut seen: Vec<(&str, &str, String)> = Vec::new();
@@ -534,19 +523,11 @@ async fn a_named_device_gets_its_own_stable_endpoint() {
             answer.status, answer.body
         );
         let endpoint = answer.string("endpoint");
-        let label = assert_host_shape(case, &endpoint, region);
+        assert_served_address(case, &endpoint);
         assert_eq!(
-            label.len(),
-            iotdeviceadvisor::state::ENDPOINT_LABEL_LENGTH,
-            "case {case:?}: a device label is one fixed-length DNS label, got {label:?}"
-        );
-        assert!(
-            label.starts_with(|c: char| c.is_ascii_lowercase()),
-            "case {case:?}: a hostname label starts with a letter, got {label:?}"
-        );
-        assert_ne!(
-            endpoint, account_level,
-            "case {case:?}: a device-level endpoint must differ from the account-level one"
+            endpoint, no_device,
+            "case {case:?}: naming a device selects no other endpoint, so it must be the \
+             address a request naming none is answered ({no_device:?}), got {endpoint:?}"
         );
 
         let again = emulator.get_endpoint(&query, region).await;
@@ -556,29 +537,22 @@ async fn a_named_device_gets_its_own_stable_endpoint() {
             "case {case:?}: the same request must get the same endpoint on every call"
         );
 
-        for (other_case, other_identity, other) in &seen {
-            if *other_identity == identity {
-                assert_eq!(
-                    &endpoint, other,
-                    "case {case:?}: names the same device as case {other_case:?}, so it must \
-                     get the same host, got {endpoint:?}"
-                );
-            } else {
-                assert_ne!(
-                    &endpoint, other,
-                    "case {case:?}: names another device than case {other_case:?}, so it must \
-                     get another host, got {endpoint:?}"
-                );
-            }
+        for (other_case, _other_identity, other) in &seen {
+            assert_eq!(
+                &endpoint, other,
+                "case {case:?}: must be answered the address case {other_case:?} is, got \
+                 {endpoint:?}"
+            );
         }
         seen.push((case, identity, endpoint));
     }
 }
 
-/// A device-level host names the region the request was signed for, exactly as the
-/// account-level one does: one device, two regions, two hosts.
+/// The address reported names no region: one device asked about in three regions is
+/// answered the one address this emulator answers on, while the region a request signs for
+/// is what its ARNs carry.
 #[tokio::test]
-async fn a_device_endpoint_is_scoped_to_the_requests_region() {
+async fn a_device_endpoint_does_not_vary_with_the_requests_region() {
     let emulator = Emulator::new();
     let thing = thing_arn("multi-region-device");
     let query = [("thingArn", thing.as_str())];
@@ -589,12 +563,12 @@ async fn a_device_endpoint_is_scoped_to_the_requests_region() {
             .get_endpoint(&query, region)
             .await
             .string("endpoint");
-        assert_host_shape(region, &endpoint, region);
+        assert_served_address(region, &endpoint);
         for (other_region, other) in &seen {
-            assert_ne!(
+            assert_eq!(
                 &endpoint, other,
-                "case {region:?}: a device's host in {region} must differ from its host in \
-                 {other_region}"
+                "case {region:?}: a device's address in {region} must be the address it is \
+                 answered in {other_region}"
             );
         }
         seen.push((region, endpoint));
@@ -695,13 +669,13 @@ async fn values_outside_the_modelled_constraints_are_refused() {
     }
 }
 
-/// An authentication method on its own names no device, so it asks for the account-level
-/// endpoint — for both values the model enumerates.
+/// An authentication method on its own names no device, so it is answered what a request
+/// naming no device is answered — for both values the model enumerates.
 #[tokio::test]
 async fn an_authentication_method_alone_still_asks_for_the_account_endpoint() {
     let emulator = Emulator::new();
     let region = "us-east-1";
-    let account_level = emulator.get_endpoint(&[], region).await.string("endpoint");
+    let no_device = emulator.get_endpoint(&[], region).await.string("endpoint");
 
     for method in ["X509ClientCertificate", "SignatureVersion4"] {
         let answer = emulator
@@ -714,20 +688,21 @@ async fn an_authentication_method_alone_still_asks_for_the_account_endpoint() {
         );
         assert_eq!(
             answer.string("endpoint"),
-            account_level,
-            "case {method:?}: a request naming no device must get the account-level endpoint"
+            no_device,
+            "case {method:?}: a request naming no device must get the endpoint a request \
+             naming none is answered"
         );
     }
 }
 
 /// `authenticationMethod` is an OPTIONAL member the model couples to no other member, so
 /// adding it to a request that is otherwise answered cannot change the answer: not its
-/// status and not the host. Asserted over every way a request can name its device — none of
-/// the three members, each one alone, each pair and all three — crossed with the method
+/// status and not the address. Asserted over every way a request can name its device — none
+/// of the three members, each one alone, each pair and all three — crossed with the method
 /// absent and with each of the two values the model enumerates (source:
 /// `smithy_query(query="operation",operation="GetEndpoint")`, where every identity member
 /// is optional and `authenticationMethod` targets the two-value `AuthenticationMethod`
-/// enum). Every row's three answers must be the one host the identity alone determines.
+/// enum). Every row's three answers must be the one address this emulator answers on.
 #[tokio::test]
 async fn an_optional_authentication_method_never_changes_the_answer() {
     let emulator = Emulator::new();
@@ -787,7 +762,7 @@ async fn an_optional_authentication_method_never_changes_the_answer() {
             baseline.status, baseline.body
         );
         let expected = baseline.string("endpoint");
-        assert_host_shape(identity_case, &expected, region);
+        assert_served_address(identity_case, &expected);
 
         for method in ["SignatureVersion4", "X509ClientCertificate"] {
             let case = format!("{identity_case} with {method}");
@@ -806,8 +781,8 @@ async fn an_optional_authentication_method_never_changes_the_answer() {
             assert_eq!(
                 answer.string("endpoint"),
                 expected,
-                "case {case:?}: the host is a function of the identity alone, so it must \
-                 equal the host for case {identity_case:?} ({expected:?}), got {:?}",
+                "case {case:?}: the address is the one this emulator answers on, so it must \
+                 equal the address for case {identity_case:?} ({expected:?}), got {:?}",
                 answer.string("endpoint")
             );
         }
