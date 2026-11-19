@@ -495,7 +495,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(variant) => {
                 // A load or an inference that could not be PERFORMED at all is a fault of this
                 // process rather than an answer about the artifact, so it is answered as one.
-                let loaded = match sagemaker::state::load_served_model(ctx, &region, variant).await
+                let loaded = match sagemaker::state::load_served_artifact(ctx, &region, variant)
+                    .await
                 {
                     Some(loaded) => loaded,
                     None => {
@@ -509,6 +510,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         let answered = sagemaker::state::serve_inference_off_worker(
                             &model,
                             &input.body,
+                            input.content_type.as_deref(),
                             input.accept.as_deref(),
                         )
                         .await;

@@ -24,6 +24,10 @@
 //!   booster's own parameters ([`super::boosted_model`]) and the prediction is computed from
 //!   them, so a model trained elsewhere and deployed here is served from what its artifact
 //!   really carries;
+//! * an artifact carrying the model's own INFERENCE CODE — the handler script a framework
+//!   container takes out of the artifact's code directory — is served by RUNNING that script over
+//!   the payload ([`super::inference_script`]), so what such a model answers is what its own code
+//!   returned;
 //! * the payload is read as the caller's own records and the prediction is COMPUTED from
 //!   those parameters, one prediction per record in the order the payload carried them —
 //!   rendered as one comma-separated record for a `text/csv` answer and as the `predictions`
@@ -31,10 +35,26 @@
 //!
 //! Nothing here runs a container image, and nothing is derived from an artifact's identity or
 //! from the request: an artifact holding no model either of those readings can take parameters
-//! out of is served by nothing at all, and neither is a variant whose model carries no
-//! artifact, a URI naming no object, an object Amazon S3 would not answer or a payload holding
-//! no record the model can be applied to. Each of those gets the operation's modelled failure
-//! for an invocation the model did not answer — never a synthesised body.
+//! out of and no entry point the container runs is served by nothing at all, and neither is a
+//! variant whose model carries no artifact, a URI naming no object, an object Amazon S3 would not
+//! answer or a payload holding no record the model can be applied to. Each of those gets the
+//! operation's modelled failure for an invocation the model did not answer — never a synthesised
+//! body.
+//!
+//! # Which reading answers an artifact that carries BOTH
+//!
+//! An artifact may carry the model's parameters AND a handler script beside them, and this
+//! service reads the PARAMETERS for it: they are the model, and the script's own `model_fn` reads
+//! that same file out of that same artifact, so the prediction is computed from the model that
+//! was deployed either way. What differs from the real service is the step between: a framework
+//! container would run the script's `predict_fn`/`transform_fn` over the loaded model, so an
+//! artifact whose script post-processes what it loaded (scaling a score, selecting a class,
+//! rendering another shape) is answered here by the parameters alone. The parameter readings are
+//! this service's own computation over a model it can read, while a script that imports a
+//! modelling library the artifact does not ship could not run at all — so the reading that
+//! answers is the one that computes from the deployed model rather than the one that fails for
+//! want of a library. An artifact carrying only code has no such choice: its code is the model,
+//! and it is run.
 
 use super::*;
 
@@ -79,11 +99,15 @@ pub struct ServingVariant {
     pub model_name: String,
     /// The model's primary container's `ModelDataUrl`, when it names one.
     pub model_data_url: Option<String>,
+    /// The entry point the model's container runs the artifact's own inference code by
+    /// ([`super::model_inference_program`]), when the container names one.
+    pub inference_program: Option<String>,
 }
 
 /// Why nothing could serve an invocation: the condition that stopped it, as the modelled
 /// failure for an invocation the model did not answer reports it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ServingRefusal {
     /// The variant's model carries no model artifact, so there are no parameters to serve.
     NoModelArtifact { model_name: String },
@@ -100,6 +124,21 @@ pub enum ServingRefusal {
     /// The payload's records carry a different number of features than the model was fitted
     /// on, so the model cannot be applied to them.
     FeatureCountMismatch { expected: usize, found: usize },
+    /// The payload carries more bytes than one run of the model's own inference code may be
+    /// handed.
+    PayloadTooLarge { bytes: usize },
+    /// The model's own inference code RAISED, and this is the exception it raised — the script's
+    /// own failure, reported as it reported it.
+    ScriptRaised {
+        error_type: String,
+        error_message: String,
+    },
+    /// The run of the model's own inference code was STOPPED by one of the bounds this emulator
+    /// gives one.
+    ScriptStopped { reason: String },
+    /// Nothing ran the model's own inference code at all, and this is why. No answer is claimed
+    /// for it, because none was computed.
+    ScriptNotRun { detail: String },
 }
 
 impl ServingRefusal {
@@ -132,6 +171,20 @@ impl ServingRefusal {
                 "The records carry {found} feature values, and the model they are applied to \
                  was fitted on {expected}."
             ),
+            Self::PayloadTooLarge { bytes } => format!(
+                "The payload carries {bytes} bytes, past the {} one inference may carry.",
+                super::MAX_SCRIPT_PAYLOAD_BYTES
+            ),
+            Self::ScriptRaised {
+                error_type,
+                error_message,
+            } => format!("The model's inference script raised {error_type}: {error_message}"),
+            Self::ScriptStopped { reason } => {
+                format!("The run of the model's inference script was stopped: {reason}.")
+            }
+            Self::ScriptNotRun { detail } => {
+                format!("The model's inference script was not run: {detail}.")
+            }
         }
     }
 }
@@ -161,9 +214,11 @@ pub fn endpoint_serving_variants(
         // behind it to serve from, so it is not a serving variant at all.
         .filter_map(|variant| {
             let model_name = variant.model_name.clone()?;
+            let deployed = store.models.get(&model_name);
             Some(ServingVariant {
                 variant_name: variant.variant_name.clone(),
-                model_data_url: store.models.get(&model_name).and_then(model_artifact_url),
+                model_data_url: deployed.and_then(model_artifact_url),
+                inference_program: deployed.and_then(model_inference_program),
                 model_name,
             })
         })
@@ -192,6 +247,34 @@ fn container_artifact_url(container: &ContainerDefinition) -> Option<String> {
         .as_ref()
         .filter(|uri| !uri.is_empty())
         .cloned()
+}
+
+/// The entry point a model's container runs the artifact's own inference code by: the
+/// `SAGEMAKER_PROGRAM` variable of the first of its containers that declares one.
+///
+/// "The environment variables to set in the Docker container"
+/// (`ContainerDefinition$Environment`) is where a framework inference container is told which
+/// module of the artifact's code directory is its handler script; a container that declares none
+/// runs the conventional name ([`super::DEFAULT_INFERENCE_PROGRAM`]), so `None` here is not "no
+/// script" but "the default name".
+#[must_use]
+pub fn model_inference_program(model: &Model) -> Option<String> {
+    let containers = model
+        .primary_container
+        .iter()
+        .chain(model.containers.iter().flatten());
+    containers
+        .filter_map(|container| {
+            container
+                .environment
+                .as_ref()?
+                .get(super::SAGEMAKER_PROGRAM_VARIABLE)
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|named| !named.is_empty())
+                .map(str::to_string)
+        })
+        .next()
 }
 
 /// What serves an invocation behind a variant: the model the artifact the variant's model
@@ -229,16 +312,45 @@ impl ServedModel {
     }
 }
 
-/// Load the model behind `variant`, reading its artifact out of this emulator's own Amazon S3.
+/// What SERVES an invocation behind a variant: what the artifact the variant's model names
+/// carries.
+///
+/// A SageMaker model is served by its container, and what that container has to work with is
+/// what the artifact holds: the model's own PARAMETERS, or the model's own inference CODE. Both
+/// are read out of the one artifact ([`artifact_from_bytes`]), and an invocation is answered from
+/// whichever of them it carries ([`serve_artifact`]).
+#[derive(Debug, Clone)]
+pub enum ServedArtifact {
+    /// The model's own parameters, read out of the artifact.
+    Model(ServedModel),
+    /// The model's own inference code, which answers a whole payload rather than a record.
+    Script(super::InferenceScript),
+}
+
+impl ServedArtifact {
+    /// How many feature values a record has to carry for this artifact's model to be applied to
+    /// it, where the artifact carries a model fitted on a particular width
+    /// ([`ServedModel::fitted_width`]) — and `None` for every other artifact, including one whose
+    /// own code decides what a payload has to carry.
+    #[must_use]
+    pub fn fitted_width(&self) -> Option<usize> {
+        match self {
+            Self::Model(model) => model.fitted_width(),
+            Self::Script(_) => None,
+        }
+    }
+}
+
+/// Load what serves `variant`, reading its artifact out of this emulator's own Amazon S3.
 ///
 /// `None` is a fault of this process rather than of the request — the decode could not be
 /// performed at all — which a handler answers as such; every answer ABOUT the artifact is a
 /// `Result` of its own.
-pub async fn load_served_model(
+pub async fn load_served_artifact(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     variant: &ServingVariant,
-) -> Option<Result<ServedModel, ServingRefusal>> {
+) -> Option<Result<ServedArtifact, ServingRefusal>> {
     let Some(uri) = variant.model_data_url.as_deref() else {
         return Some(Err(ServingRefusal::NoModelArtifact {
             model_name: variant.model_name.clone(),
@@ -260,31 +372,84 @@ pub async fn load_served_model(
     // the same seam a training run's fit uses. The work itself is bounded (see
     // [`MAX_ARTIFACT_ENTRIES`] and the ceilings in [`super::boosted_model`] and
     // [`super::binary_json`]), so the pool is never occupied for long.
-    let decoded = ::tokio::task::spawn_blocking(move || model_from_artifact(&bytes))
-        .await
-        .ok()?;
+    let program = variant.inference_program.clone();
+    let decoded =
+        ::tokio::task::spawn_blocking(move || artifact_from_bytes(&bytes, program.as_deref()))
+            .await
+            .ok()?;
     Some(decoded.ok_or(ServingRefusal::ArtifactNotServable {
         uri: location.uri(),
     }))
 }
 
-/// [`serve_inference`] on the blocking pool: applying a model to a payload's records is
-/// synchronous, CPU-bound work bounded by the model's own ceilings and by
-/// [`MAX_PAYLOAD_RECORDS`], so the worker serving the request is released while it runs.
+/// [`serve_artifact`] on the blocking pool: serving a payload is synchronous, CPU-bound work —
+/// bounded by the model's own ceilings and by [`MAX_PAYLOAD_RECORDS`] for an artifact carrying
+/// parameters, and by the bounds of one script run for one carrying code — so the worker serving
+/// the request is released while it runs.
 ///
 /// `None` is a fault of this process rather than of the request — the work could not be
 /// performed at all — which a handler answers as such.
 pub async fn serve_inference_off_worker(
-    model: &ServedModel,
+    artifact: &ServedArtifact,
     body: &[u8],
+    content_type: Option<&str>,
     accept: Option<&str>,
 ) -> Option<Result<ServedInference, ServingRefusal>> {
-    let model = model.clone();
+    let artifact = artifact.clone();
     let body = body.to_vec();
+    let content_type = content_type.map(str::to_string);
     let accept = accept.map(str::to_string);
-    ::tokio::task::spawn_blocking(move || serve_inference(&model, &body, accept.as_deref()))
-        .await
-        .ok()
+    ::tokio::task::spawn_blocking(move || {
+        serve_artifact(
+            &artifact,
+            &body,
+            content_type.as_deref(),
+            accept.as_deref(),
+        )
+    })
+    .await
+    .ok()
+}
+
+/// What `artifact` answers for `body`: the prediction its parameters compute, or what its own
+/// inference code returned.
+///
+/// `content_type` is the media type the payload is in, which a container hands its script's
+/// `input_fn`; the readings that compute from parameters read the records of either media type
+/// themselves ([`payload_records`]).
+pub fn serve_artifact(
+    artifact: &ServedArtifact,
+    body: &[u8],
+    content_type: Option<&str>,
+    accept: Option<&str>,
+) -> Result<ServedInference, ServingRefusal> {
+    match artifact {
+        ServedArtifact::Model(model) => serve_inference(model, body, accept),
+        ServedArtifact::Script(script) => {
+            super::run_inference_script(script, body, content_type, accept)
+        }
+    }
+}
+
+/// What the artifact `bytes` carry, and `None` for an artifact carrying neither a model's
+/// parameters nor its inference code.
+///
+/// `program` is the entry point the model's container names for the code it runs
+/// ([`model_inference_program`]).
+///
+/// The PARAMETERS are read first: where the artifact carries the model itself, those parameters
+/// ARE the model — the handler script's own `model_fn` would load the very same file out of the
+/// same artifact — so the inference is computed from the model that was deployed either way, by
+/// this service, record by record, the same way for every surface that applies a deployed model
+/// ([`model_from_artifact`]). An artifact carrying no parameters this service can read carries its
+/// model as CODE, and that code is what computes the inference
+/// ([`super::inference_script`]).
+#[must_use]
+pub fn artifact_from_bytes(bytes: &[u8], program: Option<&str>) -> Option<ServedArtifact> {
+    if let Some(model) = model_from_artifact(bytes) {
+        return Some(ServedArtifact::Model(model));
+    }
+    super::inference_script_in(&archive_entries_named(bytes), program).map(ServedArtifact::Script)
 }
 
 /// The model the artifact `bytes` carry, and `None` for an artifact holding none.
@@ -320,6 +485,20 @@ pub fn model_from_artifact(bytes: &[u8]) -> Option<ServedModel> {
 /// Empty for bytes that are not such an archive, which is not an error here: an artifact may be
 /// the model file itself.
 fn archive_entries(bytes: &[u8]) -> Vec<Vec<u8>> {
+    archive_entries_named(bytes)
+        .into_iter()
+        .map(|(_, body)| body)
+        .collect()
+}
+
+/// [`archive_entries`] with each entry's own PATH inside the archive, which is what decides
+/// whether an entry is the model's inference code and where the model directory holds it
+/// ([`super::inference_script_in`]).
+///
+/// An entry whose path the archive does not state, and one holding nothing, is not one of the
+/// files the artifact carries.
+#[must_use]
+pub fn archive_entries_named(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
     use ::std::io::Read;
 
     let decoder = ::flate2::read::GzDecoder::new(bytes).take(MAX_INFLATED_ARCHIVE_BYTES);
@@ -329,15 +508,20 @@ fn archive_entries(bytes: &[u8]) -> Vec<Vec<u8>> {
     };
     let mut read = Vec::new();
     for entry in entries.take(MAX_ARTIFACT_ENTRIES) {
-        let Ok(entry) = entry else { continue };
+        let Ok(mut entry) = entry else { continue };
+        let path = entry
+            .path()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut body = Vec::new();
         if entry
+            .by_ref()
             .take(MAX_INFLATED_ARCHIVE_BYTES)
             .read_to_end(&mut body)
             .is_ok()
             && !body.is_empty()
         {
-            read.push(body);
+            read.push((path, body));
         }
     }
     read

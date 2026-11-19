@@ -72,6 +72,12 @@ pub use auto_ml_run::*;
 pub mod model_serving;
 pub use model_serving::*;
 
+/// The INFERENCE CODE a model artifact carries — the handler script a framework container
+/// takes out of the artifact's code directory — and the inference that code computes when it
+/// is RUN. See `state/inference_script.rs`.
+pub mod inference_script;
+pub use inference_script::*;
+
 /// The DATA CAPTURE an endpoint performs on the invocations it serves: what its deployment
 /// asks to be recorded, and the object the record is written as. See `state/data_capture.rs`.
 pub mod data_capture;

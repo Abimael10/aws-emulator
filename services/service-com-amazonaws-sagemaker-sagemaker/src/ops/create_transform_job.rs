@@ -237,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // released before the question below is put to another service: a transform job's
         // name, the store's bound, and the model the job would run — whose execution role is
         // what the input location is then settled against, and whose artifact the run applies.
-        let (execution_role_arn, model_data_url) = {
+        let (execution_role_arn, model_data_url, inference_program) = {
             let store = state.lock();
             // A name already taken is refused before the quota is consulted: the request
             // adds no record, so "the store is full" is not why it fails.
@@ -290,6 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (
                 model.execution_role_arn.clone(),
                 crate::state::model_artifact_url(model),
+                crate::state::model_inference_program(model),
             )
         };
         // The transform reads the dataset the input names ("TransformInput - Describes the
@@ -337,6 +338,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 model_name: input.model_name.clone(),
                 role_arn: execution_role_arn.clone(),
                 model_data_url,
+                inference_program,
                 input_uri: input_uri.clone(),
                 input_data_type: input
                     .transform_input
@@ -344,6 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .s3_data_source
                     .s3_data_type
                     .clone(),
+                content_type: input.transform_input.content_type.clone(),
                 output_path: input.transform_output.s3_output_path.clone(),
                 accept: input.transform_output.accept.clone(),
             },

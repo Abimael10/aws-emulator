@@ -24,7 +24,9 @@
 //! * the model is READ out of the artifact the job's model names — the parameters a training or
 //!   AutoML run of this emulator fitted, or a serialized gradient-boosted model a container
 //!   uploaded ([`super::model_from_artifact`]) — so the inference is computed from the model
-//!   that was deployed and from nothing else;
+//!   that was deployed and from nothing else; an artifact carrying the model's own inference
+//!   CODE instead is RUN over the records ([`super::inference_script`]), so what such a model
+//!   answers for an object is what its own code returned;
 //! * each input object's records are read and scored by the ONE inference this service serves
 //!   ([`super::serve_inference`]), so a record scored by a batch transform and the same record
 //!   scored through an endpoint are answered the same number;
@@ -33,9 +35,9 @@
 //!   carries for a line-split input.
 //!
 //! Nothing here runs a container image and nothing is synthesised: a job whose model carries no
-//! artifact this service can take parameters out of, an input object it could not read, a
-//! payload holding no record, and an output object Amazon S3 would not take are each the job's
-//! modelled `Failed` status with the `FailureReason` naming that condition — never a
+//! artifact this service can take parameters out of or run the code of, an input object it could
+//! not read, a payload holding no record, and an output object Amazon S3 would not take are each
+//! the job's modelled `Failed` status with the `FailureReason` naming that condition — never a
 //! `Completed` status for a job that transformed nothing.
 //!
 //! # The job runs AS the model's execution role
@@ -137,10 +139,16 @@ pub struct TransformTarget {
     pub role_arn: Option<String>,
     /// The model's `ModelDataUrl`, when one of its containers names one.
     pub model_data_url: Option<String>,
+    /// The entry point the model's container runs the artifact's own inference code by
+    /// (`SAGEMAKER_PROGRAM`), when the container names one.
+    pub inference_program: Option<String>,
     /// `TransformS3DataSource$S3Uri`.
     pub input_uri: String,
     /// `TransformS3DataSource$S3DataType`.
     pub input_data_type: String,
+    /// `TransformInput$ContentType`: "the multipurpose internet mail extension (MIME) type of
+    /// the data", which is the media type the records are handed to the model in.
+    pub content_type: Option<String>,
     /// `TransformOutput$S3OutputPath`.
     pub output_path: String,
     /// `TransformOutput$Accept`: "the MIME type used to specify the output data", which is the
@@ -175,10 +183,11 @@ pub async fn run_transform_job(
     let partition = arn_partition(&role_arn);
     let client = s3_client(ctx, region);
 
-    // The model is loaded first: a job whose model carries no artifact this service can take
-    // parameters out of scores nothing, so there is no point reading the dataset for it.
-    let model = match load_transform_model(ctx, region, target).await {
-        Ok(model) => model,
+    // What SERVES the job is loaded first: a job whose model carries neither parameters this
+    // service can read nor inference code it can run scores nothing, so there is no point
+    // reading the dataset for it.
+    let artifact = match load_transform_model(ctx, region, target).await {
+        Ok(artifact) => artifact,
         Err(reason) => return TransformRunOutcome::failed(reason),
     };
 
@@ -211,10 +220,17 @@ pub async fn run_transform_job(
                 ))
             }
         };
-        // One prediction per record, computed by the ONE inference this service serves. The
-        // work is synchronous and CPU-bound over a caller's own object, so it goes to the
-        // blocking pool and the worker serving this request is released while it runs.
-        let scored = serve_transform_records(&model, &bytes, target.accept.as_deref()).await;
+        // One prediction per record, computed by the ONE inference this service serves — from the
+        // model's own parameters, or by running the model's own inference code over the object.
+        // The work is synchronous and CPU-bound over a caller's own object, so it goes off the
+        // worker serving this request either way.
+        let scored = serve_transform_records(
+            &artifact,
+            &bytes,
+            target.content_type.as_deref(),
+            target.accept.as_deref(),
+        )
+        .await;
         let body = match scored {
             Some(Ok(body)) => body,
             Some(Err(refusal)) => {
@@ -245,22 +261,24 @@ pub async fn run_transform_job(
     TransformRunOutcome::Completed { outputs }
 }
 
-/// The model the job's own model names, read out of its artifact.
+/// What SERVES the job's own model, read out of its artifact.
 ///
-/// `Err` is the job's `FailureReason`: a model with no artifact, or one holding no parameters
-/// this service can compute an inference from, scores nothing.
+/// `Err` is the job's `FailureReason`: a model with no artifact, and one whose artifact carries
+/// neither parameters this service can compute an inference from nor inference code it can run,
+/// scores nothing.
 async fn load_transform_model(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     target: &TransformTarget,
-) -> Result<ServedModel, String> {
+) -> Result<ServedArtifact, String> {
     let variant = ServingVariant {
         variant_name: target.model_name.clone(),
         model_name: target.model_name.clone(),
         model_data_url: target.model_data_url.clone(),
+        inference_program: target.inference_program.clone(),
     };
-    match load_served_model(ctx, region, &variant).await {
-        Some(Ok(model)) => Ok(model),
+    match load_served_artifact(ctx, region, &variant).await {
+        Some(Ok(artifact)) => Ok(artifact),
         Some(Err(refusal)) => Err(transform_inference_failed(&refusal.message())),
         None => Err(crate::state::INTERNAL_FAILURE_REASON.to_string()),
     }
@@ -327,22 +345,37 @@ async fn transform_objects(
 /// The predictions one input object's records are scored to, rendered as the body of the
 /// object's `.out`.
 ///
+/// A model whose artifact carries its own inference CODE answers the whole object itself — the
+/// container is handed the records and answers the response body for them — so what that code
+/// returned IS the `.out` object's body, unframed. A model whose artifact carries PARAMETERS is
+/// applied record by record by this service, and its answer carries the framing one HTTP answer
+/// carries, so it is reframed one prediction per line.
+///
 /// `None` is a fault of this process rather than of the request — the work could not be
 /// performed at all — which the job reports as such.
 async fn serve_transform_records(
-    model: &ServedModel,
+    artifact: &ServedArtifact,
     bytes: &[u8],
+    content_type: Option<&str>,
     accept: Option<&str>,
 ) -> Option<Result<Vec<u8>, ServingRefusal>> {
-    let model = model.clone();
+    let scripted = matches!(artifact, ServedArtifact::Script(_));
+    let artifact = artifact.clone();
     let bytes = bytes.to_vec();
+    let content_type = content_type.map(str::to_string);
     let accept = accept.map(str::to_string);
     ::tokio::task::spawn_blocking(move || {
-        serve_inference(&model, &bytes, accept.as_deref()).map(|served| {
+        serve_artifact(
+            &artifact,
+            &bytes,
+            content_type.as_deref(),
+            accept.as_deref(),
+        )
+        .map(|served| {
             // A `.out` object carries one record per line: the inference answered for an
             // invocation is ONE record of comma-separated predictions, which is the framing a
             // single HTTP answer carries, while an object holds the records of a dataset.
-            if served.content_type == CSV_MEDIA_TYPE {
+            if !scripted && served.content_type == CSV_MEDIA_TYPE {
                 let rendered = String::from_utf8_lossy(&served.body)
                     .split(CSV_FIELD_SEPARATOR)
                     .collect::<Vec<_>>()
@@ -462,11 +495,11 @@ mod tests {
     /// the input held them.
     #[tokio::test]
     async fn the_out_object_holds_one_prediction_per_record() {
-        let model = ServedModel::Fitted(LinearModel {
+        let model = ServedArtifact::Model(ServedModel::Fitted(LinearModel {
             intercept: 1.0,
             weights: vec![2.0],
             epochs: 1,
-        });
+        }));
         // (case, the input object's records, the predictions each line has to carry)
         let rows: [(&str, &str, &[f64]); 3] = [
             ("one record", "1\n", &[3.0]),
@@ -474,7 +507,7 @@ mod tests {
             ("no trailing newline", "4", &[9.0]),
         ];
         for (case, body, expected) in rows {
-            let written = serve_transform_records(&model, body.as_bytes(), None)
+            let written = serve_transform_records(&model, body.as_bytes(), None, None)
                 .await
                 .expect("the work was performed")
                 .expect("the records were scored");

@@ -245,6 +245,7 @@ fn model_serving_variant(
         variant_name: model.name.clone(),
         model_name: model.name.clone(),
         model_data_url: model_artifact_url(model),
+        inference_program: model_inference_program(model),
     })
 }
 
@@ -268,7 +269,7 @@ pub async fn run_inference_recommendations_job(
     let payloads = sample_payloads(ctx, region, config).await;
     let mut measured: Vec<InferenceRecommendation> = Vec::new();
     for target in targets {
-        let model = match load_served_model(ctx, region, &target.variant).await {
+        let model = match load_served_artifact(ctx, region, &target.variant).await {
             Some(Ok(model)) => model,
             Some(Err(refusal)) => {
                 return RecommendationRunOutcome::Failed {
@@ -330,19 +331,24 @@ pub struct Measurement {
 
 /// Send `traffic` to `model` and measure what the invocations took.
 ///
-/// Every invocation is the inference the serving path computes ([`serve_inference`]), so the
+/// Every invocation is the inference the serving path computes ([`serve_artifact`]), so the
 /// time measured is the time real predictions took. An invocation the model could not answer
 /// stops the benchmark with that condition: a load test over a payload the model cannot be
 /// applied to measures nothing.
+///
+/// The traffic is comma-separated records — the generated one is
+/// ([`generated_payload`]), and a sample payload holds the records of a dataset — so that is the
+/// media type the invocations carry, which is what a model served by its own inference code is
+/// handed beside the payload.
 pub fn benchmark_model(
-    model: &ServedModel,
+    model: &ServedArtifact,
     traffic: &[Vec<u8>],
 ) -> Result<Measurement, ServingRefusal> {
     let started = ::std::time::Instant::now();
     let mut served = 0_usize;
     for index in 0..BENCHMARK_INVOCATIONS {
         let payload = &traffic[index % traffic.len()];
-        serve_inference(model, payload, None)?;
+        serve_artifact(model, payload, Some(CSV_MEDIA_TYPE), None)?;
         served += 1;
     }
     let elapsed = started.elapsed().as_secs_f64();
@@ -367,10 +373,10 @@ fn clamped(measured: f64) -> i32 {
 /// The record the generator sends to a model the job named no sample payload for: one row of
 /// the width that model takes, as the `text/csv` a SageMaker inference container reads.
 ///
-/// A model that was fitted on no particular width ([`ServedModel::fitted_width`]) is applied to
+/// A model that was fitted on no particular width ([`ServedArtifact::fitted_width`]) is applied to
 /// a record of any width, so the generator sends a single-value one.
 #[must_use]
-pub fn generated_payload(model: &ServedModel) -> Vec<u8> {
+pub fn generated_payload(model: &ServedArtifact) -> Vec<u8> {
     let row: Vec<String> = (0..model.fitted_width().unwrap_or(1).max(1))
         .map(|_| 1.to_string())
         .collect();
@@ -443,12 +449,12 @@ mod tests {
     use super::*;
 
     /// A fitted model of `features` feature columns.
-    fn model(features: usize) -> ServedModel {
-        ServedModel::Fitted(LinearModel {
+    fn model(features: usize) -> ServedArtifact {
+        ServedArtifact::Model(ServedModel::Fitted(LinearModel {
             intercept: 1.0,
             weights: (0..features).map(|index| index as f64).collect(),
             epochs: 1,
-        })
+        }))
     }
 
     /// RULE: a benchmark reports what its invocations measured — a latency of at least one
@@ -497,7 +503,7 @@ mod tests {
                 "case {features} features: expected a record of that width, got {text:?}"
             );
             assert!(
-                serve_inference(&fitted, &payload, None).is_ok(),
+                serve_artifact(&fitted, &payload, None, None).is_ok(),
                 "case {features} features: the model must answer the generated record"
             );
         }
