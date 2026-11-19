@@ -111,10 +111,14 @@ fn not_found_message(name: &str) -> String {
 }
 
 /// The sentence this operation refuses a group a cluster is placed in with, built
-/// from the name's stored identity; see [`not_found_message`].
-fn in_use_message(name: &str) -> String {
+/// from the name's stored identity; see [`not_found_message`]. The closing clause
+/// names the dependency class that holds the group.
+///
+/// `pub(crate)` so the sibling suite that pins this class's wording over a wider
+/// table states the one expected sentence rather than carrying a second copy of it.
+pub(crate) fn in_use_message(name: &str) -> String {
     format!(
-        "Cache subnet group {} is currently in use.",
+        "Cache subnet group {} is currently in use by a cache cluster.",
         name.to_ascii_lowercase()
     )
 }

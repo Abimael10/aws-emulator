@@ -208,16 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // "Remove a secondary cluster from the Global datastore": the primary
         // is what the datastore is built around, so it leaves only with the
-        // datastore itself (`DeleteGlobalReplicationGroup`).
+        // datastore itself (`DeleteGlobalReplicationGroup`), which is what the
+        // second sentence of
+        // `crate::state::GLOBAL_PRIMARY_NOT_DISASSOCIABLE_MESSAGE` states.
         if member.role == crate::state::GLOBAL_ROLE_PRIMARY {
             return Err(
                 DisassociateGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some(format!(
-                            "Invalid value {} for ReplicationGroupId: the primary of Global \
-                             Replication Group {key} cannot be disassociated.",
-                            input.replication_group_id
-                        )),
+                        message: Some(
+                            crate::state::GLOBAL_PRIMARY_NOT_DISASSOCIABLE_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

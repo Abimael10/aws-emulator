@@ -1395,11 +1395,37 @@ pub fn replication_group_not_found_message(replication_group_id: &str) -> String
 /// would change the string for every caller.
 pub const GLOBAL_REPLICATION_GROUP_NOT_FOUND_MESSAGE: &str = "Global Replication Group not found";
 
+/// How ElastiCache refuses a `DisassociateGlobalReplicationGroup` that names the
+/// datastore's PRIMARY member: `Cannot disassociate primary replication group.
+/// Primary Replication Group will be disassociated when you delete the Global
+/// Replication Group.`
+///
+/// Two wholly fixed sentences — neither the datastore's id nor the member's
+/// appears in them. The second one is the only place the service states the
+/// remedy (delete the datastore instead), so it is part of the message rather
+/// than prose this emulator may drop. See [`GLOBAL_ROLE_PRIMARY`] for the role
+/// the gate reads.
+pub const GLOBAL_PRIMARY_NOT_DISASSOCIABLE_MESSAGE: &str =
+    "Cannot disassociate primary replication group. Primary Replication Group will be \
+     disassociated when you delete the Global Replication Group.";
+
 /// How ElastiCache words a `CreateReplicationGroup` whose `ReplicationGroupId` is
 /// already taken. Like [`SNAPSHOT_ALREADY_EXISTS_MESSAGE`], the template names the
 /// colliding name only as "specified name" rather than interpolating it.
 pub const REPLICATION_GROUP_ALREADY_EXISTS_MESSAGE: &str =
     "Replication group with specified name already exists.";
+
+/// How ElastiCache words a `CreateCacheCluster` whose `CacheClusterId` is already
+/// taken: the fixed sentence `Cache cluster already exists` — no trailing stop.
+///
+/// Nothing of the request appears in it. `CacheClusterAlreadyExistsFault` is "you
+/// already have a cluster with the given identifier", and the service states only
+/// that class: the identifier is the one the caller just sent, so echoing it adds
+/// nothing a client does not hold, and a client branching on the message needs a
+/// sentence that does not change per call. The sibling collisions of this service
+/// are worded the same way — see [`REPLICATION_GROUP_ALREADY_EXISTS_MESSAGE`] and
+/// [`SNAPSHOT_ALREADY_EXISTS_MESSAGE`].
+pub const CACHE_CLUSTER_ALREADY_EXISTS_MESSAGE: &str = "Cache cluster already exists";
 
 /// How ElastiCache words a snapshot name that is already taken when the snapshot
 /// is being TAKEN — from a cluster, from a replication group, or as a delete's
@@ -1525,14 +1551,19 @@ pub fn stored_subnet_group_name(value: &str) -> String {
 }
 
 /// How ElastiCache words a cache subnet group that cannot be deleted because a
-/// cluster is placed in it: `Cache subnet group <name> is currently in use.`
+/// cluster is placed in it: `Cache subnet group <name> is currently in use by a
+/// cache cluster.`
 ///
-/// The one variable part is the group's stored name
+/// The fixed text is `Cache subnet group ` and ` is currently in use by a cache
+/// cluster.`; the one variable part is the group's stored name
 /// ([`stored_subnet_group_name`]), as in
 /// [`subnet_group_does_not_exist_message`] — the two refusals of one delete
-/// name the group the one way.
+/// name the group the one way. The closing clause is where the service reports
+/// WHICH dependency class holds the group, so it is part of the sentence: a
+/// cluster placed in the group holds it, and so do the member clusters of a
+/// replication group placed in it.
 pub fn subnet_group_in_use_message(name: &str) -> String {
-    format!("Cache subnet group {name} is currently in use.")
+    format!("Cache subnet group {name} is currently in use by a cache cluster.")
 }
 
 /// How `CreateReplicationGroup` words a `CacheSubnetGroupName` that names no

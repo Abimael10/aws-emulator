@@ -693,10 +693,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // "You already have a cluster with the given identifier": the service
+        // states that class and nothing of the request
+        // (`crate::state::CACHE_CLUSTER_ALREADY_EXISTS_MESSAGE`).
         if store.cache_clusters.contains_key(&cache_cluster_id) {
             return Err(CreateCacheClusterErrorModeled::CacheClusterAlreadyExistsFault(
                 CacheClusterAlreadyExistsFault {
-                    message: Some(format!("Cache cluster {cache_cluster_id} already exists.")),
+                    message: Some(
+                        crate::state::CACHE_CLUSTER_ALREADY_EXISTS_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());
