@@ -5,6 +5,11 @@
 //! `STOPPED`, and it never reaches `COMPLETE` — while a job that has already
 //! reached a terminal status has no run to stop and is refused.
 //!
+//! The halt is also confined and dated: it keeps the instant the halted job
+//! started and stamps the halt on `updatedAt`, as the modelled members document,
+//! and it reaches no job other than the one its knowledge base, data source and
+//! job triple names.
+//!
 //! Every assertion here goes through the router, so it exercises the real wire
 //! path (route matching, model constraint validation, serialization) rather than
 //! calling a handler directly.
@@ -38,6 +43,15 @@ const EMBEDDING_MODEL: &str =
 /// (`smithy_query(query="shape",shape="IngestionJobStatus")`), whose other members
 /// name the statuses a run passes through.
 const TERMINAL_STATUSES: [&str; 2] = ["COMPLETE", "STOPPED"];
+
+/// The `IngestionJobStatus` values only a halt reaches: a job reports either one
+/// because `StopIngestionJob` was called for THAT job, never because another job
+/// was stopped.
+///
+/// Source: the same `IngestionJobStatus` enum of this service's Smithy model,
+/// whose remaining members (`STARTING`, `IN_PROGRESS`, `COMPLETE`, `FAILED`) are
+/// the chain of a run nobody halted.
+const HALT_STATUSES: [&str; 2] = ["STOPPING", "STOPPED"];
 
 /// How long a poll for a status the CLOCK owes keeps looking before it reports the
 /// transition never came. Deliberately far longer than any span this service owes a
@@ -74,6 +88,12 @@ impl Answer {
             .as_str()
             .unwrap_or_else(|| panic!("ingestionJob.{member} is not a string in {:?}", self.body))
             .to_string()
+    }
+
+    /// A timestamp member of the response's `ingestionJob`, as the instant the
+    /// modelled `date-time` wire form names.
+    fn job_instant(&self, member: &str) -> f64 {
+        crate::update_round_trip::date_time_wire_instant("the stored job", member, self.job(member))
     }
 
     /// The error's `message`, as the modelled error member carries it.
@@ -570,4 +590,263 @@ async fn stopping_a_job_nothing_holds_is_a_missing_resource() {
             "case {case:?}: expected ResourceNotFoundException, got {refused:?}"
         );
     }
+}
+
+/// Read a job until its status is terminal, answering the last read AND every
+/// status the reads observed on the way — the CONDITION is waited for, never a
+/// fixed duration.
+async fn poll_until_terminal_observing(
+    emulator: &Emulator,
+    case: &str,
+    knowledge_base_id: &str,
+    data_source_id: &str,
+    ingestion_job_id: &str,
+) -> (Answer, Vec<String>) {
+    let deadline = Instant::now() + POLL_DEADLINE;
+    let mut observed: Vec<String> = Vec::new();
+    loop {
+        let answer = emulator
+            .get_ingestion_job(knowledge_base_id, data_source_id, ingestion_job_id)
+            .await;
+        let status = answer.job_string("status");
+        observed.push(status.clone());
+        if TERMINAL_STATUSES.contains(&status.as_str()) {
+            return (answer, observed);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the job never reached a terminal status, observed {observed:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// RULE: a halt dates the job it stops as the modelled members document —
+/// `startedAt` stays "the time the job was started before the job was stopped"
+/// and `updatedAt` becomes the time of the halt — so neither the stop nor the
+/// clock finishing it moves `startedAt`.
+#[tokio::test]
+async fn a_stop_keeps_the_instant_the_job_started_and_stamps_the_halt() {
+    let emulator = Emulator::new();
+
+    // The rows differ along what the rule generalises over: the kind of data
+    // source the halted job ingests, and which optional members its start
+    // carried.
+    let cases: Vec<(&str, Value, Value)> = vec![
+        (
+            "a job over a crawled data source, started with its required members only",
+            s3_data_source("halt-stamp-documents"),
+            json!({}),
+        ),
+        (
+            "a job over a pushed data source, started with a description",
+            custom_data_source("halt_stamp_documents"),
+            json!({ "description": "the run the caller changed its mind about" }),
+        ),
+        (
+            "a job over a crawled data source, started with a client token",
+            s3_data_source("halt-stamp-documents-2"),
+            json!({ "clientToken": "HaltStampIdempotencyTokenForTheThirdSource" }),
+        ),
+    ];
+
+    for (index, (case, data_source_request, start_request)) in cases.into_iter().enumerate() {
+        let knowledge_base_id = emulator
+            .knowledge_base(&format!("halt-stamp-kb-{index}"))
+            .await;
+        let data_source_id = emulator
+            .data_source(&knowledge_base_id, data_source_request)
+            .await;
+        let started = emulator
+            .start_ingestion_job(&knowledge_base_id, &data_source_id, start_request)
+            .await;
+        assert_eq!(
+            started.status, 202,
+            "case {case:?}: expected StartIngestionJob -> 202, got {started:?}"
+        );
+        let ingestion_job_id = started.job_string("ingestionJobId");
+        let started_at = started.job("startedAt").clone();
+        let start_instant = started.job_instant("startedAt");
+        let start_update_instant = started.job_instant("updatedAt");
+
+        let stopped = emulator
+            .stop_ingestion_job(&knowledge_base_id, &data_source_id, &ingestion_job_id)
+            .await;
+        assert_eq!(
+            stopped.status, 202,
+            "case {case:?}: expected StopIngestionJob -> 202, got {stopped:?}"
+        );
+        assert_eq!(
+            *stopped.job("startedAt"),
+            started_at,
+            "case {case:?}: a halted job reports the instant it started, not the instant \
+             it was halted, got {:?}",
+            stopped.job("startedAt")
+        );
+        let halt_instant = stopped.job_instant("updatedAt");
+        assert!(
+            halt_instant >= start_instant,
+            "case {case:?}: expected updatedAt at or after startedAt {start_instant}, got \
+             {stopped:?}"
+        );
+        assert!(
+            halt_instant >= start_update_instant,
+            "case {case:?}: the halt is the job's latest change, so expected updatedAt at or \
+             after the start's {start_update_instant}, got {stopped:?}"
+        );
+
+        // The clock finishing the halt dates it the same way: the job still
+        // started when it started, and its last change is no earlier than the
+        // halt the stop stamped.
+        let settled = emulator
+            .poll_until_terminal(case, &knowledge_base_id, &data_source_id, &ingestion_job_id)
+            .await;
+        assert_eq!(
+            settled.job_string("status"),
+            "STOPPED",
+            "case {case:?}: the clock owes a halted job only STOPPED, got {settled:?}"
+        );
+        assert_eq!(
+            *settled.job("startedAt"),
+            started_at,
+            "case {case:?}: no later report moves the instant the job started, got {:?}",
+            settled.job("startedAt")
+        );
+        assert!(
+            settled.job_instant("updatedAt") >= halt_instant,
+            "case {case:?}: expected updatedAt at or after the halt {halt_instant}, got \
+             {settled:?}"
+        );
+    }
+}
+
+/// RULE: a stop halts only the job its knowledge base, data source and job
+/// triple names — every other stored job keeps the run chain it was in, so none
+/// of them ever reports a halted status and each still finishes `COMPLETE` with
+/// its text queryable.
+#[tokio::test]
+async fn a_stop_halts_only_the_job_its_triple_names() {
+    let emulator = Emulator::new();
+    let first_knowledge_base = emulator.knowledge_base("confined-stop-kb-0").await;
+    let second_knowledge_base = emulator.knowledge_base("confined-stop-kb-1").await;
+    let halted_source = emulator
+        .data_source(&first_knowledge_base, s3_data_source("confined-halted-source"))
+        .await;
+    let sibling_source = emulator
+        .data_source(
+            &first_knowledge_base,
+            custom_data_source("confined_sibling_source"),
+        )
+        .await;
+    let other_base_source = emulator
+        .data_source(
+            &second_knowledge_base,
+            s3_data_source("confined-other-base-source"),
+        )
+        .await;
+
+    // The rows differ along where the job the stop must not reach lives
+    // relative to the halted one: another data source of the SAME knowledge
+    // base, and a data source of ANOTHER knowledge base.
+    let siblings: [(&str, &str, &str); 2] = [
+        (
+            "a job of another data source of the same knowledge base",
+            first_knowledge_base.as_str(),
+            sibling_source.as_str(),
+        ),
+        (
+            "a job of a data source of another knowledge base",
+            second_knowledge_base.as_str(),
+            other_base_source.as_str(),
+        ),
+    ];
+    let mut sibling_jobs: Vec<(&str, &str, &str, String)> = Vec::new();
+    for (case, knowledge_base_id, data_source_id) in siblings {
+        let started = emulator
+            .start_ingestion_job(knowledge_base_id, data_source_id, json!({}))
+            .await;
+        assert_eq!(
+            started.status, 202,
+            "case {case:?}: expected StartIngestionJob -> 202, got {started:?}"
+        );
+        sibling_jobs.push((
+            case,
+            knowledge_base_id,
+            data_source_id,
+            started.job_string("ingestionJobId"),
+        ));
+    }
+
+    // The job to halt is started LAST, so the stop addresses a run that has
+    // only just begun however long the setup before it took.
+    let halted = emulator
+        .start_ingestion_job(&first_knowledge_base, &halted_source, json!({}))
+        .await;
+    assert_eq!(
+        halted.status, 202,
+        "case setup: expected StartIngestionJob -> 202, got {halted:?}"
+    );
+    let halted_job = halted.job_string("ingestionJobId");
+    let stopped = emulator
+        .stop_ingestion_job(&first_knowledge_base, &halted_source, &halted_job)
+        .await;
+    assert_eq!(
+        stopped.status, 202,
+        "case the halted job: expected StopIngestionJob -> 202, got {stopped:?}"
+    );
+    assert_eq!(
+        stopped.job_string("status"),
+        "STOPPING",
+        "case the halted job: the job the triple named is stopping, got {stopped:?}"
+    );
+
+    for (case, knowledge_base_id, data_source_id, ingestion_job_id) in &sibling_jobs {
+        let (settled, observed) = poll_until_terminal_observing(
+            &emulator,
+            case,
+            knowledge_base_id,
+            data_source_id,
+            ingestion_job_id,
+        )
+        .await;
+        for status in &observed {
+            assert!(
+                !HALT_STATUSES.contains(&status.as_str()),
+                "case {case:?}: a job no stop named is never halted, observed {observed:?}"
+            );
+        }
+        assert_eq!(
+            settled.job_string("status"),
+            "COMPLETE",
+            "case {case:?}: a run nothing halted finishes, got {settled:?}"
+        );
+        assert_eq!(
+            settled.job_string("ingestionJobId"),
+            *ingestion_job_id,
+            "case {case:?}: the read reports the job the URI named, got {settled:?}"
+        );
+        assert!(
+            !settled.job("textReadyAt").is_null(),
+            "case {case:?}: a finished run's text became queryable, got {settled:?}"
+        );
+    }
+
+    let settled_halt = emulator
+        .poll_until_terminal(
+            "the halted job",
+            &first_knowledge_base,
+            &halted_source,
+            &halted_job,
+        )
+        .await;
+    assert_eq!(
+        settled_halt.job_string("status"),
+        "STOPPED",
+        "case the halted job: the clock owes a halted job only STOPPED, got {settled_halt:?}"
+    );
+    assert!(
+        settled_halt.job("textReadyAt").is_null(),
+        "case the halted job: a halted run extracted no text, got {:?}",
+        settled_halt.job("textReadyAt")
+    );
 }
