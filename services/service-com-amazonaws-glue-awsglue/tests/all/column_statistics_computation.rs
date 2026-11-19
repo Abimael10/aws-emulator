@@ -74,7 +74,7 @@ const DATA_PREFIX: &str = "data/";
 /// Amazon S3 is mounted because a column statistics task run READS the objects behind the
 /// covered table: the run reaches them over the emulator's own in-process callback, so the
 /// object a test stages with `PutObject` is the object the run aggregates.
-fn emulator_with_s3() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_s3() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -95,7 +95,11 @@ fn s3(router: &MultiServiceRouter) -> aws_sdk_s3::Client {
 }
 
 /// Create `bucket` and put every `(key under the data prefix, body)` into it.
-async fn stage_objects(router: &MultiServiceRouter, bucket: &str, objects: &[(&str, &str)]) {
+pub(crate) async fn stage_objects(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    objects: &[(&str, &str)],
+) {
     let client = s3(router);
     client
         .create_bucket()
@@ -125,7 +129,7 @@ async fn stage_objects_into(router: &MultiServiceRouter, bucket: &str, objects: 
 
 /// The bucket a row's objects live in: its own name, in the character set a bucket name
 /// admits (`CreateBucket` refuses an underscore).
-fn bucket_of(name: &str) -> String {
+pub(crate) fn bucket_of(name: &str) -> String {
     name.replace('_', "-")
 }
 
@@ -136,7 +140,7 @@ fn location_of(name: &str) -> String {
 
 /// Store `database` holding `table`, whose storage descriptor names `columns`, the layout
 /// `serde` describes and the location `location`.
-async fn store_table(
+pub(crate) async fn store_table(
     router: &MultiServiceRouter,
     database: &str,
     table: &str,
@@ -180,7 +184,7 @@ async fn store_table(
 ///
 /// A member `extra` names replaces the one here, so a row that states its own `SerdeInfo`
 /// states the whole of it — its serialization library AND its parameters.
-fn text_descriptor(name: &str, parameters: Value, extra: Value) -> Value {
+pub(crate) fn text_descriptor(name: &str, parameters: Value, extra: Value) -> Value {
     let mut descriptor = json!({
         "Location": location_of(name),
         "InputFormat": TEXT_INPUT_FORMAT,
@@ -198,7 +202,12 @@ fn text_descriptor(name: &str, parameters: Value, extra: Value) -> Value {
 }
 
 /// Start a run of `table` and answer the `ColumnStatisticsTaskRunId` it reports.
-async fn start_run(router: &MultiServiceRouter, database: &str, table: &str, extra: Value) -> String {
+pub(crate) async fn start_run(
+    router: &MultiServiceRouter,
+    database: &str,
+    table: &str,
+    extra: Value,
+) -> String {
     let mut body = json!({ "DatabaseName": database, "TableName": table, "Role": ROLE });
     if let Some(members) = extra.as_object() {
         for (member, value) in members {
@@ -214,7 +223,7 @@ async fn start_run(router: &MultiServiceRouter, database: &str, table: &str, ext
 }
 
 /// The `ColumnStatisticsTaskRun` a read reports for one run.
-async fn get_run(router: &MultiServiceRouter, run_id: &str) -> Value {
+pub(crate) async fn get_run(router: &MultiServiceRouter, run_id: &str) -> Value {
     let body = ok(
         router,
         "GetColumnStatisticsTaskRun",
@@ -227,7 +236,7 @@ async fn get_run(router: &MultiServiceRouter, run_id: &str) -> Value {
 }
 
 /// The answer `GetColumnStatisticsForTable` gives for `columns` of one table.
-async fn get_statistics(
+pub(crate) async fn get_statistics(
     router: &MultiServiceRouter,
     database: &str,
     table: &str,
@@ -242,7 +251,7 @@ async fn get_statistics(
 }
 
 /// The `ColumnStatisticsList` of an answer, keyed by the column each entry belongs to.
-fn statistics_by_column(answer: &Value) -> Vec<(String, Value)> {
+pub(crate) fn statistics_by_column(answer: &Value) -> Vec<(String, Value)> {
     answer
         .get("ColumnStatisticsList")
         .and_then(Value::as_array)
@@ -263,7 +272,7 @@ fn statistics_by_column(answer: &Value) -> Vec<(String, Value)> {
 
 /// A numeric member of a reported structure, taking an absent member as the model's own
 /// default of 0 — awsJson omits a member whose value equals its modelled default.
-fn number(structure: &Value, member: &str) -> f64 {
+pub(crate) fn number(structure: &Value, member: &str) -> f64 {
     structure
         .get(member)
         .and_then(Value::as_f64)
@@ -274,7 +283,7 @@ fn number(structure: &Value, member: &str) -> f64 {
 /// under `statistics_type`: "only one data object should be set and indicated by the
 /// `Type` attribute", and the member names are the modelled ones
 /// (`smithy_query shape=ColumnStatisticsData`).
-fn data_member(statistics_type: &str) -> &'static str {
+pub(crate) fn data_member(statistics_type: &str) -> &'static str {
     match statistics_type {
         "BOOLEAN" => "BooleanColumnStatisticsData",
         "DATE" => "DateColumnStatisticsData",
