@@ -1000,3 +1000,102 @@ async fn estimates_the_current_month_and_refuses_one_that_has_not_begun() {
         resident(&engine)
     );
 }
+
+/// The most service lines one charge may report: the maximum the modeled
+/// `BusinessSupportServiceSpendList` carries (`"length": {"max": 50}`, from
+/// smithy_query shape=BusinessSupportAccountCharge, member
+/// `supportEligibleSpendByService`).
+const MAX_REPORTED_SERVICE_LINES: usize = 50;
+
+/// Persist one account-month whose bill holds `lines` contributing services,
+/// each with one whole unit of spend, so a stored record with more lines than
+/// the response can carry exists to be read back.
+fn persist_service_lines(engine: &Arc<engine::InMemoryEngine>, account_id: &str, lines: usize) {
+    let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
+    let mut state = state.lock();
+    state
+        .consolidated_billing_family
+        .insert(account_id.to_string(), "Linked Account".to_string());
+    assert!(
+        state.record_support_eligible_spend(SupportEligibleSpend {
+            account_id: account_id.to_string(),
+            billing_month: PAST_MONTH.to_string(),
+            support_plan_name: SUPPORT_PLAN_BUSINESS.to_string(),
+            currency_code: "USD".to_string(),
+            by_service: (0..lines)
+                .map(|index| SupportServiceSpend {
+                    contributing_service: format!("AmazonService{index:04}"),
+                    item_type: SPEND_ITEM_TYPE_USAGE.to_string(),
+                    description: None,
+                    charge_amount_minor: units(1),
+                })
+                .collect(),
+            discount: None,
+            reserved_instance_spend_minor: 0,
+            savings_plan_spend_minor: 0,
+            is_estimated_bill: false,
+        }),
+        "case {lines:?}: the seeded spend must fit in the store"
+    );
+}
+
+/// `supportEligibleSpendByService` reports the bill's service lines up to the
+/// maximum the modeled list carries, so no stored bill can make the response
+/// break the model's own bound — while `totalUsageBasis` stays the account's
+/// whole Support-eligible spend, every line of it included.
+#[tokio::test]
+async fn reports_at_most_the_modeled_number_of_service_lines() {
+    let cases: [(&str, usize); 5] = [
+        ("one service line", 1),
+        (
+            "one line below the modeled maximum",
+            MAX_REPORTED_SERVICE_LINES - 1,
+        ),
+        ("exactly the modeled maximum", MAX_REPORTED_SERVICE_LINES),
+        (
+            "one line past the modeled maximum",
+            MAX_REPORTED_SERVICE_LINES + 1,
+        ),
+        ("far past the modeled maximum", MAX_REPORTED_SERVICE_LINES * 3),
+    ];
+
+    for (case, lines) in cases {
+        let (router, engine) = emulator();
+        persist_service_lines(&engine, MEMBER_ACCOUNT_ID, lines);
+
+        let (status, body) = call(
+            &router,
+            "ListBusinessSupportAccountCharges",
+            &json!({ "billingMonth": PAST_MONTH }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} {body}"
+        );
+        let charge = charge_for(&body, MEMBER_ACCOUNT_ID);
+        let reported = charge["supportEligibleSpendByService"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            reported.len(),
+            lines.min(MAX_REPORTED_SERVICE_LINES),
+            "case {case:?}: expected at most {MAX_REPORTED_SERVICE_LINES} service lines, got {}",
+            reported.len()
+        );
+        assert_eq!(
+            reported
+                .first()
+                .and_then(|line| line["contributingService"].as_str()),
+            Some("AmazonService0000"),
+            "case {case:?}: expected the bill's own first service line, got {reported:?}"
+        );
+        let basis = charge["totalUsageBasis"].as_str().unwrap_or_default();
+        assert_eq!(
+            basis,
+            format!("{lines}.00"),
+            "case {case:?}: expected the account's whole usage basis, got {basis}"
+        );
+    }
+}

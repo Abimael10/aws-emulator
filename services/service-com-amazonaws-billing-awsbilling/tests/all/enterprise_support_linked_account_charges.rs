@@ -949,3 +949,272 @@ async fn agrees_with_the_charge_summary_for_the_same_month() {
         "expected the entries to add up to the summary's spend, got {body} and {summary}"
     );
 }
+
+/// `billableSeconds` counts the part of the billing period the account's
+/// recorded subscription periods COVER, so periods that overlap inside the
+/// period describe one stretch of time and an instant inside two of them is
+/// counted once: the entry can never report more billable seconds than the
+/// period has, nor a prorated share larger than the whole spend.
+///
+/// Every row seeds the same 1,000.00 of spend over the same 31-day month, so
+/// only the shape of the recorded windows differs: duplicates, a partial
+/// overlap, one window inside another, a chain of three, windows recorded out
+/// of order, windows that merely meet, windows that are disjoint and
+/// overlapping windows that run past both ends of the month.
+#[tokio::test]
+async fn counts_the_union_of_overlapping_subscription_periods() {
+    struct Case {
+        case: &'static str,
+        periods: Vec<SupportTimePeriod>,
+        billable_days: i64,
+        prorated: &'static str,
+        reported_periods: usize,
+    }
+    /// A recorded period from the `begin`th day of the month to the `end`th.
+    fn days(begin: i64, end: i64) -> SupportTimePeriod {
+        SupportTimePeriod::between(day_of_past_month(begin), day_of_past_month(end))
+    }
+    let cases = vec![
+        Case {
+            case: "the same whole-month window recorded twice",
+            periods: vec![days(1, PAST_MONTH_DAYS + 1), days(1, PAST_MONTH_DAYS + 1)],
+            billable_days: PAST_MONTH_DAYS,
+            prorated: "1000.00",
+            reported_periods: 1,
+        },
+        Case {
+            case: "two windows that overlap in the middle",
+            periods: vec![days(1, 16), days(11, 26)],
+            // The union is the first 25 days: 25/31 of 1000.00.
+            billable_days: 25,
+            prorated: "806.45",
+            reported_periods: 1,
+        },
+        Case {
+            case: "a window wholly inside another",
+            periods: vec![days(1, 21), days(6, 11)],
+            billable_days: 20,
+            // 20/31 of 1000.00, rounded to the cent.
+            prorated: "645.16",
+            reported_periods: 1,
+        },
+        Case {
+            case: "three windows overlapping in a chain",
+            periods: vec![days(1, 6), days(4, 11), days(9, 16)],
+            billable_days: 15,
+            // 15/31 of 1000.00, rounded to the cent.
+            prorated: "483.87",
+            reported_periods: 1,
+        },
+        Case {
+            case: "overlapping windows recorded out of order",
+            periods: vec![days(21, 26), days(1, 11), days(6, 16)],
+            billable_days: 20,
+            prorated: "645.16",
+            reported_periods: 2,
+        },
+        Case {
+            case: "two windows that meet but share no instant",
+            periods: vec![days(1, 11), days(11, 21)],
+            billable_days: 20,
+            prorated: "645.16",
+            reported_periods: 2,
+        },
+        Case {
+            case: "two disjoint windows",
+            periods: vec![days(1, 6), days(21, 26)],
+            billable_days: 10,
+            prorated: "322.58",
+            reported_periods: 2,
+        },
+        Case {
+            case: "two disjoint windows recorded out of order",
+            periods: vec![days(21, 26), days(1, 6)],
+            billable_days: 10,
+            prorated: "322.58",
+            reported_periods: 2,
+        },
+        Case {
+            case: "overlapping windows running past both ends of the month",
+            periods: vec![
+                SupportTimePeriod::between(days_before_past_month(10), day_of_past_month(16)),
+                SupportTimePeriod::between(
+                    day_of_past_month(11),
+                    day_of_past_month(PAST_MONTH_DAYS + 15),
+                ),
+            ],
+            billable_days: PAST_MONTH_DAYS,
+            prorated: "1000.00",
+            reported_periods: 1,
+        },
+    ];
+
+    for Case {
+        case,
+        periods,
+        billable_days,
+        prorated,
+        reported_periods,
+    } in cases
+    {
+        let (router, engine) = emulator();
+        persist(
+            &engine,
+            &[Seed::enterprise(MEMBER_ACCOUNT_ID, PAST_MONTH, 1_000)],
+        );
+        persist_subscription(&engine, MEMBER_ACCOUNT_ID, periods);
+
+        let (status, body) = charges_for(&router, PAST_MONTH).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} {body}"
+        );
+        let entry = entries(&body).first().cloned().unwrap_or(Value::Null);
+        let total_seconds = entry["totalSeconds"].as_i64().unwrap_or_default();
+        let billable_seconds = entry["billableSeconds"].as_i64().unwrap_or_default();
+        assert_eq!(
+            total_seconds,
+            PAST_MONTH_DAYS * DAY_SECS,
+            "case {case:?}: expected the month's own length, got {total_seconds}"
+        );
+        assert_eq!(
+            billable_seconds,
+            billable_days * DAY_SECS,
+            "case {case:?}: expected the covered part of the period, got {billable_seconds}"
+        );
+        assert!(
+            billable_seconds <= total_seconds,
+            "case {case:?}: expected no more billable seconds than the period has, \
+             got {billable_seconds} of {total_seconds}"
+        );
+        assert_eq!(
+            entry["totalSupportEligibleSpend"].as_str(),
+            Some("1000.00"),
+            "case {case:?}: expected the account's whole spend, got {entry}"
+        );
+        assert_eq!(
+            entry["proratedTotalSupportEligibleSpend"].as_str(),
+            Some(prorated),
+            "case {case:?}: expected the covered share of the spend, got {entry}"
+        );
+        // Both reported timelines are the windows the recorded periods cover:
+        // ascending, none overlapping the one before it, and together exactly
+        // the billable seconds long.
+        for member in ["subscriptionTimePeriods", "linkedTimePeriods"] {
+            let reported = entry[member].as_array().cloned().unwrap_or_default();
+            assert_eq!(
+                reported.len(),
+                reported_periods,
+                "case {case:?}: expected {reported_periods} {member} reported, got {entry}"
+            );
+            let windows: Vec<(i64, i64)> = reported
+                .iter()
+                .map(|period| {
+                    (
+                        wire_secs(&period["beginDate"]),
+                        wire_secs(&period["endDate"]),
+                    )
+                })
+                .collect();
+            let covered: i64 = windows.iter().map(|(begin, end)| end - begin).sum();
+            assert_eq!(
+                covered, billable_seconds,
+                "case {case:?}: expected {member} to cover the billable seconds, got {windows:?}"
+            );
+            for pair in windows.windows(2) {
+                assert!(
+                    pair[0].1 <= pair[1].0,
+                    "case {case:?}: expected {member} ascending and not overlapping, \
+                     got {windows:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The most service lines one entry may report: the maximum the modeled
+/// `ServiceLevelAccountUsageList` carries (`"length": {"max": 200}`, from
+/// smithy_query shape=LinkedAccountCharge, member
+/// `supportEligibleSpendByService`).
+const MAX_REPORTED_SERVICE_LINES: usize = 200;
+
+/// Persist one account-month whose bill holds `lines` contributing services,
+/// each with one whole unit of spend, so a stored record with more lines than
+/// the response can carry exists to be read back.
+fn persist_service_lines(engine: &Arc<engine::InMemoryEngine>, account_id: &str, lines: usize) {
+    let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
+    let mut state = state.lock();
+    state
+        .consolidated_billing_family
+        .insert(account_id.to_string(), "Linked Account".to_string());
+    assert!(
+        state.record_support_eligible_spend(SupportEligibleSpend {
+            account_id: account_id.to_string(),
+            billing_month: PAST_MONTH.to_string(),
+            support_plan_name: SUPPORT_PLAN_ENTERPRISE.to_string(),
+            currency_code: "USD".to_string(),
+            by_service: (0..lines)
+                .map(|index| SupportServiceSpend {
+                    contributing_service: format!("AmazonService{index:04}"),
+                    item_type: SPEND_ITEM_TYPE_USAGE.to_string(),
+                    description: None,
+                    charge_amount_minor: units(1),
+                })
+                .collect(),
+            discount: None,
+            reserved_instance_spend_minor: 0,
+            savings_plan_spend_minor: 0,
+            is_estimated_bill: false,
+        }),
+        "case {lines:?}: the seeded spend must fit in the store"
+    );
+}
+
+/// `supportEligibleSpendByService` reports the bill's service lines up to the
+/// maximum the modeled list carries, so no stored bill can make the response
+/// break the model's own bound — while `totalSupportEligibleSpend` stays the
+/// account's whole spend, every line of it included.
+#[tokio::test]
+async fn reports_at_most_the_modeled_number_of_service_lines() {
+    let cases: [(&str, usize); 5] = [
+        ("one service line", 1),
+        ("one line below the modeled maximum", MAX_REPORTED_SERVICE_LINES - 1),
+        ("exactly the modeled maximum", MAX_REPORTED_SERVICE_LINES),
+        ("one line past the modeled maximum", MAX_REPORTED_SERVICE_LINES + 1),
+        ("far past the modeled maximum", MAX_REPORTED_SERVICE_LINES * 2),
+    ];
+
+    for (case, lines) in cases {
+        let (router, engine) = emulator();
+        persist_service_lines(&engine, MEMBER_ACCOUNT_ID, lines);
+
+        let (status, body) = charges_for(&router, PAST_MONTH).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} {body}"
+        );
+        let entry = entries(&body).first().cloned().unwrap_or(Value::Null);
+        let reported = entry["supportEligibleSpendByService"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            reported.len(),
+            lines.min(MAX_REPORTED_SERVICE_LINES),
+            "case {case:?}: expected at most {MAX_REPORTED_SERVICE_LINES} service lines, \
+             got {}",
+            reported.len()
+        );
+        assert_eq!(
+            reported.first().and_then(|line| line["serviceCode"].as_str()),
+            Some("AmazonService0000"),
+            "case {case:?}: expected the bill's own first service line, got {reported:?}"
+        );
+        let total = entry["totalSupportEligibleSpend"].as_str().unwrap_or_default();
+        assert_eq!(
+            total,
+            format!("{lines}.00"),
+            "case {case:?}: expected the account's whole spend, got {total}"
+        );
+    }
+}

@@ -178,6 +178,13 @@ const DEFAULT_MAX_RESULTS: usize = 100;
 const MIN_MAX_RESULTS: usize = 1;
 const MAX_MAX_RESULTS: usize = 100;
 
+/// The most service lines one entry reports: the maximum the modeled
+/// `ServiceLevelAccountUsageList` carries (`len ..200`), so a bill with more
+/// stored lines than the response can carry is reported up to the model's own
+/// bound instead of breaking it — the rule this crate's other projections of a
+/// stored list (`additional_charge_list`, `pricing_plans_for_period`) follow.
+const MAX_SPEND_BY_SERVICE_LINES: usize = 200;
+
 /// Refuse a request member as invalid, in the modeled `ValidationException`
 /// shape (HTTP 400) this operation declares.
 ///
@@ -253,7 +260,9 @@ fn time_period((begin_secs, end_secs): (i64, i64)) -> EnterpriseSupportTimePerio
 /// an account whose subscription intervals are not recorded — the whole period,
 /// since the account's bill for the month carries the Enterprise Support plan.
 /// Either way it is the length of exactly the `subscriptionTimePeriods` the
-/// entry reports, and `proratedTotalSupportEligibleSpend` is the account's
+/// entry reports — the windows the recorded periods COVER inside the period, so
+/// periods that overlap are one stretch of time and never count a second of the
+/// period twice — and `proratedTotalSupportEligibleSpend` is the account's
 /// spend in that share of the period.
 fn linked_account_charge(
     state: &crate::state::ComAmazonawsBillingAwsbillingState,
@@ -296,6 +305,7 @@ fn linked_account_charge(
             spend
                 .by_service
                 .iter()
+                .take(MAX_SPEND_BY_SERVICE_LINES)
                 .map(|line| ServiceLevelAccountUsage {
                     service_code: Some(line.contributing_service.clone()),
                     total_support_eligible_spend: Some(amount(line.charge_amount_minor)),

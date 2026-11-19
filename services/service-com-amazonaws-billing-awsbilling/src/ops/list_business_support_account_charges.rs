@@ -169,6 +169,13 @@ const DEFAULT_MAX_RESULTS: usize = 100;
 const MIN_MAX_RESULTS: usize = 1;
 const MAX_MAX_RESULTS: usize = 100;
 
+/// The most service lines one entry reports: the maximum the modeled
+/// `BusinessSupportServiceSpendList` carries (`len ..50`), so a bill with more
+/// stored lines than the response can carry is reported up to the model's own
+/// bound instead of breaking it — the rule this crate's other projections of a
+/// stored list (`additional_charge_list`, `pricing_plans_for_period`) follow.
+const MAX_SPEND_BY_SERVICE_LINES: usize = 50;
+
 // The money, rate and billing-month arithmetic this handler shares with the
 // service's other charge report — amounts in minor units
 // (`crate::state::MINOR_UNITS_PER_UNIT`) and rates in basis points.
@@ -398,6 +405,7 @@ fn account_charge(
                 spend
                     .by_service
                     .iter()
+                    .take(MAX_SPEND_BY_SERVICE_LINES)
                     .map(|line| BusinessSupportServiceSpend {
                         contributing_service: line.contributing_service.clone(),
                         item_type: line.item_type.clone(),

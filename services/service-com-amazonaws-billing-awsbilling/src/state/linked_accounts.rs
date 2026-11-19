@@ -148,7 +148,8 @@ impl EnterpriseSupportLinkedAccount {
     }
 
     /// The parts of the account's linkage periods that fall inside the
-    /// half-open window `start_secs..end_secs`, in the order they are stored.
+    /// half-open window `start_secs..end_secs`, as the windows they COVER
+    /// (see [`clip_all`]).
     ///
     /// `None` when the account records no linkage period at all — there is
     /// nothing to report, as distinct from a recorded linkage that does not
@@ -166,7 +167,12 @@ impl EnterpriseSupportLinkedAccount {
 }
 
 /// The parts of `periods` inside the half-open window `start_secs..end_secs`,
-/// or `None` when `periods` is empty.
+/// as the windows they COVER ([`covered_windows`]), or `None` when `periods` is
+/// empty.
+///
+/// A set of periods covers the instants that fall in at least one of them, so
+/// two recorded periods that overlap describe ONE stretch of time and are
+/// reported — and counted — as one.
 fn clip_all(
     periods: &[SupportTimePeriod],
     start_secs: i64,
@@ -175,21 +181,48 @@ fn clip_all(
     if periods.is_empty() {
         return None;
     }
-    Some(
+    Some(covered_windows(
         periods
             .iter()
             .filter_map(|period| period.clipped_to(start_secs, end_secs))
             .collect(),
-    )
+    ))
+}
+
+/// The windows `windows` COVER: the same instants, as the smallest set of
+/// windows none of which overlaps another, ascending by first instant.
+///
+/// Two of an account's recorded periods can overlap — a period recorded again,
+/// or one recorded while an earlier one was still in effect — and an instant
+/// inside both of them is one instant of the timeline, not two: a window that
+/// begins before the window before it ends is folded into it. Windows that
+/// merely meet (one beginning exactly where the previous ends) are left as
+/// they are: the windows are half-open, so they share no instant.
+pub fn covered_windows(mut windows: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    windows.sort_unstable();
+    let mut covered: Vec<(i64, i64)> = Vec::with_capacity(windows.len());
+    for (begin, end) in windows {
+        match covered.last_mut() {
+            Some(last) if begin < last.1 => last.1 = last.1.max(end),
+            _ => covered.push((begin, end)),
+        }
+    }
+    covered
 }
 
 /// The whole seconds the windows in `clipped` cover.
 ///
-/// Saturating, so no set of stored periods can overflow the count.
+/// The instants two windows share are covered ONCE: the count is taken over
+/// the windows they cover ([`covered_windows`]), so a set of periods that
+/// overlap inside a billing period can never count more seconds than the
+/// period they were clipped to has. Saturating, so no set of stored periods
+/// can overflow the count.
 pub fn covered_seconds(clipped: &[(i64, i64)]) -> i64 {
-    clipped.iter().fold(0_i64, |total, (begin, end)| {
-        total.saturating_add(end.saturating_sub(*begin))
-    })
+    covered_windows(clipped.to_vec())
+        .iter()
+        .fold(0_i64, |total, (begin, end)| {
+            total.saturating_add(end.saturating_sub(*begin))
+        })
 }
 
 impl ComAmazonawsBillingAwsbillingState {
