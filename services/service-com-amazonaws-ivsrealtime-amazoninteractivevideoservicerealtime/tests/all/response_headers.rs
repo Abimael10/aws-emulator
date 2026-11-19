@@ -17,7 +17,9 @@
 //! 1. every response class the service can answer carries all seven headers, each with the
 //!    endpoint's own value: a success whose output shape binds them beside a body, a
 //!    success whose whole modelled output IS those members, a handler refusal, a boundary
-//!    refusal and a not-found refusal, from a read and from a delete alike;
+//!    refusal and a not-found refusal, from a read and from a delete alike — and, since the
+//!    policy is the endpoint's rather than any one operation's, from an UPDATE as well as
+//!    from a create, over every class of answer an update gives;
 //! 2. the value of each is the one the endpoint states, read off the crate's single
 //!    statement of the policy, so no header is served from a framework default;
 //! 3. each value is one its own header admits, and the exposed-header list publishes every
@@ -351,6 +353,137 @@ async fn every_response_class_carries_the_endpoints_header_policy() {
         POLICY.len(),
         "case \"the endpoint's policy\": expected exactly {} stated headers, got {stated:?}",
         POLICY.len()
+    );
+}
+
+/// A well-formed ingest-configuration ARN naming a configuration that was never created:
+/// it satisfies the modelled `IngestConfigurationArn` pattern
+/// (`smithy_query(query="operation",operation="UpdateIngestConfiguration")`), so the
+/// request reaches the handler and the 404 is the handler's own rather than a boundary
+/// refusal.
+fn ingest_configuration_arn(id: &str) -> String {
+    format!("arn:aws:ivs:{REGION}:{ACCOUNT}:ingest-configuration/{id}")
+}
+
+/// RULE, first reading on the fourth output shape that binds the members: an UPDATE is
+/// answered with the same policy a create is, over every class of answer it gives — the
+/// headers belong to the endpoint, so neither the operation nor what the update asks of
+/// the resource changes one of them.
+///
+/// Rows differ along what an update varies: which stage it associates (one stage, another,
+/// none at all), whether it switches redundant ingest on, off or leaves it to the modelled
+/// default, whether it repeats an update already applied, and how the call ends — served,
+/// refused by the handler for a reference nothing answers for, refused at the boundary for
+/// a value outside the model, or answered not-found.
+#[tokio::test]
+async fn an_update_is_answered_with_the_endpoints_header_policy() {
+    let emulator = Emulator::new();
+    let stage = emulator.stage("update", "policy-update-stage").await;
+    let elsewhere = emulator.stage("update", "policy-update-elsewhere").await;
+
+    let created = emulator
+        .post(
+            "CreateIngestConfiguration",
+            &json!({ "ingestProtocol": "RTMPS" }),
+        )
+        .await;
+    assert_header_policy("the configuration the updates are asked of", &created, 200);
+    let arn = created.body["ingestConfiguration"]["arn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !arn.is_empty(),
+        "case \"the configuration the updates are asked of\": expected a minted ARN, got {}",
+        created.body
+    );
+
+    let cases: Vec<(&str, Value, u16)> = vec![
+        (
+            "an update attaching a stage, redundant ingest left to the modelled default",
+            json!({ "arn": arn.as_str(), "stageArn": stage.as_str() }),
+            200,
+        ),
+        (
+            "an update moving it to another stage and switching redundant ingest on",
+            json!({
+                "arn": arn.as_str(),
+                "stageArn": elsewhere.as_str(),
+                "redundantIngest": true,
+            }),
+            200,
+        ),
+        (
+            "the same update once more, which changes nothing",
+            json!({
+                "arn": arn.as_str(),
+                "stageArn": elsewhere.as_str(),
+                "redundantIngest": true,
+            }),
+            200,
+        ),
+        (
+            "an update dissociating it and switching redundant ingest off",
+            json!({ "arn": arn.as_str(), "stageArn": "", "redundantIngest": false }),
+            200,
+        ),
+        (
+            "a not-found refusal: an ARN no configuration answers for",
+            json!({ "arn": ingest_configuration_arn("neverCreated") }),
+            404,
+        ),
+        (
+            "a handler refusal: a stage ARN no stage answers for",
+            json!({ "arn": arn.as_str(), "stageArn": absent_stage_arn("neverCreated") }),
+            400,
+        ),
+        (
+            "a boundary refusal: an ARN outside the member's modelled pattern",
+            json!({ "arn": "not-an-ingest-configuration" }),
+            400,
+        ),
+        (
+            "a boundary refusal: the required ARN omitted",
+            json!({ "stageArn": stage.as_str() }),
+            400,
+        ),
+    ];
+
+    // The configuration the last SERVED update reported, so the policy is shown to travel
+    // beside the answer's own body rather than instead of it.
+    let mut last_served = Value::Null;
+    for (case, request, status) in cases {
+        let answer = emulator.post("UpdateIngestConfiguration", &request).await;
+        assert_header_policy(case, &answer, status);
+        if status == 200 {
+            assert_eq!(
+                answer.body["ingestConfiguration"]["arn"].as_str(),
+                Some(arn.as_str()),
+                "case {case:?}: expected the updated configuration in the answer, got {}",
+                answer.body
+            );
+            last_served = answer.body["ingestConfiguration"].clone();
+        }
+    }
+
+    // Round trip: what the last served update answered is what a read reports now, so the
+    // refusals that followed it carried the policy and wrote nothing. Nothing is asserted
+    // about the read's own headers: its output shape binds none of those members, so the
+    // policy this suite is about is not a claim about it.
+    let read = emulator
+        .post("GetIngestConfiguration", &json!({ "arn": arn.as_str() }))
+        .await;
+    assert_eq!(
+        read.status, 200,
+        "case \"the configuration read back after the updates\": GetIngestConfiguration must \
+         answer HTTP 200, got {} {}",
+        read.status, read.body
+    );
+    assert_eq!(
+        read.body["ingestConfiguration"], last_served,
+        "case \"the configuration read back after the updates\": expected the configuration \
+         the last served update reported ({last_served}), got {}",
+        read.body
     );
 }
 
