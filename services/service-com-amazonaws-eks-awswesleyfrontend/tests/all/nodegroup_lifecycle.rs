@@ -13,28 +13,33 @@
 //! one in `tests/all/wire.rs` — reused rather than written again.
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    DEFAULT_AMI_TYPE, DEFAULT_CAPACITY_TYPE, DEFAULT_DISK_SIZE_GIB, DEFAULT_INSTANCE_TYPE,
-    DEFAULT_MAX_UNAVAILABLE, DEFAULT_SCALING_DESIRED_SIZE, DEFAULT_SCALING_MAX_SIZE,
-    DEFAULT_SCALING_MIN_SIZE, DEFAULT_WINDOWS_DISK_SIZE_GIB, MAX_INSTANCE_TYPES,
-    MAX_NODEGROUPS_PER_CLUSTER, MIN_DISK_SIZE_GIB, NODEGROUP_ACTIVATION_DELAY,
+    service_state, DEFAULT_AMI_TYPE, DEFAULT_CAPACITY_TYPE, DEFAULT_DISK_SIZE_GIB,
+    DEFAULT_INSTANCE_TYPE, DEFAULT_MAX_UNAVAILABLE, DEFAULT_SCALING_DESIRED_SIZE,
+    DEFAULT_SCALING_MAX_SIZE, DEFAULT_SCALING_MIN_SIZE, DEFAULT_WINDOWS_DISK_SIZE_GIB,
+    MAX_INSTANCE_TYPES, MAX_NODEGROUPS_PER_CLUSTER, MIN_DISK_SIZE_GIB, NODEGROUP_ACTIVATION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::REGION;
-use crate::wire::{call, emulator, encode_label, Answer};
+use crate::wire::{call, emulator, emulator_with_engine, encode_label, Answer};
 
 /// The `nodegroup` document an answer carries.
 fn nodegroup(answer: &Answer) -> &serde_json::Value {
     &answer.body["nodegroup"]
 }
 
-/// The same document with `status` dropped, which is the one member a read may
-/// legitimately differ on: the clock owes the node group a `CREATING` ->
-/// `ACTIVE` move between the create and a later read.
-fn without_status(answer: &Answer) -> serde_json::Value {
+/// The same document with the two members a later read may legitimately differ
+/// on dropped: `status`, because the clock owes the node group a `CREATING` ->
+/// `ACTIVE` move between the create and a later read, and `labels`, because the
+/// create answers with the node group as it was created — before the label set
+/// Amazon EKS records for it exists — while a read answers with that set
+/// (`labels_and_taints_are_reported_as_the_state_they_describe` is the rule for
+/// both members).
+fn without_members_a_read_may_differ_on(answer: &Answer) -> serde_json::Value {
     let mut document = nodegroup(answer).clone();
     if let Some(object) = document.as_object_mut() {
         object.remove("status");
+        object.remove("labels");
     }
     document
 }
@@ -119,6 +124,23 @@ async fn describe_nodegroup_in(
 
 async fn describe_nodegroup(router: &MultiServiceRouter, cluster: &str, name: &str) -> Answer {
     describe_nodegroup_in(router, REGION, cluster, name).await
+}
+
+/// `DeleteNodegroup`, which answers with the node group it is taking off its
+/// cluster — the third operation of this slice that reports one.
+async fn delete_nodegroup(router: &MultiServiceRouter, cluster: &str, name: &str) -> Answer {
+    call(
+        router,
+        REGION,
+        "DELETE",
+        &format!(
+            "/clusters/{}/node-groups/{}",
+            encode_label(cluster),
+            encode_label(name)
+        ),
+        "",
+    )
+    .await
 }
 
 /// The smallest request `CreateNodegroup` accepts: the three required members.
@@ -278,16 +300,40 @@ async fn a_created_nodegroup_reads_back_exactly_as_stored() {
             nodegroup(&created)["health"]
         );
 
-        // And the read-back: the same document, status aside.
+        // And the read-back: the same document, bar the two members the read may
+        // differ on — which are asserted here rather than dropped silently.
         let described = describe_nodegroup(&router, "roundtrip-cluster", name).await;
         assert_eq!(
             described.status, 200,
             "case {case:?}: expected 200 from DescribeNodegroup, got {described:?}"
         );
         assert_eq!(
-            without_status(&described),
-            without_status(&created),
+            without_members_a_read_may_differ_on(&described),
+            without_members_a_read_may_differ_on(&created),
             "case {case:?}: DescribeNodegroup must answer the record CreateNodegroup wrote"
+        );
+        // `labels`: the create reports the labels the request asked for — nothing at
+        // all when it asked for none — and the read reports the label set the node
+        // group carries, which is a map either way.
+        assert_eq!(
+            nodegroup(&created)["labels"],
+            request
+                .get("labels")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "case {case:?}: CreateNodegroup must report the labels the request asked for, got \
+             {:?}",
+            nodegroup(&created)["labels"]
+        );
+        assert_eq!(
+            nodegroup(&described)["labels"],
+            request
+                .get("labels")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            "case {case:?}: DescribeNodegroup must report the label set the create recorded, \
+             got {:?}",
+            nodegroup(&described)["labels"]
         );
 
         // A read never changes what the next caller sees.
@@ -309,7 +355,7 @@ async fn a_created_nodegroup_reads_back_exactly_as_stored() {
 #[tokio::test]
 async fn unspecified_members_take_their_documented_defaults() {
     let router = emulator();
-    create_cluster(&router, "defaults-cluster").await;
+    let cluster_version = create_cluster(&router, "defaults-cluster").await;
 
     // Each row: the request, then the expected `amiType`, `diskSize`,
     // `instanceTypes` and `capacityType`. The AMI families are members of the
@@ -420,14 +466,27 @@ async fn unspecified_members_take_their_documented_defaults() {
             "case {case:?}: expected maxUnavailable {DEFAULT_MAX_UNAVAILABLE}, got {:?}",
             nodegroup(&created)["updateConfig"]
         );
-        // No `releaseVersion` was named and this emulator publishes no AMI
-        // catalogue, so it reports none rather than inventing one.
-        assert_eq!(
-            nodegroup(&created)["releaseVersion"],
-            serde_json::Value::Null,
-            "case {case:?}: expected no releaseVersion, got {:?}",
-            nodegroup(&created)["releaseVersion"]
-        );
+        // "The AMI version of the Amazon EKS optimized AMI to use with your node
+        // group. By default, the latest available AMI version for the node group's
+        // current Kubernetes version is used"
+        // (`CreateNodegroupRequest$releaseVersion`) — so a node group that named
+        // none reports the AMI release published for its Kubernetes version, and
+        // one deployed with a launch template reports the template's AMI, which
+        // this service does not hold.
+        if request.get("launchTemplate").is_some() {
+            assert_eq!(
+                nodegroup(&created)["releaseVersion"],
+                serde_json::Value::Null,
+                "case {case:?}: a launch-template node group reports no releaseVersion, got {:?}",
+                nodegroup(&created)["releaseVersion"]
+            );
+        } else {
+            assert_published_ami_release(
+                case,
+                &cluster_version,
+                &nodegroup(&created)["releaseVersion"],
+            );
+        }
     }
 }
 
@@ -1131,4 +1190,347 @@ async fn the_per_cluster_nodegroup_quota_is_reported_as_resource_limit_exceeded(
         elsewhere.status, 200,
         "the quota is counted per cluster, got {elsewhere:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// RULE: a node group reports the version of the Amazon EKS optimized AMI it was
+// deployed with — the AMI version the request named, or the latest release
+// published for the node group's Kubernetes version when it named none — on
+// every operation that answers with the node group. A node group deployed with a
+// launch template reports the AMI that template names, which this service does
+// not hold, so it reports none.
+// ---------------------------------------------------------------------------
+
+/// Assert that `reported` is an AMI release version of the Kubernetes version
+/// `version`, in the form an Amazon EKS optimized AMI release is published under:
+/// `<kubernetesVersion>.<build>-<YYYYMMDD>`.
+fn assert_published_ami_release(case: &str, version: &str, reported: &serde_json::Value) {
+    let reported = reported.as_str().unwrap_or_default();
+    let Some(rest) = reported.strip_prefix(&format!("{version}.")) else {
+        panic!("case {case:?}: expected an AMI release of {version:?}, got {reported:?}");
+    };
+    let Some((build, day)) = rest.split_once('-') else {
+        panic!("case {case:?}: an AMI release names its build and its day, got {reported:?}");
+    };
+    assert!(
+        !build.is_empty() && build.chars().all(|digit| digit.is_ascii_digit()),
+        "case {case:?}: an AMI release names a numeric build, got {reported:?}"
+    );
+    assert!(
+        day.len() == 8 && day.chars().all(|digit| digit.is_ascii_digit()),
+        "case {case:?}: an AMI release names a YYYYMMDD build day, got {reported:?}"
+    );
+}
+
+/// What a row of the AMI-release table expects the node group to report.
+#[derive(Debug)]
+enum ExpectedRelease {
+    /// The latest release published for the cluster's Kubernetes version.
+    Published,
+    /// The AMI version the request named, whatever form it took.
+    Named(&'static str),
+    /// No AMI version at all: the launch template carries it.
+    Absent,
+}
+
+/// The table spans what the rule generalises over: whether the request names an
+/// AMI version at all, whether it names a launch template (which carries one of
+/// its own), the AMI family, and whether the Kubernetes version is named.
+#[tokio::test]
+async fn every_nodegroup_reports_the_ami_release_it_was_deployed_with() {
+    let (router, engine) = emulator_with_engine();
+    let cluster_version = create_cluster(&router, "ami-cluster").await;
+    // The AMI release the PUBLISHED catalog holds for that Kubernetes version,
+    // read out of the store rather than written out here: it is what a node group
+    // that names no `releaseVersion` is deployed with.
+    let published = {
+        let store = service_state(&*engine).expect("the eks store");
+        let guard = store.lock();
+        guard
+            .latest_ami_release_version(&cluster_version)
+            .expect("the published AMI release of the cluster's Kubernetes version")
+    };
+
+    let rows: Vec<(&str, serde_json::Value, ExpectedRelease)> = vec![
+        (
+            "nothing optional supplied",
+            minimal_request("ami-default"),
+            ExpectedRelease::Published,
+        ),
+        (
+            "the cluster's Kubernetes version, named",
+            serde_json::json!({
+                "nodegroupName": "ami-versioned",
+                "nodeRole": "arn:aws:iam::000000000000:role/eksNodeRole",
+                "subnets": ["subnet-aaaa1111"],
+                "version": cluster_version,
+            }),
+            ExpectedRelease::Published,
+        ),
+        (
+            "a Windows AMI family, which changes no AMI version rule",
+            serde_json::json!({
+                "nodegroupName": "ami-windows",
+                "nodeRole": "arn:aws:iam::000000000000:role/eksNodeRole",
+                "subnets": ["subnet-aaaa1111"],
+                "amiType": "WINDOWS_CORE_2022_x86_64",
+            }),
+            ExpectedRelease::Published,
+        ),
+        (
+            "an AMI version the caller named",
+            serde_json::json!({
+                "nodegroupName": "ami-named",
+                "nodeRole": "arn:aws:iam::000000000000:role/eksNodeRole",
+                "subnets": ["subnet-aaaa1111"],
+                "releaseVersion": "1.31.3-20250315",
+            }),
+            ExpectedRelease::Named("1.31.3-20250315"),
+        ),
+        (
+            "a launch template, whose AMI the template carries",
+            serde_json::json!({
+                "nodegroupName": "ami-templated",
+                "nodeRole": "arn:aws:iam::000000000000:role/eksNodeRole",
+                "subnets": ["subnet-aaaa1111"],
+                "launchTemplate": { "name": "ami-template" },
+            }),
+            ExpectedRelease::Absent,
+        ),
+        (
+            "a launch template with an AMI id named beside it",
+            serde_json::json!({
+                "nodegroupName": "ami-templated-id",
+                "nodeRole": "arn:aws:iam::000000000000:role/eksNodeRole",
+                "subnets": ["subnet-aaaa1111"],
+                "launchTemplate": { "id": "lt-0123456789abcdef0" },
+                "releaseVersion": "ami-0123456789abcdef0",
+            }),
+            ExpectedRelease::Named("ami-0123456789abcdef0"),
+        ),
+    ];
+
+    for (case, request, expected) in &rows {
+        let name = request["nodegroupName"]
+            .as_str()
+            .expect("the case names its node group");
+        let created = create_nodegroup(&router, "ami-cluster", request).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected 200 from CreateNodegroup, got {created:?}"
+        );
+        let described = describe_nodegroup(&router, "ami-cluster", name).await;
+        assert_eq!(
+            described.status, 200,
+            "case {case:?}: expected 200 from DescribeNodegroup, got {described:?}"
+        );
+        let deleted = delete_nodegroup(&router, "ami-cluster", name).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: expected 200 from DeleteNodegroup, got {deleted:?}"
+        );
+
+        for (source, answer) in [
+            ("CreateNodegroup", &created),
+            ("DescribeNodegroup", &described),
+            ("DeleteNodegroup", &deleted),
+        ] {
+            let reported = &nodegroup(answer)["releaseVersion"];
+            match expected {
+                ExpectedRelease::Published => {
+                    assert_eq!(
+                        reported,
+                        &serde_json::json!(published),
+                        "case {case:?}: {source} must report the published AMI release \
+                         {published:?}, got {reported:?}"
+                    );
+                    assert_published_ami_release(case, &cluster_version, reported);
+                }
+                ExpectedRelease::Named(named) => assert_eq!(
+                    reported,
+                    &serde_json::json!(named),
+                    "case {case:?}: {source} must report the AMI version the request named, \
+                     got {reported:?}"
+                ),
+                ExpectedRelease::Absent => assert_eq!(
+                    reported,
+                    &serde_json::Value::Null,
+                    "case {case:?}: {source} must report no AMI version, got {reported:?}"
+                ),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE: a node group's `taints` is reported only while it carries a taint, and
+// its `labels` is the label set Amazon EKS has recorded for it — which the
+// create, answering with the node group as it was created, reports only for a
+// request that asked for labels, and a read reports as a map that may be empty.
+// ---------------------------------------------------------------------------
+
+/// The table spans what the rule generalises over: which of the two members the
+/// request names, how many entries each carries, and a request that names each of
+/// them EMPTY (which records nothing, so nothing is reported).
+#[tokio::test]
+async fn labels_and_taints_are_reported_as_the_state_they_describe() {
+    let router = emulator();
+    create_cluster(&router, "labels-cluster").await;
+
+    let rows: Vec<(&str, &str, serde_json::Value, serde_json::Value)> = vec![
+        (
+            "neither labels nor taints named",
+            "lt-neither",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ),
+        (
+            "an empty label map and an empty taint list",
+            "lt-empty",
+            serde_json::json!({}),
+            serde_json::json!([]),
+        ),
+        (
+            "one label and no taints",
+            "lt-one-label",
+            serde_json::json!({ "role": "worker" }),
+            serde_json::Value::Null,
+        ),
+        (
+            "no labels and one taint",
+            "lt-one-taint",
+            serde_json::Value::Null,
+            // The effects are members of the modelled `TaintEffect` enum
+            // (`smithy_query query="shape" shape="TaintEffect"`).
+            serde_json::json!([{ "key": "dedicated", "value": "batch", "effect": "NO_EXECUTE" }]),
+        ),
+        (
+            "two labels and two taints",
+            "lt-both",
+            serde_json::json!({ "role": "worker", "tier": "batch" }),
+            serde_json::json!([
+                { "key": "dedicated", "value": "batch", "effect": "NO_SCHEDULE" },
+                { "key": "spot", "value": "yes", "effect": "PREFER_NO_SCHEDULE" },
+            ]),
+        ),
+    ];
+
+    for (case, name, labels, taints) in &rows {
+        let mut request = minimal_request(name);
+        if !labels.is_null() {
+            request["labels"] = labels.clone();
+        }
+        if !taints.is_null() {
+            request["taints"] = taints.clone();
+        }
+
+        let created = create_nodegroup(&router, "labels-cluster", &request).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected 200 from CreateNodegroup, got {created:?}"
+        );
+        let described = describe_nodegroup(&router, "labels-cluster", name).await;
+        assert_eq!(
+            described.status, 200,
+            "case {case:?}: expected 200 from DescribeNodegroup, got {described:?}"
+        );
+        let deleted = delete_nodegroup(&router, "labels-cluster", name).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: expected 200 from DeleteNodegroup, got {deleted:?}"
+        );
+
+        // What each member must be. `taints` is reported only while the node group
+        // carries one. `labels` is the label SET the node group carries: the create
+        // answers with the node group as it was created, before that set exists, so
+        // it reports only the labels the request asked for, while a read reports the
+        // set itself — an empty map for a node group that carries no label.
+        let named_labels = match labels.as_object() {
+            Some(entries) if !entries.is_empty() => labels.clone(),
+            _ => serde_json::Value::Null,
+        };
+        let recorded_labels = match labels.as_object() {
+            Some(entries) if !entries.is_empty() => labels.clone(),
+            _ => serde_json::json!({}),
+        };
+        let expected_taints = match taints.as_array() {
+            Some(entries) if !entries.is_empty() => taints.clone(),
+            _ => serde_json::Value::Null,
+        };
+
+        for (source, answer, expected_labels) in [
+            ("CreateNodegroup", &created, &named_labels),
+            ("DescribeNodegroup", &described, &recorded_labels),
+            ("DeleteNodegroup", &deleted, &recorded_labels),
+        ] {
+            assert_eq!(
+                &nodegroup(answer)["labels"],
+                expected_labels,
+                "case {case:?}: {source} must report labels {expected_labels:?}, got {:?}",
+                nodegroup(answer)["labels"]
+            );
+            assert_eq!(
+                nodegroup(answer)["taints"],
+                expected_taints,
+                "case {case:?}: {source} must report taints {expected_taints:?}, got {:?}",
+                nodegroup(answer)["taints"]
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE: every timestamp this service reports carries at most millisecond
+// resolution — the resolution this API's own timestamps carry — whatever
+// resolution the host clock this emulator reads ticks at.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reported_timestamps_carry_at_most_millisecond_resolution() {
+    let router = emulator();
+    let cluster = create_cluster_in(&router, REGION, "millis-cluster").await;
+    assert_eq!(
+        cluster.status, 200,
+        "setup: the cluster must be created, got {cluster:?}"
+    );
+    let created = create_nodegroup(&router, "millis-cluster", &minimal_request("millis")).await;
+    assert_eq!(
+        created.status, 200,
+        "setup: the node group must be created, got {created:?}"
+    );
+    let described = describe_nodegroup(&router, "millis-cluster", "millis").await;
+    let deleted = delete_nodegroup(&router, "millis-cluster", "millis").await;
+
+    // The table spans the operations and the members: a cluster's and a node
+    // group's own stamp, the one a read answers with, and the one a delete does.
+    let cases = [
+        ("CreateCluster $.cluster.createdAt", &cluster.body["cluster"]["createdAt"]),
+        (
+            "CreateNodegroup $.nodegroup.createdAt",
+            &nodegroup(&created)["createdAt"],
+        ),
+        (
+            "CreateNodegroup $.nodegroup.modifiedAt",
+            &nodegroup(&created)["modifiedAt"],
+        ),
+        (
+            "DescribeNodegroup $.nodegroup.createdAt",
+            &nodegroup(&described)["createdAt"],
+        ),
+        (
+            "DeleteNodegroup $.nodegroup.modifiedAt",
+            &nodegroup(&deleted)["modifiedAt"],
+        ),
+    ];
+
+    for (case, reported) in cases {
+        let Some(seconds) = reported.as_f64() else {
+            panic!("case {case:?}: expected an epoch timestamp, got {reported:?}");
+        };
+        let millis = seconds * 1_000.0;
+        assert!(
+            (millis - millis.round()).abs() < 1e-3,
+            "case {case:?}: a reported timestamp carries at most milliseconds, got {reported:?}"
+        );
+    }
 }

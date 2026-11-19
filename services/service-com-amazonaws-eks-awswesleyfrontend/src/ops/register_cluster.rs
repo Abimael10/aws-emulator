@@ -351,7 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let connector_config = ConnectorConfigResponse {
             activation_id: Some(state::derive_activation_id(&arn, now)),
             activation_code: Some(state::derive_activation_code(&arn, now)),
-            activation_expiry: Some(::aws_smithy_types::DateTime::from(activation_expiry)),
+            activation_expiry: Some(state::reported_instant(activation_expiry)),
             provider: Some(provider),
             role_arn: Some(role_arn),
         };

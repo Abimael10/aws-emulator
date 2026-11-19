@@ -338,9 +338,9 @@ impl CertificateAuthorityRecord {
     pub fn to_summary(&self) -> CertificateAuthoritySummary {
         CertificateAuthoritySummary {
             id: Some(self.id.clone()),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            created_at: Some(reported_instant(self.created_at)),
             created_by: Some(self.created_by.clone()),
-            activated_at: self.activated_at.map(::aws_smithy_types::DateTime::from),
+            activated_at: self.activated_at.map(reported_instant),
             activated_by: self.activated_by.clone(),
             signing_status: Some(self.signing_status.clone()),
             distribution_status: Some(self.distribution_status.clone()),
@@ -362,14 +362,14 @@ impl CertificateAuthorityRecord {
             signing_status: summary.signing_status,
             distribution_status: summary.distribution_status,
             validity: Some(CertificateAuthorityValidity {
-                not_before: Some(::aws_smithy_types::DateTime::from(self.not_before)),
-                not_after: Some(::aws_smithy_types::DateTime::from(self.not_after)),
+                not_before: Some(reported_instant(self.not_before)),
+                not_after: Some(reported_instant(self.not_after)),
             }),
             scheduled_events: Some(CertificateAuthorityScheduledEvents {
-                first_auto_activation: Some(::aws_smithy_types::DateTime::from(
+                first_auto_activation: Some(reported_instant(
                     self.not_after - CA_FIRST_AUTO_ACTIVATION_LEAD,
                 )),
-                final_auto_activation: Some(::aws_smithy_types::DateTime::from(
+                final_auto_activation: Some(reported_instant(
                     self.not_after - CA_FINAL_AUTO_ACTIVATION_LEAD,
                 )),
             }),

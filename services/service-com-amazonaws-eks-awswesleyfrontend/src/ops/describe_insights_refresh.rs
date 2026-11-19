@@ -201,9 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DescribeInsightsRefreshOutput {
             status: Some(refresh.status.clone()),
             message: Some(refresh.message()),
-            started_at: Some(::aws_smithy_types::DateTime::from(refresh.started_at)),
+            started_at: Some(state::reported_instant(refresh.started_at)),
             // Unset while the refresh is still running: it has not ended yet.
-            ended_at: refresh.ended_at.map(::aws_smithy_types::DateTime::from),
+            ended_at: refresh.ended_at.map(state::reported_instant),
         })
     }
 }

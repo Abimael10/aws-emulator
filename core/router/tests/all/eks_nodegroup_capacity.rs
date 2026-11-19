@@ -8,9 +8,10 @@
 //! * a managed node group RUNS on an Amazon EC2 Auto Scaling group that Amazon EKS
 //!   creates for it, and the node group reports that group — "the resources
 //!   associated with the node group, such as Auto Scaling groups and security groups
-//!   for remote access" (`Nodegroup$resources`) — so the name it reports is the name
-//!   Auto Scaling itself answers a describe for, and deleting the node group releases
-//!   it;
+//!   for remote access" (`Nodegroup$resources`) — once it exists, so the create
+//!   answers with the node group as it was created and no resources, the reads that
+//!   follow name the group Auto Scaling itself answers a describe for, and deleting
+//!   the node group releases it;
 //! * a Fargate profile may only use PRIVATE subnets ("the subnets must be private
 //!   subnets", `CreateFargateProfileRequest$subnets`), and a subnet is public exactly
 //!   when the route table that governs it carries a route to an internet gateway, so
@@ -173,13 +174,20 @@ fn a_managed_node_group_reports_the_auto_scaling_group_that_really_backs_it() {
                     answer.message()
                 );
 
-                // The create's own answer already reports the capacity it provisioned,
-                // and so does the read: the resources live on the stored record.
+                // The create answers with the node group AS IT WAS CREATED, before the
+                // capacity it will run on exists, so it reports no `resources` at all.
+                assert_eq!(
+                    answer.body["nodegroup"]["resources"],
+                    serde_json::Value::Null,
+                    "case {case:?}: the create must report no resources yet, got {}",
+                    answer.body["nodegroup"]
+                );
+
+                // The read that follows reports the capacity the services that own it
+                // really created: the resources live on the stored record.
                 let read = describe_nodegroup(&router, &runtime, cluster, nodegroup);
-                for (source, reported) in [
-                    ("the create", &answer.body["nodegroup"]),
-                    ("the describe", &read.body["nodegroup"]),
-                ] {
+                {
+                    let reported = &read.body["nodegroup"];
                     let groups = reported["resources"]["autoScalingGroups"]
                         .as_array()
                         .cloned()
@@ -187,14 +195,14 @@ fn a_managed_node_group_reports_the_auto_scaling_group_that_really_backs_it() {
                     assert_eq!(
                         groups.len(),
                         1,
-                        "case {case:?}: {source} must report the node group's Auto Scaling \
-                         group, got {reported}"
+                        "case {case:?}: the describe must report the node group's Auto \
+                         Scaling group, got {reported}"
                     );
                     let name = groups[0]["name"].as_str().unwrap_or_default();
                     assert!(
                         name.contains(nodegroup),
-                        "case {case:?}: {source} must name a group of this node group, got \
-                         {name:?}"
+                        "case {case:?}: the describe must name a group of this node group, \
+                         got {name:?}"
                     );
 
                     // And the remote-access security group exactly when the node group
@@ -203,8 +211,9 @@ fn a_managed_node_group_reports_the_auto_scaling_group_that_really_backs_it() {
                     assert_eq!(
                         group.is_some(),
                         *remote_access,
-                        "case {case:?}: {source} must report a remote-access security group \
-                         only for a node group that asked for remote access, got {reported}"
+                        "case {case:?}: the describe must report a remote-access security \
+                         group only for a node group that asked for remote access, got \
+                         {reported}"
                     );
                 }
 

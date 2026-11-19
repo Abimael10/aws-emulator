@@ -193,7 +193,7 @@ async fn a_node_group_reports_a_change_only_once_the_clock_completes_the_update(
             )],
         },
         Case {
-            name: "the one taint removed, leaving the node group untainted",
+            name: "the one taint removed, leaving the node group with no taint to report",
             request: serde_json::json!({
                 "taints": {
                     "removeTaints": [
@@ -201,7 +201,10 @@ async fn a_node_group_reports_a_change_only_once_the_clock_completes_the_update(
                     ],
                 },
             }),
-            expected: vec![("/taints", serde_json::json!([]))],
+            // A node group that carries no taint reports no `taints` member at
+            // all: see `nodegroup_lifecycle`'s own rule for the two optional
+            // collections. A `Null` expectation here means exactly that.
+            expected: vec![("/taints", serde_json::Value::Null)],
         },
         Case {
             name: "one member of the scaling triple, leaving the other two as stored",
@@ -325,9 +328,12 @@ async fn a_node_group_reports_a_change_only_once_the_clock_completes_the_update(
         );
         for (pointer, expected) in &case.expected {
             let actual = after.body["nodegroup"].pointer(pointer);
+            // A `Null` expectation means the member must be ABSENT: an optional
+            // collection the node group has no entry for is not reported at all.
+            let expected = (!expected.is_null()).then_some(expected);
             assert_eq!(
                 actual,
-                Some(expected),
+                expected,
                 "case {:?}: expected {pointer} {expected:?}, got {actual:?}",
                 case.name
             );

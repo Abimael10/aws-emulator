@@ -412,6 +412,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .map(|version| version.trim().to_string())
             .filter(|version| !version.is_empty());
+        // What the node group will REPORT as its AMI version once this update
+        // completes: the one the request named, or — "by default, the latest
+        // available AMI version for the node group's current Kubernetes version is
+        // used" (`UpdateNodegroupVersionRequest$releaseVersion`) — the latest
+        // published release of the AMI line of the version it moves to. A node
+        // group deployed with a launch template takes its AMI from that template,
+        // which this service does not hold, so none is resolved for it.
+        let resolved_release_version = release_version.clone().or_else(|| {
+            if deployed_launch_template.is_some() {
+                None
+            } else {
+                guard.latest_ami_release_version(&target_version)
+            }
+        });
         let mut params = vec![UpdateParam {
             r#type: Some(UPDATE_PARAM_VERSION.to_string()),
             value: Some(target_version.clone()),
@@ -487,7 +501,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.pending_config = Some(PendingNodegroupConfig {
             update_id,
             version: Some(target_version),
-            release_version,
+            release_version: resolved_release_version,
             ..PendingNodegroupConfig::default()
         });
 

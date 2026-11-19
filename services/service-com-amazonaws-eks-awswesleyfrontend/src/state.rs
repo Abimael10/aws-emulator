@@ -1593,8 +1593,8 @@ impl AssociatedPolicyRecord {
                 // is optional, so it is omitted rather than reported empty.
                 namespaces: (!self.namespaces.is_empty()).then(|| self.namespaces.clone()),
             }),
-            associated_at: Some(::aws_smithy_types::DateTime::from(self.associated_at)),
-            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            associated_at: Some(reported_instant(self.associated_at)),
+            modified_at: Some(reported_instant(self.modified_at)),
         }
     }
 }
@@ -1634,8 +1634,8 @@ impl AccessEntryRecord {
             principal_arn: Some(self.principal_arn.clone()),
             kubernetes_groups: Some(self.kubernetes_groups.clone()),
             access_entry_arn: Some(self.arn.clone()),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            created_at: Some(reported_instant(self.created_at)),
+            modified_at: Some(reported_instant(self.modified_at)),
             tags: Some(
                 self.tags
                     .iter()
@@ -2316,10 +2316,8 @@ impl InsightView {
             name: Some(self.check.name().to_string()),
             category: Some(self.check.category().to_string()),
             kubernetes_version: self.kubernetes_version.clone(),
-            last_refresh_time: Some(::aws_smithy_types::DateTime::from(self.last_refresh_time)),
-            last_transition_time: Some(::aws_smithy_types::DateTime::from(
-                self.last_transition_time,
-            )),
+            last_refresh_time: Some(reported_instant(self.last_refresh_time)),
+            last_transition_time: Some(reported_instant(self.last_transition_time)),
             description: Some(self.check.description().to_string()),
             insight_status: Some(InsightStatus {
                 status: Some(self.status.clone()),
@@ -2595,7 +2593,7 @@ impl UpdateRecord {
             status: Some(self.status.clone()),
             r#type: Some(self.r#type.clone()),
             params: Some(self.params.clone()),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            created_at: Some(reported_instant(self.created_at)),
             // `errors` carries "any errors associated with a `Failed` update",
             // and no slice can fail an update yet (each operation that could is
             // still 501 with its own gap issue). `cancellation` "is present only
@@ -2788,7 +2786,7 @@ impl FargateProfileRecord {
             fargate_profile_name: Some(self.fargate_profile_name.clone()),
             fargate_profile_arn: Some(self.arn.clone()),
             cluster_name: Some(self.cluster_name.clone()),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            created_at: Some(reported_instant(self.created_at)),
             pod_execution_role_arn: Some(self.pod_execution_role_arn.clone()),
             subnets: Some(self.subnets.clone()),
             selectors: Some(self.selectors.clone()),
@@ -3343,8 +3341,8 @@ impl AddonRecord {
                 issues: Some(self.health_issues.clone()),
             }),
             addon_arn: Some(self.arn.clone()),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            created_at: Some(reported_instant(self.created_at)),
+            modified_at: Some(reported_instant(self.modified_at)),
             service_account_role_arn: self.service_account_role_arn.clone(),
             tags: Some(
                 self.tags
@@ -3552,8 +3550,8 @@ impl CapabilityRecord {
             health: Some(CapabilityHealth {
                 issues: Some(self.health_issues.clone()),
             }),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            created_at: Some(reported_instant(self.created_at)),
+            modified_at: Some(reported_instant(self.modified_at)),
             delete_propagation_policy: Some(self.delete_propagation_policy.clone()),
             // `version` is "the version of the capability software that is
             // currently running" — software this emulator does not run and AWS
@@ -3574,8 +3572,8 @@ impl CapabilityRecord {
             r#type: Some(self.r#type.clone()),
             status: Some(self.status.clone()),
             version: None,
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            created_at: Some(reported_instant(self.created_at)),
+            modified_at: Some(reported_instant(self.modified_at)),
         }
     }
 }
@@ -3823,8 +3821,8 @@ impl PodIdentityAssociationRecord {
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             ),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            created_at: Some(reported_instant(self.created_at)),
+            modified_at: Some(reported_instant(self.modified_at)),
             // "If defined, the EKS Pod Identity association is owned by an Amazon
             // EKS add-on" — an association created through this API is owned by
             // the caller, so it reports no owner; one an add-on created carries
@@ -3998,13 +3996,9 @@ impl ClusterVersionRecord {
             // the catalog and the cluster slice cannot disagree.
             default_platform_version: Some(PLATFORM_VERSION.to_string()),
             default_version: self.default_version,
-            release_date: Some(::aws_smithy_types::DateTime::from(self.release_date)),
-            end_of_standard_support_date: Some(::aws_smithy_types::DateTime::from(
-                self.end_of_standard_support,
-            )),
-            end_of_extended_support_date: Some(::aws_smithy_types::DateTime::from(
-                self.end_of_extended_support,
-            )),
+            release_date: Some(reported_instant(self.release_date)),
+            end_of_standard_support_date: Some(reported_instant(self.end_of_standard_support)),
+            end_of_extended_support_date: Some(reported_instant(self.end_of_extended_support)),
             // Both members report the same lifecycle state, and on the WIRE both
             // report it in the `VersionStatus` spelling: `status` "is deprecated.
             // Use `versionStatus` instead, as that field matches for input and
@@ -4914,11 +4908,13 @@ pub mod kubernetes_objects;
 pub mod kubernetes_pod_spec;
 pub mod kubernetes_rbac;
 pub mod kubernetes_self_subject_review;
+mod nodegroup_ami_releases;
 mod nodegroup_capacity;
 mod nodegroups;
 mod pass_role;
 mod peers;
 pub mod pod_identity_plane;
+mod reported_timestamps;
 mod store;
 mod taggable_resources;
 pub use addon_catalog::*;
@@ -4942,9 +4938,11 @@ pub use kubernetes_aws_auth::*;
 pub use kubernetes_config_maps::{ConfigMapObject, MAX_CONFIG_MAPS_PER_NAMESPACE};
 pub use kubernetes_metadata::ObjectMetadata;
 pub use kubernetes_nodes::NodeInstance;
+pub use nodegroup_ami_releases::*;
 pub use nodegroup_capacity::*;
 pub use nodegroups::*;
 pub use pass_role::*;
 pub use peers::*;
+pub use reported_timestamps::*;
 pub use store::*;
 pub use taggable_resources::*;

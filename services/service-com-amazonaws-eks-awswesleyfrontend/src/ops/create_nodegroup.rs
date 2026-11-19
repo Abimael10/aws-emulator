@@ -428,7 +428,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request, the store is locked again where it is read and written, and the
         // calls that create the node group's capacity are `await`s this store's guard
         // is never held across.
-        let cluster_version = {
+        let (cluster_version, latest_ami_release_version) = {
             let mut guard = store.lock();
             guard.materialize_due_transitions(now);
 
@@ -460,7 +460,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            cluster_version
+            // The AMI line the node group is deployed from, read off the published
+            // calendar while the lock is held: "all node groups are created with
+            // the latest AMI release version for the respective minor Kubernetes
+            // version of the cluster" (`CreateNodegroup`), which is the version
+            // resolved just above.
+            let latest_ami_release_version = guard.latest_ami_release_version(&cluster_version);
+            (cluster_version, latest_ami_release_version)
         };
 
         let cluster_name = input.cluster_name.as_str();
@@ -792,6 +798,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => None,
         };
 
+        // "The AMI version of the Amazon EKS optimized AMI to use with your node
+        // group. By default, the latest available AMI version for the node group's
+        // current Kubernetes version is used"
+        // (`CreateNodegroupRequest$releaseVersion`) — so a request that names none is
+        // deployed with the latest published release of that version's AMI line. A
+        // node group deployed with a launch template reports the AMI the TEMPLATE
+        // names, which this service does not hold, so it reports none rather than an
+        // AMI line it was not deployed from.
+        let release_version = input.release_version.clone().or(if deployed_with_launch_template {
+            None
+        } else {
+            latest_ami_release_version
+        });
+
         let nodegroup_id =
             state::derive_nodegroup_id(&region, cluster_name, nodegroup_name, now);
         let arn = ::engine::emulator_arn(
@@ -820,7 +840,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // modification is its creation.
             modified_at: now,
             version: input.version.clone().unwrap_or(cluster_version),
-            release_version: input.release_version.clone(),
+            release_version,
             status: STATUS_CREATING.to_string(),
             active_at: Some(now + NODEGROUP_ACTIVATION_DELAY),
             // Nothing is being removed: the removal instant is written only once
@@ -863,10 +883,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             capacity: state::NodegroupCapacity::default(),
         };
 
-        // The node group as it stands before its capacity is created, which is what
-        // the answer falls back to if the node group is deleted while that capacity is
-        // being created.
-        let without_capacity = record.to_nodegroup();
+        // The node group AS IT WAS CREATED, which is what this operation answers
+        // with ([`NodegroupRecord::to_nodegroup_as_created`]): at the instant a node
+        // group is created, neither the label set Amazon EKS programs onto its nodes
+        // nor the capacity it will run on has been materialised, so it reports the
+        // labels this request asked for and no `resources` — the Auto Scaling group
+        // EKS creates for it is reported once it exists, by the reads that come after
+        // this call ("the resources associated with the node group, such as Auto
+        // Scaling groups", `Nodegroup$resources`).
+        let as_created = record.to_nodegroup_as_created();
         {
             let mut guard = store.lock();
             guard.materialize_due_transitions(now);
@@ -898,30 +923,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await;
 
         // The capacity is written onto the stored node group under a fresh lock, held
-        // only for that write.
-        let with_capacity = {
+        // only for that write, so the reads that follow this call report what the
+        // other services really created.
+        let still_stored = {
             let mut writer = store.lock();
-            writer
-                .nodegroups
-                .get_mut(&nodegroup_key)
-                .map(|stored| {
+            match writer.nodegroups.get_mut(&nodegroup_key) {
+                Some(stored) => {
                     stored.capacity = capacity.clone();
-                    stored.to_nodegroup()
-                })
-        };
-        match with_capacity {
-            Some(nodegroup) => Ok(CreateNodegroupOutput {
-                nodegroup: Some(nodegroup),
-            }),
-            // A delete landed while the capacity was being created, so nothing holds
-            // that capacity any more: it is released the way the delete would have
-            // released it, and the create still answers with the node group it made.
-            None => {
-                state::release_nodegroup_capacity(ctx, &region, &capacity).await;
-                Ok(CreateNodegroupOutput {
-                    nodegroup: Some(without_capacity),
-                })
+                    true
+                }
+                None => false,
             }
+        };
+        // A delete landed while the capacity was being created, so nothing holds that
+        // capacity any more: it is released the way the delete would have released it.
+        if !still_stored {
+            state::release_nodegroup_capacity(ctx, &region, &capacity).await;
         }
+        Ok(CreateNodegroupOutput {
+            nodegroup: Some(as_created),
+        })
     }
 }

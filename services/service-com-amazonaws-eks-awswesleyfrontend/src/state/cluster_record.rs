@@ -512,7 +512,7 @@ impl ClusterRecord {
         Cluster {
             name: Some(self.name.clone()),
             arn: Some(self.arn.clone()),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            created_at: Some(reported_instant(self.created_at)),
             version: self.version.clone(),
             endpoint: provisioned.then(|| self.endpoint.clone()).flatten(),
             role_arn: self.role_arn.clone(),

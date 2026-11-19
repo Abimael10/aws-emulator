@@ -208,9 +208,9 @@ impl EksAnywhereSubscriptionRecord {
         EksAnywhereSubscription {
             id: Some(self.id.clone()),
             arn: Some(self.arn.clone()),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            effective_date: Some(::aws_smithy_types::DateTime::from(self.effective_date)),
-            expiration_date: Some(::aws_smithy_types::DateTime::from(self.expiration_date)),
+            created_at: Some(reported_instant(self.created_at)),
+            effective_date: Some(reported_instant(self.effective_date)),
+            expiration_date: Some(reported_instant(self.expiration_date)),
             license_quantity: self.license_quantity,
             license_type: Some(self.license_type.clone()),
             term: Some(EksAnywhereSubscriptionTerm {

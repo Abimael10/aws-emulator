@@ -20,9 +20,16 @@ pub struct NodegroupRecord {
     pub created_at: SystemTime,
     pub modified_at: SystemTime,
     pub version: String,
-    /// Set only when the caller named a `releaseVersion`: this emulator
-    /// publishes no EKS-optimized AMI catalog, so for a node group that named
-    /// none it reports no AMI version rather than inventing one.
+    /// The AMI version the node group was deployed with: the one the caller named,
+    /// or the latest release of the AMI line published for its Kubernetes version
+    /// ([`ComAmazonawsEksAwswesleyfrontendState::latest_ami_release_version`]).
+    ///
+    /// `None` only for a node group deployed with a launch template, whose AMI the
+    /// template itself carries — "if the node group was deployed using a launch
+    /// template with a custom AMI, then this is the AMI ID that was specified in
+    /// the launch template" (`Nodegroup$releaseVersion`) — and this service holds
+    /// no launch templates to read that id out of, the same silence
+    /// [`NodegroupRecord::instance_types`] keeps.
     pub release_version: Option<String>,
     pub status: String,
     /// When set, the instant at which the clock owes this node group the move
@@ -208,7 +215,7 @@ impl NodegroupRecord {
         self.status = STATUS_ACTIVE.to_string();
     }
 
-    /// This record as the modelled `Nodegroup` shape.
+    /// This record as the modelled `Nodegroup` shape a READ answers with.
     pub fn to_nodegroup(&self) -> Nodegroup {
         Nodegroup {
             nodegroup_name: Some(self.nodegroup_name.clone()),
@@ -216,8 +223,8 @@ impl NodegroupRecord {
             cluster_name: Some(self.cluster_name.clone()),
             version: Some(self.version.clone()),
             release_version: self.release_version.clone(),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            created_at: Some(reported_instant(self.created_at)),
+            modified_at: Some(reported_instant(self.modified_at)),
             status: Some(self.status.clone()),
             capacity_type: Some(self.capacity_type.clone()),
             scaling_config: Some(self.scaling_config.clone()),
@@ -226,13 +233,24 @@ impl NodegroupRecord {
             remote_access: self.remote_access.clone(),
             ami_type: Some(self.ami_type.clone()),
             node_role: Some(self.node_role.clone()),
+            // The label SET Amazon EKS has recorded for this node group, which is a
+            // map whether or not it holds an entry: a node group that carries no
+            // label still has a recorded, empty set of them
+            // ([`Self::to_nodegroup_as_created`] is where that set does not exist
+            // yet).
             labels: Some(
                 self.labels
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             ),
-            taints: Some(self.taints.clone()),
+            // A taint is reported only while the node group carries one: `taints`
+            // is optional ("the Kubernetes taints to be applied to the nodes in the
+            // node group", `Nodegroup$taints`), so a node group with none reports no
+            // member rather than an empty list — which is what a client telling "no
+            // taint is applied" from "an empty list of taints was recorded" reads
+            // off the member's PRESENCE.
+            taints: (!self.taints.is_empty()).then(|| self.taints.clone()),
             disk_size: self.disk_size,
             // Nothing in this emulator reports a node group issue, so the
             // health block is present and empty rather than absent: "Any issues
@@ -256,6 +274,32 @@ impl NodegroupRecord {
             // the record rather than recomputed — and `None` when neither service
             // created any, so nothing is reported that would resolve to nothing.
             resources: self.capacity.to_nodegroup_resources(),
+        }
+    }
+
+    /// This record as the `Nodegroup` the CREATE of the node group answers with:
+    /// the node group at the instant it was created.
+    ///
+    /// It differs from what a read answers with ([`Self::to_nodegroup`]) in the
+    /// parts Amazon EKS has not materialised at that instant:
+    ///
+    /// * the label set it programs onto the node group's nodes, which exists as a
+    ///   (possibly empty) set only once it has been recorded, so a create that
+    ///   asked for no label reports no `labels` member while the read that follows
+    ///   reports the empty set the node group then carries;
+    /// * the capacity the node group runs on, which the create provisions after it
+    ///   has the node group, so its `resources` are reported by the reads that come
+    ///   after they exist — this record carries none yet at that point, which is
+    ///   what [`Self::to_nodegroup`] already reports as no member.
+    pub fn to_nodegroup_as_created(&self) -> Nodegroup {
+        Nodegroup {
+            labels: (!self.labels.is_empty()).then(|| {
+                self.labels
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+            ..self.to_nodegroup()
         }
     }
 }
