@@ -63,6 +63,10 @@ rquickjs = "0.14"
 # filesystem a run sees is that in-memory workspace, and the run is given no seam to
 # dispatch an AWS call on.
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# `png`: encodes a browser session's viewport as the PNG image `InvokeBrowser`'s
+# `screenshot` action answers with — the one format `ScreenshotFormat` declares — so the
+# image is a real PNG of the session's own dimensions rather than bytes shaped like one.
+png = "0.18"
 # The AgentCore CONTROL plane, whose store owns the browsers a browser session is
 # started on: `StartBrowserSession` names one it did not create, so the data plane
 # resolves the `browserIdentifier` against the component that owns it rather than

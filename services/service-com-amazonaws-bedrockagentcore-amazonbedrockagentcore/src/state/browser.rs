@@ -212,6 +212,12 @@ pub struct BrowserSessionRecord {
     pub last_updated_at: SystemTime,
     /// The streams this session exposes, materialised when it was started.
     pub streams: BrowserSessionStreamRecord,
+    /// What the OS-level actions `InvokeBrowser` performed on this session have left on
+    /// it: where its pointer stands, how far it has been scrolled, how much has been
+    /// typed into it. The screen those actions happen on is the session's viewport
+    /// ([`BrowserSessionRecord::surface`]), so this plane's input state and its rendered
+    /// screenshots cannot disagree about where anything is.
+    pub input: super::BrowserInputState,
     /// When `StopBrowserSession` terminated this session, or `None` while no stop has. A
     /// stopped session is `TERMINATED` from that instant on, whatever is left of its
     /// time-to-live, and the documented effect of a stop is that it cannot be restarted.
@@ -262,6 +268,9 @@ impl BrowserSessionRecord {
             // Nothing has changed this session yet, so the last instant it changed is
             // the instant it came into being.
             last_updated_at: created_at,
+            // A session that has just been started has performed no action, so its
+            // screen carries no pointer and nothing has been typed into it.
+            input: super::BrowserInputState::default(),
             stopped_at: None,
             idempotent_calls: BTreeMap::new(),
             seq,
@@ -575,3 +584,20 @@ pub fn resolve_browser<Eng: Send + Sync + 'static>(
 /// The `InternalServerException` message a call gets when the component that owns
 /// browsers could not be reached.
 pub const BROWSER_STORE_UNAVAILABLE: &str = "the browser store is unavailable";
+
+/// How this service words the `ValidationException` an action gets when the browser
+/// session it names is no longer running: `Browser session <sessionId> is not active. Start
+/// a new session or provide a valid session ID`, with the session taken from the request as
+/// the sentence's only variable part.
+///
+/// A session that has been stopped or has run out of time-to-live cannot be made usable
+/// again — the model documents that a stopped session cannot be restarted — so the
+/// condition is a request member that no longer addresses a session anything can be
+/// performed on, not a state the caller can resolve and retry, which is why the sentence
+/// names starting a new session as what the caller does next.
+pub fn browser_session_not_active(session_id: &str) -> String {
+    format!(
+        "Browser session {session_id} is not active. Start a new session or provide a valid \
+         session ID"
+    )
+}

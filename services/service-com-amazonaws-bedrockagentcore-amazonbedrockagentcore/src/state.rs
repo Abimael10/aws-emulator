@@ -130,6 +130,12 @@ pub use batch_evaluations::*;
 mod browser;
 pub use browser::*;
 
+/// The surface a browser session's OS-level actions are performed against and the input
+/// state they leave on it: [`BrowserSurface`] and [`BrowserInputState`], which is what
+/// `InvokeBrowser` goes through.
+mod browser_actions;
+pub use browser_actions::*;
+
 /// The long-term memory extraction plane: [`ExtractionJobUnit`], the units of extraction
 /// work a memory container holds, derived from the messages its events carry.
 mod extraction_jobs;

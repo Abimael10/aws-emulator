@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InvokeBrowser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InvokeBrowser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Performs ONE operating-system-level action on a live browser session, and answers
+//! with the result of that action.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InvokeBrowser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every action is performed against the session's own viewport — the screen this
+//! emulator renders and dispatches on ([`crate::state::BrowserSessionRecord::surface`]):
+//!
+//! * a `screenshot` is a PNG image of that screen, encoded at exactly the session's
+//!   viewport dimensions, with the session's pointer drawn where its last pointer action
+//!   left it. It REPORTS the session and writes nothing;
+//! * `mouseClick`, `mouseMove`, `mouseDrag` and `mouseScroll` are delivered at the point
+//!   they name, which leaves the pointer there and the session scrolled by any wheel
+//!   deltas, so the next screenshot shows it;
+//! * `keyType`, `keyPress` and `keyShortcut` are delivered through the session's
+//!   keyboard.
+//!
+//! An action the session could not perform — a point off its screen, a blank key — is
+//! reported IN BAND, on a 200 whose result carries `BrowserActionStatus` `FAILED` and the
+//! `error` sentence saying why: the ACTION failed, while the request that asked for it was
+//! well formed. The modelled errors below are for the REQUEST: the browser, the session,
+//! and a session that is no longer one an action can be performed on at all.
+//!
+//! A browser is NOT this data plane's resource, so the `browserIdentifier` is resolved
+//! against the component that owns browsers ([`crate::state::resolve_browser`]) before
+//! anything is looked for among its sessions.
 //!
 //! ## Shape of an operation
 //!
@@ -101,6 +116,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -136,6 +152,133 @@ pub type InvokeBrowserError = crate::scaffolded::Scaffolded<InvokeBrowserErrorMo
 impl From<InvokeBrowserErrorModeled> for InvokeBrowserError {
     fn from(modeled: InvokeBrowserErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// This operation's own modelled 400 `ValidationException`, for a request member that no
+/// longer addresses a session an action can be performed on.
+///
+/// `reason` is `ValidationExceptionReason`'s `FieldValidationFailed` (source:
+/// smithy_query query="shape" shape="ValidationExceptionReason", values CannotParse |
+/// FieldValidationFailed | IdempotentParameterMismatchException | EventInOtherSession |
+/// ResourceConflict), which is the member-level failure this is — the same reading the
+/// sibling tools plane makes of the identical condition.
+fn validation(message: impl Into<String>) -> InvokeBrowserErrorModeled {
+    InvokeBrowserErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: "FieldValidationFailed".to_string(),
+        field_list: None,
+    })
+}
+
+/// The modelled 404 for a resource this emulator does not hold.
+fn not_found(message: String) -> InvokeBrowserErrorModeled {
+    InvokeBrowserErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+}
+
+/// The modelled 500 for a store this emulator could not reach, which is its own fault and
+/// not the request's.
+fn internal(message: impl Into<String>) -> InvokeBrowserErrorModeled {
+    InvokeBrowserErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.into()),
+    })
+}
+
+/// How an action that was performed, or could not be, is reported: `BrowserActionStatus`
+/// and, for one that was not, the sentence saying why.
+///
+/// Every result shape of `BrowserActionResult` carries exactly this pair (`status`
+/// `@required`, `error` "present only when the action failed"), so this is the ONE place
+/// the pair is decided and no two actions can report the same outcome differently.
+fn reported(delivered: Result<(), String>) -> (String, Option<String>) {
+    match delivered {
+        Ok(()) => (crate::state::BROWSER_ACTION_SUCCESS.to_string(), None),
+        Err(why) => (crate::state::BROWSER_ACTION_FAILED.to_string(), Some(why)),
+    }
+}
+
+/// The sentence a screenshot carries when the session's screen could not be encoded as an
+/// image at all: the action failed, and no image data travels with a failure.
+const SCREENSHOT_NOT_ENCODED: &str = "the session's viewport could not be encoded as an image";
+
+/// Perform `action` on `session` at `now` and report what it did.
+///
+/// The member set in the result corresponds to the action that was performed, which is
+/// what makes this one match over the action union rather than a lookup of any kind.
+fn perform(
+    session: &mut crate::state::BrowserSessionRecord,
+    action: &BrowserAction,
+    now: SystemTime,
+) -> BrowserActionResult {
+    match action {
+        BrowserAction::mouseClick(arguments) => {
+            let (status, error) = reported(session.deliver_click(
+                arguments.x,
+                arguments.y,
+                arguments.button.as_deref(),
+                arguments.click_count,
+                now,
+            ));
+            BrowserActionResult::mouseClick(MouseClickResult { status, error })
+        }
+        BrowserAction::mouseMove(arguments) => {
+            let (status, error) =
+                reported(session.deliver_pointer_move(arguments.x, arguments.y, now));
+            BrowserActionResult::mouseMove(MouseMoveResult { status, error })
+        }
+        BrowserAction::mouseDrag(arguments) => {
+            let (status, error) = reported(session.deliver_drag(
+                (arguments.start_x, arguments.start_y),
+                (arguments.end_x, arguments.end_y),
+                arguments.button.as_deref(),
+                now,
+            ));
+            BrowserActionResult::mouseDrag(MouseDragResult { status, error })
+        }
+        BrowserAction::mouseScroll(arguments) => {
+            // `deltaX` / `deltaY` are optional and modelled -1000..1000: a wheel turn
+            // that names no delta on an axis does not scroll along it.
+            let (status, error) = reported(session.deliver_scroll(
+                arguments.x,
+                arguments.y,
+                arguments.delta_x.unwrap_or_default(),
+                arguments.delta_y.unwrap_or_default(),
+                now,
+            ));
+            BrowserActionResult::mouseScroll(MouseScrollResult { status, error })
+        }
+        BrowserAction::keyType(arguments) => {
+            session.deliver_typed_text(&arguments.text, now);
+            let (status, error) = reported(Ok(()));
+            BrowserActionResult::keyType(KeyTypeResult { status, error })
+        }
+        BrowserAction::keyPress(arguments) => {
+            let (status, error) =
+                reported(session.deliver_key_press(&arguments.key, arguments.presses, now));
+            BrowserActionResult::keyPress(KeyPressResult { status, error })
+        }
+        BrowserAction::keyShortcut(arguments) => {
+            let (status, error) = reported(session.deliver_key_shortcut(&arguments.keys, now));
+            BrowserActionResult::keyShortcut(KeyShortcutResult { status, error })
+        }
+        // `format` is a `ScreenshotFormat`, whose only value is `PNG`, and the request
+        // boundary refuses any other before this handler runs — so the screen is encoded
+        // as the one image format the model declares. A screenshot REPORTS the session:
+        // it writes nothing, so the next caller sees what it would have seen anyway.
+        BrowserAction::Screenshot(_) => match session.screenshot_png() {
+            Some(data) => BrowserActionResult::Screenshot(ScreenshotResult {
+                status: crate::state::BROWSER_ACTION_SUCCESS.to_string(),
+                error: None,
+                data: Some(data),
+            }),
+            None => BrowserActionResult::Screenshot(ScreenshotResult {
+                status: crate::state::BROWSER_ACTION_FAILED.to_string(),
+                error: Some(SCREENSHOT_NOT_ENCODED.to_string()),
+                data: None,
+            }),
+        },
     }
 }
 
@@ -175,18 +318,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InvokeBrowser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InvokeBrowserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InvokeBrowser"))
+        // `ctx` carries request metadata only, and nothing this action does is addressed
+        // from the request's own URL: the screen an action happens on is the session's.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal("the shared engine does not carry this service's state"))?;
+
+        // A session runs ON a browser, and a browser is the CONTROL plane's resource, so
+        // the path resolves outside-in: a browser this emulator does not hold is what the
+        // refusal names, before anything is looked for among its sessions. The resolution
+        // and both sentences live in `crate::state`; this operation only says which of its
+        // own modelled errors carries each.
+        if let Err(unavailable) =
+            crate::state::resolve_browser(&*self.engine, &input.browser_identifier)
+        {
+            return Err(match unavailable {
+                crate::state::BrowserUnavailable::NotFound(message) => not_found(message),
+                crate::state::BrowserUnavailable::StoreUnavailable(message) => internal(message),
+            }
+            .into());
+        }
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        let session = store
+            .browser_session_mut(&input.browser_identifier, &input.session_id)
+            .ok_or_else(|| {
+                // The session is the resource addressed and the only one named: the
+                // browser it was looked for on is not part of this message.
+                not_found(crate::state::resource_not_found_message(
+                    crate::state::NotFoundResource::Session,
+                    &input.session_id,
+                ))
+            })?;
+
+        // The action must be performed on "an active session created with
+        // StartBrowserSession": a session a stop has terminated, or whose time-to-live has
+        // run out, is `TERMINATED` and cannot be restarted, so the `sessionId` no longer
+        // addresses anything an action can be performed on.
+        if session.status_as_of(now) == crate::state::BROWSER_SESSION_TERMINATED {
+            return Err(validation(crate::state::browser_session_not_active(
+                &input.session_id,
+            ))
+            .into());
+        }
+
+        let result = perform(session, &input.action, now);
+        Ok(InvokeBrowserOutput {
+            result,
+            // The session the action was performed on, read off the stored session rather
+            // than echoed from the request.
+            session_id: session.session_id.clone(),
+        })
     }
 }

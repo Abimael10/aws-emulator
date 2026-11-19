@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the AgentCore browser session lifecycle:
-//! `StartBrowserSession` and `GetBrowserSession`.
+//! `StartBrowserSession`, `GetBrowserSession` and the OS-level actions `InvokeBrowser`
+//! performs on a session.
 //!
 //! The rule under test: a start MINTS a `sessionId` matching its modelled pattern,
 //! persists the configuration the request asked for (name, time-to-live, viewport,
@@ -12,6 +13,11 @@
 //! record with the status the clock implies — `READY` until the stored time-to-live has
 //! run out, `TERMINATED` from then on; and a browser is the CONTROL plane's resource, so
 //! a session can only be started on, or read from, a browser that component holds.
+//!
+//! And the rule the action half is under: every action `InvokeBrowser` performs happens on
+//! the session's own viewport — a screenshot is a real PNG of exactly those dimensions, a
+//! pointer action off that screen is reported FAILED in band, and an action on a session
+//! that is no longer running is refused.
 //!
 //! Every case drives real HTTP through the same `MultiServiceRouter` the emulator
 //! serves with, so the wire shape (routes, status codes, `restJson1` bodies, modelled
@@ -70,8 +76,22 @@ async fn send(
     path: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
+    let (status, parsed, _headers) = dispatch(router, method, path, body, &[]).await;
+    (status, parsed)
+}
+
+/// Send one request carrying `headers` beyond the ones every request here carries, and
+/// return its status, parsed JSON body and response headers — which is where an
+/// `@httpHeader`-bound member travels.
+async fn dispatch(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    headers: &[(&str, &str)],
+) -> (u16, Value, http::HeaderMap) {
     let payload = body.map_or_else(bytes::Bytes::new, |v| bytes::Bytes::from(v.to_string()));
-    let request = http::Request::builder()
+    let mut builder = http::Request::builder()
         .method(method)
         .uri(format!("https://bedrock-agentcore.us-east-1.amazonaws.com{path}"))
         .header(
@@ -79,13 +99,15 @@ async fn send(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/bedrock-agentcore/aws4_request, \
              SignedHeaders=host, Signature=0",
         )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build the request");
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(payload).expect("build the request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
-    (status, parsed)
+    (status, parsed, response.headers().clone())
 }
 
 /// Create one custom browser through the control plane and return the `browserId` it
@@ -801,4 +823,689 @@ async fn input_outside_a_modelled_constraint_is_refused_with_400() {
             "case {case:?}: a refused start must store nothing"
         );
     }
+}
+
+// --- InvokeBrowser: the OS-level actions performed on one session -------------------
+
+/// Where `InvokeBrowser` carries the session: `sessionId` is
+/// `@httpHeader("x-amzn-browser-session-id")` on the request AND on the answer (source:
+/// smithy_query query="operation" operation="InvokeBrowser").
+const BROWSER_SESSION_HEADER: &str = "x-amzn-browser-session-id";
+
+/// The eight bytes every PNG file begins with (RFC 2083 §3.1).
+const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+/// The sample value an unpainted pixel of a session's screen carries on every channel: a
+/// browser that has loaded no page shows a blank white viewport.
+const BLANK_SAMPLE: u8 = 0xff;
+
+/// `InvokeBrowser`: `POST /browsers/{browserIdentifier}/sessions/invoke`, with the session
+/// on its header and exactly one `BrowserAction` member in the body. Answers with the
+/// status, the parsed body, and the session the response's own header named.
+async fn invoke(
+    router: &MultiServiceRouter,
+    browser: &str,
+    session_id: &str,
+    action: Value,
+) -> (u16, Value, Option<String>) {
+    let (status, body, headers) = dispatch(
+        router,
+        "POST",
+        &format!("/browsers/{}/sessions/invoke", label(browser)),
+        Some(json!({"action": action})),
+        &[(BROWSER_SESSION_HEADER, session_id)],
+    )
+    .await;
+    let answered = headers
+        .get(BROWSER_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    (status, body, answered)
+}
+
+/// `StopBrowserSession`: `PUT /browsers/{browserIdentifier}/sessions/stop?sessionId=…`.
+async fn stop_session(
+    router: &MultiServiceRouter,
+    browser: &str,
+    session_id: &str,
+) -> (u16, Value) {
+    send(
+        router,
+        "PUT",
+        &format!(
+            "/browsers/{}/sessions/stop?sessionId={}",
+            label(browser),
+            label(session_id)
+        ),
+        None,
+    )
+    .await
+}
+
+/// Start one session on the system browser and return its `sessionId`.
+async fn started_session(router: &MultiServiceRouter, request: Value) -> String {
+    let (status, started) = start_session(router, SYSTEM_BROWSER, request).await;
+    assert_eq!(
+        status, 200,
+        "the fixture session must start, got {status} with {started:?}"
+    );
+    text(&started, "sessionId").to_string()
+}
+
+/// The `BrowserActionResult` member a 200 carries, by the name of the action performed.
+fn result_member<'a>(body: &'a Value, action: &str) -> &'a Value {
+    member(member(body, "result"), action)
+}
+
+/// How many OS-level actions the stored session has performed: what says a FAILED action
+/// delivered nothing, read off the store the handlers share.
+fn actions_performed(engine: &engine::InMemoryEngine, browser: &str, session_id: &str) -> u64 {
+    let state = agentcore::state::service_state(engine).expect("the service state");
+    let store = state.lock();
+    store
+        .browser_session(browser, session_id)
+        .map_or(0, |session| session.input.actions_performed)
+}
+
+/// The image a successful screenshot answered with, base64-decoded the way an SDK decodes
+/// a `Blob` on this wire.
+fn screenshot_image(case: &str, body: &Value) -> Vec<u8> {
+    let encoded = text(result_member(body, "screenshot"), "data");
+    assert!(
+        !encoded.is_empty(),
+        "case {case:?}: expected base64 image data, got {body:?}"
+    );
+    aws_smithy_types::base64::decode(encoded)
+        .unwrap_or_else(|error| panic!("case {case:?}: the data must be base64, got {error}"))
+}
+
+/// An image's dimensions and its RGB pixels, decoded with the maintained PNG decoder — a
+/// real image, not bytes that merely start like one.
+fn decoded(case: &str, image: &[u8]) -> (u32, u32, Vec<u8>) {
+    assert_eq!(
+        image.get(..PNG_MAGIC.len()),
+        Some(&PNG_MAGIC[..]),
+        "case {case:?}: expected the PNG signature, got {:?}",
+        image.get(..PNG_MAGIC.len())
+    );
+    let mut reader = png::Decoder::new(std::io::Cursor::new(image))
+        .read_info()
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: the image must decode as a PNG, got {error}")
+        });
+    let buffer_size = reader
+        .output_buffer_size()
+        .unwrap_or_else(|| panic!("case {case:?}: the image must state a buffer size"));
+    let mut pixels = vec![0u8; buffer_size];
+    let info = reader
+        .next_frame(&mut pixels)
+        .unwrap_or_else(|error| panic!("case {case:?}: the image must carry a frame, got {error}"));
+    pixels.truncate(info.buffer_size());
+    (info.width, info.height, pixels)
+}
+
+/// How many samples of `pixels` are not the blank surface's.
+fn painted_samples(pixels: &[u8]) -> usize {
+    pixels.iter().filter(|sample| **sample != BLANK_SAMPLE).count()
+}
+
+/// A screenshot is an image of the session's OWN screen: a real PNG, exactly as wide and
+/// as tall as the viewport that session was started with — and, for a start that named no
+/// viewport, as the surface this emulator renders such a session at.
+#[tokio::test]
+async fn a_screenshot_is_a_png_of_the_sessions_own_viewport() {
+    let (router, _engine) = emulator();
+
+    // Rows differ along the viewport the session was started with: both published bounds
+    // of `ViewPortWidth` (320..3840) and `ViewPortHeight` (240..2160), one pair between
+    // them, and a start that named no viewport at all.
+    let cases: Vec<(&str, Value, u32, u32)> = vec![
+        (
+            "smallest-published-viewport",
+            json!({"viewPort": {"width": 320, "height": 240}}),
+            320,
+            240,
+        ),
+        (
+            "a-viewport-between-the-published-bounds",
+            json!({"viewPort": {"width": 800, "height": 600}}),
+            800,
+            600,
+        ),
+        (
+            "largest-published-viewport",
+            json!({"viewPort": {"width": 3_840, "height": 2_160}}),
+            3_840,
+            2_160,
+        ),
+        (
+            "no-viewport-renders-the-surface-this-emulator-assigns",
+            json!({}),
+            agentcore::state::DEFAULT_SURFACE_WIDTH,
+            agentcore::state::DEFAULT_SURFACE_HEIGHT,
+        ),
+    ];
+
+    for (case, request, width, height) in cases {
+        let session_id = started_session(&router, request).await;
+        // `ScreenshotFormat` publishes one value, `PNG`, which this row names explicitly.
+        let (status, body, answered) = invoke(
+            &router,
+            SYSTEM_BROWSER,
+            &session_id,
+            json!({"screenshot": {"format": "PNG"}}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body:?}"
+        );
+        assert_eq!(
+            answered.as_deref(),
+            Some(session_id.as_str()),
+            "case {case:?}: expected the answer to name the session it acted on, got {answered:?}"
+        );
+        let screenshot = result_member(&body, "screenshot");
+        assert_eq!(
+            text(screenshot, "status"),
+            "SUCCESS",
+            "case {case:?}: expected a SUCCESS screenshot, got {screenshot:?}"
+        );
+        assert_eq!(
+            member(screenshot, "error"),
+            &Value::Null,
+            "case {case:?}: a performed action carries no error, got {screenshot:?}"
+        );
+        let image = screenshot_image(case, &body);
+        let (got_width, got_height, pixels) = decoded(case, &image);
+        assert_eq!(
+            (got_width, got_height),
+            (width, height),
+            "case {case:?}: expected a {width}x{height} image, got {got_width}x{got_height}"
+        );
+        // Nothing has been navigated and no pointer action has been performed, so the
+        // screen is the blank viewport and nothing is painted onto it.
+        assert_eq!(
+            painted_samples(&pixels),
+            0,
+            "case {case:?}: expected a blank screen, got {} painted samples",
+            painted_samples(&pixels)
+        );
+    }
+}
+
+/// The session's viewport is the screen EVERY action happens on: a pointer action at a
+/// point on it is performed, one off it is reported FAILED with the point and the screen
+/// it missed, and a keyboard action naming no key is FAILED for the same reason. A FAILED
+/// action delivers nothing, so it leaves the session's input state where it was.
+#[tokio::test]
+async fn an_action_is_performed_only_where_the_session_can_receive_it() {
+    let (router, engine) = emulator();
+    let session_id =
+        started_session(&router, json!({"viewPort": {"width": 800, "height": 600}})).await;
+
+    // Rows differ along the action, the point it names relative to the 800x600 screen
+    // (its corners, the pixel past each edge, a negative coordinate), and the keys a
+    // keyboard action sends.
+    let cases: Vec<(&str, &str, Value, bool)> = vec![
+        ("move-to-the-screens-origin", "mouseMove", json!({"mouseMove": {"x": 0, "y": 0}}), true),
+        (
+            "click-the-last-pixel-of-the-screen",
+            "mouseClick",
+            json!({"mouseClick": {"x": 799, "y": 599, "button": "LEFT", "clickCount": 2}}),
+            true,
+        ),
+        (
+            "click-one-pixel-past-the-right-edge",
+            "mouseClick",
+            json!({"mouseClick": {"x": 800, "y": 599}}),
+            false,
+        ),
+        (
+            "click-one-pixel-past-the-bottom-edge",
+            "mouseClick",
+            json!({"mouseClick": {"x": 799, "y": 600}}),
+            false,
+        ),
+        (
+            "move-to-a-negative-coordinate",
+            "mouseMove",
+            json!({"mouseMove": {"x": -1, "y": 10}}),
+            false,
+        ),
+        (
+            "scroll-at-a-point-on-the-screen",
+            "mouseScroll",
+            json!({"mouseScroll": {"x": 400, "y": 300, "deltaX": -1_000, "deltaY": 1_000}}),
+            true,
+        ),
+        (
+            "scroll-at-a-point-off-the-screen",
+            "mouseScroll",
+            json!({"mouseScroll": {"x": 400, "y": 1_200, "deltaY": 10}}),
+            false,
+        ),
+        (
+            "drag-between-two-points-on-the-screen",
+            "mouseDrag",
+            json!({"mouseDrag": {"startX": 10, "startY": 20, "endX": 700, "endY": 500, "button": "MIDDLE"}}),
+            true,
+        ),
+        (
+            "drag-that-ends-off-the-screen",
+            "mouseDrag",
+            json!({"mouseDrag": {"startX": 10, "startY": 20, "endX": 900, "endY": 500}}),
+            false,
+        ),
+        (
+            "type-text-through-the-keyboard",
+            "keyType",
+            json!({"keyType": {"text": "hello agentcore"}}),
+            true,
+        ),
+        (
+            "type-text-of-no-characters",
+            "keyType",
+            json!({"keyType": {"text": ""}}),
+            true,
+        ),
+        (
+            "press-a-key-repeatedly",
+            "keyPress",
+            json!({"keyPress": {"key": "Enter", "presses": 100}}),
+            true,
+        ),
+        (
+            "press-a-key-that-names-none",
+            "keyPress",
+            json!({"keyPress": {"key": " "}}),
+            false,
+        ),
+        (
+            "hold-a-shortcut-of-keys",
+            "keyShortcut",
+            json!({"keyShortcut": {"keys": ["Control", "Shift", "t"]}}),
+            true,
+        ),
+        (
+            "hold-a-shortcut-with-a-key-that-names-none",
+            "keyShortcut",
+            json!({"keyShortcut": {"keys": ["Control", ""]}}),
+            false,
+        ),
+    ];
+
+    let mut performed = actions_performed(&engine, SYSTEM_BROWSER, &session_id);
+    for (case, action, request, expect_performed) in cases {
+        let (status, body, answered) =
+            invoke(&router, SYSTEM_BROWSER, &session_id, request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: an action the session answers for is a 200, got {status} with {body:?}"
+        );
+        assert_eq!(
+            answered.as_deref(),
+            Some(session_id.as_str()),
+            "case {case:?}: expected the answer to name the session, got {answered:?}"
+        );
+        let result = result_member(&body, action);
+        assert!(
+            !result.is_null(),
+            "case {case:?}: expected the result to carry the {action:?} member, got {body:?}"
+        );
+        let expected_status = if expect_performed { "SUCCESS" } else { "FAILED" };
+        assert_eq!(
+            text(result, "status"),
+            expected_status,
+            "case {case:?}: expected status {expected_status:?}, got {result:?}"
+        );
+        if expect_performed {
+            performed += 1;
+            assert_eq!(
+                member(result, "error"),
+                &Value::Null,
+                "case {case:?}: a performed action carries no error, got {result:?}"
+            );
+        } else {
+            let error = text(result, "error");
+            assert!(
+                !error.is_empty(),
+                "case {case:?}: a failed action says why, got {result:?}"
+            );
+        }
+        assert_eq!(
+            actions_performed(&engine, SYSTEM_BROWSER, &session_id),
+            performed,
+            "case {case:?}: expected {performed} performed action(s), got {}",
+            actions_performed(&engine, SYSTEM_BROWSER, &session_id)
+        );
+    }
+}
+
+/// A pointer action that misses the screen says which point it was asked for and how big
+/// that screen is, for sessions whose screens differ.
+#[tokio::test]
+async fn a_pointer_action_off_the_screen_names_the_point_and_the_screen() {
+    let (router, _engine) = emulator();
+
+    // (case, the viewport the session runs at, the point asked for)
+    let cases: Vec<(&str, Value, i32, i32, u32, u32)> = vec![
+        (
+            "past-the-width-of-a-small-screen",
+            json!({"viewPort": {"width": 320, "height": 240}}),
+            320,
+            0,
+            320,
+            240,
+        ),
+        (
+            "past-the-height-of-a-wide-screen",
+            json!({"viewPort": {"width": 1_920, "height": 1_080}}),
+            100,
+            1_080,
+            1_920,
+            1_080,
+        ),
+        (
+            "past-the-surface-this-emulator-assigns-a-session-with-no-viewport",
+            json!({}),
+            i32::try_from(agentcore::state::DEFAULT_SURFACE_WIDTH).unwrap_or(i32::MAX),
+            0,
+            agentcore::state::DEFAULT_SURFACE_WIDTH,
+            agentcore::state::DEFAULT_SURFACE_HEIGHT,
+        ),
+    ];
+
+    for (case, request, x, y, width, height) in cases {
+        let session_id = started_session(&router, request).await;
+        let (status, body, _answered) = invoke(
+            &router,
+            SYSTEM_BROWSER,
+            &session_id,
+            json!({"mouseClick": {"x": x, "y": y}}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body:?}"
+        );
+        let error = text(result_member(&body, "mouseClick"), "error").to_string();
+        assert!(
+            error.contains(&format!("({x}, {y})")) && error.contains(&format!("{width}x{height}")),
+            "case {case:?}: expected the point ({x}, {y}) and the screen {width}x{height} in the \
+             error, got {error:?}"
+        );
+    }
+}
+
+/// An action can only be performed on a session that is still running: one a stop
+/// terminated, and one whose time-to-live has run out, are both refused with the service's
+/// own 400, and neither performs anything.
+#[tokio::test]
+async fn an_action_on_a_terminated_session_is_refused() {
+    let (router, engine) = emulator();
+
+    // (case, how this session stopped being one an action can run in)
+    let cases: Vec<(&str, bool)> = vec![
+        ("stopped-by-stop-browser-session", true),
+        ("past-its-own-time-to-live", false),
+    ];
+
+    for (case, by_stop) in cases {
+        let session_id =
+            started_session(&router, json!({"sessionTimeoutSeconds": 60})).await;
+        if by_stop {
+            let (status, stopped) = stop_session(&router, SYSTEM_BROWSER, &session_id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the fixture stop must succeed, got {status} with {stopped:?}"
+            );
+        } else {
+            age_session(
+                &engine,
+                SYSTEM_BROWSER,
+                &session_id,
+                Duration::from_secs(61),
+            );
+        }
+
+        let (status, body, _answered) = invoke(
+            &router,
+            SYSTEM_BROWSER,
+            &session_id,
+            json!({"screenshot": {}}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body:?}"
+        );
+        let expected = format!(
+            "Browser session {session_id} is not active. Start a new session or provide a valid \
+             session ID"
+        );
+        assert_eq!(
+            message(&body),
+            expected,
+            "case {case:?}: expected message {expected:?}, got {:?}",
+            message(&body)
+        );
+        assert_eq!(
+            actions_performed(&engine, SYSTEM_BROWSER, &session_id),
+            0,
+            "case {case:?}: a refused action performs nothing, got {}",
+            actions_performed(&engine, SYSTEM_BROWSER, &session_id)
+        );
+    }
+}
+
+/// An action is addressed outside-in, so a browser nothing holds and a session nothing
+/// started are each reported as the resource that did not resolve.
+#[tokio::test]
+async fn an_action_naming_no_browser_or_no_session_is_refused_with_404() {
+    let (router, _engine) = emulator();
+    let live = started_session(&router, json!({})).await;
+
+    // (case, the browser, the session, the message the refusal must carry)
+    let cases: Vec<(&str, String, String, String)> = vec![
+        (
+            "a-browser-nothing-holds",
+            MISSING_BROWSER.to_string(),
+            live.clone(),
+            format!("Browser not found: {MISSING_BROWSER}"),
+        ),
+        (
+            "a-session-nothing-started",
+            SYSTEM_BROWSER.to_string(),
+            "abc123".to_string(),
+            "Session not found: abc123".to_string(),
+        ),
+    ];
+
+    for (case, browser, session_id, expected) in cases {
+        let (status, body, _answered) = invoke(
+            &router,
+            &browser,
+            &session_id,
+            json!({"mouseMove": {"x": 1, "y": 1}}),
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            message(&body),
+            expected,
+            "case {case:?}: expected message {expected:?}, got {:?}",
+            message(&body)
+        );
+    }
+}
+
+/// A screenshot shows the session's own screen: where its last pointer action left the
+/// pointer, and nothing where no action has been. Two screenshots of an unchanged session
+/// are the same image, and the screenshot itself changes nothing a later caller sees.
+#[tokio::test]
+async fn a_screenshot_shows_where_the_pointer_actions_left_the_pointer() {
+    let (router, engine) = emulator();
+    let session_id =
+        started_session(&router, json!({"viewPort": {"width": 400, "height": 300}})).await;
+
+    let (_status, blank, _answered) =
+        invoke(&router, SYSTEM_BROWSER, &session_id, json!({"screenshot": {}})).await;
+    let first = screenshot_image("a-session-with-no-pointer-action", &blank);
+    let (_width, _height, blank_pixels) = decoded("a-session-with-no-pointer-action", &first);
+    assert_eq!(
+        painted_samples(&blank_pixels),
+        0,
+        "case \"a-session-with-no-pointer-action\": expected nothing painted, got {} samples",
+        painted_samples(&blank_pixels)
+    );
+
+    // A screenshot REPORTS the session, so taking one twice answers with the identical
+    // image and performs nothing.
+    let (_status, again, _answered) =
+        invoke(&router, SYSTEM_BROWSER, &session_id, json!({"screenshot": {}})).await;
+    let second = screenshot_image("the-same-session-screenshotted-twice", &again);
+    assert_eq!(
+        second, first,
+        "case \"the-same-session-screenshotted-twice\": expected the same image, got {} bytes \
+         against {} bytes",
+        second.len(),
+        first.len()
+    );
+    assert_eq!(
+        actions_performed(&engine, SYSTEM_BROWSER, &session_id),
+        0,
+        "case \"the-same-session-screenshotted-twice\": a screenshot performs no action, got {}",
+        actions_performed(&engine, SYSTEM_BROWSER, &session_id)
+    );
+
+    // Rows differ along where the pointer is moved to, so what the image shows follows the
+    // session's own state rather than a fixed picture.
+    for (case, x, y) in [
+        ("pointer-moved-into-the-middle-of-the-screen", 100_usize, 120_usize),
+        ("pointer-moved-near-the-top-left", 3, 4),
+    ] {
+        let (status, moved, _answered) = invoke(
+            &router,
+            SYSTEM_BROWSER,
+            &session_id,
+            json!({"mouseMove": {"x": x, "y": y}}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {moved:?}"
+        );
+        let (_status, shot, _answered) =
+            invoke(&router, SYSTEM_BROWSER, &session_id, json!({"screenshot": {}})).await;
+        let image = screenshot_image(case, &shot);
+        let (width, _height, pixels) = decoded(case, &image);
+        let samples_per_pixel = 3_usize;
+        let tip = (y * usize::try_from(width).unwrap_or(0) + x) * samples_per_pixel;
+        assert_eq!(
+            pixels.get(tip..tip + samples_per_pixel).map(painted_samples),
+            Some(samples_per_pixel),
+            "case {case:?}: expected the pointer at ({x}, {y}), got {:?}",
+            pixels.get(tip..tip + samples_per_pixel)
+        );
+        assert_eq!(
+            pixels.get(..samples_per_pixel).map(painted_samples),
+            Some(0),
+            "case {case:?}: expected the screen's origin blank, got {:?}",
+            pixels.get(..samples_per_pixel)
+        );
+    }
+}
+
+/// `lastUpdatedAt` is the instant the session was last CHANGED: an action that was
+/// delivered moves it, and a screenshot — which only reports the screen — leaves it where
+/// it was.
+#[tokio::test]
+async fn a_delivered_action_moves_last_updated_at_and_a_screenshot_does_not() {
+    let (router, engine) = emulator();
+    let session_id = started_session(&router, json!({"viewPort": {"width": 640, "height": 480}}))
+        .await;
+    // Move the whole session back in time, so the instant an action writes is a different
+    // one however fast this host runs. The session's time-to-live is far longer, so it is
+    // still a session an action can be performed on.
+    age_session(
+        &engine,
+        SYSTEM_BROWSER,
+        &session_id,
+        Duration::from_secs(300),
+    );
+    rewind_last_updated(&engine, SYSTEM_BROWSER, &session_id, Duration::from_secs(300));
+
+    let (_status, before) = get_session(&router, SYSTEM_BROWSER, &session_id).await;
+    let started_at = text(&before, "lastUpdatedAt").to_string();
+
+    // (case, the action, whether it changes the session)
+    let cases: Vec<(&str, Value, bool)> = vec![
+        ("a-screenshot-reports-and-changes-nothing", json!({"screenshot": {}}), false),
+        (
+            "a-click-is-delivered-and-changes-the-session",
+            json!({"mouseClick": {"x": 10, "y": 10}}),
+            true,
+        ),
+    ];
+
+    for (case, action, changes) in cases {
+        let (status, body, _answered) =
+            invoke(&router, SYSTEM_BROWSER, &session_id, action).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body:?}"
+        );
+        let (_status, read) = get_session(&router, SYSTEM_BROWSER, &session_id).await;
+        let now_reported = text(&read, "lastUpdatedAt").to_string();
+        if changes {
+            let moved = DateTime::from_str(&now_reported, Format::DateTime)
+                .ok()
+                .and_then(|stamp| stamp.to_millis().ok());
+            let was = DateTime::from_str(&started_at, Format::DateTime)
+                .ok()
+                .and_then(|stamp| stamp.to_millis().ok());
+            assert!(
+                moved > was,
+                "case {case:?}: expected lastUpdatedAt past {started_at:?}, got {now_reported:?}"
+            );
+        } else {
+            assert_eq!(
+                now_reported, started_at,
+                "case {case:?}: expected lastUpdatedAt to stay {started_at:?}, got \
+                 {now_reported:?}"
+            );
+        }
+    }
+}
+
+/// Move a stored session's last-changed instant `by` further into the past, so a case can
+/// tell the instant an action writes from the one that was there before it without
+/// depending on how fast this host runs. The test reaching into the shared store, not an
+/// emulator behaviour.
+fn rewind_last_updated(
+    engine: &engine::InMemoryEngine,
+    browser: &str,
+    session_id: &str,
+    by: Duration,
+) {
+    let state = agentcore::state::service_state(engine).expect("the service state");
+    let mut store = state.lock();
+    let session = store
+        .browser_session_mut(browser, session_id)
+        .expect("the session that was just started");
+    session.last_updated_at -= by;
 }
