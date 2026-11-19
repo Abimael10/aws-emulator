@@ -26,10 +26,14 @@
 //! none either. Such a request is claimed by the query wire form it addresses
 //! ([`::service_common::query_wire_form`]) and then decided here: the form is shared by
 //! every AWS Query API, so [`addresses_query_api`] admits only a request whose `Action`
-//! and `Version` state THIS API. A request to this surface is verified under the one scheme
-//! this router can verify, SigV4, as the modelled operations are — see
-//! [`QUERY_API_AUTH_SCHEMES`] for what that means for a client signing with the Signature
-//! Version 2 this API publishes.
+//! and `Version` state THIS API.
+//!
+//! A request is authenticated under the scheme it PRESENTS. One presenting SigV4 is
+//! verified by the router, as every modelled operation of this service is
+//! ([`QUERY_API_AUTH_SCHEMES`]); one presenting the Signature Version 2 this API publishes
+//! — whose credential the router's authenticator cannot see, because it travels in the
+//! request's own parameters — is verified by [`signature_version_2`], the surface that
+//! serves it.
 //!
 //! # What is served
 //!
@@ -79,6 +83,9 @@ pub mod items;
 /// The parameters of one request, read off the form it arrived in.
 pub mod parameters;
 
+/// The Signature Version 2 this API publishes, and the surface that verifies it.
+pub mod signature_version_2;
+
 /// The API version this surface serves, as its requests name it.
 pub const API_VERSION: &str = "2009-04-15";
 
@@ -104,17 +111,10 @@ pub const UNSERVED_ACTIONS: &[&str] = &["BatchDeleteAttributes", "BatchPutAttrib
 /// modelled operation for the router to read schemes off; without this the router would
 /// find no scheme for such a request and could not verify the credential it carries.
 ///
-/// Amazon SimpleDB 2009-04-15 is itself signed with Signature Version 2, which carries the
-/// caller's credential among the request's own parameters — `AWSAccessKeyId`,
-/// `SignatureVersion=2`, `SignatureMethod`, `Timestamp` and `Signature` — and sends no
-/// `Authorization` header at all. With request authentication on, a client signing that way
-/// is refused by the router before any handler runs: `vendor/server/src/request_authentication.rs`
-/// implements SigV4 alone, an authenticator is registered on the router rather than
-/// declared by a service, and the credential store hands a service no secret to check one
-/// with, so nothing inside this crate can verify that scheme. Serving such a request would
-/// mean declaring this surface unsigned, which is not a service's choice to make. The gap
-/// is the core's to close — see this change's submission notes — and it is the only thing
-/// between a conforming Signature Version 2 client and the surface below.
+/// It is the scheme of a request that PRESENTS SigV4. Amazon SimpleDB 2009-04-15 publishes
+/// Signature Version 2, whose credential travels in the request's own parameters where no
+/// authenticator of the router can see it; such a request is served — and its signature
+/// verified — by [`signature_version_2::SignatureVersion2Surface`] instead.
 const QUERY_API_AUTH_SCHEMES: &[&str] = &[::emulator_server::aws_credentials::SIGV4_SCHEME];
 
 /// Whether `req` addresses this API: a form-encoded request naming an `Action` of this

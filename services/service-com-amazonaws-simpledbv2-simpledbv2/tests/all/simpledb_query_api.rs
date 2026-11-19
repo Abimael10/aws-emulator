@@ -1390,3 +1390,502 @@ async fn a_request_that_names_this_endpoint_reaches_this_api() {
         "case after every row: no row may have changed what the account holds"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Signature Version 2: the scheme this API publishes
+// ---------------------------------------------------------------------------
+
+/// An emulator that VERIFIES every request, as the served emulator does, so the cases
+/// below are judged by the same path a client reaches.
+fn authenticating_emulator() -> MultiServiceRouter {
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(true);
+    router.register_service(
+        ::service_com_amazonaws_simpledbv2_simpledbv2::EmulatedService::new(::std::sync::Arc::new(
+            ::engine::InMemoryEngine::new(),
+        )),
+    );
+    router
+}
+
+/// The key pair that emulator accepts: the one it publishes at start, which is what a
+/// client of it is configured with.
+fn published_credentials() -> (String, String) {
+    let published =
+        ::emulator_server::request_authentication::SigV4Authenticator::minted_credentials()
+            .expect("an authenticating emulator publishes its key pair");
+    (
+        published.access_key_id.clone(),
+        published.secret_access_key.clone(),
+    )
+}
+
+/// The host every case below addresses, and therefore signs for.
+const SIGNED_HOST: &str = "sdb.us-west-2.amazonaws.com";
+
+/// The characters Signature Version 2 leaves unescaped in the string it signs: RFC 3986's
+/// unreserved set.
+const CANONICAL_UNRESERVED: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// `parameters` signed the way Amazon SimpleDB 2009-04-15 publishes — Signature Version 2
+/// — and posted as the form body a client sends.
+///
+/// The signature is computed here the way a CLIENT computes it, from the published
+/// documentation rather than from the service's own code: the HMAC of
+/// `POST\n<host>\n/\n<parameters sorted by name, percent-encoded>`, base64-encoded, under
+/// the secret of the access key the request names.
+async fn signed_query(
+    router: &MultiServiceRouter,
+    hash: &str,
+    key_id: &str,
+    secret: &str,
+    parameters: &[(&str, &str)],
+) -> (u16, String) {
+    use ::base64::Engine as _;
+    use ::hmac::Mac as _;
+
+    let mut signed: Vec<(String, String)> = parameters
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect();
+    signed.push(("AWSAccessKeyId".to_string(), key_id.to_string()));
+    signed.push(("SignatureVersion".to_string(), "2".to_string()));
+    signed.push(("SignatureMethod".to_string(), hash.to_string()));
+    signed.push(("Timestamp".to_string(), "2026-01-01T00:00:00Z".to_string()));
+    let mut canonical = signed.clone();
+    canonical.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let encode =
+        |text: &str| ::percent_encoding::utf8_percent_encode(text, CANONICAL_UNRESERVED).to_string();
+    let query = canonical
+        .iter()
+        .map(|(name, value)| format!("{}={}", encode(name), encode(value)))
+        .collect::<Vec<String>>()
+        .join("&");
+    let string_to_sign = format!("POST\n{SIGNED_HOST}\n/\n{query}");
+    let signature = if hash == "HmacSHA1" {
+        let mut mac = <::hmac::Hmac<::sha1::Sha1> as ::hmac::Mac>::new_from_slice(secret.as_bytes())
+            .expect("HMAC takes a key of any length");
+        mac.update(string_to_sign.as_bytes());
+        ::base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    } else {
+        let mut mac =
+            <::hmac::Hmac<::sha2::Sha256> as ::hmac::Mac>::new_from_slice(secret.as_bytes())
+                .expect("HMAC takes a key of any length");
+        mac.update(string_to_sign.as_bytes());
+        ::base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    };
+    signed.push(("Signature".to_string(), signature));
+    posted_form(router, &signed).await
+}
+
+/// One `POST "/"` carrying `fields` as its form body and NO `Authorization` header — which
+/// is what a Signature Version 2 request is: its credential travels in the body.
+async fn posted_form(
+    router: &MultiServiceRouter,
+    fields: &[(String, String)],
+) -> (u16, String) {
+    let mut form = ::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in fields {
+        form.append_pair(name, value);
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", SIGNED_HOST)
+        .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+        .body(bytes::Bytes::from(form.finish()))
+        .expect("a well-formed test request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(&response.into_body()).to_string();
+    (status, body)
+}
+
+/// One row of the signature table: the credential and hash a request presents, and what
+/// the surface answers it.
+struct SignatureCase {
+    case: &'static str,
+    hash: &'static str,
+    /// Whether the request names the access key the emulator published; the other rows
+    /// name one it never minted.
+    published_key: bool,
+    /// Whether the signature is computed under that key's own secret.
+    correct_secret: bool,
+    status: u16,
+    code: &'static str,
+}
+
+/// RULE: a request to the Amazon SimpleDB 2009-04-15 API is authenticated under the scheme
+/// it presents — Signature Version 2, whose credential travels among the request's own
+/// parameters — so a request whose signature is the one its parameters sign to under the
+/// credential it names is SERVED, and one whose signature or credential is not is refused
+/// with the code AWS publishes for it.
+///
+/// The rows span what the rule generalises over: each hash that API's `SignatureMethod`
+/// publishes, a signature computed under another secret, and an access key this emulator
+/// never minted.
+#[tokio::test]
+async fn a_signature_version_2_request_is_served_when_its_own_signature_verifies() {
+    let router = authenticating_emulator();
+    let (key_id, secret) = published_credentials();
+
+    let rows = [
+        SignatureCase {
+            case: "the signature of its own parameters, hashed with SHA-256",
+            hash: "HmacSHA256",
+            published_key: true,
+            correct_secret: true,
+            status: 200,
+            code: "",
+        },
+        SignatureCase {
+            case: "the signature of its own parameters, hashed with SHA-1",
+            hash: "HmacSHA1",
+            published_key: true,
+            correct_secret: true,
+            status: 200,
+            code: "",
+        },
+        SignatureCase {
+            case: "a signature computed under another secret",
+            hash: "HmacSHA256",
+            published_key: true,
+            correct_secret: false,
+            status: 403,
+            code: "SignatureDoesNotMatch",
+        },
+        SignatureCase {
+            case: "an access key this emulator never minted",
+            hash: "HmacSHA256",
+            published_key: false,
+            correct_secret: true,
+            status: 403,
+            code: "InvalidClientTokenId",
+        },
+    ];
+    for (index, row) in rows.iter().enumerate() {
+        let domain = format!("signed-domain-{index}");
+        let presented_key = match row.published_key {
+            true => key_id.clone(),
+            false => "AKIDNEVERMINTEDBYTHIS".to_string(),
+        };
+        let presented_secret = match row.correct_secret {
+            true => secret.clone(),
+            false => format!("{secret}-not-the-secret"),
+        };
+        let (status, body) = signed_query(
+            &router,
+            row.hash,
+            &presented_key,
+            &presented_secret,
+            &[
+                ("Action", "CreateDomain"),
+                ("Version", API_VERSION),
+                ("DomainName", domain.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, row.status,
+            "case {}: expected HTTP {}, got {status} with {body}",
+            row.case, row.status
+        );
+        if row.code.is_empty() {
+            assert!(
+                body.contains(&format!("<CreateDomainResponse xmlns=\"{SDB_NAMESPACE}\">")),
+                "case {}: a verified request is served this API's own envelope, got {body}",
+                row.case
+            );
+            continue;
+        }
+        assert_eq!(
+            text_of(&body, "Code").unwrap_or_default(),
+            row.code,
+            "case {}: expected the code {} in this API's own error envelope, got {body}",
+            row.case,
+            row.code
+        );
+    }
+
+    // Only the rows whose signature verified may have written anything.
+    assert_eq!(
+        texts_of(
+            &signed_query(
+                &router,
+                "HmacSHA256",
+                &key_id,
+                &secret,
+                &[("Action", "ListDomains"), ("Version", API_VERSION)],
+            )
+            .await
+            .1,
+            "DomainName",
+        ),
+        vec!["signed-domain-0".to_string(), "signed-domain-1".to_string()],
+        "case after every row: a refused request writes nothing"
+    );
+}
+
+/// RULE: the signature covers the request's OWN parameters, whatever they carry, so a
+/// value that is not plain text — a space, a reserved character, a non-ASCII one — is
+/// served exactly when the signature it was signed into verifies, and the item written
+/// under it is read back verbatim.
+///
+/// The rows span the forms a parameter value takes on this wire; each is written and read
+/// back through the signed path alone.
+#[tokio::test]
+async fn a_signed_request_carries_its_values_through_the_signature() {
+    let router = authenticating_emulator();
+    let (key_id, secret) = published_credentials();
+    let domain = "signed.values-domain";
+    let (status, body) = signed_query(
+        &router,
+        "HmacSHA256",
+        &key_id,
+        &secret,
+        &[
+            ("Action", "CreateDomain"),
+            ("Version", API_VERSION),
+            ("DomainName", domain),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "setup: the domain must be created over the signed wire, got {status} with {body}"
+    );
+
+    let rows: &[(&str, &str, &str, &str)] = &[
+        ("plain text", "item-widget", "color", "blue"),
+        ("a value carrying spaces", "item spaced", "label", "deep sky blue"),
+        (
+            "a value carrying characters a form escapes",
+            "item+plus&amp",
+            "expression",
+            "a=b&c/d?e",
+        ),
+        ("a non-ASCII value", "item-caf\u{e9}", "name", "caf\u{e9} cr\u{e8}me"),
+    ];
+
+    for (case, item, name, value) in rows {
+        let (status, body) = signed_query(
+            &router,
+            "HmacSHA256",
+            &key_id,
+            &secret,
+            &[
+                ("Action", "PutAttributes"),
+                ("Version", API_VERSION),
+                ("DomainName", domain),
+                ("ItemName", item),
+                ("Attribute.0.Name", name),
+                ("Attribute.0.Value", value),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the signed write must be served, got {status} with {body}"
+        );
+        let (status, body) = signed_query(
+            &router,
+            "HmacSHA256",
+            &key_id,
+            &secret,
+            &[
+                ("Action", "GetAttributes"),
+                ("Version", API_VERSION),
+                ("DomainName", domain),
+                ("ItemName", item),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the signed read must be served, got {status} with {body}"
+        );
+        assert_eq!(
+            attribute_pairs(&body),
+            vec![((*name).to_string(), (*value).to_string())],
+            "case {case:?}: the pair written over the signed wire must be read back \
+             verbatim, got {body}"
+        );
+    }
+}
+
+/// One row of the unusable-credential table: the case, the fields the request carries as
+/// they stand, and the status and published code it must be refused with.
+type CredentialRefusalRow<'a> = (&'a str, &'a [(&'a str, &'a str)], u16, &'a str);
+
+/// RULE: the credential a request of this API presents is judged parameter by parameter —
+/// the signature version and hash it states, the access key it names, the signature it
+/// carries — and each way of presenting an unusable one is refused with the code and
+/// sentence AWS publishes for it, in this API's own error envelope.
+///
+/// The rows span the ways a presented credential is unusable, each written as a client
+/// writes it: the fields are posted as they stand, because what is under test is the
+/// refusal that precedes any signature check.
+#[tokio::test]
+async fn an_unusable_credential_is_refused_with_the_code_the_api_publishes() {
+    let router = authenticating_emulator();
+    let rows: &[CredentialRefusalRow<'_>] = &[
+        (
+            "a signature version this API does not publish",
+            &[
+                ("Action", "CreateDomain"),
+                ("Version", API_VERSION),
+                ("DomainName", "unusable-domain"),
+                ("SignatureVersion", "1"),
+                ("AWSAccessKeyId", "AKIDEXAMPLE"),
+                ("Signature", "abc"),
+            ],
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "a signature hash this API does not publish",
+            &[
+                ("Action", "CreateDomain"),
+                ("Version", API_VERSION),
+                ("DomainName", "unusable-domain"),
+                ("SignatureVersion", "2"),
+                ("SignatureMethod", "HmacMD5"),
+                ("AWSAccessKeyId", "AKIDEXAMPLE"),
+                ("Signature", "abc"),
+            ],
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "the scheme stated with no access key at all",
+            &[
+                ("Action", "CreateDomain"),
+                ("Version", API_VERSION),
+                ("DomainName", "unusable-domain"),
+                ("SignatureVersion", "2"),
+            ],
+            403,
+            "MissingAuthenticationToken",
+        ),
+        (
+            "an access key with no signature beside it",
+            &[
+                ("Action", "CreateDomain"),
+                ("Version", API_VERSION),
+                ("DomainName", "unusable-domain"),
+                ("SignatureVersion", "2"),
+                ("AWSAccessKeyId", "AKIDEXAMPLE"),
+            ],
+            403,
+            "IncompleteSignature",
+        ),
+    ];
+
+    for (case, fields, status, code) in rows {
+        let fields: Vec<(String, String)> = fields
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        let (answered, body) = posted_form(&router, &fields).await;
+        assert_eq!(
+            answered, *status,
+            "case {case:?}: expected HTTP {status}, got {answered} with {body}"
+        );
+        assert_eq!(
+            text_of(&body, "Code").unwrap_or_default(),
+            *code,
+            "case {case:?}: expected the code {code} in this API's own error envelope, got \
+             {body}"
+        );
+    }
+
+    // No row of this table may have created the domain it named.
+    let (key_id, secret) = published_credentials();
+    let listed = signed_query(
+        &router,
+        "HmacSHA256",
+        &key_id,
+        &secret,
+        &[("Action", "ListDomains"), ("Version", API_VERSION)],
+    )
+    .await
+    .1;
+    assert!(
+        texts_of(&listed, "DomainName").is_empty(),
+        "case after every row: a refused request writes nothing, got {listed}"
+    );
+}
+
+/// RULE: the scheme a request PRESENTS is the one it is authenticated under, so a request
+/// to this API presenting SigV4 is still verified as SigV4 by the emulator — the Signature
+/// Version 2 seam waves nothing through.
+#[tokio::test]
+async fn a_sigv4_request_to_this_api_is_still_verified_as_sigv4() {
+    let router = authenticating_emulator();
+    let mut form = ::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in [
+        ("Action", "CreateDomain"),
+        ("Version", API_VERSION),
+        ("DomainName", "sigv4-domain"),
+    ] {
+        form.append_pair(name, value);
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", SIGNED_HOST)
+        .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=AKIDSDBTEST/20260101/us-west-2/sdb/aws4_request, \
+             SignedHeaders=host, Signature=0000",
+        )
+        .header("x-amz-date", "20260101T000000Z")
+        .body(bytes::Bytes::from(form.finish()))
+        .expect("a well-formed test request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(&response.into_body()).to_string();
+    assert_eq!(
+        status, 403,
+        "case a SigV4 request signed with a credential this emulator did not mint: the \
+         router must refuse it, got {status} with {body}"
+    );
+    assert!(
+        !body.contains("<Response><Errors>"),
+        "case a SigV4 request: the Signature Version 2 seam must not have claimed it — the \
+         refusal must be the router's own, not this API's error envelope, got {body}"
+    );
+    // The codes the router's own SigV4 authenticator refuses a credential it cannot verify
+    // with (`vendor/server/src/request_authentication.rs`).
+    let sigv4_refusals = [
+        "AccessDenied",
+        "SignatureDoesNotMatch",
+        "RequestTimeTooSkewed",
+        "InvalidClientTokenId",
+    ];
+    assert!(
+        sigv4_refusals.iter().any(|code| body.contains(code)),
+        "case a SigV4 request: the refusal must name one of {sigv4_refusals:?}, got {body}"
+    );
+
+    // And nothing was created by it.
+    let (key_id, secret) = published_credentials();
+    let listed = signed_query(
+        &router,
+        "HmacSHA256",
+        &key_id,
+        &secret,
+        &[("Action", "ListDomains"), ("Version", API_VERSION)],
+    )
+    .await
+    .1;
+    assert!(
+        texts_of(&listed, "DomainName").is_empty(),
+        "case a refused SigV4 request: it must have created no domain, got {listed}"
+    );
+}

@@ -31,6 +31,20 @@ hex = { workspace = true }
 # The digest behind a minted export id / client token, and the digest of the
 # `domainName` filter a ListExports page token carries.
 sha2 = { workspace = true }
+# `aws-sdk-s3`: a domain export WRITES the exported items into the caller's bucket, which
+# it does through Amazon S3's own `PutObject` over the emulator's in-process transport
+# (`service_common::s3_client`).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# `hmac` + `sha1`: the HMAC the Signature Version 2 of the Amazon SimpleDB 2009-04-15 API
+# computes its signature with, under either hash that API's `SignatureMethod` publishes
+# (`HmacSHA1` and `HmacSHA256`, whose digest is `sha2` above).
+hmac = "0.12"
+sha1 = "0.10"
+# `base64`: that signature travels base64-encoded.
+base64 = "0.22"
+# `percent-encoding`: the canonical encoding of the parameters that signature is computed
+# over.
+percent-encoding = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

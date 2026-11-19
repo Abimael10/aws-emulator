@@ -2,9 +2,11 @@
 
 //! @op StartDomainExport
 //! Implements the start of the domain-export lifecycle: it MINTS one export record,
-//! persists it, and answers from that record. `GetExport` and `ListExports` read the
-//! same store. A `domainName` the account's domain registry does not hold is refused
-//! with the modelled `NoSuchDomainException` before anything is minted.
+//! persists it, WRITES the exported domain's items into the bucket the request named
+//! (`crate::state::domain_export_run`), and answers from that record. `GetExport` and
+//! `ListExports` read the same store. A `domainName` the account's domain registry does
+//! not hold is refused with the modelled `NoSuchDomainException` before anything is
+//! minted.
 //!
 //! ## Shape of an operation
 //!
@@ -237,120 +239,182 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut store = state.lock();
-        // Status moves this call is about to report alongside are owed on the clock,
-        // not on the call, so settle before reading anything back.
-        store.settle_all(now);
-
-        // `domainName` names the domain to export, so it is RESOLVED against the
-        // account's domain registry before an id is minted or anything is stored — the
-        // request's own parameter values are checked first (above), then the resource
-        // it names. The registry holds the domains the operator declared and the domain
-        // of every stored export (see `crate::state::EXISTING_DOMAINS_ENV`): no
-        // operation of this service creates a SimpleDB domain, so an account nobody
-        // declared one for holds none and every start is refused here, exactly as the
-        // real service refuses a start naming a domain the account does not hold.
-        if !store.has_domain(&input.domain_name) {
-            audit(ctx, "refused-no-such-domain", None);
-            return Err(StartDomainExportErrorModeled::NoSuchDomainException(
-                NoSuchDomainException {
-                    message: crate::state::refusal_message::no_such_resource(
-                        crate::state::refusal_message::DOMAIN_RESOURCE,
-                    ),
-                },
+        // And the rule the object keys composed from it impose on `s3KeyPrefix`, which the
+        // model leaves unconstrained beyond its length: the export WRITES those keys, so a
+        // prefix an object key cannot carry, or one that would compose a key outside the
+        // prefix the caller asked for, is refused here — before anything is minted, stored
+        // or written.
+        if let Some(why) = input
+            .s3_key_prefix
+            .as_deref()
+            .and_then(crate::state::s3_key_prefix_rejection)
+        {
+            audit(ctx, "refused-invalid-parameter-value", None);
+            return Err(StartDomainExportErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException { message: why },
             )
             .into());
         }
 
-        // `clientToken` carries `@idempotencyToken`, so an SDK fills it in; a request
-        // that reaches here without one still needs the token the output requires, so
-        // the service mints it. It is stored on the record and read back out of it,
-        // never re-derived.
-        let client_token = match input.client_token {
-            Some(token) => token,
-            None => store.fresh_id(),
-        };
+        // Everything the store decides is decided inside this block, so its guard is
+        // released before the in-process write below: no lock is ever held across an
+        // await. The block answers what that write needs — where the export writes, the
+        // objects it writes there, and the record to report the outcome against.
+        let (output, destination, objects, export_arn) = {
+            let mut store = state.lock();
+            // Status moves this call is about to report alongside are owed on the clock,
+            // not on the call, so settle before reading anything back.
+            store.settle_all(now);
 
-        // Idempotency: inside the token's 8-hour window the same token names the same
-        // export. Identical parameters replay that export's own `exportArn` and
-        // `requestedAt`; changed parameters are the `ConflictException` the member's
-        // documentation describes.
-        if let Some(existing) = store.export_for_client_token(&client_token, now) {
-            if existing.started_with(
-                &input.domain_name,
-                &input.s3_bucket,
-                input.s3_key_prefix.as_deref(),
-                input.s3_sse_algorithm.as_deref(),
-                input.s3_sse_kms_key_id.as_deref(),
-                input.s3_bucket_owner.as_deref(),
-            ) {
-                let replayed = StartDomainExportOutput {
-                    client_token: existing.client_token.clone(),
-                    export_arn: existing.export_arn.clone(),
-                    requested_at: ::aws_smithy_types::DateTime::from(existing.requested_at),
-                };
-                audit(ctx, "replayed", Some(&replayed.export_arn));
-                return Ok(replayed);
+            // `domainName` names the domain to export, so it is RESOLVED against the
+            // account's domain registry before an id is minted or anything is stored — the
+            // request's own parameter values are checked first (above), then the resource
+            // it names. The registry holds the domains the operator declared and the domain
+            // of every stored export (see `crate::state::EXISTING_DOMAINS_ENV`): no
+            // modelled operation of this service creates a SimpleDB domain (that is the
+            // 2009-04-15 `CreateDomain` this endpoint also serves), so an account nobody
+            // declared one for holds none and every start is refused here, exactly as the
+            // real service refuses a start naming a domain the account does not hold.
+            if !store.has_domain(&input.domain_name) {
+                audit(ctx, "refused-no-such-domain", None);
+                return Err(StartDomainExportErrorModeled::NoSuchDomainException(
+                    NoSuchDomainException {
+                        message: crate::state::refusal_message::no_such_resource(
+                            crate::state::refusal_message::DOMAIN_RESOURCE,
+                        ),
+                    },
+                )
+                .into());
             }
-            audit(ctx, "refused-conflict", Some(&existing.export_arn));
-            return Err(StartDomainExportErrorModeled::ConflictException(
-                ConflictException {
-                    message: crate::state::refusal_message::CONFLICT_MESSAGE.to_string(),
-                },
-            )
-            .into());
+
+            // `clientToken` carries `@idempotencyToken`, so an SDK fills it in; a request
+            // that reaches here without one still needs the token the output requires, so
+            // the service mints it. It is stored on the record and read back out of it,
+            // never re-derived.
+            let client_token = match input.client_token {
+                Some(token) => token,
+                None => store.fresh_id(),
+            };
+
+            // Idempotency: inside the token's 8-hour window the same token names the same
+            // export. Identical parameters replay that export's own `exportArn` and
+            // `requestedAt`; changed parameters are the `ConflictException` the member's
+            // documentation describes.
+            if let Some(existing) = store.export_for_client_token(&client_token, now) {
+                if existing.started_with(
+                    &input.domain_name,
+                    &input.s3_bucket,
+                    input.s3_key_prefix.as_deref(),
+                    input.s3_sse_algorithm.as_deref(),
+                    input.s3_sse_kms_key_id.as_deref(),
+                    input.s3_bucket_owner.as_deref(),
+                ) {
+                    let replayed = StartDomainExportOutput {
+                        client_token: existing.client_token.clone(),
+                        export_arn: existing.export_arn.clone(),
+                        requested_at: ::aws_smithy_types::DateTime::from(existing.requested_at),
+                    };
+                    audit(ctx, "replayed", Some(&replayed.export_arn));
+                    return Ok(replayed);
+                }
+                audit(ctx, "refused-conflict", Some(&existing.export_arn));
+                return Err(StartDomainExportErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::refusal_message::CONFLICT_MESSAGE.to_string(),
+                    },
+                )
+                .into());
+            }
+
+            let export_id = store.fresh_id();
+            debug_assert_eq!(
+                export_id.len(),
+                crate::state::UUID_LEN,
+                "domain_name_rejection sizes the ARN from this id length"
+            );
+            let record = crate::state::StoredExport {
+                export_arn: crate::state::export_arn(&region, &input.domain_name, &export_id),
+                export_id,
+                client_token,
+                domain_name: input.domain_name,
+                export_status: crate::state::STATUS_PENDING.to_string(),
+                requested_at: now,
+                s3_bucket: input.s3_bucket,
+                s3_key_prefix: input.s3_key_prefix,
+                s3_sse_algorithm: input.s3_sse_algorithm,
+                s3_sse_kms_key_id: input.s3_sse_kms_key_id,
+                s3_bucket_owner: input.s3_bucket_owner,
+                export_manifest: None,
+                items_count: None,
+                export_data_cutoff_time: None,
+                failure_code: None,
+                failure_message: None,
+                in_progress_due_at: now
+                    .checked_add(crate::state::IN_PROGRESS_SPAN)
+                    .unwrap_or(now),
+                succeeded_due_at: now
+                    .checked_add(crate::state::SUCCEEDED_SPAN)
+                    .unwrap_or(now),
+            };
+
+            // The response is read off the very record about to be stored, so the three
+            // members this operation returns can only ever be what `GetExport` will report.
+            let output = StartDomainExportOutput {
+                client_token: record.client_token.clone(),
+                export_arn: record.export_arn.clone(),
+                requested_at: ::aws_smithy_types::DateTime::from(record.requested_at),
+            };
+
+            // The RUN this start initiates: "initiates the export of a SimpleDB domain to
+            // an S3 bucket", so the items the domain holds are serialized here — off that
+            // domain's own record, while the store is locked — and written into the bucket
+            // after the guard is released (`crate::state::domain_export_run`). Nothing is
+            // slept for: the export's STATUS moves on the clock as before, while its data
+            // is in the bucket from the moment the start that asked for it has answered.
+            let destination = crate::state::domain_export_run::ExportDestination::of(&record);
+            let objects = store
+                .domain(&record.domain_name)
+                .map(|domain| crate::state::domain_export_run::export_objects(&record, domain))
+                .unwrap_or_default();
+            let export_arn = record.export_arn.clone();
+
+            // The store is finite and enforces its own ceiling: a start that would take it
+            // past that ceiling stores nothing and is refused the way the service refuses
+            // one past its export quota.
+            if !store.insert_export(record) {
+                audit(ctx, "refused-quota-exceeded", None);
+                return Err(StartDomainExportErrorModeled::NumberExportsLimitExceeded(
+                    NumberExportsLimitExceeded {
+                        message: crate::state::refusal_message::EXPORTS_LIMIT_MESSAGE.to_string(),
+                    },
+                )
+                .into());
+            }
+            (output, destination, objects, export_arn)
+        };
+
+        let refused =
+            crate::state::domain_export_run::run_export(ctx, &region, &destination, &objects)
+                .await;
+        // The export's own status spans are counted from HERE, the instant this call is
+        // done with it: they are what it spends being processed, so a caller reading the
+        // export straight after this call always observes it in its non-terminal status,
+        // however long the write above took (`crate::state::count_export_moves_from`).
+        {
+            let mut store = state.lock();
+            store.count_export_moves_from(&export_arn, ::std::time::SystemTime::now());
+            if let Some(failure) = &refused {
+                // The object store answered that this export's data cannot be written
+                // where it was pointed, so the record carries that answer and the terminal
+                // status the clock owes it is `FAILED`. The start itself still succeeded —
+                // the export was accepted, and its outcome is what `GetExport` reports —
+                // which is why this is not one of the modelled refusals above.
+                store.record_export_failure(&export_arn, failure);
+            }
         }
-
-        let export_id = store.fresh_id();
-        debug_assert_eq!(
-            export_id.len(),
-            crate::state::UUID_LEN,
-            "domain_name_rejection sizes the ARN from this id length"
-        );
-        let record = crate::state::StoredExport {
-            export_arn: crate::state::export_arn(&region, &input.domain_name, &export_id),
-            export_id,
-            client_token,
-            domain_name: input.domain_name,
-            export_status: crate::state::STATUS_PENDING.to_string(),
-            requested_at: now,
-            s3_bucket: input.s3_bucket,
-            s3_key_prefix: input.s3_key_prefix,
-            s3_sse_algorithm: input.s3_sse_algorithm,
-            s3_sse_kms_key_id: input.s3_sse_kms_key_id,
-            s3_bucket_owner: input.s3_bucket_owner,
-            export_manifest: None,
-            items_count: None,
-            export_data_cutoff_time: None,
-            failure_code: None,
-            failure_message: None,
-            in_progress_due_at: now
-                .checked_add(crate::state::IN_PROGRESS_SPAN)
-                .unwrap_or(now),
-            succeeded_due_at: now
-                .checked_add(crate::state::SUCCEEDED_SPAN)
-                .unwrap_or(now),
-        };
-
-        // The response is read off the very record about to be stored, so the three
-        // members this operation returns can only ever be what `GetExport` will report.
-        let output = StartDomainExportOutput {
-            client_token: record.client_token.clone(),
-            export_arn: record.export_arn.clone(),
-            requested_at: ::aws_smithy_types::DateTime::from(record.requested_at),
-        };
-
-        // The store is finite and enforces its own ceiling: a start that would take it
-        // past that ceiling stores nothing and is refused the way the service refuses
-        // one past its export quota.
-        if !store.insert_export(record) {
-            audit(ctx, "refused-quota-exceeded", None);
-            return Err(StartDomainExportErrorModeled::NumberExportsLimitExceeded(
-                NumberExportsLimitExceeded {
-                    message: crate::state::refusal_message::EXPORTS_LIMIT_MESSAGE.to_string(),
-                },
-            )
-            .into());
+        if refused.is_some() {
+            audit(ctx, "write-refused", Some(&export_arn));
+            return Ok(output);
         }
 
         audit(ctx, "created", Some(&output.export_arn));

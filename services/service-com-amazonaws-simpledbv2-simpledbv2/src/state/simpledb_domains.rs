@@ -108,6 +108,15 @@ impl Domain {
         self.items.get(item_name)
     }
 
+    /// Every item this domain holds, in name order, each with the attributes it holds —
+    /// what an export of this domain serializes into the bucket it was pointed at
+    /// ([`crate::state::domain_export_run`]).
+    pub fn items(&self) -> impl Iterator<Item = (&str, &ItemAttributes)> + '_ {
+        self.items
+            .iter()
+            .map(|(name, attributes)| (name.as_str(), attributes))
+    }
+
     /// Every attribute NAME this domain uses, each once — the `AttributeNameCount` of its
     /// metadata is how many there are.
     pub fn attribute_names(&self) -> BTreeSet<&str> {

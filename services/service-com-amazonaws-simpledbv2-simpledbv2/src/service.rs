@@ -54,7 +54,8 @@
 //! in the form-encoded body rather than in an `Authorization` header, and a client pointed
 //! at this emulator reaches it on a loopback address. `can_handle` below therefore claims
 //! the query wire form itself when a request names no service, and `override_operation`
-//! decides from the body whether the request is this API's.
+//! decides from the body whether the request is this API's — and, for one that is, which
+//! signature scheme it presents, because that decides which seam verifies its credential.
 
 /// The Amazon SimpleDB 2009-04-15 AWS Query API this endpoint serves beside the
 /// modelled export operations.
@@ -77,6 +78,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// of its own operations, and it owns the shared engine, so the domains and items it
     /// writes are the ones the modelled export operations read.
     sdb_query_api: sdb_query_api::SimpleDbQueryApi<Eng>,
+    /// The same API as served to a client signing it with the Signature Version 2 that API
+    /// publishes, whose credential the router's own authenticator cannot see: that surface
+    /// verifies the signature itself. It is built over the SAME shared engine, so both
+    /// seams answer from one store.
+    sdb_query_api_signature_version_2:
+        sdb_query_api::signature_version_2::SignatureVersion2Surface<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -86,6 +93,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             sdb_query_api: sdb_query_api::SimpleDbQueryApi::new(Arc::clone(&engine)),
+            sdb_query_api_signature_version_2:
+                sdb_query_api::signature_version_2::SignatureVersion2Surface::new(Arc::clone(
+                    &engine,
+                )),
             entry: crate::ServiceDefinition::new(engine),
         }
     }
@@ -138,9 +149,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // states the API it is for.
         //
         // Naming it an operation is also what has the router verify the caller's
-        // credential before anything is served, under the scheme
-        // `sdb_query_api::QUERY_API_AUTH_SCHEMES` states.
+        // credential before anything is served, under the scheme the surface it is handed
+        // declares. A request of this API is authenticated under the scheme it PRESENTS:
+        // one presenting SigV4 in its `Authorization` header is verified by the router, as
+        // every modelled operation of this service is, and one presenting a credential of
+        // its OWN — among its parameters, which is where the Signature Version 2 this API
+        // publishes carries one, and where no authenticator of the router can see it — is
+        // served by the surface that verifies that signature itself
+        // (`sdb_query_api::signature_version_2`).
         if sdb_query_api::addresses_query_api(req) {
+            if sdb_query_api::signature_version_2::presents_its_own_credential(req) {
+                return Some(&self.sdb_query_api_signature_version_2);
+            }
             return Some(&self.sdb_query_api);
         }
         None

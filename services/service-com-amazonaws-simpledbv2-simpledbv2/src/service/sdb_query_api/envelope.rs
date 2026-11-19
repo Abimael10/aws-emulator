@@ -134,6 +134,54 @@ pub fn no_such_version(version: &str) -> QueryApiError {
     }
 }
 
+/// The status a refusal about the caller's CREDENTIAL carries, as AWS answers one.
+const FORBIDDEN_STATUS: u16 = 403;
+
+/// The refusal for a request that carries no credential for this API to authenticate it
+/// by.
+///
+/// The code and the sentence AWS publishes for it among the errors common to every AWS
+/// Query API.
+pub fn missing_authentication_token() -> QueryApiError {
+    QueryApiError {
+        status: FORBIDDEN_STATUS,
+        code: "MissingAuthenticationToken",
+        message: "The request must contain either a valid (registered) AWS access key ID \
+                  or X.509 certificate."
+            .to_string(),
+    }
+}
+
+/// The refusal for a credential that carries no signature this API can read.
+pub fn incomplete_signature() -> QueryApiError {
+    QueryApiError {
+        status: FORBIDDEN_STATUS,
+        code: "IncompleteSignature",
+        message: "The request signature does not conform to AWS standards.".to_string(),
+    }
+}
+
+/// The refusal for an `AWSAccessKeyId` naming no credential this emulator holds.
+pub fn invalid_client_token_id() -> QueryApiError {
+    QueryApiError {
+        status: FORBIDDEN_STATUS,
+        code: "InvalidClientTokenId",
+        message: "The AWS Access Key Id you provided does not exist in our records."
+            .to_string(),
+    }
+}
+
+/// The refusal for a signature that is not the one the request's own parameters sign to.
+pub fn signature_does_not_match() -> QueryApiError {
+    QueryApiError {
+        status: FORBIDDEN_STATUS,
+        code: "SignatureDoesNotMatch",
+        message: "The request signature we calculated does not match the signature you \
+                  provided. Check your AWS Secret Access Key and signing method."
+            .to_string(),
+    }
+}
+
 /// The refusal for a required parameter the request left out, worded as the API words it:
 /// the parameter the request must contain.
 pub fn missing_parameter(parameter: &str) -> QueryApiError {

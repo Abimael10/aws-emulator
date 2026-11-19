@@ -28,6 +28,9 @@ pub mod refusal_message;
 /// writes.
 pub mod simpledb_domains;
 
+/// What an export RUNS: the objects it writes into the bucket it was pointed at.
+pub mod domain_export_run;
+
 use simpledb_domains::Domain;
 
 /// The ARN namespace, endpoint prefix and sigv4 signing name of this service — all
@@ -71,6 +74,8 @@ pub const STATUS_PENDING: &str = "PENDING";
 pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// The terminal `ExportStatus` of an export that ran: "export completed successfully".
 pub const STATUS_SUCCEEDED: &str = "SUCCEEDED";
+/// The terminal `ExportStatus` of an export that did not: "export encountered an error".
+pub const STATUS_FAILED: &str = "FAILED";
 
 /// How long after `StartDomainExport` the clock owes the export its move out of
 /// `PENDING` and into `IN_PROGRESS`.
@@ -151,15 +156,15 @@ pub struct StoredExport {
     pub items_count: Option<i64>,
     /// Set when the export reaches `SUCCEEDED`.
     pub export_data_cutoff_time: Option<SystemTime>,
-    /// Set only when the export reaches `FAILED`, which nothing in this emulator
-    /// drives an export to: no modelled operation can fail a running export, so the
-    /// honest answer for both failure members is absent.
+    /// Set when the export reaches `FAILED`: the Amazon S3 answer its own run was
+    /// refused with ([`domain_export_run`]). An export whose data was written has no
+    /// failure to report, so the honest answer for both failure members is absent.
     pub failure_code: Option<String>,
     /// See [`Self::failure_code`].
     pub failure_message: Option<String>,
     /// Instant the move `PENDING` -> `IN_PROGRESS` comes due.
     pub in_progress_due_at: SystemTime,
-    /// Instant the move `IN_PROGRESS` -> `SUCCEEDED` comes due.
+    /// Instant the move `IN_PROGRESS` -> its terminal status comes due.
     pub succeeded_due_at: SystemTime,
 }
 
@@ -175,6 +180,15 @@ impl StoredExport {
             self.export_status = STATUS_IN_PROGRESS.to_string();
         }
         if self.export_status == STATUS_IN_PROGRESS && now >= self.succeeded_due_at {
+            // The export's own run — the write of this domain's items into the bucket the
+            // start named ([`domain_export_run`]) — is what decides WHICH terminal status
+            // the clock owes: a run the object store refused leaves the failure it was
+            // refused with on the record, and an export that could not write its data
+            // encountered an error rather than completing successfully.
+            if self.failure_code.is_some() {
+                self.export_status = STATUS_FAILED.to_string();
+                return;
+            }
             self.export_status = STATUS_SUCCEEDED.to_string();
             self.export_manifest = Some(self.manifest_key());
             // The number of SimpleDB items the exported domain holds, counted off that
@@ -196,10 +210,10 @@ impl StoredExport {
     /// export's id, and the summary file name. Those are the only inputs the service
     /// has for it.
     ///
-    /// It is the key the export WOULD write; this emulator stores no S3 object for it,
-    /// so a caller that goes on to `HeadObject` that key against an S3 emulator will
-    /// not find it.
-    fn manifest_key(&self) -> String {
+    /// It is the key the export's own run WRITES the manifest to
+    /// ([`domain_export_run::export_objects`]), so an `exportManifest` a finished export
+    /// reports names an object a caller of the bucket fetches.
+    pub fn manifest_key(&self) -> String {
         format!(
             "{}{}/{MANIFEST_SUMMARY_FILE}",
             self.s3_key_prefix.as_deref().unwrap_or(""),
@@ -455,6 +469,49 @@ impl ComAmazonawsSimpledbv2Simpledbv2State {
         self.exports.insert(export.export_arn.clone(), export);
         true
     }
+
+    /// Count the status moves the export `export_arn` is owed from `from`, the instant its
+    /// start FINISHED accepting it.
+    ///
+    /// The spans are what the export spends being processed, so they run from the moment
+    /// the call that asked for it is done — and that is what keeps the guarantee they exist
+    /// for: a caller reading the export straight after the start always observes the
+    /// non-terminal status, however long the start's own work (writing the data into the
+    /// bucket, [`domain_export_run`]) took on the machine it ran on. Counted from the
+    /// instant the request arrived instead, a slow write could hand back an export whose
+    /// `PENDING` window had already passed.
+    ///
+    /// Only an export still in its first status is rescheduled, so nothing can reopen a
+    /// move that has already been materialised, and an ARN this store holds no record under
+    /// reschedules nothing.
+    pub fn count_export_moves_from(&mut self, export_arn: &str, from: SystemTime) {
+        let Some(export) = self.exports.get_mut(export_arn) else {
+            return;
+        };
+        if export.export_status != STATUS_PENDING {
+            return;
+        }
+        export.in_progress_due_at = from.checked_add(IN_PROGRESS_SPAN).unwrap_or(from);
+        export.succeeded_due_at = from.checked_add(SUCCEEDED_SPAN).unwrap_or(from);
+    }
+
+    /// Record that the export `export_arn`'s own run could not write its data, with the
+    /// answer the object store refused that write with.
+    ///
+    /// It is what makes the terminal status the clock owes that export `FAILED` rather
+    /// than `SUCCEEDED` ([`StoredExport::settle`]), and what `GetExport` reports as the
+    /// export's `failureCode` and `failureMessage`. An ARN this store holds no record
+    /// under records nothing.
+    pub fn record_export_failure(
+        &mut self,
+        export_arn: &str,
+        failure: &domain_export_run::ExportFailure,
+    ) {
+        if let Some(export) = self.exports.get_mut(export_arn) {
+            export.failure_code = Some(failure.code.clone());
+            export.failure_message = Some(failure.message.clone());
+        }
+    }
 }
 
 /// Whether `candidate` is a well-formed ARN naming an export of this service.
@@ -536,6 +593,50 @@ pub fn domain_name_rejection(region: &str, domain_name: &str) -> Option<String> 
 
 /// The modelled member a [`domain_name_rejection`] faults, as the model names it.
 const DOMAIN_NAME_MEMBER: &str = "domainName";
+
+/// Why an `s3KeyPrefix` cannot be used to compose the export's object keys — the
+/// `message` of the refusal it earns — or `None` when it can.
+///
+/// `S3KeyPrefix` carries only `@length(1, 850)`, so the centralized walk admits any text;
+/// the rule enforced here is the one the KEYS composed from it impose. The prefix is "the
+/// prefix string to be used to generate the S3 object keys for export artifacts", and the
+/// export writes those keys ([`domain_export_run`]), so it has to be text an object key
+/// can carry and has to leave the keys inside the export's own key space:
+///
+/// * an ASCII control character cannot travel in an object key at all — the key is bound
+///   to the request URI of the write that stores it;
+/// * a prefix that is absolute, or that navigates with a `..` element, composes a key
+///   addressing an artifact somewhere other than under the prefix the caller asked for.
+///
+/// Every other character an object key admits is admitted here, so a prefix carrying
+/// separators, dots, spaces or non-ASCII text — all of which Amazon S3 holds objects
+/// under — is accepted. The refusal is stated as the service states an invalid parameter
+/// ([`refusal_message::invalid_parameter_value`]), which names the parameter and its
+/// requirement and echoes nothing the caller sent.
+pub fn s3_key_prefix_rejection(s3_key_prefix: &str) -> Option<String> {
+    let navigates = s3_key_prefix.starts_with('/')
+        || s3_key_prefix
+            .split('/')
+            .any(|element| element == ".." || element == ".");
+    let unusable = s3_key_prefix.chars().any(char::is_control);
+    (navigates || unusable).then(|| {
+        refusal_message::invalid_parameter_value(
+            S3_KEY_PREFIX_MEMBER,
+            S3_KEY_PREFIX_REQUIREMENT,
+        )
+    })
+}
+
+/// The modelled member an [`s3_key_prefix_rejection`] faults, as the model names it.
+const S3_KEY_PREFIX_MEMBER: &str = "s3KeyPrefix";
+
+/// The requirement an `s3KeyPrefix` has to meet for the keys composed from it to name the
+/// export's own artifacts. Stated as the forms it may not take rather than as the one the
+/// request carried.
+const S3_KEY_PREFIX_REQUIREMENT: &str =
+    "be a relative object-key prefix: free of ASCII control characters, which an object \
+     key cannot carry, and of a leading '/' or a '.' or '..' path element, each of which \
+     would compose a key outside the prefix the export was asked for";
 
 /// The requirement a `domainName` has to meet for the minted `exportArn` to name the
 /// export and nothing else. Stated as the characters it may not carry rather than as

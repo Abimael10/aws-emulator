@@ -52,6 +52,15 @@ impl QueryParameters {
         }
     }
 
+    /// EVERY decoded field, in the order it arrived — what a reader has to see when the
+    /// whole parameter set is the subject rather than one named parameter, which is the
+    /// case for the Signature Version 2 signature the 2009-04-15 API publishes: that
+    /// signature is computed over all of a request's own parameters
+    /// ([`super::signature_version_2`]).
+    pub fn fields(&self) -> &[(String, String)] {
+        &self.fields
+    }
+
     /// The value of `name`, or `None` when the request carries no such parameter.
     ///
     /// The FIRST occurrence decides: a parameter sent twice is one parameter with one

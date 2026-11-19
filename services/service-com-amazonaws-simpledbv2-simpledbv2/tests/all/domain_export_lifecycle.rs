@@ -1221,3 +1221,85 @@ async fn a_start_past_the_store_ceiling_is_refused() {
         "case a full store: a refused start must store nothing, got {listed:?}"
     );
 }
+
+/// `s3KeyPrefix` is the text every object key the export writes is composed from, so a
+/// prefix an object key cannot carry — or one that would compose a key outside the prefix
+/// the caller asked for — is refused rather than written, while every prefix Amazon S3
+/// does hold objects under is accepted and is the prefix the export's own manifest key
+/// carries.
+///
+/// The rows span the forms a prefix takes: the ones object keys admit (a trailing
+/// separator, a nested path, dots inside a name, spaces, non-ASCII text, no prefix at all)
+/// and the ones they do not (a leading separator, a `.` or `..` element, a control
+/// character).
+#[tokio::test]
+async fn a_key_prefix_the_export_cannot_compose_its_keys_from_is_refused() {
+    let router = emulator_with_domains(&["prefixed"]);
+
+    let accepted: &[(&str, Option<&str>)] = &[
+        ("no prefix at all", None),
+        ("a prefix ending in a separator", Some("exports/")),
+        ("a nested prefix", Some("exports/2026/q1/")),
+        ("a prefix that is a bare name", Some("exports")),
+        ("dots inside a name", Some("exports/a..b/")),
+        ("a space", Some("my exports/")),
+        ("non-ASCII text", Some("exportés/")),
+    ];
+    let mut minted: Vec<String> = Vec::new();
+    for (case, prefix) in accepted {
+        let mut request = json!({ "domainName": "prefixed", "s3Bucket": "prefix-bucket" });
+        if let Some(prefix) = prefix {
+            request["s3KeyPrefix"] = json!(prefix);
+        }
+        let started = ok_call(&router, "StartDomainExport", &request).await;
+        let arn = member(&started, "exportArn")
+            .unwrap_or_else(|| panic!("case {case:?}: the start must mint an ARN, got {started:?}"));
+        let fetched = ok_call(&router, "GetExport", &json!({ "exportArn": arn })).await;
+        assert_eq!(
+            member(&fetched, "s3KeyPrefix").as_deref(),
+            *prefix,
+            "case {case:?}: the stored prefix must be the one the start named, got {fetched:?}"
+        );
+        minted.push(arn);
+    }
+
+    let refused: &[(&str, &str)] = &[
+        ("a leading separator", "/exports/"),
+        ("a parent-directory element", "exports/../elsewhere/"),
+        ("a current-directory element", "exports/./here/"),
+        ("a bare parent-directory element", ".."),
+        ("a carriage return", "exports/cr\rinjected/"),
+        ("a line feed", "exports/lf\ninjected/"),
+        ("a NUL", "exports/nul\0injected/"),
+    ];
+    for (case, prefix) in refused {
+        let (status, body) = call(
+            &router,
+            "StartDomainExport",
+            &json!({
+                "domainName": "prefixed",
+                "s3Bucket": "prefix-bucket",
+                "s3KeyPrefix": prefix,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {body:?}"
+        );
+    }
+
+    // Only the accepted rows reached the store: a refused start mints and writes nothing.
+    let listed = ok_call(&router, "ListExports", &json!({ "domainName": "prefixed" })).await;
+    assert_eq!(
+        summary_arns(&listed),
+        minted,
+        "case after every row: only the accepted prefixes may have stored a record, got \
+         {listed:?}"
+    );
+}
