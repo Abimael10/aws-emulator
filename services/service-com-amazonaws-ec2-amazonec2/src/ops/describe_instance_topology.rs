@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceTopology
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceTopology`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports where each instance [`crate::state`] holds in the Region the request
+//! was signed for sits in the Amazon Web Services network — the instance's placement and the
+//! PATH THROUGH THE TOPOLOGY TREE the host it runs on hangs off — narrowed by the instance
+//! ids, the placement group names and the documented filters the request names, and paged.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceTopology::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Instance topology is supported for specific instance types only", so the report covers
+//! the instances whose type has a topology at all
+//! ([`crate::state::instance_type_supports_topology`]) and leaves every other instance out
+//! rather than reporting an empty row for it.
+//!
+//! Reporting a topology writes NOTHING of its own: every member is derived from where the
+//! store already has the instance placed, so two reads answer the same nodes. The one write
+//! is the clock's — an instance whose launch has settled is `running`, and that move was owed
+//! at that instant whether or not anybody called — which is what makes a path appear for an
+//! instance that has finished launching, since "the value is null or empty if … the instance
+//! is in a state other than `running`" (`InstanceTopology$NetworkNodes`).
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +172,385 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceTopology` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceTopologyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceTopology"))
+        use ::std::collections::HashSet;
+
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            decode_page_token, described_placement_group_unknown, instance_region,
+            instance_type_supports_topology, invalid_pagination_token_for, page_from_cursor,
+            request_region, require_service_state, CompiledFilter, MatchBudget, PageTokenRule,
+            MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+            UNNAMED_FILTER,
+        };
+
+        // An instance's topology is where it sits "within an Availability Zone or Local Zone",
+        // and EC2 is reached through a REGIONAL endpoint, so the instances this request can
+        // report are the ones of the Region its SigV4 credential scope names — the same
+        // narrowing every other reader of an instance applies.
+        let region = request_region(ctx.parts());
+
+        // "Constraints: Maximum 100 explicitly specified instance IDs" (`$InstanceIds`).
+        let requested_ids: &[String] = input.instance_ids.as_deref().unwrap_or_default();
+        if requested_ids.len() > MAX_TOPOLOGY_INSTANCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceIds carries {} ids, above the maximum of {MAX_TOPOLOGY_INSTANCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+        // "Constraints: Maximum 100 explicitly specified placement group names"
+        // (`$GroupNames`), the same bound on the other selection list.
+        let requested_groups: &[String] = input.group_names.as_deref().unwrap_or_default();
+        if requested_groups.len() > MAX_TOPOLOGY_GROUP_NAMES {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "GroupNames carries {} names, above the maximum of {MAX_TOPOLOGY_GROUP_NAMES}",
+                requested_groups.len()
+            )));
+        }
+        // "You can't specify this parameter and the instance IDs parameter in the same
+        // request" (`$MaxResults`): a page size over a list the request already bounds names
+        // two different answers, so it is refused rather than one of them being picked —
+        // through the one template this service words that pair with
+        // ([`crate::state::parameters_cannot_be_combined`]), which names the id SELECTION
+        // first and the page size second, each spelled the way THIS operation's wire form
+        // spells it.
+        if input.max_results.is_some() && !requested_ids.is_empty() {
+            return Err(crate::state::parameters_cannot_be_combined(
+                "instanceId",
+                "maxResults",
+            ));
+        }
+
+        // Matching cost is filters x values x held values x stored instances and the model
+        // bounds none of them, so the request-controlled factors are capped here, before any
+        // work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // instance would have matched it, so an unsupported filter can never read as "no
+        // results" — and an entry naming NO filter is reported by the name EC2 has for an
+        // absent one.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or(UNNAMED_FILTER);
+            if !INSTANCE_TOPOLOGY_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token returned from a previous paginated request" — anything else is refused
+        // rather than read as a position, and it is refused before the store is read at all,
+        // so a bogus token is caught whatever the store happens to hold.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        // "The instance IDs. Default: Describes all your instances" (`$InstanceIds`): the ids
+        // are a SELECTION of the instances this report covers rather than a resolution of
+        // them. An id this operation cannot READ as an instance id is refused — there is
+        // nothing to select with — but one it can read and the account holds no instance for
+        // contributes no row and no refusal, which is what the recorded contract for this
+        // operation answers for a long-form id of the issued form that names no instance. An
+        // instance of another Region, or one whose type has no topology, is left out the same
+        // way, since neither has a topology this endpoint reports. Read before the store is
+        // locked, the form being a fact of the value alone.
+        for instance_id in requested_ids {
+            if !crate::state::instance_id_is_well_formed(instance_id) {
+                return Err(Scaffolded::invalid_instance_id_malformed(instance_id));
+            }
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Which host an instance sits on is a question about the CURRENT state, so the
+        // transitions the clock already owed are materialised before it is read: an instance
+        // whose launch settled a moment ago is running and has a path to report, and that
+        // move was due at that instant whether or not anybody called. This is the only write
+        // this reporting operation causes, and it is the clock's.
+        store.materialize_due_transitions();
+
+        // "The name of the placement group that each instance is in" (`$GroupNames`): a name
+        // the account holds no placement group for is refused too, with the spelling the
+        // REPORTING calls of this service answer an unknown group with — selecting nothing
+        // for it would read as "no instance is in that group" when the group does not exist
+        // at all.
+        if !requested_groups.is_empty() {
+            // The names the store holds, collected ONCE rather than rescanned per name.
+            let stored_groups: HashSet<&str> = store
+                .placement_groups
+                .values()
+                .filter_map(|group| group.group_name.as_deref())
+                .collect();
+            if let Some(unknown) = requested_groups
+                .iter()
+                .find(|name| !stored_groups.contains(name.as_str()))
+            {
+                return Err(described_placement_group_unknown(unknown));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named placement
+        // group resolved: the flag asks whether the request WOULD have succeeded, so one that
+        // would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The two selection lists narrow the report; held as sets, so narrowing costs one
+        // lookup per instance rather than a scan of the asked-for lists.
+        let wanted_ids: HashSet<&str> = requested_ids.iter().map(String::as_str).collect();
+        let wanted_groups: HashSet<&str> = requested_groups.iter().map(String::as_str).collect();
+        let owner_id = ::engine::emulator_account_id();
+
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored instances,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<InstanceTopology> = Vec::new();
+        for (instance_id, instance) in &store.instances {
+            if budget.exhausted() {
+                break;
+            }
+            // The id, the Region and the placement group narrowing are read off the stored
+            // record, so an instance the request did not ask for costs no projection and no
+            // comparison at all.
+            if !wanted_ids.is_empty() && !wanted_ids.contains(instance_id.as_str()) {
+                continue;
+            }
+            if instance_region(instance) != region {
+                continue;
+            }
+            // "Instance topology is supported for specific instance types only"
+            // (`DescribeInstanceTopology`): an instance of a type AWS reports no topology for
+            // has no row at all — not a row with an empty path — which is what the recorded
+            // contract for this operation answers for one.
+            if !instance_type_supports_topology(&instance.instance_type) {
+                continue;
+            }
+            if !wanted_groups.is_empty()
+                && !instance
+                    .detail
+                    .placement_group_name
+                    .as_deref()
+                    .is_some_and(|group_name| wanted_groups.contains(group_name))
+            {
+                continue;
+            }
+            let topology = topology_of(instance, owner_id);
+            if matches_every_filter(&topology, &selectors, &mut budget) {
+                selected.push(topology);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+        // Reported in `InstanceId` order, which the page cursor names a position in — an
+        // instance id is hex digits of a counter that only grows, and the store holds its
+        // instances in a map whose iteration order is not that order, so the selected set is
+        // sorted into it before it is paged.
+        selected.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+
+        // `MaxResults` carries the modelled `range 1..100`
+        // (`smithy_query(query="shape",shape="DescribeInstanceTopologyMaxResults")`), so the
+        // boundary validator has already refused anything outside it, and a request that
+        // names no page size gets the documented "Default: 20" rather than the whole store.
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_TOPOLOGY_PAGE_SIZE)
+            .clamp(1, MAX_TOPOLOGY_PAGE_SIZE);
+        // A token only when an instance follows this page: "This value is null when there are
+        // no more items to return" (`$NextToken`). Paged through the one definition of EC2
+        // paging, whose cursor names the id the next page resumes after.
+        let (page, next_token) = page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(page_size),
+            PageTokenRule::WhenAnotherItemFollows,
+            |topology| topology.instance_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(DescribeInstanceTopologyOutput {
+            instances: Some(page.to_vec()),
+            next_token,
+        })
     }
+}
+
+/// "Maximum 100 explicitly specified instance IDs"
+/// (`DescribeInstanceTopologyRequest$InstanceIds`). The model declares no `@length` for the
+/// list, so the handler is the only place that bound is enforced.
+const MAX_TOPOLOGY_INSTANCE_IDS: usize = 100;
+
+/// "Maximum 100 explicitly specified placement group names"
+/// (`DescribeInstanceTopologyRequest$GroupNames`), enforced here for the same reason.
+const MAX_TOPOLOGY_GROUP_NAMES: usize = 100;
+
+/// The largest page this operation serves: the maximum of the modelled `@range` on
+/// `DescribeInstanceTopologyMaxResults`
+/// (`smithy_query(query="shape",shape="DescribeInstanceTopologyMaxResults")`).
+const MAX_TOPOLOGY_PAGE_SIZE: usize = 100;
+
+/// The page a request that names no `MaxResults` gets: "Default: 20"
+/// (`DescribeInstanceTopologyRequest$MaxResults`).
+const DEFAULT_TOPOLOGY_PAGE_SIZE: usize = 20;
+
+/// The filter names this operation documents, from
+/// `DescribeInstanceTopologyRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeInstanceTopologyRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// That list is the whole set — it is far SHORTER than the one `DescribeInstances` documents,
+/// so a name that operation answers is not one this operation does — and every entry must be
+/// answered by [`filter_values`]. "Filter names are case-sensitive" (`Filter$Name`), so every
+/// comparison against it is exact.
+const INSTANCE_TOPOLOGY_FILTERS: [&str; 3] = ["availability-zone", "instance-type", "zone-id"];
+
+/// The topology of one stored instance, as the account `owner_id` sees it.
+///
+/// Every member is read off the stored instance: the topology is a VIEW of where that
+/// instance sits, not a second record of it, so nothing here can drift from what
+/// `DescribeInstances` reports for the same instance.
+fn topology_of(instance: &crate::state::InstanceRecord, owner_id: &str) -> InstanceTopology {
+    InstanceTopology {
+        instance_id: Some(instance.instance_id.clone()),
+        instance_type: Some(instance.instance_type.clone()),
+        // "The name of the placement group that the instance is in"
+        // (`InstanceTopology$GroupName`) — absent for an instance in none, rather than the
+        // EMPTY name `DescribeInstances` reports inside its `Placement`, since this member is
+        // the group itself and not a placement record with a slot for it.
+        group_name: instance.detail.placement_group_name.clone(),
+        network_nodes: network_nodes(instance, owner_id),
+        availability_zone: Some(instance.placement_az.clone()),
+        // A zone's name and its id are the same derived pair, so the id is read back out of
+        // the Region the instance's zone belongs to rather than held a second time beside it.
+        zone_id: crate::state::zone_id_for_zone_name(&instance.placement_az),
+        // "The ID of the Capacity Block. This parameter is only supported for UltraServer
+        // instances and identifies instances within the UltraServer domain"
+        // (`InstanceTopology$CapacityBlockId`): no launch path of this service places an
+        // instance in a Capacity Block, so no stored instance is in one and the member is
+        // absent rather than filled with a block the account does not hold.
+        capacity_block_id: None,
+    }
+}
+
+/// The path through the topology tree the instance's host hangs off: the node of the
+/// Availability Zone's network at the top, then the hosts of that zone serving its instance
+/// type, then the host it runs on.
+///
+/// "The nodes are hashed based on your account. Instances from different accounts running
+/// under the same server will return a different hashed list of strings"
+/// (`InstanceTopology$NetworkNodes`), so each node id is a pure function of the owning account
+/// and of everything that places the instance at that level — which is what makes two
+/// instances share exactly the levels they share a placement at, and makes every read report
+/// the same ids without anything being stored. The hashing itself is
+/// [`crate::state::topology_network_nodes`], which `DescribeCapacityReservationTopology` names
+/// its nodes through as well.
+///
+/// `None` when "the instance is in a state other than `running`" (same member): an instance
+/// that is not running occupies no host, so there is no path to report. The member's other
+/// case — "the instance type is not supported" — cannot be reached from here, because an
+/// instance of a type AWS reports no topology for is not a row of this report at all
+/// ([`crate::state::instance_type_supports_topology`]), which is what the recorded contract
+/// for this operation answers for one.
+fn network_nodes(instance: &crate::state::InstanceRecord, owner_id: &str) -> Option<Vec<String>> {
+    if instance.state != crate::state::InstanceStateName::Running {
+        return None;
+    }
+    let zone_id = crate::state::zone_id_for_zone_name(&instance.placement_az).unwrap_or_default();
+    // The levels of the tree, from its root down. The deepest one is the HOST the instance
+    // runs on: the Dedicated Host the launch placed it on where it placed it on one, the
+    // cluster of hosts its placement group packs the group's instances onto where it is in a
+    // group, and a host of its own otherwise — so two instances report the same leaf exactly
+    // when the store has them sharing a host.
+    let levels = [
+        zone_id.as_str(),
+        instance.instance_type.as_str(),
+        instance
+            .detail
+            .host_id
+            .as_deref()
+            .or(instance.detail.placement_group_name.as_deref())
+            .unwrap_or(&instance.instance_id),
+    ];
+    Some(crate::state::topology_network_nodes(owner_id, &levels))
+}
+
+/// The values the EC2 filter `name` compares against this reported topology.
+///
+/// A filter naming an attribute the row does not carry compares against NO values, so it
+/// selects nothing. `name` is one of [`INSTANCE_TOPOLOGY_FILTERS`].
+fn filter_values<'a>(
+    topology: &'a InstanceTopology,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "availability-zone" => text(topology.availability_zone.as_deref()),
+        "instance-type" => text(topology.instance_type.as_deref()),
+        "zone-id" => text(topology.zone_id.as_deref()),
+        // Unreachable: the loop above has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check were
+        // bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does this row satisfy every filter?
+///
+/// The AND/OR evaluation, the wildcard matching — which is what answers the documented `p4d*`
+/// instance-family form — and the budget charging all live in
+/// [`crate::state::matches_every_filter`], so this operation only says WHERE a filter's values
+/// come from.
+fn matches_every_filter(
+    topology: &InstanceTopology,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    crate::state::matches_every_filter(selectors, budget, &|name| filter_values(topology, name))
 }

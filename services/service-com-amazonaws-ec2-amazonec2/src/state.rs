@@ -3029,9 +3029,14 @@ mod retired_api_actions;
 /// The published parameter bounds the handlers enforce by hand, and the sentences EC2
 /// refuses a violation of one with.
 mod parameter_bounds;
+/// The path through EC2's topology tree a resource's hardware hangs off, as every topology
+/// report names its nodes. Everything it declares is re-exported below, so a handler reaches
+/// it as `crate::state::topology_network_nodes` like any other primitive of this module.
+mod topology_network_nodes;
 pub use bundle_tasks::*;
 pub use retired_api_actions::*;
 pub use parameter_bounds::*;
+pub use topology_network_nodes::*;
 pub use store::*;
 pub use vpcs_and_security_groups::*;
 pub use default_subnets::*;

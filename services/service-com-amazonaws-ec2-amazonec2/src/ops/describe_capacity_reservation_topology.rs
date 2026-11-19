@@ -397,12 +397,6 @@ const MAX_TOPOLOGY_PAGE_SIZE: usize = 10;
 /// (`DescribeCapacityReservationTopologyRequest$MaxResults`).
 const DEFAULT_TOPOLOGY_PAGE_SIZE: usize = 10;
 
-/// The id prefix EC2 gives one node of its topology tree: `nn-` and the 17 lowercase
-/// hexadecimal digits every long-form EC2 resource id carries
-/// ([`crate::state::prefixed_id_is_well_formed`]), which is the form the node ids in the
-/// Amazon EC2 API Reference's own topology examples take.
-const NETWORK_NODE_ID_PREFIX: &str = "nn";
-
 /// The filter names this operation documents, from
 /// `DescribeCapacityReservationTopologyRequest$Filters`:
 ///
@@ -526,34 +520,11 @@ fn network_nodes(reservation: &CapacityReservation, state: &str) -> Option<Vec<S
             .or(reservation.capacity_reservation_id.as_deref())
             .unwrap_or_default(),
     ];
-    let mut path: Vec<&str> = Vec::with_capacity(levels.len() + 1);
-    path.push(owner_id);
-    let mut nodes: Vec<String> = Vec::with_capacity(levels.len());
-    for level in levels {
-        path.push(level);
-        nodes.push(network_node_id(&path));
-    }
-    Some(nodes)
-}
-
-/// The id of the topology node `path` names: `nn-` and the digest of the account and of
-/// every level of the path down to it, in the 17 digits a long-form EC2 id carries — whose
-/// leading digit is `0`, because that form holds 68 bits for a 64-bit identifier, which is
-/// also what [`crate::state::ComAmazonawsEc2Amazonec2State::next_id`] mints.
-///
-/// The standard library's hasher, seeded by its own default rather than randomly, so a node
-/// id is a pure function of its path: every read of one placement answers the same id, and
-/// two placements that differ at any level get different ones. Nothing here is a secret and
-/// nothing depends on a node id being unforgeable — it is an opaque name for a position in
-/// the tree.
-fn network_node_id(path: &[&str]) -> String {
-    use ::std::hash::{Hash, Hasher};
-
-    let mut hasher = ::std::hash::DefaultHasher::new();
-    for level in path {
-        level.hash(&mut hasher);
-    }
-    format!("{NETWORK_NODE_ID_PREFIX}-{:017x}", hasher.finish())
+    // Hashed per account and per level by the one reading of EC2's topology tree
+    // ([`crate::state::topology_network_nodes`]), which the instance report names its own
+    // nodes through as well — so a reservation and an instance placed the same way hang off
+    // the same ancestors.
+    Some(crate::state::topology_network_nodes(owner_id, &levels))
 }
 
 /// The values the EC2 filter `name` compares against this reported topology.
