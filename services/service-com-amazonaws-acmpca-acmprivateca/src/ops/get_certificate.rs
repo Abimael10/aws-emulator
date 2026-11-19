@@ -175,14 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_arn(crate::state::INVALID_ARN_MESSAGE.to_string()));
         };
 
-        // A certificate ARN carries the ARN of the CA that issued it as its prefix, so
-        // one CA's certificate never resolves against another's. Checked before the CA's
-        // own state, so a mismatched pair is reported as the mismatch it is whatever
-        // state the CA is in.
+        // A certificate ARN carries the ARN of the CA that issued it as its prefix, so one
+        // CA's certificate never resolves against another's: under the CA the request
+        // names, such an ARN is one more certificate that CA holds no record of, so it is
+        // answered with the service's one sentence for an absent certificate rather than
+        // with a sentence of its own built out of the request.
         if issuing_ca_arn != ca_arn {
-            return Err(not_found(format!(
-                "the certificate {certificate_arn} was not issued by {ca_arn}"
-            )));
+            return Err(not_found(
+                crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
+            ));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -200,30 +201,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
         };
 
-        // A CA signs a certificate with the certificate of its OWN that vouches for its
-        // key, so one that does not hold a certificate yet can have issued certificates
-        // only in the one case this service's `IssueCertificate` admits: the root CA
-        // certificate it signs for ITSELF, which this read is the documented next step
-        // after. So the certificate the request names is resolved first, and a CA with
-        // nothing to show for the ARN is then judged: before it holds a certificate of its
-        // own it is not in a state to have issued any, which is the state refusal about the
-        // authority; once it does, the absence reported is that of the certificate the
-        // request asked about.
+        // This read is ABOUT the certificate the request names, so that certificate is
+        // what it reports on: an ARN this CA holds no record of is the absence of that
+        // CERTIFICATE, whatever status the authority rests in and whether or not it holds a
+        // certificate of its OWN yet. The authority's readiness is a fact about the
+        // authority, never the reason a certificate could not be resolved — a caller
+        // probing for a certificate, or polling for one it asked to have issued, branches
+        // on the absence of the certificate it asked about.
         //
         // `RequestInProgressException` is kept for the one thing it says — a certificate
-        // this CA really is minting, which a caller may retry for (below) — rather than for
-        // a CA that will never have one, which a caller would retry forever.
+        // this CA really is minting, which a caller may retry for (below).
         let Some(certificate) = record.certificates.get(&certificate_arn) else {
-            if record.ca_certificate_pem.is_none() {
-                return Err(GetCertificateErrorModeled::InvalidStateException(
-                    InvalidStateException {
-                        message: Some(crate::state::not_in_state_to_have_issued_message(
-                            &ca_arn,
-                        )),
-                    },
-                )
-                .into());
-            }
             return Err(not_found(
                 crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
             ));

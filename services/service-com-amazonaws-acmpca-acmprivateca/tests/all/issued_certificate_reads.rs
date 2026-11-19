@@ -2,23 +2,20 @@
 
 //! Which refusal `GetCertificate` answers for a certificate it cannot serve.
 //!
-//! The rule under test: the three refusals say three different things, and a client branches
-//! on them.
+//! The rule under test: a read of a certificate reports on the CERTIFICATE the request
+//! names, so a certificate ARN the private CA holds no record of is the absence of that
+//! certificate (`ResourceNotFoundException` with the service's one fixed sentence for an
+//! absent certificate), whatever status the authority rests in and whether or not it holds
+//! a certificate of its OWN yet — the authority's readiness is never reported as the reason
+//! the lookup found nothing.
 //!
-//! * A CA that holds no certificate of its own has not been in a state to issue
-//!   certificates, so a certificate ARN it has nothing for is the STATE refusal
-//!   (`InvalidStateException`), naming the authority — a client polling such a CA would
-//!   otherwise retry for a certificate that is never coming.
-//! * A CA that does hold one, asked for a certificate it did not issue, is the absence of
-//!   that CERTIFICATE (`ResourceNotFoundException`).
-//! * `RequestInProgressException` says one thing only: the certificate asked for is still
-//!   being minted, so the same request later succeeds.
+//! `RequestInProgressException` keeps the one thing it says: the certificate asked for is
+//! still being minted, so the same request later succeeds.
 //!
-//! The rows span the statuses a CA passes through and both kinds of certificate ARN — one
-//! the CA issued and one it did not.
+//! The rows span the statuses a CA passes through, before and after it holds its own
+//! certificate, crossed with the ways a certificate ARN fails to resolve on it.
 
 use serde_json::json;
-use service_com_amazonaws_acmpca_acmprivateca::state::not_in_state_to_have_issued_message;
 use service_com_amazonaws_acmpca_acmprivateca::state::CERTIFICATE_NOT_FOUND_MESSAGE;
 
 use crate::private_ca_lifecycle::{
@@ -30,10 +27,27 @@ use crate::resource_policy::error_message;
 /// The template that produces a ROOT CA's own certificate.
 const ROOT_CA_TEMPLATE: &str = "arn:aws:acm-pca:::template/RootCACertificate/V1";
 
-/// A certificate ARN under `ca_arn` that no certificate of that CA carries: a serial of the
-/// right form the CA never allocated.
-fn unissued_certificate_arn(ca_arn: &str) -> String {
-    format!("{ca_arn}/certificate/0123456789abcdef0123456789abcdef")
+/// The whole sentence Amazon Web Services Private CA refuses an absent certificate with:
+/// fixed text, with no part of it taken from the request or from the store.
+const ABSENT_CERTIFICATE_SENTENCE: &str = "Could not find specified certificate.";
+
+/// The ways a certificate ARN under `ca_arn` names no certificate that CA holds: serials of
+/// different lengths and spellings that the CA never allocated.
+fn unresolvable_certificate_arns(ca_arn: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "a 32-character serial the CA never allocated",
+            format!("{ca_arn}/certificate/0123456789abcdef0123456789abcdef"),
+        ),
+        (
+            "a shorter serial",
+            format!("{ca_arn}/certificate/0123456789abcdef"),
+        ),
+        (
+            "a serial spelled in upper-case hex",
+            format!("{ca_arn}/certificate/0123456789ABCDEF0123456789ABCDEF"),
+        ),
+    ]
 }
 
 /// A `GetCertificate` body.
@@ -41,20 +55,70 @@ fn read(ca_arn: &str, certificate_arn: &str) -> serde_json::Value {
     json!({"CertificateAuthorityArn": ca_arn, "CertificateArn": certificate_arn})
 }
 
-/// A CA with no certificate of its own answers the state refusal, in every status it can be
-/// in before it takes one, and whatever certificate ARN the request names.
-#[tokio::test]
-async fn a_ca_that_cannot_have_issued_certificates_answers_the_state_refusal() {
-    let emulator = Emulator::new();
+/// Require `GetCertificate` to report the absence of the CERTIFICATE, with the service's
+/// fixed sentence and nothing of the request inside it.
+async fn reports_the_certificate_as_absent(
+    emulator: &Emulator,
+    case: &str,
+    ca_arn: &str,
+    certificate_arn: &str,
+) {
+    let refused = emulator
+        .refused(
+            case,
+            "GetCertificate",
+            &read(ca_arn, certificate_arn),
+            "ResourceNotFoundException",
+        )
+        .await;
+    let message = error_message(&refused, case);
+    assert_eq!(
+        message, ABSENT_CERTIFICATE_SENTENCE,
+        "case {case:?}: expected the sentence about the certificate, got {message:?}"
+    );
+    assert!(
+        !message.contains(ca_arn) && !message.contains(certificate_arn),
+        "case {case:?}: the sentence is fixed text and names no ARN, got {message:?}"
+    );
+}
 
-    // Two CAs: one read while its creation has not settled, one read after it has.
-    let creating = string(
+/// The service's constant and the sentence it has to spell are one string, so a reworded
+/// constant cannot pass unnoticed.
+#[test]
+fn the_absent_certificate_sentence_is_the_services_fixed_text() {
+    assert_eq!(
+        CERTIFICATE_NOT_FOUND_MESSAGE, ABSENT_CERTIFICATE_SENTENCE,
+        "the absent-certificate refusal carries one fixed sentence, got \
+         {CERTIFICATE_NOT_FOUND_MESSAGE:?}"
+    );
+}
+
+/// A CA whose creation has not settled yet already reports the absence of a certificate it
+/// has no record of: the read is about the certificate, not about the authority.
+#[tokio::test]
+async fn a_ca_still_being_created_reports_the_certificate_as_the_absent_one() {
+    let emulator = Emulator::new();
+    let case = "a CA still being created";
+    let arn = string(
         &emulator
-            .ok("creating", "CreateCertificateAuthority", &root_ca_request("creating-root"))
+            .ok(case, "CreateCertificateAuthority", &root_ca_request("creating-root"))
             .await,
         "CertificateAuthorityArn",
-        "creating",
+        case,
     );
+
+    for (row, certificate_arn) in unresolvable_certificate_arns(&arn) {
+        let case = format!("{case}: {row}");
+        reports_the_certificate_as_absent(&emulator, &case, &arn, &certificate_arn).await;
+    }
+}
+
+/// Every settled status a CA rests in answers the same way, before and after it holds a
+/// certificate of its own, and for a certificate ARN of ANOTHER authority too.
+#[tokio::test]
+async fn every_status_reports_an_unknown_certificate_as_the_absent_one() {
+    let emulator = Emulator::new();
+    // One CA left waiting for its certificate, one driven all the way to ACTIVE.
     let pending = string(
         &emulator
             .ok("pending", "CreateCertificateAuthority", &root_ca_request("pending-root"))
@@ -62,85 +126,107 @@ async fn a_ca_that_cannot_have_issued_certificates_answers_the_state_refusal() {
         "CertificateAuthorityArn",
         "pending",
     );
+    let (active, _) = active_ca(&emulator, "served-root").await;
 
-    // CREATING: the CA exists and has no certificate yet.
-    for (case, arn) in [("a CA still being created", &creating)] {
-        let refused = emulator
-            .refused(
-                case,
-                "GetCertificate",
-                &read(arn, &unissued_certificate_arn(arn)),
-                "InvalidStateException",
-            )
-            .await;
-        let message = error_message(&refused, case);
-        assert_eq!(
-            message,
-            not_in_state_to_have_issued_message(arn),
-            "case {case:?}: expected the sentence about the authority, got {message:?}"
-        );
-    }
-
-    wait_for_the_clock();
-
-    // PENDING_CERTIFICATE: the same refusal, because the CA still holds no certificate of
-    // its own to have signed anything with.
-    for (case, arn) in [
-        ("a CA waiting for its certificate", &pending),
-        ("a CA whose creation has settled since", &creating),
-    ] {
-        let refused = emulator
-            .refused(
-                case,
-                "GetCertificate",
-                &read(arn, &unissued_certificate_arn(arn)),
-                "InvalidStateException",
-            )
-            .await;
-        let message = error_message(&refused, case);
-        assert_eq!(
-            message,
-            not_in_state_to_have_issued_message(arn),
-            "case {case:?}: expected the sentence about the authority, got {message:?}"
-        );
-    }
-
-    // The ONE certificate such a CA can have issued is its own root certificate, and that
-    // one is served: the state refusal is about a CA with nothing to show, not about the
-    // status it is in.
-    let case = "the root certificate a pending CA signed for itself";
-    let csr = string(
-        &emulator
-            .ok(
-                case,
-                "GetCertificateAuthorityCsr",
-                &json!({"CertificateAuthorityArn": pending}),
-            )
-            .await,
-        "Csr",
-        case,
-    );
+    // A certificate that really exists — issued by the ACTIVE CA — so the foreign-ARN row
+    // below is about which authority holds the certificate rather than about a made-up ARN.
+    let case = "a leaf of the active CA";
     let issued = emulator
         .ok(
             case,
             "IssueCertificate",
             &json!({
-                "CertificateAuthorityArn": pending,
-                "Csr": blob(&csr),
+                "CertificateAuthorityArn": active,
+                "Csr": blob(&csr_pem("an-end-entity")),
                 "SigningAlgorithm": "SHA256WITHRSA",
-                "TemplateArn": ROOT_CA_TEMPLATE,
-                "Validity": {"Type": "YEARS", "Value": 3},
+                "Validity": {"Type": "DAYS", "Value": 30},
             }),
         )
         .await;
-    let root_arn = string(&issued, "CertificateArn", case);
+    let leaf = string(&issued, "CertificateArn", case);
+    wait_for_the_clock();
+    emulator.ok(case, "GetCertificate", &read(&active, &leaf)).await;
+
+    // (the stage, the CA it is read on, the status that CA is put into first)
+    let stages: &[(&str, &str, Option<&str>)] = &[
+        ("a CA waiting for its certificate", pending.as_str(), None),
+        ("an active CA", active.as_str(), None),
+        ("a disabled CA", active.as_str(), Some("DISABLED")),
+        ("an active CA again", active.as_str(), Some("ACTIVE")),
+    ];
+
+    for (stage, ca_arn, status) in stages {
+        if let Some(status) = status {
+            emulator
+                .ok(
+                    stage,
+                    "UpdateCertificateAuthority",
+                    &json!({"CertificateAuthorityArn": ca_arn, "Status": status}),
+                )
+                .await;
+        }
+        let mut rows = unresolvable_certificate_arns(ca_arn);
+        if *ca_arn != active.as_str() {
+            // A certificate another authority issued is one this CA holds no record of.
+            rows.push(("a certificate another authority issued", leaf.clone()));
+        }
+        for (row, certificate_arn) in rows {
+            let case = format!("{stage}: {row}");
+            reports_the_certificate_as_absent(&emulator, &case, ca_arn, &certificate_arn).await;
+        }
+        // The certificate the active CA did issue is still served in that status.
+        emulator
+            .ok(stage, "GetCertificate", &read(&active, &leaf))
+            .await;
+    }
+}
+
+/// The ONE certificate a CA without its own certificate can have issued is the root
+/// certificate it signs for itself: that one is minted asynchronously and then served,
+/// while any other ARN on the same CA is the absence of a certificate.
+#[tokio::test]
+async fn the_root_certificate_a_pending_ca_signs_for_itself_is_minted_then_served() {
+    let emulator = Emulator::new();
+    let case = "a pending CA signing for itself";
+    let arn = string(
+        &emulator
+            .ok(case, "CreateCertificateAuthority", &root_ca_request("self-signing-root"))
+            .await,
+        "CertificateAuthorityArn",
+        case,
+    );
+    wait_for_the_clock();
+    let csr = string(
+        &emulator
+            .ok(case, "GetCertificateAuthorityCsr", &json!({"CertificateAuthorityArn": arn}))
+            .await,
+        "Csr",
+        case,
+    );
+    let root_arn = string(
+        &emulator
+            .ok(
+                case,
+                "IssueCertificate",
+                &json!({
+                    "CertificateAuthorityArn": arn,
+                    "Csr": blob(&csr),
+                    "SigningAlgorithm": "SHA256WITHRSA",
+                    "TemplateArn": ROOT_CA_TEMPLATE,
+                    "Validity": {"Type": "YEARS", "Value": 3},
+                }),
+            )
+            .await,
+        "CertificateArn",
+        case,
+    );
 
     // Until that issuance completes, the retry signal is the one that says so.
     let in_progress = emulator
         .refused(
             case,
             "GetCertificate",
-            &read(&pending, &root_arn),
+            &read(&arn, &root_arn),
             "RequestInProgressException",
         )
         .await;
@@ -150,93 +236,24 @@ async fn a_ca_that_cannot_have_issued_certificates_answers_the_state_refusal() {
     );
     wait_for_the_clock();
     let served = emulator
-        .ok(case, "GetCertificate", &read(&pending, &root_arn))
+        .ok(case, "GetCertificate", &read(&arn, &root_arn))
         .await;
     assert!(
         string(&served, "Certificate", case).contains("-----BEGIN CERTIFICATE-----"),
         "case {case:?}: a certificate the CA did issue is served whatever status it is in"
     );
-    // Any OTHER ARN on that same CA is still the state refusal: it holds no certificate of
-    // its own yet.
-    let case = "another ARN on the same pending CA";
-    let refused = emulator
-        .refused(
-            case,
-            "GetCertificate",
-            &read(&pending, &unissued_certificate_arn(&pending)),
-            "InvalidStateException",
-        )
-        .await;
-    assert_eq!(
-        error_message(&refused, case),
-        not_in_state_to_have_issued_message(&pending),
-        "case {case:?}: expected the sentence about the authority"
-    );
-}
 
-/// Once a CA holds its certificate, an ARN it never issued is the absence of the
-/// CERTIFICATE — in every status such a CA can rest in.
-#[tokio::test]
-async fn a_ca_holding_its_certificate_reports_the_certificate_as_the_absent_one() {
-    let emulator = Emulator::new();
-    let (arn, _) = active_ca(&emulator, "served-root").await;
-
-    // A certificate it did issue, read back once issuance has completed.
-    let case = "a leaf of an active CA";
-    let issued = emulator
-        .ok(
-            case,
-            "IssueCertificate",
-            &json!({
-                "CertificateAuthorityArn": arn,
-                "Csr": blob(&csr_pem("an-end-entity")),
-                "SigningAlgorithm": "SHA256WITHRSA",
-                "Validity": {"Type": "DAYS", "Value": 30},
-            }),
-        )
-        .await;
-    let leaf = string(&issued, "CertificateArn", case);
-    wait_for_the_clock();
-    emulator.ok(case, "GetCertificate", &read(&arn, &leaf)).await;
-
-    // (case, the status the CA is put into before the read)
-    let statuses: &[(&str, Option<&str>)] = &[
-        ("an active CA", None),
-        ("a disabled CA", Some("DISABLED")),
-        ("an active CA again", Some("ACTIVE")),
-    ];
-    for (case, status) in statuses {
-        if let Some(status) = status {
-            emulator
-                .ok(
-                    case,
-                    "UpdateCertificateAuthority",
-                    &json!({"CertificateAuthorityArn": arn, "Status": status}),
-                )
-                .await;
-        }
-        let refused = emulator
-            .refused(
-                case,
-                "GetCertificate",
-                &read(&arn, &unissued_certificate_arn(&arn)),
-                "ResourceNotFoundException",
-            )
-            .await;
-        let message = error_message(&refused, case);
-        assert_eq!(
-            message, CERTIFICATE_NOT_FOUND_MESSAGE,
-            "case {case:?}: expected the sentence about the certificate, got {message:?}"
-        );
-        // And the certificate it did issue is still served in that status.
-        emulator.ok(case, "GetCertificate", &read(&arn, &leaf)).await;
+    // Any OTHER ARN on that same CA is the absence of a certificate.
+    for (row, certificate_arn) in unresolvable_certificate_arns(&arn) {
+        let case = format!("{case}: {row}");
+        reports_the_certificate_as_absent(&emulator, &case, &arn, &certificate_arn).await;
     }
 }
 
-/// A CA whose certificate was imported rather than issued here answers the same way: what
-/// decides the refusal is whether the CA HOLDS a certificate, not which call produced it.
+/// Taking its own certificate does not change WHICH refusal a CA answers for a certificate
+/// it has no record of: the same code and the same sentence before and after the import.
 #[tokio::test]
-async fn an_imported_certificate_is_what_moves_the_ca_past_the_state_refusal() {
+async fn taking_its_own_certificate_does_not_change_the_refusal() {
     let emulator = Emulator::new();
     let case = "imported";
     let arn = string(
@@ -248,19 +265,11 @@ async fn an_imported_certificate_is_what_moves_the_ca_past_the_state_refusal() {
     );
     wait_for_the_clock();
 
-    let before = emulator
-        .refused(
-            case,
-            "GetCertificate",
-            &read(&arn, &unissued_certificate_arn(&arn)),
-            "InvalidStateException",
-        )
-        .await;
-    assert_eq!(
-        error_message(&before, case),
-        not_in_state_to_have_issued_message(&arn),
-        "case {case:?}: before its certificate, the refusal is about the authority"
-    );
+    let rows = unresolvable_certificate_arns(&arn);
+    for (row, certificate_arn) in &rows {
+        let case = format!("{case}: {row}, before its certificate");
+        reports_the_certificate_as_absent(&emulator, &case, &arn, certificate_arn).await;
+    }
 
     let own = own_ca_certificate(&emulator, case, &arn).await;
     emulator
@@ -271,17 +280,8 @@ async fn an_imported_certificate_is_what_moves_the_ca_past_the_state_refusal() {
         )
         .await;
 
-    let after = emulator
-        .refused(
-            case,
-            "GetCertificate",
-            &read(&arn, &unissued_certificate_arn(&arn)),
-            "ResourceNotFoundException",
-        )
-        .await;
-    assert_eq!(
-        error_message(&after, case),
-        CERTIFICATE_NOT_FOUND_MESSAGE,
-        "case {case:?}: with its certificate, the refusal is about the certificate"
-    );
+    for (row, certificate_arn) in &rows {
+        let case = format!("{case}: {row}, with its certificate");
+        reports_the_certificate_as_absent(&emulator, &case, &arn, certificate_arn).await;
+    }
 }

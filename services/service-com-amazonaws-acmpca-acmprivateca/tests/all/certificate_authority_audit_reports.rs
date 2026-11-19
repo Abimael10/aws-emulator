@@ -438,3 +438,112 @@ async fn a_report_is_described_only_by_the_ca_that_produced_it() {
         "case {case:?}: expected the sentence about the report, got {message:?}"
     );
 }
+
+/// The whole sentence an absent audit report is refused with: fixed text, capitalisation
+/// included, with no part of it taken from the request or from the store.
+const ABSENT_REPORT_SENTENCE: &str = "Could not find specified Audit Report.";
+
+/// Report ids that match the modelled `AuditReportId` — `@length 36..36` and pattern
+/// `^[a-z0-9]{8}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{12}$`, read from
+/// `smithy_query(query="shape",shape="AuditReportId")` — and name no report of the CA they
+/// are asked of.
+const UNKNOWN_REPORT_IDS: [(&str, &str); 4] = [
+    ("the all-zero id", "00000000-0000-0000-0000-000000000000"),
+    ("a version-4 shaped id", "7b9f4c1e-0d2a-4f6b-9c3e-5a8d1f2b4c60"),
+    ("an id of letters only", "abcdefab-abcd-abcd-abcd-abcdefabcdef"),
+    ("an id of digits only", "12345678-9012-3456-7890-123456789012"),
+];
+
+/// The service's constant and the sentence it has to spell are one string, so a reworded or
+/// re-cased constant cannot pass unnoticed.
+#[test]
+fn the_absent_report_sentence_is_the_services_fixed_text() {
+    assert_eq!(
+        AUDIT_REPORT_NOT_FOUND_MESSAGE, ABSENT_REPORT_SENTENCE,
+        "the absent-report refusal carries one fixed sentence, got \
+         {AUDIT_REPORT_NOT_FOUND_MESSAGE:?}"
+    );
+}
+
+/// An id no report was produced under is refused with that one sentence, verbatim — from a
+/// CA that has produced a report, one that has produced none, and one that can produce none
+/// yet, over every spelling of an id the model admits.
+#[tokio::test]
+async fn an_id_no_report_was_produced_under_is_refused_with_the_fixed_sentence() {
+    let emulator = Emulator::new();
+    assert_eq!(
+        emulator.create_bucket(BUCKET).await,
+        200,
+        "the bucket the reports are deposited in is created through S3"
+    );
+    let case = "absent audit reports";
+
+    // A CA that has produced a report, so the refusals below are about the id asked for
+    // rather than about a CA with no reports at all.
+    let (audited, _) = audited_ca(&emulator, case, "absent-report-owner").await;
+    let produced = string(
+        &emulator
+            .ok(
+                case,
+                "CreateCertificateAuthorityAuditReport",
+                &report_request(&audited, "JSON"),
+            )
+            .await,
+        "AuditReportId",
+        case,
+    );
+    // A CA that holds its certificate and has produced no report.
+    let (unaudited, _) = active_ca(&emulator, case, "absent-report-neighbour", None).await;
+    // And one still waiting for its own certificate, which can produce no report at all.
+    let pending = string(
+        &emulator
+            .ok(case, "CreateCertificateAuthority", &root_ca_request("absent-report-pending"))
+            .await,
+        "CertificateAuthorityArn",
+        case,
+    );
+    wait_for_the_clock();
+
+    let authorities = [
+        ("a CA that has produced a report", audited.as_str()),
+        ("a CA that has produced none", unaudited.as_str()),
+        ("a CA waiting for its certificate", pending.as_str()),
+    ];
+    for (authority, arn) in authorities {
+        // The id another CA's report carries is, on this CA, one more id it holds no report
+        // under.
+        let mut rows: Vec<(&str, &str)> = UNKNOWN_REPORT_IDS.to_vec();
+        if arn != audited.as_str() {
+            rows.push(("another CA's report id", produced.as_str()));
+        }
+        for (row, report_id) in rows {
+            let case = format!("{authority}: {row}");
+            let message = refused(
+                &emulator,
+                &case,
+                "DescribeCertificateAuthorityAuditReport",
+                &json!({"CertificateAuthorityArn": arn, "AuditReportId": report_id}),
+                "ResourceNotFoundException",
+            )
+            .await;
+            assert_eq!(
+                message, ABSENT_REPORT_SENTENCE,
+                "case {case:?}: expected the service's absent-report sentence, got {message:?}"
+            );
+            assert!(
+                !message.contains(arn) && !message.contains(report_id),
+                "case {case:?}: the sentence is fixed text and names no id, got {message:?}"
+            );
+        }
+    }
+
+    // The report that WAS produced is still described by the CA that produced it: the
+    // refusals above reported the ids asked for, and changed nothing.
+    emulator
+        .ok(
+            case,
+            "DescribeCertificateAuthorityAuditReport",
+            &json!({"CertificateAuthorityArn": audited, "AuditReportId": produced}),
+        )
+        .await;
+}
