@@ -43,6 +43,37 @@ pub fn health_check_grpc_codes() -> RangeInclusive<u32> {
     0..=99
 }
 
+/// Whether `matcher` counts an HTTP response code of `status` as a SUCCESSFUL health check
+/// — "the HTTP or gRPC codes to use when checking for a successful response from a target".
+///
+/// The member carries a list rather than a number — "you can specify multiple values (for
+/// example, "200,202") or a range of values (for example, "200-299")" — so the code is
+/// counted as success when it is one of the values named or lies inside one of the ranges
+/// named, which is the same spelling [`check_health_check_matcher`] judges the bounds of.
+///
+/// A matcher naming no HTTP code at all states no criterion an HTTP response code could
+/// meet, so it counts none as success: what such a check is judged on is not a code the
+/// response carries.
+///
+/// Read where a health check's ANSWER is read — the invocation a check of a `lambda` target
+/// group is ([`crate::service::lambda_health_check`]) — so the codes a check counts as
+/// success and the codes a write of one is accepted at come from one reading of the member.
+pub fn matcher_admits(matcher: &MatcherRecord, status: u16) -> bool {
+    let Some(value) = matcher.http_code.as_deref() else {
+        return false;
+    };
+    let status = u32::from(status);
+    value.split(',').any(|entry| match entry.split_once('-') {
+        Some((low, high)) => {
+            match (low.trim().parse::<u32>(), high.trim().parse::<u32>()) {
+                (Ok(low), Ok(high)) => (low..=high).contains(&status),
+                _ => false,
+            }
+        }
+        None => entry.trim().parse::<u32>().is_ok_and(|code| code == status),
+    })
+}
+
 /// How a refusal names the kind of code it judged: the spelling Elastic Load Balancing
 /// uses in the sentence, which is the protocol the code belongs to rather than the member
 /// that carried it.
@@ -172,6 +203,48 @@ mod tests {
                 .to_string()),
             "case the same code against the wider range: unexpected refusal"
         );
+    }
+
+    /// RULE: a matcher counts a response code as success exactly when its `HttpCode` names
+    /// that code, on its own or among several, or a range it names contains it.
+    ///
+    /// The rows span each spelling the member accepts (one value, several, a range), the
+    /// bounds of a range and one past each of them, a value nothing admits, and a matcher
+    /// naming no HTTP code at all — none of which the issue this answers cited.
+    #[test]
+    fn a_matcher_counts_the_codes_its_http_member_names_as_success() {
+        // (the matcher's `HttpCode`, the status, whether the check succeeded)
+        let rows: &[(Option<&str>, u16, bool)] = &[
+            (Some("200"), 200, true),
+            (Some("200"), 201, false),
+            (Some("200,202"), 202, true),
+            (Some("200,202"), 201, false),
+            (Some("200-299"), 200, true),
+            (Some("200-299"), 250, true),
+            (Some("200-299"), 299, true),
+            (Some("200-299"), 199, false),
+            (Some("200-299"), 300, false),
+            (Some("200-399"), 302, true),
+            (Some("200,300-399"), 404, false),
+            (Some("404"), 404, true),
+            // A value naming no code at all counts nothing as success.
+            (Some(""), 200, false),
+            (Some("OK"), 200, false),
+            // A matcher naming no HTTP code states no criterion a status can meet.
+            (None, 200, false),
+        ];
+        for (http_code, status, expected) in rows {
+            let matcher = MatcherRecord {
+                http_code: http_code.map(str::to_string),
+                grpc_code: None,
+            };
+            let admitted = matcher_admits(&matcher, *status);
+            assert_eq!(
+                admitted, *expected,
+                "case {http_code:?} against the status {status}: expected success={expected}, \
+                 got {admitted}"
+            );
+        }
     }
 
     /// The gRPC member is judged against its own range, which is the same for every

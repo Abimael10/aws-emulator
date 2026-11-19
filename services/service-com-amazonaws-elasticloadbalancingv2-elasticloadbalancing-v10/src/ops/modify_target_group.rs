@@ -370,7 +370,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same driving the writes that change a load balancer's routing or its
         // registrations perform ([`crate::state::host_counts`]). Nothing a read did.
         drop(guard);
-        crate::state::drive_host_count_metrics(&self.engine);
+        crate::state::drive_host_count_metrics(&self.engine, ctx.callback());
 
         Ok(ModifyTargetGroupOutput {
             target_groups: Some(vec![modified]),

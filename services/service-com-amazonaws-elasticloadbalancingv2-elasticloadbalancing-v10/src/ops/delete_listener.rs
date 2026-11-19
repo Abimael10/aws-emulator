@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A target group no remaining listener forwards to is checked by this load balancer
         // no longer, so its host-count series closes ([`crate::state::host_counts`]).
         drop(guard);
-        crate::state::drive_host_count_metrics(&self.engine);
+        crate::state::drive_host_count_metrics(&self.engine, ctx.callback());
 
         Ok(DeleteListenerOutput {})
     }

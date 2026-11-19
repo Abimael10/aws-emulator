@@ -171,6 +171,12 @@ service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # the report back where a client reads it — off the queue, through Amazon SQS's own API — so
 # a row answered without the handler having run fails.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# A HEALTH CHECK of a `lambda` target group is an invocation too, and the records of the run it
+# makes reach the function's log group through Lambda's own delivery — so CloudWatch Logs is
+# mounted beside the two above and the suite reads those records back through that service's own
+# `DescribeLogStreams` and `GetLogEvents`
+# (`tests/all/alb_lambda_target_health_check.rs`).
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The .zip deployment package such a function is created from, written in memory the way a
 # caller uploads one — the same reader/writer the Lambda crate's own invoke suites use.
 zip = { version = "9", default-features = false, features = ["deflate"] }

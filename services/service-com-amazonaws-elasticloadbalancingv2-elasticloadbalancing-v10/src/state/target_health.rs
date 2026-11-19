@@ -128,6 +128,34 @@ const MIN_HEALTH_CHECK_INTERVAL_SECONDS: i32 = 5;
 /// [`MIN_HEALTH_CHECK_INTERVAL_SECONDS`].
 const MAX_HEALTH_CHECK_INTERVAL_SECONDS: i32 = 300;
 
+/// How long one health check of a registration of `group` waits for an answer: the group's own
+/// `HealthCheckTimeoutSeconds` — "the amount of time, in seconds, during which no response from
+/// a target means a failed health check".
+///
+/// A DURATION the caller configures, so it keeps the value the target group reports for it, and
+/// BOUNDED by the member's own documented range ("the range is 2–120 seconds") for the same
+/// reason the cadence above is: the span is arithmetic on the clock, so it is held to what a
+/// target group could legitimately carry. A group carrying no timeout at all waits the shortest
+/// the member allows.
+///
+/// Read where a check WAITS for an answer — the invocation a check of a `lambda` target group is
+/// ([`crate::service::lambda_health_check`]) — so the wait and the value a client reads for the
+/// member are the same span.
+pub fn health_check_timeout(group: &TargetGroupRecord) -> Duration {
+    let configured = group.health_check.timeout_seconds.clamp(
+        MIN_HEALTH_CHECK_TIMEOUT_SECONDS,
+        MAX_HEALTH_CHECK_TIMEOUT_SECONDS,
+    );
+    Duration::from_secs(configured.unsigned_abs().into())
+}
+
+/// The shortest wait `HealthCheckTimeoutSeconds` may be written at ("the range is 2–120
+/// seconds").
+const MIN_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 2;
+
+/// The longest wait that member may be written at; see [`MIN_HEALTH_CHECK_TIMEOUT_SECONDS`].
+const MAX_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 120;
+
 /// The instant a span that starts `now` comes due.
 ///
 /// The addition is CHECKED: a span the clock cannot represent an end for is due at once,

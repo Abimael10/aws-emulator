@@ -233,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::release_load_balancer_interfaces(&*self.engine, &network_interface_ids);
         // A load balancer that is gone checks no target group, so the host-count series of
         // every pair it was routing closes here ([`crate::state::host_counts`]).
-        crate::state::drive_host_count_metrics(&self.engine);
+        crate::state::drive_host_count_metrics(&self.engine, ctx.callback());
         crate::state::record_zonal_shift_registration(&*self.engine, ctx, &registration).await;
 
         Ok(DeleteLoadBalancerOutput {})

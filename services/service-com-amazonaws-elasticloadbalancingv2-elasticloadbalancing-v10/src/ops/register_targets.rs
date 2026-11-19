@@ -297,7 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The group's host counts have changed, and a registration of a group a load
         // balancer routes to is checked from now on ([`crate::state::host_counts`]).
         drop(guard);
-        crate::state::drive_host_count_metrics(&self.engine);
+        crate::state::drive_host_count_metrics(&self.engine, ctx.callback());
 
         Ok(RegisterTargetsOutput {})
     }

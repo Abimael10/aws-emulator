@@ -224,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A registration that is draining or gone is counted in neither host count, so the
         // series of every pair this group is routed by moves on ([`crate::state::host_counts`]).
         drop(guard);
-        crate::state::drive_host_count_metrics(&self.engine);
+        crate::state::drive_host_count_metrics(&self.engine, ctx.callback());
 
         Ok(DeregisterTargetsOutput {})
     }

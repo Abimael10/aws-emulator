@@ -62,11 +62,16 @@
 //!   which is what makes the address one something in this VPC answers on, and fails for an
 //!   address no interface holds;
 //! * anything else observes NOTHING, and a registration nothing was observed about keeps the
-//!   health it has rather than being failed on silence: a `lambda` target, whose function is
-//!   another service's resource, and every target of a group whose VPC the account's EC2
-//!   inventory does not hold — an inventory that knows nothing about the network the target
-//!   sits in can report nothing about the target either ([`super::network`] reads every
-//!   other fact this service does not own the same way).
+//!   health it has rather than being failed on silence: every target of a group whose VPC the
+//!   account's EC2 inventory does not hold — an inventory that knows nothing about the network
+//!   the target sits in can report nothing about the target either ([`super::network`] reads
+//!   every other fact this service does not own the same way).
+//!
+//! A `lambda` registration is observed by none of that, because it names no address and no
+//! port: one check of it is an INVOCATION of the function
+//! ([`crate::service::lambda_health_check`]), which this pass performs for the registrations
+//! whose own cadence has made a check due — an invocation is a run of the function, so a look
+//! taken between two checks makes none.
 //!
 //! The verdict only MOVES once the target group's own thresholds are reached — "the number of
 //! consecutive health check failures required before considering a target unhealthy"
@@ -118,6 +123,7 @@ use ::std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as cloudwatch;
 use ::service_com_amazonaws_ec2_amazonec2::ops::types as ec2_types;
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
+use ::smithy_server_runtime::EmbeddedEmulator;
 
 use super::target_health::{HEALTHY_STATE, INITIAL_STATE, UNHEALTHY_STATE};
 use super::{
@@ -341,6 +347,18 @@ struct Checked {
     /// pass failed to resolve — the difference between a load balancer in no security group
     /// and one whose association is unknown ([`super::health_check_firewall::CheckSource`]).
     source_groups_resolved: bool,
+    /// Whether the group's own cadence had made a check of this registration DUE at the
+    /// instant the pass read it ([`super::TargetGroupRecord::observed_check`] folds the look
+    /// against that same instant).
+    ///
+    /// What keeps the invocation a `lambda` registration's check is to the cadence the caller
+    /// configured: every other target type is observed out of a store, which costs the target
+    /// nothing, while an invocation RUNS the function.
+    check_due: bool,
+    /// What one health check of this registration INVOKES, for a `lambda` registration of a
+    /// group whose health checks are on — `None` for every other registration, which is
+    /// checked by what [`observe`] reads ([`crate::service::lambda_health_check::probe`]).
+    lambda: Option<crate::service::lambda_health_check::Probe>,
 }
 
 /// What one check observed about a registration: `Some(true)` for one something in this
@@ -366,6 +384,11 @@ type Observation = Option<bool>;
 /// target group no load balancer forwards to is checked by nothing and is skipped here too.
 ///
 /// Called with NO guard of this store held: it takes the lock itself.
+///
+/// The checks it runs are the ones a store can observe on its own ([`observe`]): this entry
+/// point carries no callback, so the invocation a `lambda` registration's check is belongs to
+/// the clock's own pass ([`publish_due_checks_over`]) and never to a scheduler's reconcile,
+/// and a check of one that is DUE is left to that pass ([`observe_all_connected`]).
 pub fn check_registrations<Eng: Send + Sync + 'static>(
     engine: &Eng,
     registrations: &[(String, TargetKey)],
@@ -376,12 +399,13 @@ pub fn check_registrations<Eng: Send + Sync + 'static>(
     let Some(state) = super::service_state(engine) else {
         return;
     };
+    let now = SystemTime::now();
     let checked = {
         let store = state.lock();
-        named_registrations(&store, registrations)
+        named_registrations(&store, registrations, now)
     };
-    let observations = observe_all(engine, &checked);
-    fold_observations(&mut state.lock(), &observations, SystemTime::now());
+    let observations = observe_all_connected(engine, &checked);
+    fold_observations(&mut state.lock(), &observations, now);
 }
 
 /// Publish every host-count datapoint the clock has already made due, and start the one
@@ -394,7 +418,17 @@ pub fn check_registrations<Eng: Send + Sync + 'static>(
 ///
 /// With no async runtime to spawn onto there is no clock, and the checks due at the moment of
 /// the write are then the whole series until the next write — the router always runs on one.
-pub fn drive_host_count_metrics<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) {
+///
+/// `callback` is the handle into the emulator this request is running within
+/// (`ctx.callback()`), which is how the check of a `lambda` registration reaches the function
+/// it invokes ([`crate::service::lambda_health_check`]): the CLOCK keeps a clone of it and
+/// makes those checks on its own wake-ups, so the write itself stays synchronous — the
+/// datapoints due at the instant of the write are published before it answers, as they were
+/// before any function was invoked for a check.
+pub fn drive_host_count_metrics<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+    callback: &EmbeddedEmulator,
+) {
     publish_due_checks(&**engine);
     let Some(state) = super::service_state(&**engine) else {
         return;
@@ -406,6 +440,7 @@ pub fn drive_host_count_metrics<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) {
         return;
     };
     let engine = Arc::clone(engine);
+    let callback = callback.clone();
     let claimed = ::engine::ServiceState::clone(&state);
     let handle = runtime.spawn(async move {
         // `true` only if the wake-up cap is what ended the loop; a clock that ran out of
@@ -421,7 +456,7 @@ pub fn drive_host_count_metrics<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) {
             // due check from costing a CPU-bound spin, and it hands the runtime back
             // between wake-ups.
             ::tokio::time::sleep(wait).await;
-            publish_due_checks(&*engine);
+            publish_due_checks_over(&*engine, &callback).await;
         }
         if capped {
             // Only THIS clock's claim, so a clock started since keeps its own.
@@ -530,24 +565,83 @@ fn earliest_check_due(store: &ElbState, now: SystemTime) -> Option<Duration> {
 /// 3. under this service's guard again, fold the observations into the registrations and take
 ///    the datapoints the due series are published as;
 /// 4. with the metric store's guard, append them and make the alarms over them due.
+///
+/// The checks it runs are the ones a store can observe on its own ([`observe`]): the
+/// invocation a `lambda` registration's check is belongs to [`publish_due_checks_over`],
+/// which is the pass the clock makes, so a check of one that is DUE is left to that pass
+/// rather than being consumed here ([`observe_all_connected`]).
 fn publish_due_checks<Eng: Send + Sync + 'static>(engine: &Eng) {
-    let Some(state) = super::service_state(engine) else {
+    let Some((state, opened)) = opened_pass(engine) else {
         return;
     };
+    let observations = observe_all_connected(engine, &opened.checked);
+    closed_pass(engine, &state, &observations, &opened);
+}
+
+/// [`publish_due_checks`] with the HEALTH CHECK of every `lambda` registration the pass made
+/// due performed over `callback` ([`observe_all_due`]) — the pass the clock makes, which is
+/// the one that can invoke a function.
+async fn publish_due_checks_over<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    callback: &EmbeddedEmulator,
+) {
+    let Some((state, opened)) = opened_pass(engine) else {
+        return;
+    };
+    let observations = observe_all_due(engine, callback, &opened.checked).await;
+    closed_pass(engine, &state, &observations, &opened);
+}
+
+/// Where one pass stands: the instants it reads the store against, and the registrations it
+/// is about.
+#[derive(Debug)]
+struct OpenPass {
+    /// The wall-clock instant every due-ness in the pass is read against, and every
+    /// datapoint it publishes is stamped from.
+    now: SystemTime,
+    /// The monotonic instant the publish schedule is read against.
+    instant: Instant,
+    /// The registrations this pass looks at ([`registrations_to_check`]).
+    checked: Vec<Checked>,
+}
+
+/// Step 1 of a pass: under this service's guard, open a series for every pair that is routed
+/// and close the ones that are not, and snapshot the registrations to check.
+fn opened_pass<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<(::engine::ServiceState<ElbState>, OpenPass)> {
+    let state = super::service_state(engine)?;
     let now = SystemTime::now();
     let instant = Instant::now();
     let checked = {
         let mut store = state.lock();
         sync_series(&mut store, now, instant);
-        registrations_to_check(&store)
+        registrations_to_check(&store, now)
     };
-    let observations = observe_all(engine, &checked);
+    Some((
+        state,
+        OpenPass {
+            now,
+            instant,
+            checked,
+        },
+    ))
+}
+
+/// Steps 3 and 4 of a pass: fold what its checks observed into the registrations they were
+/// about, and append the datapoints the due series are published as.
+fn closed_pass<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    state: &::engine::ServiceState<ElbState>,
+    observations: &[(String, TargetKey, Observation)],
+    opened: &OpenPass,
+) {
     let published = {
         let mut store = state.lock();
-        fold_observations(&mut store, &observations, now);
-        due_datapoints(&mut store, now, instant)
+        fold_observations(&mut store, observations, opened.now);
+        due_datapoints(&mut store, opened.now, opened.instant)
     };
-    append_datapoints(engine, published, now);
+    append_datapoints(engine, published, opened.now);
 }
 
 /// Open a series for every `(load balancer, target group)` pair the store now routes, and
@@ -596,7 +690,7 @@ fn run_up() -> Duration {
 /// Every one of them is LOOKED at; whether that look counts as one of the group's own
 /// scheduled checks is decided per registration, against the cadence it is checked at
 /// ([`super::TargetGroupRecord::observed_check`]).
-fn registrations_to_check(store: &ElbState) -> Vec<Checked> {
+fn registrations_to_check(store: &ElbState, now: SystemTime) -> Vec<Checked> {
     let mut checked: Vec<Checked> = Vec::new();
     for (target_group_arn, group) in &store.target_groups {
         if group.load_balancer_arns.is_empty() {
@@ -612,6 +706,7 @@ fn registrations_to_check(store: &ElbState) -> Vec<Checked> {
                 group,
                 key,
                 target,
+                now,
             ));
         }
     }
@@ -624,7 +719,11 @@ fn registrations_to_check(store: &ElbState) -> Vec<Checked> {
 ///
 /// A pair naming a group or a registration this store no longer holds contributes nothing: a
 /// deregistration may have taken it out since the caller read it.
-fn named_registrations(store: &ElbState, registrations: &[(String, TargetKey)]) -> Vec<Checked> {
+fn named_registrations(
+    store: &ElbState,
+    registrations: &[(String, TargetKey)],
+    now: SystemTime,
+) -> Vec<Checked> {
     registrations
         .iter()
         .take(MAX_CHECKS_PER_PASS)
@@ -640,6 +739,7 @@ fn named_registrations(store: &ElbState, registrations: &[(String, TargetKey)]) 
                 group,
                 key,
                 target,
+                now,
             ))
         })
         .collect()
@@ -653,6 +753,7 @@ fn checked_registration(
     group: &TargetGroupRecord,
     key: &TargetKey,
     target: &RegisteredTarget,
+    now: SystemTime,
 ) -> Checked {
     let health_check_port = group
         .health_check_port_of(target)
@@ -691,7 +792,56 @@ fn checked_registration(
         source_group_ids,
         source_interface_ids,
         source_groups_resolved,
+        check_due: now >= target.checks_due_at,
+        // A `lambda` registration is checked by invoking the function rather than by
+        // connecting to a port, and only while the group's health checks are on
+        // ([`crate::service::lambda_health_check`]).
+        lambda: crate::service::lambda_health_check::probe(group, target_group_arn, &target.id),
     }
+}
+
+/// What one check of each registration in `checked` observed, with the health check of every
+/// `lambda` registration the pass made DUE performed.
+///
+/// That check is an INVOCATION of the registered function
+/// ([`crate::service::lambda_health_check`]) rather than a reading of a store, so it is made
+/// here — where no guard of this store is held, as every other observation of this pass is —
+/// and only for a registration whose own cadence has made a check due: an invocation runs the
+/// function, so a look taken between two checks must not make one.
+async fn observe_all_due<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    callback: &EmbeddedEmulator,
+    checked: &[Checked],
+) -> Vec<(String, TargetKey, Observation)> {
+    let mut observations = observe_all(engine, checked);
+    for (target, observed) in checked.iter().zip(observations.iter_mut()) {
+        let Some(probe) = target.lambda.as_ref().filter(|_| target.check_due) else {
+            continue;
+        };
+        observed.2 = crate::service::lambda_health_check::observed(callback, probe).await;
+    }
+    observations
+}
+
+/// [`observe_all`] WITHOUT the due check of a `lambda` registration, for the pass that cannot
+/// make one: it carries no transport to invoke the function over
+/// ([`crate::service::lambda_health_check`]).
+///
+/// Such a registration is left out of the pass entirely rather than observed as nothing,
+/// because a look that is folded in COUNTS as the check its cadence had made due
+/// ([`super::TargetGroupRecord::observed_check`] moves the next one an interval on): a check
+/// nothing performed must not consume that cadence, or a stream of writes would keep the
+/// clock's own pass from ever making one.
+fn observe_all_connected<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    checked: &[Checked],
+) -> Vec<(String, TargetKey, Observation)> {
+    observe_all(engine, checked)
+        .into_iter()
+        .zip(checked.iter())
+        .filter(|(_, target)| !(target.check_due && target.lambda.is_some()))
+        .map(|(observation, _)| observation)
+        .collect()
 }
 
 /// What one check of each registration in `checked` observed, one entry per registration the
@@ -1019,8 +1169,10 @@ fn observe(target: &Checked, held: Option<&Inventory>) -> Observation {
     match target.target_type.as_str() {
         IP_TARGET_TYPE => Some(held.addresses.contains(&target.id)),
         INSTANCE_TARGET_TYPE => Some(held.running.contains(&target.id)),
-        // A `lambda` target is a function of another service, and a target type this
-        // service does not read is one no check here observes anything about.
+        // A `lambda` target names no address and no port, so nothing of the account's
+        // inventory is a fact about it: its check is the invocation
+        // [`observe_all_due`] makes. Any other target type is one this service does not
+        // read, and so observes nothing about either.
         _ => None,
     }
 }
@@ -1788,6 +1940,11 @@ mod tests {
                 source_group_ids: Vec::new(),
                 source_interface_ids: Vec::new(),
                 source_groups_resolved: false,
+                // This table is about what [`observe`] reads, which is every target type
+                // checked by a connection: a check of one of those is due or not without
+                // changing what it observes, and none of them is a `lambda` registration.
+                check_due: true,
+                lambda: None,
             };
             let observed = observe(&checked, Some(&held));
             assert_eq!(
@@ -1898,6 +2055,8 @@ mod tests {
                 source_group_ids: Vec::new(),
                 source_interface_ids: Vec::new(),
                 source_groups_resolved: false,
+                check_due: true,
+                lambda: None,
             };
             let observed = observe(&checked, Some(&held));
             assert_eq!(
@@ -2023,6 +2182,8 @@ mod tests {
                     // The load balancer's own record was read, which is where its groups
                     // come from.
                     source_groups_resolved: true,
+                    check_due: true,
+                    lambda: None,
                 };
                 let observed = observe(&checked, Some(&held));
                 assert_eq!(
@@ -2114,6 +2275,8 @@ mod tests {
                     source_group_ids: vec![load_balancer_group.clone()],
                     source_interface_ids: vec![load_balancer_interface.clone()],
                     source_groups_resolved: true,
+                    check_due: true,
+                    lambda: None,
                 };
                 let observed = observe(&checked, Some(&held));
                 assert_eq!(

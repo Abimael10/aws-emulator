@@ -402,7 +402,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // And a target group this load balancer now routes to is one it CHECKS, so its
         // host-count series opens here ([`crate::state::host_counts`]).
         drop(guard);
-        crate::state::drive_host_count_metrics(&self.engine);
+        crate::state::drive_host_count_metrics(&self.engine, ctx.callback());
 
         Ok(CreateRuleOutput {
             rules: Some(vec![stored]),

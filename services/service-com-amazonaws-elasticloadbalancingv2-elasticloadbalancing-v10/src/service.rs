@@ -105,6 +105,10 @@ pub mod access_log_destination;
 
 pub mod lambda_target;
 
+/// The HEALTH CHECK of a `lambda` target group: the invocation one check of such a group is,
+/// and the verdict the function's own answer decides.
+pub mod lambda_health_check;
+
 /// A `forward` to an `instance` or an `ip` target group: how a request is served by the
 /// workload the registered target itself runs.
 pub mod instance_target;

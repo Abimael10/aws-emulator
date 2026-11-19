@@ -99,8 +99,8 @@ pub use source_ip_conditions::{
 pub mod target_health;
 
 pub use target_health::{
-    deregistration_delay, health_check_interval, SchedulerRegistration, ServedPorts, TargetProbe,
-    DEREGISTRATION_DELAY_ATTRIBUTE,
+    deregistration_delay, health_check_interval, health_check_timeout, SchedulerRegistration,
+    ServedPorts, TargetProbe, DEREGISTRATION_DELAY_ATTRIBUTE,
 };
 
 /// Whether the security groups of a target's own network interface let a health check of it
@@ -175,7 +175,7 @@ pub use health_check_http_members::{
 pub mod health_check_matcher;
 
 pub use health_check_matcher::{
-    check_health_check_matcher, health_check_grpc_codes, health_check_http_codes,
+    check_health_check_matcher, health_check_grpc_codes, health_check_http_codes, matcher_admits,
     matcher_code_message,
 };
 

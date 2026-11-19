@@ -463,7 +463,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // host-count series opens for a pair it now routes and closes for one it does not
         // ([`crate::state::host_counts`]).
         drop(guard);
-        crate::state::drive_host_count_metrics(&self.engine);
+        crate::state::drive_host_count_metrics(&self.engine, ctx.callback());
         Ok(ModifyListenerOutput {
             listeners: Some(listeners),
         })

@@ -13991,6 +13991,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-acm-certificatemanager",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
+ "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",

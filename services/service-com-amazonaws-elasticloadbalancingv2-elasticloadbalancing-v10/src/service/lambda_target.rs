@@ -58,6 +58,16 @@
 //! No body is invented for any of those statuses, exactly as the sibling statuses this plane
 //! answers carry none ([`super::data_plane`]): the load balancer's own error page is not a
 //! document this emulator holds.
+//!
+//! # The other invocation of the same function
+//!
+//! A HEALTH CHECK of such a target group is an invocation too — the load balancer invokes the
+//! function rather than connecting to a port — and it is decided by
+//! [`super::lambda_health_check`], which reads the status of the object the function returned
+//! and nothing else of it. The event that check hands the function ([`health_check_event`]),
+//! the grant it is made under ([`invocation_admitted`]) and the client it is made with
+//! ([`lambda_client_over`]) are this module's, so ONE module states the contract between a
+//! load balancer and a Lambda target however the invocation came about.
 
 use ::serde_json::{Map, Value};
 use ::service_common::iam_authorization::{self as iam, Decision};
@@ -84,7 +94,10 @@ const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 /// The ARN namespace a Lambda function's ARN names it under, which is where the Region the
 /// invocation is made in is read from.
-const LAMBDA_ARN_NAMESPACE: &str = "lambda";
+///
+/// `pub(super)` because the health check of a `lambda` target group is an invocation of the
+/// same function, made in the same Region ([`super::lambda_health_check`]).
+pub(super) const LAMBDA_ARN_NAMESPACE: &str = "lambda";
 
 /// The service principal a load balancer invokes a function as, as a resource policy names
 /// one: "for Amazon Web Services services, the principal is a domain-style identifier that
@@ -129,6 +142,18 @@ const FORWARDED_PORT_HEADER: &str = "x-forwarded-port";
 /// The response header a load balancer's own cookie travels in — the target-group stickiness
 /// pin ([`super::target_group_selection`]) — beside whatever the function's own response set.
 const SET_COOKIE_HEADER: &str = "set-cookie";
+
+/// The request ONE HEALTH CHECK of a `lambda` target group makes: an Application Load
+/// Balancer's health check sends an HTTP `GET` to the destination the group's
+/// `HealthCheckPath` names, and names itself in the request's user-agent field
+/// ([`HEALTH_CHECKER_USER_AGENT`]). What that request becomes as an event is
+/// [`health_check_event`]; what the answer to it decides is [`super::lambda_health_check`].
+const HEALTH_CHECK_METHOD: &str = "GET";
+
+/// The header a health check reports the checker in, and the value an Application Load
+/// Balancer's own health checker reports itself as.
+const USER_AGENT_HEADER: &str = "user-agent";
+const HEALTH_CHECKER_USER_AGENT: &str = "ELB-HealthChecker/2.0";
 
 /// Which function a `forward` to a `lambda` target group invokes, and what the event reports
 /// about the hop — read out of the store under its own guard, so the invocation is made with
@@ -406,6 +431,53 @@ fn event(forwarded: &Forwarded, request: &DataPlaneRequest, body: &[u8]) -> Valu
     Value::Object(event)
 }
 
+/// The event ONE HEALTH CHECK of a `lambda` target group becomes.
+///
+/// A check of such a group is performed by INVOKING the function rather than by connecting to
+/// a port, so the function is handed an event of the same shape a forwarded request becomes:
+/// the target group the check belongs to, the method and the destination the check requests
+/// ([`HEALTH_CHECK_METHOD`], the group's `HealthCheckPath`), the user-agent field the checker
+/// names itself in, and no query string and no body — a health check carries neither, and
+/// nothing of any client is reported, because no client sent it.
+///
+/// The single- or multi-valued members follow the group's own
+/// `lambda.multi_value_headers.enabled` ([`multi_value_headers`]), exactly as they do for a
+/// forwarded request: the attribute is about what the load balancer and the function
+/// exchange, which is this event too.
+pub(super) fn health_check_event(
+    target_group_arn: &str,
+    path: &str,
+    multi_value_headers: bool,
+) -> Value {
+    let mut event = Map::new();
+    event.insert(
+        "requestContext".to_string(),
+        ::serde_json::json!({
+            "elb": { TARGET_GROUP_ARN_MEMBER: target_group_arn }
+        }),
+    );
+    event.insert("httpMethod".to_string(), Value::from(HEALTH_CHECK_METHOD));
+    event.insert("path".to_string(), Value::from(path));
+    let query: Vec<(String, String)> = Vec::new();
+    let headers = vec![(
+        USER_AGENT_HEADER.to_string(),
+        HEALTH_CHECKER_USER_AGENT.to_string(),
+    )];
+    if multi_value_headers {
+        event.insert(
+            "multiValueQueryStringParameters".to_string(),
+            multi_valued(&query),
+        );
+        event.insert(MULTI_VALUE_HEADERS_MEMBER.to_string(), multi_valued(&headers));
+    } else {
+        event.insert("queryStringParameters".to_string(), single_valued(&query));
+        event.insert(HEADERS_MEMBER.to_string(), single_valued(&headers));
+    }
+    event.insert(BODY_MEMBER.to_string(), Value::from(""));
+    event.insert(BASE64_MEMBER.to_string(), Value::from(false));
+    Value::Object(event)
+}
+
 /// The headers the event reports: the request's own, and the protocol and port of the
 /// listener it arrived on, which the load balancer reports itself. A value the load balancer
 /// reports REPLACES one the client sent under the same name — what is behind the load
@@ -479,9 +551,7 @@ fn multi_valued(pairs: &[(String, String)]) -> Value {
 /// Every refusal here is one the LOAD BALANCER answers: the object is the contract between
 /// the two, so a payload that is not one is not passed through to the client.
 fn mapped_response(payload: &[u8], multi_value_headers: bool) -> Result<Served, String> {
-    let Ok(Value::Object(returned)) = ::serde_json::from_slice::<Value>(payload) else {
-        return Err("the response is not a JSON object".to_string());
-    };
+    let returned = returned_object(payload)?;
     let status = status_of(&returned)?;
     let mut headers = headers_of(&returned)?;
     // A header the object names more than once is sent more than once, which is how several
@@ -498,6 +568,27 @@ fn mapped_response(payload: &[u8], multi_value_headers: bool) -> Result<Served, 
         body: body_of(&returned)?,
         ..Served::default()
     })
+}
+
+/// The object a function returned, refused when the payload is not one — the first thing
+/// every reader of such a payload establishes, whether it reads the whole response
+/// ([`mapped_response`]) or the status alone ([`answered_status`]).
+fn returned_object(payload: &[u8]) -> Result<Map<String, Value>, String> {
+    match ::serde_json::from_slice::<Value>(payload) {
+        Ok(Value::Object(returned)) => Ok(returned),
+        _ => Err("the response is not a JSON object".to_string()),
+    }
+}
+
+/// The status the object a function returned names, for a reader that reads the STATUS and
+/// nothing else of it — which is what ONE HEALTH CHECK of a `lambda` target group is judged
+/// on ([`super::lambda_health_check`]): the check succeeds while the code the function
+/// answered is one the target group's `Matcher` counts as success.
+///
+/// Refused for exactly the reasons the whole response is refused for, because it is the same
+/// contract: a payload that is no response object, and one naming no readable status.
+pub(super) fn answered_status(payload: &[u8]) -> Result<u16, String> {
+    status_of(&returned_object(payload)?)
 }
 
 /// The status the returned object names, refused when it is not a number inside the range a
@@ -628,7 +719,7 @@ fn body_of(returned: &Map<String, Value>) -> Result<Vec<u8>, String> {
 /// registration whose function Lambda does not answer about at all, and an emulator with no
 /// Lambda mounted, are not evidence of a missing grant. A function whose policy Lambda
 /// REPORTS as absent is an answer rather than a silence: it grants nothing.
-async fn invocation_admitted(
+pub(super) async fn invocation_admitted(
     client: &::aws_sdk_lambda::Client,
     function: &str,
     source_arn: &str,
@@ -688,7 +779,7 @@ async fn invocation_admitted(
 /// A failure the emulator itself produced — no service of it serves the endpoint, or more
 /// than one claims it — is not Lambda answering, so it grounds no refusal: `service_common`
 /// owns the one reading of that refusal.
-fn refused_by_lambda<E>(
+pub(super) fn refused_by_lambda<E>(
     error: &::aws_smithy_runtime_api::client::result::SdkError<
         E,
         ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
@@ -707,10 +798,20 @@ fn refused_by_lambda<E>(
 /// emulator mounts and no connection is opened; the credentials are the ones the callback
 /// hands over, which sign this call and are never reported or logged.
 fn lambda_client(ctx: &OperationContext<'_>, region: &str) -> ::aws_sdk_lambda::Client {
+    lambda_client_over(ctx.callback(), region)
+}
+
+/// [`lambda_client`] for a caller that has the callback without a request to read it off: the
+/// health check of a `lambda` target group runs on this service's own clock
+/// ([`super::lambda_health_check`]), so there is no operation context to take it from.
+pub(super) fn lambda_client_over(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+) -> ::aws_sdk_lambda::Client {
     let config = ::aws_sdk_lambda::Config::builder()
         .behavior_version(::aws_sdk_lambda::config::BehaviorVersion::latest())
-        .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(callback.http_client())
+        .credentials_provider(callback.aws_credentials_provider())
         .region(::aws_sdk_lambda::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://lambda.{region}.amazonaws.com"))
         // The transport is in-process: there is nothing to retry, time out or watch for a
