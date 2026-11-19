@@ -208,15 +208,26 @@ const EXEC_COMMAND: &str = "exec";
 /// itself with the command"), which is how a container's command hands itself to the server its
 /// image ships, `hostname` writes the name the runtime gave this container, and `test` — with
 /// its `[ ... ]` spelling — answers a question about the words it
-/// was given or about the container's own filesystem ([`ContainerShell::run_test`]). The
-/// commands that work over that filesystem are [`FILE_COMMANDS`]; a command outside either
+/// was given or about the container's own filesystem ([`ContainerShell::run_test`]). `pwd`,
+/// `id`, `ulimit` and `df` REPORT the process this session is — where it runs, who it runs
+/// as, the limits it runs under and the space on the filesystem it writes on — off the
+/// settings its launch resolved ([`PROCESS_REPORT_COMMANDS`]).
+/// The commands that work over that filesystem are [`FILE_COMMANDS`]; a command outside either
 /// catalog and outside the text filters and the SERVERS the container's image ships
 /// ([`super::container_servers`]) needs a program or a network this container does not
 /// have.
 pub const BUILT_IN_COMMANDS: &[&str] = &[
     "echo", "true", "false", ":", "exit", "export", "unset", "trap", "sleep", "wait", "test",
-    "[", "set", "exec", "hostname",
+    "[", "set", "exec", "hostname", "pwd", "id", "ulimit", "df",
 ];
+
+/// The commands of [`BUILT_IN_COMMANDS`] that REPORT a fact about the process this session
+/// is, rather than doing anything to it: where it runs (`pwd`), who it runs as (`id`), the
+/// resource limits it runs under (`ulimit`) and the space on the filesystem it writes on
+/// (`df`). Each is answered off the settings the container's launch resolved
+/// ([`super::container_process`]), and a question about a setting this emulator holds no
+/// value for is a command that did not run.
+const PROCESS_REPORT_COMMANDS: [&str; 4] = ["pwd", "id", "ulimit", "df"];
 
 /// The commands an assignment written before them persists in the session for: POSIX's
 /// special built-in utilities, for which "variable assignments specified with special
@@ -546,6 +557,11 @@ pub struct ContainerShell {
     /// none — one whose commands reach no account service at all, so an `aws` command is one
     /// it could not run ([`super::container_aws_cli`]).
     aws: Option<Arc<ContainerAwsCli>>,
+    /// What the PROCESS this session is runs as — the user and the resource limits its
+    /// container definition gives it, and the ephemeral storage its task was given — which
+    /// is what the utilities that report a process's own session answer
+    /// ([`super::container_process`]).
+    process: ContainerProcess,
 }
 
 impl ContainerShell {
@@ -599,7 +615,18 @@ impl ContainerShell {
             pipefail: false,
             last_status: EXIT_SUCCESS,
             aws: None,
+            process: ContainerProcess::default(),
         }
+    }
+
+    /// This session as the PROCESS its container's launch resolved: the user it runs as, the
+    /// resource limits it runs under and the ephemeral storage it writes on
+    /// ([`super::container_process`]). A session built without it holds what a definition
+    /// stating none of them holds, so nothing is reported that a launch did not resolve.
+    #[must_use]
+    pub fn with_process(mut self, process: ContainerProcess) -> Self {
+        self.process = process;
+        self
     }
 
     /// This session with the AWS CLI its container's environment provides on it: the
@@ -1806,9 +1833,53 @@ impl ContainerShell {
                 // for and the utility answers success.
                 "wait" => EXIT_SUCCESS,
                 "test" | "[" => self.run_test(name, arguments),
+                _ if PROCESS_REPORT_COMMANDS.contains(&name) => {
+                    self.run_process_report(name, arguments, redirections).await
+                }
                 _ => self.declined(),
             }
         })
+    }
+
+    /// Perform one of the commands that REPORT a fact about the process this session is
+    /// ([`PROCESS_REPORT_COMMANDS`]): where it runs, who it runs as, the resource limits it
+    /// runs under, or the space on the filesystem it writes on.
+    ///
+    /// Each answer is the one the container's launch resolved
+    /// ([`super::container_process`]), written as the utility writes it. An invocation that
+    /// asks for a form this session does not perform, or about a setting this emulator holds
+    /// no value for, is a command that did not run ([`Self::declined`]) rather than a value
+    /// nothing backs.
+    async fn run_process_report(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        redirections: &Redirections,
+    ) -> i32 {
+        let written = match name {
+            "pwd" => working_directory_report(arguments, self.filesystem.working_in()),
+            "id" => self.process.identity_report(arguments),
+            "ulimit" => self.process.limit_report(arguments),
+            // WHICH filesystem each operand is on is resolved against the container's own
+            // filesystem here, because that is what holds the mounts.
+            "df" => {
+                let in_a_mount = arguments
+                    .iter()
+                    .filter(|argument| !argument.starts_with('-'))
+                    .any(|path| self.filesystem.is_in_a_mount(path));
+                self.process
+                    .storage_report(arguments, self.filesystem.layer_bytes(), in_a_mount)
+            }
+            _ => None,
+        };
+        let Some(written) = written else {
+            return self.declined();
+        };
+        if self.write_stdout(&written, redirections).await {
+            EXIT_SUCCESS
+        } else {
+            EXIT_FAILURE
+        }
     }
 
     /// `test EXPRESSION`, and its `[ EXPRESSION ]` spelling: the question the expression
@@ -2299,11 +2370,20 @@ impl ContainerShell {
     /// [`MAX_EXPANSION_BYTES`], or one whose expansion would take the command past
     /// [`MAX_LINE_EXPANSION_BYTES`].
     fn expand_word<'a>(&'a mut self, word: &str) -> ShellFuture<'a, Option<String>> {
+        self.expand_word_at(word, MAX_WORD_DEPTH)
+    }
+
+    /// [`Self::expand_word`] with `depth` levels of nesting LEFT rather than the whole budget,
+    /// for the expansion of a word that stands INSIDE another one: the text of an arithmetic
+    /// expansion is itself expanded ([`Self::expand_arithmetic`]), so that nested expansion
+    /// continues this walk's descent instead of starting a fresh one — which is what keeps the
+    /// recursion of a word nesting arithmetic inside arithmetic inside [`MAX_WORD_DEPTH`].
+    fn expand_word_at<'a>(&'a mut self, word: &str, depth: usize) -> ShellFuture<'a, Option<String>> {
         let word = word.to_string();
         Box::pin(async move {
             let options = ::brush_parser::ParserOptions::default();
             let pieces = ::brush_parser::word::parse(&word, &options).ok()?;
-            let expanded = self.expand_pieces(pieces, MAX_WORD_DEPTH, false).await?;
+            let expanded = self.expand_pieces(pieces, depth, false).await?;
             self.expansion_left = self.expansion_left.checked_sub(expanded.len())?;
             Some(expanded)
         })
@@ -2342,7 +2422,9 @@ impl ContainerShell {
                         escaped_text(&sequence, double_quoted)?
                     }
                     ::brush_parser::word::WordPiece::ArithmeticExpression(expression) => {
-                        self.expand_arithmetic(&expression.value).await?
+                        // `depth` and not the whole budget: the expression's own text is
+                        // expanded, and that expansion is one level further down THIS walk.
+                        self.expand_arithmetic(&expression.value, depth).await?
                     }
                     _ => return None,
                 };
@@ -2427,13 +2509,23 @@ impl ContainerShell {
     /// `None` is an expansion with no value, which makes the word carrying it one this
     /// container does not perform: text past the bound a parse is given
     /// ([`within_parse_bounds`], applied to what the expansion materialised rather than only
-    /// to the line it came from), an expression that does not parse, one that module does not
+    /// to the line it came from), an expression nested past the `depth` its word has left,
+    /// one that does not parse, one that module does not
     /// evaluate, and one whose arithmetic has no answer (a division by zero, an overflow).
-    fn expand_arithmetic<'a>(&'a mut self, text: &str) -> ShellFuture<'a, Option<String>> {
+    ///
+    /// `depth` is how many levels of nesting the word carrying this expansion has left
+    /// ([`Self::expand_word_at`]): resolving the text is a step DOWN that walk, so an
+    /// expansion written inside another one spends a level rather than beginning again, and
+    /// this recursion ends whatever the text nests.
+    fn expand_arithmetic<'a>(
+        &'a mut self,
+        text: &str,
+        depth: usize,
+    ) -> ShellFuture<'a, Option<String>> {
         let text = text.to_string();
         Box::pin(async move {
             let resolved = self
-                .expand_word(&text)
+                .expand_word_at(&text, depth)
                 .await
                 .unwrap_or_else(|| text.clone());
             // The expansion above can have MATERIALISED text far longer and far more deeply

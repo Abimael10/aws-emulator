@@ -309,6 +309,24 @@ impl ContainerFilesystem {
         !self.mounts.is_empty()
     }
 
+    /// Whether `path` lands inside a volume MOUNTED into this container, as against on the
+    /// container's own writable layer: the two are different filesystems, and what is known
+    /// about each of them is different ([`super::container_process`]).
+    pub fn is_in_a_mount(&self, path: &str) -> bool {
+        self.locate(path)
+            .is_some_and(|located| located.mount.is_some())
+    }
+
+    /// How many bytes the container's own writable LAYER holds — the sum of what every file
+    /// on it holds, which is what the space on that filesystem is reported as used
+    /// ([`super::container_process`]).
+    pub fn layer_bytes(&self) -> u64 {
+        self.layer
+            .stored_files()
+            .map(|(_, contents)| u64::try_from(contents.len()).unwrap_or(u64::MAX))
+            .sum()
+    }
+
     /// `path` as a process of this container resolves it: a relative path against the
     /// container's working directory, with `.` and `..` segments resolved — and `None` for a
     /// path no filesystem here accepts.

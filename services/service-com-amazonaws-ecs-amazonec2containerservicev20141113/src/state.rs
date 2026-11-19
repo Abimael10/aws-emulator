@@ -348,6 +348,12 @@ pub use deployment_events::*;
 mod container_shell;
 pub use container_shell::*;
 
+/// What a container's PROCESS runs as — the working directory, the user, the resource limits
+/// and the ephemeral storage its launch resolved — and what the utilities that report a
+/// process's own session answer about them.
+mod container_process;
+pub use container_process::*;
+
 /// The SERVER a container's program starts, and what it answers for a request made to the
 /// task's own address on the port that server listens on.
 mod container_servers;

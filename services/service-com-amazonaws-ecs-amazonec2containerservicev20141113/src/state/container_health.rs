@@ -388,6 +388,10 @@ pub struct HealthProbeLaunch {
     /// `ContainerDefinition$workingDirectory`, which the probe's relative paths are resolved
     /// against — the container's own, for the same reason.
     working_directory: Option<String>,
+    /// What the container's process runs as, for that same reason: the probe runs INSIDE the
+    /// container, so the user, the resource limits and the storage it reports are the
+    /// container's own ([`super::container_process`]).
+    process: ContainerProcess,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -520,6 +524,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     mounts,
                     working_directory: stored
                         .and_then(|stored| stored.working_directory.clone()),
+                    process: ContainerProcess::of(stored, task),
                 });
             }
         }
@@ -834,7 +839,8 @@ async fn run_health_probe(
     // container is PROBED with, and what listens in the container is what its own program
     // started ([`super::container_servers`]), so this session publishes nothing.
     let mut shell =
-        ContainerShell::new(probe.environment, output, signals, deadline, filesystem, None);
+        ContainerShell::new(probe.environment, output, signals, deadline, filesystem, None)
+            .with_process(probe.process.clone());
     let program = probe.program;
     let outcome = ::tokio::time::timeout(probe.timeout, async move { shell.run(&program).await })
         .await

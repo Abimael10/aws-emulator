@@ -20,6 +20,10 @@
 //!    `mountPoints[].containerPath`, over ONE namespace, and a mount point whose `readOnly`
 //!    is `true` has every write to it refused with the kernel's EROFS while the read through
 //!    it still answers.
+//! 5. A container's process runs with the RUNTIME SETTINGS its task definition and its
+//!    placement resolved — `workingDirectory`, `user`, `ulimits` and the task's
+//!    `ephemeralStorage` — so the utilities that report a process's own session answer those
+//!    values from inside the container: `pwd`, `id`, `ulimit` and `df`.
 //!
 //! CloudWatch Logs is mounted BESIDE Amazon ECS on the SAME engine, so a container's output
 //! travels the real in-process callback into the real log service and is read back with that
@@ -32,7 +36,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    cluster_with_capacity, list, ok, present_count, string, SIGNED_REGION,
+    awsvpc_network_configuration, cluster_with_capacity, create_cluster, list, ok, present_count,
+    seed_awsvpc_subnets, string, ACCOUNT, SIGNED_REGION,
 };
 
 /// The log group every container below delivers to, created through CloudWatch Logs' own
@@ -63,9 +68,11 @@ const QUIET_BUDGET: Duration = Duration::from_secs(3);
 
 /// A router carrying Amazon ECS and CloudWatch Logs over ONE shared engine — the two
 /// services a container's output travels through, mounted the way the production router
-/// mounts them.
+/// mounts them — holding the one Amazon VPC subnet an `awsvpc` placement of this suite names
+/// in the account's records, which a Fargate task is allocated its interface in.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    seed_awsvpc_subnets(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -275,21 +282,32 @@ async fn all_task_arns(router: &MultiServiceRouter, cluster: &str, case: &str) -
     arns
 }
 
-/// Poll `probe` until it answers `Some`, or the budget runs out — for the transitions the
-/// clock owes and the deliveries a container's own run makes.
+/// Poll `probe` until it answers `Some`, or [`POLL_BUDGET`] runs out — for the transitions
+/// the clock owes and the deliveries a container's own run makes.
 async fn poll_until<T, F, Fut>(probe: F, description: &str) -> T
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
-    let deadline = Instant::now() + POLL_BUDGET;
+    poll_until_within(probe, POLL_BUDGET, description).await
+}
+
+/// The same, with the budget the caller gives it: a Fargate `awsvpc` task waits for the
+/// interface Amazon ECS creates and attaches for it before anything of it starts, which is
+/// several spans more than a task placed on capacity already registered to its cluster.
+async fn poll_until_within<T, F, Fut>(probe: F, budget: Duration, description: &str) -> T
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = Instant::now() + budget;
     loop {
         if let Some(answer) = probe().await {
             return answer;
         }
         assert!(
             Instant::now() < deadline,
-            "{description}: not observed within {POLL_BUDGET:?}"
+            "{description}: not observed within {budget:?}"
         );
         ::tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -973,4 +991,329 @@ async fn a_declared_volume_is_mounted_and_a_read_only_mount_point_refuses_writes
         "case {case:?}: expected the program to end successfully, got {exit_code} with \
          {lines:?}"
     );
+}
+
+/// The cluster the runtime-settings rows below place their Fargate tasks in.
+const PROCESS_CLUSTER: &str = "containerprocess";
+
+/// How long the runtime-settings rows keep polling before giving up. Generous: a Fargate
+/// `awsvpc` task waits for the interface Amazon ECS creates and attaches for it, then for its
+/// own start and its containers', and this suite runs beside every other test of the
+/// workspace, which can slow each of those spans down. The deadline is only here so a failure
+/// is a failure rather than a hang.
+const PROCESS_POLL_BUDGET: Duration = Duration::from_secs(240);
+
+/// What one row of the runtime-settings table asks for, and what its container must report.
+struct ProcessRow {
+    case: &'static str,
+    /// The family prefix the row registers under, so each row reads its own revisions back.
+    family: &'static str,
+    /// `ContainerDefinition$workingDirectory`, when the row names one.
+    working_directory: Option<&'static str>,
+    /// `ContainerDefinition$user`, when the row names one.
+    user: Option<&'static str>,
+    /// `ContainerDefinition$ulimits`, when the row names any.
+    ulimits: Option<Value>,
+    /// `TaskDefinition$ephemeralStorage.sizeInGiB`, when the row expands it.
+    storage_gib: Option<i32>,
+    /// The program whose utilities REPORT the settings, whose lines the row asserts.
+    report: &'static str,
+    /// The lines those utilities must write, in order, with runs of spaces collapsed.
+    expect_lines: &'static [&'static str],
+    /// The program a SECOND task of the same revision runs: one that BRANCHES on each
+    /// setting and exits with the status those branches chose.
+    branch: &'static str,
+    /// The status that program must exit with.
+    expect_exit: i64,
+}
+
+/// Register one Fargate-compatible revision of `family` whose one container runs `command`
+/// with `row`'s settings and delivers its output to [`LOG_GROUP`].
+async fn register_process_revision(
+    router: &MultiServiceRouter,
+    row: &ProcessRow,
+    family: &str,
+    command: &str,
+) {
+    let mut container = json!({
+        "name": CONTAINER,
+        "image": IMAGE,
+        "command": ["sh", "-c", command],
+        "logConfiguration": {
+            "logDriver": "awslogs",
+            "options": {
+                "awslogs-group": LOG_GROUP,
+                "awslogs-region": SIGNED_REGION,
+                "awslogs-stream-prefix": STREAM_PREFIX,
+            },
+        },
+    });
+    if let Some(directory) = row.working_directory {
+        container["workingDirectory"] = json!(directory);
+    }
+    if let Some(user) = row.user {
+        container["user"] = json!(user);
+    }
+    if let Some(ulimits) = row.ulimits.clone() {
+        container["ulimits"] = ulimits;
+    }
+    let mut definition = json!({
+        "family": family,
+        "networkMode": "awsvpc",
+        "requiresCompatibilities": ["FARGATE"],
+        // A documented Fargate task size: 256 CPU units, 512 MiB.
+        "cpu": "256",
+        "memory": "512",
+        // A Fargate revision whose container configures the `awslogs` driver has to name a
+        // task execution role ("Fargate requires task definition to have execution role ARN
+        // to support log driver awslogs"). No IAM store is mounted here, so nothing is shown
+        // about this role and no gate over its documents decides anything for these launches.
+        "executionRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/container-process-exec"),
+        "containerDefinitions": [container],
+    });
+    if let Some(size) = row.storage_gib {
+        definition["ephemeralStorage"] = json!({ "sizeInGiB": size });
+    }
+    ok(router, "RegisterTaskDefinition", definition, row.case).await;
+}
+
+/// Launch one standalone Fargate task of `family` and answer its ARN.
+async fn run_fargate_task(router: &MultiServiceRouter, family: &str, case: &str) -> String {
+    let body = ok(
+        router,
+        "RunTask",
+        json!({
+            "cluster": PROCESS_CLUSTER,
+            "taskDefinition": family,
+            "launchType": "FARGATE",
+            "networkConfiguration": awsvpc_network_configuration(),
+        }),
+        case,
+    )
+    .await;
+    let tasks = list(&body, "tasks", case);
+    let task = tasks
+        .first()
+        .unwrap_or_else(|| panic!("case {case:?}: expected RunTask to place one task, got {body}"));
+    string(task, "taskArn", case)
+}
+
+/// Poll `probe` until it answers `Some`, or [`PROCESS_POLL_BUDGET`] runs out — waiting for
+/// the CONDITION (a line delivered, a status reported) rather than for a span.
+async fn poll_process_until<T, F, Fut>(probe: F, description: &str) -> T
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    poll_until_within(probe, PROCESS_POLL_BUDGET, description).await
+}
+
+/// RULE 5: a container's process runs with the runtime settings its task definition and its
+/// placement resolved — `workingDirectory`, `user`, `ulimits` and the task's
+/// `ephemeralStorage` — so the utilities that report a process's own session answer those
+/// values: `pwd` the directory, `id` the user and group, `ulimit` a resource limit, and `df`
+/// the space on the filesystem the container writes on.
+///
+/// Each row reads them back TWO ways, which is what tells a value that is merely written from
+/// one a program can act on: the lines the utilities wrote, delivered through the container's
+/// own `awslogs` driver and read back with CloudWatch Logs' own `GetLogEvents`, and the status
+/// of a program that BRANCHES on each of them — the form a client checks its runtime settings
+/// with.
+#[tokio::test]
+async fn a_containers_process_reports_the_runtime_settings_its_launch_resolved() {
+    let router = emulator();
+    create_cluster(&router, PROCESS_CLUSTER, "setup").await;
+    ok(
+        &router,
+        "PutClusterCapacityProviders",
+        json!({
+            "cluster": PROCESS_CLUSTER,
+            "capacityProviders": ["FARGATE"],
+            "defaultCapacityProviderStrategy": [],
+        }),
+        "setup",
+    )
+    .await;
+    create_log_group(&router, "setup").await;
+
+    let rows: &[ProcessRow] = &[
+        ProcessRow {
+            case: "every setting named",
+            family: "processnamed",
+            working_directory: Some("/srv/app"),
+            user: Some("1234:5678"),
+            ulimits: Some(json!([
+                { "name": "nofile", "softLimit": 1024, "hardLimit": 4096 },
+            ])),
+            storage_gib: Some(50),
+            report: "pwd; id -u; id -g; ulimit -n; ulimit -Hn; df -k /",
+            // `df`'s own report: the header, then the row of the filesystem the container's
+            // writable layer is on, sized by the task's ephemeral storage — 50 GiB in the
+            // 1024-byte blocks the utility reports in.
+            expect_lines: &[
+                "/srv/app",
+                "1234",
+                "5678",
+                "1024",
+                "4096",
+                "Filesystem 1K-blocks Used Available Use% Mounted on",
+                "overlay 52428800 0 52428800 0% /",
+            ],
+            branch: "code=0; \
+                     [ \"$(pwd)\" = /srv/app ] || code=$((code+1)); \
+                     [ \"$(id -u)\" = 1234 ] || code=$((code+2)); \
+                     [ \"$(ulimit -n)\" = 1024 ] || code=$((code+4)); \
+                     [ \"$(ulimit -Hn)\" = 4096 ] || code=$((code+8)); \
+                     exit $code",
+            expect_exit: 0,
+        },
+        ProcessRow {
+            case: "no setting named at all",
+            family: "processdefault",
+            working_directory: None,
+            user: None,
+            ulimits: None,
+            storage_gib: None,
+            // The defaults: the root of the container's filesystem, the superuser, the
+            // `nofile` limit the `Ulimit` documentation states Fargate overrides, and the
+            // ephemeral storage a Fargate task that expands none holds — 20 GiB, reported
+            // here in mebibytes.
+            report: "pwd; id -u; id -g; ulimit -n; ulimit -Hn; df -m /",
+            expect_lines: &[
+                "/",
+                "0",
+                "0",
+                "65535",
+                "65535",
+                "Filesystem 1M-blocks Used Available Use% Mounted on",
+                "overlay 20480 0 20480 0% /",
+            ],
+            branch: "code=0; \
+                     [ \"$(pwd)\" = / ] || code=$((code+1)); \
+                     [ \"$(id -u)\" = 0 ] || code=$((code+2)); \
+                     [ \"$(id -gn)\" = root ] || code=$((code+4)); \
+                     [ \"$(ulimit -n)\" = 65535 ] || code=$((code+8)); \
+                     exit $code",
+            expect_exit: 0,
+        },
+        ProcessRow {
+            case: "a user named by name, and the smallest storage the member admits",
+            family: "processnameduser",
+            working_directory: Some("/tmp"),
+            user: Some("appuser:staff"),
+            ulimits: Some(json!([
+                { "name": "nproc", "softLimit": -1, "hardLimit": -1 },
+                { "name": "stack", "softLimit": 8388608, "hardLimit": 8388608 },
+            ])),
+            // "The minimum supported value is 21 GiB".
+            storage_gib: Some(21),
+            // A user written as a NAME is the name `id -n` answers; the limit on the stack is
+            // reported in the kibibytes the utility documents, and a limit of -1 is a
+            // resource that is not limited at all.
+            report: "id -un; id -gn; ulimit -u; ulimit -s; df -h /tmp; pwd",
+            expect_lines: &[
+                "appuser",
+                "staff",
+                "unlimited",
+                "8192",
+                "Filesystem Size Used Available Use% Mounted on",
+                "overlay 21.0G 0 21.0G 0% /",
+                "/tmp",
+            ],
+            branch: "code=0; \
+                     [ \"$(pwd)\" = /tmp ] || code=$((code+1)); \
+                     [ \"$(id -un)\" = appuser ] || code=$((code+2)); \
+                     [ \"$(ulimit -u)\" = unlimited ] || code=$((code+4)); \
+                     [ \"$(ulimit -s)\" = 8192 ] || code=$((code+8)); \
+                     exit $code",
+            expect_exit: 0,
+        },
+        ProcessRow {
+            case: "the largest storage the member admits, and a program that answers what it \
+                   did not find",
+            family: "processmax",
+            working_directory: Some("/data"),
+            user: Some("7"),
+            ulimits: Some(json!([
+                { "name": "nofile", "softLimit": 2048, "hardLimit": 8192 },
+            ])),
+            // "the maximum supported value is 200 GiB".
+            storage_gib: Some(200),
+            report: "df -k /data; id -u; ulimit -Hn",
+            expect_lines: &[
+                "Filesystem 1K-blocks Used Available Use% Mounted on",
+                "overlay 209715200 0 209715200 0% /",
+                "7",
+                "8192",
+            ],
+            // Every clause of this program is FALSE for the settings this revision names, so
+            // the status is the sum of their bits — which is what makes the zeros above an
+            // observation of the settings rather than a constant.
+            branch: "code=0; \
+                     [ \"$(pwd)\" = /elsewhere ] || code=$((code+1)); \
+                     [ \"$(id -u)\" = 8 ] || code=$((code+2)); \
+                     [ \"$(ulimit -n)\" = 1 ] || code=$((code+4)); \
+                     [ \"$(ulimit -Hn)\" = 2 ] || code=$((code+8)); \
+                     exit $code",
+            expect_exit: 15,
+        },
+    ];
+
+    // Every row's two tasks are launched FIRST and polled afterwards: the runs happen in
+    // parallel in the one emulator, so the suite waits for the longest of them rather than
+    // for their sum.
+    let mut launched: Vec<(&ProcessRow, String, String)> = Vec::new();
+    for row in rows {
+        let report_family = format!("{}report", row.family);
+        register_process_revision(&router, row, &report_family, row.report).await;
+        let report_arn = run_fargate_task(&router, &report_family, row.case).await;
+        let branch_family = format!("{}branch", row.family);
+        register_process_revision(&router, row, &branch_family, row.branch).await;
+        let branch_arn = run_fargate_task(&router, &branch_family, row.case).await;
+        launched.push((row, report_arn, branch_arn));
+    }
+
+    for (row, report_arn, branch_arn) in &launched {
+        let case = row.case;
+        let stream = stream_of(report_arn);
+        let wanted = row.expect_lines.len();
+        let lines = poll_process_until(
+            || async {
+                let events = delivered(&router, &stream).await;
+                (events.len() >= wanted).then_some(events)
+            },
+            &format!("case {case:?}: the {wanted} lines the utilities write in {stream}"),
+        )
+        .await;
+        // Runs of spaces collapsed: `df` ALIGNS its columns, and what a program reads out of
+        // the report is its fields rather than the padding between them.
+        let written: Vec<String> = lines
+            .iter()
+            .map(|line| line.split_whitespace().collect::<Vec<&str>>().join(" "))
+            .collect();
+        assert_eq!(
+            written,
+            row.expect_lines
+                .iter()
+                .map(|line| (*line).to_string())
+                .collect::<Vec<String>>(),
+            "case {case:?}: expected the utilities to report the settings the launch \
+             resolved, got {written:?}"
+        );
+
+        let exit_code = poll_process_until(
+            || async {
+                let task = describe(&router, PROCESS_CLUSTER, branch_arn, case).await;
+                let containers = list(&task, "containers", case);
+                present_count(containers.first()?, "exitCode", case)
+            },
+            &format!("case {case:?}: the branching program's exitCode"),
+        )
+        .await;
+        assert_eq!(
+            exit_code, row.expect_exit,
+            "case {case:?}: expected the branching program to exit {}, got {exit_code}",
+            row.expect_exit
+        );
+    }
 }

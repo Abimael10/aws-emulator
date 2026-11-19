@@ -211,6 +211,10 @@ pub struct ContainerLaunch {
     credential: TaskRoleCredential,
     /// The Region those calls are addressed in, which is the Region the task was placed in.
     region: String,
+    /// What the PROCESS of this container runs as: the user and the resource limits its
+    /// definition gives it, and the ephemeral storage its task was given
+    /// ([`super::container_process`]).
+    process: ContainerProcess,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -411,6 +415,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     signals,
                     credential: credential.clone(),
                     region: launch_region.clone(),
+                    // What this container's process runs as, read off the same stored
+                    // definition its program is, and off the task's own placement.
+                    process: ContainerProcess::of(Some(stored), task),
                 });
             }
             for (container_arn, signals, runs_a_program) in started {
@@ -691,7 +698,10 @@ async fn run_container(
         callback.clone(),
         &launch.region,
         launch.credential.clone(),
-    ));
+    ))
+    // What the process this session IS runs as, which is what the utilities that report a
+    // process's own session answer ([`super::container_process`]).
+    .with_process(launch.process.clone());
     let outcome = shell.run(program).await;
     state
         .lock()
