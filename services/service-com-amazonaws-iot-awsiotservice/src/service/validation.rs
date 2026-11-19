@@ -29,6 +29,9 @@
 //!   back. A value and a length bound say the same thing twice, and this service's recorded
 //!   refusals of a member that broke its bound AND its expression together state neither
 //!   clause with a value;
+//! * a member outside either end of its `@range` is stated with no value for the same
+//!   reason: the clause names the member and the numeric bound it broke, and the number that
+//!   broke it is not echoed back;
 //! * every other class keeps the value the request submitted — a value outside an
 //!   enumerated set is quoted beside the set it had to be in — which is what the framework
 //!   already states.
@@ -87,8 +90,14 @@ fn in_stated_value_set_order(refusal: &Refusal) -> Refusal {
 
 /// Whether the clause for `violation` states no value: the member was ABSENT, so there is
 /// no value to quote; it fell outside its `@pattern`, whose clause names the expression
-/// rather than what was submitted; it fell outside its `@length`, whose clause names the
-/// bound rather than the text that broke it; or it is one this service never discloses.
+/// rather than what was submitted; it fell outside its `@length` or its `@range`, whose
+/// clause names the bound rather than the value that broke it; or it is one this service
+/// never discloses.
+///
+/// What these classes have in common is that the clause already states the REQUIREMENT the
+/// value broke — an expression, a length bound, a numeric bound — so quoting the value says
+/// the same thing twice; the one class whose requirement is a SET of admissible values is
+/// stated beside the value it rejected, which is what the framework already writes.
 fn states_no_value(violation: &Violation) -> bool {
     matches!(
         violation.kind,
@@ -96,6 +105,8 @@ fn states_no_value(violation: &Violation) -> bool {
             | ViolationKind::Pattern(_)
             | ViolationKind::MinLength(_)
             | ViolationKind::MaxLength(_)
+            | ViolationKind::MinValue(_)
+            | ViolationKind::MaxValue(_)
     ) || violation.sensitive
 }
 
@@ -113,15 +124,15 @@ mod tests {
         }
     }
 
-    /// RULE: a member the request did not carry, a member outside its `@pattern` and a
-    /// member outside its `@length` are each stated with NO value, every other constraint
-    /// class states the value the request submitted, and a `@pattern` is quoted without
-    /// the anchors a whole-value pattern wraps it in.
+    /// RULE: a member the request did not carry, a member outside its `@pattern`, a member
+    /// outside its `@length` and a member outside its `@range` are each stated with NO
+    /// value, every other constraint class states the value the request submitted, and a
+    /// `@pattern` is quoted without the anchors a whole-value pattern wraps it in.
     #[test]
     fn an_absent_member_states_no_value_and_every_other_class_states_one() {
         // The rows span the classes the framework reports: an absent member, a value
-        // outside a pattern, one past each end of a length bound and one outside an
-        // enumerated set.
+        // outside a pattern, one past each end of a length bound, one past each end of a
+        // numeric bound and one outside an enumerated set.
         let rows = [
             (
                 "a member the request did not carry",
@@ -151,6 +162,26 @@ mod tests {
                 violation("targetAwsAccount", ViolationKind::MinLength(12), Some("12345")),
                 "1 validation error detected: Value at 'targetAwsAccount' failed to satisfy \
                  constraint: Member must have length greater than or equal to 12",
+            ),
+            (
+                "a member past its range maximum",
+                violation(
+                    "credentialDurationSeconds",
+                    ViolationKind::MaxValue("43200".to_owned()),
+                    Some("46800"),
+                ),
+                "1 validation error detected: Value at 'credentialDurationSeconds' failed to \
+                 satisfy constraint: Member must have value less than or equal to 43200",
+            ),
+            (
+                "a member short of its range minimum",
+                violation(
+                    "credentialDurationSeconds",
+                    ViolationKind::MinValue("900".to_owned()),
+                    Some("899"),
+                ),
+                "1 validation error detected: Value at 'credentialDurationSeconds' failed to \
+                 satisfy constraint: Member must have value greater than or equal to 900",
             ),
             (
                 "a member outside its value set",

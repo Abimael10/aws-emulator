@@ -45,6 +45,10 @@
 //! * a member outside either end of its `@length` is stated with no value either — the
 //!   clause names the bound it broke, not the text that broke it — which the child suite
 //!   [`length_constraint_clauses`] pins over the operations and bounds that rule covers;
+//! * a member outside either end of its `@range` is stated with no value for the same
+//!   reason — the clause names the numeric bound it broke, not the number that broke it —
+//!   which the child suite [`range_constraint_clauses`] pins over the operations, the
+//!   bindings and both ends of the bounds that rule covers;
 //! * a value outside an enumerated set is quoted beside that set, whose members are listed
 //!   in the order of the hash table the front door holds them in rather than in the model's
 //!   declaration order.
@@ -75,6 +79,13 @@ use smithy_server_runtime::MultiServiceRouter;
 /// module of a `#[path]`-declared file resolves next to that file unless it says otherwise.
 #[path = "not_found_wording/length_constraint_clauses.rs"]
 mod length_constraint_clauses;
+
+/// The `@range` class of that same envelope: a clause about a NUMERIC bound states the
+/// bound and not the value that broke it, over the operations, the bindings and both ends
+/// of the bounds the rule covers. Declared the same way, and for the same reason, as the
+/// length suite above.
+#[path = "not_found_wording/range_constraint_clauses.rs"]
+mod range_constraint_clauses;
 
 /// The account id this emulator serves, which the registry families qualify a missing
 /// name with (`engine::emulator_account_id`).
