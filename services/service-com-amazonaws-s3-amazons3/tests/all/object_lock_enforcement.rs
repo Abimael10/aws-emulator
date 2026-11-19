@@ -40,7 +40,9 @@ use service_com_amazonaws_s3_amazons3::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::bucket_lifecycle::{put_bucket_policy, router_with_engine, send, send_bytes, Answer};
+use super::bucket_lifecycle::{
+    put_bucket_policy, router as plain_router, router_with_engine, send, send_bytes, Answer,
+};
 use super::object_and_tagging_roundtrip::{get_object, text};
 use super::object_legal_hold::{legal_hold_payload, lock_enabled_bucket, put_object_legal_hold};
 use super::object_retention::{
@@ -92,12 +94,34 @@ async fn locked_version(
     case: &str,
     lock: Lock,
 ) -> String {
+    locked_version_placed_at(router, engine, bucket, key, case, lock)
+        .await
+        .0
+}
+
+/// [`locked_version`], reporting BESIDE the version id the instant every date it placed is
+/// an offset from, in epoch seconds.
+///
+/// That instant is read off the wall clock ONCE, here, and handed back, so a row that then
+/// asserts on the date a read reports expects the instant this setup really placed. A
+/// caller that sampled its own `now` and added the same offset would expect a different
+/// instant whenever the two samples fall either side of a second boundary — a race on how
+/// fast the host runs rather than anything about the service.
+async fn locked_version_placed_at(
+    router: &MultiServiceRouter,
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    bucket: &str,
+    key: &str,
+    case: &str,
+    lock: Lock,
+) -> (String, i64) {
+    let placed_at = now_seconds();
     let version_id = object(router, bucket, key)
         .await
         .unwrap_or_else(|| panic!("case {case:?}: the write into {bucket:?} must mint a version id"));
     let (retention, legal_hold) = lock;
     if let Some((mode, offset)) = retention {
-        let until = now_seconds() + offset;
+        let until = placed_at + offset;
         if offset < 0 {
             given_lapsed_retention(engine, bucket, key, mode, until);
         } else {
@@ -129,7 +153,7 @@ async fn locked_version(
             text(&held)
         );
     }
-    version_id
+    (version_id, placed_at)
 }
 
 /// Whether the bucket still holds the version `version_id` of `key`: a read of it answers
@@ -510,6 +534,10 @@ async fn a_governance_bypass_is_refused_to_a_caller_denied_the_permission() {
 /// One row of the reported-lock table: the case name, the key, the lock placed on the
 /// version, and the three header values a read of it must report (`None` for a header the
 /// response must not carry).
+///
+/// The retain-until value is the member's OFFSET from the instant the setup placed the lock
+/// at ([`locked_version_placed_at`] reports that instant), so a row names the whole date it
+/// expects without any row reading the clock a second time.
 type ReportRow = (
     &'static str,
     &'static str,
@@ -576,11 +604,11 @@ async fn a_read_reports_the_object_lock_state_of_the_version() {
     lock_enabled_bucket(&router, "object-lock-reported").await;
 
     for (case, key, lock, mode, offset, hold) in report_rows() {
-        // The instant the row's date is an offset from, taken before the setup so the
-        // expected value is the one the setup placed.
-        let placed_at = now_seconds();
-        let version_id =
-            locked_version(&router, &engine, "object-lock-reported", key, case, lock).await;
+        // The instant the row's date is an offset from: the ONE reading of the clock the
+        // setup placed its date from, so the expected value is the value stored.
+        let (version_id, placed_at) =
+            locked_version_placed_at(&router, &engine, "object-lock-reported", key, case, lock)
+                .await;
 
         for (reader, answer) in [
             (
@@ -647,10 +675,125 @@ async fn a_read_reports_the_object_lock_state_of_the_version() {
                     assert_eq!(
                         seconds,
                         placed_at + offset,
-                        "case {case:?}: {reader} must echo the stored RetainUntilDate, got \
-                         {seconds} from {rendered:?}"
+                        "case {case:?}: {reader} must echo the stored RetainUntilDate {}, got \
+                         {seconds} from {rendered:?}",
+                        placed_at + offset
                     );
                 }
+            }
+        }
+    }
+}
+
+/// The retain-until instants a put carries, as offsets from the single clock reading the
+/// case computes them from: a minute and a half, five minutes and a second, one second
+/// under an hour, a day, and a decade and thirteen seconds out. The rows differ along the
+/// MAGNITUDE of the period and along whether the instant lands on a round minute, which is
+/// what an echo truncated to coarser units would lose. Every offset leaves a period far
+/// longer than the handful of in-process requests the case makes, so no row is a wager on
+/// how fast the host runs.
+const RETAIN_UNTIL_OFFSETS: [i64; 5] =
+    [90, 301, 3_599, 24 * ONE_HOUR, 10 * 365 * 24 * ONE_HOUR + 13];
+
+/// The reported `RetainUntilDate` is a RECORD of the version: every read of it answers the
+/// instant the put carried, unchanged and unrounded, and reading it does not move it.
+///
+/// The narrower half of what [`a_read_reports_the_object_lock_state_of_the_version`] covers,
+/// over the dimensions that table does not carry: periods that do not land on a round
+/// minute, and a SECOND read of each version through each reader.
+#[tokio::test]
+async fn a_read_echoes_the_exact_instant_the_retention_put_carried() {
+    // No lapsed period here, so nothing is seeded through the store and this needs only the
+    // router.
+    let router = plain_router();
+    lock_enabled_bucket(&router, "object-lock-echoed").await;
+
+    for offset in RETAIN_UNTIL_OFFSETS {
+        let case = format!("a period {offset} seconds out");
+        let key = format!("echoed-{offset}");
+        // ONE reading of the clock: the instant the put carries and the instant the reads
+        // must report are the same value, so nothing here depends on how long the requests
+        // between them take.
+        let until = now_seconds() + offset;
+        let version_id = object(&router, "object-lock-echoed", &key)
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: the write must mint a version id"));
+        let placed = put_object_retention(
+            &router,
+            "object-lock-echoed",
+            &key,
+            "",
+            &[],
+            &retention_payload(Some(GOVERNANCE_RETENTION_MODE), Some(until)),
+        )
+        .await;
+        assert_eq!(
+            placed.status, 200,
+            "case {case:?}: the retention must be placed, got {} with body {:?}",
+            placed.status,
+            text(&placed)
+        );
+
+        // Read TWICE through each reader: the reported instant is a record of the version,
+        // so it is the same on every later read and a read never moves it.
+        for pass in ["first read", "second read"] {
+            for (reader, answer) in [
+                (
+                    "GetObject",
+                    get_object(
+                        &router,
+                        "object-lock-echoed",
+                        &key,
+                        &format!("?versionId={version_id}"),
+                        &[],
+                    )
+                    .await,
+                ),
+                (
+                    "HeadObject",
+                    head_object(
+                        &router,
+                        "object-lock-echoed",
+                        &key,
+                        &format!("?versionId={version_id}"),
+                    )
+                    .await,
+                ),
+            ] {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case:?}: {reader} on the {pass} must answer 200, got {} with body \
+                     {:?}",
+                    answer.status,
+                    text(&answer)
+                );
+                assert_eq!(
+                    answer.header("x-amz-object-lock-mode").as_deref(),
+                    Some(GOVERNANCE_RETENTION_MODE),
+                    "case {case:?}: {reader} on the {pass} must report the placed mode, got {:?}",
+                    answer.header("x-amz-object-lock-mode")
+                );
+                let rendered = answer
+                    .header("x-amz-object-lock-retain-until-date")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: {reader} on the {pass} must report the retain-until \
+                             date"
+                        )
+                    });
+                let seconds = DateTime::from_str(&rendered, Format::DateTime)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "case {case:?}: {reader} on the {pass} must report an ISO8601 \
+                             date-time, got {rendered:?} ({error})"
+                        )
+                    })
+                    .secs();
+                assert_eq!(
+                    seconds, until,
+                    "case {case:?}: {reader} on the {pass} must echo the instant the put \
+                     carried ({until}), got {seconds} from {rendered:?}"
+                );
             }
         }
     }
