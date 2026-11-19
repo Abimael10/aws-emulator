@@ -190,15 +190,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // The instance is resolved on its own first, and a missing one is reported as
-        // the instance it is: Connect's not-found message is per resource plane, so an
-        // `InstanceId` that names no instance carries the instance plane's sentence
-        // whichever resource inside it the request asks for, while a resource missing
-        // from a resolved instance carries the resource-agnostic one.
+        // The instance is resolved on its own first, so a request naming an instance
+        // this account does not hold is refused rather than read as a queue delete.
+        // Connect states ONE not-found sentence for every resource
+        // (`crate::state::resource_not_found`), quoting nothing the request carried, so
+        // the refusal is the same words whether the instance or the queue inside it is
+        // the resource that resolved to nothing.
         let instance = store.instances.get_mut(&input.instance_id).ok_or_else(|| {
-            DeleteQueueErrorModeled::ResourceNotFoundException(crate::state::instance_not_found(
-                &input.instance_id,
-            ))
+            DeleteQueueErrorModeled::ResourceNotFoundException(crate::state::resource_not_found())
         })?;
 
         if instance.queues.remove(&input.queue_id).is_none() {

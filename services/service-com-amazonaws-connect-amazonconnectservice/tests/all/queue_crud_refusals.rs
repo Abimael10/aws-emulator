@@ -17,12 +17,12 @@
 //!    value for QueueName must be less than or equal to 127`, the service's own name for
 //!    that parameter and the bound the request broke.
 //! 3. A RESOURCE THAT IS NOT THERE. Once the request is acceptable, an identifier that
-//!    resolves to nothing is `ResourceNotFoundException` (404), worded per resource
-//!    plane: an `InstanceId` that resolves to nothing is `Instance <InstanceId> not
-//!    found`, while a queue missing from an instance that IS there is the
-//!    resource-agnostic `Resource not found` — `instance_not_found_refusal` asserts that
-//!    rule across the whole service; the rows here pin it against the two refusals above,
-//!    which is where the queue plane used to answer the wrong one.
+//!    resolves to nothing is `ResourceNotFoundException` (404) carrying this service's
+//!    one not-found sentence, the fixed `Resource not found` — the same words for an
+//!    `InstanceId` that resolves to nothing and for a queue missing from an instance that
+//!    IS there. `instance_not_found_refusal` asserts that rule across the whole service;
+//!    the rows here pin it against the two refusals above, which is where the queue plane
+//!    used to answer the wrong one.
 
 use serde_json::{json, Value};
 
@@ -179,9 +179,9 @@ async fn an_instance_label_of_the_identifier_form_reaches_the_lookup() {
         for (operation, method, uri, body) in queue_calls_on_instance(&instance_id) {
             let answer = connect.send_answer(method, &uri, body).await;
             let actual = message_of(&answer.body);
-            // The label reached the lookup and resolved nothing, so the answer is the
-            // instance plane's not-found sentence naming it.
-            let expected = format!("Instance {instance_id} not found");
+            // The label reached the lookup and resolved nothing, so the answer is this
+            // service's not-found sentence, which quotes nothing the request carried.
+            let expected = "Resource not found";
             assert_eq!(
                 answer.status, 404,
                 "case {case:?}/{operation}: expected HTTP 404, got {} {}",
@@ -196,6 +196,11 @@ async fn an_instance_label_of_the_identifier_form_reaches_the_lookup() {
             assert_eq!(
                 actual, expected,
                 "case {case:?}/{operation}: expected message {expected:?}, got {actual:?}"
+            );
+            assert!(
+                !answer.body.to_string().contains(&instance_id),
+                "case {case:?}/{operation}: the refusal quotes no identifier, got {}",
+                answer.body
             );
         }
     }
@@ -362,8 +367,8 @@ async fn the_minted_identifier_resolves_the_queue_it_names() {
         assert_eq!(
             message_of(&gone.body),
             "Resource not found",
-            "case {case:?}: a queue missing from an instance that is there carries the \
-             resource-agnostic sentence, got {}",
+            "case {case:?}: a deleted queue is reported in this service's one not-found \
+             sentence, got {}",
             gone.body
         );
     }

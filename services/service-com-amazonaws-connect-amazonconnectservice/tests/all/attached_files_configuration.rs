@@ -411,9 +411,9 @@ async fn an_unknown_instance_configures_and_reports_nothing() {
         .await;
     let unknown = "11111111-2222-3333-4444-555555555555";
     assert_ne!(unknown, live_id, "the row has to name an absent instance");
-    // The instance plane's not-found sentence, written out here rather than read off the
-    // implementation: the identifier the request addressed, inside its fixed halves.
-    let expected_message = format!("Instance {unknown} not found");
+    // This service's one not-found sentence, written out here rather than read off the
+    // implementation: fixed text, quoting no identifier.
+    let expected_message = "Resource not found";
 
     for scope in ATTACHMENT_SCOPE_VALUES {
         let answers = [

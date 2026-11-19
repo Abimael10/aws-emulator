@@ -332,7 +332,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let instance = store.instances.get_mut(&input.instance_id).ok_or_else(|| {
             StartChatContactErrorModeled::ResourceNotFoundException(
-                crate::state::instance_not_found(&input.instance_id),
+                crate::state::resource_not_found(),
             )
         })?;
         // The chat is started by a flow of the instance, so an identifier that names no

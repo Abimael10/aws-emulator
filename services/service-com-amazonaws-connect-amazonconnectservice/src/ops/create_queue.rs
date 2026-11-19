@@ -226,9 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // unused.
         let id = store.mint_resource_id();
         let instance = store.instances.get_mut(&input.instance_id).ok_or_else(|| {
-            CreateQueueErrorModeled::ResourceNotFoundException(crate::state::instance_not_found(
-                &input.instance_id,
-            ))
+            CreateQueueErrorModeled::ResourceNotFoundException(crate::state::resource_not_found())
         })?;
 
         // A queue name is unique within its instance.
