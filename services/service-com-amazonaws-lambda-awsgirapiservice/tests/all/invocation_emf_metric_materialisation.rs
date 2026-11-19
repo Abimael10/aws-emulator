@@ -76,7 +76,11 @@ const UNIT_NONE: &str = "None";
 
 /// The handler every row runs: it prints the lines the event hands it, and nothing else, so
 /// what reaches the log is exactly what the row declared.
-const PRINTING_HANDLER: &str = r"
+///
+/// `pub(crate)` for the reason [`emulator`] is: the sibling suite over what the group's metric
+/// filters count prints its own rows' lines through this one handler, whose runtime writes each
+/// line as the record it wrote rather than decorating it.
+pub(crate) const PRINTING_HANDLER: &str = r"
 def lambda_handler(event, context):
     lines = event.get('lines', [])
     for line in lines:
@@ -87,7 +91,11 @@ def lambda_handler(event, context):
 /// Lambda, CloudWatch Logs, IAM and CloudWatch over ONE shared engine, as
 /// `core/router/src/lib.rs` mounts them: the log the run's delivery writes is ingested by the
 /// same store this suite reads the metric out of.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the sibling suite over what the group's METRIC FILTERS count
+/// ([`crate::invocation_log_metric_filter_counting`]) reads its series out of these same four
+/// services on one engine rather than mounting a second copy of them.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = router_on(&engine);
     router.register_service(
@@ -227,7 +235,10 @@ async fn datapoints(
 
 /// `Invoke` the function `name` synchronously with the lines it is to print, and answer the
 /// payload the handler returned.
-async fn invoke_printing(
+///
+/// `pub(crate)` for the reason [`emulator`] is: the sibling suite over what the group's metric
+/// filters count drives its own rows' runs through this one invocation path.
+pub(crate) async fn invoke_printing(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -257,7 +268,9 @@ async fn invoke_printing(
 
 /// The messages a group-wide search of `group` returns, which is where a client reads what a
 /// run wrote.
-async fn messages(router: &MultiServiceRouter, case: &str, group: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the reason [`emulator`] is.
+pub(crate) async fn messages(router: &MultiServiceRouter, case: &str, group: &str) -> Vec<String> {
     let answered = logs(
         router,
         case,
