@@ -1005,6 +1005,13 @@ impl ConsumerRecord {
         }
     }
 
+    /// The consumer's tags as the modelled `Tag` list, ordered by key, through the one
+    /// projection every tagged resource of this service is reported through
+    /// ([`tags_ordered`]).
+    pub fn tags_ordered(&self) -> Vec<Tag> {
+        tags_ordered(&self.tags)
+    }
+
     /// This record as the modelled `Consumer`, which is what a registration answers with.
     pub fn to_shape(&self, now: SystemTime) -> Consumer {
         Consumer {
@@ -2386,18 +2393,29 @@ impl ComAmazonawsKinesisKinesis20131202State {
     /// when this account and region hold no resource under that ARN.
     ///
     /// A `ResourceARN` addresses "the Kinesis resource" rather than one kind of it
-    /// (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`), and a stream and a channel
-    /// each carry ONE stored tag set, so ONE lookup spans both kinds: whichever kind the ARN
-    /// names, the tags answered are the stored set every tag write of that resource wrote.
+    /// (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`, which the ARN of a consumer
+    /// registered with a stream satisfies too), and a stream, a channel and a stream consumer
+    /// each carry ONE stored tag set, so ONE lookup spans every kind this service holds:
+    /// whichever kind the ARN names, the tags answered are the stored set every tag write of
+    /// that resource wrote.
     pub fn resource_tags_by_arn(
         &self,
         now: SystemTime,
         region: &str,
         arn: &str,
     ) -> Option<Vec<Tag>> {
-        self.stream_by_arn(now, region, arn)
-            .map(Stream::tags_ordered)
-            .or_else(|| self.channel_by_arn(region, arn).map(Channel::tags_ordered))
+        if let Some(channel) = self.channel_by_arn(region, arn) {
+            return Some(channel.tags_ordered());
+        }
+        // A consumer's ARN is its stream's ARN extended, so the stream holding the resource
+        // is resolved first and the kind decided from which record inside it the ARN names —
+        // the very walk the resource-policy lookups of this service resolve through.
+        let stream = self.stream_holding_resource(now, region, arn)?;
+        if stream.arn == arn {
+            Some(stream.tags_ordered())
+        } else {
+            stream.consumer_by_arn(arn).map(ConsumerRecord::tags_ordered)
+        }
     }
 
     /// The resource-policy slot of the Kinesis resource `arn` names at `now` — `Some(None)`
@@ -2519,9 +2537,9 @@ impl ComAmazonawsKinesisKinesis20131202State {
     /// [`Self::resource_tags_by_arn`] for a caller that WRITES the set it finds: one rule,
     /// one lookup, so the stored set a tag write changes is the very set a read reports.
     ///
-    /// It spans exactly the resource kinds that read spans, because a stream and a channel
-    /// each carry ONE stored tag set: whichever kind the ARN names, an assignment and an
-    /// unassignment reach that very set.
+    /// It spans exactly the resource kinds that read spans, because a stream, a channel and a
+    /// stream consumer each carry ONE stored tag set: whichever kind the ARN names, an
+    /// assignment and an unassignment reach that very set.
     pub fn resource_tags_by_arn_mut(
         &mut self,
         now: SystemTime,
@@ -2539,8 +2557,17 @@ impl ComAmazonawsKinesisKinesis20131202State {
         self.streams
             .values_mut()
             .filter(|stream| stream.region == region && stream.is_held(now))
-            .find(|stream| stream.arn == arn)
-            .map(|stream| &mut stream.tags)
+            .find_map(|stream| {
+                if stream.arn == arn {
+                    Some(&mut stream.tags)
+                } else {
+                    // A consumer's ARN extends its stream's, so such an ARN names a consumer
+                    // of this stream, and that consumer's own set is what the write reaches.
+                    stream
+                        .consumer_by_arn_mut(arn)
+                        .map(|consumer| &mut consumer.tags)
+                }
+            })
     }
 }
 

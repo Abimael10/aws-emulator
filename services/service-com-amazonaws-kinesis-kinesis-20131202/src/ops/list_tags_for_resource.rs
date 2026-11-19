@@ -3,15 +3,17 @@
 //! @op ListTagsForResource
 //!
 //! Reports the tags the Kinesis resource the request's `ResourceARN` names carries in
-//! `crate::state`'s stores — what `CreateStream`, `AddTagsToStream`, `TagResource` and
-//! `CreateChannel` wrote — as the modelled `Tags` list ordered by key. A pure read: nothing
+//! `crate::state`'s stores — what `CreateStream`, `AddTagsToStream`, `TagResource`,
+//! `CreateChannel` and `RegisterStreamConsumer` wrote — as the modelled `Tags` list ordered
+//! by key. A pure read: nothing
 //! it does changes what a later caller sees, and a resource carrying no tags is reported as
 //! the empty list rather than refused.
 //!
-//! A `ResourceARN` addresses a resource of EITHER kind this service holds (its pattern is
-//! `^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`), and a stream and a channel each
-//! carry ONE stored tag set, so the ARN is resolved across both kinds through the one lookup
-//! that spans them
+//! A `ResourceARN` addresses a resource of EVERY kind this service holds (its pattern is
+//! `^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`, which the ARN of a consumer
+//! registered with a stream satisfies too), and a stream, a channel and a stream consumer
+//! each carry ONE stored tag set, so the ARN is resolved across every kind through the one
+//! lookup that spans them
 //! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resource_tags_by_arn`]): the
 //! set this read reports is the very set the tag writes of that resource wrote. An ARN this
 //! account and region hold no resource under is the modelled `ResourceNotFoundException`,

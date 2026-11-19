@@ -8,10 +8,11 @@
 //! and every tag the request does not name stays as it was; `ListTagsForResource` and
 //! `ListTagsForStream` report that stored set.
 //!
-//! A `ResourceARN` addresses a resource of EITHER kind this service holds (its pattern is
-//! `^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`), and a stream and a channel each
-//! carry ONE stored tag set, so the ARN is resolved across both kinds through the mutable
-//! counterpart of the one lookup `ListTagsForResource` reads through
+//! A `ResourceARN` addresses a resource of EVERY kind this service holds (its pattern is
+//! `^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`, which the ARN of a consumer
+//! registered with a stream satisfies too), and a stream, a channel and a stream consumer
+//! each carry ONE stored tag set, so the ARN is resolved across every kind through the
+//! mutable counterpart of the one lookup `ListTagsForResource` reads through
 //! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resource_tags_by_arn_mut`]):
 //! the set this write deletes from is the very set that read reports. An ARN this account
 //! and region hold no resource under is the modelled `ResourceNotFoundException`, worded for

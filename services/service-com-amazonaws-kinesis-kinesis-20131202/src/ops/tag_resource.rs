@@ -2,8 +2,9 @@
 
 //! @op TagResource
 //!
-//! Assigns the request's `Tags` to the Kinesis resource its `ResourceARN` names — a stream
-//! or a channel, the two kinds that ARN may name — and answers the modelled empty body. A
+//! Assigns the request's `Tags` to the Kinesis resource its `ResourceARN` names — a stream,
+//! a channel or a consumer registered with a stream, the kinds that ARN may name — and
+//! answers the modelled empty body. A
 //! key the resource already carries takes the new value and every other tag it carries
 //! stays, so the stored tag set is the union of what was there and what the request
 //! assigned; `ListTagsForResource` (and, for a stream, `ListTagsForStream`) reports that
@@ -219,11 +220,12 @@ fn apply_assignment(
     }
 
     // `ResourceARN` addresses "the Kinesis resource" rather than one kind of it — it is
-    // modelled `^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`, so a channel is a
-    // first-class tagging target — and each kind carries ONE stored tag set, so the write
-    // goes through the lookup that spans every kind this service holds, the very lookup
-    // `ListTagsForResource` reads and `UntagResource` writes. An ARN of a resource kind this
-    // emulator holds none of resolves to no resource, which is the not-found answer.
+    // modelled `^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`, so a channel and a
+    // consumer registered with a stream (whose ARN continues its stream's resource segment)
+    // are first-class tagging targets too — and each kind carries ONE stored tag set, so the
+    // write goes through the lookup that spans every kind this service holds, the very lookup
+    // `ListTagsForResource` reads and `UntagResource` writes. An ARN naming no resource this
+    // account and region hold is the not-found answer.
     //
     // A resource's tags are control-plane metadata of the resource itself, not of the
     // shards its create is provisioning: the stored tag set exists for as long as the
