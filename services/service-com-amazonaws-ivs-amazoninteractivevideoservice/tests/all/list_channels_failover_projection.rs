@@ -23,6 +23,11 @@
 //! answer the same ones — so a member a client carries round that loop is not dropped on
 //! the way back.
 //!
+//! The last cases of all state the rule on the BYTES the emulator sends, because a key
+//! set is a property of those bytes and not of what a parser makes of them: a member
+//! written twice, or written and then shadowed, reads back fine through `serde_json`
+//! (which keeps one value per key) while a strict client sees a malformed object.
+//!
 //! The key-set cases state the rule as the KEY SET of a summary: a summary is the
 //! projection of the stored channel onto the members its shape declares plus the projected
 //! failover-slate ARN, so it reports each of those members exactly as the single read of
@@ -34,8 +39,10 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use super::channel_lifecycle::{text, Ivs};
-use super::channel_projection_scope::{ad_configuration, recording_configuration, POLICY_ARN};
+use super::channel_lifecycle::{text, Ivs, CHANNEL_ARN_PREFIX};
+use super::channel_projection_scope::{
+    ad_configuration, objects_carrying, recording_configuration, POLICY_ARN,
+};
 
 /// The member the recorded IVS responses carry on every projected channel and that this
 /// model revision declares on neither channel shape
@@ -579,6 +586,233 @@ async fn a_whole_summary_sent_back_verbatim_is_accepted() {
             again, summary,
             "case {case:?}: sending a summary back verbatim must leave the channel as it \
              was, got {again} after {summary}"
+        );
+    }
+}
+
+/// The projected member as a response BODY spells the pair: the quoted object key, and
+/// the key together with the unconfigured value.
+///
+/// Counted over the whole body, the first is a count of the objects that carry the member
+/// — which is the one thing a parsed body cannot report, because a parser keeps a single
+/// value per key and so reads a member written twice exactly as it reads one written once.
+const FAILOVER_SLATE_KEY_ON_THE_WIRE: &str = "\"failoverSlateConfigurationArn\"";
+const FAILOVER_SLATE_UNCONFIGURED_ON_THE_WIRE: &str = "\"failoverSlateConfigurationArn\":\"\"";
+
+/// How many times `needle` occurs in `haystack`.
+fn occurrences(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+/// The channel objects of a parsed response, found WITHOUT looking at the projected
+/// member, so a row's expected count is independent of the thing under test.
+///
+/// A channel object is one carrying an `arn` in the channel ARN space together with
+/// `latencyMode`, a member both channel shapes declare and every channel this store holds
+/// reports (`smithy_query(query="shape",shape="Channel,ChannelSummary")`). The second half
+/// matters because an entry of the `errors` list a partial `BatchGetChannel` answers with
+/// carries the channel ARN it could not resolve and nothing else of a channel.
+fn channel_objects(body: &Value) -> Vec<Value> {
+    objects_carrying(body, "arn")
+        .into_iter()
+        .filter(|object| {
+            text(object, "arn").starts_with(CHANNEL_ARN_PREFIX)
+                && object.get("latencyMode").is_some()
+        })
+        .collect()
+}
+
+/// One row of the wire-bytes table: the case name, how many channels the store holds, the
+/// call to make, and how many channel objects its answer carries.
+struct WireCase {
+    case: &'static str,
+    channels: usize,
+    operation: &'static str,
+    /// The request, built from the ARNs of the channels the row created.
+    request: fn(&[String]) -> Value,
+    expected: usize,
+}
+
+/// The member is written ONCE per channel object in the bytes the emulator sends, and
+/// written nowhere else — so a client reading the body as text, as the recorded responses
+/// are compared, finds exactly one `failoverSlateConfigurationArn` key per channel it was
+/// answered, each holding the unconfigured value.
+///
+/// Rows differ along the operation that serves the channel objects, how many it serves
+/// (none, one, several), and whether the answer carries objects that are NOT channels — a
+/// create's stream key, a partial batch's error entries, another resource's summaries.
+#[tokio::test]
+async fn every_channel_object_on_the_wire_carries_the_member_exactly_once() {
+    let cases: Vec<WireCase> = vec![
+        WireCase {
+            case: "a list of one channel",
+            channels: 1,
+            operation: "ListChannels",
+            request: |_| json!({}),
+            expected: 1,
+        },
+        WireCase {
+            case: "a list of four channels",
+            channels: 4,
+            operation: "ListChannels",
+            request: |_| json!({}),
+            expected: 4,
+        },
+        WireCase {
+            case: "a page of two out of four channels",
+            channels: 4,
+            operation: "ListChannels",
+            request: |_| json!({ "maxResults": 2 }),
+            expected: 2,
+        },
+        WireCase {
+            case: "a list over a store holding no channel",
+            channels: 0,
+            operation: "ListChannels",
+            request: |_| json!({}),
+            expected: 0,
+        },
+        WireCase {
+            case: "a create, whose answer carries a stream key beside the channel",
+            channels: 0,
+            operation: "CreateChannel",
+            request: |_| json!({ "name": "created" }),
+            expected: 1,
+        },
+        WireCase {
+            case: "a single read",
+            channels: 1,
+            operation: "GetChannel",
+            request: |arns| json!({ "arn": arns[0] }),
+            expected: 1,
+        },
+        WireCase {
+            case: "an update",
+            channels: 1,
+            operation: "UpdateChannel",
+            request: |arns| json!({ "arn": arns[0], "name": "renamed" }),
+            expected: 1,
+        },
+        WireCase {
+            case: "a batch read of three channels",
+            channels: 3,
+            operation: "BatchGetChannel",
+            request: |arns| json!({ "arns": arns }),
+            expected: 3,
+        },
+        WireCase {
+            case: "a batch read whose last ARN names no channel",
+            channels: 2,
+            operation: "BatchGetChannel",
+            request: |arns| {
+                json!({ "arns": [arns[0].clone(), arns[1].clone(),
+                                 format!("{CHANNEL_ARN_PREFIX}absentchannel")] })
+            },
+            expected: 2,
+        },
+        WireCase {
+            case: "the stream keys of a channel, an answer with no channel object in it",
+            channels: 1,
+            operation: "ListStreamKeys",
+            request: |arns| json!({ "channelArn": arns[0] }),
+            expected: 0,
+        },
+    ];
+
+    for WireCase {
+        case,
+        channels,
+        operation,
+        request,
+        expected,
+    } in cases
+    {
+        let ivs = Ivs::new();
+        let arns: Vec<String> = channels_of_differing_shapes(&ivs, channels)
+            .await
+            .into_iter()
+            .collect();
+        let reply = ivs.call(operation, &request(&arns)).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected HTTP 200 from {operation}, got {} {}",
+            reply.status, reply.raw
+        );
+
+        let carried = channel_objects(&reply.body);
+        assert_eq!(
+            carried.len(),
+            expected,
+            "case {case:?}: expected {expected} channel object(s) in the answer, got {}, in {}",
+            carried.len(),
+            reply.raw
+        );
+        let keys = occurrences(&reply.raw, FAILOVER_SLATE_KEY_ON_THE_WIRE);
+        assert_eq!(
+            keys, expected,
+            "case {case:?}: the body must spell the {FAILOVER_SLATE} key once per channel \
+             object ({expected}), got {keys} in {}",
+            reply.raw
+        );
+        let unconfigured = occurrences(&reply.raw, FAILOVER_SLATE_UNCONFIGURED_ON_THE_WIRE);
+        assert_eq!(
+            unconfigured, expected,
+            "case {case:?}: every one of those {expected} key(s) must hold the unconfigured \
+             {UNCONFIGURED:?}, {unconfigured} do in {}",
+            reply.raw
+        );
+    }
+}
+
+/// The same count, page by page: every page of a paginated list spells the member once per
+/// summary that page carries, including the pages a `nextToken` resumes and the last page,
+/// which carries fewer summaries than the page size asks for.
+#[tokio::test]
+async fn every_page_of_a_list_spells_the_member_once_per_summary() {
+    let ivs = Ivs::new();
+    let expected = channels_of_differing_shapes(&ivs, 5).await;
+
+    // 1 and 100 are the published bounds of the modelled `MaxChannelResults`
+    // (`range(min: 1, max: 100)`); 2 does not divide the set and 5 is exactly it.
+    for page_size in [1_usize, 2, 5, 100] {
+        let case = format!("maxResults={page_size} over {} channels", expected.len());
+        let mut seen = BTreeSet::new();
+        let mut token = Value::Null;
+        for page_index in 0..(expected.len() + 2) {
+            let mut request = json!({ "maxResults": page_size });
+            if let Some(token) = token.as_str() {
+                request["nextToken"] = json!(token);
+            }
+            let reply = ivs.call("ListChannels", &request).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: expected HTTP 200 for page {page_index}, got {} {}",
+                reply.status, reply.raw
+            );
+            let summaries = reply.body["channels"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let keys = occurrences(&reply.raw, FAILOVER_SLATE_UNCONFIGURED_ON_THE_WIRE);
+            assert_eq!(
+                keys,
+                summaries.len(),
+                "case {case:?}: page {page_index} must spell {FAILOVER_SLATE} as the \
+                 unconfigured {UNCONFIGURED:?} once per summary ({}), got {keys} in {}",
+                summaries.len(),
+                reply.raw
+            );
+            for summary in &summaries {
+                seen.insert(text(summary, "arn"));
+            }
+            token = reply.body.get("nextToken").cloned().unwrap_or(Value::Null);
+            if token.as_str().is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen, expected,
+            "case {case:?}: paging must reach every persisted channel, reached {seen:?}"
         );
     }
 }

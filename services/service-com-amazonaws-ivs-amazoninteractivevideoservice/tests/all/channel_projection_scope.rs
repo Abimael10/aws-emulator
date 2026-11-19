@@ -82,7 +82,7 @@ pub(crate) async fn ad_configuration(ivs: &Ivs, name: &str) -> String {
 }
 
 /// Every object under `value`, at any depth, that carries `key`.
-fn objects_carrying(value: &Value, key: &str) -> Vec<Value> {
+pub(crate) fn objects_carrying(value: &Value, key: &str) -> Vec<Value> {
     let mut found = Vec::new();
     collect_carriers(value, key, &mut found);
     found

@@ -53,12 +53,19 @@ pub(crate) struct Ivs {
 }
 
 /// One answer from the emulator: the status, the wire error code (the restJson1
-/// `__type` discriminator) and the parsed body.
+/// `__type` discriminator), the parsed body and the body EXACTLY as it went on the
+/// wire.
+///
+/// The raw text is kept beside the parsed value because a key set is a property of the
+/// bytes: a parser keeps one value per key and drops whatever it cannot place, so a
+/// member written twice, or written and then shadowed, is invisible to `body` and plain
+/// in `raw`.
 #[derive(Debug)]
 pub(crate) struct Reply {
     pub(crate) status: u16,
     pub(crate) error_code: String,
     pub(crate) body: Value,
+    pub(crate) raw: String,
 }
 
 impl Ivs {
@@ -157,6 +164,7 @@ impl Ivs {
             status,
             error_code,
             body: parsed,
+            raw: String::from_utf8_lossy(response.body()).into_owned(),
         }
     }
 
