@@ -1,0 +1,52 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: rds-catalog-describe-orderable-db-instance-options-db-c6gd-12xlarge-db-r5d-4xlarge
+Issue-Step: task#1
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: rds-catalog-describe-orderable-db-instance-options-db-c6gd-12xlarge-db-r5d-4xlarge rds-catalog-describe-orderable-db-instance-options-db-r5d-8xlarge-db-x2iedn-xlarge rds-db-parameter-group-lifecycle-and-engine-defaults
+Issue-Shape-Id: com.amazonaws.rds#AmazonRDSv19
+Issue-Key: rds|DescribeOrderableDBInstanceOptions|2xx->2xx|$.DescribeOrderableDBInstanceOptionsResponse.DescribeOrderableDBInstanceOptionsResult.OrderableDBInstanceOptions.OrderableDBInstanceOption[*]
+Issue-Key: rds|DescribeEngineDefaultClusterParameters|2xx->2xx|$.DescribeEngineDefaultClusterParametersResponse.DescribeEngineDefaultClusterParametersResult.EngineDefaults.Parameters.Parameter[*].ParameterValue
+Issue-Related: 20261114T091417Z-rds-6-of-the-9-reference-catalog-causes-remain-open.md
+Issue-Commit: ae04e9c7457c944b401f43b41441b2fef7a78bf2
+
+# rds static catalog reads serve emulator-authored rows: orderable DB instance options omit modeled members and the Aurora engine-default cluster parameters are the wrong parameter set
+
+> _Note: this issue was identified against the code base at commit `ae04e9c7457c944b401f43b41441b2fef7a78bf2`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeOrderableDBInstanceOptions
+
+## Description
+Three net-new causes, all in RDS's STATIC reference-catalog reads: the rows the emulator serves are authored by the emulator rather than being the catalog AWS publishes. All three answer HTTP 200, so no client sees an error — they silently read wrong or absent reference data. A previously filed issue on the SAME operation (20261022T092913Z-rds-describeorderabledbinstanceoptions-returns-a-fabricated-option-set.md) is RESOLVED and does not cover these; the sibling issues 20261115T081244Z-rds-describeenginedefaultparameters-serves-an-engine-default-catalog-whose.md (DescribeEngineDefaultParameters, the INSTANCE-level operation) and 20261119T201015Z-rds-describedbparameters-pages-serve-emulator-authored-parameter-metadata.md (DescribeDBParameters) are open but are different operations and do not carry these replay keys.
+
+Cause 1 of 3 — DescribeOrderableDBInstanceOptions option rows omit modeled members entirely (fixture rds-catalog-describe-orderable-db-instance-options-db-c6gd-12xlarge-db-r5d-4xlarge, step task#1; 111 steps in this cluster).
+AWS: Smithy: DescribeOrderableDBInstanceOptions -> OrderableDBInstanceOptionsMessage{OrderableDBInstanceOptions: list<OrderableDBInstanceOption>, Marker}; the OrderableDBInstanceOption shape models, among others, OutpostCapable, MinStorageSize, MaxStorageSize, SupportsKerberosAuthentication, SupportsStorageAutoscaling, SupportsGlobalDatabases, SupportsClusters, SupportsHttpEndpoint, SupportsDedicatedLogVolume, SupportsAdditionalStorageVolumes, SupportedNetworkTypes, SupportedActivityStreamModes, AvailableProcessorFeatures. The recording shows AWS populating every one of those on each row (recorded behavior for the concrete per-class values: the model does not state which class supports what).
+Emulator: each row carries only a subset — the recorded row for db.c6gd.12xlarge/mysql 8.4.9 is served WITHOUT OutpostCapable, MinStorageSize, MaxStorageSize, SupportsKerberosAuthentication, SupportsStorageAutoscaling, SupportsGlobalDatabases, SupportsClusters, SupportsHttpEndpoint, SupportsDedicatedLogVolume, SupportsAdditionalStorageVolumes, SupportedNetworkTypes, SupportedActivityStreamModes and AvailableProcessorFeatures, and the members it does serve carry emulator-chosen booleans (SupportsOptimizedReads/SupportsOptimizedWrites served 'true' where the recording has 'false' for that class).
+Why: a client that sizes storage from the catalog (MinStorageSize/MaxStorageSize), decides Multi-AZ-cluster or Outposts or global-database eligibility, or picks a network type reads absent members and either crashes on a null or concludes the capability does not exist; the optimized-reads/writes flags point it at the wrong instance class.
+Fix: the DescribeOrderableDBInstanceOptions catalog data and its serializer in the rds crate — every modeled OrderableDBInstanceOption member must be emitted per (engine, engine version, instance class, storage type) row with AWS's values, not a trimmed row.
+
+Cause 2 of 3 — the same handler over a different instance-class slice (fixture rds-catalog-describe-orderable-db-instance-options-db-r5d-8xlarge-db-x2iedn-xlarge, step task#97; 6 steps). Same defect, separate recorded cluster, so it must be re-replayed on its own: the db.t3.2xlarge/mysql 8.4.9 row is likewise served without the members listed in Cause 1. Here SupportsOptimizedReads/SupportsOptimizedWrites happen to agree, which shows the divergence is the per-row member SET, not just two booleans.
+AWS / Emulator / Why / Fix: as Cause 1.
+
+Cause 3 of 3 — DescribeEngineDefaultClusterParameters serves the wrong parameter set and no pagination marker (fixture rds-db-parameter-group-lifecycle-and-engine-defaults, step task#11).
+AWS: Smithy: DescribeEngineDefaultClusterParameters(DBParameterGroupFamily required) -> EngineDefaults{DBParameterGroupFamily, Marker, Parameters: list<Parameter>}; @paginated outputToken=EngineDefaults.Marker, items=EngineDefaults.Parameters. Parameter models ParameterName, ParameterValue, Description, Source, ApplyType, DataType, AllowedValues, IsModifiable, MinimumEngineVersion, ApplyMethod, SupportedEngineModes. For the concrete rows this is recorded behavior only: the recording for the aurora-mysql5.7 family returns the Aurora CLUSTER-level default set (e.g. aurora_binlog_replication_max_yield_seconds: ApplyType dynamic, DataType integer, AllowedValues '0-36000', MinimumEngineVersion '5.7.mysql_aurora.2.04.5', with AWS's own Description text) and a non-empty EngineDefaults.Marker so the caller can page.
+Emulator: it answers the instance-level/engine-generic parameter set instead — the row at the same index is binlog_format (ApplyType static, DataType string, AllowedValues 'ROW,STATEMENT,MIXED,OFF', no MinimumEngineVersion, Description 'The format binary log events are written in; OFF disables binary logging.'), and EngineDefaults.Marker is absent where the recording carries one.
+Why: a client reading the Aurora cluster engine defaults gets parameters that do not exist at cluster scope and misses the ones that do, so a ModifyDBClusterParameterGroup built from this catalog targets the wrong parameters; with no Marker the second page is never fetched and the caller believes the default set is a few rows long.
+Fix: the DescribeEngineDefaultClusterParameters handler and its backing engine-default catalog in the rds crate — the CLUSTER-family default set (with per-parameter ApplyType/DataType/AllowedValues/MinimumEngineVersion/Description) plus EngineDefaults.Marker pagination.
+
+Traces: rds-catalog-describe-orderable-db-instance-options-db-c6gd-12xlarge-db-r5d-4xlarge#task#1 (Cause 1), rds-catalog-describe-orderable-db-instance-options-db-r5d-8xlarge-db-x2iedn-xlarge#task#97 (Cause 2), rds-db-parameter-group-lifecycle-and-engine-defaults#task#11 (Cause 3).
+
+## Evidence
+Cause 1 — DescribeOrderableDBInstanceOptions, expected 200 / actual 200, key $...OrderableDBInstanceOptions.OrderableDBInstanceOption[0]: 'missing'. Expected row (db.c6gd.12xlarge, mysql 8.4.9, gp2) includes OutpostCapable 'false', MinStorageSize '5', MaxStorageSize '65536', SupportsKerberosAuthentication 'true', SupportsStorageAutoscaling 'true', SupportsGlobalDatabases 'false', SupportsClusters 'false', SupportsHttpEndpoint 'false', SupportsDedicatedLogVolume 'false', SupportsAdditionalStorageVolumes 'false', SupportedNetworkTypes {member:[IPV4,DUAL]}, SupportedActivityStreamModes '', AvailableProcessorFeatures '', SupportsOptimizedReads 'false', SupportsOptimizedWrites 'false'. Actual row carries none of the first thirteen and reports SupportsOptimizedReads 'true', SupportsOptimizedWrites 'true'. Cluster covers 111 steps across the catalog fixture.
+
+Cause 2 — same operation, fixture ...db-r5d-8xlarge-db-x2iedn-xlarge step task#97, 6 steps: expected db.t3.2xlarge row again carries OutpostCapable/MinStorageSize/MaxStorageSize/SupportsKerberosAuthentication/SupportsStorageAutoscaling/SupportsGlobalDatabases/SupportsClusters/SupportsHttpEndpoint/SupportsDedicatedLogVolume/SupportsAdditionalStorageVolumes/SupportedNetworkTypes/SupportedActivityStreamModes/AvailableProcessorFeatures; actual row omits all of them.
+
+Cause 3 — DescribeEngineDefaultClusterParameters, expected 200 / actual 200: $...EngineDefaults.Marker expected 'YXdzX2RlZmF1bHRfc2FnZW1ha2VyX3JvbGU=' (a marker value — only its PRESENCE is the requirement, the literal token is per-run), got None. Parameter[1]: ParameterName expected 'aurora_binlog_replication_max_yield_seconds', got 'binlog_format'; AllowedValues expected '0-36000', got 'ROW,STATEMENT,MIXED,OFF'; ApplyType expected 'dynamic', got 'static'; DataType expected 'integer', got 'string'; MinimumEngineVersion expected '5.7.mysql_aurora.2.04.5', got None; Description expected AWS's aurora_binlog_replication_max_yield_seconds text, got 'The format binary log events are written in; OFF disables binary logging.' The divergence key lists Parameter[1] through Parameter[19] as diverging, i.e. the whole served page is the wrong set.
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout and replay the wire corpus (trace set simparity-wire-aws-v1).
+2. Cause 1: replay fixture rds-catalog-describe-orderable-db-instance-options-db-c6gd-12xlarge-db-r5d-4xlarge step task#1 — POST DescribeOrderableDBInstanceOptions with Engine=mysql, EngineVersion=8.4.9, DBInstanceClass=db.c6gd.12xlarge and compare each OrderableDBInstanceOption member set against the recorded response.
+3. Cause 2: replay fixture rds-catalog-describe-orderable-db-instance-options-db-r5d-8xlarge-db-x2iedn-xlarge step task#97 (same operation, db.t3.2xlarge slice).
+4. Cause 3: replay fixture rds-db-parameter-group-lifecycle-and-engine-defaults step task#11 — POST DescribeEngineDefaultClusterParameters with DBParameterGroupFamily=aurora-mysql5.7 and compare EngineDefaults.Marker and the Parameters rows against the recording.
