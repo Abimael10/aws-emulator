@@ -91,17 +91,17 @@ const REGION: &str = "us-east-1";
 /// `CloudFront-*` headers the edge generates, `Managed-AllViewerAndCloudFrontHeaders-2022-06`:
 /// its id is the one this service's own managed catalogue publishes. It is what lets the
 /// function report the country and the address the edge observed for the viewer.
-const ALL_VIEWER_AND_CLOUDFRONT: &str = "33f36d7e-f396-46d9-90e0-52428a34d9dc";
+pub(crate) const ALL_VIEWER_AND_CLOUDFRONT: &str = "33f36d7e-f396-46d9-90e0-52428a34d9dc";
 
 /// The AWS-managed origin request policy `Managed-AllViewerExceptHostHeader`, whose id is the
 /// one that same catalogue publishes. It is the policy CloudFront documents for an OAC-signed
 /// origin: forwarding the viewer's own `Host` would not be the host the signature was computed
 /// over.
-const ALL_VIEWER_EXCEPT_HOST: &str = "b689b0a8-53d0-40ab-baf2-68738e2966ac";
+pub(crate) const ALL_VIEWER_EXCEPT_HOST: &str = "b689b0a8-53d0-40ab-baf2-68738e2966ac";
 
 /// The marker the function puts in every answer of its own, so an answer that carries it came
 /// from the origin and one that does not was produced by CloudFront itself.
-const ORIGIN_MARKER: &str = "FUNCTION-URL-OK";
+pub(crate) const ORIGIN_MARKER: &str = "FUNCTION-URL-OK";
 
 /// Lambda's own metric namespace and the series that counts the invocations admitted to a
 /// function, as that service publishes them.
@@ -114,13 +114,13 @@ const EDGE_REQUEST_ID_HEADER: &str = "x-amz-cf-id";
 
 /// The path the open behaviour serves, and the path pattern (and a path under it) of the
 /// behaviour that trusts a key group.
-const OPEN_PATH: &str = "/whoami";
+pub(crate) const OPEN_PATH: &str = "/whoami";
 const PRIVATE_PATTERN: &str = "/private/*";
 const PRIVATE_PATH: &str = "/private/object";
 
 /// `X-Cache` for an answer the origin produced for this request, and for one CloudFront
 /// produced itself.
-const MISS: &str = "Miss from cloudfront";
+pub(crate) const MISS: &str = "Miss from cloudfront";
 const ERROR: &str = "Error from cloudfront";
 
 /// The handler behind the function URL: it reports the request it was handed — the method, the
@@ -170,7 +170,10 @@ fn package() -> Vec<u8> {
 }
 
 /// The text of the first `<name>` element of an XML body, or `""`.
-fn element(body: &str, name: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite that stages a resource through [`Topology::cloudfront`]
+/// reads the minted identifier out of the answer the same way.
+pub(crate) fn element(body: &str, name: &str) -> String {
     let open = format!("<{name}>");
     let Some(start) = body.find(&open).map(|at| at + open.len()) else {
         return String::new();
@@ -189,7 +192,7 @@ fn element(body: &str, name: &str) -> String {
 /// assembled router mounts them: the function the edge fetches is run by that Lambda as a
 /// session of the role IAM holds, and the invocations it admits are counted in the CloudWatch
 /// store both services share.
-struct Topology {
+pub(crate) struct Topology {
     router: MultiServiceRouter,
     callback: EmbeddedEmulator,
     engine: Arc<engine::InMemoryEngine>,
@@ -202,7 +205,7 @@ struct Topology {
 impl Topology {
     /// An emulator that does not verify signatures, so a setup call carries a credential scope
     /// (which is what names the Region and routes it) without a computed signature.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_verification(false)
     }
 
@@ -288,7 +291,7 @@ impl Topology {
     /// On a verifying emulator the request is SIGNED the way an in-process call of this
     /// emulator is signed, through the one signing path the services share; otherwise it
     /// carries the credential scope alone, which is what routes it.
-    async fn cloudfront(
+    pub(crate) async fn cloudfront(
         &self,
         case: &str,
         method: &str,
@@ -335,7 +338,7 @@ impl Topology {
 
     /// The HOST of a PUBLIC function URL over [`HANDLER_SOURCE`]: `AuthType=NONE` and the
     /// resource-policy grant that admits the anonymous caller an unsigned origin fetch is.
-    async fn public_function_url_host(&self, case: &str, function: &str) -> String {
+    pub(crate) async fn public_function_url_host(&self, case: &str, function: &str) -> String {
         let host = self
             .function_url_host(case, function, aws_sdk_lambda::types::FunctionUrlAuthType::None)
             .await;
@@ -450,7 +453,7 @@ impl Topology {
     /// reports them over a window around now: the owning service's record of whether the
     /// origin was reached at all. `0` for a function nobody invoked, which publishes no
     /// datapoint.
-    async fn invocations(&self, case: &str, function: &str) -> f64 {
+    pub(crate) async fn invocations(&self, case: &str, function: &str) -> f64 {
         let (start, end) = window(now_secs());
         let answered = cloudwatch(
             &self.router,
@@ -511,7 +514,11 @@ impl Topology {
 
     /// One distribution from `config`: its `(Id, ARN, DomainName)`, with the domain held to
     /// being an address a client on this machine can dial.
-    async fn created_distribution(&self, case: &str, config: &str) -> (String, String, String) {
+    pub(crate) async fn created_distribution(
+        &self,
+        case: &str,
+        config: &str,
+    ) -> (String, String, String) {
         let (status, raw) = self
             .cloudfront(case, "POST", &format!("/{API_VERSION}/distribution"), Some(config))
             .await;
@@ -538,7 +545,7 @@ impl Topology {
     /// Look again until `GetDistribution` reports `id` `Deployed` — a configuration that has
     /// not reached the edge locations serves no viewer — or the deadline passes, which fails
     /// the case. The CONDITION is what is waited for, never a span of the host's clock.
-    async fn awaited_deployment(&self, case: &str, id: &str) {
+    pub(crate) async fn awaited_deployment(&self, case: &str, id: &str) {
         let deadline = Instant::now() + READY_DEADLINE;
         loop {
             let (status, raw) = self
@@ -647,12 +654,12 @@ fn trusted_behavior(key_group: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// What one exchange on the published address observed.
-struct Answered {
-    status: u16,
+pub(crate) struct Answered {
+    pub(crate) status: u16,
     /// The whole answer as it came off the connection, status line and headers included.
-    raw: String,
+    pub(crate) raw: String,
     /// The body alone, which is where the origin's own bytes are.
-    body: String,
+    pub(crate) body: String,
 }
 
 impl Answered {
@@ -664,7 +671,7 @@ impl Answered {
 
     /// [`Answered::of`] for a viewer that STATES `headers` of its own beside the `Host` — a
     /// browser that carries a header the edge reads about the connection it opened.
-    async fn of_stating(
+    pub(crate) async fn of_stating(
         case: &str,
         domain: &str,
         method: &str,
@@ -691,12 +698,12 @@ impl Answered {
     }
 
     /// Whether the answer carries the origin's own bytes.
-    fn carries_the_origins_bytes(&self) -> bool {
+    pub(crate) fn carries_the_origins_bytes(&self) -> bool {
         self.body.contains(ORIGIN_MARKER)
     }
 
     /// Whether the answer was reported as one the edge served from `x_cache`.
-    fn reports_cache(&self, x_cache: &str) -> bool {
+    pub(crate) fn reports_cache(&self, x_cache: &str) -> bool {
         self.raw
             .to_ascii_lowercase()
             .contains(&format!("x-cache: {}", x_cache.to_ascii_lowercase()))
@@ -708,7 +715,7 @@ impl Answered {
     }
 
     /// The function's own report, as the document it answered with.
-    fn report(&self, case: &str) -> Value {
+    pub(crate) fn report(&self, case: &str) -> Value {
         serde_json::from_str(&self.body).unwrap_or_else(|error| {
             panic!(
                 "case {case:?}: the origin's answer is no document ({error}): {:?}",
@@ -719,7 +726,9 @@ impl Answered {
 }
 
 /// The header names the function reported on the request it served.
-fn header_names(report: &Value) -> Vec<String> {
+///
+/// `pub(crate)` so a sibling suite reading the same report asks it the same question.
+pub(crate) fn header_names(report: &Value) -> Vec<String> {
     report["header_names"]
         .as_array()
         .map(|names| {
@@ -735,7 +744,7 @@ fn header_names(report: &Value) -> Vec<String> {
 /// carries the address the request came from, with the viewer's port after it where that port
 /// is known, so the address is read off the front of the value. An IPv6 literal carries its
 /// own colons inside brackets.
-fn viewer_ip(reported: &str) -> String {
+pub(crate) fn viewer_ip(reported: &str) -> String {
     let trimmed = reported.trim();
     if let Some(end) = trimmed.find(']') {
         return trimmed[..=end].to_string();
