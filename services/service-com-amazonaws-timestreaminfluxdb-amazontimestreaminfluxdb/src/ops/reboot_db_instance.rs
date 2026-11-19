@@ -231,13 +231,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A reboot restarts the InfluxDB process of an instance that is RUNNING: an
         // instance still being provisioned, reconfigured or deleted is busy with a change
-        // of its own, so such a request is refused and the record is left untouched.
+        // of its own, so such a request is refused and the record is left untouched. The
+        // refusal states the rebootable-state rule and names the account that owns the
+        // record, which is the one this service reads out of the record's own ARN.
         if !record.is_available() {
-            let refusal = st::resource_not_in_status(
+            let refusal = st::resource_not_rebootable(
                 st::NAMED_DB_INSTANCE,
-                &record.id,
-                &record.status,
-                st::STATUS_AVAILABLE,
+                &input.identifier,
+                st::arn_account_id(&record.arn),
             );
             return Err(RebootDbInstanceErrorModeled::ValidationException(refusal).into());
         }

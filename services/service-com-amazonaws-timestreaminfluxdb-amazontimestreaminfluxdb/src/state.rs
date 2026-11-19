@@ -158,24 +158,27 @@ pub fn db_instance_not_found(identifier: &str) -> ResourceNotFoundException {
     }
 }
 
-/// The refusal a lifecycle action gets while the resource it names is still busy with a
-/// change of its own: the request is well formed, but the resource is not in the status
-/// the action can start from.
+/// The refusal a restart gets while the resource it names is busy with a change of its
+/// own: the request is well formed and the resource exists, but a resource that is not
+/// running cannot be restarted, so the state conflict surfaces as request validation
+/// rather than as a conflict.
 ///
-/// Names the resource, its id, the status it is actually in and the status the action
-/// needs — all four read out of this emulator's own state, nothing of them interpolated
-/// from a recording.
+/// The sentence states the RULE the request broke — the resource is not in a rebootable
+/// state — and its only variable parts are the identifier the request named and the
+/// account that owns the stored record ([`arn_account_id`]). It deliberately names
+/// neither the status the resource is in nor the status a restart needs: a client keys
+/// its retry-until-rebootable loop off the rule, and reads the resource's status from a
+/// read of the resource.
 #[must_use]
-pub fn resource_not_in_status(
+pub fn resource_not_rebootable(
     resource: NamedResource,
     id: &str,
-    current_status: &str,
-    required_status: &str,
+    account_id: &str,
 ) -> ValidationException {
     ValidationException {
         message: format!(
-            "The {} with id [{id}] is in status [{current_status}] and must be in status \
-             [{required_status}] for the requested operation",
+            "{} with identifier {id} and customer id {account_id} is not in a rebootable \
+             state",
             resource.spelling,
         ),
         // The request itself is valid and no field of it failed validation — the
@@ -929,6 +932,21 @@ pub fn family_arn(segment: &str, region: &str, id: &str) -> String {
 /// The ARN of a DB instance: `arn:aws:timestream-influxdb:<region>:<account>:db-instance/<id>`.
 pub fn db_instance_arn(region: &str, id: &str) -> String {
     family_arn(ARN_SEGMENT_DB_INSTANCE, region, id)
+}
+
+/// The account a stored record belongs to, read out of the record's OWN `arn`: the fifth
+/// colon-separated segment of `arn:<partition>:<service>:<region>:<account>:<resource>`.
+///
+/// A refusal that names the owning customer takes it from here rather than from the
+/// calling identity, so it reports who holds the resource. An ARN with no account segment
+/// — one this emulator did not mint — falls back to the emulator's own account, which is
+/// the account every ARN [`family_arn`] builds carries.
+#[must_use]
+pub fn arn_account_id(arn: &str) -> &str {
+    match arn.split(':').nth(4) {
+        Some(account) if !account.is_empty() => account,
+        _ => ::engine::emulator_account_id(),
+    }
 }
 
 /// The engine parameter family a DB parameter group configures when its create request

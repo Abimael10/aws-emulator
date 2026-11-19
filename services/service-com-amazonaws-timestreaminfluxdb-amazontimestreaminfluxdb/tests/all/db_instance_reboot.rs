@@ -7,9 +7,11 @@
 //! record, reports `status` `REBOOTING` while the restart runs, changes no other member of
 //! the record, and the clock settles the record back to `AVAILABLE` on its own. An
 //! instance in any other status is busy with a change of its own, so the request is
-//! refused with HTTP 400 `ValidationException` and the record is left exactly as it was;
-//! an `identifier` that resolves to no live instance is refused with HTTP 404
-//! `ResourceNotFoundException`.
+//! refused with HTTP 400 `ValidationException` saying the resource is not in a rebootable
+//! state — naming the identifier the request asked for and the account that owns the
+//! record, and neither the status it is in nor the status a restart needs — and the record
+//! is left exactly as it was; an `identifier` that resolves to no live instance is refused
+//! with HTTP 404 `ResourceNotFoundException`.
 //!
 //! Every status name asserted here is a member of the modelled `Status` enum
 //! (`smithy_query(query="shape", shape="Status")`), and the member set the reboot answer
@@ -369,9 +371,37 @@ async fn a_reboot_is_refused_while_the_instance_is_in_a_transient_status() {
             case.label
         );
         let message = body["message"].as_str().unwrap_or_default();
+        // The refusal states the RULE the request broke: the sentence is fixed text apart
+        // from the identifier the request named and the 12-digit account that owns the
+        // record, which is field 5 of the instance's own `arn`. It names neither the
+        // status the instance is in nor the status a restart needs, so the SAME sentence
+        // answers every transient status in this table.
+        let account_id = started["arn"]
+            .as_str()
+            .and_then(|arn| arn.split(':').nth(4))
+            .unwrap_or_else(|| {
+                panic!("case {:?}: expected an `arn` on {started}", case.label)
+            });
+        // The modelled `Arn` pattern fixes the account segment at `[0-9]{12}`
+        // (`smithy_query(query="shape", shape="Arn")`), so the id the sentence carries is
+        // the 12-digit owning account and not some other segment of the ARN.
         assert!(
-            message.contains(&id) && message.contains(case.status),
-            "case {:?}: the refusal must name the instance and the status it is in, \
+            account_id.len() == 12 && account_id.bytes().all(|byte| byte.is_ascii_digit()),
+            "case {:?}: expected a 12-digit account id in the arn, got {account_id:?}",
+            case.label
+        );
+        let expected = format!(
+            "DbInstance with identifier {id} and customer id {account_id} is not in a \
+             rebootable state"
+        );
+        assert_eq!(
+            message, expected,
+            "case {:?}: expected {expected:?}, got {message:?}",
+            case.label
+        );
+        assert!(
+            !message.contains(case.status),
+            "case {:?}: the refusal must not name the status the instance is in, \
              got {message:?}",
             case.label
         );
@@ -486,6 +516,22 @@ async fn a_reboot_of_an_identifier_that_resolves_to_nothing_is_not_found() {
             body["resourceType"].as_str(),
             Some("DB_INSTANCE"),
             "case {label:?}: unexpected resourceType in {body}"
+        );
+        // The message of this error class is the whole fixed sentence: it interpolates no
+        // id, name or time, so every row of the table — the id of a deleted instance just
+        // as much as one nothing ever minted — is refused with the same text, and the
+        // identifier asked for is reported in `resourceId` instead.
+        assert_eq!(
+            body["message"].as_str(),
+            Some("The DB instance with db id does not exist"),
+            "case {label:?}: unexpected refusal message in {body}"
+        );
+        assert!(
+            !body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(identifier),
+            "case {label:?}: the message must not interpolate the identifier, got {body}"
         );
     }
 
