@@ -814,8 +814,8 @@ pub const PUBLISHED_DOCUMENTS: &[PublishedDocument] = &[
         created_date_millis: 1_786_631_569_844,
     },
     // The rest of the Command documents Systems Manager publishes: what Run Command,
-    // Distributor, State Manager and the patch and update workflows name. The recorded
-    // catalogue pins the date of `AWS-ConfigureAWSPackage`; the dates below it are the
+    // Distributor, State Manager and the patch and update workflows name. Each document
+    // the recorded catalogue pins a date for carries that date; the rest carry the
     // stand-ins this file's header describes.
     PublishedDocument {
         name: "AWS-ConfigureAWSPackage",
@@ -839,7 +839,7 @@ pub const PUBLISHED_DOCUMENTS: &[PublishedDocument] = &[
         name: "AWS-InstallWindowsUpdates",
         document_type: "Command",
         content: published_command_documents::INSTALL_WINDOWS_UPDATES,
-        created_date_millis: 1_503_695_769_206,
+        created_date_millis: 1_781_017_685_843,
     },
     PublishedDocument {
         name: "AWS-FindWindowsUpdates",
@@ -851,7 +851,7 @@ pub const PUBLISHED_DOCUMENTS: &[PublishedDocument] = &[
         name: "AWS-RunRemoteScript",
         document_type: "Command",
         content: published_command_documents::RUN_REMOTE_SCRIPT,
-        created_date_millis: 1_503_695_784_612,
+        created_date_millis: 1_508_978_913_261,
     },
     PublishedDocument {
         name: "AWS-RunDocument",
@@ -875,33 +875,33 @@ pub const PUBLISHED_DOCUMENTS: &[PublishedDocument] = &[
         name: "AWS-ApplyAnsiblePlaybooks",
         document_type: "Command",
         content: published_command_documents::APPLY_ANSIBLE_PLAYBOOKS,
-        created_date_millis: 1_563_822_104_358,
+        created_date_millis: 1_758_834_443_390,
     },
     PublishedDocument {
         name: "AWS-ConfigureCloudWatch",
         document_type: "Command",
         content: published_command_documents::CONFIGURE_CLOUD_WATCH,
-        created_date_millis: 1_503_695_816_733,
+        created_date_millis: 1_525_720_957_739,
     },
     PublishedDocument {
         name: "AWS-RunInspecChecks",
         document_type: "Command",
         content: published_command_documents::RUN_INSPEC_CHECKS,
-        created_date_millis: 1_551_308_281_476,
+        created_date_millis: 1_758_834_488_387,
     },
-    // The Session documents Session Manager starts a session with, each at a stand-in
-    // publication date.
+    // The Session documents Session Manager starts a session with: the two the recorded
+    // catalogue pins a date for carry that date, the rest a stand-in publication date.
     PublishedDocument {
         name: "AWS-StartSSHSession",
         document_type: DOCUMENT_TYPE_SESSION,
         content: published_command_documents::START_SSH_SESSION,
-        created_date_millis: 1_555_361_827_515,
+        created_date_millis: 1_562_087_817_013,
     },
     PublishedDocument {
         name: "AWS-StartPortForwardingSession",
         document_type: DOCUMENT_TYPE_SESSION,
         content: published_command_documents::START_PORT_FORWARDING_SESSION,
-        created_date_millis: 1_566_497_019_264,
+        created_date_millis: 1_563_487_178_453,
     },
     PublishedDocument {
         name: "AWS-StartPortForwardingSessionToRemoteHost",
@@ -921,25 +921,26 @@ pub const PUBLISHED_DOCUMENTS: &[PublishedDocument] = &[
         content: published_command_documents::START_NON_INTERACTIVE_COMMAND,
         created_date_millis: 1_641_332_086_774,
     },
-    // The Automation runbooks that act on an Amazon EC2 instance or its volumes, each at a
-    // stand-in publication date.
+    // The Automation runbooks that act on an Amazon EC2 instance or its volumes: each one
+    // the recorded catalogue pins a date for carries that date, the rest a stand-in
+    // publication date.
     PublishedDocument {
         name: "AWS-StartEC2Instance",
         document_type: "Automation",
         content: published_automation_runbooks::START_EC2_INSTANCE,
-        created_date_millis: 1_514_908_801_332,
+        created_date_millis: 1_782_421_644_712,
     },
     PublishedDocument {
         name: "AWS-StopEC2Instance",
         document_type: "Automation",
         content: published_automation_runbooks::STOP_EC2_INSTANCE,
-        created_date_millis: 1_514_908_809_447,
+        created_date_millis: 1_531_242_313_476,
     },
     PublishedDocument {
         name: "AWS-RestartEC2Instance",
         document_type: "Automation",
         content: published_automation_runbooks::RESTART_EC2_INSTANCE,
-        created_date_millis: 1_514_908_817_519,
+        created_date_millis: 1_511_217_229_956,
     },
     PublishedDocument {
         name: "AWS-TerminateEC2Instance",
@@ -951,7 +952,7 @@ pub const PUBLISHED_DOCUMENTS: &[PublishedDocument] = &[
         name: "AWS-CreateImage",
         document_type: "Automation",
         content: published_automation_runbooks::CREATE_IMAGE,
-        created_date_millis: 1_514_908_833_712,
+        created_date_millis: 1_533_661_478_787,
     },
     PublishedDocument {
         name: "AWS-CreateSnapshot",
@@ -969,13 +970,13 @@ pub const PUBLISHED_DOCUMENTS: &[PublishedDocument] = &[
         name: "AWS-UpdateLinuxAmi",
         document_type: "Automation",
         content: published_automation_runbooks::UPDATE_LINUX_AMI,
-        created_date_millis: 1_514_908_858_046,
+        created_date_millis: 1_775_747_623_945,
     },
     PublishedDocument {
         name: "AWS-PatchInstanceWithRollback",
         document_type: "Automation",
         content: published_automation_runbooks::PATCH_INSTANCE_WITH_ROLLBACK,
-        created_date_millis: 1_514_908_866_117,
+        created_date_millis: 1_761_232_679_723,
     },
     PublishedDocument {
         name: "AWS-ResizeInstance",

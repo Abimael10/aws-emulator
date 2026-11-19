@@ -237,13 +237,32 @@ async fn a_publication_date_is_the_same_in_every_region_and_in_a_second_emulator
 /// the rows below are the ones that corpus pins, and the suites above hold the rule for
 /// every other entry of the catalogue.
 const RECORDED_PUBLICATION_DATES_MILLIS: &[(&str, i64)] = &[
+    ("AWS-ApplyAnsiblePlaybooks", 1_758_834_443_390),
     ("AWS-ConfigureAWSPackage", 1_706_038_480_989),
+    ("AWS-ConfigureCloudWatch", 1_525_720_957_739),
+    ("AWS-CreateImage", 1_533_661_478_787),
     ("AWS-GatherSoftwareInventory", 1_564_011_832_472),
+    ("AWS-InstallWindowsUpdates", 1_781_017_685_843),
+    ("AWS-PatchInstanceWithRollback", 1_761_232_679_723),
+    ("AWS-RestartEC2Instance", 1_511_217_229_956),
+    ("AWS-RunInspecChecks", 1_758_834_488_387),
     ("AWS-RunPatchBaseline", 1_786_631_569_844),
     ("AWS-RunPowerShellScript", 1_503_695_741_940),
+    ("AWS-RunRemoteScript", 1_508_978_913_261),
     ("AWS-RunShellScript", 1_503_695_717_821),
+    ("AWS-StartEC2Instance", 1_782_421_644_712),
+    ("AWS-StartPortForwardingSession", 1_563_487_178_453),
+    ("AWS-StartSSHSession", 1_562_087_817_013),
+    ("AWS-StopEC2Instance", 1_531_242_313_476),
+    ("AWS-UpdateLinuxAmi", 1_775_747_623_945),
     ("AWS-UpdateSSMAgent", 1_622_567_950_979),
 ];
+
+/// The `CreatedDate` of a reported version or document in epoch MILLISECONDS, which is the
+/// precision Systems Manager reports a document date at.
+fn millis_of(case: &str, reported: &Value) -> i64 {
+    (created_date(case, reported) * 1_000.0).round() as i64
+}
 
 /// Each document whose published date is known is served at THAT date, to the
 /// millisecond.
@@ -256,12 +275,67 @@ async fn the_known_publication_dates_are_served_as_the_catalogue_carries_them() 
             "case {name}: the catalogue must publish a document the corpus pins a date for"
         );
         let version = the_one_version(&router, name, name).await;
-        let millis = (created_date(name, &version) * 1_000.0).round() as i64;
+        let millis = millis_of(name, &version);
         assert_eq!(
             millis, *expected_millis,
             "case {name}: expected the published date {expected_millis} in epoch \
              milliseconds, got {millis}"
         );
+    }
+}
+
+/// A date the catalogue pins belongs to the DOCUMENT, not to the read that reported it:
+/// every read of a published document — the version listing, the describe and the document
+/// listing — reports that same date, and so does the same read through another Region's
+/// endpoint. The rows span the document types the catalogue publishes (`Command`,
+/// `Automation`, `Session`, `Policy`) and dates from a decade apart.
+#[tokio::test]
+async fn a_known_publication_date_is_reported_by_every_read_and_in_every_region() {
+    let router = router();
+    let listed = list_documents(&router).await;
+
+    for (name, expected_millis) in RECORDED_PUBLICATION_DATES_MILLIS {
+        let described = {
+            let (status, response) = call(&router, "DescribeDocument", &json!({ "Name": name })).await;
+            assert_eq!(
+                status, 200,
+                "case {name}: DescribeDocument must resolve a document AWS publishes, got \
+                 {status} {response}"
+            );
+            millis_of(name, &response["Document"])
+        };
+        assert_eq!(
+            described, *expected_millis,
+            "case {name}: DescribeDocument must report the published date \
+             {expected_millis} in epoch milliseconds, got {described}"
+        );
+
+        let identifier = listed.get(*name).unwrap_or_else(|| {
+            panic!("case {name}: a listing must report every published document, got {listed:?}")
+        });
+        let in_listing = millis_of(name, identifier);
+        assert_eq!(
+            in_listing, *expected_millis,
+            "case {name}: ListDocuments must report the published date {expected_millis} \
+             in epoch milliseconds, got {in_listing}"
+        );
+
+        for region in ["us-east-1", "eu-west-3"] {
+            let (status, response) =
+                call_in_region(&router, region, "ListDocumentVersions", &json!({ "Name": name }))
+                    .await;
+            assert_eq!(
+                status, 200,
+                "case {name}: a published document resolves through {region}, got {status} \
+                 {response}"
+            );
+            let in_region = millis_of(name, &response["DocumentVersions"][0]);
+            assert_eq!(
+                in_region, *expected_millis,
+                "case {name}: the published date is {expected_millis} in epoch \
+                 milliseconds through {region} too, got {in_region}"
+            );
+        }
     }
 }
 
