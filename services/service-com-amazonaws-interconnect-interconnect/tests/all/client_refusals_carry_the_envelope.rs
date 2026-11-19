@@ -24,9 +24,14 @@
 //!   the published catalog can reach — an Environment in the `unavailable` state, which
 //!   the published catalog holds none of, and the account's connection quota, which
 //!   `connection_lifecycle` drives end to end — so a sentence added beside them cannot
-//!   quietly leave the envelope out either.
+//!   quietly leave the envelope out either;
+//! * and per OPERATION, over two faults of the SAME operation (the page cursor a listing
+//!   never issued against the sibling fault its other members or its resource handle
+//!   carry), with each sentence spelled out in this suite rather than taken from the
+//!   helper the handler words it with — so one operation answering two message shapes
+//!   fails here, which is what a client stripping or matching the prefix would see.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::{json, Map, Value};
 
@@ -39,7 +44,8 @@ use service_com_amazonaws_interconnect_interconnect::state::{
     environment_not_found_message, environment_unavailable_message, not_a_connection_arn_message,
     not_a_gateway_identifier_message, parse_connection_arn, proposal_already_accepted_message,
     proposal_not_acceptable_message, proposal_not_retrievable_message, reserved_tag_key_violation,
-    tag_write_violation, REFUSAL_ENVELOPE, TAG_KEY_LENGTH, UNAVAILABLE_ENVIRONMENT_STATE,
+    tag_write_violation, ATTACH_POINT_CURSOR_TAG, CONNECTION_CURSOR_TAG,
+    ENVIRONMENT_CURSOR_TAG, REFUSAL_ENVELOPE, TAG_KEY_LENGTH, UNAVAILABLE_ENVIRONMENT_STATE,
 };
 
 use crate::emulator::{
@@ -509,5 +515,286 @@ fn every_refusal_sentence_the_service_builds_carries_the_envelope() {
     assert!(
         !mismatch.contains(foreign),
         "case \"an ARN of another scope\": expected the refusal to reproduce nothing of the ARN, got {mismatch:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// One operation, one refusal shape
+// ---------------------------------------------------------------------------
+
+/// The envelope spelled out HERE rather than read off the crate that builds it: what a
+/// client strips or matches on is the TEXT, so these rows pin the text, which is then
+/// tied to the constant the service exports so neither can be re-spelled alone.
+const ENVELOPE_TEXT: &str = "Unable to process request: ";
+
+/// `NextToken`'s published length (`smithy_query(query="shape",shape="NextToken")`:
+/// `@length` 1..1024), so a row can send a token at each published bound and still be
+/// answered by the listing's own cursor rule rather than by the request-boundary walk.
+const NEXT_TOKEN_LENGTH: (usize, usize) = (1, 1024);
+
+/// The `@length` ceiling the model gives the target of both `Provider` members
+/// (`smithy_query(query="shape",shape="Provider")`: `cloudServiceProvider` and
+/// `lastMileProvider` both target an `@length(max: 32)` string).
+const PROVIDER_NAME_MAX_LENGTH: usize = 32;
+
+/// The three paginated operations of this service, each with the output member it pages
+/// and the public tag it stamps on the cursors it mints — not a secret, which is what
+/// lets a row send a value shaped like one of that listing's own cursors.
+const LISTINGS: [(&str, &str, &str); 3] = [
+    ("ListConnections", "connections", CONNECTION_CURSOR_TAG),
+    ("ListEnvironments", "environments", ENVIRONMENT_CURSOR_TAG),
+    ("ListAttachPoints", "attachPoints", ATTACH_POINT_CURSOR_TAG),
+];
+
+/// The sentence a listing refuses a `nextToken` it never issued with, spelled out: the
+/// envelope, the clause, and the operation whose cursors the token would have had to be
+/// one of.
+fn cursor_sentence(operation: &str) -> String {
+    format!("{ENVELOPE_TEXT}nextToken is not a pagination token issued by {operation}")
+}
+
+/// The sentence a `provider` member value past its modelled ceiling is refused with.
+fn provider_sentence(member: &str, length: usize) -> String {
+    format!(
+        "{ENVELOPE_TEXT}provider.{member} must be at most {PROVIDER_NAME_MAX_LENGTH} characters \
+         long, and one of length {length} is not"
+    )
+}
+
+/// The sentence an `environmentId` that resolves to no Environment of the called Region
+/// is refused with.
+fn unresolvable_environment_sentence(environment_id: &str) -> String {
+    format!("{ENVELOPE_TEXT}This environment model with id {environment_id} could not be found")
+}
+
+/// `nextToken` values no listing of this service ever issued, each labelled with the form
+/// it stands for and each INSIDE the member's published length, so what refuses them is
+/// the cursor rule and not the boundary walk. `tag` is the listing's own public cursor
+/// tag, so one row sends a value shaped like a cursor of the very listing it is offered
+/// to.
+fn tokens_no_listing_issued(tag: &str) -> Vec<(String, String)> {
+    let (min_length, max_length) = NEXT_TOKEN_LENGTH;
+    vec![
+        (
+            "a token of no cursor shape at all".to_string(),
+            "not-a-cursor".to_string(),
+        ),
+        (
+            format!("a token of the member's published minimum length, {min_length}"),
+            "x".repeat(min_length),
+        ),
+        (
+            format!("a token of the member's published maximum length, {max_length}"),
+            "a".repeat(max_length),
+        ),
+        (
+            "this listing's own public tag over a key of the caller's".to_string(),
+            format!("{tag}{}", UNRESOLVABLE_ENVIRONMENTS[0]),
+        ),
+        (
+            "the hex rendering an issued cursor arrives in, over bytes no store minted"
+                .to_string(),
+            "00112233445566778899aabbccddeeff".to_string(),
+        ),
+    ]
+}
+
+/// RULE: one operation answers ONE refusal shape. Every client fault this service words
+/// itself opens with the service's envelope, so the two faults of a single operation — a
+/// `nextToken` the listing never issued and the fault its sibling member or resource
+/// handle carries — cannot come back in two message shapes, whichever modelled error they
+/// travel in.
+///
+/// The rows differ along what the rule generalises over: the paginated operation (all
+/// three), the form of the value no listing issued (no cursor shape, each published length
+/// bound, that listing's own public tag over a foreign key, an issued cursor's hex
+/// rendering over bytes no store minted), and — per operation — the KIND of fault compared
+/// against it (a union member value its model cannot hold, a resource handle that resolves
+/// to nothing) together with the modelled error shape that fault travels in. Every
+/// sentence is spelled out here rather than taken from the helper the handler words it
+/// with, so a re-spelled message fails this suite instead of following the helper.
+#[tokio::test]
+async fn one_operation_words_its_cursor_refusal_like_its_other_refusals() {
+    // What this suite pins is what the service builds its refusals from.
+    assert_eq!(
+        ENVELOPE_TEXT, REFUSAL_ENVELOPE,
+        "case \"the envelope\": expected the text this suite pins to be the one the service \
+         words its refusals with, got {REFUSAL_ENVELOPE:?}"
+    );
+
+    let emulator = Emulator::new();
+    let placements = placements(&emulator).await;
+    let environment = placements
+        .first()
+        .expect("case \"catalog\": expected an Environment a connection can be placed on")
+        .0
+        .clone();
+    // An attach point of the account, so the attach-point listing has the account's own
+    // gateways to resolve and its served row below is a real page rather than a listing
+    // of nothing.
+    let _gateway = emulator.attach_point().await;
+
+    // Each listing SERVES a page when no cursor is offered, so the refusals below are
+    // about the token and not a listing that refuses everything.
+    for (operation, paged, _) in LISTINGS {
+        let body = if operation == "ListAttachPoints" {
+            json!({ "environmentId": environment })
+        } else {
+            json!({})
+        };
+        let (status, answered) = emulator.ic(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "case {operation:?} with no cursor: expected HTTP 200, got {status} with {answered:?}"
+        );
+        assert!(
+            answered[paged].as_array().is_some(),
+            "case {operation:?} with no cursor: expected a page in {paged:?}, got {answered:?}"
+        );
+    }
+
+    let mut rows: Vec<Refusal> = Vec::new();
+
+    // The cursor refusal of each listing, in every form of value no listing issued.
+    for (operation, _, tag) in LISTINGS {
+        for (form, token) in tokens_no_listing_issued(tag) {
+            let mut body = Map::new();
+            body.insert("nextToken".to_string(), json!(token));
+            if operation == "ListAttachPoints" {
+                body.insert("environmentId".to_string(), json!(environment));
+            }
+            rows.push(Refusal {
+                case: format!("{operation} with {form}"),
+                operation,
+                body: Value::Object(body),
+                status: 400,
+                code: VALIDATION_CODE,
+                message: cursor_sentence(operation),
+            });
+        }
+    }
+
+    // The OTHER fault of each of those same three operations, so what is compared is two
+    // message shapes of one operation. The two readers of `Provider` are refused on a
+    // member value its model cannot hold — a different member and a different length each
+    // — and the attach-point listing, which reads no `Provider`, on a handle that resolves
+    // to no Environment: a client fault in another modelled error shape altogether.
+    let over_long = "P".repeat(PROVIDER_NAME_MAX_LENGTH + 1);
+    rows.push(Refusal {
+        case: "ListEnvironments filtered by a cloudServiceProvider past its ceiling".to_string(),
+        operation: "ListEnvironments",
+        body: json!({ "provider": { "cloudServiceProvider": over_long } }),
+        status: 400,
+        code: VALIDATION_CODE,
+        message: provider_sentence("cloudServiceProvider", PROVIDER_NAME_MAX_LENGTH + 1),
+    });
+    let much_too_long = "L".repeat(PROVIDER_NAME_MAX_LENGTH * 2);
+    rows.push(Refusal {
+        case: "ListConnections filtered by a lastMileProvider past its ceiling".to_string(),
+        operation: "ListConnections",
+        body: json!({ "provider": { "lastMileProvider": much_too_long } }),
+        status: 400,
+        code: VALIDATION_CODE,
+        message: provider_sentence("lastMileProvider", PROVIDER_NAME_MAX_LENGTH * 2),
+    });
+    rows.push(Refusal {
+        case: "ListAttachPoints for an environmentId that resolves to nothing".to_string(),
+        operation: "ListAttachPoints",
+        body: json!({ "environmentId": UNRESOLVABLE_ENVIRONMENTS[1] }),
+        status: 400,
+        code: CLIENT_CODE,
+        message: unresolvable_environment_sentence(UNRESOLVABLE_ENVIRONMENTS[1]),
+    });
+    // Both faults in ONE request: the request's own value is judged first, so the cursor
+    // sentence is what comes back — in the same envelope either verdict carries.
+    rows.push(Refusal {
+        case: "ListAttachPoints with a foreign cursor AND an unresolvable environmentId"
+            .to_string(),
+        operation: "ListAttachPoints",
+        body: json!({
+            "environmentId": UNRESOLVABLE_ENVIRONMENTS[1],
+            "nextToken": "not-a-cursor",
+        }),
+        status: 400,
+        code: VALIDATION_CODE,
+        message: cursor_sentence("ListAttachPoints"),
+    });
+
+    // What each operation answered, so the two shapes of one operation can be compared
+    // once every row has run.
+    let mut answers: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
+    for row in &rows {
+        let case = &row.case;
+        let (status, answered) = emulator.ic(row.operation, row.body.clone()).await;
+        assert_eq!(
+            status, row.status,
+            "case {case:?}: expected HTTP {}, got {status} with {answered:?}",
+            row.status
+        );
+        let reported_code = code(&answered);
+        assert!(
+            reported_code.contains(row.code),
+            "case {case:?}: expected the modelled {}, got {reported_code:?}",
+            row.code
+        );
+        let reported = message(&answered);
+        assert_eq!(
+            reported, row.message,
+            "case {case:?}: expected {:?}, got {reported:?}",
+            row.message
+        );
+        assert!(
+            reported.starts_with(ENVELOPE_TEXT),
+            "case {case:?}: expected a refusal opening with {ENVELOPE_TEXT:?}, got {reported:?}"
+        );
+        // A refusal is not a page: nothing of the listing's items comes back with it.
+        if let Some((_, paged, _)) = LISTINGS
+            .iter()
+            .find(|(operation, _, _)| *operation == row.operation)
+        {
+            assert!(
+                answered[*paged].as_array().is_none(),
+                "case {case:?}: expected the refusal to carry no page, got {:?}",
+                answered[*paged]
+            );
+        }
+        answers
+            .entry(row.operation)
+            .or_default()
+            .push((case.clone(), reported));
+    }
+
+    // The rule itself, per operation: the sentences it answered differ — two faults really
+    // were driven through each one — and every one of them opens with the same envelope,
+    // so a client that strips or matches that prefix sees ONE message shape from the
+    // operation rather than one per failure mode.
+    for (operation, reported) in &answers {
+        let distinct: BTreeSet<&str> = reported
+            .iter()
+            .map(|(_, sentence)| sentence.as_str())
+            .collect();
+        assert!(
+            distinct.len() >= 2,
+            "case {operation:?}: expected two different faults of one operation to be compared, \
+             got {distinct:?}"
+        );
+        for (case, sentence) in reported {
+            assert!(
+                sentence.starts_with(ENVELOPE_TEXT),
+                "case {case:?}: expected every refusal of {operation} to open with \
+                 {ENVELOPE_TEXT:?}, got {sentence:?}"
+            );
+            assert!(
+                sentence.len() > ENVELOPE_TEXT.len(),
+                "case {case:?}: expected the envelope to be followed by a reason, got {sentence:?}"
+            );
+        }
+    }
+    assert_eq!(
+        answers.len(),
+        LISTINGS.len(),
+        "case \"the per-operation table\": expected every paginated operation to contribute two \
+         faults, got {:?}",
+        answers.keys().collect::<Vec<_>>()
     );
 }
