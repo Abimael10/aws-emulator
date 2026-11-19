@@ -153,6 +153,21 @@ const CREATE_MEMBERS: &[&str] = &[
     "WarmThroughput",
 ];
 
+/// The properties a declaration states its keys and the attributes behind them in: the
+/// table's own key schema, the definitions every key attribute has to be declared in, and the
+/// two index lists, each of whose entries carries a key schema of its own.
+///
+/// Source: `CreateTable`'s own members
+/// (`smithy_query(query="operation",operation="CreateTable")`), which the type publishes under
+/// the same names ([`CREATE_MEMBERS`]).
+const KEY_SCHEMA_PROPERTY: &str = "KeySchema";
+const ATTRIBUTE_DEFINITIONS_PROPERTY: &str = "AttributeDefinitions";
+const INDEX_PROPERTIES: &[&str] = &["GlobalSecondaryIndexes", "LocalSecondaryIndexes"];
+
+/// The member each element of either list names one attribute in (`KeySchemaElement$AttributeName`,
+/// `AttributeDefinition$AttributeName`).
+const ATTRIBUTE_NAME_MEMBER: &str = "AttributeName";
+
 /// The property carrying the table's DynamoDB Streams settings, whose SHAPE differs between
 /// the template and the API ([`stream_specification`]).
 const STREAM_SPECIFICATION_PROPERTY: &str = "StreamSpecification";
@@ -276,6 +291,9 @@ pub(super) async fn create(
     propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     refuse_unapplied_properties(&resource.properties, &resource.resource_type)?;
+    // ...and the one rule the handler holds the declaration's own two key properties to,
+    // before the owning service is called at all ([`refuse_undefined_key_attributes`]).
+    refuse_undefined_key_attributes(&resource.properties)?;
     let mut request = Map::new();
     // The table is created under the identifier CloudFormation decided for the resource,
     // which is what `Ref` resolves to and what a client calls DynamoDB with.
@@ -1328,6 +1346,68 @@ fn unapplied(property: &str, resource_type: &str) -> Refusal {
     Refusal {
         code: "NotImplemented".to_string(),
         message: format!("this emulator does not apply the {property} property of {resource_type}"),
+    }
+}
+
+/// The code a declaration the resource HANDLER itself refuses is reported under: the fault is
+/// in the declaration, which is the class every validation refusal falls in
+/// ([`super::HANDLER_ERROR_INVALID_REQUEST`]).
+const DECLARATION_REFUSED: &str = "ValidationException";
+
+/// The sentence the handler refuses a declaration whose key schema names an attribute the
+/// declaration does not define with.
+///
+/// Entirely FIXED text: it states the rule and names neither the attribute nor the index. The
+/// handler holds the declaration to the rule itself, before it calls the owning service at
+/// all, so what a resource's failed event reports is which rule the template broke — not the
+/// index-oriented `ValidationException` DynamoDB words `CreateTable`'s own refusal with, which
+/// names an index a template declaring none does not have.
+const UNDEFINED_KEY_ATTRIBUTE: &str =
+    "An attribute referenced in a KeySchema element is not defined in AttributeDefinitions";
+
+/// Hold the declaration to the one rule that relates its two key properties: every attribute
+/// a `KeySchema` element names — the table's own, and every index's — has to be declared in
+/// `AttributeDefinitions`.
+///
+/// Checked over EVERY key schema the declaration carries, because the rule is about the
+/// declaration as a whole: `AttributeDefinitions` is the one list of the attributes the table
+/// has types for, and an index key is an attribute of the same table.
+fn refuse_undefined_key_attributes(properties: &Value) -> Result<(), Refusal> {
+    let defined = attribute_names(declared_in(properties, ATTRIBUTE_DEFINITIONS_PROPERTY));
+    let mut referenced = attribute_names(declared_in(properties, KEY_SCHEMA_PROPERTY));
+    for property in INDEX_PROPERTIES {
+        if let Some(Value::Array(indexes)) = declared_in(properties, property) {
+            for index in indexes {
+                referenced.extend(attribute_names(declared_in(index, KEY_SCHEMA_PROPERTY)));
+            }
+        }
+    }
+    if referenced.iter().all(|name| defined.contains(name)) {
+        return Ok(());
+    }
+    Err(Refusal {
+        code: DECLARATION_REFUSED.to_string(),
+        message: UNDEFINED_KEY_ATTRIBUTE.to_string(),
+    })
+}
+
+/// The `AttributeName` every element of a declared key schema or definition list names, in
+/// declaration order.
+///
+/// A declaration that states no list, states it as something other than a list, or whose
+/// element names no attribute contributes nothing: what such a declaration is refused for is
+/// the owning service's to say, and this rule is only about the names the two lists do carry.
+fn attribute_names(declared: Option<&Value>) -> Vec<&str> {
+    match declared {
+        Some(Value::Array(elements)) => elements
+            .iter()
+            .filter_map(|element| {
+                element
+                    .get(ATTRIBUTE_NAME_MEMBER)
+                    .and_then(Value::as_str)
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
