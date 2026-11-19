@@ -64,6 +64,10 @@ const ALL_AT_ONCE: &str = "AppConfig.AllAtOnce";
 /// The `LocationUri` that selects AppConfig's own hosted configuration store.
 const HOSTED: &str = "hosted";
 
+/// How far past a span a test moves the clock when it needs that span's transition to have
+/// fallen due, so the verdict never turns on how fast the host ran the call before it.
+const MARGIN: Duration = Duration::from_secs(60);
+
 /// One AppConfig hierarchy, as its control plane minted it.
 #[derive(Debug, Clone)]
 pub(crate) struct Hierarchy {
@@ -445,6 +449,64 @@ impl Emulator {
             deployment.started_at -= Duration::from_secs(24 * 60 * 60);
         }
         environment.materialize(SystemTime::now());
+    }
+
+    /// Bring forward the instant the refusal a control-plane removal owes the session
+    /// `token` falls due, so it has already fallen due.
+    ///
+    /// A poll that cannot re-resolve its triple is served from what the session is bound to
+    /// until that instant (`state::Session::withdrawal_due_at`, one
+    /// `state::WITHDRAWAL_SPAN` past the first poll that found the triple withdrawn), and
+    /// reaching it is the CLOCK's doing, so a test that needs the refusal moves the instant
+    /// rather than sleeping for the span.
+    pub(crate) fn expire_withdrawal_deadline(&self, token: &str) {
+        self.set_withdrawal_deadline(token, SystemTime::now() - MARGIN);
+    }
+
+    /// Push the same instant well into the future, so a poll that cannot re-resolve its
+    /// triple is inside the span whatever the host has been doing in between.
+    pub(crate) fn postpone_withdrawal_deadline(&self, token: &str) {
+        self.set_withdrawal_deadline(token, SystemTime::now() + MARGIN);
+    }
+
+    fn set_withdrawal_deadline(&self, token: &str, at: SystemTime) {
+        let state = self.state();
+        let mut store = state.lock();
+        let session = store
+            .sessions
+            .get_mut(token)
+            .unwrap_or_else(|| panic!("no session is stored under the token {token}"));
+        assert!(
+            session.withdrawal_due_at.is_some(),
+            "the session under the token {token} owes no withdrawal, so there is no deadline \
+             to move"
+        );
+        session.withdrawal_due_at = Some(at);
+    }
+
+    /// When the refusal the session `token` owes falls due, if a poll has found its triple
+    /// withdrawn at all.
+    pub(crate) fn withdrawal_deadline(&self, token: &str) -> Option<SystemTime> {
+        let state = self.state();
+        let store = state.lock();
+        store
+            .session(token)
+            .unwrap_or_else(|| panic!("no session is stored under the token {token}"))
+            .withdrawal_due_at
+    }
+
+    /// Backdate when the session `token` was last polled, so what follows is the poll of a
+    /// client that has been idle that long — the cadence a client honouring
+    /// `NextPollIntervalInSeconds` polls at, which no test can wait out.
+    pub(crate) fn backdate_last_poll(&self, token: &str, ago: Duration) {
+        let state = self.state();
+        let mut store = state.lock();
+        let session = store
+            .sessions
+            .get_mut(token)
+            .unwrap_or_else(|| panic!("no session is stored under the token {token}"));
+        let then = SystemTime::now() - ago;
+        session.last_polled_at = Some(then);
     }
 
     /// Start a session over a triple, named however the caller spells it.

@@ -350,7 +350,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // triple has in force (`crate::state::Session::bound_configuration`): a copy of
         // an immutable version, which every token of the session's poll chain then shares
         // for as long as that version is the one in force. Each poll resolves the triple
-        // against the control plane again, so the copy decides nothing a poll answers.
+        // against the control plane again to pick up a newer version, and falls back on
+        // the copy once the triple no longer resolves, until the withdrawal that owes falls
+        // due — see `crate::ops::get_latest_configuration`.
         //
         // WHICH configuration that is depends on where this session stands in a rollout
         // still under way: a configuration session is one TARGET of a deployment, and a

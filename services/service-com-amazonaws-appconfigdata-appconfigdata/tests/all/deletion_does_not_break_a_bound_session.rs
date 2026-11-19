@@ -4,34 +4,55 @@
 //! polling, driven end to end over HTTP.
 //!
 //! The rule under test is about every level of the AppConfig hierarchy and every poll of
-//! a session, not about one deletion: a session is over LIVE control-plane state, so
-//! every poll resolves the session's (application, environment, configuration profile)
-//! triple against that store as it stands at the instant of the poll. Whatever the
-//! control plane no longer holds — a level of the hierarchy, or the configuration version
-//! the in-force deployment names — leaves the poll nothing to serve, and the poll is
-//! refused with the modelled `ResourceNotFoundException` (404) naming the resource that
-//! is gone. That is the same answer `StartConfigurationSession` gives for the same
-//! triple, so what a session is served never depends on when it was started: a token
-//! bounds a poll in TIME, it is not a standing grant over withdrawn state.
+//! a session, not about one deletion: a session's (application, environment,
+//! configuration profile) triple is resolved when the session is STARTED, and a poll
+//! re-resolves it to pick up a newer version in force — not to re-authorise the session.
+//! So a record the control plane stops holding does not refuse the poll that follows the
+//! removal, however long the client waited between polls: that poll is answered from the
+//! resolution the session carries, which names the version the client already has, so it is
+//! the modelled no-change 200 (empty `Configuration`, the configuration's content type, a
+//! rotated `Next-Poll-Configuration-Token` and a poll interval). That first withdrawn poll
+//! is what makes the refusal DUE, one withdrawal span later — a transition the CLOCK makes,
+//! so it arrives whether or not anybody polls again — and from then on every poll of that
+//! chain is refused with the modelled `ResourceNotFoundException` (404) naming the resource
+//! that is gone. A session bound to no configuration at all has nothing to serve either way
+//! and is refused at once, and `StartConfigurationSession` keeps resolving the triple live,
+//! so a session started over a removed record is still refused.
+//!
+//! A poll served from a withdrawn binding carries the deadline it found rather than
+//! recording a later one, which is what makes the refusal arrive however often the client
+//! polls; a poll whose own resolution held owes no refusal at all.
 //!
 //! The rows differ along what the rule generalises over: WHICH level the control plane
 //! removes (and how many at once), whether the session had already polled when the
 //! removal happened, whether the session spelled its triple by name or by id, and the
 //! form, content type and version label of the configuration it was serving. Each row
-//! also checks the two halves that must NOT change: a session started after the removal
-//! is judged the same way (that is what keeps the refusal a property of the state rather
-//! than of the token), and an untouched hierarchy's session keeps polling throughout, so
-//! the refusal is scoped to the removed records rather than being an outage of the
-//! endpoint.
+//! also checks the two halves that must NOT change: a session started after the removal is
+//! judged against the control plane as it stands, and an untouched hierarchy's session
+//! keeps polling throughout, so nothing here is an outage of the endpoint.
 //!
 //! Every request goes through the router harness the polling suite sets up
 //! ([`super::configuration_session_poll::Emulator`]), which mounts AppConfigData and the
 //! AppConfig control plane over one shared engine: the hierarchy is created, deployed and
-//! deleted through AppConfig's own operations, exactly as an operator would.
+//! deleted through AppConfig's own operations, exactly as an operator would. The one thing
+//! no operation exposes is the clock, so the instants a row needs — how long the client has
+//! been idle, and the refusal having fallen due — are moved in the store
+//! (`backdate_last_poll`, `expire_withdrawal_deadline`) instead of being waited out.
+
+use std::time::Duration;
 
 use bytes::Bytes;
+use service_com_amazonaws_appconfigdata_appconfigdata::state::DEFAULT_POLL_INTERVAL_IN_SECONDS;
 
 use super::configuration_session_poll::{Emulator, Hierarchy};
+
+/// How long each row's session has been idle when it polls after the removal: twice the
+/// interval the service itself tells a client to poll at
+/// (`state::DEFAULT_POLL_INTERVAL_IN_SECONDS`), so the answer below cannot depend on the
+/// client having polled in the same instant as the removal. The wait is driven by
+/// backdating the stored instant, never by sleeping.
+const IDLE_FOR: Duration =
+    Duration::from_secs(2 * DEFAULT_POLL_INTERVAL_IN_SECONDS.unsigned_abs() as u64);
 
 /// One level of the hierarchy the control plane removes. AppConfig does not cascade the
 /// resources a container owns, so a row that reaches a container lists the children it
@@ -45,9 +66,10 @@ enum Removal {
     Application,
 }
 
-/// What a poll of the removed triple must answer: the modelled `ResourceType` for the
-/// resource the control plane no longer holds, and the input member `ReferencedBy` is
-/// keyed by where the refusal is about a resource a request parameter named.
+/// What a poll of the removed triple must answer ONCE the withdrawal has fallen due: the
+/// modelled `ResourceType` for the resource the control plane no longer holds, and the
+/// input member `ReferencedBy` is keyed by where the refusal is about a resource a request
+/// parameter named.
 ///
 /// The `ResourceType` values are the five the model's `ResourceType` enum declares
 /// (Application, ConfigurationProfile, Deployment, Environment, Configuration), listed in
@@ -60,16 +82,18 @@ struct Withdrawn {
     referenced_by: Option<&'static str>,
 }
 
-/// What a session STARTED after the removal must answer — the half of the rule that
-/// shows the refusal belongs to the state and not to the age of a token.
+/// What a session STARTED after the removal must answer — the half of the rule that shows
+/// `StartConfigurationSession` still resolves the triple against the control plane as it
+/// stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AfterRemoval {
     /// `StartConfigurationSession` is refused with the modelled
     /// `ResourceNotFoundException` naming this `ResourceType`, and the `Message` is that
     /// level's fixed "<ResourceType> not found" sentence.
     SessionRefused { resource_type: &'static str },
-    /// The triple still resolves, so the session is minted — and its first poll is
-    /// refused with this `ResourceType`, exactly as the withdrawn session's poll is.
+    /// The triple still resolves, so the session is minted — and because it is bound to no
+    /// configuration at all, its first poll is refused with this `ResourceType` straight
+    /// away.
     PollRefused { resource_type: &'static str },
 }
 
@@ -219,14 +243,17 @@ const CASES: &[Case] = &[
 /// configuration is visible.
 const CONTROL_CONTENT: &[u8] = br#"{"control":true}"#;
 
-/// A session polling a configuration is WITHDRAWN as soon as the control plane stops
-/// holding what it polls: the live, unexpired token it already holds is refused with the
-/// modelled `ResourceNotFoundException` naming the resource that is gone, whichever level
-/// is removed, however the session spelled its triple and whether or not it had already
-/// polled — while a session started afterwards is judged exactly the same way, and an
+/// A session already bound to a configuration KEEPS POLLING across a control-plane
+/// removal: the live, unexpired token it holds is served from the resolution the session
+/// carries — the no-change 200 for a client that already has that version — whichever
+/// level is removed, however the session spelled its triple, whether or not it had already
+/// polled and however long it has been idle. That poll is what makes the refusal due; once
+/// it has fallen due, every poll of that chain is refused with the modelled
+/// `ResourceNotFoundException` naming the resource that is gone, while
+/// `StartConfigurationSession` is judged against the live control plane throughout and an
 /// untouched hierarchy's session is undisturbed.
 #[tokio::test]
-async fn a_removal_withdraws_a_session_already_polling_a_configuration() {
+async fn a_removal_leaves_a_bound_session_polling_until_the_refusal_falls_due() {
     for case in CASES {
         let name = case.name;
         let emulator = Emulator::new();
@@ -290,7 +317,7 @@ async fn a_removal_withdraws_a_session_already_polling_a_configuration() {
 
         // A row that polls first is served the deployed content and holds the latest
         // version when the removal happens; a row that does not has been served nothing
-        // yet.
+        // yet, so the poll after the removal is its first and carries the content.
         let token = if case.polled_before {
             let poll = emulator.get_latest_configuration(&token).await;
             assert_eq!(
@@ -314,20 +341,75 @@ async fn a_removal_withdraws_a_session_already_polling_a_configuration() {
 
         remove(&emulator, &victim, case.removed).await;
 
-        // THE RULE: the token is live and unexpired, and the poll is refused anyway —
-        // what it polls is no longer there to serve.
+        // The row's session has been idle for twice the interval the service tells a client
+        // to poll at, so what follows is the poll of a client honouring that cadence rather
+        // than one that happened to poll in the same instant as the removal.
+        emulator.backdate_last_poll(&token, IDLE_FOR);
+        assert_eq!(
+            emulator.withdrawal_deadline(&token),
+            None,
+            "case {name}: no poll has found the triple withdrawn yet, so the session can owe \
+             no refusal"
+        );
+
+        // THE RULE, first half: the poll that follows the removal is SERVED from what the
+        // session is bound to — the content it has not been given yet, or nothing at all
+        // for a client that already has that version — and it rotates a successor token
+        // the chain can go on with.
+        let token = assert_served_from_its_binding(
+            &emulator,
+            &token,
+            name,
+            "the poll after the removal",
+            case,
+            !case.polled_before,
+        )
+        .await;
+
+        // That poll is what made the refusal DUE: the successor carries the deadline...
+        let deadline = emulator.withdrawal_deadline(&token).unwrap_or_else(|| {
+            panic!(
+                "case {name}: the poll that found the triple withdrawn must record when the \
+                 refusal falls due"
+            )
+        });
+
+        // ...and the chain keeps polling until it, carrying the SAME deadline rather than a
+        // fresh one, so polling faster cannot postpone the refusal. The client now holds
+        // that version, so this poll is the no-change answer whatever the row served above.
+        emulator.postpone_withdrawal_deadline(&token);
+        let postponed = emulator.withdrawal_deadline(&token);
+        let token = assert_served_from_its_binding(
+            &emulator,
+            &token,
+            name,
+            "the next poll of the chain",
+            case,
+            false,
+        )
+        .await;
+        assert_eq!(
+            emulator.withdrawal_deadline(&token),
+            postponed,
+            "case {name}: a poll served from the binding must carry the deadline it found, \
+             not record a later one (the deadline the removal set was {deadline:?})"
+        );
+
+        // THE RULE, second half: once the withdrawal has fallen due, the poll is refused,
+        // naming the resource the control plane no longer holds...
+        emulator.expire_withdrawal_deadline(&token);
         let withdrawn = Withdrawal::read(&emulator, &token).await;
         withdrawn.assert_is(
             name,
-            "the poll after the removal",
+            "the poll once the withdrawal had fallen due",
             case.withdrawn,
             application,
             environment,
             profile,
         );
 
-        // The refusal is the STABLE answer, not a one-off: the same token presented
-        // again is refused the same way, which is what lets a client's poll loop
+        // ...and that refusal is the STABLE answer, not a one-off: the same token
+        // presented again is refused the same way, which is what lets a client's poll loop
         // converge on it.
         let again = Withdrawal::read(&emulator, &token).await;
         again.assert_is(
@@ -340,7 +422,8 @@ async fn a_removal_withdraws_a_session_already_polling_a_configuration() {
         );
 
         // The untouched hierarchy's session is undisturbed, which is what scopes the
-        // refusal above to the removed records rather than to the endpoint.
+        // refusal above to the removed records rather than to the endpoint — and it owes no
+        // refusal, because its own resolution held.
         let control_poll = emulator.get_latest_configuration(&control_token).await;
         assert_eq!(
             control_poll.status,
@@ -355,9 +438,15 @@ async fn a_removal_withdraws_a_session_already_polling_a_configuration() {
              serve no content, got {:?}",
             control_poll.body.as_ref()
         );
+        let control_deadline = emulator.withdrawal_deadline(&control_poll.next_token());
+        assert_eq!(
+            control_deadline, None,
+            "case {name}: a poll whose own resolution held owes no refusal, got a deadline of \
+             {control_deadline:?}"
+        );
 
-        // And a session started AFTER the removal is judged the same way the withdrawn
-        // one is: the refusal is a property of the state, not of how old a token is.
+        // And a session started AFTER the removal is judged against the control plane as
+        // it stands, which is where resolving the triple belongs.
         assert_after_removal(&emulator, &victim, case).await;
     }
 }
@@ -378,6 +467,66 @@ fn spelled(victim: &Hierarchy, by_id: bool) -> (&str, &str, &str) {
             &victim.profile_name,
         )
     }
+}
+
+/// Poll with `token` after the removal and assert the whole no-change answer the session's
+/// binding owes, answering the successor token the poll rotated.
+///
+/// The payload is the only part that depends on the row: a session that has already been
+/// served this version is given no content and no version label ("if the client already
+/// has the latest version of the configuration data, this value is empty"), and one that
+/// has not is given the deployed bytes and whatever label the version carries. The content
+/// type describes the session's configuration either way, so it is always reported.
+async fn assert_served_from_its_binding(
+    emulator: &Emulator,
+    token: &str,
+    case_name: &str,
+    poll_name: &str,
+    case: &Case,
+    expect_content: bool,
+) -> String {
+    let poll = emulator.get_latest_configuration(token).await;
+    let text = poll.text();
+    assert_eq!(
+        poll.status, 200,
+        "case {case_name}: {poll_name} expected 200, got {} body {text}",
+        poll.status
+    );
+    let (expected_content, expected_label): (&[u8], Option<&str>) = if expect_content {
+        (case.content, case.version_label)
+    } else {
+        (b"", None)
+    };
+    assert_eq!(
+        poll.body.as_ref(),
+        expected_content,
+        "case {case_name}: {poll_name} expected the payload {:?}, got {:?}",
+        String::from_utf8_lossy(expected_content),
+        poll.body.as_ref()
+    );
+    assert_eq!(
+        poll.header("content-type"),
+        Some(case.content_type),
+        "case {case_name}: {poll_name} expected content type {}, got {:?}",
+        case.content_type,
+        poll.header("content-type")
+    );
+    assert_eq!(
+        poll.header("version-label"),
+        expected_label,
+        "case {case_name}: {poll_name} expected version label {expected_label:?}, got {:?}",
+        poll.header("version-label")
+    );
+    let interval = poll.header("next-poll-interval-in-seconds");
+    assert!(
+        interval.is_some_and(|seconds| seconds.parse::<i64>().is_ok_and(|seconds| seconds > 0)),
+        "case {case_name}: {poll_name} expected a positive poll interval, got {interval:?}"
+    );
+    assert!(
+        poll.header("next-poll-configuration-token").is_some(),
+        "case {case_name}: {poll_name} must rotate a successor token, got {text}"
+    );
+    poll.next_token()
 }
 
 /// One refusal a withdrawn poll answered with, reduced to what the rule is about.
@@ -578,9 +727,9 @@ async fn hosted_version_numbers(emulator: &Emulator, victim: &Hierarchy) -> Vec<
 }
 
 /// Start a fresh session over the victim's triple after the removal and assert the row's
-/// [`AfterRemoval`]: an unresolvable level is refused by `StartConfigurationSession`, and
-/// a session the triple still resolves for is minted and then has nothing to serve —
-/// which is the same verdict the already-polling session's token now gets.
+/// [`AfterRemoval`]: an unresolvable level is refused by `StartConfigurationSession`, and a
+/// session the triple still resolves for is minted bound to no configuration, which leaves
+/// its first poll nothing to serve at once.
 async fn assert_after_removal(emulator: &Emulator, victim: &Hierarchy, case: &Case) {
     let name = case.name;
     let (application, environment, profile) = spelled(victim, case.by_id);

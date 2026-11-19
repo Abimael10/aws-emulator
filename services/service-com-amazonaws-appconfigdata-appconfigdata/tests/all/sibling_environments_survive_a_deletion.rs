@@ -3,24 +3,24 @@
 //! Deleting ONE environment of an application withdraws exactly the sessions that poll
 //! THAT environment, driven end to end over HTTP.
 //!
-//! The rule under test: a configuration session is over LIVE control-plane state, so a
-//! poll resolves the session's (application, environment, configuration profile) triple
-//! against that store as it stands at the instant of the poll — a token bounds a poll in
-//! TIME, it is not a standing grant over state the control plane has withdrawn. A record
-//! the control plane no longer holds leaves every session resolving through it nothing to
-//! serve, and each such poll is refused with the modelled `ResourceNotFoundException`
-//! (404) naming the level that is gone; the refusal is scoped to the removed record, so
-//! every sibling record still held keeps serving, including the siblings that share the
-//! removed record's parents and the very configuration version it was serving.
+//! The rule under test: a session's (application, environment, configuration profile)
+//! triple is resolved when the session is STARTED, and a poll re-resolves it to pick up a
+//! newer version in force rather than to re-authorise the session — so deleting one
+//! environment does not refuse the poll that follows the deletion for a session already
+//! bound to a configuration: that poll is answered from the resolution the session carries,
+//! and is what makes the refusal DUE, one withdrawal span later. From that instant on every
+//! poll of that chain is refused with the modelled `ResourceNotFoundException` (404) naming
+//! the level that is gone. The withdrawal is SCOPED to the deleted record, so every sibling
+//! record still held keeps serving, including the siblings that share the removed record's
+//! parents and the very configuration version it was serving.
 //!
-//! That the refusal must be SCOPED is the half this suite adds to
+//! That the withdrawal must be SCOPED is the half this suite adds to
 //! [`super::deletion_does_not_break_a_bound_session`], whose control hierarchy is a
 //! separate application: here the two environments are siblings under ONE application,
 //! polling ONE configuration profile, served from ONE hosted configuration version
 //! deployed into both — so a withdrawal that reached further than the deleted environment
 //! (to the application, the profile or the version) would stop the surviving session too,
-//! and a withdrawal that reached the data plane only for sessions started afterwards
-//! would keep serving the deleted one.
+//! and one that never fell due would keep serving the deleted environment for ever.
 //!
 //! The rows differ along what the rule generalises over: WHICH of the two sibling
 //! environments is deleted (the first created or the second), how the sessions spelled
@@ -32,7 +32,10 @@
 //! Every request goes through the router harness the polling suite sets up
 //! ([`super::configuration_session_poll::Emulator`]), which mounts AppConfigData and the
 //! AppConfig control plane over one shared engine: the hierarchy is created, deployed to
-//! and deleted through AppConfig's own operations, exactly as an operator would.
+//! and deleted through AppConfig's own operations, exactly as an operator would. The one
+//! thing no operation exposes is the clock, so the refusal is made to have fallen due by
+//! bringing the session's withdrawal deadline forward (`expire_withdrawal_deadline`)
+//! instead of sleeping for the span.
 
 use bytes::Bytes;
 
@@ -129,12 +132,12 @@ const CASES: &[Case] = &[
     },
 ];
 
-/// Deleting one environment withdraws every session polling it — the token it already
-/// holds is refused with the modelled `ResourceNotFoundException` naming the environment,
-/// and a session started over the deleted triple afterwards is refused the same way —
-/// while its sibling environment under the same application, polling the same
-/// configuration profile and served from the same configuration version, keeps serving
-/// that version's exact bytes.
+/// Deleting one environment withdraws every session polling it once the withdrawal falls
+/// due — the live, unexpired token such a session holds keeps polling until then, and is
+/// refused with the modelled `ResourceNotFoundException` naming the environment
+/// afterwards, as is a session started over the deleted triple — while its sibling
+/// environment under the same application, polling the same configuration profile and
+/// served from the same configuration version, keeps serving that version's exact bytes.
 #[tokio::test]
 async fn deleting_one_environment_withdraws_only_its_own_sessions() {
     for case in CASES {
@@ -196,21 +199,30 @@ async fn deleting_one_environment_withdraws_only_its_own_sessions() {
         delete_environment(&emulator, doomed, case.deletion_protection_check).await;
         assert_control_plane_withdrew(&emulator, doomed, surviving, name).await;
 
-        // THE RULE: every live, unexpired token of the deleted environment is refused —
-        // the one minted before the deletion and the witness chain alike — and the
-        // refusal is the STABLE answer a client's poll loop converges on rather than a
-        // one-off.
-        for (label, token) in [
-            ("the pre-deletion token", &pre_token),
-            ("the witness chain", &witness),
-            ("the pre-deletion token presented again", &pre_token),
+        // THE RULE: every live, unexpired token of the deleted environment keeps polling
+        // while the resolution that bound its session stands, and is refused once the
+        // withdrawal has fallen due — the one minted before the deletion and the witness
+        // chain alike — after which the refusal is the STABLE answer a client's poll loop
+        // converges on rather than a one-off.
+        for (label, token, expect_content) in [
+            // The witness chain has already been served this version; the pre-deletion
+            // token has only for the rows that polled it.
+            ("the pre-deletion token", &pre_token, !case.polled_before),
+            ("the witness chain", &witness, false),
         ] {
-            let refused = emulator.get_latest_configuration(token).await;
-            assert_withdrawn(&refused, name, label, doomed_environment);
+            assert_withdrawal_falls_due(
+                &emulator,
+                token,
+                case,
+                label,
+                expect_content,
+                doomed_environment,
+            )
+            .await;
         }
 
-        // A session STARTED over the deleted triple is refused the same way, so what a
-        // session is served never depends on when it was started.
+        // A session STARTED over the deleted triple is refused at once: resolving the
+        // triple against the live control plane is what starting a session does.
         let started = emulator
             .post_json(
                 "/configurationsessions",
@@ -498,6 +510,54 @@ async fn list_environment_ids(
         }
     }
     panic!("case {case_name}: ListEnvironments never ran out of pages, ids so far {ids:?}");
+}
+
+/// One poll chain of the deleted environment: the poll that follows the deletion is still
+/// served from what the session is bound to — the deployed bytes for a session that has not
+/// been given this version yet, nothing for one that has — and once the withdrawal has
+/// fallen due every poll of the chain is refused the same way.
+async fn assert_withdrawal_falls_due(
+    emulator: &Emulator,
+    token: &str,
+    case: &Case,
+    label: &str,
+    expect_content: bool,
+    environment_identifier: &str,
+) {
+    let case_name = case.name;
+    let served = emulator.get_latest_configuration(token).await;
+    assert_eq!(
+        served.status,
+        200,
+        "case {case_name}: {label} polled after the deletion expected 200, got {} body {}",
+        served.status,
+        served.text()
+    );
+    let expected: &[u8] = if expect_content { case.content } else { b"" };
+    assert_eq!(
+        served.body.as_ref(),
+        expected,
+        "case {case_name}: {label} polled after the deletion expected the payload {:?}, got {:?}",
+        String::from_utf8_lossy(expected),
+        served.body.as_ref()
+    );
+    let next = served.next_token();
+
+    // The refusal falls due one withdrawal span after the poll that found the environment
+    // gone, and reaching that instant is the CLOCK's doing, which no operation exposes.
+    emulator.expire_withdrawal_deadline(&next);
+    for poll in [
+        "the poll once the withdrawal had fallen due",
+        "the next poll of the chain",
+    ] {
+        let refused = emulator.get_latest_configuration(&next).await;
+        assert_withdrawn(
+            &refused,
+            case_name,
+            &format!("{label}: {poll}"),
+            environment_identifier,
+        );
+    }
 }
 
 /// One refusal a withdrawn poll must answer with: 404 `ResourceNotFoundException` naming

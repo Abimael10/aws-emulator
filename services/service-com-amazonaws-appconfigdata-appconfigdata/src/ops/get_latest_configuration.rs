@@ -6,12 +6,20 @@
 //! then reads the AppConfig control plane for the configuration version deployed into
 //! the session's (application, environment, configuration profile) triple and returns
 //! the content only when that version differs from the one the session was last
-//! served. A session is over LIVE control-plane state, so a triple that store no longer
-//! resolves — a level of the hierarchy that has been deleted, or a profile with nothing
-//! in force in that environment — has nothing for this poll to serve and the poll is
-//! refused with the modelled `ResourceNotFoundException` for the resource that is gone:
-//! the same answer STARTING a session over that same triple gets, so what a session is
-//! served never depends on when it was started. Every answer — the content, the content
+//! served. Re-reading that store is how a poll picks up a NEWER version, not how the
+//! session is re-authorised — resolving the triple is what STARTING a session does — so a
+//! triple that store no longer resolves (a level of the hierarchy that has been deleted,
+//! or a profile with nothing in force in that environment) does not refuse the poll that
+//! follows the edit, however long the client waited between polls: that poll is served from
+//! the resolution the session carries
+//! ([`crate::state::Session::binding_in_force`]), which is the version the client already
+//! has, so the answer is the modelled no-change one. That first withdrawn poll is what makes
+//! the refusal due, one [`crate::state::WITHDRAWAL_SPAN`] later — a transition the CLOCK
+//! makes, so it falls due whether or not anybody polls again — and from then on the poll is
+//! refused with the modelled
+//! `ResourceNotFoundException` for the resource that is gone — at once for a session that
+//! was bound to no configuration at all, which has nothing to serve either way. Every
+//! answer — the content, the content
 //! type, the version label, the rotated token and the poll interval — is read out of
 //! persisted state: the session out of this service's own store, the configuration out
 //! of AppConfig's.
@@ -381,20 +389,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // STEP 2 — the configuration this poll serves, resolved against the AppConfig
         // CONTROL PLANE as it stands NOW: a session is over a configuration that is
-        // deployed, and that store is the only thing that says whether it still is. A
-        // level of the hierarchy it no longer holds, or a profile with nothing in force
-        // in that environment, therefore has nothing for this poll to serve, and the
-        // poll is refused with the modelled `ResourceNotFoundException` for the resource
-        // that is gone — the same answer `StartConfigurationSession` gives for that same
-        // triple, so what a session is served never depends on when it was started. The
-        // model bounds a token in TIME; a token is not a standing grant over state that
-        // has been withdrawn.
-        //
-        // The session's own binding (`crate::state::Session::bound_configuration`) is
-        // not a fallback for that: it is the copy of the version the session was last
-        // served, kept so every token of one poll chain shares one copy of an immutable
-        // version instead of holding a new one per poll. A store that cannot be READ at
-        // all is the server error below, not a resource that is missing.
+        // deployed, and that store is the only thing that says whether a NEWER version is
+        // in force. Re-resolving is what picks that up; it is not what re-authorises the
+        // session, which was resolved when it was STARTED. So a level of the hierarchy
+        // that store no longer holds, or a profile with nothing in force in that
+        // environment, does not refuse the poll that follows the edit, however long the
+        // client waited: the poll is answered from the resolution the session carries
+        // (`crate::state::Session::binding_in_force`) and is what makes the refusal DUE,
+        // one `crate::state::WITHDRAWAL_SPAN` later. From that instant on — a transition
+        // the clock makes, not one a poll has to come and trigger — the poll is refused
+        // with the modelled `ResourceNotFoundException` for the resource that is gone. A
+        // session bound to no configuration at all has nothing to serve either way and is
+        // refused at once. A store that cannot be READ at all is the server error below,
+        // not a resource that is missing.
         //
         // A name is resolved through the bindings the session's own mint recorded, not
         // against whatever the control plane says carries that name now, so renaming a
@@ -425,38 +432,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(control_plane_unavailable());
         };
-        let deployed: std::sync::Arc<crate::state::ServedConfiguration> = match deployed {
-            // The control plane answered, so the session is re-bound to what it reports.
-            // A configuration VERSION is immutable once written — it is what a deployment
-            // names, and no operation rewrites its bytes, its content type or its label —
-            // so a live answer naming the version this session is already bound to IS that
-            // configuration, and the existing binding is kept rather than a second copy of
-            // the same bytes held for every token in the poll chain.
-            Ok(live) => match &session.bound_configuration {
-                Some(bound) if bound.version == live.version => std::sync::Arc::clone(bound),
-                _ => std::sync::Arc::new(live),
-            },
-            // Nothing the control plane holds answers for this session any more, so
-            // there is no configuration to serve: the poll is refused, naming the
-            // resource that is gone. Nothing is rotated and nothing is recorded — a
-            // refused poll serves no successor token.
-            Err(unresolved) => {
-                tracing::debug!(
-                    operation = "GetLatestConfiguration",
-                    outcome = "ResourceNotFoundException",
-                    resource_type = unresolved.resource_type,
-                    "refused a poll whose configuration the control plane no longer holds"
-                );
-                return Err(GetLatestConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(unresolved.message.clone()),
-                        resource_type: Some(unresolved.resource_type.to_string()),
-                        referenced_by: unresolved.referenced_by(),
-                    },
-                )
-                .into());
-            }
+        let resolution: Resolution = match deployed {
+                // The control plane answered, so the session is re-bound to what it reports.
+                // A configuration VERSION is immutable once written — it is what a deployment
+                // names, and no operation rewrites its bytes, its content type or its label —
+                // so a live answer naming the version this session is already bound to IS that
+                // configuration, and the existing binding is kept rather than a second copy of
+                // the same bytes held for every token in the poll chain.
+                Ok(live) => Resolution::Live(match &session.bound_configuration {
+                    Some(bound) if bound.version == live.version => std::sync::Arc::clone(bound),
+                    _ => std::sync::Arc::new(live),
+                }),
+                // The triple no longer resolves. Until the withdrawal that owes falls due,
+                // this poll is served from the version the session is bound to — the one it
+                // already has, so the answer is the modelled no-change one. The successor
+                // carries the deadline this poll found, or the one it records now if it is
+                // the first to find the triple withdrawn, so the chain converges on the
+                // refusal rather than renewing itself.
+                Err(unresolved) => match session.binding_in_force(now) {
+                    Some(bound) => Resolution::FromBinding(std::sync::Arc::clone(bound)),
+                    // The withdrawal has fallen due, or the session was bound to no
+                    // configuration at all: there is nothing to serve, so the poll is
+                    // refused, naming the resource that is gone. Nothing is rotated and
+                    // nothing is recorded — a refused poll serves no successor token.
+                    None => {
+                        tracing::debug!(
+                            operation = "GetLatestConfiguration",
+                            outcome = "ResourceNotFoundException",
+                            resource_type = unresolved.resource_type,
+                            "refused a poll whose configuration the control plane no longer holds"
+                        );
+                        return Err(GetLatestConfigurationErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(unresolved.message.clone()),
+                                resource_type: Some(unresolved.resource_type.to_string()),
+                                referenced_by: unresolved.referenced_by(),
+                            },
+                        )
+                        .into());
+                    }
+                },
         };
+        let deployed = resolution.configuration();
 
         // STEP 3 — content is returned ONLY when the deployed version differs from
         // the one this session was last served. Both values are read out of state,
@@ -490,6 +507,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // of the chain shares this one copy of it for as long as the version in
             // force is the same one.
             next_session.bound_configuration = Some(std::sync::Arc::clone(&deployed));
+            // When the refusal this session owes falls due. A resolution that HELD clears
+            // it: the control plane answers for the triple again, so nothing is withdrawn.
+            // A poll served from the binding passes on the deadline it found, and the first
+            // such poll is the one that sets it — so the withdrawal falls due one span after
+            // the triple went, however often the chain is polled in between.
+            next_session.withdrawal_due_at = match resolution {
+                Resolution::Live(_) => None,
+                Resolution::FromBinding(_) => Some(
+                    session
+                        .withdrawal_due_at
+                        .unwrap_or_else(|| crate::state::withdrawal_deadline(now)),
+                ),
+            };
             next_session.last_polled_at = Some(now);
             state.store_session(next_session, now)
         };
@@ -534,6 +564,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 deployed.version_label.clone()
             },
         })
+    }
+}
+
+/// Where the configuration a poll serves came from: the control plane answered for the
+/// session's triple, or the triple no longer resolves and the withdrawal that owes has not
+/// fallen due yet.
+///
+/// Which of the two it is decides one thing beyond the payload: a live resolution clears the
+/// refusal the session owes, and one served from the binding records or carries the instant
+/// it falls due, so a chain the control plane has withdrawn converges on its refusal.
+enum Resolution {
+    Live(std::sync::Arc<crate::state::ServedConfiguration>),
+    FromBinding(std::sync::Arc<crate::state::ServedConfiguration>),
+}
+
+impl Resolution {
+    /// The configuration this poll serves, however it was resolved.
+    fn configuration(&self) -> std::sync::Arc<crate::state::ServedConfiguration> {
+        match self {
+            Self::Live(configuration) | Self::FromBinding(configuration) => {
+                std::sync::Arc::clone(configuration)
+            }
+        }
     }
 }
 

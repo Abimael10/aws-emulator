@@ -18,12 +18,15 @@
 //! [`served_configuration`]). A configuration deployed through `StartDeployment` is
 //! therefore the one a poll serves.
 //!
-//! What a session keeps of its own about that hierarchy is a copy of the configuration
-//! it was last served ([`Session::bound_configuration`]), which is what every token of
-//! one poll chain shares while the version in force stays the same. It is not a copy a
-//! poll falls back on: a session is over LIVE control-plane state, so once that store no
-//! longer resolves what the session polls, the poll is refused with the modelled
-//! `ResourceNotFoundException` naming the resource that is gone.
+//! What a session keeps of its own about that hierarchy is its own resolution of it: the
+//! configuration it was last served ([`Session::bound_configuration`]) and, once a poll has
+//! found the triple withdrawn, when the refusal that withdrawal owes falls due
+//! ([`Session::withdrawal_due_at`]). Every token of one poll chain shares that copy while
+//! the version in force stays the same, and a poll that can no longer re-resolve the triple
+//! is answered FROM it — the first such poll is what makes the refusal due, one
+//! [`WITHDRAWAL_SPAN`] later. Past that instant the poll is refused with the modelled
+//! `ResourceNotFoundException` naming the resource that is gone, as is a session that was
+//! bound to no configuration at all ([`Session::binding_in_force`]).
 //!
 //! The other thing the data plane keeps of its own about that hierarchy is how a NAME
 //! resolves. Every session identifier is "the ID or the name" of its level, and an id
@@ -82,6 +85,30 @@ pub const DEFAULT_POLL_INTERVAL_IN_SECONDS: i32 = 60;
 /// and the token it is holding is the last thing evicted.
 pub const MAX_SESSIONS: usize = 4_096;
 
+/// How long after a poll FIRST finds the session's triple withdrawn the refusal falls due.
+///
+/// A session is resolved when it is STARTED, and a poll re-resolves the triple to pick up a
+/// newer version in force — not to re-authorise the session — so an edit to the control
+/// plane made while a session is polling never refuses the poll that follows it, however
+/// long the client waited between polls: that poll is served from what the session is bound
+/// to and is what makes the withdrawal due, this span later
+/// ([`Session::withdrawal_due_at`]). The withdrawal is then a transition the CLOCK makes
+/// due, so the poll after it is refused whether or not anybody asked in between. The span
+/// is never zero — a client polling straight after the edit is still served — and it is a
+/// span chosen for this emulator, nothing AWS documents, so it is short enough for a client
+/// retrying its poll to converge on the refusal.
+pub const WITHDRAWAL_SPAN: Duration = Duration::from_secs(3);
+
+/// When the refusal falls due for a poll that found the triple withdrawn at `now`.
+///
+/// `SystemTime + Duration` panics on an unrepresentable result, so a grossly misconfigured
+/// host clock must not unwind through a handler: it falls back to `now`, which makes the
+/// withdrawal due immediately after the poll it was recorded by rather than aborting the
+/// request.
+pub fn withdrawal_deadline(now: SystemTime) -> SystemTime {
+    now.checked_add(WITHDRAWAL_SPAN).unwrap_or(now)
+}
+
 /// When a token minted at `now` stops being usable.
 ///
 /// `SystemTime + Duration` panics on an unrepresentable result, so a grossly
@@ -117,15 +144,27 @@ pub struct Session {
     /// was started and carried forward by every poll that resolves. `None` for a session
     /// whose triple had nothing in force when it started.
     ///
-    /// A copy, never an entitlement: what a poll serves is what the control plane has in
-    /// force at the instant of the poll, and a triple that store no longer resolves is
-    /// refused rather than served from here. Shared behind an `Arc` because rotating a
+    /// What a poll serves is what the control plane has in force at the instant of the
+    /// poll; this is what it is served from once the triple can no longer be re-resolved,
+    /// until the withdrawal that poll made due has fallen due
+    /// ([`Session::binding_in_force`]).
+    /// Shared behind an `Arc` because rotating a
     /// token clones the session: a configuration VERSION is immutable once written, so
     /// every token of one poll chain shares this one copy of it instead of holding a new
     /// one per poll, and polling in a loop holds no more of them than the chain's current
     /// version. What the store holds at once is bounded by the same two limits as the
     /// sessions themselves — each entry's expiry and [`MAX_SESSIONS`].
     pub bound_configuration: Option<Arc<ServedConfiguration>>,
+    /// When the refusal the control plane's edit owes this session falls due: the instant
+    /// recorded by the FIRST poll that could not re-resolve the session's triple, one
+    /// [`WITHDRAWAL_SPAN`] past that poll. `None` while the triple still resolves — the
+    /// state every session starts in, and the one a poll whose own resolution held puts it
+    /// back in, so a record the control plane holds again withdraws nothing.
+    ///
+    /// A poll served from the binding carries the deadline it found on, never a fresh one,
+    /// so the withdrawal falls due however often the chain is polled
+    /// ([`Session::binding_in_force`]).
+    pub withdrawal_due_at: Option<SystemTime>,
     /// Where this session stands in a gradual rollout: the position the control plane
     /// compares against a deployment's `PercentageComplete` when it decides which
     /// deployment is in force for this session
@@ -154,6 +193,20 @@ pub struct Session {
 }
 
 impl Session {
+    /// The configuration this session is bound to, while the withdrawal it owes has not
+    /// fallen due at `now` — what a poll is served when the control plane can no longer
+    /// re-resolve the session's triple.
+    ///
+    /// `None` from [`Session::withdrawal_due_at`] onwards, and `None` for a session bound
+    /// to no configuration at all: in both cases a poll whose triple no longer resolves has
+    /// nothing to serve. A session no poll has yet found withdrawn carries no deadline, so
+    /// what it is bound to is served whenever it next polls, however long it waited.
+    pub fn binding_in_force(&self, now: SystemTime) -> Option<&Arc<ServedConfiguration>> {
+        self.bound_configuration
+            .as_ref()
+            .filter(|_| self.withdrawal_due_at.is_none_or(|due| now < due))
+    }
+
     /// Whether the token this entry is keyed by has already served a poll — so the
     /// client was handed a successor to present instead, and this entry is the one the
     /// store gives up first when it has to give one up.
@@ -331,6 +384,7 @@ impl ComAmazonawsAppconfigdataAppconfigdataState {
             required_minimum_poll_interval_in_seconds,
             last_served_version: None,
             bound_configuration,
+            withdrawal_due_at: None,
             rollout_bucket,
             created_at: now,
             expires_at: expiry(now),
