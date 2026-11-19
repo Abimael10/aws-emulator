@@ -348,6 +348,15 @@ def _certificates_in(cadata):
     return held
 
 
+def _certificates_read(held):
+    """The certificates the bytes of a PEM FILE carry.
+
+    The bytes are the file's own text, so the PEM framing above is what finds each
+    certificate in them — a file carrying none is the same refusal as `cadata` carrying none.
+    """
+    return _certificates_in(held.decode("utf-8", "replace"))
+
+
 class MemoryBIO(object):
     """A buffer the TLS layer would read from and write to, in memory.
 
@@ -476,18 +485,30 @@ class SSLContext(object):
     def load_verify_locations(self, cafile=None, capath=None, cadata=None):
         if cafile is None and capath is None and cadata is None:
             raise TypeError("cafile, capath and cadata cannot be all omitted")
-        for path in (cafile, capath):
-            if path is not None:
-                # The one file refusal this runtime has: a function opens no host file, so
-                # a store named by a PATH is not readable while one passed as DATA is.
-                open(path, "rb")
+        if cafile is not None:
+            # A store named by a PATH is read out of the files this execution environment
+            # has — the function's own package and its layers — exactly as one passed as
+            # DATA is read out of the bytes. A path of the HOST opens nothing, so that is
+            # where a host store is refused and nothing here has to say so.
+            with open(cafile, "rb") as reading:
+                self._certificates.extend(_certificates_read(reading.read()))
+        if capath is not None:
+            # A DIRECTORY of certificates, named the way the TLS library hashes them, which
+            # is no file to read.
+            open(capath, "rb")
         if cadata is not None:
             self._certificates.extend(_certificates_in(cadata))
 
     def load_cert_chain(self, certfile, keyfile=None, password=None):
-        for path in (certfile, keyfile):
-            if path is not None:
-                open(path, "rb")
+        """The chain this context presents, read out of the files the paths name.
+
+        The certificate file has to carry a certificate, exactly as `cadata` does: what is
+        counted is a chain that was really read, never a path that merely opened.
+        """
+        with open(certfile, "rb") as reading:
+            _certificates_read(reading.read())
+        if keyfile is not None:
+            open(keyfile, "rb")
         self._chains += 1
 
     def load_default_certs(self, purpose=Purpose.SERVER_AUTH):

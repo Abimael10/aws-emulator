@@ -915,7 +915,8 @@ async fn a_node_handler_cannot_reach_the_host() {
 }
 
 /// The environment a run sees is the function's own: no host environment variable and no
-/// credential of this emulator is in it.
+/// credential of this emulator is in it, and the search path is the one a managed runtime's
+/// own sandbox states rather than this host's.
 #[tokio::test]
 async fn a_node_handler_sees_only_the_functions_own_environment() {
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -923,9 +924,14 @@ async fn a_node_handler_sees_only_the_functions_own_environment() {
     let entries: &[(&str, &str)] = &[(
         "index.js",
         "exports.handler = async () => {\n\
-             const absent = ['PATH', 'HOME', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']\n\
+             const absent = ['HOME', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']\n\
                  .filter((name) => process.env[name] !== undefined);\n\
-             return { secret: process.env.SECRET, absent: absent, cwd: process.cwd() };\n\
+             return {\n\
+                 secret: process.env.SECRET,\n\
+                 absent: absent,\n\
+                 path: process.env.PATH,\n\
+                 cwd: process.cwd(),\n\
+             };\n\
          };\n",
     )];
     let name = "probe-node-env";
@@ -942,7 +948,14 @@ async fn a_node_handler_sees_only_the_functions_own_environment() {
     );
     assert_eq!(
         answered.json(),
-        json!({"secret": "shhh", "absent": [], "cwd": "/var/task"}),
+        json!({
+            "secret": "shhh",
+            "absent": [],
+            // "PATH – /usr/local/bin:/usr/bin/:/bin:/opt/bin": the sandbox's own documented
+            // search path, whose last entry is the layer root's `bin` directory.
+            "path": "/usr/local/bin:/usr/bin/:/bin:/opt/bin",
+            "cwd": "/var/task",
+        }),
         "expected the function's own environment and nothing of the host, got {}",
         answered.text()
     );

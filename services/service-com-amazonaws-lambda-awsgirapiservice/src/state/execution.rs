@@ -98,6 +98,11 @@ pub mod warm_pool;
 /// it.
 pub mod node;
 
+/// The FILESYSTEM that runtime serves the handler: the mounts of the execution environment,
+/// read from this process's own memory. Declared before the runtime it opens, because that
+/// source is built with this one's macro.
+mod guest_mount;
+
 /// The runtime the handler runs under, in the language the handler is written in.
 mod bootstrap;
 
@@ -1942,6 +1947,13 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
     let defaults: &[(&str, String)] = &[
         ("TZ", ":UTC".to_string()),
         ("LANG", "en_US.UTF-8".to_string()),
+        // "PATH – /usr/local/bin:/usr/bin/:/bin:/opt/bin": the system directories a managed
+        // runtime's sandbox looks for a program in, with the layer root's own `bin` at the
+        // end — which is what makes an executable a layer ships reachable by its bare name.
+        (
+            "PATH",
+            "/usr/local/bin:/usr/bin/:/bin:/opt/bin".to_string(),
+        ),
         (
             "LD_LIBRARY_PATH",
             "/var/lang/lib:/lib64:/usr/lib64:/var/runtime:/var/runtime/lib:/var/task:\
@@ -2785,6 +2797,9 @@ mod tests {
             ("_HANDLER", "lambda_function.lambda_handler"),
             ("AWS_EXECUTION_ENV", "AWS_Lambda_python3.12"),
             ("AWS_LAMBDA_INITIALIZATION_TYPE", "on-demand"),
+            // The documented value of the sandbox's own search path, whose last entry is the
+            // layer root's `bin` directory.
+            ("PATH", "/usr/local/bin:/usr/bin/:/bin:/opt/bin"),
         ];
         for (name, expected) in cases {
             let actual = environment.get(*name).map(String::as_str);
@@ -2794,7 +2809,12 @@ mod tests {
                 "case {name}: expected {expected:?}, got {actual:?}"
             );
         }
-        for absent in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "PATH", "HOME"] {
+        for absent in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "HOME",
+        ] {
             assert!(
                 !environment.contains_key(absent),
                 "case {absent}: no host variable reaches a run, and no credential variable \

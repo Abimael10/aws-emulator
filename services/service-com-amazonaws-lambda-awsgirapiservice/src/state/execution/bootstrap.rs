@@ -57,10 +57,17 @@
 //! Nothing here imports an operating-system module: the environment the handler sees is
 //! installed by the HOST into the module `os` reads it from, and the context's members are
 //! read out of the document above rather than out of a module this source would otherwise
-//! have to reach for.
+//! have to reach for. What the handler reads as the FILES of its execution environment is a
+//! source of its own ([`super::guest_mount`]), evaluated into this scope before this one and
+//! handed the same mounts the finders here import from.
 
 /// The Python source of the runtime, evaluated once per execution environment.
-pub(super) const RUNTIME_SOURCE: &str = r##"
+///
+/// It opens with the FILESYSTEM of the execution environment ([`super::guest_mount`]), which
+/// `_prepare` below installs the mounts through: the two are one compiled unit, so the names
+/// that section leaves behind are the runtime's own.
+pub(super) const RUNTIME_SOURCE: &str = super::guest_mount::mount_source!(
+    r##"
 import sys
 
 # Everything this runtime itself needs, imported once, before the handler's own work
@@ -429,6 +436,17 @@ def _entry_path(held):
     return held
 
 
+def _mount_entries(sources):
+    """The FILES one mount holds: every held entry at its own path inside the mount.
+
+    A module and a data file are both files of the mount, so the prefix a data entry is held
+    under is taken off here: what the filesystem of the execution environment serves is paths
+    ([`super::guest_mount`]), and the prefix is this runtime's own way of keeping a data entry
+    where no module name resolves to it.
+    """
+    return {_entry_path(held): sources[held] for held in sources}
+
+
 class _PackageFile:
     """One PATH inside one mount of the execution environment, as the standard library's own
     resource reading traverses one.
@@ -584,9 +602,101 @@ def _layer_import_roots(library):
     version = library.rpartition("/")[2]
     roots = []
     if version:
-        roots.append("python/lib/" + version + "/site-packages")
+        roots.append("python/lib/" + version + "/" + _SITE_DIRECTORY)
     roots.append("python")
     return roots
+
+
+# The name of a SITE directory: the one directory of an installation whose path-configuration
+# files are processed, which is what lets a dependency layer put its packages somewhere else
+# and still have them importable.
+_SITE_DIRECTORY = "site-packages"
+
+# The suffix of a path-configuration file, as site processing looks for one.
+_PATH_CONFIGURATION_SUFFIX = ".pth"
+
+
+def _search_path(library, layer_roots):
+    """The DIRECTORIES of this execution environment's import path, in the order a managed
+    runtime lists them on `sys.path`.
+
+    The task root the deployment package is mounted at comes first, so the function's own
+    modules win over everything; then the import directories of the layer root
+    (`_layer_import_roots`); then the runtime's own module directory and the library directory
+    of the language installation it ships. Every entry is a directory this environment really
+    has, which is what the mounts are.
+    """
+
+    path = [_TASK_ROOT]
+    path += [_LAYER_ROOT + "/" + root for root in layer_roots]
+    path.append(_RUNTIME_ROOT)
+    if library:
+        path.append(library)
+    return path
+
+
+def _add_site_directories(roots):
+    """Process the path-configuration files of the layer root's import directories, extending
+    `roots` and answering the directories they added, as absolute paths.
+
+    Each import directory of the layer root is a SITE directory of this environment, so the
+    `.pth` files in it are read in the order of their names, and each line of one is either an
+    `import` statement site processing executes or a directory it adds to the path — which is
+    the layout a dependency layer that installs its packages elsewhere relies on. A directory
+    the mounts hold nothing at is not added, exactly as site processing adds only a directory
+    that exists; one that is under the layer root becomes an import directory of that root as
+    well, so a module shipped there is importable and not merely listed. The directories added
+    are not themselves site directories, so their own `.pth` files are not processed, which is
+    where site processing stops too.
+    """
+
+    added = []
+    for root in list(roots):
+        directory = _LAYER_ROOT + "/" + root
+        names = [
+            name
+            for name in _mount_names(directory)
+            if name.endswith(_PATH_CONFIGURATION_SUFFIX)
+        ]
+        for name in sorted(names):
+            for line in (_mount_text(directory + "/" + name) or "").splitlines():
+                entry = _site_entry(line, directory)
+                if entry is None or entry in added:
+                    continue
+                added.append(entry)
+                if entry.startswith(_LAYER_ROOT + "/"):
+                    roots.append(entry[len(_LAYER_ROOT) + 1:])
+    return added
+
+
+def _site_entry(line, directory):
+    """The directory one line of a path-configuration file adds, or `None` when it adds none.
+
+    A blank line and a comment add nothing; an `import` line is a statement site processing
+    executes, and a line that fails is reported and does not stop the rest of the file, which
+    is how site processing treats one.
+    """
+
+    text = line.strip()
+    if not text or text.startswith("#"):
+        return None
+    if text.startswith("import ") or text.startswith("import\t"):
+        try:
+            exec(text, {})
+        except BaseException as error:
+            sys.stderr.write(
+                "[WARNING] a path configuration line could not be processed: %s: %s\n"
+                % (type(error).__name__, error)
+            )
+        return None
+    # The one collapse of `.` and `..` this environment has is the filesystem's own
+    # ([`super::guest_mount`]), so a line is resolved through it rather than through a second
+    # copy here: a line that walks out of the mounts therefore names a path of no mount, which
+    # holds no directory to add.
+    resolved = _mount_resolved(text if text.startswith("/") else directory + "/" + text)
+    if resolved is None:
+        return None
+    return resolved if _mount_is_directory(resolved) else None
 
 
 class _LayerFinder:
@@ -914,6 +1024,27 @@ def _prepare(request, library):
     handler's own `Timeout` starts running.
     """
     sources = request["modules"]
+    layer_sources = request.get("layerModules") or {}
+    runtime_stdlib = request.get("runtimeStdlib") or {}
+    runtime_sources = request.get("runtimeModules") or {}
+    # The FILESYSTEM of the execution environment, built before any of the function's own code
+    # is read: every mount's entries at the directory that mount is mounted at, so a file the
+    # deployment package or one of the function's layers ships is an ordinary readable file to
+    # the handler ([`super::guest_mount`]). The same held entries are what the finders below
+    # import from, so a module and a file are two readings of one entry.
+    _mount_install(
+        [
+            (_TASK_ROOT, _mount_entries(sources)),
+            (_LAYER_ROOT, _mount_entries(layer_sources)),
+            (library or _RUNTIME_ROOT, _mount_entries(runtime_stdlib)),
+            (_RUNTIME_ROOT, _mount_entries(runtime_sources)),
+        ],
+        time.time(),
+    )
+    # The import directories of the LAYER ROOT, which the finder below resolves a layer's
+    # modules from and which site processing extends further down — one list, so a directory a
+    # path-configuration file adds is both on the path and importable.
+    layer_roots = _layer_import_roots(library)
     # The MOUNTS a module is resolved from, in the order a real runtime's `sys.path` lists
     # their directories: the deployment package at the task root first, so the handler's own
     # modules win over everything; then the content the function's LAYERS mount under the
@@ -922,16 +1053,14 @@ def _prepare(request, library):
     # built on one — which are resolved ahead of the frozen standard library and behind the
     # two above, so a package or a layer shipping its own copy of one of them wins.
     mounts = [_PackageFinder(sources, importlib.util.spec_from_loader, _TASK_ROOT)]
-    layer_sources = request.get("layerModules") or {}
     if layer_sources:
         mounts.append(
             _LayerFinder(
                 layer_sources,
-                _layer_import_roots(library),
+                layer_roots,
                 importlib.util.spec_from_loader,
             )
         )
-    runtime_stdlib = request.get("runtimeStdlib") or {}
     if runtime_stdlib:
         mounts.append(
             _PackageFinder(
@@ -955,6 +1084,16 @@ def _prepare(request, library):
                 runtime_sources, importlib.util.spec_from_loader, _RUNTIME_ROOT
             )
         )
+    # The import PATH the handler reads off `sys.path`: the directories of the mounts above,
+    # in the order a managed runtime lists them. It is set once the finders are standing,
+    # because site processing comes next and an `import` line of a path-configuration file is
+    # resolved against them.
+    sys.path[:] = _search_path(library, layer_roots)
+    # The SITE directories of the layer root, processed as an installation's are: a
+    # path-configuration file there extends the path with the directories it names, which is
+    # what a dependency layer that installs its packages elsewhere relies on. They go at the
+    # END of the path, where site processing appends them.
+    sys.path.extend(_add_site_directories(layer_roots))
     time.sleep = _bounded_sleep
     # Before the handler's module is imported, which is where a module-level record is
     # emitted from.
@@ -1189,4 +1328,5 @@ def _main_invoke(deadline_epoch_ms):
 __lambda_prepare = _main_prepare
 __lambda_bind = _main_bind
 __lambda_invoke = _main_invoke
-"##;
+"##
+);

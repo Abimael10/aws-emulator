@@ -391,10 +391,11 @@ async fn a_certificate_store_takes_data_and_refuses_a_host_file(
         "read_back": [3, 5],
         // Nothing to load at all is the language's own refusal.
         "nothing_given": "TypeError",
-        // A path names a file of the host, which no function opens.
+        // A path of the HOST names a file no function opens; a path of this function's own
+        // mounts that carries no such file is simply absent.
         "cafile": "OSError",
         "capath": "OSError",
-        "cert_chain": "OSError",
+        "cert_chain": "FileNotFoundError",
         // Data that carries no certificate is the module's own error.
         "not_a_certificate": "SSLError",
         // A store nothing was loaded into holds nothing.
