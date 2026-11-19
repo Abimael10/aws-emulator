@@ -64,7 +64,7 @@ fn schedule(expression: &str, duration: &str, timezone: Option<&str>) -> Value {
 /// An `at` expression naming the wall-clock instant `at` falls on in `timezone`: "At expressions
 /// … Format: `at(yyyy-MM-ddThh:mm)`" (`Schedule$Expression`), a LOCAL instant carrying no zone of
 /// its own.
-fn at_expression(at: DateTime<Utc>, timezone: Tz) -> String {
+pub(crate) fn at_expression(at: DateTime<Utc>, timezone: Tz) -> String {
     format!("at({})", at.with_timezone(&timezone).format("%Y-%m-%dT%H:%M"))
 }
 
@@ -85,7 +85,7 @@ fn stamp(value: &Value, member: &str) -> Option<f64> {
 /// zone its windows are read in — "If you don't specify a time zone, UTC is used by default."
 /// (`Schedule$Timezone`), which the write materialises onto the schedule it stores, so every
 /// reader reports the zone the rule is actually evaluated in.
-fn scheduled_in_its_timezone(request: &Value) -> Value {
+pub(crate) fn scheduled_in_its_timezone(request: &Value) -> Value {
     let mut rule = request["Rule"].clone();
     if rule["Schedule"].get("Timezone").is_none() {
         rule["Schedule"]["Timezone"] = json!("UTC");
