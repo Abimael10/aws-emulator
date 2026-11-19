@@ -942,9 +942,7 @@ pub fn identity_center_application_arn(
     {
         return None;
     }
-    let instance = configuration
-        .and_then(|configuration| configuration.identity_center_configuration.as_ref())
-        .and_then(|center| center.identity_center_instance_arn.as_deref())
+    let instance = identity_center_instance_arn(configuration)
         .and_then(|arn| arn.split('/').next_back())
         .filter(|segment| !segment.is_empty())
         .map(str::to_string)
@@ -955,6 +953,36 @@ pub fn identity_center_application_arn(
         "",
         &format!("application/{instance}/apl-{}", short_hex()),
     ))
+}
+
+/// The Identity Center instance ARN a domain's identity-provider configuration names,
+/// or `None` when it names none.
+///
+/// `IdentityProviderConfiguration` is exactly one optional `identityCenterConfiguration`,
+/// which is itself exactly one optional `identityCenterInstanceArn`, so this one accessor
+/// is what every reader of the structure goes through — the operation that mints an
+/// Identity Center application from it and the one that has to tell whether a patch moved
+/// it.
+pub fn identity_center_instance_arn(
+    configuration: Option<&IdentityProviderConfiguration>,
+) -> Option<&str> {
+    configuration
+        .and_then(|configuration| configuration.identity_center_configuration.as_ref())
+        .and_then(|center| center.identity_center_instance_arn.as_deref())
+        .filter(|arn| !arn.is_empty())
+}
+
+/// Whether two identity-provider configurations describe the same configuration.
+///
+/// The same reason [`same_encryption`] exists: the wire shape derives no `PartialEq`. All
+/// the structure carries is the Identity Center instance it names, so that is what the
+/// comparison is over — a configuration present but naming no instance and an absent one
+/// describe the same thing.
+pub fn same_identity_provider_configuration(
+    left: Option<&IdentityProviderConfiguration>,
+    right: Option<&IdentityProviderConfiguration>,
+) -> bool {
+    identity_center_instance_arn(left) == identity_center_instance_arn(right)
 }
 
 /// Sixteen hex characters of a fresh v4 UUID — the body AWS Identity Center ids use.

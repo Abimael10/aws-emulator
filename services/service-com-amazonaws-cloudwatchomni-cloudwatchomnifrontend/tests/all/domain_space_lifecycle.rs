@@ -17,6 +17,9 @@
 //!
 //! * a create persists, and the matching reader returns the persisted record
 //!   verbatim and stably;
+//! * a patch changes only the members the request carries, and the members a domain
+//!   DERIVES from them move with them: its name's endpoint URLs follow the name, while
+//!   the members built from its id (the ARN, the domain endpoint URL) do not;
 //! * every derived member (id shape, ARN, endpoint URL, region, owner account,
 //!   status, encryption configuration) is computed from the stored resource;
 //! * a reader answers `ResourceNotFoundException` for a resource the store does not
@@ -52,10 +55,11 @@ use omni::ops::types::{
     CreateDomainInput, CreateDomainOutput, CreateSpaceInput, CreateSpaceOutput, DeleteDomainInput,
     DeleteDomainOutput, DeleteSpaceInput, DeleteSpaceOutput, Domain, EncryptionConfiguration,
     GetDomainInput, GetDomainOutput, GetSpaceInput, GetSpaceOutput, IdentityCenterConfiguration,
-    IdentityProviderConfiguration, ListSpacesInput, ListSpacesOutput, Space,
-    CREATE_DOMAIN_INPUT_SCHEMA, CREATE_SPACE_INPUT_SCHEMA, GET_SPACE_INPUT_SCHEMA,
-    LIST_SPACES_INPUT_SCHEMA,
+    IdentityProviderConfiguration, ListSpacesInput, ListSpacesOutput, Space, UpdateDomainInput,
+    UpdateDomainOutput, CREATE_DOMAIN_INPUT_SCHEMA, CREATE_SPACE_INPUT_SCHEMA,
+    GET_SPACE_INPUT_SCHEMA, LIST_SPACES_INPUT_SCHEMA, UPDATE_DOMAIN_INPUT_SCHEMA,
 };
+use omni::ops::update_domain::{UpdateDomain, UpdateDomainError};
 use omni::state::{DOMAIN_QUOTA, SPACE_QUOTA};
 
 /// The region the suite signs for; the handlers record the signed region on each
@@ -299,6 +303,15 @@ impl Omni {
                 },
                 &self.ctx(),
             )
+            .await
+    }
+
+    async fn update_domain(
+        &self,
+        input: &UpdateDomainInput,
+    ) -> Result<UpdateDomainOutput, UpdateDomainError> {
+        UpdateDomain::new(Arc::clone(&self.engine))
+            .handle(input.clone(), &self.ctx())
             .await
     }
 
@@ -1446,5 +1459,730 @@ async fn the_space_lifecycle_over_the_rpcv2cbor_wire() {
         listed.next_token.is_none(),
         "one space under a bound of 10 needs no token, got {:?}",
         listed.next_token
+    );
+}
+
+/// An `IdentityProviderConfiguration` naming one Identity Center instance.
+///
+/// The ARN satisfies `IdentityCenterInstanceArn`'s modelled
+/// `^arn:aws[a-z-]*:sso:::instance/[a-zA-Z0-9-]+$`.
+fn idc_configuration(instance_arn: &str) -> IdentityProviderConfiguration {
+    IdentityProviderConfiguration {
+        identity_center_configuration: Some(IdentityCenterConfiguration {
+            identity_center_instance_arn: Some(instance_arn.to_string()),
+        }),
+    }
+}
+
+/// One Identity Center instance ARN.
+const IDC_INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-1234567890abcdef";
+
+/// A second one, so a case can move a domain's Identity Center instance.
+const OTHER_IDC_INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-fedcba0987654321";
+
+/// The endpoint URL a domain of this name is addressed by.
+///
+/// `Domain.customEndpointUrls` is "Additional endpoint URLs derived from the domain
+/// name", against `domainEndpointUrl`'s "The HTTPS endpoint URL for accessing the
+/// domain", which [`create_domain_persists_a_record_get_domain_returns_it_verbatim`]
+/// already pins to the domain's ID.
+fn custom_endpoint_url(name: &str) -> String {
+    format!("https://{name}.cloudwatch-omni.global.app.aws")
+}
+
+/// The members of a domain that `UpdateDomain`'s input cannot name, rendered for
+/// comparison: a patch must bring every one of them through untouched.
+fn untouched_domain(domain: &Domain) -> String {
+    format!(
+        "{:?}",
+        (
+            &domain.domain_id,
+            &domain.domain_arn,
+            &domain.domain_endpoint_url,
+            &domain.region,
+            &domain.status,
+            domain.created_at.secs(),
+            domain.created_at.subsec_nanos(),
+        )
+    )
+}
+
+/// The identity providers of a domain, as a row writes them.
+fn providers(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_string()).collect()
+}
+
+/// One row of the `UpdateDomain` partial-update table.
+struct DomainPatch {
+    case: &'static str,
+    /// The domain to start from.
+    initial_name: String,
+    initial_providers: Vec<&'static str>,
+    initial_instance: Option<&'static str>,
+    /// The members the `UpdateDomain` request carries.
+    patch_name: Option<String>,
+    patch_providers: Option<Vec<&'static str>>,
+    patch_instance: Option<&'static str>,
+    /// What the domain must report afterwards.
+    expected_name: String,
+    expected_providers: Vec<&'static str>,
+}
+
+fn domain_patch_table() -> Vec<DomainPatch> {
+    // Rows differ along WHICH members the patch carries (each one alone, all three at
+    // once, and none at all), along the shape of the domain they start from (IAM-only,
+    // IDC with and without a named instance, both providers), along the new name's size
+    // — "abc" and a 63-character name are both published bounds of the member's modelled
+    // `@length(3..63)` — and along the provider count and order.
+    let longest_name = "a".repeat(63);
+    vec![
+        DomainPatch {
+            case: "a name-only patch keeps the providers",
+            initial_name: "omni-patch-one".to_string(),
+            initial_providers: vec!["IAM"],
+            initial_instance: None,
+            patch_name: Some("omni-patch-one-renamed".to_string()),
+            patch_providers: None,
+            patch_instance: None,
+            expected_name: "omni-patch-one-renamed".to_string(),
+            expected_providers: vec!["IAM"],
+        },
+        DomainPatch {
+            case: "a rename down to the shortest admissible name",
+            initial_name: "omni-patch-two".to_string(),
+            initial_providers: vec!["IDC"],
+            initial_instance: None,
+            patch_name: Some("abc".to_string()),
+            patch_providers: None,
+            patch_instance: None,
+            expected_name: "abc".to_string(),
+            expected_providers: vec!["IDC"],
+        },
+        DomainPatch {
+            case: "a rename up to the longest admissible name",
+            initial_name: "omni-patch-three".to_string(),
+            initial_providers: vec!["IAM", "IDC"],
+            initial_instance: Some(IDC_INSTANCE_ARN),
+            patch_name: Some(longest_name.clone()),
+            patch_providers: None,
+            patch_instance: None,
+            expected_name: longest_name,
+            expected_providers: vec!["IAM", "IDC"],
+        },
+        DomainPatch {
+            case: "a providers-only patch adds IDC and keeps the name",
+            initial_name: "omni-patch-four".to_string(),
+            initial_providers: vec!["IAM"],
+            initial_instance: None,
+            patch_name: None,
+            patch_providers: Some(vec!["IAM", "IDC"]),
+            patch_instance: None,
+            expected_name: "omni-patch-four".to_string(),
+            expected_providers: vec!["IAM", "IDC"],
+        },
+        DomainPatch {
+            case: "a providers-only patch drops IDC",
+            initial_name: "omni-patch-five".to_string(),
+            initial_providers: vec!["IDC"],
+            initial_instance: Some(IDC_INSTANCE_ARN),
+            patch_name: None,
+            patch_providers: Some(vec!["IAM"]),
+            patch_instance: None,
+            expected_name: "omni-patch-five".to_string(),
+            expected_providers: vec!["IAM"],
+        },
+        DomainPatch {
+            case: "a configuration-only patch moves the Identity Center instance",
+            initial_name: "omni-patch-six".to_string(),
+            initial_providers: vec!["IDC"],
+            initial_instance: Some(IDC_INSTANCE_ARN),
+            patch_name: None,
+            patch_providers: None,
+            patch_instance: Some(OTHER_IDC_INSTANCE_ARN),
+            expected_name: "omni-patch-six".to_string(),
+            expected_providers: vec!["IDC"],
+        },
+        DomainPatch {
+            case: "every member at once",
+            initial_name: "omni-patch-seven".to_string(),
+            initial_providers: vec!["IAM"],
+            initial_instance: None,
+            patch_name: Some("omni-patch-seven-renamed".to_string()),
+            patch_providers: Some(vec!["IDC", "IAM"]),
+            patch_instance: Some(IDC_INSTANCE_ARN),
+            expected_name: "omni-patch-seven-renamed".to_string(),
+            expected_providers: vec!["IDC", "IAM"],
+        },
+        DomainPatch {
+            case: "a patch carrying no member at all",
+            initial_name: "omni-patch-eight".to_string(),
+            initial_providers: vec!["IAM", "IDC"],
+            initial_instance: Some(IDC_INSTANCE_ARN),
+            patch_name: None,
+            patch_providers: None,
+            patch_instance: None,
+            expected_name: "omni-patch-eight".to_string(),
+            expected_providers: vec!["IAM", "IDC"],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn update_domain_changes_only_the_members_the_request_carries() {
+    let omni = Omni::new();
+
+    for row in domain_patch_table() {
+        let case = row.case;
+        let mut create = create_domain_input(&row.initial_name, &row.initial_providers);
+        create.identity_provider_configuration = row.initial_instance.map(idc_configuration);
+        let created = omni
+            .create_domain(&create)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: CreateDomain failed: {error:?}"))
+            .domain;
+
+        let patch = UpdateDomainInput {
+            domain_id: created.domain_id.clone(),
+            name: row.patch_name.clone(),
+            identity_providers: row.patch_providers.as_deref().map(providers),
+            identity_provider_configuration: row.patch_instance.map(idc_configuration),
+        };
+        let updated = omni
+            .update_domain(&patch)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: UpdateDomain failed: {error:?}"))
+            .domain;
+
+        assert_eq!(
+            updated.name.as_deref(),
+            Some(row.expected_name.as_str()),
+            "case {case:?}: expected name {:?}, got {:?}",
+            row.expected_name,
+            updated.name
+        );
+        assert_eq!(
+            updated.identity_providers,
+            providers(&row.expected_providers),
+            "case {case:?}: expected identityProviders {:?}, got {:?}",
+            row.expected_providers,
+            updated.identity_providers
+        );
+        // The name's endpoint URLs are derived, so they follow the name the patch left.
+        let custom = updated.custom_endpoint_urls.clone().unwrap_or_default();
+        assert_eq!(
+            custom,
+            vec![custom_endpoint_url(&row.expected_name)],
+            "case {case:?}: customEndpointUrls {custom:?} do not follow the name {:?}",
+            row.expected_name
+        );
+        // The members built from the domain's ID, and every member this input cannot
+        // name, come through a rename untouched.
+        assert_eq!(
+            untouched_domain(&updated),
+            untouched_domain(&created),
+            "case {case:?}: a member UpdateDomain's input cannot name was changed"
+        );
+        // `identityCenterApplicationArn` is "Absent for IAM-only domains".
+        let expects_application = row.expected_providers.contains(&"IDC");
+        assert_eq!(
+            updated.identity_center_application_arn.is_some(),
+            expects_application,
+            "case {case:?}: identityCenterApplicationArn presence {:?} does not follow the IDC \
+             provider",
+            updated.identity_center_application_arn
+        );
+        if let Some(application) = updated.identity_center_application_arn.as_deref() {
+            assert!(
+                is_arn(application),
+                "case {case:?}: identityCenterApplicationArn {application:?} does not satisfy \
+                 {ARN_PATTERN}"
+            );
+        }
+
+        // `updatedAt` moves when a member of the domain moves, so a request carrying no
+        // member leaves it exactly where the create left it.
+        let requested_anything = row.patch_name.is_some()
+            || row.patch_providers.is_some()
+            || row.patch_instance.is_some();
+        if requested_anything {
+            assert!(
+                updated.updated_at.secs() >= created.updated_at.secs(),
+                "case {case:?}: updatedAt {:?} precedes the value the create left, {:?}",
+                updated.updated_at,
+                created.updated_at
+            );
+        } else {
+            assert_eq!(
+                millis(updated.updated_at),
+                millis(created.updated_at),
+                "case {case:?}: a patch carrying no member moved updatedAt to {:?}",
+                updated.updated_at
+            );
+        }
+
+        // The patched record is the stored one: `GetDomain` answers from it rather than
+        // from a second copy.
+        let fetched = omni
+            .get_domain(&created.domain_id)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: GetDomain failed: {error:?}"))
+            .domain;
+        assert_eq!(
+            format!("{fetched:?}"),
+            format!("{updated:?}"),
+            "case {case:?}: GetDomain did not return the record UpdateDomain persisted"
+        );
+
+        // `UpdateDomain` is modelled `@idempotent`: replaying one patch answers the same
+        // domain rather than moving it again.
+        let replayed = omni
+            .update_domain(&patch)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: replaying UpdateDomain failed: {error:?}"))
+            .domain;
+        assert_eq!(
+            format!("{replayed:?}"),
+            format!("{updated:?}"),
+            "case {case:?}: replaying the patch answered a different domain"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_identity_center_application_follows_the_domains_providers() {
+    let omni = Omni::new();
+    let mut create = create_domain_input("omni-application", &["IDC"]);
+    create.identity_provider_configuration = Some(idc_configuration(IDC_INSTANCE_ARN));
+    let created = omni
+        .create_domain(&create)
+        .await
+        .expect("CreateDomain with IDC succeeds")
+        .domain;
+    let minted = created
+        .identity_center_application_arn
+        .clone()
+        .expect("an IDC domain reports an Identity Center application");
+    // The application is minted under the instance the request named.
+    assert!(
+        minted.contains("ssoins-1234567890abcdef"),
+        "case \"minted\": the application {minted:?} is not under the named instance"
+    );
+
+    // A rename touches nothing about the domain's identity, so the application stays.
+    let renamed = omni
+        .update_domain(&UpdateDomainInput {
+            domain_id: created.domain_id.clone(),
+            name: Some("omni-application-renamed".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("the rename succeeds")
+        .domain;
+    assert_eq!(
+        renamed.identity_center_application_arn.as_deref(),
+        Some(minted.as_str()),
+        "case \"rename\": the rename moved the Identity Center application to {:?}",
+        renamed.identity_center_application_arn
+    );
+
+    // Naming another instance moves the application under that instance.
+    let moved = omni
+        .update_domain(&UpdateDomainInput {
+            domain_id: created.domain_id.clone(),
+            identity_provider_configuration: Some(idc_configuration(OTHER_IDC_INSTANCE_ARN)),
+            ..Default::default()
+        })
+        .await
+        .expect("moving the instance succeeds")
+        .domain;
+    let after_move = moved
+        .identity_center_application_arn
+        .clone()
+        .expect("a domain still listing IDC reports an application");
+    assert!(
+        after_move.contains("ssoins-fedcba0987654321"),
+        "case \"moved\": the application {after_move:?} is not under the instance named"
+    );
+
+    // Dropping IDC drops the application: it is "Absent for IAM-only domains".
+    let iam_only = omni
+        .update_domain(&UpdateDomainInput {
+            domain_id: created.domain_id.clone(),
+            identity_providers: Some(providers(&["IAM"])),
+            ..Default::default()
+        })
+        .await
+        .expect("dropping IDC succeeds")
+        .domain;
+    assert_eq!(
+        iam_only.identity_center_application_arn, None,
+        "case \"IAM-only\": the application survived dropping IDC: {:?}",
+        iam_only.identity_center_application_arn
+    );
+
+    // And listing IDC again mints one.
+    let idc_again = omni
+        .update_domain(&UpdateDomainInput {
+            domain_id: created.domain_id.clone(),
+            identity_providers: Some(providers(&["IDC", "IAM"])),
+            ..Default::default()
+        })
+        .await
+        .expect("adding IDC back succeeds")
+        .domain;
+    assert!(
+        idc_again
+            .identity_center_application_arn
+            .as_deref()
+            .is_some_and(is_arn),
+        "case \"IDC again\": no application was minted: {:?}",
+        idc_again.identity_center_application_arn
+    );
+}
+
+#[tokio::test]
+async fn renaming_a_domain_onto_a_name_another_domain_holds_is_a_conflict() {
+    let omni = Omni::new();
+    let first = domain(&omni, "conflict", "omni-conflict-first", &["IAM"]).await;
+    let second = domain(&omni, "conflict", "omni-conflict-second", &["IAM"]).await;
+    let before = format!("{second:?}");
+
+    expect_modelled_error(
+        "onto a sibling's name",
+        omni.update_domain(&UpdateDomainInput {
+            domain_id: second.domain_id.clone(),
+            name: first.name.clone(),
+            // The provider change rides along, so the refusal is shown to roll back the
+            // whole patch rather than only the name.
+            identity_providers: Some(providers(&["IDC"])),
+            ..Default::default()
+        })
+        .await,
+        409,
+        "ConflictException",
+    );
+    let after = omni
+        .get_domain(&second.domain_id)
+        .await
+        .expect("the refused domain is still there")
+        .domain;
+    assert_eq!(
+        format!("{after:?}"),
+        before,
+        "a refused UpdateDomain changed the domain"
+    );
+
+    // Naming the name the domain already carries is not a conflict with itself, and
+    // changes nothing.
+    let same = omni
+        .update_domain(&UpdateDomainInput {
+            domain_id: second.domain_id.clone(),
+            name: second.name.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("renaming a domain to its own name succeeds")
+        .domain;
+    assert_eq!(
+        format!("{same:?}"),
+        before,
+        "a patch asking for the name the domain holds changed it"
+    );
+
+    // A successful rename moves the domain's entry in the name index: the name it
+    // released is free to be taken again, and the name it took is now the conflict.
+    omni.update_domain(&UpdateDomainInput {
+        domain_id: second.domain_id.clone(),
+        name: Some("omni-conflict-third".to_string()),
+        ..Default::default()
+    })
+    .await
+    .expect("the rename succeeds");
+    let reused = omni
+        .create_domain(&create_domain_input("omni-conflict-second", &["IAM"]))
+        .await
+        .expect("the released name can be taken again")
+        .domain;
+    expect_modelled_error(
+        "onto the name a later create took",
+        omni.update_domain(&UpdateDomainInput {
+            domain_id: first.domain_id.clone(),
+            name: Some("omni-conflict-third".to_string()),
+            ..Default::default()
+        })
+        .await,
+        409,
+        "ConflictException",
+    );
+    expect_modelled_error(
+        "onto the reused name",
+        omni.update_domain(&UpdateDomainInput {
+            domain_id: first.domain_id.clone(),
+            name: reused.name.clone(),
+            ..Default::default()
+        })
+        .await,
+        409,
+        "ConflictException",
+    );
+}
+
+#[tokio::test]
+async fn updating_a_domain_the_store_does_not_hold_is_not_found() {
+    let omni = Omni::new();
+    // Well-formed `DomainId`s that name nothing: one the store never held, and one whose
+    // domain was deleted.
+    let deleted = domain(&omni, "deleted", "omni-update-deleted", &["IAM"]).await;
+    omni.delete_domain(&deleted.domain_id)
+        .await
+        .expect("the domain deletes");
+
+    for domain_id in [MISSING_DOMAIN_ID, deleted.domain_id.as_str()] {
+        expect_modelled_error(
+            domain_id,
+            omni.update_domain(&UpdateDomainInput {
+                domain_id: domain_id.to_string(),
+                name: Some("omni-update-missing".to_string()),
+                ..Default::default()
+            })
+            .await,
+            404,
+            "ResourceNotFoundException",
+        );
+    }
+
+    // A miss is not a write: the name the misses asked for is still free, and a domain
+    // created after them still updates.
+    let created = omni
+        .create_domain(&create_domain_input("omni-update-missing", &["IAM"]))
+        .await
+        .expect("the name a missed patch asked for was never taken")
+        .domain;
+    let updated = omni
+        .update_domain(&UpdateDomainInput {
+            domain_id: created.domain_id.clone(),
+            name: Some("omni-update-after-misses".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("the domain created after the misses updates")
+        .domain;
+    assert_eq!(
+        updated.name.as_deref(),
+        Some("omni-update-after-misses"),
+        "the update after the misses did not persist, got {:?}",
+        updated.name
+    );
+}
+
+#[tokio::test]
+async fn an_identity_provider_outside_the_modelled_value_set_is_refused() {
+    let omni = Omni::new();
+    let created = domain(&omni, "providers", "omni-bad-provider", &["IAM"]).await;
+    let before = format!("{created:?}");
+
+    // `IdentityProvider`'s value set is exactly IAM | IDC, so nothing else is a provider
+    // this domain can be configured with.
+    for provider in ["SAML", "iam", "IDC2", ""] {
+        expect_modelled_error(
+            provider,
+            omni.update_domain(&UpdateDomainInput {
+                domain_id: created.domain_id.clone(),
+                name: Some("omni-bad-provider-renamed".to_string()),
+                identity_providers: Some(vec![provider.to_string()]),
+                ..Default::default()
+            })
+            .await,
+            400,
+            "ValidationException",
+        );
+        let after = omni
+            .get_domain(&created.domain_id)
+            .await
+            .unwrap_or_else(|error| panic!("case {provider:?}: GetDomain failed: {error:?}"))
+            .domain;
+        assert_eq!(
+            format!("{after:?}"),
+            before,
+            "case {provider:?}: a refused UpdateDomain changed the domain"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_modelled_update_domain_constraints_refuse_what_they_declare() {
+    // `aws_smithy_schema_server::validate_to_message` is the exact check the framework
+    // runs on a deserialized input before the handler sees it, so the handler never
+    // re-checks a modelled constraint.
+    let too_long = "a".repeat(64);
+    let refused: Vec<(&str, String)> = vec![
+        ("shorter than @length(min: 3)", "ab".to_string()),
+        ("longer than @length(max: 63)", too_long),
+        ("outside the name pattern (upper case)", "Upper".to_string()),
+        (
+            "outside the name pattern (consecutive hyphens)",
+            "double--hyphen".to_string(),
+        ),
+        (
+            "outside the name pattern (leading hyphen)",
+            "-leading".to_string(),
+        ),
+        (
+            "outside the name pattern (trailing hyphen)",
+            "trailing-".to_string(),
+        ),
+    ];
+    for (why, name) in refused {
+        let input = UpdateDomainInput {
+            domain_id: MISSING_DOMAIN_ID.to_string(),
+            name: Some(name.clone()),
+            ..Default::default()
+        };
+        assert!(
+            aws_smithy_schema_server::validate_to_message(&input, UPDATE_DOMAIN_INPUT_SCHEMA)
+                .is_some(),
+            "case {why:?}: UpdateDomain name {name:?} was accepted"
+        );
+    }
+    // Both published bounds of `name`'s @length(3..63) are accepted.
+    for name in ["abc".to_string(), "a".repeat(63)] {
+        let input = UpdateDomainInput {
+            domain_id: MISSING_DOMAIN_ID.to_string(),
+            name: Some(name.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            aws_smithy_schema_server::validate_to_message(&input, UPDATE_DOMAIN_INPUT_SCHEMA),
+            None,
+            "case {name:?}: a name on the published bound was refused"
+        );
+    }
+    // `domainId` carries `DomainId`'s pattern, and `identityProviders` its
+    // `@length(1..2)` `@uniqueItems`.
+    let outside: Vec<(&str, UpdateDomainInput)> = vec![
+        (
+            "a domainId outside the modelled pattern",
+            UpdateDomainInput {
+                domain_id: "not-a-domain-id".to_string(),
+                ..Default::default()
+            },
+        ),
+        (
+            "an empty identityProviders list",
+            UpdateDomainInput {
+                domain_id: MISSING_DOMAIN_ID.to_string(),
+                identity_providers: Some(Vec::new()),
+                ..Default::default()
+            },
+        ),
+        (
+            "a repeated identity provider",
+            UpdateDomainInput {
+                domain_id: MISSING_DOMAIN_ID.to_string(),
+                identity_providers: Some(providers(&["IAM", "IAM"])),
+                ..Default::default()
+            },
+        ),
+        (
+            "more identity providers than @length(max: 2)",
+            UpdateDomainInput {
+                domain_id: MISSING_DOMAIN_ID.to_string(),
+                identity_providers: Some(providers(&["IAM", "IDC", "IAM"])),
+                ..Default::default()
+            },
+        ),
+    ];
+    for (why, input) in outside {
+        assert!(
+            aws_smithy_schema_server::validate_to_message(&input, UPDATE_DOMAIN_INPUT_SCHEMA)
+                .is_some(),
+            "case {why:?}: the input was accepted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_domain_over_the_rpcv2cbor_wire() {
+    let omni = Omni::new();
+    let mut create = create_domain_input("omni-wire-domain", &["IAM", "IDC"]);
+    create.identity_provider_configuration = Some(idc_configuration(IDC_INSTANCE_ARN));
+    let (status, body) = omni
+        .over_the_wire("CreateDomain", CREATE_DOMAIN_INPUT_SCHEMA, &create)
+        .await;
+    assert_eq!(
+        status,
+        200,
+        "CreateDomain over the wire answered {status}: {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let codec = CborCodec::default();
+    let mut deserializer = codec.create_deserializer(&body);
+    let created = CreateDomainOutput::deserialize(&mut deserializer)
+        .expect("the output deserializes")
+        .domain;
+
+    let (status, body) = omni
+        .over_the_wire(
+            "UpdateDomain",
+            UPDATE_DOMAIN_INPUT_SCHEMA,
+            &UpdateDomainInput {
+                domain_id: created.domain_id.clone(),
+                name: Some("omni-wire-domain-renamed".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(
+        status,
+        200,
+        "UpdateDomain over the wire answered {status}: {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let mut deserializer = codec.create_deserializer(&body);
+    let patched = UpdateDomainOutput::deserialize(&mut deserializer)
+        .expect("the output deserializes")
+        .domain;
+    assert_eq!(
+        (
+            patched.name.as_deref(),
+            patched.custom_endpoint_urls.clone().unwrap_or_default(),
+            patched.domain_endpoint_url.as_str(),
+            patched.identity_providers.clone(),
+        ),
+        (
+            Some("omni-wire-domain-renamed"),
+            vec![custom_endpoint_url("omni-wire-domain-renamed")],
+            created.domain_endpoint_url.as_str(),
+            providers(&["IAM", "IDC"]),
+        ),
+        "the wire response did not move the name's endpoint URLs and keep the rest: {patched:?}"
+    );
+    assert_eq!(
+        patched.identity_center_application_arn,
+        created.identity_center_application_arn,
+        "the rename moved the Identity Center application to {:?}",
+        patched.identity_center_application_arn
+    );
+
+    // And a miss over the wire is the modelled 404 with its modelled error code.
+    let (status, body) = omni
+        .over_the_wire(
+            "UpdateDomain",
+            UPDATE_DOMAIN_INPUT_SCHEMA,
+            &UpdateDomainInput {
+                domain_id: MISSING_DOMAIN_ID.to_string(),
+                name: Some("omni-wire-domain-missing".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    let rendered = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(
+        status, 404,
+        "UpdateDomain over the wire answered {status} for a missing domain: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("ResourceNotFoundException"),
+        "the wire error body does not name ResourceNotFoundException: {rendered:?}"
     );
 }
