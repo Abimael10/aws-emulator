@@ -23,7 +23,9 @@
 //! schedule), and each refusal row is paired with the acceptance that proves the rule refuses
 //! only what breaks it — the published bound itself included.
 
-use crate::alarm_mute_rules::{put_request, with_members, DURATION_TOO_LONG, SCHEDULE_MALFORMED};
+use crate::alarm_mute_rules::{
+    minute_aligned, put_request, with_members, DURATION_TOO_LONG, SCHEDULE_MALFORMED,
+};
 use crate::harness::{build_router, call, error_code, error_message, ok};
 use ::chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{json, Value};
@@ -34,13 +36,6 @@ const AT_EXPRESSION_DATES: &str = "Can not set start or expire dates for At expr
 
 /// How CloudWatch words the refusal of a rule that is expired the moment it is written.
 const RULE_EXPIRED: &str = "The Alarm Mute Rule is expired.";
-
-/// The whole minute `at` falls in, as the epoch seconds a timestamp member carries — the
-/// granularity a one-time expression states its instants at ("Format: `at(yyyy-MM-ddThh:mm)`",
-/// `Schedule$Expression`), so a boundary stated at it is minute-aligned.
-fn minute_aligned(at: DateTime<Utc>) -> i64 {
-    at.timestamp() - at.timestamp().rem_euclid(60)
-}
 
 /// An `at` expression naming the whole minute `at` falls in, in UTC.
 fn at_expression(at: DateTime<Utc>) -> String {

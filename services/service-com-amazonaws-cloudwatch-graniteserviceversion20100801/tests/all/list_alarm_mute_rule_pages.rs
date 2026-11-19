@@ -19,7 +19,9 @@
 // The mute-rule request builders and readers this suite needs already exist beside it, for the
 // same resource: the sibling suite owns them and this one reads a listing through the same pair
 // of helpers rather than a second copy.
-use crate::alarm_mute_rules::{listed_arns, put_alarm, put_request, rule_arn, text, with_members};
+use crate::alarm_mute_rules::{
+    listed_arns, minute_aligned, put_alarm, put_request, rule_arn, text, with_members,
+};
 use crate::harness::{build_router, call, error_code, ok};
 use ::chrono::{TimeDelta, Utc};
 use serde_json::{json, Value};
@@ -225,7 +227,7 @@ async fn a_summary_carries_only_the_members_the_shape_models() {
         (
             "a rule that expires",
             "summary-with-expiry",
-            json!({"ExpireDate": (now + TimeDelta::days(1)).timestamp()}),
+            json!({"ExpireDate": minute_aligned(now + TimeDelta::days(1))}),
             true,
         ),
         (
@@ -233,8 +235,8 @@ async fn a_summary_carries_only_the_members_the_shape_models() {
             "summary-with-everything",
             json!({
                 "Description": "the suite's own rule",
-                "StartDate": (now - TimeDelta::days(1)).timestamp(),
-                "ExpireDate": (now + TimeDelta::days(2)).timestamp(),
+                "StartDate": minute_aligned(now - TimeDelta::days(1)),
+                "ExpireDate": minute_aligned(now + TimeDelta::days(2)),
                 "MuteTargets": {"AlarmNames": ["SummaryAlarm"]},
                 "Tags": [{"Key": "owner", "Value": "suite"}],
             }),
@@ -307,11 +309,11 @@ async fn listing_the_rules_changes_nothing_a_later_caller_sees() {
         ("read-active", json!({})),
         (
             "read-scheduled",
-            json!({"StartDate": (now + TimeDelta::days(1)).timestamp()}),
+            json!({"StartDate": minute_aligned(now + TimeDelta::days(1))}),
         ),
         (
             "read-expired",
-            json!({"ExpireDate": (now - TimeDelta::days(1)).timestamp()}),
+            json!({"ExpireDate": minute_aligned(now - TimeDelta::days(1))}),
         ),
         (
             "read-targeted",

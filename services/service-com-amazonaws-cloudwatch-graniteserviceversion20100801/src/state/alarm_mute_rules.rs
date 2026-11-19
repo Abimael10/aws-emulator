@@ -687,6 +687,64 @@ pub const MUTE_RULE_EXPIRED_MESSAGE: &str = "The Alarm Mute Rule is expired.";
 pub const AT_EXPRESSION_DATES_MESSAGE: &str =
     "Can not set start or expire dates for At expressions";
 
+/// The granularity a mute rule's window boundaries are stated at: the whole minute.
+///
+/// `StartDate` and `ExpireDate` are plain timestamp members carrying no modelled constraint
+/// (`smithy_query(query="operation",operation="PutAlarmMuteRule")`), and the schedule they bound
+/// states its own instants at the minute and no finer — "Format: `at(yyyy-MM-ddThh:mm)`" and
+/// "Format: `cron(Minutes Hours Day-of-month Month Day-of-week)`" (`Schedule$Expression`) — so a
+/// boundary carrying a seconds component names an instant no window of the rule can open or close
+/// at. Measured against `monitoring`, such a boundary is REFUSED rather than rounded to a minute,
+/// which is the only answer that leaves the caller's own instant intact.
+const MUTE_BOUNDARY_GRANULARITY_SECS: f64 = 60.0;
+
+/// The boundary member a request states the instant the rule takes effect after in
+/// (`PutAlarmMuteRuleInput$StartDate`), as a refusal of its value names it.
+const START_DATE_MEMBER: &str = "StartDate";
+
+/// The boundary member a request states the instant the rule is no longer evaluated after in
+/// (`PutAlarmMuteRuleInput$ExpireDate`), as a refusal of its value names it.
+const EXPIRE_DATE_MEMBER: &str = "ExpireDate";
+
+/// How CloudWatch states that the boundary `member` was given at a finer granularity than a mute
+/// rule's windows are stated at: one sentence about that member, saying what precision the rule
+/// supports and what to do about it, and carrying nothing of the instant the request submitted.
+pub fn minute_precision_message(member: &str) -> String {
+    format!(
+        "The Alarm Mute Rule {member} only supports minute-level precision. Please provide the \
+         time without seconds."
+    )
+}
+
+/// Whether `secs` names a whole minute — the granularity a mute window's boundaries are stated at
+/// ([`MUTE_BOUNDARY_GRANULARITY_SECS`]). An instant no number answers to names no minute.
+fn is_minute_aligned(secs: f64) -> bool {
+    secs.is_finite() && secs.rem_euclid(MUTE_BOUNDARY_GRANULARITY_SECS) == 0.0
+}
+
+/// Why a window boundary a write carries is stated at a finer granularity than a mute rule's
+/// windows, in the sentence CloudWatch states that refusal in, or `None` when both boundaries name
+/// whole minutes.
+///
+/// A rule the model cannot express, judged per boundary member and before the two are compared
+/// with each other: each of `StartDate` and `ExpireDate` has to name a whole minute
+/// ([`is_minute_aligned`]), and the one that does not is named in the refusal
+/// ([`minute_precision_message`]). `StartDate` is judged first, so a request whose boundaries are
+/// both finer than a minute is told about the one it states the window's opening with.
+pub fn alarm_mute_rule_precision_error(
+    start_date: Option<f64>,
+    expire_date: Option<f64>,
+) -> Option<String> {
+    [
+        (START_DATE_MEMBER, start_date),
+        (EXPIRE_DATE_MEMBER, expire_date),
+    ]
+    .into_iter()
+    .filter_map(|(member, at)| at.map(|at| (member, at)))
+    .find(|(_, at)| !is_minute_aligned(*at))
+    .map(|(member, _)| minute_precision_message(member))
+}
+
 /// Why `schedule` names no mute window this service can run, in the sentence CloudWatch states
 /// that refusal in, or `None` when it names one.
 ///

@@ -68,6 +68,16 @@ pub(crate) fn at_expression(at: DateTime<Utc>, timezone: Tz) -> String {
     format!("at({})", at.with_timezone(&timezone).format("%Y-%m-%dT%H:%M"))
 }
 
+/// The whole minute `at` falls in, as the epoch seconds a window boundary carries.
+///
+/// A mute rule's windows open and close on the minute ("Format: `at(yyyy-MM-ddThh:mm)`" and
+/// "Format: `cron(Minutes Hours Day-of-month Month Day-of-week)`", `Schedule$Expression`), so a
+/// `StartDate` or `ExpireDate` a write accepts names a whole minute: every row that bounds a
+/// window states its boundary through this.
+pub(crate) fn minute_aligned(at: DateTime<Utc>) -> i64 {
+    at.timestamp() - at.timestamp().rem_euclid(60)
+}
+
 /// A string member of a body.
 pub(crate) fn text(value: &Value, member: &str) -> Option<String> {
     value
@@ -147,8 +157,8 @@ async fn every_mute_rule_configuration_round_trips_through_get_alarm_mute_rule()
             with_members(
                 put_request("bounded-window", "cron(0 18 * * FRI)", "P2DT12H"),
                 json!({
-                    "StartDate": (now + TimeDelta::hours(1)).timestamp(),
-                    "ExpireDate": (now + TimeDelta::days(30)).timestamp(),
+                    "StartDate": minute_aligned(now + TimeDelta::hours(1)),
+                    "ExpireDate": minute_aligned(now + TimeDelta::days(30)),
                     "Tags": [{"Key": "Team", "Value": "TeamA"}],
                 }),
             ),
@@ -329,7 +339,7 @@ async fn a_mute_rules_status_is_what_the_clock_makes_of_its_window() {
             "a recurring schedule before the rule takes effect",
             json!({
                 "Rule": {"Schedule": schedule("cron(* * * * *)", "PT1H", None)},
-                "StartDate": (now + TimeDelta::hours(2)).timestamp(),
+                "StartDate": minute_aligned(now + TimeDelta::hours(2)),
             }),
             "SCHEDULED",
         ),
@@ -337,7 +347,7 @@ async fn a_mute_rules_status_is_what_the_clock_makes_of_its_window() {
             "a recurring schedule past the date it is no longer evaluated",
             json!({
                 "Rule": {"Schedule": schedule("cron(* * * * *)", "PT1H", None)},
-                "ExpireDate": (now - TimeDelta::minutes(1)).timestamp(),
+                "ExpireDate": minute_aligned(now - TimeDelta::minutes(1)),
             }),
             "EXPIRED",
         ),
@@ -760,14 +770,14 @@ async fn given_mute_rules(router: &MultiServiceRouter, now: DateTime<Utc>) {
         (
             "scheduled-rule",
             json!({
-                "StartDate": (now + TimeDelta::hours(2)).timestamp(),
+                "StartDate": minute_aligned(now + TimeDelta::hours(2)),
                 "MuteTargets": {"AlarmNames": ["WebServerCPUAlarm", "DatabaseConnectionAlarm"]},
             }),
         ),
         (
             "expired-rule",
             json!({
-                "ExpireDate": (now - TimeDelta::minutes(1)).timestamp(),
+                "ExpireDate": minute_aligned(now - TimeDelta::minutes(1)),
                 "MuteTargets": {"AlarmNames": ["DatabaseConnectionAlarm"]},
             }),
         ),
@@ -1135,7 +1145,7 @@ async fn a_deleted_mute_rule_is_reported_by_no_read() {
             "deleted-expired",
             with_members(
                 put_request("deleted-expired", "cron(0 2 * * *)", "PT4H"),
-                json!({"ExpireDate": (now - TimeDelta::days(1)).timestamp()}),
+                json!({"ExpireDate": minute_aligned(now - TimeDelta::days(1))}),
             ),
         ),
     ];

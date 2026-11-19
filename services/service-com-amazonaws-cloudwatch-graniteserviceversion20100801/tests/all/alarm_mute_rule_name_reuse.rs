@@ -39,8 +39,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::alarm_mute_rules::{
-    at_expression, listed_arns, put_request, rule_arn, scheduled_in_its_timezone, text,
-    with_members,
+    at_expression, listed_arns, minute_aligned, put_request, rule_arn, scheduled_in_its_timezone,
+    text, with_members,
 };
 use crate::harness::{
     build_router, call_in_region, creation_identity_millis, error_code, reported_creation_id,
@@ -228,8 +228,8 @@ async fn a_deleted_mute_rule_frees_its_name_and_leaves_nothing_of_itself_behind(
                 json!({
                     "Description": "the window the first rule muted",
                     "MuteTargets": {"AlarmNames": ["WebServerCPUAlarm", "QueueDepthAlarm"]},
-                    "StartDate": (now - TimeDelta::hours(1)).timestamp(),
-                    "ExpireDate": (now + TimeDelta::days(2)).timestamp(),
+                    "StartDate": minute_aligned(now - TimeDelta::hours(1)),
+                    "ExpireDate": minute_aligned(now + TimeDelta::days(2)),
                 }),
             )),
             after: put_request("reused-bare", ALWAYS_OPEN.0, ALWAYS_OPEN.1),
@@ -274,7 +274,7 @@ async fn a_deleted_mute_rule_frees_its_name_and_leaves_nothing_of_itself_behind(
             )),
             after: with_members(
                 put_request("reused-regional", ALWAYS_OPEN.0, ALWAYS_OPEN.1),
-                json!({"ExpireDate": (now - TimeDelta::days(1)).timestamp()}),
+                json!({"ExpireDate": minute_aligned(now - TimeDelta::days(1))}),
             ),
             status: "EXPIRED",
             mute_type: RECURRING,

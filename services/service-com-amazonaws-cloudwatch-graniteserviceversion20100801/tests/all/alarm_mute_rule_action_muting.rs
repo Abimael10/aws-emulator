@@ -16,6 +16,7 @@
 
 use serde_json::{json, Value};
 
+use crate::alarm_mute_rules::minute_aligned;
 use crate::harness::{
     element, emulator, given_queue, grant_sns_delivery_on, received_messages, rpc, rpc_in_region,
     set_alarm_state, sns, subscribe_queue, Emulator, REGION,
@@ -335,7 +336,7 @@ async fn an_active_mute_rule_mutes_the_actions_a_targeted_alarm_s_transition_fir
             composite: false,
             forced_state: "ALARM",
             rules: vec![RuleSpec {
-                expire_date: Some((now - ::chrono::TimeDelta::minutes(1)).timestamp()),
+                expire_date: Some(minute_aligned(now - ::chrono::TimeDelta::minutes(1))),
                 ..targeting("cron(* * * * *)", "PT1H")
             }],
             muting_rule: None,
