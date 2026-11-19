@@ -1726,6 +1726,30 @@ impl BillingGroupRecord {
             "STANDARD"
         }
     }
+
+    /// Do this record and `other` hold the SAME values for every member a write can
+    /// change — exactly the members one generation of the group carries
+    /// ([`VersionedResource::current_version`]), named here once so the two cannot drift?
+    ///
+    /// What decides whether a write modified the group at all: `LastModifiedTime` is the
+    /// instant of the write that left the group as it stands, and the generation in force
+    /// starts in the period that instant falls in, so a write leaving every one of these
+    /// members where it was neither moves the instant nor opens a generation.
+    ///
+    /// "The same values" are the ones a READ of the group reports, so the requested
+    /// status is compared through the derived [`status`](Self::status): the status a group
+    /// reports before any caller has set one and that same status named explicitly are ONE
+    /// value, which no read can tell apart. The other members are reported exactly as
+    /// they are held — an absent `Description` or `AutoAssociate` as an absent member
+    /// rather than as an empty string or `false` — so for those the held value IS the
+    /// reported one.
+    pub fn holds_same_members_as(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.description == other.description
+            && self.pricing_plan_arn == other.pricing_plan_arn
+            && self.status() == other.status()
+            && self.auto_associate == other.auto_associate
+    }
 }
 
 /// The billing-period versioning rule, as a billing group carries it: a generation of a

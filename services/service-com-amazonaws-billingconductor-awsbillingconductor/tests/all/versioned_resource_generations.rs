@@ -36,6 +36,12 @@
 //! the test cannot ask the service for. That is the harness
 //! `tests/all/pricing_rule_association_periods.rs` and
 //! `tests/all/billing_group_billing_periods.rs` already carry, driven from here.
+//!
+//! The rule's other half is also shared, and this suite drives it over the same resources:
+//! whether a write MODIFIED a resource at all is decided by comparing the values a read of
+//! it reports — exactly the members one generation of it carries — so a request naming only
+//! values the resource already reports moves no `LastModifiedTime` and opens no generation,
+//! whichever resource it addresses and whichever of those members it names.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_billingconductor_awsbillingconductor::state::{
@@ -446,4 +452,225 @@ async fn an_association_write_keeps_the_pricing_plan_generation_it_closes() {
         "case {case}: expected the association to move LastModifiedTime past \
          {generation_start}, got {modified_now}"
     );
+}
+
+/// The values a row of the billing-group member table names: the group's own name and the
+/// two pricing plans of the world it is written in, so a row can restate exactly what the
+/// group already reports.
+struct Reported {
+    /// The name the group was created with.
+    name: String,
+    /// The pricing plan the group computes with.
+    plan: String,
+    /// A second pricing plan, the one a changing write moves the group to.
+    other_plan: String,
+}
+
+/// One row of the billing-group member table: one member class of the group's generation,
+/// with the value the group already reports for it and a value it does not.
+struct MemberRow {
+    label: &'static str,
+    /// The members `CreateBillingGroup` is given beyond the harness defaults, so the group
+    /// starts out reporting the value the row restates.
+    created: fn(&Reported) -> Value,
+    /// The members the call under test names — the SAME values the group already reports.
+    restated: fn(&Reported) -> Value,
+    /// The same member class, with a value the group does not report.
+    changed: fn(&Reported) -> Value,
+}
+
+/// The name of the `index`-th group of the member table.
+fn member_group_name(index: usize) -> String {
+    format!("NoOpMember{index}")
+}
+
+/// The member classes of a billing group's generation — the members
+/// `UpdateBillingGroupInput` can change
+/// (`smithy_query(query="shape",shape="UpdateBillingGroupInput")`: `Name`, `Description`,
+/// `ComputationPreference.PricingPlanArn`, `Status`,
+/// `AccountGrouping.AutoAssociate`), one row each: a name under a pattern, free text, an
+/// ARN, an enum value and a boolean.
+fn member_rows() -> Vec<MemberRow> {
+    vec![
+        MemberRow {
+            label: "Name",
+            created: |_| json!({}),
+            restated: |reported| json!({"Name": reported.name}),
+            changed: |_| json!({"Name": "NoOpMemberRenamed"}),
+        },
+        MemberRow {
+            label: "Description",
+            created: |_| json!({"Description": "as created"}),
+            restated: |_| json!({"Description": "as created"}),
+            changed: |_| json!({"Description": "moved on"}),
+        },
+        MemberRow {
+            label: "ComputationPreference.PricingPlanArn",
+            created: |_| json!({}),
+            restated: |reported| {
+                json!({"ComputationPreference": {"PricingPlanArn": reported.plan}})
+            },
+            changed: |reported| {
+                json!({"ComputationPreference": {"PricingPlanArn": reported.other_plan}})
+            },
+        },
+        MemberRow {
+            label: "Status",
+            created: |_| json!({}),
+            restated: |_| json!({"Status": "ACTIVE"}),
+            changed: |_| json!({"Status": "PENDING"}),
+        },
+        MemberRow {
+            label: "AccountGrouping.AutoAssociate",
+            created: |_| json!({"AccountGrouping": {"AutoAssociate": false}}),
+            restated: |_| json!({"AccountGrouping": {"AutoAssociate": false}}),
+            changed: |_| json!({"AccountGrouping": {"AutoAssociate": true}}),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_write_naming_only_the_values_a_resource_reports_opens_no_generation() {
+    let world = World::new().await;
+    let now = current_period();
+    // Each resource and its only generation live a year back, so the write under test lands
+    // in a LATER billing period than the generation it would displace — the condition under
+    // which both consequences of the decision (the instant and the generation) are
+    // observable at once.
+    let created_in = shift_period(&now, -12);
+    let created_at = period_start_millis(&created_in);
+
+    // First over every versioned resource, through its own update operation: `Description`
+    // is the one member all three carry, so one row is the same restatement whichever
+    // resource it addresses.
+    for (index, kind) in Versioned::ALL.iter().copied().enumerate() {
+        let case = format!("{kind:?} restating the Description it reports");
+        let arn = world.create(kind, index, "as created").await;
+        world.created_in(kind, &arn, &created_in);
+        world.describe(&case, kind, &arn, "as created").await;
+
+        // Nothing moved: the period the generation started in and the current one are still
+        // answered from that one generation, with the instant it started at.
+        for period in [&created_in, &now] {
+            let case = format!("{case} read at {period:?}");
+            let element = world
+                .element_in(&case, kind, &arn, Some(period))
+                .await
+                .unwrap_or_else(|| {
+                    panic!("case {case}: the resource existed then, so it is reported")
+                });
+            assert_members(
+                &case,
+                &element,
+                &json!({"Description": "as created", "LastModifiedTime": created_at}),
+            );
+        }
+
+        // The control: a write naming a value the resource does NOT report moves the instant
+        // and freezes the generation the reads above were answered from.
+        let case = format!("{kind:?} naming a Description it does not report");
+        world.describe(&case, kind, &arn, "moved on").await;
+        let frozen = world
+            .element_in(&case, kind, &arn, Some(&created_in))
+            .await
+            .unwrap_or_else(|| panic!("case {case}: the resource existed then, so it is reported"));
+        assert_members(
+            &case,
+            &frozen,
+            &json!({"Description": "as created", "LastModifiedTime": created_at}),
+        );
+        let current = world
+            .element_in(&case, kind, &arn, Some(&now))
+            .await
+            .unwrap_or_else(|| panic!("case {case}: the resource exists now, so it is reported"));
+        assert_members(&case, &current, &json!({"Description": "moved on"}));
+        let modified = current["LastModifiedTime"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("case {case}: no LastModifiedTime in {current:?}"));
+        assert!(
+            modified > created_at,
+            "case {case}: expected a write that modified the resource to move \
+             LastModifiedTime past {created_at}, got {modified}"
+        );
+    }
+
+    // Then over EVERY member class a billing group's generation carries, because that is
+    // the resource whose update names the longest member list: one restating write and one
+    // changing write per member, through the real wire.
+    let other_plan = world.billing.create_plan("NoOpMemberOtherPlan").await;
+    for (index, row) in member_rows().into_iter().enumerate() {
+        let reported = Reported {
+            name: member_group_name(index),
+            plan: world.group_plan.clone(),
+            other_plan: other_plan.clone(),
+        };
+        // A group's primary account is one of its own linked accounts and an account
+        // belongs to at most one group, so each row's group owns a different one; the
+        // offset keeps them clear of the groups created above.
+        let primary = primary_account_id(index + 32);
+        let case = format!("a group restating the {} it reports", row.label);
+        let group = world
+            .billing
+            .create_group(
+                &reported.name,
+                &reported.plan,
+                &primary,
+                &(row.created)(&reported),
+            )
+            .await;
+        world.billing.created_in(&group, &created_in);
+        let generations_before = world.billing.superseded_generations(&group);
+
+        world
+            .billing
+            .update_group(&case, &group, &(row.restated)(&reported))
+            .await;
+        let generations_after = world.billing.superseded_generations(&group);
+        assert_eq!(
+            generations_after, generations_before,
+            "case {case}: expected a write that modified nothing to freeze no generation, \
+             got {generations_before} generations before and {generations_after} after"
+        );
+        let element = world
+            .billing
+            .element_in(&case, &group, Some(&now))
+            .await
+            .unwrap_or_else(|| panic!("case {case}: the group exists now, so it is reported"));
+        assert_members(&case, &element, &json!({"LastModifiedTime": created_at}));
+
+        // The control for the same member: a value the group does not report moves the
+        // instant and spends a slot of the bounded generation history.
+        let case = format!("a group naming a {} it does not report", row.label);
+        world
+            .billing
+            .update_group(&case, &group, &(row.changed)(&reported))
+            .await;
+        let generations_after = world.billing.superseded_generations(&group);
+        assert_eq!(
+            generations_after,
+            generations_before + 1,
+            "case {case}: expected a write that modified the group in a later billing period \
+             to freeze the generation it displaced, got {generations_before} generations \
+             before and {generations_after} after"
+        );
+        let frozen = world
+            .billing
+            .element_in(&case, &group, Some(&created_in))
+            .await
+            .unwrap_or_else(|| panic!("case {case}: the group existed then, so it is reported"));
+        assert_members(&case, &frozen, &json!({"LastModifiedTime": created_at}));
+        let element = world
+            .billing
+            .element_in(&case, &group, Some(&now))
+            .await
+            .unwrap_or_else(|| panic!("case {case}: the group exists now, so it is reported"));
+        let modified = element["LastModifiedTime"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("case {case}: no LastModifiedTime in {element:?}"));
+        assert!(
+            modified > created_at,
+            "case {case}: expected a write that modified the group to move LastModifiedTime \
+             past {created_at}, got {modified}"
+        );
+    }
 }

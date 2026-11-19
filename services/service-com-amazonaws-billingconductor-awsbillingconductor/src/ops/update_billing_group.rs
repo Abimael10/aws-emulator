@@ -360,23 +360,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `LastModifiedTime` is "the most recent time when the billing group was
         // modified", so it moves only when this call actually modified the group: a
         // request that names no member, or names the values the group already holds,
-        // leaves it where it was.
-        //
-        // "The values the group already holds" are the ones a READ of it reports, so
-        // every term below compares the reported value rather than the internal form it
-        // is kept in: `Status` is compared through the derived
-        // `BillingGroupRecord::status`, under which the status a group reports before any
-        // caller has set one and that same status named explicitly are ONE value — so
-        // restating it modifies nothing a read can tell apart. `Name`,
-        // `Description`, the pricing plan and `AutoAssociate` are reported exactly as
-        // they are held, an absent `Description` or `AutoAssociate` as an absent member
-        // rather than as an empty string or `false`, so for those the held value IS the
-        // reported one and the comparison is the stored member itself.
-        let changed = updated.name != stored.name
-            || updated.description != stored.description
-            || updated.pricing_plan_arn != stored.pricing_plan_arn
-            || updated.status() != stored.status()
-            || updated.auto_associate != stored.auto_associate;
+        // leaves it where it was. The generation in force starts in the billing period
+        // that instant falls in, so a call that modified nothing writes no generation
+        // either — the same rule `UpdatePricingPlan`, `UpdatePricingRule` and
+        // `UpdateCustomLineItem` apply to the sibling resources, decided by the state
+        // method that names the members a generation carries
+        // ([`crate::state::BillingGroupRecord::holds_same_members_as`]).
+        let changed = !updated.holds_same_members_as(&stored);
         if changed {
             updated.last_modified_time_millis = crate::state::now_millis();
             // The name index follows the rename, so the old name frees up and the new
