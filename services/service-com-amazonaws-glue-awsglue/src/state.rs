@@ -424,7 +424,6 @@ use crate::ops::types::{
     TriggerUpdate,
     UpdateClassifierInput, UpdateColumnStatisticsTaskSettingsInput, UpdateCrawlerInput,
     UpdateDataQualityRulesetInput, UpdateGlossaryInput,
-    UpdateIntegrationResourcePropertyInput,
     UpdateMLTransformInput,
     UpdateWorkflowInput,
     UsageProfileDefinition,
@@ -3322,6 +3321,29 @@ impl ComAmazonawsGlueAwsglueState {
     /// below [`MAX_INTEGRATION_RESOURCE_PROPERTIES`].
     pub fn can_store_integration_resource_property(&self) -> bool {
         self.integration_resource_properties.len() < MAX_INTEGRATION_RESOURCE_PROPERTIES
+    }
+
+    /// The record `resource_arn` keys, held open for a WRITE of the processing properties
+    /// of the resource `resource` — created empty, under the ARN that resource derives
+    /// ([`integration_resource_property_id`]), when this store holds none yet.
+    ///
+    /// The ONE write path of that namespace, the mirror of
+    /// [`Self::integration_resource_property`]: every operation that states a resource's
+    /// processing properties goes through it, so the key a write lands under is the key the
+    /// read and the delete of the same `ResourceArn` look up, and a resource that already
+    /// has a record keeps the one `ResourcePropertyArn` it derives rather than gaining a
+    /// second record. Which MEMBERS the write then states is the operation's own
+    /// ([`IntegrationResourcePropertyEntry::apply_processing_properties`]).
+    pub fn integration_resource_property_mut(
+        &mut self,
+        resource_arn: &str,
+        resource: &TaggedResource,
+    ) -> &mut IntegrationResourcePropertyEntry {
+        self.integration_resource_properties
+            .entry(resource_arn.to_string())
+            .or_insert_with(|| {
+                IntegrationResourcePropertyEntry::for_resource(resource_arn, resource)
+            })
     }
 
     /// The integration table property record stored for `resource_arn` and `table_name`, if

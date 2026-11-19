@@ -317,22 +317,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from the request's `ResourceArn` rather than minted, which is what lets a caller
         // that holds only the ARN it submitted address the record afterwards. One resource
         // has one record, so the derived name is unique in this namespace. The record is
-        // built member for member here rather than through the entry's own constructor,
-        // which mints an opaque per-call id no caller can derive.
-        let property_id = format!("{}/{}", resource.kind.arn_segment(), resource.name);
-        let stored = store
-            .integration_resource_properties
-            .entry(input.resource_arn.clone())
-            .or_insert_with(|| crate::state::IntegrationResourcePropertyEntry {
-                resource_arn: input.resource_arn.clone(),
-                property_id,
-                source_processing_properties: input.source_processing_properties.clone(),
-                target_processing_properties: input.target_processing_properties.clone(),
-                tags: input.tags.clone().unwrap_or_default(),
-            });
-        if stored_already {
-            stored.apply_create(&input);
-        }
+        // opened through the store's own write path, the one the update of the same record
+        // goes through, so the two cannot write one resource's properties under two keys.
+        let stored = store.integration_resource_property_mut(&input.resource_arn, &resource);
+        stored.apply_create(&input);
 
         ::tracing::info!(
             operation = "CreateIntegrationResourceProperty",

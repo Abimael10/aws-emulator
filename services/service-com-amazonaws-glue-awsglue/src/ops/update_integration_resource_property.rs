@@ -4,15 +4,34 @@
 //!
 //! Writes the processing properties of ONE resource of an integration: "this API can be used
 //! for updating the ResourceProperty of the Glue connection (for the source) or Glue database
-//! ARN (for the target)". One record per resource, keyed by the ARN the request names, which
-//! is the record `GetIntegrationResourceProperty` reads back — so a write for a resource that
-//! carries no record yet is that record's first write and not a miss.
+//! ARN (for the target)". The record is the one that resource keys in this account's
+//! per-resource namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::integration_resource_properties`]), reached
+//! through the one write path
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::integration_resource_property_mut`]) the
+//! create of the same record goes through — so what this call stores is what
+//! `GetIntegrationResourceProperty` of that ARN reads back and what
+//! `DeleteIntegrationResourceProperty` of it removes. There is ONE record per resource, so a
+//! write for a resource that carries no record yet is that record's FIRST write and not a
+//! miss, under the `ResourcePropertyArn` that resource DERIVES.
 //!
-//! The two rules of this family order the call ([`crate::service::integration_properties`]):
-//! the sides stated are judged on the request BODY alone, before `ResourceArn` is read at
-//! all, and the ARN is then read as one of the integration's two legs — a value that names
-//! neither is this operation's modelled `ValidationException`, and a leg this account does
-//! not hold is its `EntityNotFoundException`.
+//! The side a call does not state is left as stored: "updating resource properties will
+//! impact all the integrations using it" is about the record this call states, and the two
+//! sides of an integration belong to two different resources written by two calls. So the
+//! two rules of this family order the call
+//! ([`crate::service::integration_properties`]): the sides stated are judged on the request
+//! BODY alone — a request stating BOTH, and a request stating NEITHER, are refused with the
+//! operation's modelled `ValidationException` and persist nothing — before `ResourceArn` is
+//! read at all; the member is then read as one of the integration's two legs, and a value
+//! that names neither is refused without the record namespace being touched.
+//!
+//! Where this write and the create of the same record DIFFER is what each of them resolves
+//! past that point, and each is as recorded. The create is stating the integration's target,
+//! so it resolves that resource in the catalog and refuses a connection or a database this
+//! account does not hold. This call resolves the `ResourceArn` only as far as the record's
+//! identity: the recorded lifecycle writes against the Glue database ARN of a target this
+//! account holds no database for and READS THE RECORD BACK, so the record namespace is the
+//! ARN's and not the catalog's, and asking the catalog here would refuse a write AWS serves.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -185,8 +204,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What this call writes is a side of the integration: the source's processing
         // properties or the target's, never both — the two sides belong to two different
         // resources and are written by two calls, so a request stating BOTH addresses two
-        // resources at once and no `ResourceArn` can be the resource of both. Decided on the
-        // request alone, as the create decides it, before anything it addresses is resolved.
+        // resources at once and no `ResourceArn` can be the resource of both. Read from the
+        // same one sentence the write that opens a record reads it from
+        // ([`crate::ops::create_integration_resource_property`]), so the two writes of one
+        // record cannot disagree about which requests state a side at all, and decided on the
+        // request alone, before anything it addresses is resolved.
         if input.source_processing_properties.is_some()
             && input.target_processing_properties.is_some()
         {
@@ -205,8 +227,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model marks each side optional on its own, so a request that states NEITHER is
         // refused here as the service's own requirement — it asks for no property to be
-        // written at all. Decided on the request alone, like the rule above, so nothing is
-        // persisted for it and a later read of that resource still reports what it did.
+        // written at all. Decided on the request alone, like the rule above, and before any
+        // write, so nothing is persisted for it and the record it named is left exactly as it
+        // was.
         if input.source_processing_properties.is_none()
             && input.target_processing_properties.is_none()
         {
@@ -224,12 +247,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The connection ARN of the source, or the database ARN of the target": a value that
-        // names neither names no resource whose properties this call could write.
+        // names neither names no resource whose properties this call could write. The member
+        // is read as an ARN first, and the two classes of value that fail are answered
+        // differently
+        // ([`crate::service::integration_properties::updated_resource_property_target`]): one
+        // this call cannot read as an ARN at all is the input being invalid, while an ARN that
+        // names neither leg is the validation failure naming the value it was handed.
+        //
+        // The reading stops at the record's identity — the resource type and name the ARN
+        // carries — and resolves the resource no further: this write addresses the record
+        // namespace, so a leg this account holds no catalog record for still takes a record,
+        // which is what makes the read that follows this call report one.
         let resource = match crate::service::integration_properties::updated_resource_property_target(
             &input.resource_arn,
         ) {
             Ok(resource) => resource,
-            Err(message) => {
+            Err(crate::service::integration_properties::UpdatedResourceArnRefusal::NotAnArn) => {
+                return Err(
+                    UpdateIntegrationResourcePropertyErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            // RECORDED: the refusal is the code alone — it states no
+                            // sentence, so none is invented for it here.
+                            message: None,
+                            from_federation_source: None,
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::service::integration_properties::UpdatedResourceArnRefusal::NamesNoLeg(
+                message,
+            )) => {
                 return Err(
                     UpdateIntegrationResourcePropertyErrorModeled::ValidationException(
                         ValidationException {
@@ -242,25 +290,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        // The properties are the named resource's own, so that resource has to exist: an ARN
-        // of a connection or a database this endpoint does not hold — including one of
-        // another account or another Region — names nothing here. Worded as the create words
-        // it, because both writes of one record resolve the same resource.
-        if store.resource_tags(&resource).is_none() {
-            return Err(
-                UpdateIntegrationResourcePropertyErrorModeled::EntityNotFoundException(
-                    EntityNotFoundException {
-                        message: Some(crate::state::tagged_resource_not_found_message(
-                            &resource,
-                            &input.resource_arn,
-                        )),
-                        from_federation_source: None,
-                    },
-                )
-                .into(),
-            );
-        }
-
         // One record per resource: this write is that record's next one where the resource
         // already has it, and its first where it does not — "these properties can include the
         // role to access the connection or database", which a resource either carries or does
@@ -289,23 +318,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The record's own ARN names the resource it describes, under this record type's ARN
-        // segment, exactly as the create derives it — so a record written by either call is
-        // addressed by the same `ResourcePropertyArn`.
-        let property_id = format!("{}/{}", resource.kind.arn_segment(), resource.name);
-        let stored = store
-            .integration_resource_properties
-            .entry(input.resource_arn.clone())
-            .or_insert_with(|| crate::state::IntegrationResourcePropertyEntry {
-                resource_arn: input.resource_arn.clone(),
-                property_id,
-                source_processing_properties: input.source_processing_properties.clone(),
-                target_processing_properties: input.target_processing_properties.clone(),
-                tags: Vec::new(),
-            });
-        if stored_already {
-            stored.apply_update(&input);
-        }
+        // The side this request states replaces the stored one and the side it does not state
+        // is left as stored, under the `ResourcePropertyArn` the resource derives — exactly as
+        // the create derives it, through the store's one write path, so a record written by
+        // either call is addressed by the same ARN, and a client that wrote one side and then
+        // updates the other reads both back from one record.
+        let stored = store.integration_resource_property_mut(&input.resource_arn, &resource);
+        stored.apply_processing_properties(
+            input.source_processing_properties.clone(),
+            input.target_processing_properties.clone(),
+        );
 
         ::tracing::info!(
             operation = "UpdateIntegrationResourceProperty",

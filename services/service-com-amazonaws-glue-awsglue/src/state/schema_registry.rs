@@ -156,19 +156,37 @@ impl GlueArn {
     }
 }
 
+/// `value`'s six ARN fields when it is spelled as an ARN of ANY service at all:
+/// `arn:<partition>:<service>:<region>:<account>:<resource>`, with the resource portion kept
+/// whole so it keeps any colon and any `/` of its own.
+///
+/// The ONE split this crate does of the ARN form, so no two operations can disagree about
+/// what an ARN is. Which SERVICE the ARN names is the caller's question —
+/// [`parse_glue_arn`] reads Glue's own, while a reading that only has to tell an ARN from a
+/// value that is no ARN at all stops here.
+pub fn arn_fields(value: &str) -> Option<[&str; 6]> {
+    let fields: [&str; 6] = value
+        .splitn(6, ':')
+        .collect::<Vec<&str>>()
+        .try_into()
+        .ok()?;
+    (fields[0] == "arn").then_some(fields)
+}
+
 /// `arn`'s identity fields and resource portion when it is a well-formed Glue resource
 /// ARN, or `None` when it is not one — a value in another service's namespace, or an ARN
 /// missing a field.
 ///
-/// The ONE split this crate does of a Glue ARN, so no two operations can disagree about
-/// what one is. Only the fields are read here; which resource TYPE the ARN names
+/// The ONE reading of a Glue ARN, over the one split of the ARN form
+/// ([`arn_fields`]), so no two operations can disagree about what one is. Only the fields
+/// are read here; which resource TYPE the ARN names
 /// ([`GlueArn::resource_of_type`]), whether it names this endpoint's estate
 /// ([`GlueArn::is_local`]) and whether this store holds the resource are separate answers.
 pub fn parse_glue_arn(arn: &str) -> Option<GlueArn> {
     // `arn:<partition>:glue:<region>:<account>:<resource>`. The resource is the LAST
     // field, so it keeps any colon and any `/` of its own.
-    let fields: Vec<&str> = arn.splitn(6, ':').collect();
-    if fields.len() != 6 || fields[0] != "arn" || fields[2] != ARN_NAMESPACE {
+    let fields = arn_fields(arn)?;
+    if fields[2] != ARN_NAMESPACE {
         return None;
     }
     Some(GlueArn {

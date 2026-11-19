@@ -41,6 +41,19 @@ pub fn integration_resource_property_arn(region: &str, property_id: &str) -> Str
     )
 }
 
+/// The name the record of `resource`'s processing properties carries inside its own ARN:
+/// the resource type and name the resource's OWN ARN carries.
+///
+/// "The resource ARN created through this create API"
+/// (`CreateIntegrationResourcePropertyResponse$ResourcePropertyArn`) addresses the record of
+/// ONE resource, and there is one record per resource — so the name is DERIVED from that
+/// resource rather than minted, which both keeps it unique in this namespace and lets a
+/// caller that holds only the ARN it submitted derive the record's. Read by every operation
+/// that opens the record for a write, so they cannot report two ARNs for one record.
+pub fn integration_resource_property_id(resource: &TaggedResource) -> String {
+    format!("{}/{}", resource.kind.arn_segment(), resource.name)
+}
+
 /// The Glue resource an integration property call's `ResourceArn` names, or
 /// `Err` with the message a refusal carries when the value cannot name one.
 ///
@@ -105,6 +118,24 @@ pub struct IntegrationResourcePropertyEntry {
 }
 
 impl IntegrationResourcePropertyEntry {
+    /// The EMPTY record of the resource `resource`, as a first write of that resource's
+    /// processing properties opens it: no side stated yet, no tags, under the name its own
+    /// ARN carries ([`integration_resource_property_id`]).
+    ///
+    /// The id is DERIVED from the resource the record describes rather than minted, which
+    /// is what lets a caller holding only the ARN it submitted derive the record's; it is
+    /// the same for every write of that resource, so a later write reports the
+    /// `ResourcePropertyArn` the first one did.
+    pub fn for_resource(resource_arn: &str, resource: &TaggedResource) -> Self {
+        Self {
+            resource_arn: resource_arn.to_string(),
+            property_id: integration_resource_property_id(resource),
+            source_processing_properties: None,
+            target_processing_properties: None,
+            tags: Vec::new(),
+        }
+    }
+
     /// The record a first `CreateIntegrationResourceProperty` for `resource_arn` stores:
     /// the properties the request carried, under a freshly minted id.
     pub fn from_create_input(input: &CreateIntegrationResourcePropertyInput) -> Self {
@@ -117,24 +148,43 @@ impl IntegrationResourcePropertyEntry {
         }
     }
 
-    /// Apply a create for a resource this store ALREADY holds a record for: each member the
-    /// request states replaces the stored one, and a member it does not state is left as
-    /// stored.
+    /// Apply the processing properties ONE write states: the side it states replaces the
+    /// stored one, and the side it does not state is left as stored.
     ///
     /// The source and the target properties of one integration are written by separate
     /// calls — "To set both source and target properties the same API needs to be invoked
     /// with the Glue connection ARN as ResourceArn with SourceProcessingProperties and the
-    /// Glue database ARN as ResourceArn with TargetProcessingProperties respectively" — so a
-    /// write that states one side says nothing about the other and must not erase it. The id
-    /// is not touched: the record is the same resource's, so its ARN stays what the first
-    /// create minted.
+    /// Glue database ARN as ResourceArn with TargetProcessingProperties respectively"
+    /// (`CreateIntegrationResourceProperty`) — so a write that states one side says nothing
+    /// about the other and must not erase it. Shared by every operation that states a
+    /// resource's processing properties, so the create and the update of one record agree
+    /// about what a stated and an unstated side each mean.
+    pub fn apply_processing_properties(
+        &mut self,
+        source: Option<SourceProcessingProperties>,
+        target: Option<TargetProcessingProperties>,
+    ) {
+        if source.is_some() {
+            self.source_processing_properties = source;
+        }
+        if target.is_some() {
+            self.target_processing_properties = target;
+        }
+    }
+
+    /// Apply a create for a resource this store ALREADY holds a record for: each member the
+    /// request states replaces the stored one, and a member it does not state is left as
+    /// stored.
+    ///
+    /// The properties themselves are applied the one way every write of this record applies
+    /// them ([`Self::apply_processing_properties`]); the create carries `Tags` beside them,
+    /// which the other writes of the record have no member for. The id is not touched: the
+    /// record is the same resource's, so its ARN stays what the first write derived.
     pub fn apply_create(&mut self, input: &CreateIntegrationResourcePropertyInput) {
-        if input.source_processing_properties.is_some() {
-            self.source_processing_properties = input.source_processing_properties.clone();
-        }
-        if input.target_processing_properties.is_some() {
-            self.target_processing_properties = input.target_processing_properties.clone();
-        }
+        self.apply_processing_properties(
+            input.source_processing_properties.clone(),
+            input.target_processing_properties.clone(),
+        );
         if let Some(tags) = input.tags.clone() {
             self.tags = tags;
         }
@@ -143,23 +193,6 @@ impl IntegrationResourcePropertyEntry {
     /// This record's own ARN, as served in `region`.
     pub fn arn(&self, region: &str) -> String {
         integration_resource_property_arn(region, &self.property_id)
-    }
-
-    /// Apply an `UpdateIntegrationResourceProperty` to this record: each side the request
-    /// states replaces the stored one, and a side it does not state is left as stored.
-    ///
-    /// The same reading as a repeated create ([`Self::apply_create`]), for the same reason:
-    /// the two sides of an integration are written by separate calls, so a write that states
-    /// one says nothing about the other and must not erase it. The id is not touched — the
-    /// record is the same resource's — and the request carries no tags, so the ones stored
-    /// stay where they are.
-    pub fn apply_update(&mut self, input: &UpdateIntegrationResourcePropertyInput) {
-        if input.source_processing_properties.is_some() {
-            self.source_processing_properties = input.source_processing_properties.clone();
-        }
-        if input.target_processing_properties.is_some() {
-            self.target_processing_properties = input.target_processing_properties.clone();
-        }
     }
 }
 

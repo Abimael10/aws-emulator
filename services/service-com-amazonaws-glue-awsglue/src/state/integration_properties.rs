@@ -43,8 +43,8 @@
 //! [`crate::service::partition_indexes`] gives there.
 
 use crate::state::{
-    integration_resource_reference, integration_table_reference, messages, parse_glue_arn,
-    IntegrationTableResource, TaggedResource, TaggedResourceKind,
+    arn_fields, integration_resource_reference, integration_table_reference, messages,
+    parse_glue_arn, IntegrationTableResource, TaggedResource, TaggedResourceKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -91,19 +91,49 @@ pub fn resource_property_target(
     })
 }
 
-/// The Glue resource whose processing properties an UPDATE writes, or the sentence its
-/// refusal carries.
+/// Why an UPDATE of an integration resource property will not take the `ResourceArn` it was
+/// given.
 ///
-/// The same member and the same two legs as the create reads above, read in ONE step:
-/// RECORDED behaviour of this call is that every value it cannot interpret as one of them —
-/// another service's ARN, a Glue ARN of a resource type this API does not accept, a value
-/// that is no ARN at all — earns the operation's modelled `ValidationException` carrying
-/// this service's general reading of that member ([`invalid_resource_arn`]), the sentence the
-/// delete and the three integration table property calls word it with. The create words it
-/// as the TARGET it is stating instead, which is why the two are separate functions over one
-/// resolution.
-pub fn updated_resource_property_target(resource_arn: &str) -> Result<TaggedResource, String> {
-    integration_resource_reference(resource_arn).map_err(|_| invalid_resource_arn(resource_arn))
+/// The two refusals are different ERROR CLASSES, as they are for the create's reading
+/// ([`ResourceArnRefusal`]), but this call draws the line in a different place: it reads the
+/// member as an ARN first, so a value that is no ARN at all is refused before any resource is
+/// named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdatedResourceArnRefusal {
+    /// The value is not an ARN at all, so there is nothing to read a resource out of: the
+    /// operation's modelled `InvalidInputException`. RECORDED: that refusal carries the code
+    /// alone and states no sentence, which is why this variant holds none.
+    NotAnArn,
+    /// An ARN that names neither leg of an integration — another service's namespace, or a
+    /// Glue ARN of a resource type this API does not accept. RECORDED: the operation's
+    /// modelled `ValidationException` carrying this service's general reading of that member
+    /// ([`invalid_resource_arn`]), the sentence the delete and the three integration table
+    /// property calls word it with.
+    NamesNoLeg(String),
+}
+
+/// The Glue resource whose processing properties an UPDATE writes, or the refusal its
+/// `ResourceArn` earns.
+///
+/// The same member and the same two legs as the create reads
+/// ([`resource_property_target`]), but read as an ARN FIRST: RECORDED behaviour of this call
+/// is that a value it cannot read as an ARN at all earns one error class and an ARN that
+/// names neither leg earns another ([`UpdatedResourceArnRefusal`]), where the create words
+/// both as the TARGET it is stating — which is why the two are separate functions over one
+/// resolution. Whether this account HOLDS the leg is not asked here at all: this write
+/// addresses the record namespace, and a leg with no catalog record still takes a record.
+///
+/// The ARN form is read through the crate's one split of it ([`arn_fields`]), which says
+/// nothing about which service or resource the value names — that is what tells a client
+/// whose value could never address anything from one whose value addresses the wrong thing.
+pub fn updated_resource_property_target(
+    resource_arn: &str,
+) -> Result<TaggedResource, UpdatedResourceArnRefusal> {
+    if arn_fields(resource_arn).is_none() {
+        return Err(UpdatedResourceArnRefusal::NotAnArn);
+    }
+    integration_resource_reference(resource_arn)
+        .map_err(|_| UpdatedResourceArnRefusal::NamesNoLeg(invalid_resource_arn(resource_arn)))
 }
 
 /// Whether `resource_arn` is an ARN of one of Glue's OWN resources, which is the whole of
