@@ -262,19 +262,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A scaling range the cluster could never satisfy. The model bounds each member
-        // on its own; that `minInstanceCount` must not exceed `maxInstanceCount` is a
-        // cross-member rule only the service can state.
-        let scaling = &input.scaling_configuration;
-        if scaling.min_instance_count > scaling.max_instance_count {
+        // A group's stored subnet list must hold at least one subnet
+        // ([`crate::state::subnet_list_violation`]) — the same bound the update path holds
+        // that list to, since both request members target the unbounded `StringList`.
+        if let Some(constraint) = crate::state::subnet_list_violation(input.subnet_ids.len()) {
             return Err(CreateComputeNodeGroupErrorModeled::ValidationException(
-                crate::state::field_validation(
-                    "scalingConfiguration",
-                    "Member must specify a minInstanceCount at most its maxInstanceCount"
-                        .to_string(),
-                ),
+                crate::state::field_validation("subnetIds", constraint),
             )
             .into());
+        }
+
+        // A scaling range the cluster could never satisfy, refused by the one rule every
+        // path that stores a scaling configuration shares
+        // ([`crate::state::scaling_range_violation`]).
+        if let Some(refusal) = crate::state::scaling_range_violation(&input.scaling_configuration) {
+            return Err(CreateComputeNodeGroupErrorModeled::ValidationException(refusal).into());
         }
 
         // A resource holds at most `MAX_TAGS_PER_RESOURCE` tags on EVERY path that writes

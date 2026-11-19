@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateComputeNodeGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateComputeNodeGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateComputeNodeGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the configuration members a request carries to the stored compute node group of
+//! the cluster it names, leaves every member it omits at its stored value, and answers from
+//! the STORED record — so the update and a later read cannot differ.
 //!
 //! ## Shape of an operation
 //!
@@ -215,18 +209,270 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateComputeNodeGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateComputeNodeGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateComputeNodeGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateComputeNodeGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the PCS emulator holds no state on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The caller-sized lists this update would PERSIST, bounded for the same reason the
+        // create's are: the model bounds none of them, so one request could otherwise size
+        // one stored record arbitrarily.
+        let slurm = input.slurm_configuration.as_ref();
+        let stored_lists: [(&str, usize); 3] = [
+            ("subnetIds", input.subnet_ids.as_ref().map_or(0, Vec::len)),
+            (
+                "slurmConfiguration.slurmCustomSettings",
+                slurm.map_or(0, |slurm| {
+                    slurm.slurm_custom_settings.as_ref().map_or(0, Vec::len)
+                }),
+            ),
+            (
+                "slurmConfiguration.gresCustomSettings",
+                slurm.map_or(0, |slurm| {
+                    slurm.gres_custom_settings.as_ref().map_or(0, Vec::len)
+                }),
+            ),
+        ];
+        for (member, entries) in stored_lists {
+            if let Some(constraint) = crate::state::stored_list_violation(entries) {
+                return Err(UpdateComputeNodeGroupErrorModeled::ValidationException(
+                    crate::state::field_validation(member, constraint),
+                )
+                .into());
+            }
+        }
+
+        // A group's stored subnet list must hold at least one subnet, so an update carrying
+        // an EMPTY list would leave the resource outside its own modelled constraint
+        // ([`crate::state::subnet_list_violation`], the bound the create path shares).
+        if let Some(constraint) = input
+            .subnet_ids
+            .as_ref()
+            .and_then(|subnet_ids| crate::state::subnet_list_violation(subnet_ids.len()))
+        {
+            return Err(UpdateComputeNodeGroupErrorModeled::ValidationException(
+                crate::state::field_validation("subnetIds", constraint),
+            )
+            .into());
+        }
+
+        // A scaling range the cluster could never satisfy, refused by the one rule every
+        // path that stores a scaling configuration shares
+        // ([`crate::state::scaling_range_violation`]).
+        if let Some(refusal) = input
+            .scaling_configuration
+            .as_ref()
+            .and_then(crate::state::scaling_range_violation)
+        {
+            return Err(UpdateComputeNodeGroupErrorModeled::ValidationException(refusal).into());
+        }
+
+        let region = crate::state::request_region(ctx);
+
+        // The references this update would carry into other services are resolved before
+        // anything of this service's own is resolved or stored, exactly as the create path
+        // resolves them: the instance profile belongs to IAM and the subnets to EC2. Both
+        // hops are made before the state lock is taken, so nothing is held across them.
+        if let Some(arn) = input.iam_instance_profile_arn.as_ref() {
+            if let Some(refusal) =
+                crate::state::instance_profile::violation(ctx, &region, arn).await
+            {
+                return Err(
+                    UpdateComputeNodeGroupErrorModeled::ValidationException(refusal).into(),
+                );
+            }
+        }
+        if let Some(subnet_ids) = input.subnet_ids.as_ref() {
+            if let Some(refusal) =
+                crate::state::ec2_subnets::violation(ctx, &region, subnet_ids).await
+            {
+                return Err(
+                    UpdateComputeNodeGroupErrorModeled::ValidationException(refusal).into(),
+                );
+            }
+        }
+
+        // The principal a refusal of the CALLER names, read before this service's store is
+        // locked so the session registry is never reached while the guard is held.
+        let caller = crate::state::cluster_authorization::caller_principal_arn(&*self.engine, ctx);
+
+        let mut state = state.lock();
+        state.settle();
+
+        // The cluster this update is scoped to has to resolve, and WHICH refusal an
+        // identifier that resolves to none earns is decided by its FORM: a generated cluster
+        // id names a cluster that is not there, a cluster NAME is a permissions failure; see
+        // `crate::state::cluster_authorization`.
+        let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
+            return Err(match crate::state::cluster_authorization::unresolved_cluster(
+                &input.cluster_identifier,
+            ) {
+                crate::state::cluster_authorization::UnresolvedCluster::NotFound => {
+                    UpdateComputeNodeGroupErrorModeled::ResourceNotFoundException(
+                        crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
+                    )
+                }
+                crate::state::cluster_authorization::UnresolvedCluster::Denied => {
+                    UpdateComputeNodeGroupErrorModeled::AccessDeniedException(
+                        crate::state::cluster_authorization::cluster_denied(
+                            &caller,
+                            Self::NAME,
+                            &input.cluster_identifier,
+                        ),
+                    )
+                }
+            }
+            .into());
+        };
+
+        // The group the update is addressed to, resolved by its generated id or by its name
+        // — the two forms `ComputeNodeGroupIdentifier` allows.
+        let Some(group_id) = state
+            .clusters
+            .get(&cluster_id)
+            .and_then(|cluster| cluster.compute_node_group(&input.compute_node_group_identifier))
+            .map(|group| group.id.clone())
+        else {
+            return Err(UpdateComputeNodeGroupErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::COMPUTE_NODE_GROUP,
+                    &input.compute_node_group_identifier,
+                ),
+            )
+            .into());
+        };
+
+        // An `@idempotencyToken` retry returns the first call's result and has NO further
+        // effect, so the stored record is answered without applying the change a second
+        // time. The token is remembered with the group the first call changed, so the same
+        // token naming another group is a conflict rather than a second update.
+        if let Some(remembered) = state
+            .remembered_create(Self::NAME, input.client_token.as_ref())
+            .cloned()
+        {
+            if remembered.cluster_id.as_deref() != Some(cluster_id.as_str())
+                || remembered.resource_id != group_id
+            {
+                return Err(UpdateComputeNodeGroupErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "clientToken was already used to update compute node group {}",
+                            remembered.resource_id
+                        ),
+                        resource_id: remembered.resource_id,
+                        resource_type: crate::state::COMPUTE_NODE_GROUP.resource_type.to_string(),
+                    },
+                )
+                .into());
+            }
+            let Some(replayed) = state
+                .clusters
+                .get(&cluster_id)
+                .and_then(|cluster| cluster.compute_node_groups.get(&group_id))
+            else {
+                return Err(UpdateComputeNodeGroupErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the compute node group disappeared while it was being read"
+                            .to_string(),
+                    },
+                )
+                .into());
+            };
+            return Ok(UpdateComputeNodeGroupOutput {
+                compute_node_group: Some(replayed.to_api()),
+            });
+        }
+
+        let Some(group) = state
+            .clusters
+            .get_mut(&cluster_id)
+            .and_then(|cluster| cluster.compute_node_groups.get_mut(&group_id))
+        else {
+            return Err(UpdateComputeNodeGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the compute node group disappeared while it was being written"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Only a settled group takes an update: one still provisioning, already updating, or
+        // on its way out has an operation of its own in flight.
+        if group.status != crate::state::STATUS_ACTIVE {
+            return Err(UpdateComputeNodeGroupErrorModeled::ConflictException(
+                crate::state::not_active(crate::state::COMPUTE_NODE_GROUP, &group.id),
+            )
+            .into());
+        }
+
+        // A member the request carries is applied; one it omits leaves the stored value
+        // alone. A request that asks for no change leaves the group where it is rather than
+        // moving its status for nothing.
+        let mut changed = false;
+        if let Some(ami_id) = input.ami_id {
+            group.ami_id = Some(ami_id);
+            changed = true;
+        }
+        if let Some(subnet_ids) = input.subnet_ids {
+            group.subnet_ids = subnet_ids;
+            changed = true;
+        }
+        if let Some(template) = input.custom_launch_template {
+            group.custom_launch_template = template;
+            changed = true;
+        }
+        if let Some(purchase_option) = input.purchase_option {
+            group.purchase_option = Some(purchase_option);
+            changed = true;
+        }
+        if let Some(spot_options) = input.spot_options {
+            group.spot_options = Some(spot_options);
+            changed = true;
+        }
+        if let Some(scaling) = input.scaling_configuration {
+            group.scaling_configuration = scaling.into();
+            changed = true;
+        }
+        if let Some(arn) = input.iam_instance_profile_arn {
+            group.iam_instance_profile_arn = arn;
+            changed = true;
+        }
+        if let Some(slurm) = input.slurm_configuration {
+            let stored = group.slurm_configuration.take();
+            group.slurm_configuration =
+                Some(crate::state::apply_compute_node_group_slurm_update(stored, slurm));
+            changed = true;
+        }
+        if let Some(actions) = input.node_lifecycle_actions {
+            // Both members of `UpdateNodeLifecycleActionsRequest` are `@required` or
+            // carry a `@default`, so the request states a WHOLE set of lifecycle actions:
+            // it replaces the stored set rather than merging into it.
+            group.node_lifecycle_actions = Some(actions.into());
+            changed = true;
+        }
+        if changed {
+            // PCS reports the group as UPDATING while it applies the change; the service
+            // owes it ACTIVE again from the next request on.
+            group.status = crate::state::STATUS_UPDATING.to_string();
+            group.modified_at = crate::state::now_date_time();
+            group.pending = Some(crate::state::PendingChange::Activate);
+        }
+        // Answered from the STORED record, so the update and a later read cannot differ.
+        let updated = group.to_api();
+        state.remember_create(
+            Self::NAME,
+            input.client_token.as_ref(),
+            Some(&cluster_id),
+            &group_id,
+        );
+
+        Ok(UpdateComputeNodeGroupOutput {
+            compute_node_group: Some(updated),
+        })
     }
 }

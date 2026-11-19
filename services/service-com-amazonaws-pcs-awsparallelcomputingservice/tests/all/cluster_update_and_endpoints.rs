@@ -5,6 +5,19 @@
 //!
 //! Driven over the awsJson1_0 wire through the same router the emulator serves from, on
 //! the harness [`crate::cluster_lifecycle`] already builds.
+//!
+//! What `UpdateComputeNodeGroup` does to a cluster's compute node groups is its own suite,
+//! in the submodule below
+//! (`tests/all/cluster_update_and_endpoints/compute_node_group_update.rs`).
+
+// `tests/all/cluster_update_and_endpoints.rs` is itself loaded by `#[path]` from
+// `tests/all.rs`, so a submodule of it is looked up beside it rather than in a directory
+// named after it: the `#[path]` here is what points at
+// `tests/all/cluster_update_and_endpoints/`. The layout check declares suites DIRECTLY
+// under `tests/all/`; a file deeper than that is declared by its own parent module, which
+// is this one.
+#[path = "cluster_update_and_endpoints/compute_node_group_update.rs"]
+mod compute_node_group_update;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;

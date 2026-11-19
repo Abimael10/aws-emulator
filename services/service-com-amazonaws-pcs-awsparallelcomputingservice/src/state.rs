@@ -75,6 +75,7 @@ use crate::ops::types::{
     QueueSlurmConfigurationRequest, QueueSummary, ResourceNotFoundException, ScalingConfiguration,
     ScalingConfigurationRequest, Scheduler, SchedulerRequest, ServiceQuotaExceededException,
     SlurmRest, SlurmRestRequest, SpotOptions, UpdateClusterSlurmConfigurationRequest,
+    UpdateComputeNodeGroupSlurmConfigurationRequest, UpdateNodeLifecycleActionsRequest,
     ValidationException,
     ValidationExceptionField,
 };
@@ -189,6 +190,12 @@ pub const MAX_QUEUES_PER_CLUSTER: usize = 50;
 /// record arbitrarily; the ceiling matches the 200 the model allows for `RequestTagMap`,
 /// the one caller-sized collection it does bound.
 pub const MAX_STORED_LIST_ENTRIES: usize = 200;
+
+/// The fewest subnets a stored compute node group carries: the `@length(min: 1)` the model
+/// declares on `ComputeNodeGroup$subnetIds` (`SubnetIdList`). The request members that
+/// place a group target the unbounded `StringList`, so this is the bound a request carrying
+/// an empty list is refused by ([`length_at_least_constraint`]).
+pub const MIN_SUBNET_IDS: usize = 1;
 
 /// The most tags one PCS resource holds, matching AWS's resource-tagging limit of 50
 /// tags per resource. Checked on every path that writes tags — the `tags` a create
@@ -988,6 +995,13 @@ pub fn length_at_most_constraint(entries: usize) -> String {
     format!("Member must have length less than or equal to {entries}")
 }
 
+/// The constraint clause stated for a collection shorter than the fewest entries its member
+/// admits — the lower-bound counterpart of [`length_at_most_constraint`], in the same clause
+/// form.
+pub fn length_at_least_constraint(entries: usize) -> String {
+    format!("Member must have length greater than or equal to {entries}")
+}
+
 /// The modelled `ValidationException` for ONE member whose value failed `constraint`:
 /// [`constraint_violations`] over a single violation.
 pub fn field_validation(member: &str, constraint: String) -> ValidationException {
@@ -1193,6 +1207,37 @@ pub fn stored_list_violation(entries: usize) -> Option<String> {
     (entries > MAX_STORED_LIST_ENTRIES).then(|| length_at_most_constraint(MAX_STORED_LIST_ENTRIES))
 }
 
+/// The constraint clause a compute node group's `subnetIds` failed, or `None` when the
+/// service accepts the list.
+///
+/// A STORED group's subnet list is `SubnetIdList`, modelled `@length(min: 1)`
+/// (`ComputeNodeGroup$subnetIds`), while the request members that place a group target the
+/// unbounded `StringList`: this is the lower bound every path that WRITES that list holds it
+/// to, stated once so a create and an update cannot disagree about it. The cluster's own
+/// `NetworkingRequest$subnetIds` needs no entry here — it targets `SubnetIdList` itself, so
+/// the boundary refuses an empty list before a handler runs.
+pub fn subnet_list_violation(entries: usize) -> Option<String> {
+    (entries < MIN_SUBNET_IDS).then(|| length_at_least_constraint(MIN_SUBNET_IDS))
+}
+
+/// The modelled `ValidationException` a scaling configuration the cluster could never
+/// satisfy is refused with, or `None` when the service accepts it.
+///
+/// The model bounds each member of `ScalingConfigurationRequest` on its own; that
+/// `minInstanceCount` must not exceed `maxInstanceCount` is a cross-member rule only the
+/// service can state, and it is stated once here so every path that stores a scaling
+/// configuration refuses the same values in the same words.
+pub fn scaling_range_violation(
+    scaling: &ScalingConfigurationRequest,
+) -> Option<ValidationException> {
+    (scaling.min_instance_count > scaling.max_instance_count).then(|| {
+        field_validation(
+            "scalingConfiguration",
+            "Member must specify a minInstanceCount at most its maxInstanceCount".to_string(),
+        )
+    })
+}
+
 /// The modelled `ValidationException` (HTTP 400) `CreateCluster` refuses a scheduler
 /// version with, or `None` when the service carries on with it.
 ///
@@ -1301,6 +1346,26 @@ pub fn apply_slurm_update(
                 .or_else(|| previous.map(|previous| previous.mode))
                 .unwrap_or_else(|| MODE_NONE.to_string()),
         });
+    }
+    merged
+}
+
+/// The stored Slurm configuration an `UpdateComputeNodeGroup` leaves behind: a member the
+/// request carries replaces the stored one, a member it omits leaves the stored one alone —
+/// the compute-node-group counterpart of [`apply_slurm_update`].
+pub fn apply_compute_node_group_slurm_update(
+    stored: Option<ComputeNodeGroupSlurmConfiguration>,
+    update: UpdateComputeNodeGroupSlurmConfigurationRequest,
+) -> ComputeNodeGroupSlurmConfiguration {
+    let mut merged = stored.unwrap_or_default();
+    if let Some(seconds) = update.scale_down_idle_time_in_seconds {
+        merged.scale_down_idle_time_in_seconds = Some(seconds);
+    }
+    if let Some(settings) = update.slurm_custom_settings {
+        merged.slurm_custom_settings = Some(settings);
+    }
+    if let Some(settings) = update.gres_custom_settings {
+        merged.gres_custom_settings = Some(settings);
     }
     merged
 }
@@ -1528,6 +1593,15 @@ impl From<ComputeNodeGroupSlurmConfigurationRequest> for ComputeNodeGroupSlurmCo
             scale_down_idle_time_in_seconds: request.scale_down_idle_time_in_seconds,
             slurm_custom_settings: request.slurm_custom_settings,
             gres_custom_settings: request.gres_custom_settings,
+        }
+    }
+}
+
+impl From<UpdateNodeLifecycleActionsRequest> for NodeLifecycleActions {
+    fn from(request: UpdateNodeLifecycleActionsRequest) -> Self {
+        Self {
+            stages: request.stages,
+            script_caching_policy: request.script_caching_policy,
         }
     }
 }
