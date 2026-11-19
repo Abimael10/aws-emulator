@@ -32,13 +32,15 @@
 //! The four types whose resources a stack really creates in AWS AppConfig
 //! (`state::provisioning::appconfig_resources`) carry the identifier that service minted as
 //! their physical resource id, which is what a `Ref` to one resolves to;
-//! `appconfig_estate_provisioning.rs` is the suite for that half of the rule. Every OTHER
+//! `appconfig_estate_provisioning.rs` is the suite for that half of the rule. The two ROLLOUT
+//! types (`state::provisioning::appconfig_rollout`) carry the TRIPLE their own API addresses one
+//! resource by, the last part of which is the number AppConfig minted;
+//! `appconfig_rollout_provisioning.rs` is the suite for them. Every OTHER
 //! published type of the namespace is declared-only (`unprovisioned_resources.rs` pins that:
 //! nothing is called in the owning service and the stack completes) and carries the physical
 //! resource id CloudFormation's own naming rules give it. What `Fn::GetAtt` reads off the
-//! declared-only types (an experiment definition's `Id`, a hosted configuration version's
-//! `VersionNumber`) is their published RETURN VALUES, a separate question this suite asserts
-//! nothing about: it belongs to the open stack-outputs issue
+//! declared-only types (an experiment definition's `Id`) is their published RETURN VALUES, a
+//! separate question this suite asserts nothing about: it belongs to the open stack-outputs issue
 //! (`20261023T032202Z-appconfig-getconfiguration-and-getexperimentdefinition-answer-501-and-cloudformation.md`).
 
 use serde_json::{json, Value};
@@ -47,6 +49,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::resource_types::
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::status;
 
+use crate::appconfig_estate_provisioning::COMPOSITE_IDENTITY_SEPARATOR;
 use crate::stack_lifecycle::{
     call, create_stack, describe_stack, member, router, wait_for_the_transition, xml_text,
     xml_texts,
@@ -97,10 +100,10 @@ fn stack_name_for(resource_type: &str) -> String {
 }
 
 /// The four types of this namespace whose resources a stack really CREATES in AWS AppConfig
+/// under the identifier that service MINTS
 /// (`state::provisioning::appconfig_resources`): each one's physical resource id is the `Id`
 /// that service minted — modelled `^[a-z0-9]{4,7}$` — rather than a name CloudFormation
-/// generated, which `appconfig_estate_provisioning.rs` is the suite for. Every other
-/// published type of the namespace is still declared-only.
+/// generated, which `appconfig_estate_provisioning.rs` is the suite for.
 const PROVISIONED: &[&str] = &[
     "AWS::AppConfig::Application",
     "AWS::AppConfig::ConfigurationProfile",
@@ -108,9 +111,27 @@ const PROVISIONED: &[&str] = &[
     "AWS::AppConfig::Environment",
 ];
 
+/// The two types of this namespace whose resources a stack creates under the TRIPLE their own
+/// API addresses one by (`state::provisioning::appconfig_rollout`): the application and the
+/// profile or the environment, and the number AppConfig minted, joined the way CloudFormation
+/// joins the parts of a composite identifier. `appconfig_rollout_provisioning.rs` is the suite
+/// for them. Every other published type of the namespace is still declared-only.
+const ROLLOUT_PROVISIONED: &[&str] = &[
+    "AWS::AppConfig::Deployment",
+    "AWS::AppConfig::HostedConfigurationVersion",
+];
+
 /// The logical id of the application a child of the namespace is declared under, for the rows
 /// whose own create takes one.
 const PARENT: &str = "Parent";
+
+/// The logical ids of the estate a ROLLOUT row is declared inside: the configuration profile the
+/// content is hosted for, the environment a deployment rolls it into, the strategy that paces
+/// that rollout, and the hosted version a deployment deploys.
+const PARENT_PROFILE: &str = "ParentProfile";
+const PARENT_ENVIRONMENT: &str = "ParentEnvironment";
+const PARENT_STRATEGY: &str = "ParentStrategy";
+const PARENT_VERSION: &str = "ParentVersion";
 
 /// A one-resource template declaring `resource_type` under the logical id `Subject`.
 ///
@@ -147,6 +168,43 @@ fn one_resource_template(resource_type: &str) -> String {
             "Type": resource_type,
             "Properties": { "DeploymentDurationInMinutes": 0, "GrowthFactor": 100 }
         }),
+        // `CreateHostedConfigurationVersion` requires the profile the content is hosted for
+        // beside the content itself and its media type, so the profile and its application are
+        // declared with it.
+        "AWS::AppConfig::HostedConfigurationVersion" => {
+            resources.insert(PARENT.to_string(), parent_application());
+            resources.insert(PARENT_PROFILE.to_string(), parent_profile());
+            json!({
+                "Type": resource_type,
+                "Properties": {
+                    "ApplicationId": { "Ref": PARENT },
+                    "ConfigurationProfileId": { "Ref": PARENT_PROFILE },
+                    "ContentType": "application/json",
+                    "Content": "{\"enabled\": true}"
+                }
+            })
+        }
+        // `StartDeployment` requires the environment it rolls into, the profile and the version
+        // it deploys, and the strategy that paces it, so the whole estate is declared with it.
+        "AWS::AppConfig::Deployment" => {
+            resources.insert(PARENT.to_string(), parent_application());
+            resources.insert(PARENT_PROFILE.to_string(), parent_profile());
+            resources.insert(PARENT_ENVIRONMENT.to_string(), parent_environment());
+            resources.insert(PARENT_STRATEGY.to_string(), parent_strategy());
+            resources.insert(PARENT_VERSION.to_string(), parent_hosted_version());
+            json!({
+                "Type": resource_type,
+                "Properties": {
+                    "ApplicationId": { "Ref": PARENT },
+                    "EnvironmentId": { "Ref": PARENT_ENVIRONMENT },
+                    "ConfigurationProfileId": { "Ref": PARENT_PROFILE },
+                    "ConfigurationVersion": {
+                        "Fn::GetAtt": [PARENT_VERSION, "VersionNumber"]
+                    },
+                    "DeploymentStrategyId": { "Ref": PARENT_STRATEGY }
+                }
+            })
+        }
         _ => json!({ "Type": resource_type }),
     };
     resources.insert("Subject".to_string(), subject);
@@ -156,6 +214,49 @@ fn one_resource_template(resource_type: &str) -> String {
 /// The application a child of the namespace is declared under, named by CloudFormation itself.
 fn parent_application() -> Value {
     json!({ "Type": "AWS::AppConfig::Application" })
+}
+
+/// The configuration profile a hosted version or a deployment is declared against.
+fn parent_profile() -> Value {
+    json!({
+        "Type": "AWS::AppConfig::ConfigurationProfile",
+        "Properties": { "ApplicationId": { "Ref": PARENT }, "LocationUri": "hosted" }
+    })
+}
+
+/// The environment a deployment rolls its configuration into.
+fn parent_environment() -> Value {
+    json!({
+        "Type": "AWS::AppConfig::Environment",
+        "Properties": { "ApplicationId": { "Ref": PARENT } }
+    })
+}
+
+/// The strategy a deployment is paced by: the one that reaches every target at once and bakes
+/// for no time at all, so nothing in this suite waits on a rollout window.
+fn parent_strategy() -> Value {
+    json!({
+        "Type": "AWS::AppConfig::DeploymentStrategy",
+        "Properties": {
+            "DeploymentDurationInMinutes": 0,
+            "FinalBakeTimeInMinutes": 0,
+            "GrowthFactor": 100,
+            "ReplicateTo": "NONE"
+        }
+    })
+}
+
+/// The hosted configuration version a deployment deploys.
+fn parent_hosted_version() -> Value {
+    json!({
+        "Type": "AWS::AppConfig::HostedConfigurationVersion",
+        "Properties": {
+            "ApplicationId": { "Ref": PARENT },
+            "ConfigurationProfileId": { "Ref": PARENT_PROFILE },
+            "ContentType": "application/json",
+            "Content": "{\"enabled\": true}"
+        }
+    })
 }
 
 /// The catalogue's own `AWS::AppConfig::` group, in catalogue order.
@@ -255,6 +356,19 @@ async fn every_published_appconfig_type_may_be_declared_and_is_recorded() {
                         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
                 "case {resource_type:?}: expected the id AppConfig mints (4-7 lowercase \
                  alphanumerics), got {physical_id:?}"
+            );
+        } else if ROLLOUT_PROVISIONED.contains(resource_type) {
+            // A rollout resource exists in AppConfig under the triple its own API addresses one
+            // by, whose last part is the number that service minted.
+            let parts: Vec<&str> = physical_id.split(COMPOSITE_IDENTITY_SEPARATOR).collect();
+            assert!(
+                parts.len() == 3
+                    && parts
+                        .iter()
+                        .all(|part| !part.is_empty() && !part.contains("Subject"))
+                    && parts[2].chars().all(|c| c.is_ascii_digit()),
+                "case {resource_type:?}: expected the triple AppConfig addresses one by, ending \
+                 in the number it minted, got {physical_id:?}"
             );
         } else {
             assert!(

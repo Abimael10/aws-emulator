@@ -179,6 +179,13 @@ impl Owner {
             Self::AppConfigResource(kind) => {
                 appconfig_resources::create(ctx, region, kind, resource, propagated).await
             }
+            // A hosted configuration version is not taggable — AppConfig publishes no call that
+            // carries a tag to one — while a DEPLOYMENT is: `StartDeployment$Tags` is the tag map
+            // that call takes, so the rollout carries the tags CloudFormation gives the resource
+            // beside its own ([`appconfig_rollout::create`]).
+            Self::AppConfigRollout(kind) => {
+                appconfig_rollout::create(ctx, region, kind, resource, propagated).await
+            }
             // A GraphQL API is taggable: its `Tags` property is the tag map `CreateGraphqlApi`
             // takes, so the API carries the tags CloudFormation gives it beside its own. None
             // of its children is: every tagging call of that service addresses an API, so
@@ -365,6 +372,13 @@ impl Owner {
             // An application, an environment, a configuration profile and a deployment
             // strategy each exist from the moment their own create answers.
             Self::AppConfigResource(_) => Ok(appconfig_resources::ready()),
+            // A hosted configuration version exists from the moment its create answers; a
+            // DEPLOYMENT is reported at the first stage of its rollout, so that arm waits for
+            // AppConfig to report the rollout finished
+            // ([`appconfig_rollout::readiness`]).
+            Self::AppConfigRollout(kind) => {
+                appconfig_rollout::readiness(ctx, region, kind, physical_resource_id).await
+            }
             // An API, a data source, a resolver, a function and a key each exist from the
             // moment their own create answers; a SCHEMA is installed ASYNCHRONOUSLY, so that
             // arm reads the creation's status back
@@ -558,6 +572,13 @@ impl Owner {
             // came back with that same create, so there is nothing left to read once the
             // resource is up.
             Self::AppConfigResource(_) => Ok(BTreeMap::new()),
+            // A hosted version's number came back with its own create, so there is nothing left
+            // to read for one; a DEPLOYMENT publishes the STATE of the rollout, which the stages
+            // it has been through since its create have left behind, so that one is read again
+            // ([`appconfig_rollout::ready_attributes`]).
+            Self::AppConfigRollout(kind) => {
+                appconfig_rollout::ready_attributes(ctx, region, kind, physical_resource_id).await
+            }
             // Each AppSync resource publishes the identifiers its own create answered — the
             // API's id, ARN and endpoints among them — so there is nothing left to read once
             // the resource is up.
@@ -695,6 +716,11 @@ impl Owner {
             // no state a deleted application, environment, profile or strategy is still being
             // removed in.
             Self::AppConfigResource(_) => Ok(appconfig_resources::removal()),
+            // `DeleteHostedConfigurationVersion` takes the version away as it answers, and a
+            // deployment's removal stops a rollout still in flight, which AppConfig reports no
+            // state a removed resource is still being deleted in
+            // ([`appconfig_rollout::removal`]).
+            Self::AppConfigRollout(_) => Ok(appconfig_rollout::removal()),
             // Each AppSync delete takes the resource away as it answers: that service reports
             // no state a removed API, data source, resolver, function or key is still being
             // deleted in.
@@ -897,6 +923,13 @@ impl Owner {
             Self::AppConfigResource(kind) => {
                 appconfig_resources::update(ctx, region, kind, resource, declared).await
             }
+            // Every property of a hosted configuration version and of a deployment is fixed when
+            // the resource is made, so a change to either is reported as NOT applied rather than
+            // as a success that dropped the caller's change — which is why a deployment restating
+            // one replaces the resource ([`appconfig_rollout::update`]).
+            Self::AppConfigRollout(kind) => {
+                appconfig_rollout::update(ctx, region, kind, resource, declared).await
+            }
             Self::AppSyncResource(kind) => {
                 appsync_resources::update(ctx, region, kind, resource, declared).await
             }
@@ -1052,6 +1085,10 @@ impl Owner {
             // The tags of an AppConfig resource that already exists are reconciled by no arm
             // here yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
             Self::AppConfigResource(_) => Ok(()),
+            // Neither a hosted configuration version nor a deployment that already exists has its
+            // tags reconciled by an arm here yet ([`Provisioner::retag`]'s own default), so
+            // nothing is asked about them.
+            Self::AppConfigRollout(_) => Ok(()),
             // The tags of a GraphQL API that already exists are reconciled by no arm here yet
             // ([`Provisioner::retag`]'s own default), and no child of one is taggable at all, so
             // nothing is asked about them.
@@ -1229,6 +1266,13 @@ impl Owner {
             // on one of them deletes the resource with no snapshot invented for it.
             Self::AppConfigResource(kind) => {
                 appconfig_resources::delete(ctx, region, kind, resource).await
+            }
+            // AppConfig takes no snapshot of a hosted configuration version or of a deployment on
+            // the way out either: there is no such call, so a `Snapshot` deletion policy on one of
+            // them removes the resource with no snapshot invented for it
+            // ([`appconfig_rollout::delete`]).
+            Self::AppConfigRollout(kind) => {
+                appconfig_rollout::delete(ctx, region, kind, resource).await
             }
             // AppSync takes no snapshot of an API or of anything under one on the way out:
             // there is no such call, so a `Snapshot` deletion policy on one of them deletes the
@@ -1412,6 +1456,10 @@ impl Owner {
             Self::AppConfigResource(kind) => {
                 appconfig_resources::actual_configuration(ctx, region, kind, resource).await?
             }
+            // A hosted configuration version and a deployment are each immutable — every property
+            // of both types requires the resource to be replaced, and AppConfig publishes no call
+            // that edits one — so nothing of either can have drifted from its declaration.
+            Self::AppConfigRollout(_) => return Ok(ActualConfiguration::Unchecked),
             Self::AppSyncResource(kind) => {
                 appsync_resources::actual_configuration(ctx, region, kind, resource).await?
             }
@@ -1520,6 +1568,8 @@ impl Owner {
             Self::ApplicationAutoScaling(_) => message.to_string(),
             // AWS AppConfig's does the same.
             Self::AppConfigResource(_) => message.to_string(),
+            // And so does its rollout provider.
+            Self::AppConfigRollout(_) => message.to_string(),
             // AWS AppSync's does the same.
             Self::AppSyncResource(_) => message.to_string(),
             // Elastic Load Balancing's does the same.

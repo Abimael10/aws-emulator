@@ -303,6 +303,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         NEPTUNE_GRAPH_GRAPH_SNAPSHOT => NEPTUNE_GRAPH_SNAPSHOT_ATTRIBUTES,
         AMPLIFYUIBUILDER_COMPONENT | AMPLIFYUIBUILDER_THEME => AMPLIFYUIBUILDER_TIMED_ATTRIBUTES,
         AMPLIFYUIBUILDER_FORM => AMPLIFYUIBUILDER_ATTRIBUTES,
+        // A hosted configuration version publishes the version number AppConfig minted for the
+        // content, and a deployment the number it allocated for the rollout beside the
+        // `DeploymentState` it reports that rollout in — each a value only that service produces,
+        // which these naming rules compute a stand-in for before the resource exists.
+        APPCONFIG_HOSTED_CONFIGURATION_VERSION => &[APPCONFIG_VERSION_NUMBER_ATTRIBUTE],
+        APPCONFIG_DEPLOYMENT => APPCONFIG_DEPLOYMENT_ATTRIBUTES,
         AMPLIFY_APP => AMPLIFY_APP_ATTRIBUTES,
         AMPLIFY_BRANCH => AMPLIFY_BRANCH_ATTRIBUTES,
         MWAA_ENVIRONMENT => MWAA_ENVIRONMENT_ATTRIBUTES,
@@ -983,6 +989,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == APPCONFIG_ENVIRONMENT
         || resource_type == APPCONFIG_CONFIGURATION_PROFILE
         || resource_type == APPCONFIG_DEPLOYMENT_STRATEGY
+        // The two AppConfig ROLLOUT types are two more, for the reason their own constants
+        // record ([`APPCONFIG_HOSTED_CONFIGURATION_VERSION`] and its sibling):
+        // `CreateHostedConfigurationVersion` takes the content and answers the `VersionNumber`
+        // AppConfig minted, `StartDeployment` takes no identifier and answers the
+        // `DeploymentNumber` it allocated, and each type is identified by the triple its own API
+        // addresses one resource by — of which that number is a part no naming rule could
+        // compute ([`appconfig_rollout_identity`]).
+        || resource_type == APPCONFIG_HOSTED_CONFIGURATION_VERSION
+        || resource_type == APPCONFIG_DEPLOYMENT
         // A Secrets Manager secret is one more: `CreateSecret` takes the secret's NAME and
         // answers the `ARN` that service built for it, whose six trailing characters it draws
         // per secret ([`SECRETSMANAGER_SECRET`]) — so no naming rule could compute it — and
@@ -1048,7 +1063,10 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
 }
 
 /// The separator CloudFormation joins the parts of a COMPOSITE physical resource id with.
-pub(super) const COMPOSITE_IDENTITY_SEPARATOR: &str = "|";
+///
+/// Public so a reader of such an identity — a test asserting the triple a resource is known by —
+/// reads the separator this service really joins with rather than a second literal of its own.
+pub const COMPOSITE_IDENTITY_SEPARATOR: &str = "|";
 
 /// The properties whose values ARE a resource's physical resource id, in the order they are
 /// joined in, for a type whose primary identifier is COMPOSITE; the empty list for every
@@ -1114,6 +1132,20 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
         AMPLIFYUIBUILDER_COMPONENT | AMPLIFYUIBUILDER_FORM | AMPLIFYUIBUILDER_THEME => {
             AMPLIFYUIBUILDER_ATTRIBUTES
         }
+        // The two AWS AppConfig ROLLOUT types are in that same position: a hosted configuration
+        // version is identified by the application, the configuration profile and the
+        // `VersionNumber` AppConfig minted, and a deployment by the application, the environment
+        // and the `DeploymentNumber` it allocated — the three labels each of those APIs addresses
+        // one resource by. The last part of each is that service's to mint, so
+        // [`composite_identity`] answers `None` for one (the declaration carries no number to
+        // join) and the identity is built from what the create answered instead
+        // ([`appconfig_rollout_identity`]).
+        APPCONFIG_HOSTED_CONFIGURATION_VERSION => &[
+            "ApplicationId",
+            "ConfigurationProfileId",
+            APPCONFIG_VERSION_NUMBER_ATTRIBUTE,
+        ],
+        APPCONFIG_DEPLOYMENT => &["ApplicationId", "EnvironmentId", "DeploymentNumber"],
         _ => &[],
     }
 }

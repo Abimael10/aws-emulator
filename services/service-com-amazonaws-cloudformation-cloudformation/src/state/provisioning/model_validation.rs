@@ -79,6 +79,33 @@ pub(super) struct RequiredProperties {
 /// The types whose provider's model validation this stage runs — see the module docs for what
 /// a row carries and where it comes from.
 pub(super) const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
+    // `AWS::AppConfig::HostedConfigurationVersion` IS the configuration content hosted for one
+    // profile of one application, so every member `CreateHostedConfigurationVersion` declares
+    // required — the two ids that address the call, the content it carries and the media type it
+    // is carried under — is published "Required: Yes", and the type declares no name
+    // CloudFormation could generate.
+    RequiredProperties {
+        resource_type: crate::state::template::APPCONFIG_HOSTED_CONFIGURATION_VERSION,
+        required: &[
+            "ApplicationId",
+            "ConfigurationProfileId",
+            "Content",
+            "ContentType",
+        ],
+    },
+    // `AWS::AppConfig::Deployment` IS one rollout of one configuration version into one
+    // environment, so every member `StartDeployment` declares required is published
+    // "Required: Yes" for it.
+    RequiredProperties {
+        resource_type: crate::state::template::APPCONFIG_DEPLOYMENT,
+        required: &[
+            "ApplicationId",
+            "ConfigurationProfileId",
+            "ConfigurationVersion",
+            "DeploymentStrategyId",
+            "EnvironmentId",
+        ],
+    },
     // `AWS::AppSync::DomainName`: a custom domain IS a name served with a certificate, and
     // `CreateDomainName` declares both members required.
     RequiredProperties {

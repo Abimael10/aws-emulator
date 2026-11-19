@@ -432,15 +432,32 @@ pub(super) const AMPLIFYUIBUILDER_ID_ATTRIBUTE: &str = "Id";
 /// again by [`crate::state::provisioner`] from the entity that service answered — the one
 /// place each of the three parts is really known.
 pub(crate) fn amplifyuibuilder_identity(app_id: &str, environment_name: &str, id: &str) -> String {
-    [app_id, environment_name, id].join(COMPOSITE_IDENTITY_SEPARATOR)
+    composite_identity_triple(app_id, environment_name, id)
 }
 
 /// The three parts of such an identity, where `identity` is one
 /// ([`amplifyuibuilder_identity`]); `None` for a value that is not.
 pub(crate) fn amplifyuibuilder_identity_parts(identity: &str) -> Option<(&str, &str, &str)> {
+    composite_identity_triple_parts(identity)
+}
+
+/// The physical resource id a type whose primary identifier is a TRIPLE is known by: the three
+/// values the owning service's own API addresses one resource by, joined with
+/// [`COMPOSITE_IDENTITY_SEPARATOR`], which is what such a type's `Ref` returns.
+///
+/// The ONE join of that identity, which every per-type function above and below delegates to, so
+/// the readings of that separator cannot diverge — and the one place a value that is not such a
+/// triple is told apart from one that is ([`composite_identity_triple_parts`]).
+pub(crate) fn composite_identity_triple(first: &str, second: &str, third: &str) -> String {
+    [first, second, third].join(COMPOSITE_IDENTITY_SEPARATOR)
+}
+
+/// The three parts of such an identity ([`composite_identity_triple`]); `None` for a value that
+/// is not one, which is what keeps a call from being addressed with a value of another shape.
+pub(crate) fn composite_identity_triple_parts(identity: &str) -> Option<(&str, &str, &str)> {
     let mut parts = identity.split(COMPOSITE_IDENTITY_SEPARATOR);
-    let (app_id, environment_name, id) = (parts.next()?, parts.next()?, parts.next()?);
-    parts.next().is_none().then_some((app_id, environment_name, id))
+    let (first, second, third) = (parts.next()?, parts.next()?, parts.next()?);
+    parts.next().is_none().then_some((first, second, third))
 }
 
 /// The attribute of [`AMPLIFY_APP_ATTRIBUTES`] that carries the app's ARN, which is the
@@ -1397,6 +1414,54 @@ pub const APPCONFIG_APPLICATION: &str = "AWS::AppConfig::Application";
 pub const APPCONFIG_ENVIRONMENT: &str = "AWS::AppConfig::Environment";
 pub const APPCONFIG_CONFIGURATION_PROFILE: &str = "AWS::AppConfig::ConfigurationProfile";
 pub const APPCONFIG_DEPLOYMENT_STRATEGY: &str = "AWS::AppConfig::DeploymentStrategy";
+
+/// The `AWS::<cloudFormationName>::<Resource>` types of the two AWS AppConfig resources a
+/// ROLLOUT is declared with: the configuration content hosted for a profile, and the deployment
+/// of one version of it into an environment
+/// ([`crate::state::provisioning::appconfig_rollout`] is what creates them).
+///
+/// Neither one's identity is a name at all: `CreateHostedConfigurationVersion` takes the content
+/// and answers the `VersionNumber` AppConfig assigned, and `StartDeployment` takes no identifier
+/// and answers the `DeploymentNumber` it allocated. Each type's primary identifier is therefore
+/// the TRIPLE its own API addresses one resource by — the application and the profile or the
+/// environment, and that number — which is what a `Ref` to one resolves to
+/// ([`appconfig_rollout_identity`]) and what [`identity_is_service_assigned`] names both types
+/// for; `Fn::GetAtt` reads the number itself, and for a deployment the `State` AppConfig reports
+/// the rollout in.
+pub const APPCONFIG_HOSTED_CONFIGURATION_VERSION: &str =
+    "AWS::AppConfig::HostedConfigurationVersion";
+pub const APPCONFIG_DEPLOYMENT: &str = "AWS::AppConfig::Deployment";
+
+/// The attribute `AWS::AppConfig::HostedConfigurationVersion` publishes: the version number
+/// AppConfig minted for the content, which is the `ConfigurationVersion` a `StartDeployment`
+/// deploys.
+pub(super) const APPCONFIG_VERSION_NUMBER_ATTRIBUTE: &str = "VersionNumber";
+
+/// The attributes `AWS::AppConfig::Deployment` publishes, in the sorted order a resource's own
+/// attribute map holds them in: the number AppConfig allocated for the deployment, and the
+/// `DeploymentState` it reports the rollout in.
+pub(super) const APPCONFIG_DEPLOYMENT_ATTRIBUTES: &[&str] = &["DeploymentNumber", "State"];
+
+/// The physical resource id of one of those two resources: the triple its own API addresses one
+/// by — the application, the profile or the environment, and the number AppConfig minted —
+/// joined with [`COMPOSITE_IDENTITY_SEPARATOR`], which is what the type's `Ref` returns.
+///
+/// Not a row of [`composite_identity`]: that one builds an identity out of the values a
+/// declaration STATES, and the last part of this one is a number AppConfig assigns, which no
+/// declaration carries. So the identity is built by
+/// [`crate::state::provisioning::appconfig_rollout`] from what the create answered — the one
+/// place all three parts are really known — and the naming rules leave the resource the
+/// identifier they computed until then ([`identity_is_service_assigned`] names both types, so
+/// that identifier is only the stand-in a declaration is resolved against).
+pub(crate) fn appconfig_rollout_identity(first: &str, second: &str, number: &str) -> String {
+    composite_identity_triple(first, second, number)
+}
+
+/// The three parts of such an identity, where `identity` is one
+/// ([`appconfig_rollout_identity`]); `None` for a value that is not.
+pub(crate) fn appconfig_rollout_identity_parts(identity: &str) -> Option<(&str, &str, &str)> {
+    composite_identity_triple_parts(identity)
+}
 
 /// The types of the two Amazon MemoryDB GROUPS a cluster is configured out of (that
 /// model's `awsService.cloudFormationName: MemoryDB`): the parameter group that carries

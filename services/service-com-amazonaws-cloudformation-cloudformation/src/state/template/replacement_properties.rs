@@ -261,6 +261,32 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         APPCONFIG_ENVIRONMENT => &["ApplicationId"],
         APPCONFIG_CONFIGURATION_PROFILE => &["ApplicationId", "LocationUri", "Type"],
         APPCONFIG_DEPLOYMENT_STRATEGY => &["ReplicateTo"],
+        // A hosted configuration VERSION is its content under the number AppConfig minted, and a
+        // DEPLOYMENT is one rollout of one version into one environment: that service publishes
+        // no call that edits either — `CreateHostedConfigurationVersion` and `StartDeployment`
+        // are the only calls that make one, and the only other call on an existing deployment
+        // stops it — so every property of both types is create-only and a declaration restating
+        // any of them asks for a different resource, which the deployment replaces. The parts of
+        // each type's composite identity are in that position for the second reason as well.
+        APPCONFIG_HOSTED_CONFIGURATION_VERSION => &[
+            "ApplicationId",
+            "ConfigurationProfileId",
+            "Content",
+            "ContentType",
+            "Description",
+            "LatestVersionNumber",
+            "VersionLabel",
+        ],
+        APPCONFIG_DEPLOYMENT => &[
+            "ApplicationId",
+            "ConfigurationProfileId",
+            "ConfigurationVersion",
+            "DeploymentStrategyId",
+            "Description",
+            "DynamicExtensionParameters",
+            "EnvironmentId",
+            "KmsKeyIdentifier",
+        ],
         // A grant on a private CA is made WHOLE and cannot be edited: Amazon Web Services
         // Private CA publishes no call that changes one — `CreatePermission` refuses a
         // request that re-asserts the same CA, principal and account for another action set,

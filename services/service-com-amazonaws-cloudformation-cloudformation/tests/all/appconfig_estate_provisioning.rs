@@ -86,8 +86,46 @@ pub(crate) async fn appconfig(
     (status, parsed)
 }
 
+/// One AWS AppConfig call whose ANSWER is an `@httpPayload` rather than a document: the bytes
+/// that operation serves, exactly as they came.
+///
+/// `GetHostedConfigurationVersion` binds a configuration's `Content` as its payload and every
+/// other member it reports as a header, so what a client reads back is the content itself —
+/// which for a media type that is not JSON is no document at all and cannot be read as one.
+/// [`appconfig`] is the document form of the same call; both are shared with the sibling
+/// AppConfig suites so one reading of this service's wire serves them all.
+pub(crate) async fn appconfig_payload(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+) -> (u16, String) {
+    let request = http::Request::builder()
+        .method(method)
+        .uri(format!("https://appconfig.{REGION}.amazonaws.com{uri}"))
+        .header("host", format!("appconfig.{REGION}.amazonaws.com"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/appconfig/\
+                 aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
+            ),
+        )
+        .body(bytes::Bytes::new())
+        .expect("a well-formed AWS AppConfig request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(response.body()).to_string();
+    (status, body)
+}
+
+/// How CloudFormation joins the parts of a COMPOSITE primary identifier, which is what the
+/// physical resource id of an AppConfig resource identified by a triple is built with: the
+/// separator this service itself joins with, re-exported here for the sibling AppConfig suites so
+/// no reading of that identity carries a literal of its own.
+pub(crate) use service_com_amazonaws_cloudformation_cloudformation::state::template::COMPOSITE_IDENTITY_SEPARATOR;
+
 /// The physical resource ids `DescribeStackResources` reports, keyed by logical id.
-async fn physical_ids(
+pub(crate) async fn physical_ids(
     router: &MultiServiceRouter,
     case: &str,
     stack: &str,
@@ -105,7 +143,7 @@ async fn physical_ids(
 
 /// The physical resource id of one logical id, or a panic naming the case: a resource the
 /// stack reports without one is exactly the defect this suite is about.
-fn id_of(case: &str, reported: &[(String, String)], logical_id: &str) -> String {
+pub(crate) fn id_of(case: &str, reported: &[(String, String)], logical_id: &str) -> String {
     reported
         .iter()
         .find(|(logical, _)| logical == logical_id)
@@ -134,7 +172,7 @@ async fn outputs(router: &MultiServiceRouter, case: &str, stack: &str) -> Vec<(S
 }
 
 /// One output's value, or a panic naming the case.
-fn output(case: &str, reported: &[(String, String)], key: &str) -> String {
+pub(crate) fn output(case: &str, reported: &[(String, String)], key: &str) -> String {
     reported
         .iter()
         .find(|(name, _)| name == key)

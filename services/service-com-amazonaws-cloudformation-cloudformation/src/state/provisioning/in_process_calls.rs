@@ -283,6 +283,46 @@ pub(crate) async fn call_rest_payload(
     Err(refusal_of(signing_name, status, &document))
 }
 
+/// [`call_rest_payload`] for an operation that both TAKES its input and REPORTS its answer
+/// outside a document: the bytes the caller passes are the request's body and the headers it
+/// names are what the answer is read from.
+///
+/// A REST operation may bind every member of its input and its output to a header beside one
+/// payload member — AWS AppConfig's `CreateHostedConfigurationVersion` takes the configuration's
+/// content as its `@httpPayload` and reports the `VersionNumber` it minted in a `Version-Number`
+/// header — so neither half of such a call can be written or read as a JSON envelope. `sent` are
+/// the request headers the called operation's own `@httpHeader` traits name, including the
+/// content type the payload is sent under; `answered` the response headers to report back, one
+/// entry per named header the answer actually had, keyed by the name as the caller spelled it.
+///
+/// A refusal is that service's own, read out of its error DOCUMENT exactly as
+/// [`call_rest_payload`] reads one: a `restJson1` service words an error as a document whichever
+/// way its successful answer is bound.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_rest_payload_reporting(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    signing_name: &str,
+    region: &str,
+    method: &'static str,
+    uri: &str,
+    sent: Vec<(&'static str, String)>,
+    payload: Vec<u8>,
+    answered: &[&str],
+) -> Result<BTreeMap<String, String>, Refusal> {
+    let (status, reported, answer) =
+        dispatch(ctx, signing_name, region, method, uri, sent, payload, answered)
+            .await
+            .map_err(|message| Refusal {
+                code: "InternalFailure".to_string(),
+                message,
+            })?;
+    if (200..300).contains(&status) {
+        return Ok(reported);
+    }
+    let document: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
+    Err(refusal_of(signing_name, status, &document))
+}
+
 /// Call one REST-XML operation of another emulated service in-process and read the XML
 /// document it answers with, with the response HEADERS the caller names beside it.
 /// `Err(refusal)` is that service's own refusal: the error CODE it carries, and the message

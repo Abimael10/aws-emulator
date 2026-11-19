@@ -2060,6 +2060,35 @@ pub(crate) fn return_values(
             );
             (identity, attributes)
         }
+        // AWS AppConfig's rollout: the configuration content an
+        // `AWS::AppConfig::HostedConfigurationVersion` hosts for a profile, and the
+        // `AWS::AppConfig::Deployment` that rolls one version of it into an environment. Each
+        // type's `Ref` returns the triple its own API addresses one resource by
+        // ([`appconfig_rollout_identity`]), whose last part is the number AppConfig MINTS —
+        // `CreateHostedConfigurationVersion` answers the `VersionNumber` it assigned and
+        // `StartDeployment` the `DeploymentNumber` it allocated — so the identity and the
+        // attributes read off it are STAND-INS here, which `super::provisioning` re-points at
+        // what each create really answered
+        // ([`crate::state::provisioning::appconfig_rollout`], and
+        // [`identity_is_service_assigned`] names both types). `Fn::GetAtt` reads that number,
+        // and for a deployment the `State` AppConfig reports the rollout in, which only that
+        // service produces.
+        APPCONFIG_HOSTED_CONFIGURATION_VERSION => {
+            attributes.insert(
+                APPCONFIG_VERSION_NUMBER_ATTRIBUTE.to_string(),
+                service_assigned_document(name, APPCONFIG_VERSION_NUMBER_ATTRIBUTE),
+            );
+            (name.to_string(), attributes)
+        }
+        APPCONFIG_DEPLOYMENT => {
+            for attribute in APPCONFIG_DEPLOYMENT_ATTRIBUTES {
+                attributes.insert(
+                    (*attribute).to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (name.to_string(), attributes)
+        }
         // Amazon Managed Workflows for Apache Airflow's own control plane: the environment an
         // `AWS::MWAA::Environment` declares. "Ref returns the name of the Amazon MWAA
         // environment", which is the handle every Amazon MWAA operation on one takes, so the

@@ -224,6 +224,10 @@ pub(in crate::state) mod appsync_domain_names;
 /// the configuration profile that reads a configuration and the deployment strategy that
 /// rolls one out: created in AWS AppConfig itself ([`appconfig_resources`]).
 mod appconfig_resources;
+/// The two `AWS::AppConfig::*` types a ROLLOUT is declared with — the configuration content
+/// hosted for a profile, and the deployment of one version of it into an environment: created in
+/// AWS AppConfig itself ([`appconfig_rollout`]).
+mod appconfig_rollout;
 /// The three `AWS::AppSync::*` types a stack declares beyond a GraphQL API's own estate — an
 /// Event API, the channel namespaces events travel over on it, and the link of a source API
 /// into a Merged API: created in AWS AppSync itself ([`appsync_event_and_merged_apis`]).
@@ -1226,6 +1230,11 @@ pub(super) enum Owner {
     /// deployment strategy a rollout follows. Which of them it is travels with the owner, as
     /// it does for the types above.
     AppConfigResource(appconfig_resources::Kind),
+    /// One of the two `AWS::AppConfig::*` types [`appconfig_rollout`] creates in AWS AppConfig
+    /// beyond that estate: the hosted configuration version a profile serves, and the deployment
+    /// that rolls one of its versions into an environment. Which of them it is travels with the
+    /// owner, as it does for the types above.
+    AppConfigRollout(appconfig_rollout::Kind),
     /// One of the six `AWS::AppSync::*` types [`appsync_resources`] creates in AWS AppSync:
     /// the GraphQL API, the schema it serves, a data source it reads through, a resolver on
     /// one of its fields, a pipeline function and an API key. Which of them it is travels with
@@ -1346,6 +1355,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = appconfig_resources::kind_of(resource_type) {
         return Some(Owner::AppConfigResource(kind));
+    }
+    if let Some(kind) = appconfig_rollout::kind_of(resource_type) {
+        return Some(Owner::AppConfigRollout(kind));
     }
     if let Some(kind) = appsync_resources::kind_of(resource_type) {
         return Some(Owner::AppSyncResource(kind));

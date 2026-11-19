@@ -2967,6 +2967,10 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE,
     APPLICATION_SIGNALS_GROUPING_CONFIGURATION,
     APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG,
+    // The two AWS AppConfig ROLLOUT types, each publishing the number that service minted for
+    // the resource — and a deployment the state it reports the rollout in.
+    APPCONFIG_HOSTED_CONFIGURATION_VERSION,
+    APPCONFIG_DEPLOYMENT,
     BACKUP_VAULT,
     BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE,
