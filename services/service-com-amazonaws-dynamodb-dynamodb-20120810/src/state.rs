@@ -4644,6 +4644,13 @@ pub use import_log_groups::*;
 /// `crate::state::…`.
 mod export_objects;
 pub use export_objects::*;
+
+/// Whether the CALLING PRINCIPAL may make the Amazon S3 calls a table export or a table
+/// import performs for it, in its own file: it is one rule, read by both of the surfaces
+/// that move a table's data through that service. Re-exported below, so every caller still
+/// names them `crate::state::…`.
+mod s3_access;
+pub use s3_access::*;
 pub use kinesis::*;
 
 /// Which member of a request states the read/write capacity mode. Re-exported below, so

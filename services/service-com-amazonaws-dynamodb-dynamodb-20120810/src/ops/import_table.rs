@@ -18,7 +18,10 @@
 //! has finished.
 //!
 //! What the TASK runs into is reported on the record rather than answered to the caller:
-//! a source bucket the object store holds none of, a target name that is already a
+//! a source bucket the object store holds none of, a source the policies in force do not let
+//! the CALLER read — an import reads its source with the permissions of the principal that
+//! asked for it ([`crate::state::import_listing_denial`],
+//! [`crate::state::import_read_denial`]) — a target name that is already a
 //! table's, and a source carrying an item the table could not hold, each leave the import
 //! `FAILED` with the reason — the last of them after the items that DID pass validation
 //! were written, which is what `ErrorCount` counts. The one conflict answered to
@@ -408,6 +411,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // engine: a bucket that store holds none of is a source nothing can be read from,
         // which FAILS the task — the import is accepted, so the reason is reported on the
         // record rather than answered here.
+        let source_bucket = input.s3_bucket_source.s3_bucket.clone();
         let objects = match crate::state::read_import_source(&*self.engine, &input.s3_bucket_source)
         {
             Ok(objects) => Ok(objects),
@@ -424,6 +428,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             }
         };
+        // The source read is the CALLER's: an import reads its source with the permissions
+        // of the principal that asked for it, so the listing that selects the objects and
+        // the read of each one are authorized exactly as those calls by that principal are —
+        // against the policies in force on it and the source bucket's own policy
+        // ([`crate::state::import_listing_denial`],
+        // [`crate::state::import_read_denial`]). A call the policies refuse is a call the
+        // task does not make, so NO source data reaches the new table and the task fails
+        // with the refusal.
+        let objects = objects.and_then(|objects| {
+            if let Some(denied) =
+                crate::state::import_listing_denial(&*self.engine, &caller, &source_bucket)
+            {
+                return Err(denied);
+            }
+            match crate::state::import_read_denial(&*self.engine, &caller, &source_bucket, &objects)
+            {
+                Some(denied) => Err(denied),
+                None => Ok(objects),
+            }
+        });
         // The attribute types the declaration DECLARES, which is what a CSV column's
         // value is read as.
         let declared_types: ::std::collections::BTreeMap<String, String> = parameters

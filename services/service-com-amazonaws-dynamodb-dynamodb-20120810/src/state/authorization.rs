@@ -52,6 +52,12 @@
 //! scope alone ([`account_denial`]): IAM's implicit deny still refuses a principal that
 //! nothing grants the action to.
 //!
+//! A call this service makes to ANOTHER service's resource FOR the caller — the object write
+//! a table export performs, the object read a table import performs — is made with the
+//! CALLER's permissions, so it is decided by the same rule over that service's own action and
+//! ARN, against the caller's identity-based documents and the resource policy that resource
+//! carries ([`performed_for_caller_denial`]).
+//!
 //! A statement that names the ACCOUNT rather than the caller (the account's root ARN, or
 //! the bare account id that stands for it) delegates to the account rather than granting:
 //! "you must also attach an identity-based policy" to the principal. So the account
@@ -837,6 +843,63 @@ pub fn identity_only_denial(caller: &Caller, action: &str, resource: &str) -> Op
     // credential's scope alone: such a call addresses no resource whose own policy could
     // grant or deny it, so nothing is handed in for that half.
     identity_denial(caller, action, resource, &granting, || false)
+}
+
+/// Why the policies in force refuse the caller a call this service makes to ANOTHER
+/// service's resource FOR it — the object write a table export performs, the object read a
+/// table import performs — or `None` when they permit it.
+///
+/// Such a call is made with the CALLER's permissions rather than with this service's own, so
+/// it is decided by exactly the two documents the other service would decide it by: the
+/// identity-based documents in force on the caller, and the resource-based `policy` the
+/// addressed resource carries (`None` for one carrying none). The rule is the module docs'
+/// rule, over the two halves such a call has: an explicit `Deny` in either refuses it
+/// whatever any grant says, and otherwise it needs an `Allow` — in the caller's own
+/// documents, or in the resource's policy naming the caller — with the credential's own
+/// scope capping whatever they grant ([`identity_denial`], the one decision ladder of this
+/// service).
+///
+/// `action` is the IAM action of the OTHER service (`s3:PutObject`) and `resource` that
+/// service's own ARN for what the call addresses, since that is what a statement about it is
+/// written over. The condition keys are the CALLER's own ([`principal_context`]): this
+/// service's data-plane keys are about a call on a table and say nothing about a call on
+/// another service's resource.
+pub fn performed_for_caller_denial(
+    caller: &Caller,
+    policy: Option<&str>,
+    action: &str,
+    resource: &str,
+) -> Option<String> {
+    let context = principal_context(caller);
+    let published = principal_published_keys(caller);
+    // An explicit deny in the resource's own policy wins over every grant, including the
+    // account's own credential. It is decided against every spelling the caller may be
+    // named by, its account's included.
+    if let Some(policy) = policy {
+        let denied = caller.denied_spellings();
+        let denying = iam::Request::new(action, resource, &denied)
+            .with_context(&context)
+            .with_published_keys(&published);
+        if iam::resource_decision(policy, &denying) == Decision::Denied {
+            return Some(not_authorized(
+                &caller.arn,
+                action,
+                resource,
+                iam::RESOURCE_POLICY_EXPLICIT_DENY,
+            ));
+        }
+    }
+    let granting = iam::Request::new(action, resource, &caller.principals)
+        .with_context(&context)
+        .with_published_keys(&published);
+    identity_denial(caller, action, resource, &granting, || {
+        // The one grant a RESOURCE's own policy can make: an `Allow` that names this
+        // principal directly, which is a permission of its own. Read only where the
+        // identity-based documents did not already grant the call.
+        policy.is_some_and(|policy| {
+            iam::resource_decision(policy, &granting) == Decision::Allowed
+        })
+    })
 }
 
 /// The `AccessDeniedException` message a CONTROL-PLANE call on one table earns when the

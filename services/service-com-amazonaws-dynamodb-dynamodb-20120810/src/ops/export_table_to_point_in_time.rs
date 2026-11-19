@@ -10,6 +10,11 @@
 //! (`crate::state::Export`) is the export catalogue's, so `DescribeExport` and
 //! `ListExports` report the very export this started.
 //!
+//! The export's own WRITE is the caller's: its objects are written into the destination
+//! bucket with the permissions of the principal that asked for the export
+//! ([`crate::state::export_write_denial`]), so an export whose write the policies in force
+//! refuse ends `FAILED` with that refusal and leaves the destination prefix empty.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -395,21 +400,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The export RUNS: its objects are recorded in Amazon S3's own store on this same
-        // engine, so what it writes is what that service's `ListObjectsV2` and
-        // `GetObject` then serve. A destination the object store holds no bucket for is a
-        // destination nothing can be written to, which fails the task — the export was
-        // accepted, so the failure is reported on the record rather than answered here.
-        let failure = match crate::state::write_exported_objects(&*self.engine, &bucket, &objects) {
-            Some(written) if written.objects == objects.len() => None,
-            Some(_) => Some(crate::state::ExportFailure {
-                code: crate::state::EXPORT_FAILURE_WRITE_REFUSED.to_string(),
-                message: crate::state::EXPORT_FAILURE_WRITE_REFUSED_MESSAGE.to_string(),
-            }),
-            None => Some(crate::state::ExportFailure {
-                code: crate::state::EXPORT_FAILURE_NO_SUCH_BUCKET.to_string(),
-                message: crate::state::EXPORT_FAILURE_NO_SUCH_BUCKET_MESSAGE.to_string(),
-            }),
+        // The export's write is the CALLER's: an export writes its snapshot with the
+        // permissions of the principal that asked for it, so each object it would write is
+        // authorized exactly as an object write of that principal is — against the policies
+        // in force on it and the destination bucket's own policy
+        // ([`crate::state::export_write_denial`]). A write the policies refuse is a write
+        // the task does not make, so NOTHING is written and the task fails with the refusal.
+        let failure = match crate::state::export_write_denial(
+            &*self.engine,
+            &caller,
+            &bucket,
+            &objects,
+        ) {
+            Some(denied) => Some(denied),
+            // The export RUNS: its objects are recorded in Amazon S3's own store on this
+            // same engine, so what it writes is what that service's `ListObjectsV2` and
+            // `GetObject` then serve. A destination the object store holds no bucket for is
+            // a destination nothing can be written to, which fails the task — the export was
+            // accepted, so the failure is reported on the record rather than answered here.
+            None => match crate::state::write_exported_objects(&*self.engine, &bucket, &objects) {
+                Some(written) if written.objects == objects.len() => None,
+                Some(_) => Some(crate::state::ExportFailure {
+                    code: crate::state::EXPORT_FAILURE_WRITE_REFUSED.to_string(),
+                    message: crate::state::EXPORT_FAILURE_WRITE_REFUSED_MESSAGE.to_string(),
+                }),
+                None => Some(crate::state::ExportFailure {
+                    code: crate::state::EXPORT_FAILURE_NO_SUCH_BUCKET.to_string(),
+                    message: crate::state::EXPORT_FAILURE_NO_SUCH_BUCKET_MESSAGE.to_string(),
+                }),
+            },
         };
         if let Some(failure) = failure {
             let mut store = state.lock();
