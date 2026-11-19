@@ -55,3 +55,49 @@ Cause 3: expected the function invoked on PutObject once s3.amazonaws.com was pe
 1) Cause 1: CreateEventSourceMapping on a queue (vary BatchSize, FilterCriteria, Enabled=false) and SendMessage; poll for invocations and queue depth.
 2) Cause 2: PutFunctionEventInvokeConfig with DestinationConfig.OnFailure = a queue, Invoke asynchronously with a handler that raises, then ReceiveMessage on that queue.
 3) Cause 3: PutBucketNotificationConfiguration with a LambdaFunctionConfigurations entry, AddPermission for s3.amazonaws.com, PutObject, poll for the invocation.
+
+## Resolution
+All three capabilities are served by the current tree; the report was filed against
+`d6cb6c2`, before any of them existed, and every replayed unit of the three causes now
+passes.
+
+Cause 1 — the queue poller of an event source mapping lives in
+services/service-com-amazonaws-lambda-awsgirapiservice/src/state/sqs_poller.rs (receive
+through the queue's own delivery bookkeeping, Records[] assembly with the message's
+attributes and messageAttributes, the batching window, FilterCriteria, the invoke over the
+in-process callback, and delete-or-retain per the attempt's outcome), armed after the call
+that makes or changes a mapping by `crate::state::drive_sqs_pollers` in
+src/ops/create_event_source_mapping.rs and src/ops/update_event_source_mapping.rs. Pinned
+by that crate's tests/all/event_source_mapping_sqs_delivery.rs,
+sqs_event_source_handler_run.rs, sqs_event_source_filter_criteria.rs,
+sqs_event_source_record_attributes.rs and event_source_mapping_pause_and_resume_delivery.rs
+(the paused and the resumed halves of Enabled).
+
+Cause 2 — the invocation record an asynchronous event's last attempt hands the destination
+its event-invoke configuration names, written as the function's own execution role, lives in
+services/service-com-amazonaws-lambda-awsgirapiservice/src/state/async_completion_delivery.rs.
+Pinned by core/router/tests/all/lambda_async_failure_record_names_its_own_event.rs and
+lambda_async_destination_bus_rule_keyed_on_the_publisher.rs.
+
+Cause 3 — the notification dispatcher (configuration matching, the destination's own grant,
+and the asynchronous invoke) lives in
+services/service-com-amazonaws-s3-amazons3/src/state/notifications.rs. Pinned by
+core/router/tests/all/s3_notification_invokes_its_lambda_target.rs,
+s3_notification_fans_out_across_destination_kinds.rs and
+s3_notification_delivery_follows_the_destination_grant.rs.
+
+What was missing was a suite over the JOIN of the three, the shape of this report's
+`s3-notification-to-sqs-lambda-esm-drains-queue` trace: added as
+core/router/tests/all/s3_notification_to_sqs_lambda_esm_drains_the_queue.rs, which writes
+objects into a bucket whose notification configuration names a queue and asserts that each
+admitted key reaches the RUNNING handler of the mapping on that queue as a queue-sourced
+record carrying the S3 event, that the queue drains, and that a key the configuration's
+filter excludes reaches the function not at all.
+
+Surviving replay key, not a divergence on any cause:
+`sqs-esm-disabled-mapping-no-invocation-negative|run#14|AssertionError|assert
+_matches(calib_reports, calib_marker)` is `moved` — the run gets past the calibration
+assertion that key names and ends later, in a `time.sleep(5)`, when the harness's own 60 s
+per-check wall-clock budget runs out; the disabled-then-enabled behaviour it calibrates is
+pinned by event_source_mapping_pause_and_resume_delivery.rs. Every other key of this report
+is fixed.
