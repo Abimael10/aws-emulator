@@ -9,7 +9,7 @@
 //! `totalLinksCount` are DERIVED by scanning [`ComAmazonawsRtbfabricRtbfabricState::links`],
 //! never stored.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 /// The `/responder-gateway/{gatewayId}/certificate` surface's record.
@@ -387,7 +387,8 @@ pub struct ComAmazonawsRtbfabricRtbfabricState {
     /// [`LINK_QUOTA`]; released by `DeleteLink`.
     pub links: HashMap<(String, String), Link>,
     /// Keyed by (`linkId`, `ruleId`). Bounded by [`ROUTING_RULE_QUOTA`]; released
-    /// with the link it routes for ([`release_link`](Self::release_link)).
+    /// with the link it routes for ([`release_link`](Self::release_link)), and so
+    /// is the client-token record that minted it.
     pub routing_rules: HashMap<(String, String), LinkRoutingRule>,
     /// Keyed by (`gatewayId`, `acmCertificateArn`) — the pair that identifies one
     /// certificate association. Bounded by
@@ -508,8 +509,10 @@ impl ComAmazonawsRtbfabricRtbfabricState {
             .get_mut(&(link_id.to_string(), rule_id.to_string()))
     }
 
-    /// Release the link `link_id` addressed from `gateway_id`: the record, and every
-    /// routing rule that routed for it, since a rule cannot outlive its link.
+    /// Release the link `link_id` addressed from `gateway_id`: the record, every
+    /// routing rule that routed for it, since a rule cannot outlive its link, and
+    /// the client-token records those resources' creates wrote
+    /// ([`forget_released_client_tokens`](Self::forget_released_client_tokens)).
     ///
     /// `None` when that gateway is no end of any link of that id, which is the
     /// not-found the caller is answered with.
@@ -518,6 +521,7 @@ impl ComAmazonawsRtbfabricRtbfabricState {
         let released = self.links.remove(&key)?;
         self.routing_rules
             .retain(|(rule_link_id, _), _| *rule_link_id != released.link_id);
+        self.forget_released_client_tokens();
         Some(released)
     }
 
@@ -581,10 +585,11 @@ impl ComAmazonawsRtbfabricRtbfabricState {
     ///   that routed for one of those links;
     /// * every certificate association on that gateway, which is a fact about a
     ///   gateway that no longer exists;
-    /// * every client-token record that minted a resource of that gateway, so the id
-    ///   a replayed token would answer with is never one the store no longer holds.
+    /// * every client-token record that minted one of the resources released here —
+    ///   the gateway itself and the routing rules of its links — so the id a
+    ///   replayed token would answer with is never one the store no longer holds.
     fn release_dependents(&mut self, gateway_id: &str) {
-        let orphaned: Vec<String> = self
+        let orphaned: HashSet<String> = self
             .links
             .values()
             .filter(|link| link.has_end(gateway_id))
@@ -592,11 +597,43 @@ impl ComAmazonawsRtbfabricRtbfabricState {
             .collect();
         self.links.retain(|_, link| !link.has_end(gateway_id));
         self.routing_rules
-            .retain(|(rule_link_id, _), _| !orphaned.contains(rule_link_id));
+            .retain(|(rule_link_id, _), _| !orphaned.contains(rule_link_id.as_str()));
         self.certificate_associations
             .retain(|(association_gateway_id, _), _| association_gateway_id != gateway_id);
+        self.forget_released_client_tokens();
+    }
+
+    /// Forget every client-token record whose resource the store no longer holds.
+    ///
+    /// A record exists to answer a replayed token with the resource the first call
+    /// minted, so it is a fact ABOUT that resource: it is released together with
+    /// it, exactly as a link's routing rules are. Keeping it would make a replay
+    /// answer with — or refuse a fresh create over — an id the store no longer
+    /// holds.
+    ///
+    /// Stated over what a record points at rather than over one release path, so
+    /// every release honours it: the record survives exactly as long as a stored
+    /// resource carries its id.
+    fn forget_released_client_tokens(&mut self) {
+        // Every id a stored resource of this service carries. A record is written
+        // today only by the two gateway creates and the routing-rule create (see
+        // [`IDEMPOTENCY_QUOTA`]), so the link ids are here for the rule rather than
+        // for a record that exists: a create that minted a link under a token would
+        // be retained and released by the same reading.
+        let live: HashSet<&str> = self
+            .requester_gateways
+            .keys()
+            .map(String::as_str)
+            .chain(self.responder_gateways.keys().map(String::as_str))
+            .chain(self.links.values().map(|link| link.link_id.as_str()))
+            .chain(
+                self.routing_rules
+                    .values()
+                    .map(|rule| rule.rule_id.as_str()),
+            )
+            .collect();
         self.idempotency
-            .retain(|_, record| record.resource_id != gateway_id);
+            .retain(|_, record| live.contains(record.resource_id.as_str()));
     }
 }
 

@@ -12,6 +12,9 @@
 //! * a rule is created `CREATION_IN_PROGRESS` and the clock settles it to `ACTIVE`;
 //! * a rule cannot outlive the link it routes for, so deleting the link takes its
 //!   rules with it;
+//! * a client-token record is released with the resource it minted, so once a rule is
+//!   gone its token is free again, while a record whose rule is still stored keeps
+//!   replaying that rule;
 //! * every refusal for a gateway, a link or a rule this store does not hold is the
 //!   service's one not-found: HTTP 404 with fixed text naming nothing from the
 //!   request.
@@ -47,6 +50,17 @@ const POLL_PAUSE: Duration = Duration::from_millis(20);
 /// `smithy_query(query="shape", shape="LinkLogSettings")` declares it.
 fn log_settings() -> Value {
     json!({ "applicationLogs": { "sampling": { "errorLog": 100.0, "filterLog": 0.0 } } })
+}
+
+/// A `CreateRequesterGateway` body whose members satisfy the modelled patterns, so the
+/// same token can be presented twice to see what its record answers.
+fn requester_gateway_body(client_token: &str) -> Value {
+    json!({
+        "vpcId": "vpc-0123456789abcdef0",
+        "subnetIds": ["subnet-0123456789abcdef0"],
+        "securityGroupIds": ["sg-0123456789abcdef0"],
+        "clientToken": client_token,
+    })
 }
 
 fn text(body: &Value, member: &str) -> String {
@@ -129,12 +143,7 @@ impl Fabric {
             .send(
                 "POST",
                 "/requester-gateway",
-                Some(json!({
-                    "vpcId": "vpc-0123456789abcdef0",
-                    "subnetIds": ["subnet-0123456789abcdef0"],
-                    "securityGroupIds": ["sg-0123456789abcdef0"],
-                    "clientToken": format!("{token}-requester"),
-                })),
+                Some(requester_gateway_body(&format!("{token}-requester"))),
             )
             .await;
         assert_eq!(
@@ -164,6 +173,16 @@ impl Fabric {
         );
         let requester_id = text(&requester.body, "gatewayId");
         let responder_id = text(&responder.body, "gatewayId");
+        let link_id = self.create_link(case, &requester_id, &responder_id).await;
+        Pair {
+            requester_id,
+            responder_id,
+            link_id,
+        }
+    }
+
+    /// Open a link between two stored gateways and return the id the service minted.
+    async fn create_link(&self, case: &str, requester_id: &str, responder_id: &str) -> String {
         let link = self
             .send(
                 "POST",
@@ -179,11 +198,7 @@ impl Fabric {
             "case {case:?}: expected CreateLink to answer 200, got {} {:?}",
             link.status, link.body
         );
-        Pair {
-            requester_id,
-            responder_id,
-            link_id: text(&link.body, "linkId"),
-        }
+        text(&link.body, "linkId")
     }
 
     async fn create_rule(
@@ -735,4 +750,253 @@ async fn a_rule_does_not_outlive_the_link_it_routes_for() {
         .get_rule(&pair.responder_id, &pair.link_id, &rule_id)
         .await;
     assert_not_found(case, &read, &[&pair.responder_id, &pair.link_id, &rule_id]);
+}
+
+/// How the resources a routing rule's client-token record belongs to are released.
+enum Release {
+    /// `DeleteLink`, addressed from the end named here.
+    Link { from_requester: bool },
+    /// `DeleteRequesterGateway`, which takes the link and so the rule with it.
+    RequesterGateway,
+    /// `DeleteResponderGateway`, the other end of the same link.
+    ResponderGateway,
+}
+
+/// One row of the release table: the call that releases the rule.
+struct ReleaseRow {
+    name: &'static str,
+    release: Release,
+}
+
+/// Every call this service serves that releases a routing rule: the rule's own link
+/// from either of its two ends, and either gateway the link joins.
+const RELEASE_ROWS: &[ReleaseRow] = &[
+    ReleaseRow {
+        name: "the link deleted from its requester end",
+        release: Release::Link {
+            from_requester: true,
+        },
+    },
+    ReleaseRow {
+        name: "the link deleted from its responder end",
+        release: Release::Link {
+            from_requester: false,
+        },
+    },
+    ReleaseRow {
+        name: "the requester gateway deleted",
+        release: Release::RequesterGateway,
+    },
+    ReleaseRow {
+        name: "the responder gateway deleted",
+        release: Release::ResponderGateway,
+    },
+];
+
+#[tokio::test]
+async fn a_rules_client_token_is_released_with_the_rule() {
+    // One condition and priority throughout: what varies between the rows is which
+    // call releases the rule, not what the rule holds.
+    let conditions = json!({ "pathPrefix": "/bid" });
+    let priority = 10;
+
+    for row in RELEASE_ROWS {
+        let case = row.name;
+        let fabric = Fabric::new();
+        let pair = fabric.linked_pair(case, "token-first").await;
+        let created = fabric
+            .create_rule(
+                &pair.responder_id,
+                &pair.link_id,
+                "token-rule",
+                priority,
+                conditions.clone(),
+                None,
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected CreateLinkRoutingRule to answer 200, got {} {:?}",
+            created.status, created.body
+        );
+        let released_rule_id = text(&created.body, "ruleId");
+
+        let path = match row.release {
+            Release::Link { from_requester: true } => {
+                format!("/gateway/{}/link/{}", pair.requester_id, pair.link_id)
+            }
+            Release::Link {
+                from_requester: false,
+            } => format!("/gateway/{}/link/{}", pair.responder_id, pair.link_id),
+            Release::RequesterGateway => format!("/requester-gateway/{}", pair.requester_id),
+            Release::ResponderGateway => format!("/responder-gateway/{}", pair.responder_id),
+        };
+        let deleted = fabric.send("DELETE", &path, None).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: expected the delete to answer 200, got {} {:?}",
+            deleted.status, deleted.body
+        );
+
+        // The rule the token minted is gone, so nothing the record points at is
+        // readable any more.
+        let read = fabric
+            .get_rule(&pair.responder_id, &pair.link_id, &released_rule_id)
+            .await;
+        assert_not_found(
+            case,
+            &read,
+            &[&pair.responder_id, &pair.link_id, &released_rule_id],
+        );
+
+        // A fresh link to carry the next rule: the same gateway pair when only the
+        // link went, a new pair when a gateway went with it.
+        let (gateway_id, link_id) = match row.release {
+            Release::Link { .. } => {
+                let link_id = fabric
+                    .create_link(case, &pair.requester_id, &pair.responder_id)
+                    .await;
+                (pair.responder_id.clone(), link_id)
+            }
+            Release::RequesterGateway | Release::ResponderGateway => {
+                let next = fabric.linked_pair(case, "token-second").await;
+                (next.responder_id.clone(), next.link_id.clone())
+            }
+        };
+
+        // The record went with the rule, so the token is free: the create mints a
+        // second rule rather than being refused for parameters that no longer
+        // describe anything the store holds.
+        let reused = fabric
+            .create_rule(
+                &gateway_id,
+                &link_id,
+                "token-rule",
+                priority,
+                conditions.clone(),
+                None,
+            )
+            .await;
+        assert_eq!(
+            reused.status, 200,
+            "case {case:?}: expected the freed token to mint a rule, got {} {:?}",
+            reused.status, reused.body
+        );
+        let minted_rule_id = text(&reused.body, "ruleId");
+        assert_ne!(
+            minted_rule_id, released_rule_id,
+            "case {case:?}: expected a newly minted ruleId, got the released {released_rule_id:?}"
+        );
+
+        // And what it minted is really stored: readable through its own link.
+        let read_back = fabric.get_rule(&gateway_id, &link_id, &minted_rule_id).await;
+        assert_eq!(
+            read_back.status, 200,
+            "case {case:?}: expected the new rule to read back, got {} {:?}",
+            read_back.status, read_back.body
+        );
+        assert_eq!(
+            text(&read_back.body, "linkId"),
+            link_id,
+            "case {case:?}: expected the new rule to route for link {link_id:?}, got {:?}",
+            read_back.body["linkId"]
+        );
+        assert_eq!(
+            read_back.body["conditions"], conditions,
+            "case {case:?}: expected the new rule to hold the created conditions, got {:?}",
+            read_back.body["conditions"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_client_token_whose_resource_is_still_stored_keeps_replaying_it() {
+    let fabric = Fabric::new();
+    let case = "a release elsewhere in the store";
+    let conditions = json!({ "hostHeader": "bids.example.com" });
+    let kept = fabric.linked_pair(case, "token-kept").await;
+    // A second pair, whose link is what the test releases.
+    let released = fabric.linked_pair(case, "token-released").await;
+
+    let created = fabric
+        .create_rule(
+            &kept.responder_id,
+            &kept.link_id,
+            "token-rule",
+            7,
+            conditions.clone(),
+            None,
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: expected CreateLinkRoutingRule to answer 200, got {} {:?}",
+        created.status, created.body
+    );
+
+    let deleted = fabric
+        .send(
+            "DELETE",
+            &format!(
+                "/gateway/{}/link/{}",
+                released.requester_id, released.link_id
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case {case:?}: expected DeleteLink to answer 200, got {} {:?}",
+        deleted.status, deleted.body
+    );
+
+    // Only the released resources' records go: the rule this token minted is still
+    // stored, so the replay answers it rather than minting a second rule.
+    let replay = fabric
+        .create_rule(
+            &kept.responder_id,
+            &kept.link_id,
+            "token-rule",
+            7,
+            conditions,
+            None,
+        )
+        .await;
+    assert_eq!(
+        replay.status, 200,
+        "case {case:?}: expected the replay to answer 200, got {} {:?}",
+        replay.status, replay.body
+    );
+    assert_eq!(
+        replay.body["ruleId"], created.body["ruleId"],
+        "case {case:?}: expected the replay to answer the stored rule {:?}, got {:?}",
+        created.body["ruleId"], replay.body["ruleId"]
+    );
+    assert_eq!(
+        replay.body["createdAt"], created.body["createdAt"],
+        "case {case:?}: expected the replay to answer the stored rule's createdAt {:?}, got {:?}",
+        created.body["createdAt"], replay.body["createdAt"]
+    );
+
+    // The same holds for a gateway that is still stored: the delete above released a
+    // link, not either gateway of the kept pair.
+    let gateway_replay = fabric
+        .send(
+            "POST",
+            "/requester-gateway",
+            Some(requester_gateway_body("token-kept-requester")),
+        )
+        .await;
+    assert_eq!(
+        gateway_replay.status, 200,
+        "case {case:?}: expected CreateRequesterGateway to answer 200, got {} {:?}",
+        gateway_replay.status, gateway_replay.body
+    );
+    assert_eq!(
+        text(&gateway_replay.body, "gatewayId"),
+        kept.requester_id,
+        "case {case:?}: expected the replay to answer the stored gateway {:?}, got {:?}",
+        kept.requester_id,
+        gateway_replay.body["gatewayId"]
+    );
 }
