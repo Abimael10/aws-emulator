@@ -46,8 +46,11 @@ use super::table_bucket_encryption::reported;
 /// The KMS keys this suite's rows name: two in the region most rows work in and
 /// two in the other one, so a row can move a bucket from one key to another
 /// without leaving the region that holds them.
+///
+/// Shared with the suites that read a bucket's encryption beside its other reads,
+/// so the key fixture is declared once for this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Key {
+pub(crate) enum Key {
     First,
     Second,
     West,
@@ -55,7 +58,7 @@ enum Key {
 }
 
 /// The ARNs KMS minted for those keys in this run.
-struct Keys {
+pub(crate) struct Keys {
     first: String,
     second: String,
     west: String,
@@ -63,18 +66,24 @@ struct Keys {
 }
 
 impl Keys {
+    /// The Region [`Key::First`] and [`Key::Second`] are created in.
+    pub(crate) const REGION: &'static str = "us-east-1";
+
+    /// The Region [`Key::West`] and [`Key::WestSecond`] are created in.
+    pub(crate) const OTHER_REGION: &'static str = "eu-west-1";
+
     /// Create every key, each in the region the rows that name it work in.
-    async fn create(emulator: &Emulator) -> Self {
+    pub(crate) async fn create(emulator: &Emulator) -> Self {
         Self {
-            first: emulator.create_kms_key("us-east-1").await,
-            second: emulator.create_kms_key("us-east-1").await,
-            west: emulator.create_kms_key("eu-west-1").await,
-            west_second: emulator.create_kms_key("eu-west-1").await,
+            first: emulator.create_kms_key(Self::REGION).await,
+            second: emulator.create_kms_key(Self::REGION).await,
+            west: emulator.create_kms_key(Self::OTHER_REGION).await,
+            west_second: emulator.create_kms_key(Self::OTHER_REGION).await,
         }
     }
 
     /// The ARN of one slot.
-    fn arn(&self, key: Key) -> &str {
+    pub(crate) fn arn(&self, key: Key) -> &str {
         match key {
             Key::First => &self.first,
             Key::Second => &self.second,
@@ -88,7 +97,7 @@ impl Keys {
 const NAMESPACE: &str = "put_encryption_ns";
 
 /// An `encryptionConfiguration`, as `(sseAlgorithm, the key slot)`.
-type Configuration = (&'static str, Option<Key>);
+pub(crate) type Configuration = (&'static str, Option<Key>);
 
 /// A configuration as a row ASSERTS it: the algorithm, and the key ARN resolved
 /// from the slot the row named.
@@ -111,7 +120,7 @@ struct Case {
 }
 
 /// The body member a put (or a create) carries for `configuration`.
-fn configuration_member(configuration: Configuration, keys: &Keys) -> Value {
+pub(crate) fn configuration_member(configuration: Configuration, keys: &Keys) -> Value {
     let (algorithm, key) = configuration;
     let mut members = Map::new();
     members.insert("sseAlgorithm".to_string(), json!(algorithm));
