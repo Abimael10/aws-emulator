@@ -104,15 +104,17 @@ fn create_body(
 // The tenants under test
 // ---------------------------------------------------------------------------
 
-/// Where a tenant's web ACL customization comes from, as an index into [`WEB_ACLS`].
+/// Where a tenant's web ACL customization comes from.
 #[derive(Debug, Clone, Copy)]
 enum WebAcl {
     /// The record carries no web ACL customization at all.
     Absent,
-    /// The create states the customization.
+    /// The create states the customization, naming the [`WEB_ACLS`] form at this index — a
+    /// create states the identifier it is given.
     StatedByTheCreate(usize),
-    /// A later `AssociateDistributionTenantWebACL` call writes it.
-    WrittenByACall(usize),
+    /// A later `AssociateDistributionTenantWebACL` call writes it, naming a web ACL WAF
+    /// holds, since that call resolves the web ACL it is handed.
+    WrittenByACall,
 }
 
 /// One row: a tenant staged with invalidations and a web ACL, then deleted.
@@ -147,7 +149,7 @@ const ROWS: &[Row] = &[
         slug: "scope-none",
         domains: 1,
         batches: &[],
-        web_acl: WebAcl::WrittenByACall(0),
+        web_acl: WebAcl::WrittenByACall,
     },
     Row {
         case: "one invalidation, one domain, a web ACL stated by the create",
@@ -161,7 +163,7 @@ const ROWS: &[Row] = &[
         slug: "scope-three",
         domains: 2,
         batches: &[&["/*"], &["/a.css", "/b.css"], &["/images/*"]],
-        web_acl: WebAcl::WrittenByACall(3),
+        web_acl: WebAcl::WrittenByACall,
     },
     Row {
         case: "two invalidations, two domains, no web ACL at all",
@@ -179,7 +181,7 @@ const KEEPER: Row = Row {
     slug: "scope-keeper",
     domains: 1,
     batches: &[&["/keep/*"], &["/keep/one.html", "/keep/two.html"]],
-    web_acl: WebAcl::WrittenByACall(2),
+    web_acl: WebAcl::WrittenByACall,
 };
 
 /// A tenant as it stands once its invalidations and its web ACL are in place.
@@ -192,7 +194,7 @@ struct Staged {
     /// The invalidations held under the tenant, in creation order.
     invalidations: Vec<String>,
     /// The web ACL ARN the record's customization names, when it carries one.
-    web_acl: Option<&'static str>,
+    web_acl: Option<String>,
 }
 
 /// Create one tenant for `row` under `distribution_id`, with its invalidations and its web
@@ -254,10 +256,20 @@ async fn stage(router: &MultiServiceRouter, distribution_id: &str, row: &Row) ->
 
     let web_acl = match row.web_acl {
         WebAcl::Absent => None,
-        WebAcl::StatedByTheCreate(index) => Some(WEB_ACLS[index].1),
-        WebAcl::WrittenByACall(index) => {
-            let arn = WEB_ACLS[index].1;
-            let associated = associate(router, &id, arn, Some(&etag)).await;
+        WebAcl::StatedByTheCreate(index) => Some(WEB_ACLS[index].1.to_string()),
+        WebAcl::WrittenByACall => {
+            // The association resolves the web ACL, so the one this row writes by a call is
+            // created in WAF first, under a name of this row's own.
+            let arn = crate::waf_control_plane::create_web_acl(
+                router,
+                &format!("delete-scope-{}", row.slug),
+                crate::waf_control_plane::SCOPE_CLOUDFRONT,
+                "{\"Allow\":{}}",
+                "",
+            )
+            .await
+            .arn;
+            let associated = associate(router, &id, &arn, Some(&etag)).await;
             assert_eq!(
                 associated.status, 200,
                 "case {case}: expected HTTP 200 associating {arn}, got {} with {}",
@@ -308,7 +320,8 @@ async fn assert_intact(router: &MultiServiceRouter, staged: &Staged, case: &str)
     let reported = web_acl_of(read.root());
     let expected = staged
         .web_acl
-        .map(|arn| (CUSTOMIZATION_ACTION_OVERRIDE.to_string(), arn.to_string()));
+        .as_ref()
+        .map(|arn| (CUSTOMIZATION_ACTION_OVERRIDE.to_string(), arn.clone()));
     assert_eq!(
         reported, expected,
         "case {case}: expected the untouched tenant to report web ACL customization \

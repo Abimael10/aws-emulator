@@ -13,10 +13,10 @@
 //! mints is the only one a following call satisfies: the superseded token fails the
 //! precondition and changes nothing.
 //!
-//! The rows differ along what the rule generalises over: the FORM of the web ACL named
-//! (every entry of [`crate::web_acl_association::WEB_ACLS`] — the WAF generation, the
-//! account, the partition and the bare WAF Classic id), the LENGTH of the chain of
-//! associations a tenant is put through (each form in turn on one tenant, then the last one
+//! The rows differ along what the rule generalises over: WHICH web ACL is named (every entry
+//! of [`crate::web_acl_association::held_web_acls`] — web ACLs WAF really holds, since the
+//! association resolves the one it is handed), the LENGTH of the chain of
+//! associations a tenant is put through (each one in turn on one tenant, then the last one
 //! repeated), what the tenant already carries (every entry of
 //! [`crate::tenant_web_acl_association::STARTS`]), and WHICH tenant of a set the call names.
 //!
@@ -33,7 +33,7 @@ use crate::distribution_tenant_lifecycle::multi_tenant_distribution;
 use crate::tenant_web_acl_association::{
     associate, create_tenant, read_tenant, web_acl_of, STARTS,
 };
-use crate::web_acl_association::{associate_web_acl, read_back, WEB_ACLS};
+use crate::web_acl_association::{associate_web_acl, held_web_acls, read_back, HELD_WEB_ACLS};
 
 /// How many `WebAcl` elements the tenant's `Customizations` carries, and how many `Arn`
 /// elements that one member carries: the member holds ONE web ACL, so a read reports it once
@@ -87,6 +87,7 @@ async fn associate_ok(
 async fn each_association_replaces_the_tenants_one_web_acl() {
     let router = emulator();
     let distribution_id = multi_tenant_distribution(&router, "ref-tenant-web-acl-replace").await;
+    let web_acls = held_web_acls(&router).await;
 
     for (start_index, start) in STARTS.iter().enumerate() {
         let slug = format!("r{start_index}x");
@@ -94,13 +95,13 @@ async fn each_association_replaces_the_tenants_one_web_acl() {
             create_tenant(&router, &distribution_id, &slug, start.case, *start).await;
         let mut etag = created_etag;
 
-        // Every form in turn on the SAME tenant, then the last form once more: a chain of
-        // associations, each of which has to leave one web ACL behind rather than a second
+        // Every held web ACL in turn on the SAME tenant, then the last one once more: a chain
+        // of associations, each of which has to leave one web ACL behind rather than a second
         // one beside it.
-        let chain: Vec<&str> = WEB_ACLS
+        let chain: Vec<&str> = web_acls
             .iter()
-            .map(|(_, arn)| *arn)
-            .chain(std::iter::once(WEB_ACLS[WEB_ACLS.len() - 1].1))
+            .map(|(_, arn)| arn.as_str())
+            .chain(std::iter::once(web_acls[web_acls.len() - 1].1.as_str()))
             .collect();
 
         for (step, web_acl) in chain.iter().enumerate() {
@@ -146,7 +147,7 @@ async fn each_association_replaces_the_tenants_one_web_acl() {
             // The version the call superseded no longer satisfies the precondition, and the
             // refused call leaves the member and the version exactly as the served one left
             // them.
-            let stale = associate(&router, &id, WEB_ACLS[0].1, Some(&superseded)).await;
+            let stale = associate(&router, &id, web_acls[0].1.as_str(), Some(&superseded)).await;
             assert_eq!(
                 stale.status, 412,
                 "case {case}: expected HTTP 412 from the superseded version {superseded:?}, got \
@@ -195,23 +196,27 @@ struct Snapshot {
 /// parent distribution are untouched — same web ACL, same version.
 #[tokio::test]
 async fn an_association_reaches_only_the_named_tenant() {
-    // One row per web ACL form the association names, each naming a different position of
-    // the tenant set, so both the forms and the positions are spanned.
-    for (index, (acl_case, web_acl)) in WEB_ACLS.iter().enumerate() {
+    // One row per held web ACL the association names, each naming a different position of
+    // the tenant set, so both the web ACLs and the positions are spanned. A fresh emulator per
+    // row, so what the row observes is what the row caused — and the web ACLs are created in
+    // that row's own WAF.
+    let rows = HELD_WEB_ACLS.len();
+    for index in 0..rows {
+        let router = emulator();
+        let web_acls = held_web_acls(&router).await;
+        let (acl_case, web_acl) = (web_acls[index].0, web_acls[index].1.clone());
         let target = index % STARTS.len();
         let case = format!("{acl_case}/{}", STARTS[target].case);
         let case = case.as_str();
-        // A fresh emulator per row, so what the row observes is what the row caused.
-        let router = emulator();
         let distribution_id =
             multi_tenant_distribution(&router, &format!("ref-assoc-scope-{index}")).await;
 
         // The parent distribution names a web ACL of its own — the one a tenant's
         // customization overrides, and which the tenant's association must leave in place.
-        // The forms are a ring, so the distribution's own ACL is not the one associated.
-        let distribution_web_acl = WEB_ACLS[(index + 1) % WEB_ACLS.len()].1;
+        // The web ACLs are a ring, so the distribution's own is not the one associated.
+        let distribution_web_acl = web_acls[(index + 1) % web_acls.len()].1.clone();
         let associated =
-            associate_web_acl(&router, &distribution_id, distribution_web_acl, None).await;
+            associate_web_acl(&router, &distribution_id, &distribution_web_acl, None).await;
         assert_eq!(
             associated.status, 200,
             "case {case}: expected HTTP 200 from AssociateDistributionWebACL, got {} with {}",
@@ -243,13 +248,13 @@ async fn an_association_reaches_only_the_named_tenant() {
 
         // The call under test: the tenant at `target`, at the version it stands at.
         let named = tenants[target].clone();
-        let minted = associate_ok(&router, &named.id, web_acl, &named.etag, case).await;
+        let minted = associate_ok(&router, &named.id, &web_acl, &named.etag, case).await;
 
         let read = read_tenant(&router, &named.id, case).await;
         let reported = web_acl_of(read.root());
         let expected = Some((
             CUSTOMIZATION_ACTION_OVERRIDE.to_string(),
-            (*web_acl).to_string(),
+            web_acl.clone(),
         ));
         assert_eq!(
             reported, expected,

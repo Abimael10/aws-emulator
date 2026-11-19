@@ -30,19 +30,7 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{past_propagation, API_VERSION, HOST};
-
-/// The WAFv2 control plane's own endpoint, which is what routes a request to that service.
-const WAF_HOST: &str = "wafv2.amazonaws.com";
-
-/// The `X-Amz-Target` prefix WAFv2's `awsJson1_1` operations are named under, from that
-/// model's `targetPrefix`.
-const WAF_TARGET: &str = "AWSWAF_20190729";
-
-/// A SigV4 credential scope naming WAFv2's signing name, so the router resolves that
-/// service for the setup calls.
-const WAF_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20260101/us-east-1/wafv2/aws4_request, \
-     SignedHeaders=host, Signature=abc";
+use crate::waf_control_plane::SCOPE_CLOUDFRONT;
 
 /// The viewer path the blocking rule matches. The `SearchString` that matches it is the
 /// base64 of `blockme` in [`BLOCKING_RULE`] — `ByteMatchStatement$SearchString` is a blob,
@@ -63,57 +51,22 @@ fn emulator_with_waf() -> MultiServiceRouter {
     router
 }
 
-/// Call one WAFv2 operation and answer its JSON body.
-async fn waf_call(router: &MultiServiceRouter, operation: &str, body: &str) -> (u16, String) {
-    let request = ::http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("host", WAF_HOST)
-        .header("authorization", WAF_AUTHORIZATION)
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("{WAF_TARGET}.{operation}"))
-        .body(::bytes::Bytes::from(body.to_string()))
-        .expect("the setup request is well formed");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let body = String::from_utf8_lossy(&response.into_body()).to_string();
-    (status, body)
-}
-
 /// Create one web ACL whose rules are `rules` and whose default action is `default_action`,
 /// and answer the ARN WAFv2 minted for it.
 ///
-/// The ARN is read out of the create's own answer (`Summary.ARN`), never built here: it is
-/// the identifier that service assigned, and it is what a distribution's configuration
-/// names.
+/// The ARN is read out of the create's own answer, never built here: it is the identifier that
+/// service assigned, and it is what a distribution's configuration names. The call itself is
+/// [`crate::waf_control_plane`]'s, so this suite and the association suites reach WAFv2 the
+/// same way.
 async fn create_web_acl(
     router: &MultiServiceRouter,
     name: &str,
     default_action: &str,
     rules: &str,
 ) -> String {
-    let body = format!(
-        "{{\"Name\":\"{name}\",\"Scope\":\"CLOUDFRONT\",\
-         \"DefaultAction\":{default_action},\
-         \"VisibilityConfig\":{{\"SampledRequestsEnabled\":false,\
-         \"CloudWatchMetricsEnabled\":false,\"MetricName\":\"{name}\"}},\
-         \"Rules\":[{rules}]}}"
-    );
-    let (status, answered) = waf_call(router, "CreateWebACL", &body).await;
-    assert_eq!(
-        status, 200,
-        "case {name}: expected HTTP 200 from CreateWebACL, got {status} with {answered}"
-    );
-    let marker = "\"ARN\":\"";
-    let start = answered
-        .find(marker)
-        .unwrap_or_else(|| panic!("case {name}: CreateWebACL answered no ARN: {answered}"))
-        + marker.len();
-    let rest = &answered[start..];
-    let end = rest
-        .find('"')
-        .unwrap_or_else(|| panic!("case {name}: CreateWebACL's ARN is unterminated: {answered}"));
-    rest[..end].to_string()
+    crate::waf_control_plane::create_web_acl(router, name, SCOPE_CLOUDFRONT, default_action, rules)
+        .await
+        .arn
 }
 
 /// A rule that BLOCKS a viewer request whose URI path contains `blockme`.

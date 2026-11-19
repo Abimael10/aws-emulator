@@ -17,14 +17,16 @@
 //!
 //! The rows below span what that rule generalises over: WHICH form the identifier takes
 //! (the `wafv2` ARN in two scopes and a second partition, a WAF Classic ARN, a bare WAF
-//! Classic id), HOW the association got onto the distribution (named in the create's
-//! configuration, set by `AssociateDistributionWebACL`, moved from one web ACL to
-//! another), how many distributions share one web ACL (so a page can cut inside a matching
-//! set), distributions associated with no web ACL at all, and a well-formed identifier no
-//! distribution carries.
+//! Classic id, and a web ACL WAF really holds), HOW the association got onto the distribution
+//! (named in the create's configuration, set by `AssociateDistributionWebACL`, moved from one
+//! web ACL to another), how many distributions share one web ACL (so a page can cut inside a
+//! matching set), distributions associated with no web ACL at all, and a well-formed
+//! identifier no distribution carries.
 //!
-//! The identifier catalog is [`crate::web_acl_association::WEB_ACLS`], whose source is the
-//! model's own documentation of `DistributionConfig$WebACLId`; the wire harness (the
+//! The identifier catalog is [`catalog`]: the forms a CONFIGURATION may name
+//! ([`crate::web_acl_association::WEB_ACLS`], whose source is the model's own documentation
+//! of `DistributionConfig$WebACLId`) plus one web ACL WAF holds, because
+//! `AssociateDistributionWebACL` resolves the web ACL it is handed. The wire harness (the
 //! router, the request helpers and the element scanner) is the one
 //! [`crate::distribution_lifecycle`] builds.
 
@@ -37,11 +39,36 @@ use crate::distribution_lifecycle::{
     call, create_distribution, emulator, get_distribution, is_distribution_id, list_distributions,
     Answer, Node, API_VERSION,
 };
+use crate::waf_control_plane::{create_web_acl, SCOPE_CLOUDFRONT};
 use crate::web_acl_association::{associate_web_acl, WEB_ACLS};
+
+/// The identifiers under test, in the order the rows index them: every form a CONFIGURATION
+/// may name ([`WEB_ACLS`]), then one web ACL WAF really HOLDS, created through its own
+/// control plane on this router — the association call resolves the web ACL it is handed, so
+/// only such a one can be put on a distribution by a call rather than by a create.
+async fn catalog(router: &MultiServiceRouter) -> Vec<(&'static str, String)> {
+    let mut identifiers: Vec<(&'static str, String)> = WEB_ACLS
+        .iter()
+        .map(|(case, arn)| (*case, (*arn).to_string()))
+        .collect();
+    identifiers.push((
+        "a web ACL WAF holds",
+        create_web_acl(
+            router,
+            "by-web-acl-id-held",
+            SCOPE_CLOUDFRONT,
+            "{\"Allow\":{}}",
+            "",
+        )
+        .await
+        .arn,
+    ));
+    identifiers
+}
 
 /// One distribution under test: the web ACL its create names in its configuration, and the
 /// web ACL a later `AssociateDistributionWebACL` call puts on it. Each index is into
-/// [`WEB_ACLS`]; `None` is "no web ACL".
+/// [`catalog`]; `None` is "no web ACL".
 #[derive(Debug, Clone, Copy)]
 struct Row {
     case: &'static str,
@@ -58,9 +85,13 @@ impl Row {
     }
 }
 
-/// The index in [`WEB_ACLS`] no row below ever associates, so a well-formed identifier
+/// The index in [`catalog`] no row below ever associates, so a well-formed identifier
 /// nothing carries is covered.
 const UNUSED_WEB_ACL: usize = 4;
+
+/// The catalog index of the web ACL WAF holds, which is the one an association CALL can put
+/// on a distribution.
+const HELD_WEB_ACL: usize = 5;
 
 const ROWS: &[Row] = &[
     Row {
@@ -104,21 +135,16 @@ const ROWS: &[Row] = &[
         associated: None,
     },
     Row {
-        case: "created with no web ACL, then associated with another account's global one",
+        case: "created with no web ACL, then associated with a web ACL WAF holds",
         in_config: None,
-        associated: Some(1),
+        associated: Some(HELD_WEB_ACL),
     },
     Row {
-        case: "created under the wafv2 global web ACL, then moved to a WAF Classic ARN",
+        case: "created under the wafv2 global web ACL, then moved to a web ACL WAF holds",
         in_config: Some(0),
-        associated: Some(3),
+        associated: Some(HELD_WEB_ACL),
     },
 ];
-
-/// The identifier of the web ACL at `index`.
-fn web_acl_id(index: usize) -> &'static str {
-    WEB_ACLS[index].1
-}
 
 /// `WebACLId` travels as ONE `@httpLabel` path segment, so the separators inside an ARN are
 /// percent-encoded exactly as an SDK client encodes them.
@@ -168,9 +194,9 @@ fn listed_ids(list: &Node) -> Vec<String> {
 
 /// The `DistributionConfig` a row submits: one origin, one default cache behaviour and the
 /// web ACL the row's create names, if any.
-fn config_xml(caller_reference: &str, row: &Row) -> String {
+fn config_xml(caller_reference: &str, row: &Row, identifiers: &[(&'static str, String)]) -> String {
     let web_acl = match row.in_config {
-        Some(index) => format!("<WebACLId>{}</WebACLId>", web_acl_id(index)),
+        Some(index) => format!("<WebACLId>{}</WebACLId>", identifiers[index].1),
         None => String::new(),
     };
     format!(
@@ -189,10 +215,17 @@ fn config_xml(caller_reference: &str, row: &Row) -> String {
 
 /// Create every row, applying the association call the row asks for, and report the
 /// `(row, id)` pairs.
-async fn seed(router: &MultiServiceRouter) -> Vec<(&'static Row, String)> {
+async fn seed(
+    router: &MultiServiceRouter,
+    identifiers: &[(&'static str, String)],
+) -> Vec<(&'static Row, String)> {
     let mut created = Vec::new();
     for (position, row) in ROWS.iter().enumerate() {
-        let answer = create_distribution(router, &config_xml(&format!("ref-{position}"), row)).await;
+        let answer = create_distribution(
+            router,
+            &config_xml(&format!("ref-{position}"), row, identifiers),
+        )
+        .await;
         assert_eq!(
             answer.status, 201,
             "case {}: expected HTTP 201 from CreateDistribution, got {} with {}",
@@ -205,7 +238,7 @@ async fn seed(router: &MultiServiceRouter) -> Vec<(&'static Row, String)> {
             row.case
         );
         if let Some(index) = row.associated {
-            let associated = associate_web_acl(router, &id, web_acl_id(index), None).await;
+            let associated = associate_web_acl(router, &id, &identifiers[index].1, None).await;
             assert_eq!(
                 associated.status, 200,
                 "case {}: expected HTTP 200 from AssociateDistributionWebACL, got {} with {}",
@@ -347,10 +380,11 @@ async fn stored_web_acl(router: &MultiServiceRouter, id: &str, case: &str) -> St
 #[tokio::test]
 async fn each_web_acl_lists_the_distributions_associated_with_it() {
     let router = emulator();
-    let created = seed(&router).await;
+    let identifiers = catalog(&router).await;
+    let created = seed(&router, &identifiers).await;
     let all_ids = listed_ids_of_distributions(&router).await;
 
-    for (index, (case, web_acl)) in WEB_ACLS.iter().enumerate() {
+    for (index, (case, web_acl)) in identifiers.iter().enumerate() {
         let expected = expected_ids(&created, Some(index));
         let answer = list_by_web_acl(&router, web_acl, "").await;
         assert_eq!(
@@ -386,7 +420,8 @@ async fn each_web_acl_lists_the_distributions_associated_with_it() {
 #[tokio::test]
 async fn the_null_sentinel_lists_the_unassociated_distributions() {
     let router = emulator();
-    let created = seed(&router).await;
+    let identifiers = catalog(&router).await;
+    let created = seed(&router, &identifiers).await;
 
     let expected = expected_ids(&created, None);
     assert!(
@@ -420,10 +455,13 @@ async fn the_null_sentinel_lists_the_unassociated_distributions() {
 #[tokio::test]
 async fn walking_the_pages_enumerates_each_web_acl_exactly_once() {
     let router = emulator();
-    let created = seed(&router).await;
+    let identifiers = catalog(&router).await;
+    let created = seed(&router, &identifiers).await;
 
-    let mut selectors: Vec<(Option<usize>, String)> = (0..WEB_ACLS.len())
-        .map(|index| (Some(index), web_acl_id(index).to_string()))
+    let mut selectors: Vec<(Option<usize>, String)> = identifiers
+        .iter()
+        .enumerate()
+        .map(|(index, (_, arn))| (Some(index), arn.clone()))
         .collect();
     selectors.push((None, WEB_ACL_ID_NONE.to_string()));
 
@@ -446,17 +484,18 @@ async fn walking_the_pages_enumerates_each_web_acl_exactly_once() {
 #[tokio::test]
 async fn an_identifier_nothing_carries_lists_nothing() {
     let router = emulator();
-    let created = seed(&router).await;
+    let identifiers = catalog(&router).await;
+    let created = seed(&router, &identifiers).await;
     assert!(
         expected_ids(&created, Some(UNUSED_WEB_ACL)).is_empty(),
         "the table must leave one catalogued web ACL unassociated"
     );
 
-    let known = web_acl_id(0);
+    let known = identifiers[0].1.clone();
     let absent: Vec<(&str, String)> = vec![
         (
             "a catalogued identifier no distribution carries",
-            web_acl_id(UNUSED_WEB_ACL).to_string(),
+            identifiers[UNUSED_WEB_ACL].1.clone(),
         ),
         ("a known identifier in upper case", known.to_uppercase()),
         (
@@ -512,14 +551,15 @@ async fn an_identifier_nothing_carries_lists_nothing() {
 #[tokio::test]
 async fn an_unusable_page_size_or_marker_is_refused() {
     let router = emulator();
-    seed(&router).await;
+    let identifiers = catalog(&router).await;
+    seed(&router, &identifiers).await;
 
     let refusals: &[(&str, &str, bool)] = &[
         ("?MaxItems=-7", "a negative page size", true),
         ("?MaxItems=not-a-number", "a page size that is no integer", true),
         ("?Marker=not-an-id", "a marker that is no distribution id", false),
     ];
-    for selector in [web_acl_id(0), WEB_ACL_ID_NONE] {
+    for selector in [identifiers[0].1.as_str(), WEB_ACL_ID_NONE] {
         for (query, description, states_the_page_size) in refusals {
             let answer = list_by_web_acl(&router, selector, query).await;
             assert_eq!(
@@ -550,11 +590,14 @@ async fn an_unusable_page_size_or_marker_is_refused() {
 #[tokio::test]
 async fn listing_changes_nothing_a_later_caller_sees() {
     let router = emulator();
-    let created = seed(&router).await;
+    let identifiers = catalog(&router).await;
+    let created = seed(&router, &identifiers).await;
     let before = listed_ids_of_distributions(&router).await;
 
-    for (index, selector) in (0..WEB_ACLS.len())
-        .map(|index| (Some(index), web_acl_id(index).to_string()))
+    for (index, selector) in identifiers
+        .iter()
+        .enumerate()
+        .map(|(index, (_, arn))| (Some(index), arn.clone()))
         .chain(std::iter::once((None, WEB_ACL_ID_NONE.to_string())))
     {
         let expected = expected_ids(&created, index);

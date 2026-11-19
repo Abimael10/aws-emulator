@@ -12,14 +12,17 @@
 //! clock owes it the terminal status, because the new configuration has to reach the edge
 //! locations.
 //!
-//! What the association does NOT do is resolve the web ACL: a web ACL is a WAF resource,
-//! not one this store holds, so WHICH web ACL of CloudFront's own namespace a caller named
-//! is not decided here. What IS decided about the value is the namespace it names: a
-//! distribution is protected by the web ACLs of the global namespace alone — the one WAFv2's
-//! `CLOUDFRONT` scope is "for a global resource type, such as a Amazon CloudFront
-//! distribution" — so an ARN naming a web ACL of the regional namespace, or another resource
-//! of either, is the modelled `InvalidArgument` and nothing is mutated, and so is naming no
-//! web ACL at all. The other two modelled errors have no condition here: `AccessDenied`
+//! What the association DOES resolve is the web ACL itself: a web ACL is a WAF resource, so
+//! whether the account has the one a request names is a question only WAF can answer, and
+//! CloudFront asks it before it writes anything — "specify a web ACL that was previously
+//! validated" is what it tells a caller that named one it could not resolve
+//! ([`crate::service::web_acl::associable`]). Both halves of that resolution refuse the same
+//! modelled `InvalidArgument` with nothing mutated: a value naming no web ACL WAF holds, and
+//! one naming a web ACL outside the namespace a distribution is protected by — the web ACLs
+//! of the global namespace alone, the one WAFv2's `CLOUDFRONT` scope is "for a global
+//! resource type, such as a Amazon CloudFront distribution" — so an ARN naming a web ACL of
+//! the regional namespace, another resource of either, a WAF Classic identifier or no web ACL
+//! at all is refused. The other two modelled errors have no condition here: `AccessDenied`
 //! belongs to the authorization the emulator does not perform, and `EntityLimitExceeded`
 //! reports a quota on an entity count, while an association creates no entity and CloudFront
 //! publishes no bound on how many distributions one web ACL may be associated with, so
@@ -173,6 +176,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::store_unavailable());
         };
+
+        // WHICH web ACL the request named is resolved against WAF — the service that holds
+        // web ACLs — and it is resolved BEFORE this service's store is locked, so the two
+        // stores are never held at the same time. The answer decides nothing until the
+        // sequence below reaches the argument, so a request that fails an earlier condition
+        // still earns that condition's refusal.
+        let web_acl_arn = input.web_acl_arn.trim();
+        let web_acl_resolves = crate::service::web_acl::associable(&*self.engine, web_acl_arn);
+
         let now = SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
@@ -216,12 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The Amazon Resource Name (ARN) of the WAF web ACL to associate" is what this
-        // member carries, and a web ACL is a WAF resource this store cannot resolve — so
-        // the one thing decidable about WHICH web ACL it names is whether the request named
-        // one at all. A blank value names none, which is the modelled `InvalidArgument`
-        // rather than an association of nothing. The value is read ONCE here, so the ARN
+        // member carries, so the first thing decidable about it is whether the request named
+        // a web ACL at all. A blank value names none, which is the modelled `InvalidArgument`
+        // rather than an association of nothing. The value was read ONCE above, so the ARN
         // that is judged below is the ARN that is stored.
-        let web_acl_arn = input.web_acl_arn.trim();
         if web_acl_arn.is_empty() {
             return Err(AssociateDistributionWebACLErrorModeled::InvalidArgument(
                 InvalidArgument {
@@ -234,13 +244,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A distribution is protected by the web ACLs of ONE WAFv2 namespace — the global
-        // one the `CLOUDFRONT` scope names — so an ARN naming a web ACL of the regional
-        // namespace (or another resource of either) names nothing WAF would enforce in
-        // front of this distribution ([`crate::state::associable_web_acl_arn`]). It is
-        // refused BEFORE the configuration is written, so nothing is mutated and no version
-        // is minted: a later read still reports the web ACL the distribution had.
-        if !crate::state::associable_web_acl_arn(web_acl_arn) {
+        // An association is admitted only for a web ACL that RESOLVES
+        // ([`crate::service::web_acl::associable`]): one WAF really holds, of the global
+        // namespace a distribution is protected by — the `CLOUDFRONT` scope is the one "for
+        // a global resource type, such as a Amazon CloudFront distribution". A value that
+        // names no such web ACL — one that was never created or has been deleted, a web ACL
+        // of the regional namespace, another resource of either, an identifier that is no
+        // WAFv2 web ACL ARN at all — is the modelled `InvalidArgument`, and it is refused
+        // BEFORE the configuration is written, so nothing is mutated and no version is
+        // minted: a later read still reports the web ACL the distribution had.
+        if !web_acl_resolves {
             return Err(AssociateDistributionWebACLErrorModeled::InvalidArgument(
                 crate::state::invalid_web_acl(),
             )

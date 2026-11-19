@@ -29,7 +29,6 @@ use crate::distribution_tenant_lifecycle::multi_tenant_distribution;
 use crate::distribution_tenant_update::{update_tenant, update_xml};
 use crate::distribution_tenants_list::{list_body, list_tenants, summaries};
 use crate::tenant_web_acl_association::{associate, create_tenant, Start, STARTS};
-use crate::web_acl_association::WEB_ACLS;
 
 // ---------------------------------------------------------------------------
 // The tenants under test
@@ -103,7 +102,18 @@ async fn apply(
             .await
         }
         Versioned::AWebAclAssociation => {
-            associate(router, id, WEB_ACLS[0].1, Some(current)).await
+            // The association resolves the web ACL, so the one this row associates is created
+            // in WAF first, under a name of this tenant's own so no two rows collide.
+            let web_acl = crate::waf_control_plane::create_web_acl(
+                router,
+                &format!("version-token-{id}"),
+                crate::waf_control_plane::SCOPE_CLOUDFRONT,
+                "{\"Allow\":{}}",
+                "",
+            )
+            .await
+            .arn;
+            associate(router, id, &web_acl, Some(current)).await
         }
     };
     assert_eq!(

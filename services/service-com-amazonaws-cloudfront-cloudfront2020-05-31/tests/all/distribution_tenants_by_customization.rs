@@ -861,10 +861,20 @@ async fn a_tenant_joins_and_leaves_a_listing_as_its_record_changes() {
         .expect("the table creates a tenant with no customizations")
         .clone();
 
-    // The web ACL the association names is one the table already stored a tenant under, so
-    // the listing it joins starts as whatever the creates put there — read off the table
-    // rather than assumed.
-    let web_acl = WEB_ACLS[1].1;
+    // The web ACL the association names is one WAF really HOLDS, because the association
+    // resolves the web ACL it is handed; nothing was created under it, so the listing the
+    // tenant joins starts as whatever the creates put there — read off the table rather than
+    // assumed.
+    let web_acl = crate::waf_control_plane::create_web_acl(
+        &router,
+        "by-customization-joins",
+        crate::waf_control_plane::SCOPE_CLOUDFRONT,
+        "{\"Allow\":{}}",
+        "",
+    )
+    .await
+    .arn;
+    let web_acl = web_acl.as_str();
     let before = expected_ids(&created, Kind::WebAcl, web_acl);
     let answer = list_by_customization(&router, &body_for(Kind::WebAcl, web_acl, None, None)).await;
     assert_eq!(

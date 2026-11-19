@@ -66,11 +66,6 @@ const ANYCAST_IP_LIST_NOT_FOUND: &str = "The specified Anycast IP list does not 
 /// The sentence every read of a distribution tenant the store does not hold answers with.
 const TENANT_NOT_FOUND: &str = "The specified distribution tenant doesn't exist.";
 
-/// A WAF web ACL ARN an association names. Nothing resolves it, so it only has to be a
-/// non-blank value the association can store.
-const WEB_ACL_ARN: &str =
-    "arn:aws:wafv2:us-east-1:000000000000:global/webacl/PathIdShape/473e64fd-f30b-4765-81a0-62ad96dd167a";
-
 /// An invalidation id the tenant-scoped read addresses — never minted, so what the read
 /// answers is decided by the TENANT identifier the row varies.
 const INVALIDATION_ID: &str = "I1111111111111";
@@ -172,6 +167,12 @@ const OPS: &[Op] = &[
 
 /// Call `op` with `id` as its path identifier, over the operation's own wire binding.
 ///
+/// A number no other call of this suite uses, for naming a resource another service mints.
+fn next_serial() -> usize {
+    static NEXT: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
+    NEXT.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `version` is the `If-Match` the mutations run under.
 async fn call_op(router: &MultiServiceRouter, op: Op, id: &str, version: &str) -> Answer {
     match op {
@@ -210,7 +211,19 @@ async fn call_op(router: &MultiServiceRouter, op: Op, id: &str, version: &str) -
             .await
         }
         Op::AssociateDistributionTenantWebAcl => {
-            associate(router, id, WEB_ACL_ARN, Some(version)).await
+            // The association RESOLVES the web ACL it is handed, so the ARN this call names is
+            // one created in WAF for it; the serial keeps each created web ACL's WAF name its
+            // own, so no two calls collide over it.
+            let arn = crate::waf_control_plane::create_web_acl(
+                router,
+                &format!("path-id-shape-{}", next_serial()),
+                crate::waf_control_plane::SCOPE_CLOUDFRONT,
+                "{\"Allow\":{}}",
+                "",
+            )
+            .await
+            .arn;
+            associate(router, id, &arn, Some(version)).await
         }
         Op::DisassociateDistributionTenantWebAcl => disassociate(router, id, Some(version)).await,
         Op::CreateInvalidationForDistributionTenant => {

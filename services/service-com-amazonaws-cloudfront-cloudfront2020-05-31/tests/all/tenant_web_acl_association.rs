@@ -19,14 +19,14 @@
 //!   operations model for an entity they cannot find;
 //! * a disassociation is IDEMPOTENT: a tenant with no web ACL customization is answered,
 //!   not refused, and ends in the same state as one that had its customization removed;
-//! * a request that names no web ACL at all is `InvalidArgument` (HTTP 400): a web ACL is a
-//!   WAF resource this service cannot resolve, so whether one was named is the only thing
-//!   about the value the association decides;
+//! * a request that names no web ACL at all is `InvalidArgument` (HTTP 400), and so is one
+//!   naming a web ACL WAF does not hold: the association resolves the web ACL against WAF
+//!   before it writes anything ([`crate::associated_web_acl_resolution`] is that rule);
 //! * the propagation a write owes the tenant is the CLOCK's, as it is for a distribution.
 //!
-//! The rows differ along what the rule generalises over: the FORM of the web ACL named
-//! (each entry of [`crate::web_acl_association::WEB_ACLS`] — the WAF generation, the
-//! account, the partition and the bare WAF Classic id), and what the tenant already carries
+//! The rows differ along what the rule generalises over: WHICH web ACL is named (each entry
+//! of [`crate::web_acl_association::held_web_acls`] — web ACLs WAF really holds, differing in
+//! their rules, their names and their default action), and what the tenant already carries
 //! (no customizations at all, customizations that are not about a web ACL, a web ACL
 //! already overridden, and a web ACL explicitly disabled).
 //!
@@ -41,12 +41,12 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
-    call, emulator, is_version_token, past_propagation, Answer, Node, API_VERSION,
+    call, emulator, is_version_token, Answer, Node, API_VERSION, POLL_INTERVAL, READY_DEADLINE,
 };
 use crate::distribution_tenant_lifecycle::{
     create_distribution_tenant, escape, managed_certificate_request, multi_tenant_distribution,
 };
-use crate::web_acl_association::{Stated, WEB_ACLS};
+use crate::web_acl_association::{held_web_acls, Stated};
 
 // ---------------------------------------------------------------------------
 // Calling the tenant web ACL surface
@@ -265,8 +265,9 @@ pub(crate) async fn create_tenant(
 async fn associating_and_disassociating_move_the_tenants_web_acl() {
     let router = emulator();
     let distribution_id = multi_tenant_distribution(&router, "ref-tenant-web-acl").await;
+    let web_acls = held_web_acls(&router).await;
 
-    for (acl_index, (acl_case, web_acl)) in WEB_ACLS.iter().enumerate() {
+    for (acl_index, (acl_case, web_acl)) in web_acls.iter().enumerate() {
         for (start_index, start) in STARTS.iter().enumerate() {
             let case = format!("{acl_case}/{}", start.case);
             let slug = format!("t{acl_index}x{start_index}");
@@ -303,7 +304,7 @@ async fn associating_and_disassociating_move_the_tenants_web_acl() {
             );
             assert_eq!(
                 associated.root().text_at("WebACLArn"),
-                Some(*web_acl),
+                Some(web_acl.as_str()),
                 "case {case}: expected the answer to name web ACL {web_acl:?}, got {:?}",
                 associated.root().text_at("WebACLArn")
             );
@@ -326,7 +327,7 @@ async fn associating_and_disassociating_move_the_tenants_web_acl() {
                 web_acl_of(read.root()),
                 Some((
                     CUSTOMIZATION_ACTION_OVERRIDE.to_string(),
-                    (*web_acl).to_string()
+                    web_acl.clone()
                 )),
                 "case {case}: expected the read to report the associated web ACL, got {:?} in {}",
                 web_acl_of(read.root()),
@@ -490,7 +491,8 @@ const PRECONDITIONS: &[Precondition] = &[
 async fn the_tenants_version_is_a_required_precondition() {
     let router = emulator();
     let distribution_id = multi_tenant_distribution(&router, "ref-tenant-web-acl-if-match").await;
-    let web_acl = WEB_ACLS[0].1;
+    let web_acls = held_web_acls(&router).await;
+    let web_acl = web_acls[0].1.as_str();
 
     for (index, row) in PRECONDITIONS.iter().enumerate() {
         for (which, associating) in [("associate", true), ("disassociate", false)] {
@@ -576,7 +578,8 @@ async fn the_tenants_version_is_a_required_precondition() {
 #[tokio::test]
 async fn an_unheld_tenant_is_not_found() {
     let router = emulator();
-    let web_acl = WEB_ACLS[0].1;
+    let web_acls = held_web_acls(&router).await;
+    let web_acl = web_acls[0].1.as_str();
 
     for (case, id, status, code) in [
         (
@@ -664,27 +667,51 @@ async fn an_association_naming_no_web_acl_is_refused() {
     }
 }
 
+/// Look again until the distribution tenant `id` reports itself [`STATUS_DEPLOYED`] — the
+/// status the CLOCK owes the record after a write — or [`READY_DEADLINE`] passes, which fails
+/// the case.
+///
+/// The tenant counterpart of [`crate::distribution_lifecycle::awaited_deployment`], under the
+/// same policy: the CONDITION is what is waited for, never a span of the host's clock, so no
+/// case here depends on how fast the host runs.
+///
+/// `pub(crate)` so every suite that waits for a tenant's deployment waits for it the same
+/// way.
+pub(crate) async fn awaited_tenant_deployment(
+    router: &MultiServiceRouter,
+    case: &str,
+    id: &str,
+) -> Answer {
+    let deadline = ::std::time::Instant::now() + READY_DEADLINE;
+    loop {
+        let read = read_tenant(router, id, case).await;
+        if read.root().text_at("Status") == Some(STATUS_DEPLOYED) {
+            return read;
+        }
+        assert!(
+            ::std::time::Instant::now() < deadline,
+            "case {case}: the tenant never reached {STATUS_DEPLOYED}, last answer {}",
+            read.raw
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// The propagation each call owes the tenant is the CLOCK's: the tenant is `InProgress`
-/// straight after the write and `Deployed` once the span has passed, without any call making
-/// it so, and the customization the write landed survives the wait.
+/// straight after the write and `Deployed` once the span the clock owes has passed, without
+/// any call making it so, and the customization the write landed survives the wait.
 #[tokio::test]
 async fn the_clock_settles_the_write() {
     let router = emulator();
     let distribution_id = multi_tenant_distribution(&router, "ref-tenant-web-acl-settle").await;
     let case = "settle";
     let (id, etag) = create_tenant(&router, &distribution_id, "s0x", case, STARTS[0]).await;
-    let web_acl = WEB_ACLS[0].1;
+    let web_acls = held_web_acls(&router).await;
+    let web_acl = web_acls[0].1.as_str();
 
     // Start from a deployed tenant, so the status the association reports is the one it
-    // caused rather than the create's.
-    tokio::time::sleep(past_propagation()).await;
-    let read = read_tenant(&router, &id, case).await;
-    assert_eq!(
-        read.root().text_at("Status"),
-        Some(STATUS_DEPLOYED),
-        "case {case}: expected the created tenant to settle to {STATUS_DEPLOYED}, got {:?}",
-        read.root().text_at("Status")
-    );
+    // caused rather than the create's — waited for as the condition it is.
+    awaited_tenant_deployment(&router, case, &id).await;
 
     let associated = associate(&router, &id, web_acl, Some(&etag)).await;
     assert_eq!(
@@ -700,9 +727,9 @@ async fn the_clock_settles_the_write() {
         read.root().text_at("Status")
     );
 
-    tokio::time::sleep(past_propagation()).await;
-
-    let read = read_tenant(&router, &id, case).await;
+    // Nothing calls anything to make it so: the read below is the one that materialises what
+    // the clock already owes.
+    let read = awaited_tenant_deployment(&router, case, &id).await;
     assert_eq!(
         read.root().text_at("Status"),
         Some(STATUS_DEPLOYED),

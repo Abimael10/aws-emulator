@@ -18,6 +18,10 @@
 //! module holds no second reading of a rule tree. It does the two things only this service
 //! can do — name WHICH web ACL the distribution put in front of itself, and read the viewer
 //! request into the components a `FieldToMatch` names — and says what the edge answers.
+//!
+//! The same resolution is what an ASSOCIATION is admitted by ([`associable`]): the web ACL a
+//! CloudFront resource is put behind has to be one WAF holds, so the one module that asks
+//! WAF about a distribution's web ACL is where that question is asked too.
 
 use aws_smithy_runtime_api::http::Request as RtRequest;
 use service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
@@ -110,6 +114,35 @@ pub fn refusal<Eng: Send + Sync + 'static>(
         },
     };
     (Some(refusal), logged)
+}
+
+/// Whether a web ACL `web_acl_arn` names may be put in front of a CloudFront resource:
+/// whether WAF really holds one under that ARN, and whether it is one of the namespace
+/// CloudFront is protected by ([`crate::state::associable_web_acl_arn`]).
+///
+/// What an ASSOCIATION resolves before it writes anything. A web ACL is a WAF resource, so
+/// whether the account HAS the one a request names is a question only WAF can answer, and
+/// CloudFront asks it: "specify a web ACL that was previously validated" is what it tells a
+/// caller that named one it could not resolve. A value that is no WAFv2 web ACL ARN of the
+/// global namespace — another resource kind, the regional namespace, a WAF Classic
+/// identifier, a string that is no ARN at all — names no web ACL to resolve and so resolves
+/// to nothing here too.
+///
+/// `false` as well when the WAFv2 store cannot be reached at all: a web ACL whose existence
+/// nothing can confirm is not one the account previously validated.
+///
+/// Call it with NO lock of this service's store held: it locks the wafv2 store, and that
+/// service holds no record of this one, so the two are never held at the same time.
+pub fn associable<Eng: Send + Sync + 'static>(engine: &Eng, web_acl_arn: &str) -> bool {
+    if !crate::state::associable_web_acl_arn(web_acl_arn) {
+        return false;
+    }
+    let Some(waf) = ::service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(engine)
+    else {
+        return false;
+    };
+    let store = waf.lock();
+    store.web_acl_by_arn(web_acl_arn).is_some()
 }
 
 /// Whether `web_acl_id` names a WAFv2 web ACL by its ARN.

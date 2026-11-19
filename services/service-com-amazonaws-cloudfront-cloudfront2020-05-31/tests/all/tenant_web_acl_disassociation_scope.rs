@@ -14,8 +14,10 @@
 //! leave the distribution's own web ACL in place for the tenant to fall back to, and has to
 //! say nothing about any other tenant of that distribution.
 //!
-//! The rows differ along what the rule generalises over: the FORM of the web ACL the parent
-//! distribution itself names (EVERY entry of [`crate::web_acl_association::WEB_ACLS`]),
+//! The rows differ along what the rule generalises over: WHICH web ACL the parent
+//! distribution itself names (every entry of
+//! [`crate::web_acl_association::held_web_acls`] — the association resolves the web ACL it is
+//! handed, so each is one WAF really holds),
 //! WHICH tenant of the set the call names (each position of
 //! [`crate::tenant_web_acl_association::STARTS`] in turn), and what each tenant carries while
 //! it is a bystander (each entry of that same table — no customizations at all,
@@ -31,7 +33,7 @@ use crate::distribution_tenant_lifecycle::multi_tenant_distribution;
 use crate::tenant_web_acl_association::{
     create_tenant, disassociate, read_tenant, web_acl_of, STARTS,
 };
-use crate::web_acl_association::{associate_web_acl, read_back, WEB_ACLS};
+use crate::web_acl_association::{associate_web_acl, held_web_acls, read_back, HELD_WEB_ACLS};
 
 /// One bystander tenant as a read reports it before the call under test: its id, the version
 /// it stands at, and the `(Action, Arn)` of its web ACL customization (`None` when it
@@ -49,23 +51,26 @@ struct Snapshot {
 /// sibling tenant and the parent distribution are untouched — same web ACL, same version.
 #[tokio::test]
 async fn a_disassociation_reaches_only_the_named_tenant() {
-    // One row per web ACL form the parent distribution can name, each naming a different
-    // position of the tenant set, so both the forms and the positions are spanned.
-    for (index, (acl_case, distribution_web_acl)) in WEB_ACLS.iter().enumerate() {
+    // One row per web ACL the parent distribution can name, each naming a different
+    // position of the tenant set, so both the web ACLs and the positions are spanned. A fresh
+    // emulator per row, so what the row observes is what the row caused — and the web ACLs are
+    // created in that row's own WAF.
+    for index in 0..HELD_WEB_ACLS.len() {
+        let router = emulator();
+        let web_acls = held_web_acls(&router).await;
+        let acl_case = web_acls[index].0;
+        let distribution_web_acl = web_acls[index].1.clone();
         let target = index % STARTS.len();
         let case = format!("{acl_case}/{}", STARTS[target].case);
         let case = case.as_str();
-        // A fresh emulator per row, so what the row observes is what the row caused.
-        let router = emulator();
         let distribution_id =
             multi_tenant_distribution(&router, &format!("ref-disassoc-scope-{index}")).await;
 
         // The parent distribution names a web ACL of its own, which is what a tenant's
         // customization overrides — and what a disassociation of that customization must
         // leave in place.
-        let distribution_web_acl = *distribution_web_acl;
         let associated =
-            associate_web_acl(&router, &distribution_id, distribution_web_acl, None).await;
+            associate_web_acl(&router, &distribution_id, &distribution_web_acl, None).await;
         assert_eq!(
             associated.status, 200,
             "case {case}: expected HTTP 200 from AssociateDistributionWebACL, got {} with {}",

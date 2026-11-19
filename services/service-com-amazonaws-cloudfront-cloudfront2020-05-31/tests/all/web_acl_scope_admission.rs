@@ -21,9 +21,11 @@
 //! The rows differ along what the rule generalises over: the NAMESPACE segment the ARN
 //! carries, the RESOURCE KIND it names, the region and account segments, and the partition —
 //! including a refused ARN and an admitted one that differ in the namespace segment alone, so
-//! the namespace is the only thing deciding. The admitted forms are
-//! [`crate::web_acl_association::WEB_ACLS`], whose entries span the WAF generation and the
-//! bare WAF Classic id a `WebACLId` also carries.
+//! the namespace is the only thing deciding. The admitted forms are the web ACLs WAF really
+//! holds ([`crate::web_acl_association::held_web_acls`]), because an association resolves the
+//! web ACL it is handed ([`crate::associated_web_acl_resolution`]) — and so a web ACL WAF
+//! really holds in the REGIONAL namespace is refused too, which is that suite's own row: the
+//! rows here are about the namespace an ARN NAMES.
 //!
 //! The wire harness, the association helpers and the readers are the ones
 //! [`crate::distribution_lifecycle`], [`crate::web_acl_association`],
@@ -33,7 +35,7 @@
 use crate::distribution_lifecycle::{config_table, emulator, Answer};
 use crate::distribution_tenant_lifecycle::multi_tenant_distribution;
 use crate::tenant_web_acl_association::{associate, create_tenant, read_tenant, web_acl_of, STARTS};
-use crate::web_acl_association::{associate_web_acl, create, read_back, WEB_ACLS};
+use crate::web_acl_association::{associate_web_acl, create, held_web_acls, read_back};
 
 /// The sentence CloudFront refuses an association naming a web ACL it may not be put behind
 /// with. The whole text is fixed: it states that the web ACL named is not one CloudFront can
@@ -45,8 +47,8 @@ const INVALID_WEB_ACL: &str = "The specified web ACL isn't valid. Specify a web 
 /// namespace segment (`regional`), the resource kind a `global` ARN can name instead of a web
 /// ACL, the region and account segments, and the partition.
 ///
-/// The first row is the regional twin of `WEB_ACLS[0]` — the same account, name and id in the
-/// other namespace — so the pair differs in the namespace segment alone.
+/// The first row is the regional twin of an admitted web ACL's form — the same name and id in
+/// the other namespace — so the pair differs in the namespace segment alone.
 const UNASSOCIABLE_WEB_ACLS: &[(&str, &str)] = &[
     (
         "the regional twin of an admitted global web ACL",
@@ -109,8 +111,10 @@ fn assert_refused(answer: &Answer, case: &str) {
 #[tokio::test]
 async fn a_distribution_takes_only_a_web_acl_of_cloudfronts_namespace() {
     let router = emulator();
+    let web_acls = held_web_acls(&router).await;
     let row = &config_table()[0];
-    let admitted = WEB_ACLS[0].1;
+    let admitted = web_acls[0].1.as_str();
+    let other_admitted = web_acls[1].1.as_str();
 
     for (index, (case, web_acl)) in UNASSOCIABLE_WEB_ACLS.iter().enumerate() {
         let reference = format!("ref-scope-dist-{index}");
@@ -147,18 +151,18 @@ async fn a_distribution_takes_only_a_web_acl_of_cloudfronts_namespace() {
 
         // The same call naming a form of CloudFront's own namespace lands on the same
         // distribution, so the namespace the ARN names is what decided the refusal.
-        let moved_on = associate_web_acl(&router, &id, WEB_ACLS[1].1, Some(&seeded_etag)).await;
+        let moved_on = associate_web_acl(&router, &id, other_admitted, Some(&seeded_etag)).await;
         assert_eq!(
             moved_on.status, 200,
-            "case {case}: expected HTTP 200 associating {:?} after the refusal, got {} with {}",
-            WEB_ACLS[1].1, moved_on.status, moved_on.raw
+            "case {case}: expected HTTP 200 associating {other_admitted:?} after the refusal, \
+             got {} with {}",
+            moved_on.status, moved_on.raw
         );
         let (stored, _, _) = read_back(&router, &id, case).await;
         assert_eq!(
-            stored,
-            WEB_ACLS[1].1,
-            "case {case}: expected the admitted association to store {:?}, got {stored:?}",
-            WEB_ACLS[1].1
+            stored, other_admitted,
+            "case {case}: expected the admitted association to store {other_admitted:?}, got \
+             {stored:?}"
         );
     }
 }
@@ -168,9 +172,10 @@ async fn a_distribution_takes_only_a_web_acl_of_cloudfronts_namespace() {
 #[tokio::test]
 async fn every_admitted_form_still_lands_on_a_distribution() {
     let router = emulator();
+    let web_acls = held_web_acls(&router).await;
     let row = &config_table()[0];
 
-    for (index, (case, web_acl)) in WEB_ACLS.iter().enumerate() {
+    for (index, (case, web_acl)) in web_acls.iter().enumerate() {
         let reference = format!("ref-scope-admitted-{index}");
         let body = row.xml().replace(&row.caller_reference, &reference);
         let (id, created_etag) = create(&router, case, &body).await;
@@ -196,6 +201,8 @@ async fn every_admitted_form_still_lands_on_a_distribution() {
 async fn a_tenant_takes_only_a_web_acl_of_cloudfronts_namespace() {
     let router = emulator();
     let distribution_id = multi_tenant_distribution(&router, "ref-scope-tenant").await;
+    let web_acls = held_web_acls(&router).await;
+    let admitted_arn = web_acls[0].1.as_str();
     let start = STARTS[0];
 
     for (index, (case, web_acl)) in UNASSOCIABLE_WEB_ACLS.iter().enumerate() {
@@ -226,18 +233,18 @@ async fn a_tenant_takes_only_a_web_acl_of_cloudfronts_namespace() {
             read.header("etag")
         );
 
-        let admitted = associate(&router, &id, WEB_ACLS[0].1, Some(&created_etag)).await;
+        let admitted = associate(&router, &id, admitted_arn, Some(&created_etag)).await;
         assert_eq!(
             admitted.status, 200,
-            "case {case}: expected HTTP 200 associating {:?} after the refusal, got {} with {}",
-            WEB_ACLS[0].1, admitted.status, admitted.raw
+            "case {case}: expected HTTP 200 associating {admitted_arn:?} after the refusal, got \
+             {} with {}",
+            admitted.status, admitted.raw
         );
         let read = read_tenant(&router, &id, case).await;
         assert_eq!(
             web_acl_of(read.root()).map(|(_, arn)| arn),
-            Some(WEB_ACLS[0].1.to_string()),
-            "case {case}: expected the tenant to carry {:?}, got {:?}",
-            WEB_ACLS[0].1,
+            Some(admitted_arn.to_string()),
+            "case {case}: expected the tenant to carry {admitted_arn:?}, got {:?}",
             web_acl_of(read.root())
         );
     }

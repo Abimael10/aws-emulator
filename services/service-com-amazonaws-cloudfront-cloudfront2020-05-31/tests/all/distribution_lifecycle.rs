@@ -70,6 +70,10 @@ pub(crate) const API_VERSION: &str = "2020-05-31";
 /// ([`crate::anycast_ip_list_lifecycle::ensure_anycast_entitlement`]) rather than by
 /// hand-writing an applied value.
 ///
+/// WAFv2 is mounted on it too, for the same reason: a web ACL is a WAF resource, so a suite
+/// that puts one in front of a distribution creates it through WAFv2's own control plane
+/// ([`crate::waf_control_plane`]) and the association resolves it there.
+///
 /// `pub(crate)` so the sibling suites in `tests/all/` stand one up the same way rather
 /// than each writing its own harness.
 pub(crate) fn emulator() -> MultiServiceRouter {
@@ -78,7 +82,12 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     router.register_service(
-        service_com_amazonaws_servicequotas_servicequotasv20190624::EmulatedService::new(engine),
+        service_com_amazonaws_servicequotas_servicequotasv20190624::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_wafv2_awswaf_20190729::EmulatedService::new(engine),
     );
     router
 }

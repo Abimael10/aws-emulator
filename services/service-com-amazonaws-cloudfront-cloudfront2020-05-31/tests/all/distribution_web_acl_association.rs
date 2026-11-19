@@ -37,9 +37,10 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 };
 
 use crate::distribution_lifecycle::{
-    call, config, config_table, get_distribution, is_version_token, past_propagation, Answer,
+    awaited_deployment, call, config, config_table, get_distribution, is_version_token, Answer,
     Config, API_VERSION,
 };
+use crate::waf_control_plane::{create_web_acl, SCOPE_CLOUDFRONT};
 use crate::web_acl_association::{associate_web_acl, create, read_back, Stated, WEB_ACLS};
 
 // The sentences this service answers these two codes with, spelled out here rather than
@@ -91,17 +92,19 @@ enum Reached {
 #[derive(Debug, Clone, Copy)]
 struct Removal {
     case: &'static str,
-    /// An index into [`WEB_ACLS`], or `None` for a distribution that names no web ACL.
+    /// An index into [`WEB_ACLS`] for a row the CREATE's configuration names its web ACL in;
+    /// `None` for a row that reaches its web ACL by associating one WAF holds, and for the
+    /// distribution that names no web ACL at all.
     web_acl: Option<usize>,
     reached: Reached,
     precondition: Stated,
 }
 
-/// Every form the association can take (the [`WEB_ACLS`] forms: a `wafv2` ARN of the global
-/// namespace in two accounts, another partition, a WAF Classic ARN and a bare WAF Classic
-/// id), reached both ways a configuration can come to name a web ACL, plus the
-/// distribution that never named one — crossed with the forms the optional `If-Match`
-/// takes.
+/// Every form the stored association can take — each [`WEB_ACLS`] form a CONFIGURATION may
+/// name (a `wafv2` ARN of the global namespace in two accounts, another partition, a WAF
+/// Classic ARN and a bare WAF Classic id), plus the web ACL an ASSOCIATION reaches (one WAF
+/// really holds, since that call resolves it) and the distribution that never named one —
+/// crossed with the forms the optional `If-Match` takes.
 const REMOVALS: &[Removal] = &[
     Removal {
         case: "wafv2-global-from-the-create-config",
@@ -110,15 +113,15 @@ const REMOVALS: &[Removal] = &[
         precondition: Stated::Current,
     },
     Removal {
-        case: "wafv2-global-other-account-from-an-association",
+        case: "wafv2-global-other-account-from-the-create-config",
         web_acl: Some(1),
-        reached: Reached::ByAssociate,
+        reached: Reached::ByCreate,
         precondition: Stated::Absent,
     },
     Removal {
-        case: "other-partition-from-an-association",
+        case: "other-partition-from-the-create-config",
         web_acl: Some(2),
-        reached: Reached::ByAssociate,
+        reached: Reached::ByCreate,
         precondition: Stated::QuotedCurrent,
     },
     Removal {
@@ -128,10 +131,22 @@ const REMOVALS: &[Removal] = &[
         precondition: Stated::Absent,
     },
     Removal {
-        case: "waf-classic-id-from-an-association",
+        case: "waf-classic-id-from-the-create-config",
         web_acl: Some(4),
+        reached: Reached::ByCreate,
+        precondition: Stated::Current,
+    },
+    Removal {
+        case: "a-web-acl-waf-holds-from-an-association",
+        web_acl: None,
         reached: Reached::ByAssociate,
         precondition: Stated::Current,
+    },
+    Removal {
+        case: "a-web-acl-waf-holds-from-an-association-no-precondition",
+        web_acl: None,
+        reached: Reached::ByAssociate,
+        precondition: Stated::Absent,
     },
     Removal {
         case: "never-associated",
@@ -150,7 +165,25 @@ async fn disassociating_a_web_acl_clears_it_from_the_distribution() {
     for row in REMOVALS {
         let case = row.case;
         let router = crate::distribution_lifecycle::emulator();
-        let web_acl = row.web_acl.map(|index| WEB_ACLS[index].1);
+        // Where the row's web ACL comes from: a form a CONFIGURATION may name, for a row the
+        // create states it in, and a web ACL WAF really holds for a row that reaches it by
+        // associating one — that call resolves the web ACL, so only one WAF holds can land.
+        let web_acl: Option<String> = match row.reached {
+            Reached::ByCreate => row.web_acl.map(|index| WEB_ACLS[index].1.to_string()),
+            Reached::ByAssociate => Some(
+                create_web_acl(
+                    &router,
+                    &format!("removal-{case}"),
+                    SCOPE_CLOUDFRONT,
+                    "{\"Allow\":{}}",
+                    "",
+                )
+                .await
+                .arn,
+            ),
+            Reached::Never => None,
+        };
+        let expected_before = web_acl.clone().unwrap_or_default();
 
         // The configuration each row creates: one naming the web ACL itself where the row
         // reaches the association through the create, one naming none otherwise. Rows also
@@ -158,7 +191,7 @@ async fn disassociating_a_web_acl_clears_it_from_the_distribution() {
         // price class, through the lifecycle suite's `DistributionConfig` builder.
         let template = Config {
             web_acl_id: match row.reached {
-                Reached::ByCreate => web_acl.map(str::to_string),
+                Reached::ByCreate => web_acl.clone(),
                 Reached::ByAssociate | Reached::Never => None,
             },
             ..config(case, &format!("ref-disassoc-{case}"))
@@ -169,8 +202,13 @@ async fn disassociating_a_web_acl_clears_it_from_the_distribution() {
         // disassociation — and the empty value where the row names no web ACL.
         let mut etag = created_etag.clone();
         if row.reached == Reached::ByAssociate {
-            let associated =
-                associate_web_acl(&router, &id, web_acl.unwrap_or_default(), Some(&etag)).await;
+            let associated = associate_web_acl(
+                &router,
+                &id,
+                web_acl.as_deref().unwrap_or_default(),
+                Some(&etag),
+            )
+            .await;
             assert_eq!(
                 associated.status, 200,
                 "case {case}: expected HTTP 200 from AssociateDistributionWebACL, got {} with {}",
@@ -180,16 +218,15 @@ async fn disassociating_a_web_acl_clears_it_from_the_distribution() {
         }
         let (before, _, _) = read_back(&router, &id, case).await;
         assert_eq!(
-            before,
-            web_acl.unwrap_or_default(),
-            "case {case}: expected the distribution to name web ACL {:?} before the \
-             disassociation, got {before:?}",
-            web_acl.unwrap_or_default()
+            before, expected_before,
+            "case {case}: expected the distribution to name web ACL {expected_before:?} before \
+             the disassociation, got {before:?}"
         );
 
         // Let the last write finish propagating, so the status the disassociation leaves
-        // behind is the one it owes rather than one left over from the setup.
-        tokio::time::sleep(past_propagation()).await;
+        // behind is the one it owes rather than one left over from the setup. The CONDITION is
+        // what is waited for, under the crate's own generous deadline.
+        awaited_deployment(&router, case, &id).await;
         let (_, _, status) = read_back(&router, &id, case).await;
         assert_eq!(
             status, STATUS_DEPLOYED,
@@ -279,8 +316,9 @@ async fn disassociating_a_web_acl_clears_it_from_the_distribution() {
              {read_etag:?}"
         );
 
-        // And the deployment it owes is the CLOCK's, not another call's.
-        tokio::time::sleep(past_propagation()).await;
+        // And the deployment it owes is the CLOCK's, not another call's: nothing is called to
+        // make it so, and the read is what materialises what the clock already owed.
+        awaited_deployment(&router, case, &id).await;
         let (_, _, status) = read_back(&router, &id, case).await;
         assert_eq!(
             status, STATUS_DEPLOYED,
@@ -381,10 +419,20 @@ const REFUSALS: &[Refusal] = &[
 #[tokio::test]
 async fn a_refused_disassociation_writes_nothing() {
     let router = crate::distribution_lifecycle::emulator();
-    let web_acl = WEB_ACLS[0].1;
+    // The association resolves the web ACL, so the one this distribution starts behind is one
+    // WAF really holds.
+    let web_acl = create_web_acl(
+        &router,
+        "removal-refusals",
+        SCOPE_CLOUDFRONT,
+        "{\"Allow\":{}}",
+        "",
+    )
+    .await
+    .arn;
     let row = &config_table()[0];
     let (id, created_etag) = create(&router, "refusals", &row.xml()).await;
-    let associated = associate_web_acl(&router, &id, web_acl, Some(&created_etag)).await;
+    let associated = associate_web_acl(&router, &id, &web_acl, Some(&created_etag)).await;
     assert_eq!(
         associated.status, 200,
         "case refusals: expected HTTP 200 from AssociateDistributionWebACL, got {} with {}",

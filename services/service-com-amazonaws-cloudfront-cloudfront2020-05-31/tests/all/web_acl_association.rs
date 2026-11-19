@@ -18,10 +18,11 @@
 //! * a distribution the store does not hold is `EntityNotFound` (HTTP 404) — the error this
 //!   operation models for an entity it cannot find.
 //! * a request that names NO web ACL is `InvalidArgument` (HTTP 400): an association of
-//!   nothing is not an association. WHICH web ACL of CloudFront's own namespace was named is
-//!   not resolved here — a web ACL is a WAF resource this service does not hold — while the
-//!   NAMESPACE a `wafv2` ARN names is decided, and the forms that decision refuses are
-//!   [`crate::web_acl_scope_admission`]'s table.
+//!   nothing is not an association. WHICH web ACL was named IS resolved — against WAF, the
+//!   service that holds web ACLs — so every web ACL this suite associates is one it created
+//!   through WAFv2's own control plane ([`held_web_acls`]); the forms that resolve to nothing
+//!   are [`crate::associated_web_acl_resolution`]'s table, and the namespace refusal is
+//!   [`crate::web_acl_scope_admission`]'s.
 //!
 //! The wire harness (the router, the request helpers and the restXml element scanner) is
 //! the one [`crate::distribution_lifecycle`] builds, so these assertions travel the same
@@ -33,28 +34,26 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
-    call, config_table, create_distribution, emulator, get_distribution, is_version_token,
-    past_propagation, Answer, API_VERSION,
+    awaited_deployment, call, config_table, create_distribution, emulator, get_distribution,
+    is_version_token, Answer, API_VERSION,
 };
+use crate::waf_control_plane::{create_web_acl, COUNTING_RULE, SCOPE_CLOUDFRONT};
 
-/// Web ACL identifiers this suite associates, spanning the forms the member takes that an
-/// association ADMITS: the WAF generation (`wafv2`, and the `waf`/`waf-regional` services of
-/// WAF Classic), the partition, the account and region segments, and the bare ACL id WAF
-/// Classic is named by.
+/// Web ACL identifiers a CONFIGURATION may name, spanning the forms the member takes: the
+/// WAF generation (`wafv2`, and the `waf`/`waf-regional` services of WAF Classic), the
+/// partition, the account and region segments, and the bare ACL id WAF Classic is named by.
 ///
-/// Every `wafv2` ARN here names the GLOBAL namespace, because that is the only one a
-/// distribution may be put behind: the `CLOUDFRONT` scope is the one "for a global resource
-/// type, such as a Amazon CloudFront distribution". The forms an association refuses — a
-/// `wafv2` ARN of the regional namespace, and one naming another resource of either — are
-/// the table [`crate::web_acl_scope_admission`] drives both association operations from.
-///
-/// The forms come from the model's own documentation of `DistributionConfig$WebACLId` —
-/// "use the ACL ARN, for example
+/// These are the forms `DistributionConfig$WebACLId` and `Customizations$WebAcl` CARRY, which
+/// is not the same question as which of them an ASSOCIATION resolves: a configuration states
+/// the identifier it states — "use the ACL ARN, for example
 /// `arn:aws:wafv2:us-east-1:123456789012:global/webacl/ExampleWebACL/a1b2c3d4-5678-90ab-cdef-EXAMPLE11111`
 /// … To specify a web ACL created using WAF Classic, use the ACL ID, for example
-/// `a1b2c3d4-5678-90ab-cdef-EXAMPLE11111`".
+/// `a1b2c3d4-5678-90ab-cdef-EXAMPLE11111`" — while `AssociateDistributionWebACL` resolves the
+/// web ACL it is handed against WAF and refuses one the account does not hold
+/// ([`held_web_acls`], and [`crate::associated_web_acl_resolution`] for the rule).
 ///
-/// `pub(crate)` so the disassociation suite takes a web ACL off each of these same forms.
+/// `pub(crate)` so every suite that states a web ACL in a configuration or a customization
+/// states one of these same forms.
 pub(crate) const WEB_ACLS: &[(&str, &str)] = &[
     (
         "wafv2-global",
@@ -80,6 +79,62 @@ pub(crate) const WEB_ACLS: &[(&str, &str)] = &[
         "473e64fd-f30b-4765-81a0-62ad96dd167a",
     ),
 ];
+
+/// The web ACLs [`held_web_acls`] creates, as `(case, the WAFv2 `Name`, the default action,
+/// the rules)`.
+///
+/// `pub(crate)` so a suite that stands up one emulator PER ROW knows how many rows there are
+/// without creating a web ACL to count them.
+pub(crate) const HELD_WEB_ACLS: &[(&str, &str, &str, &str)] = &[
+    ("no-rules", "held-web-acl-plain", "{\"Allow\":{}}", ""),
+    (
+        "one-counting-rule",
+        "held-web-acl-one-rule",
+        "{\"Allow\":{}}",
+        COUNTING_RULE,
+    ),
+    (
+        "a-considerably-longer-name",
+        "held-web-acl-with-a-considerably-longer-name",
+        "{\"Allow\":{}}",
+        "",
+    ),
+    (
+        "a-default-action-that-blocks",
+        "held-web-acl-default-block",
+        "{\"Block\":{}}",
+        "",
+    ),
+    (
+        "a-rule-and-a-blocking-default",
+        "held-web-acl-rule-and-block",
+        "{\"Block\":{}}",
+        COUNTING_RULE,
+    ),
+];
+
+/// The web ACLs an association can RESOLVE: one per [`HELD_WEB_ACLS`] row, created through
+/// WAFv2's own `CreateWebACL` on the router these suites run against, answered as
+/// `(case, the ARN WAF minted)` in row order.
+///
+/// A web ACL is a WAF resource, so the only way to have one is to create it there; the ARNs
+/// are WAF's own, never built here. The rows differ along what a web ACL IS — no rules, one
+/// rule, a long name, a default action that blocks — none of which the association looks at,
+/// which is the point: what admits the association is that WAF holds the web ACL, not what
+/// the web ACL does.
+///
+/// `pub(crate)` so every suite that associates a web ACL associates one the account really
+/// holds, rather than carrying its own idea of a resolvable ARN. Call it ONCE per router: the
+/// names are WAF's own identity for these web ACLs, and a second create under the same name
+/// is a duplicate.
+pub(crate) async fn held_web_acls(router: &MultiServiceRouter) -> Vec<(&'static str, String)> {
+    let mut held: Vec<(&'static str, String)> = Vec::with_capacity(HELD_WEB_ACLS.len());
+    for (case, name, default_action, rules) in HELD_WEB_ACLS {
+        let created = create_web_acl(router, name, SCOPE_CLOUDFRONT, default_action, rules).await;
+        held.push((*case, created.arn));
+    }
+    held
+}
 
 /// A `DistributionConfig` under `caller_reference` naming `connection_mode`, which is what
 /// decides whether the distribution is multi-tenant: the mode "specifies whether the
@@ -182,8 +237,9 @@ pub(crate) async fn read_back(
 #[tokio::test]
 async fn associating_a_web_acl_stores_it_on_the_distribution() {
     let router = emulator();
+    let web_acls = held_web_acls(&router).await;
 
-    for (index, (acl_case, web_acl)) in WEB_ACLS.iter().enumerate() {
+    for (index, (acl_case, web_acl)) in web_acls.iter().enumerate() {
         for row in config_table() {
             let case = format!("{acl_case}/{}", row.case);
             let reference = format!("ref-assoc-{acl_case}-{}", row.case);
@@ -212,7 +268,7 @@ async fn associating_a_web_acl_stores_it_on_the_distribution() {
             );
             assert_eq!(
                 associated.root().text_at("WebACLArn"),
-                Some(*web_acl),
+                Some(web_acl.as_str()),
                 "case {case}: expected the answer to name web ACL {web_acl:?}, got {:?}",
                 associated.root().text_at("WebACLArn")
             );
@@ -247,7 +303,7 @@ async fn associating_a_web_acl_stores_it_on_the_distribution() {
 
             // A second association replaces the first — the member holds ONE web ACL — so
             // each row replaces with the NEXT row's web ACL, never with its own.
-            let replacement = WEB_ACLS[(index + 1) % WEB_ACLS.len()].1;
+            let replacement = web_acls[(index + 1) % web_acls.len()].1.as_str();
             let replaced = associate_web_acl(&router, &id, replacement, Some(&etag)).await;
             assert_eq!(
                 replaced.status, 200,
@@ -269,10 +325,12 @@ async fn associating_a_web_acl_stores_it_on_the_distribution() {
 #[tokio::test]
 async fn the_clock_settles_the_association() {
     let router = emulator();
+    let web_acls = held_web_acls(&router).await;
+    let web_acl = web_acls[0].1.as_str();
     let row = &config_table()[0];
     let (id, etag) = create(&router, "settle", &row.xml()).await;
 
-    let associated = associate_web_acl(&router, &id, WEB_ACLS[0].1, Some(&etag)).await;
+    let associated = associate_web_acl(&router, &id, web_acl, Some(&etag)).await;
     assert_eq!(
         associated.status, 200,
         "case settle: expected HTTP 200 from AssociateDistributionWebACL, got {} with {}",
@@ -285,7 +343,10 @@ async fn the_clock_settles_the_association() {
          {status:?}"
     );
 
-    tokio::time::sleep(past_propagation()).await;
+    // The deployment is the CLOCK's, so the CONDITION is what is waited for: the crate's
+    // poll-until helper looks again until the distribution reports itself deployed, under a
+    // deadline generous enough that nothing here depends on how fast the host runs.
+    awaited_deployment(&router, "settle", &id).await;
 
     let (stored, _, status) = read_back(&router, &id, "settle").await;
     assert_eq!(
@@ -293,8 +354,7 @@ async fn the_clock_settles_the_association() {
         "case settle: expected {STATUS_DEPLOYED} once the propagation was owed, got {status:?}"
     );
     assert_eq!(
-        stored,
-        WEB_ACLS[0].1,
+        stored, web_acl,
         "case settle: expected the association to survive the propagation, got {stored:?}"
     );
 }
@@ -405,6 +465,7 @@ const PRECONDITIONS: &[Precondition] = &[
 #[tokio::test]
 async fn if_match_governs_the_association() {
     let router = emulator();
+    let web_acls = held_web_acls(&router).await;
 
     for row in PRECONDITIONS {
         let case = row.case;
@@ -412,7 +473,7 @@ async fn if_match_governs_the_association() {
         let (id, etag) = create(&router, case, &config_xml(&reference, "direct")).await;
 
         let stated: Option<String> = row.stated.header(&etag);
-        let web_acl = WEB_ACLS[0].1;
+        let web_acl = web_acls[0].1.as_str();
         let answer = associate_web_acl(&router, &id, web_acl, stated.as_deref()).await;
         assert_eq!(
             answer.status, row.expected_status,
@@ -493,7 +554,8 @@ async fn a_request_naming_no_web_acl_is_refused() {
 #[tokio::test]
 async fn an_unheld_distribution_is_not_found() {
     let router = emulator();
-    let web_acl = WEB_ACLS[0].1;
+    let web_acls = held_web_acls(&router).await;
+    let web_acl = web_acls[0].1.as_str();
 
     for (case, id) in [
         ("never-minted", "EDFDVBD6EXAMPLE"),
@@ -521,11 +583,12 @@ async fn an_unheld_distribution_is_not_found() {
 #[tokio::test]
 async fn a_multi_tenant_distribution_takes_a_web_acl_too() {
     let router = emulator();
+    let web_acls = held_web_acls(&router).await;
 
     for (connection_mode, case) in [("tenant-only", "multi-tenant"), ("direct", "standard")] {
         let reference = format!("ref-mode-{case}");
         let (id, etag) = create(&router, case, &config_xml(&reference, connection_mode)).await;
-        let web_acl = WEB_ACLS[0].1;
+        let web_acl = web_acls[0].1.as_str();
 
         let answer = associate_web_acl(&router, &id, web_acl, Some(&etag)).await;
         assert_eq!(

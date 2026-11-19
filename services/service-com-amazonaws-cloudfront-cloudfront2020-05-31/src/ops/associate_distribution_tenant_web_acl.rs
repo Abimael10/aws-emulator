@@ -14,11 +14,14 @@
 //! disassociation: a request that states no `If-Match` is refused with
 //! `InvalidIfMatchVersion` (HTTP 400).
 //!
-//! What the association does NOT do is resolve the web ACL: a web ACL is a WAF resource, not
-//! one this store holds. What IS decided about the value is the namespace it names — a
-//! tenant, like its parent distribution, is protected by the web ACLs of WAFv2's global
-//! namespace alone — so an ARN naming a web ACL of the regional namespace, or another
-//! resource of either, is the modelled `InvalidArgument` and nothing is mutated.
+//! What the association DOES resolve is the web ACL itself: a web ACL is a WAF resource, so
+//! whether the account has the one a request names is a question only WAF can answer, and
+//! CloudFront asks it before it writes anything ([`crate::service::web_acl::associable`]) —
+//! "specify a web ACL that was previously validated" is what it tells a caller that named one
+//! it could not resolve. A tenant, like its parent distribution, is protected by the web ACLs
+//! of WAFv2's global namespace alone, so a value naming no web ACL WAF holds, one of the
+//! regional namespace, another resource of either or no web ACL at all is the modelled
+//! `InvalidArgument` with nothing mutated.
 //!
 //! ## Shape of an operation
 //!
@@ -169,6 +172,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::store_unavailable());
         };
         let _ = ctx;
+
+        // WHICH web ACL the request named is resolved against WAF — the service that holds
+        // web ACLs — and it is resolved BEFORE this service's store is locked, so the two
+        // stores are never held at the same time. The answer decides nothing until the
+        // sequence below reaches the argument, so a request that fails an earlier condition
+        // still earns that condition's refusal.
+        let web_acl_arn = input.web_acl_arn.trim();
+        let web_acl_resolves = crate::service::web_acl::associable(&*self.engine, web_acl_arn);
+
         let now = SystemTime::now();
         let mut store = state.lock();
         // Materialise whatever the clock already owes this service's state before the call
@@ -228,11 +240,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The Amazon Resource Name (ARN) of the WAF web ACL to associate" is what this
-        // member carries, and a web ACL is a WAF resource this store cannot resolve — so the
-        // one thing decidable here is whether the request named a web ACL at all. A blank
-        // value names none, which is the modelled `InvalidArgument` rather than an
-        // association of nothing.
-        let web_acl_arn = input.web_acl_arn.trim();
+        // member carries, so the first thing decidable about it is whether the request named
+        // a web ACL at all. A blank value names none, which is the modelled `InvalidArgument`
+        // rather than an association of nothing.
         if web_acl_arn.is_empty() {
             return Err(AssociateDistributionTenantWebACLErrorModeled::InvalidArgument(
                 InvalidArgument {
@@ -245,13 +255,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A tenant is protected by the web ACLs of the SAME one WAFv2 namespace its parent
-        // distribution is — the global one the `CLOUDFRONT` scope names — so an ARN naming a
-        // web ACL of the regional namespace (or another resource of either) names nothing
-        // WAF would enforce in front of it ([`crate::state::associable_web_acl_arn`]). It is
-        // refused BEFORE the customization is written, so nothing is mutated and no version
-        // is minted.
-        if !crate::state::associable_web_acl_arn(web_acl_arn) {
+        // An association is admitted only for a web ACL that RESOLVES
+        // ([`crate::service::web_acl::associable`]): one WAF really holds, and of the SAME
+        // one WAFv2 namespace its parent distribution is protected by — the global one the
+        // `CLOUDFRONT` scope names. A value naming no such web ACL is refused BEFORE the
+        // customization is written, so nothing is mutated and no version is minted.
+        if !web_acl_resolves {
             return Err(AssociateDistributionTenantWebACLErrorModeled::InvalidArgument(
                 crate::state::invalid_web_acl(),
             )
