@@ -247,6 +247,11 @@ pub use step_logs::*;
 /// release carries and what one bundles — split out and re-exported the same way.
 mod spark_releases;
 mod release_catalog;
+/// The INVARIANT over the catalog's labels — that a label resolves to a release exactly when
+/// the catalog publishes it, so the listing a caller chooses from and the resolution a launch
+/// puts its choice through cannot drift apart — split out of [`self`] the same way. It holds
+/// no catalog data of its own and exports nothing.
+mod published_releases;
 mod step_records;
 pub use step_records::*;
 pub use release_catalog::*;

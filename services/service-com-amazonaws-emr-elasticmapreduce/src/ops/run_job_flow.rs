@@ -466,15 +466,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The Amazon EMR release label, which determines the version of open-source
-        // application packages installed on the cluster." (`RunJobFlow$ReleaseLabel` doc.)
-        // A cluster runs ONE release of Amazon EMR, so the label a launch names is
-        // resolved against the release catalog this service publishes — the same catalog
-        // `DescribeReleaseLabel`, `ListReleaseLabels` and `ListSupportedInstanceTypes`
-        // answer from (`crate::state::catalog_release`) — and a label naming none of its
-        // releases is refused before any cluster state is written. The member is
-        // OPTIONAL: "for Amazon EMR releases 4.0 and later. ... Use AmiVersion for
-        // releases 3.x and 2.x", so a launch that names no release label names no release
-        // to resolve.
+        // application packages installed on the cluster. Release labels are in the form
+        // emr-x.x.x, where x.x.x is an Amazon EMR release version such as emr-5.14.0. …
+        // The release label applies only to Amazon EMR releases version 4.0 and later.
+        // Earlier versions use AmiVersion." (`RunJobFlow$ReleaseLabel` doc.) A cluster runs
+        // ONE release of Amazon EMR, and the launch NAMES it, so the label is resolved
+        // against the ONE release catalog this service publishes — every release Amazon EMR
+        // lists, of every family of it (`crate::state::catalog_release`), which is the same
+        // set `ListReleaseLabels` enumerates for a caller to choose from — and only a label
+        // naming none of its releases is refused, before any cluster state is written. The
+        // member is OPTIONAL — "use AmiVersion for releases 3.x and 2.x" — so a launch that
+        // names no release label names no release to resolve.
         if let Some(release_label) = input.release_label.as_deref() {
             if crate::state::catalog_release(release_label).is_none() {
                 return Err(refuse(crate::state::invalid_release_label_message(
