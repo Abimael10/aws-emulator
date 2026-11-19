@@ -36,6 +36,19 @@
 //! cell off the template's still match it: at the sizes a page is drawn at, a stem is one or
 //! two cells across.
 //!
+//! What a blurred grid cannot see is told apart by counting: how many SEPARATE strokes the
+//! ink falls into and how many HOLES they enclose ([`shape_of`]), measured off the pixels of
+//! the mark and of the template alike, so a character a face draws with a mark of its own —
+//! the dot of a `j`, the bars of an equals sign — is not read off ink that is one unbroken
+//! stroke, and one drawn around two counters — an `8`, a `B` — is not read off ink that
+//! closes once.
+//!
+//! The frame is the line's own, so the capital height it is scaled by is read off the marks
+//! the line carries ([`line_of`]): the height its flat capitals agree on, since the round
+//! letters of a face overshoot them and the few letters that descend through the baseline
+//! reach past them, and framing a line by either measures every mark on it against a
+//! capital height no letter of it has.
+//!
 //! ## What it costs
 //!
 //! The bank is built once ([`bank`]) and holds a few hundred templates, so every mark is
@@ -96,6 +109,14 @@ const BLUR_CENTRE: f32 = 0.5;
 /// Sørensen-Dice coefficient of the two grids, for the character to be reported. Ink that
 /// agrees with no glyph this well matched nothing, so it contributes no text.
 pub(super) const MIN_MATCH: f32 = 0.52;
+
+/// What one stroke or one hole of difference between a mark's ink and a template's costs
+/// that template ([`shape_of`]): enough to settle two characters that are the same ink but
+/// for the mark a face draws apart from the rest, or for where one of them closes — a `J`
+/// against a `j`, a `6` against an `8` — which a grid blurred a cell wide can hardly tell
+/// apart, and not so much that a stroke which merged with its neighbour, a counter that
+/// filled in, or a stroke that broke, is read as another character.
+const SHAPE_APART: f32 = 0.05;
 
 /// The side of one glyph cell of the embedded 8x8 bitmap font.
 pub(super) const FONT_CELL: usize = 8;
@@ -259,6 +280,24 @@ struct Mark {
     top: f32,
     /// How much ink it carries, in capital heights squared.
     mass: f32,
+    /// How many SEPARATE strokes its ink falls into, and how many holes they enclose: see
+    /// [`shape_of`].
+    shape: Shape,
+}
+
+/// What a mark's ink is made of, in the counts that survive every size it is drawn at: see
+/// [`shape_of`].
+#[derive(Debug, Clone, Copy)]
+struct Shape {
+    strokes: usize,
+    holes: usize,
+}
+
+impl Shape {
+    /// How far this shape stands from `other`'s: a stroke or a hole of difference each.
+    fn apart(&self, other: &Self) -> f32 {
+        (self.strokes.abs_diff(other.strokes) + self.holes.abs_diff(other.holes)) as f32
+    }
 }
 
 impl Mark {
@@ -301,6 +340,7 @@ impl Mark {
             height: (y1.saturating_sub(y0) + 1) as f32 / line.cap,
             top: (line.baseline - y0 as f32) / line.cap,
             mass: ink * sampled / (line.cap * line.cap),
+            shape: shape_of(coverage, (x0, x1, y0, y1)),
             fine,
         }
     }
@@ -353,6 +393,12 @@ impl Mark {
     /// worth taking it over.
     fn unshifted_agreement(&self, other: &Self) -> f32 {
         dice(&self.fine, self.fine_ink, &other.fine, other.fine_ink)
+    }
+
+    /// How far this mark's ink stands from `other`'s in what it is MADE of: see
+    /// [`shape_of`].
+    fn shape_apart(&self, other: &Self) -> f32 {
+        self.shape.apart(&other.shape)
     }
 }
 
@@ -479,6 +525,111 @@ fn sample(
 /// stroke is still a whole pixel of ink.
 fn stroke(ink: f32) -> f32 {
     ((ink - super::INK_FLOOR) / (1.0 - super::INK_FLOOR)).clamp(0.0, 1.0)
+}
+
+/// What the ink inside `x0..=x1` by `y0..=y1` is made of, as the two counts that survive
+/// every size a glyph is drawn at: how many SEPARATE STROKES it falls into, and how many
+/// HOLES those strokes enclose.
+///
+/// A character is drawn in a known number of each — one stroke for most letters, two for the
+/// ones a face draws with a dot or a pair of bars (`i`, `j`, `:`, `=`, `?`), three for a `%`;
+/// no hole in a `C` or a `7`, one in a `6`, a `9`, a `P` or an `A`, two in an `8` or a `B` —
+/// so a mark that is one unbroken stroke around one counter is not the character a face
+/// draws in two of either, whatever the two grids agree on cell by cell. That is what a grid
+/// blurred a cell wide cannot see: the counter of a `6` and the two of an `8` are the same
+/// ink everywhere but where the one closes.
+///
+/// Both counts are taken the same way on both sides of the comparison, off the pixels of the
+/// mark and of the template, over the eight neighbours of an inked pixel so a stroke drawn
+/// at a diagonal counts once, and over the four of a blank one so two counters that touch at
+/// a corner stay two. A hole is ground the mark encloses, so ground that reaches the edge of
+/// the mark's own box is not one. What a page's own ink gives is evidence rather than a rule:
+/// a stroke that merged with its neighbour at the size the page was drawn at, a counter that
+/// filled in, or a stroke that broke, costs its character a little ([`SHAPE_APART`]) instead
+/// of ruling it out.
+///
+/// The scan is over at most [`MAX_MARK_SAMPLES`] pixels on a side ([`stride_over`]), as the
+/// mark's own ink is, so a mark the size of a page costs no more to count than a character
+/// does.
+fn shape_of(
+    coverage: &impl Fn(isize, isize) -> f32,
+    (x0, x1, y0, y1): (usize, usize, usize, usize),
+) -> Shape {
+    let (stride_x, stride_y) = (
+        stride_over((x1 + 1 - x0) as f32, MAX_MARK_SAMPLES),
+        stride_over((y1 + 1 - y0) as f32, MAX_MARK_SAMPLES),
+    );
+    let columns: Vec<usize> = (x0..=x1).step_by(stride_x).collect();
+    let rows: Vec<usize> = (y0..=y1).step_by(stride_y).collect();
+    let inked: Vec<bool> = rows
+        .iter()
+        .flat_map(|y| {
+            columns
+                .iter()
+                .map(move |x| coverage(*x as isize, *y as isize) >= super::INK_FLOOR)
+        })
+        .collect();
+    let (wide, deep) = (columns.len(), rows.len());
+    let mut taken = vec![false; inked.len()];
+    let mut strokes = 0usize;
+    let mut holes = 0usize;
+    let mut reached: Vec<(usize, usize)> = Vec::new();
+    for row in 0..deep {
+        for column in 0..wide {
+            if taken[row * wide + column] {
+                continue;
+            }
+            // A region of ink is a stroke; a region of ground is a hole, unless it reaches
+            // the edge of the mark's box, where it is the ground around the mark instead.
+            let ink = inked[row * wide + column];
+            let mut edge = false;
+            taken[row * wide + column] = true;
+            reached.push((column, row));
+            let steps: &[(i32, i32)] = if ink {
+                &[
+                    (-1, -1),
+                    (-1, 0),
+                    (-1, 1),
+                    (0, -1),
+                    (0, 1),
+                    (1, -1),
+                    (1, 0),
+                    (1, 1),
+                ]
+            } else {
+                &[(-1, 0), (0, -1), (0, 1), (1, 0)]
+            };
+            while let Some((at_column, at_row)) = reached.pop() {
+                edge = edge
+                    || at_column == 0
+                    || at_row == 0
+                    || at_column + 1 == wide
+                    || at_row + 1 == deep;
+                for (step_row, step_column) in steps {
+                    let next_column = at_column as i32 + step_column;
+                    let next_row = at_row as i32 + step_row;
+                    if next_column < 0
+                        || next_row < 0
+                        || next_column >= wide as i32
+                        || next_row >= deep as i32
+                    {
+                        continue;
+                    }
+                    let cell = next_row as usize * wide + next_column as usize;
+                    if inked[cell] == ink && !taken[cell] {
+                        taken[cell] = true;
+                        reached.push((next_column as usize, next_row as usize));
+                    }
+                }
+            }
+            match (ink, edge) {
+                (true, _) => strokes += 1,
+                (false, false) => holes += 1,
+                (false, true) => {}
+            }
+        }
+    }
+    Shape { strokes, holes }
 }
 
 /// Spread each cell's ink over its neighbours, so a stroke that lands a cell off the
@@ -807,6 +958,25 @@ impl DrawTarget for Drawn {
     }
 }
 
+/// How wide the widest character the bank holds a template for stands, in the capital
+/// heights of the line that sets it.
+///
+/// Measured off the bank itself rather than fixed in advance: a proportional face sets a
+/// capital W a third wider than the capitals it stands beside, so a ceiling below that
+/// would refuse the widest letters of the very faces this recogniser is asked to name. It
+/// is therefore the hard bound on what one character can measure — ink wider than this is
+/// more than one — and never a reason to refuse a character the bank could have named.
+pub(super) fn widest_glyph() -> f32 {
+    static WIDEST: OnceLock<f32> = OnceLock::new();
+    *WIDEST.get_or_init(|| {
+        bank()
+            .iter()
+            .flat_map(|held| held.faces.iter())
+            .map(|face| face.width)
+            .fold(1.0, f32::max)
+    })
+}
+
 /// The character the mark `glyph` of a page is drawn with, and how well its ink agreed with
 /// that character's, or `None` when no glyph's ink is this mark's.
 ///
@@ -822,14 +992,64 @@ impl DrawTarget for Drawn {
 /// 3. the grids again with the one-cell search of [`Mark::agreement`], which settles the
 ///    answer.
 pub(super) fn recognise(ink: &Ink, glyph: &GlyphBox, line: Line) -> Option<Named> {
+    recognise_region(ink, *glyph, line, &|_, _| true)
+}
+
+/// The same, for a mark that is one CONNECTED region of a run's ink: `own` says which
+/// pixels of the mark's rectangle its own strokes reach, so the ink of a mark whose box
+/// overlaps this one's is not measured as part of it.
+pub(super) fn recognise_region(
+    ink: &Ink,
+    glyph: GlyphBox,
+    line: Line,
+    own: &dyn Fn(isize, isize) -> bool,
+) -> Option<Named> {
     if line.cap < 1.0 {
         return None;
     }
-    let page = |x: isize, y: isize| ink.coverage(x, y);
+    let page = |x: isize, y: isize| {
+        if own(x, y) {
+            ink.coverage(x, y)
+        } else {
+            0.0
+        }
+    };
     let mark = Mark::measure(&page, (glyph.x0, glyph.x1, glyph.y0, glyph.y1), line);
+    name_mark(&mark)
+}
+
+/// The character `mark` is drawn with, over the bank, by the three steps of [`recognise`].
+fn name_mark(mark: &Mark) -> Option<Named> {
     if mark.fine_ink <= 0.0 {
         return None;
     }
+    let named = candidates(mark);
+    let best = named
+        .iter()
+        .copied()
+        .reduce(|held, found| if found.1 > held.1 { found } else { held })?;
+    if best.1 < MIN_MATCH {
+        return None;
+    }
+    // Whether the shape left the reading OPEN: a bar is not a character of a word at all,
+    // and where the mark is a stem the shape may not tell the stems apart — the best of the
+    // others it could be scores as well.
+    let open = best.0 == '|'
+        || (STEMS.contains(&best.0)
+            && named
+                .iter()
+                .filter(|(ch, _)| *ch != best.0 && STEMS.contains(ch))
+                .any(|(_, scored)| best.1 - scored <= STEM_MARGIN));
+    Some(Named {
+        ch: best.0,
+        score: best.1,
+        open,
+    })
+}
+
+/// The characters `mark` could be, each with how well its ink agreed with that character's
+/// closest face: the [`CLOSE_LOOK`] the two narrowing steps keep.
+fn candidates(mark: &Mark) -> Vec<(char, f32)> {
     let bank = bank();
     let mut shortlist = Ranking::<SHORTLIST>::new();
     for (index, candidate) in bank.iter().enumerate() {
@@ -854,31 +1074,11 @@ pub(super) fn recognise(ink: &Ink, glyph: &GlyphBox, line: Line) -> Option<Named
         let scored = bank[index]
             .faces
             .iter()
-            .map(|face| mark.agreement(face))
+            .map(|face| mark.agreement(face) - SHAPE_APART * mark.shape_apart(face))
             .fold(0.0f32, f32::max);
         named.push((bank[index].ch, scored));
     }
-    let best = named
-        .iter()
-        .copied()
-        .reduce(|held, found| if found.1 > held.1 { found } else { held })?;
-    if best.1 < MIN_MATCH {
-        return None;
-    }
-    // Whether the shape left the reading OPEN: a bar is not a character of a word at all,
-    // and where the mark is a stem the shape may not tell the stems apart — the best of the
-    // others it could be scores as well.
-    let open = best.0 == '|'
-        || (STEMS.contains(&best.0)
-            && named
-                .iter()
-                .filter(|(ch, _)| *ch != best.0 && STEMS.contains(ch))
-                .any(|(_, scored)| best.1 - scored <= STEM_MARGIN));
-    Some(Named {
-        ch: best.0,
-        score: best.1,
-        open,
-    })
+    named
 }
 
 /// What one mark was named: the character, how well its ink agreed with that character's,
@@ -901,6 +1101,12 @@ pub(super) const STEMS: &[char] = &['I', 'l', '1', '|'];
 /// which of them it is OPEN: a hair, since the four are the same ink only where the face
 /// draws them so.
 const STEM_MARGIN: f32 = 0.04;
+
+/// How close to the ninth decile of a line's mark heights a mark must stand to count as one
+/// of the line's own CAPITALS when its height is measured ([`line_of`]): within a tenth,
+/// which is the pixel or two a round letter overshoots a flat capital by at the sizes a page
+/// is set at.
+const NEAR_CAP: f32 = 0.9;
 
 /// The `N` best-scoring items offered to it, best first: how each step of [`recognise`]
 /// hands the next one the characters worth a closer look.
@@ -965,7 +1171,42 @@ pub(super) fn line_of(glyphs: &[GlyphBox], top: usize, bottom: usize) -> Line {
         super::quantile(&feet, 0.5),
         super::quantile(&kept_heights, 0.9),
     ) {
-        (Some(baseline), Some(cap)) if cap >= 1.0 => Line { baseline, cap },
+        (Some(baseline), Some(_)) => {
+            // The height of the capitals this line STANDS on the baseline: the marks whose
+            // own foot is the baseline's row. A face measures its capitals by a flat letter
+            // — which is what every template here is framed by — while the few marks that
+            // descend through the baseline (a `J`, a `Q`, a comma) reach further down than
+            // any capital of the line does.
+            let standing: Vec<f32> = kept
+                .iter()
+                .filter(|glyph| ((glyph.y1 + 1) as f32 - baseline).abs() < 1.0)
+                .map(|glyph| glyph.height() as f32)
+                .collect();
+            // What the TALL marks of the line agree on, rather than the tallest of them:
+            // the ninth decile is a capital's height on a line that holds one, and the
+            // median of the marks standing near it is the height the line's flat capitals
+            // really measure — a round letter overshoots them by a pixel at the size a page
+            // is set at, and framing the line by that pixel measures every mark on it
+            // against a capital height no letter of it has.
+            let cap = super::quantile(&standing, 0.9)
+                .map(|tall| {
+                    let agreed: Vec<f32> = standing
+                        .iter()
+                        .copied()
+                        .filter(|height| {
+                            *height >= NEAR_CAP * tall && *height <= tall / NEAR_CAP
+                        })
+                        .collect();
+                    super::quantile(&agreed, 0.5).unwrap_or(tall)
+                })
+                .or_else(|| super::quantile(&kept_heights, 0.9))
+                .unwrap_or(0.0);
+            if cap >= 1.0 {
+                Line { baseline, cap }
+            } else {
+                band
+            }
+        }
         _ => band,
     }
 }
@@ -973,6 +1214,35 @@ pub(super) fn line_of(glyphs: &[GlyphBox], top: usize, bottom: usize) -> Line {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every character of the bank is named as itself when the ink of its own face is what
+    /// the recogniser is given: the comparison names a mark after the character it is drawn
+    /// as, at the sizes a page is set at, including the sizes between two the bank holds
+    /// templates at.
+    #[test]
+    fn a_glyph_of_a_face_is_named_as_the_character_it_draws() {
+        // Sizes BETWEEN the rasters `OUTLINE_FACES` holds, so each row is matched against
+        // templates whose stroke weight and counters are a size away from its own.
+        for size in [19.0f32, 25.0, 31.0] {
+            let face = outline_face(ttf_noto_sans::REGULAR, size);
+            for ch in ('A'..='Z').chain('0'..='9') {
+                let Some(mark) = face(ch) else {
+                    panic!("case {ch:?} at {size}: the outline face must draw it");
+                };
+                let named = name_mark(&mark);
+                assert_eq!(
+                    named.map(|found| found.ch),
+                    Some(ch),
+                    "case {ch:?} at {size} pixels: a glyph must be named as the character it \
+                     draws, got {:?}",
+                    candidates(&mark)
+                        .iter()
+                        .map(|(other, scored)| (*other, (scored * 100.0) as i32))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
 
     /// No two characters of one face are the same ink: each letter and digit, as every face
     /// of the bank draws it, agrees with its own character more than with any other, so the

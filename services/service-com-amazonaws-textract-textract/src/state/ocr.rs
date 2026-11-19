@@ -31,8 +31,10 @@
 //!    are separated by what their step covers past that advance rather than by the gap a
 //!    narrow figure leaves inside its own cell ([`figure_advance`]).
 //!    A run of inked columns is a candidate for ONE character, but at the size a page is
-//!    drawn at it can hold two whose strokes touch, or be what is left of one whose thin
-//!    stroke broke: which it is, is settled by NAMING ([`settle`]).
+//!    drawn at it can hold two whose strokes touch, two whose boxes merely overlap — a
+//!    proportional face sets letters whose ink reaches back under the letter before them
+//!    ([`Ink::regions_in`]) — or be what is left of one whose thin stroke broke: which it
+//!    is, is settled by NAMING ([`settle`]).
 //! 4. **Recognise** — each mark is resampled into a frame anchored on the line it sits in
 //!    and scored against every printable ASCII character of a bank of typefaces — the
 //!    embedded 8x8 font, a pre-rasterised sans-serif face at several weights and sizes, the
@@ -280,6 +282,18 @@ const RULE_MAX_HEIGHT: usize = 3;
 /// margin cannot stretch one line into a long string.
 const MAX_INDENT: usize = 100;
 
+/// How far short of what the marks of its own line match their characters at a run's own
+/// name may fall before the segmentation looks inside it for the characters it holds.
+///
+/// Two letters whose ink runs together are a run no wider than one wide capital as often as
+/// not — a narrow letter set against its neighbour — so width alone does not give them away.
+/// What does is the NAME: the character such a run is named as is not the ink it carries,
+/// and it matches a clear margin worse than the marks of the same line that are one
+/// character each. Measured against the line's own marks rather than an absolute score, so
+/// a page in a face nothing here is a copy of — where every mark matches middlingly — is
+/// read as it stands instead of being looked into mark by mark.
+const WEAK_MARK_MATCH: f32 = 0.1;
+
 /// How wide one mark of a line may be, in that line's capital heights, before the
 /// segmentation looks for a cut inside it: no Latin character is wider than its own
 /// capitals by this much, so a run of ink that is holds more than one character.
@@ -299,6 +313,21 @@ const MAX_MARK_PITCH: f32 = 1.6;
 /// pieces of a run are named over every sequence of these places, so this bounds the work
 /// one run of ink can cause.
 const MAX_CUT_CANDIDATES: usize = 20;
+
+/// The most CONNECTED regions one run of ink may fall into for those regions to be read as
+/// its marks ([`Ink::regions_in`]). NOT an AWS limit: naming one region costs a comparison
+/// against the recogniser's bank. A run of a line's own characters falls into a handful of
+/// them; one that falls into more is speckle or a dither pattern, which is read as the ink
+/// it stands as.
+const MAX_REGIONS: usize = 8;
+
+/// The most pixels a run of ink may cover for its connected regions to be found at all. NOT
+/// an AWS limit: finding them walks the run's own pixels, so this is what keeps the work and
+/// the memory one run of ink can cause bounded whatever the page's size. A run holding two
+/// characters of a line covers a few thousand pixels at the sizes a page is set at; a run
+/// that covers a large part of the page is ink of another kind, which the cuts read as it
+/// stands.
+const MAX_REGION_PIXELS: usize = 1 << 18;
 
 /// How narrow a piece of a cut run may be, in its line's capital heights: narrower than the
 /// narrowest character a line sets, so two cuts that close together would separate a
@@ -1447,6 +1476,96 @@ impl Ink {
             .sum()
     }
 
+    /// The CONNECTED regions of `run`'s ink inside `band`, in reading order: the marks its
+    /// ink really falls into.
+    ///
+    /// A run of inked columns is the ink of one column range, which is not the same thing as
+    /// the ink of one character: a proportional face sets letters whose ink reaches back
+    /// under the letter before them — the hook of a `J`, the tail of a `Q` — so two
+    /// characters' boxes overlap in columns while their strokes never touch, and no cut down
+    /// a column separates them. What separates them is CONNECTION: a mark is the ink its own
+    /// strokes reach, taken here over the eight neighbours of each inked pixel so that a
+    /// stroke drawn at a diagonal stays one region.
+    ///
+    /// The regions are offered to the segmentation as one reading of the run beside the cuts
+    /// ([`cut_apart`]); nothing is split unless the pieces are NAMED better than the whole.
+    /// A run whose ink falls into more than [`MAX_REGIONS`] of them is left to the cuts: that
+    /// is speckle or a dither pattern rather than a line's characters, and so is a run that
+    /// covers more of the page than [`MAX_REGION_PIXELS`], which is more than the characters
+    /// of one line of text ever do.
+    fn regions_in(&self, run: &GlyphBox, band: &InkLine) -> Vec<Region> {
+        let right = run.x1.min(self.width.saturating_sub(1));
+        let bottom = band.bottom.min(self.height.saturating_sub(1));
+        if run.x0 > right || band.top > bottom {
+            return Vec::new();
+        }
+        let (columns, rows) = (right + 1 - run.x0, bottom + 1 - band.top);
+        if columns.saturating_mul(rows) > MAX_REGION_PIXELS {
+            return Vec::new();
+        }
+        let cell = |x: usize, y: usize| (y - band.top) * columns + (x - run.x0);
+        let mut taken = vec![false; columns * rows];
+        let mut found: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut reached: Vec<(usize, usize)> = Vec::new();
+        for y in band.top..=bottom {
+            for x in run.x0..=right {
+                if !self.at(x, y) || taken[cell(x, y)] {
+                    continue;
+                }
+                taken[cell(x, y)] = true;
+                reached.push((x, y));
+                let mut region: Vec<(usize, usize)> = Vec::new();
+                while let Some((at_x, at_y)) = reached.pop() {
+                    region.push((at_x, at_y));
+                    for (step_y, step_x) in [
+                        (-1i32, -1i32),
+                        (-1, 0),
+                        (-1, 1),
+                        (0, -1),
+                        (0, 1),
+                        (1, -1),
+                        (1, 0),
+                        (1, 1),
+                    ] {
+                        let next_x = at_x as i32 + step_x;
+                        let next_y = at_y as i32 + step_y;
+                        let inside = next_x >= run.x0 as i32
+                            && next_x <= right as i32
+                            && next_y >= band.top as i32
+                            && next_y <= bottom as i32;
+                        if !inside {
+                            continue;
+                        }
+                        let (next_x, next_y) = (next_x as usize, next_y as usize);
+                        if self.at(next_x, next_y) && !taken[cell(next_x, next_y)] {
+                            taken[cell(next_x, next_y)] = true;
+                            reached.push((next_x, next_y));
+                        }
+                    }
+                }
+                found.push(region);
+                if found.len() > MAX_REGIONS {
+                    return Vec::new();
+                }
+            }
+        }
+        let mut regions: Vec<Region> = found.iter().map(|pixels| Region::of(pixels)).collect();
+        regions.sort_by_key(|region| (region.glyph.x0, region.glyph.y0));
+        regions
+    }
+
+    /// How much ink `region`'s own pixels carry.
+    fn ink_in_region(&self, region: &Region) -> f32 {
+        (region.glyph.y0..=region.glyph.y1)
+            .map(|y| {
+                (region.glyph.x0..=region.glyph.x1)
+                    .filter(|x| region.holds(*x as isize, y as isize))
+                    .map(|x| self.strength(x, y))
+                    .sum::<f32>()
+            })
+            .sum()
+    }
+
     /// The columns INSIDE `run` where it might be cut: the places its ink narrows, which is
     /// what two characters whose strokes touch leave between them.
     ///
@@ -1623,6 +1742,48 @@ struct InkLine {
     glyphs: Vec<GlyphBox>,
 }
 
+/// One CONNECTED region of a run's ink: the box it occupies, and which pixels of that box
+/// its own strokes reach.
+///
+/// Two characters' boxes can overlap while their strokes never touch (see
+/// [`Ink::regions_in`]), so a region carries the mask as well as the box: the ink of the
+/// mark beside it stands inside the same rectangle and is not this mark's.
+#[derive(Debug, Clone)]
+struct Region {
+    glyph: GlyphBox,
+    /// Row-major over `glyph`'s own rectangle.
+    own: Vec<bool>,
+}
+
+impl Region {
+    /// The region `pixels` make up: the box around them, and the mask of which of that
+    /// box's pixels they are.
+    fn of(pixels: &[(usize, usize)]) -> Self {
+        let mut extremes = Extremes::default();
+        for (x, y) in pixels {
+            extremes.mark(*x, *y);
+        }
+        // Every region comes from at least one pixel, so it has bounds; a region without
+        // them is the empty box at the origin, which holds nothing.
+        let (x0, x1, y0, y1) = extremes.bounds().unwrap_or((0, 0, 0, 0));
+        let glyph = GlyphBox { x0, x1, y0, y1 };
+        let mut own = vec![false; glyph.width() * glyph.height()];
+        for (x, y) in pixels {
+            own[(y - y0) * glyph.width() + (x - x0)] = true;
+        }
+        Self { glyph, own }
+    }
+
+    /// Whether `(x, y)` is one of this region's own pixels.
+    fn holds(&self, x: isize, y: isize) -> bool {
+        let inside = (self.glyph.x0 as isize..=self.glyph.x1 as isize).contains(&x)
+            && (self.glyph.y0 as isize..=self.glyph.y1 as isize).contains(&y);
+        inside
+            && self.own[(y as usize - self.glyph.y0) * self.glyph.width()
+                + (x as usize - self.glyph.x0)]
+    }
+}
+
 /// One mark of a line as the segmentation settled it: its rectangle, the ink that rectangle
 /// holds, and the character it was named with, if any.
 #[derive(Debug, Clone, Copy)]
@@ -1653,13 +1814,19 @@ impl Settled {
 /// the pieces of a stroke that broke apart.
 ///
 /// A run of inked columns is a candidate for ONE character, but at the size a page is
-/// drawn at that candidate can be wrong both ways: neighbouring letters set tight, or
-/// spread by a heavy weight or a lossy coding, touch and come out as one run, while a thin
-/// stroke — the arch of an 'n', the waist of an 's' — can fall under the floor that tells
-/// ink from ground and leave a letter in pieces. Both are settled by NAMING: a cut is kept
-/// only where the pieces are named better than the whole was, and a join only where the
-/// whole is named better than its pieces, so a page that needs neither is read exactly as
-/// its runs stand.
+/// drawn at that candidate can be wrong every way: neighbouring letters set tight, or
+/// spread by a heavy weight or a lossy coding, touch and come out as one run; a letter whose
+/// ink reaches back under the one before it shares that one's columns without touching it at
+/// all; and a thin stroke — the arch of an 'n', the waist of an 's' — can fall under the
+/// floor that tells ink from ground and leave a letter in pieces. All three are settled by
+/// NAMING: a cut or a split into the run's own connected regions is kept only where the
+/// pieces are named better than the whole was, and a join only where the whole is named
+/// better than its pieces, so a page that needs none of them is read exactly as its runs
+/// stand.
+///
+/// Which runs are looked inside at all is settled by naming too: the ones too wide to be one
+/// character of their line, and the ones whose own name falls a clear margin short of what
+/// the line's other marks match at ([`WEAK_MARK_MATCH`]).
 fn settle(
     ink: &Ink,
     band: &InkLine,
@@ -1670,11 +1837,52 @@ fn settle(
     // character, whatever the line's capitals measure.
     let typical = median(band.glyphs.iter().map(GlyphBox::width)).unwrap_or(1.0);
     let too_wide = (MAX_MARK_WIDTH * line.cap).max(MAX_MARK_PITCH * typical);
+    // Every run named as it stands, which is what the pieces of a cut are weighed against.
+    let whole: Vec<Settled> = band
+        .glyphs
+        .iter()
+        .map(|run| name(ink, *run, line, budget))
+        .collect::<Result<_, _>>()?;
+    // What the marks of THIS line match their characters at: the runs that fall a clear
+    // margin short of it are the ones whose ink is not one character of the face the rest
+    // of the line is set in.
+    let matched = median_of(
+        &whole
+            .iter()
+            .map(|mark| mark.named.map_or(0.0, |found| found.score))
+            .collect::<Vec<f32>>(),
+    )
+    .unwrap_or(0.0);
     let mut cut: Vec<Settled> = Vec::new();
-    for run in &band.glyphs {
-        cut_apart(ink, band, *run, line, too_wide, budget, &mut cut)?;
+    for (run, whole) in band.glyphs.iter().zip(whole) {
+        // Which readings of this run are worth taking. A run TOO WIDE to be one character of
+        // its line holds more than one, and where its characters' strokes touch only a cut
+        // through the narrowing between them separates them. A run whose own name is
+        // UNCONVINCING — a clear margin worse than what the marks of the same line match at —
+        // may hold two characters that are no wider than one: what gives those away is not
+        // the width but that the character they were named as is not the ink they carry.
+        // Only the CONNECTED reading is taken for them, because ink that is not joined is
+        // evidence of two marks, while a cut through ink that is joined, offered to every
+        // middling mark of a page set in a face nothing here is a copy of, would read the
+        // pieces of one letter as the punctuation they are shaped like.
+        let look = LookInside {
+            cuts: (run.width() as f32) > too_wide,
+            regions: (run.width() as f32) > too_wide
+                || whole
+                    .named
+                    .is_none_or(|found| found.score < matched - WEAK_MARK_MATCH),
+        };
+        cut_apart(ink, band, whole, line, look, budget, &mut cut)?;
     }
     join(ink, band, cut, line, budget)
+}
+
+/// Which readings of a run of ink the segmentation takes beside the run as it stands: the
+/// cuts through the places its ink narrows, the run's own connected regions, or neither.
+#[derive(Debug, Clone, Copy)]
+struct LookInside {
+    cuts: bool,
+    regions: bool,
 }
 
 /// Name one mark, against this request's naming budget.
@@ -1692,90 +1900,149 @@ fn name(
     })
 }
 
-/// Cut `run` into the pieces that account for its ink best, and push what it settles as
-/// onto `out`.
+/// Name one connected region of a run's ink, measuring the region's OWN pixels and not the
+/// ink a mark beside it leaves inside the same rectangle.
+fn name_region(
+    ink: &Ink,
+    region: &Region,
+    line: glyphs::Line,
+    budget: &mut Budget,
+) -> Result<Settled, Unreadable> {
+    budget.spend()?;
+    Ok(Settled {
+        named: glyphs::recognise_region(ink, region.glyph, line, &|x, y| region.holds(x, y)),
+        ink: ink.ink_in_region(region),
+        glyph: region.glyph,
+    })
+}
+
+/// Read `whole`'s run apart into the marks that account for its ink best, and push what it
+/// settles as onto `out`.
 ///
-/// A run wider than one character of its line holds more than one, with nothing but a
-/// narrowing of its ink between them — the letters' strokes touch, or the halo around them
-/// does. Where exactly is settled by NAMING: the columns where the run's ink narrows are
-/// the places it could be cut ([`Ink::cut_candidates`]), and the run is cut into the
-/// sequence of pieces whose names account for its ink best of all such sequences — found
-/// once, over the whole run, rather than by halving it, since where one letter ends depends
-/// on where the letters after it do.
+/// A run `look`ed inside may hold more than one character in either of two ways. Its
+/// characters' strokes may TOUCH, with nothing but a narrowing of its ink between them — the
+/// letters set tight, or the halo around them run together — and where exactly is settled by
+/// NAMING: the columns where the run's ink narrows are the places it could be cut
+/// ([`Ink::cut_candidates`]), and the run is cut into the sequence of pieces whose names
+/// account for its ink best of all such sequences — found once, over the whole run, rather
+/// than by halving it, since where one letter ends depends on where the letters after it do.
+/// Or its characters may share COLUMNS without touching at all, which no cut separates, and
+/// then the run's own connected regions are the marks ([`Ink::regions_in`]).
+///
+/// `whole` is the run named as it stands, and it is the reading that stands unless one of
+/// the other two accounts for its ink better: the same ink either way, so what they are
+/// compared on is how well it is named.
 fn cut_apart(
     ink: &Ink,
     band: &InkLine,
-    run: GlyphBox,
+    whole: Settled,
     line: glyphs::Line,
-    too_wide: f32,
+    look: LookInside,
     budget: &mut Budget,
     out: &mut Vec<Settled>,
 ) -> Result<(), Unreadable> {
-    let whole = name(ink, run, line, budget)?;
-    // No character of this line is this wide: a run that is holds more than one.
-    if (run.width() as f32) <= too_wide {
+    // Nothing about this run says it holds more than one character: it is the mark it was
+    // named as.
+    if !(look.cuts || look.regions) {
         out.push(whole);
         return Ok(());
     }
+    let run = whole.glyph;
+    // What its own CONNECTED regions name as, where its ink falls into more than one of
+    // them: two characters whose boxes overlap but whose strokes never touch. A run that is
+    // one region is the one mark `whole` already named.
+    //
+    // Every region has to stand as tall as a character of its line, for the reason a cut's
+    // pieces do: ink that does not is part of ONE character — the dot of an `i`, the piece a
+    // stroke that broke left behind — and reading such a run by its regions would report a
+    // letter as the marks of punctuation its pieces are shaped like. What puts a broken
+    // letter back together is [`join`].
+    let mut regions: Vec<Settled> = Vec::new();
+    let found = ink.regions_in(&run, band);
+    let apart = found.len() > 1
+        && found
+            .iter()
+            .all(|region| (region.glyph.height() as f32) >= MIN_PIECE_HEIGHT * line.cap);
+    if look.regions && apart {
+        for region in &found {
+            regions.push(name_region(ink, region, line, budget)?);
+        }
+    }
+    let regions_value = if regions.is_empty() {
+        f32::MIN
+    } else {
+        regions.iter().map(Settled::value).sum()
+    };
     // Where each piece may start: the run's own left edge, each place it could be cut, and
     // one past its right edge, so the piece from `starts[i]` to `starts[j] - 1` is the ink
     // between two of them.
     let mut starts = vec![run.x0];
-    starts.extend(ink.cut_candidates(&run, band, line).into_iter().map(|at| at + 1));
-    starts.push(run.x1 + 1);
-    if starts.len() < 3 {
-        out.push(whole);
-        return Ok(());
+    if look.cuts {
+        starts.extend(ink.cut_candidates(&run, band, line).into_iter().map(|at| at + 1));
     }
+    starts.push(run.x1 + 1);
     let last = starts.len() - 1;
-    let widest = MAX_MARK_WIDTH * line.cap;
+    let widest = glyphs::widest_glyph() * line.cap;
     // The best-named sequence of pieces from each start onwards, found from the right so
     // each piece is named once.
     let mut best = vec![f32::MIN; starts.len()];
     let mut then = vec![last; starts.len()];
     let mut named: Vec<Option<Settled>> = vec![None; starts.len()];
     best[last] = 0.0;
-    for from in (0..last).rev() {
-        for to in from + 1..=last {
-            let width = (starts[to] - starts[from]) as f32;
-            // Too wide to be one character: and, since the pieces only grow from here, so
-            // is every piece after it — unless nothing narrower was found at all, in which
-            // case this one piece carries the rest of the run.
-            if width > widest && to > from + 1 {
-                break;
-            }
-            let Some(piece) = ink.mark_in(starts[from], starts[to] - 1, band) else {
-                continue;
-            };
-            // A cut separates two characters of the line's own text, and both of them stand
-            // as tall as such a character: a piece shorter than that is part of ONE
-            // character — the bar of a T, the arm of an L — and cutting there would read a
-            // letter as two marks of punctuation.
-            if (piece.height() as f32) < MIN_PIECE_HEIGHT * line.cap {
-                continue;
-            }
-            let piece = name(ink, piece, line, budget)?;
-            // What the cut at the END of this piece costs: the STROKE it crosses. Two
-            // characters whose ink runs together are bridged by the halo anti-aliasing
-            // leaves around their strokes, which is little ink past the floor that tells
-            // ink from ground; the inside of one character — the middle of an M, the waist
-            // of an S — is a stroke, which is all of it. Charging the cut for what it
-            // crosses is what keeps a letter whole where the page gives both.
-            let crossed = if to == last {
-                0.0
-            } else {
-                CUT_COST * ink.stroke_in_column(starts[to] - 1, band)
-            };
-            let value = piece.value() - crossed + best[to];
-            if value > best[from] {
-                best[from] = value;
-                then[from] = to;
-                named[from] = Some(piece);
+    // A run with no place to be cut inside it leaves `best[0]` where it started, so the cut
+    // reading of such a run is worth nothing and the other two settle it.
+    if starts.len() >= 3 {
+        for from in (0..last).rev() {
+            for to in from + 1..=last {
+                let width = (starts[to] - starts[from]) as f32;
+                // Too wide to be one character: and, since the pieces only grow from here,
+                // so is every piece after it — unless nothing narrower was found at all, in
+                // which case this one piece carries the rest of the run.
+                if width > widest && to > from + 1 {
+                    break;
+                }
+                let Some(piece) = ink.mark_in(starts[from], starts[to] - 1, band) else {
+                    continue;
+                };
+                // A cut separates two characters of the line's own text, and both of them
+                // stand as tall as such a character: a piece shorter than that is part of
+                // ONE character — the bar of a T, the arm of an L — and cutting there would
+                // read a letter as two marks of punctuation.
+                if (piece.height() as f32) < MIN_PIECE_HEIGHT * line.cap {
+                    continue;
+                }
+                let piece = name(ink, piece, line, budget)?;
+                // What the cut at the END of this piece costs: the STROKE it crosses. Two
+                // characters whose ink runs together are bridged by the halo anti-aliasing
+                // leaves around their strokes, which is little ink past the floor that tells
+                // ink from ground; the inside of one character — the middle of an M, the
+                // waist of an S — is a stroke, which is all of it. Charging the cut for what
+                // it crosses is what keeps a letter whole where the page gives both.
+                let crossed = if to == last {
+                    0.0
+                } else {
+                    CUT_COST * ink.stroke_in_column(starts[to] - 1, band)
+                };
+                let value = piece.value() - crossed + best[to];
+                if value > best[from] {
+                    best[from] = value;
+                    then[from] = to;
+                    named[from] = Some(piece);
+                }
             }
         }
     }
-    if best[0] <= whole.value() + CUT_GAIN * whole.ink {
+    let cuts_value = best[0];
+    // The run stands as it is unless being read apart accounts for its ink better, by the
+    // margin a cut has to gain ([`CUT_GAIN`]) — the same ink either way, so what the three
+    // readings are compared on is how well they name it.
+    let standing = whole.value() + CUT_GAIN * whole.ink;
+    if standing >= cuts_value.max(regions_value) {
         out.push(whole);
+        return Ok(());
+    }
+    if regions_value >= cuts_value {
+        out.extend(regions);
         return Ok(());
     }
     let mut at = 0usize;
@@ -1808,7 +2075,7 @@ fn join(
             let close = (mark.glyph.x0.saturating_sub(before.glyph.x1 + 1) as f32)
                 <= MAX_PIECE_GAP * line.cap;
             let fits = ((mark.glyph.x1 + 1 - before.glyph.x0) as f32)
-                <= MAX_MARK_WIDTH * line.cap;
+                <= glyphs::widest_glyph() * line.cap;
             if !(piece && close && fits) {
                 break;
             }
@@ -1816,6 +2083,13 @@ fn join(
                 break;
             };
             let together = name(ink, together, line, budget)?;
+            // Against the better of the two pieces, not against both of them together: a
+            // simple shape agrees with the template it is a copy of more closely than a
+            // letter of several strokes does with its own, so two pieces that are each a
+            // clean mark of their own — the two diagonals a `V` falls into when its apex
+            // thins out, the bar and the stem of a broken `T` — would otherwise stand as
+            // the characters they are not. What the join asks is whether the letter they
+            // make up is a better reading of the ink than either of them is.
             if together.value() <= before.value().max(mark.value()) {
                 break;
             }
@@ -2420,6 +2694,11 @@ impl Separators {
 
 #[cfg(test)]
 mod probe;
+
+/// Reading the characters of a token off a page set in a proportional face.
+#[cfg(test)]
+#[path = "ocr/diag.rs"]
+mod tokens;
 
 /// How a line that sets its characters on one advance is separated into words.
 #[cfg(test)]

@@ -529,6 +529,73 @@ async fn a_page_of_tokens_is_read_character_for_character() {
     }
 }
 
+/// Two characters a proportional face sets as ONE run of inked columns are read as the two
+/// characters they are.
+///
+/// The rule under test: the `Text` a raster operation reports is the characters the page was
+/// drawn with, and where one character ends is settled by the ink — not by the column a
+/// slice down the page happens to find. A proportional face gives the segmentation two ways
+/// that a run of inked columns is not one character, and a page of TOKENS is where they
+/// show, since a token is no word and nothing but the ink names each of its characters:
+///
+/// * a letter whose ink reaches BACK UNDER the letter before it — the hook of a `J`, the
+///   tail of a `Q` — so the two boxes overlap in columns although the strokes never touch,
+///   and the pair stands no wider than one wide capital;
+/// * a wide capital set against a narrow one — a `W` beside a `V` — whose strokes do touch,
+///   where the widest letter a face sets is half again as wide as the capitals it stands
+///   with, so a `W` must be allowed to be one character.
+///
+/// A third class is what the ink of ONE character is made of: the characters that are the
+/// same ink but for where one of them closes — a `6` against an `8`, an `A` against an `8` —
+/// which a page set in any face has to be read apart.
+///
+/// The rows differ along what the rule generalises over: which character reaches under its
+/// neighbour, which letterform classes the token draws from, and the size the page is set
+/// at.
+#[tokio::test]
+async fn two_characters_set_as_one_run_of_ink_are_read_as_two() {
+    let router = harness();
+    let tokens = [
+        // A `J` after a capital, a figure and a round letter.
+        "XSJMK34S",
+        "18JK73EU",
+        "MOHJHG7D",
+        // A `J` beside the `1` it shares a stem with.
+        "5A91JT85",
+        // A `Q`, whose tail reaches under the letter after it.
+        "4QJ7QX2W",
+        // The wide capitals against the narrow ones.
+        "VWMWXY7K",
+        "AVWX8MW2",
+        // The characters drawn around two counters against the ones drawn around one and
+        // none: an 8 and a B against a 6, a 9, an A and a 0, against a 5 and a 7.
+        "68B9A057",
+    ];
+    for token in tokens {
+        for size in [18.0f32, 24.0, 32.0] {
+            let case = format!("{token} at {size} pixels");
+            let drawn = format!("SIM2REAL {token}");
+            let page = outline_page(&[&drawn], ttf_noto_sans::REGULAR, size, dark_on_light());
+            let blocks = read_page(&router, &case, &page, ImageFormat::Png).await;
+            let bare =
+                |text: &str| -> String { text.chars().filter(|ch| !ch.is_whitespace()).collect() };
+            assert_eq!(
+                bare(&texts_of(&blocks, "LINE").join("")),
+                bare(&drawn),
+                "case {case:?}: the characters drawn must be the characters read, got {:?}",
+                texts_of(&blocks, "LINE")
+            );
+            // The token is ONE word: two characters whose boxes overlap are not two words,
+            // and neither are two whose strokes touch.
+            assert!(
+                texts_of(&blocks, "WORD").iter().any(|word| word == token),
+                "case {case:?}: the token is one word of the page, got {:?}",
+                texts_of(&blocks, "WORD")
+            );
+        }
+    }
+}
+
 /// The analysis path reads the same page the same way: the words a number is read as are
 /// the words every read path over that document reports.
 #[tokio::test]
