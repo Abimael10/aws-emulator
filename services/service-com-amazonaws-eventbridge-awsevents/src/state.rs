@@ -926,6 +926,16 @@ pub const UNKNOWN_CONDITION: &str = "UNKNOWN";
 /// dead letter's `ERROR_MESSAGE` carries beside this condition.
 pub const INVALID_PARAMETER: &str = "INVALID_PARAMETER";
 
+/// The condition EventBridge reports for a delivery whose target API call was
+/// ANSWERED without taking the event: the call carries the event as one entry of
+/// a batch, and the answer reports that entry among the ones the target did not
+/// hold rather than refusing the call itself — a failure of this event inside a
+/// request that otherwise succeeded. It is the retryable class: the target may
+/// hold the same entry on a later attempt, so the delivery is retried under the
+/// target's `RetryPolicy` and the dead letter accounts for those retries
+/// ([`retry_bounds`]).
+pub const EVENTS_IN_BATCH_REQUEST_REJECTED: &str = "EVENTS_IN_BATCH_REQUEST_REJECTED";
+
 /// The condition EventBridge reports for a delivery whose own input was not one a
 /// target may be handed: what it had to send is not a JSON document, so no call
 /// was made with it.

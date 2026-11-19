@@ -211,6 +211,18 @@ use ecs_task::*;
 #[path = "put_events/rest_api_stage.rs"]
 mod rest_api_stage;
 
+/// The CloudWatch Logs half of the delivery pass: the log event a rule writes
+/// into the log group a target names, what the documents in force over that
+/// group admit of it, and the retries of a write that group would not take.
+///
+/// The `#[path]` is what points the child at `ops/put_events/`, for the reason
+/// the api-destination module above gives.
+#[path = "put_events/log_group.rs"]
+mod log_group;
+// The items it holds are this module's own, for the reason the api-destination
+// glob above gives.
+use log_group::*;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -3308,8 +3320,17 @@ impl TargetKind {
                 // gives a cancellation or shutdown signal somewhere to land
                 // before it starts, as the stream branch above does.
                 ::tokio::task::yield_now().await;
-                deliver_log_event(callback, clients, region, arn, self.action(), handover, body)
-                    .await
+                deliver_log_event(
+                    callback,
+                    clients,
+                    region,
+                    arn,
+                    self.action(),
+                    handover,
+                    body,
+                    retries,
+                )
+                .await
             }
             Self::DeliveryStream => {
                 // `PutRecord` addresses the stream by NAME
@@ -4222,334 +4243,6 @@ fn function_invoke_refusal(function_arn: &str, action: &str) -> (String, String)
                 crate::state::SERVICE_PRINCIPAL,
                 action,
                 function_arn,
-            )
-        ),
-    )
-}
-
-/// Deliver one routed event to the CloudWatch Logs log group `arn` names: write
-/// ONE log event into it, carrying what the target receives.
-///
-/// The rule AWS follows: a rule target whose `Arn` names a log group is
-/// delivered to by WRITING the event into that group — one log event per matched
-/// event — rather than by calling an API of it, and the write is
-/// `logs:PutLogEvents` into a stream of that group made as this service's own
-/// principal, so the documents in force over the GROUP are what admit it
-/// ([`log_group_grants`]). What the log event CARRIES is the text the
-/// target receives, read as the log record it is
-/// ([`crate::state::log_group_target::log_record`]): the whole envelope under the
-/// envelope's own instant for a target taking the event as published, and the
-/// `timestamp` and `message` a reshaped input names for one that asked for
-/// something else.
-///
-/// The write is made of TWO calls, each needing its own grant: a log event can
-/// only be put into a stream that exists, so the stream is opened first. The two
-/// are decided separately, because they fail differently — a delivery whose put
-/// is not admitted writes nothing at all, while one whose stream OPEN is not
-/// admitted opens no stream and is left to the put, which succeeds into a stream
-/// the group already holds and fails for one it does not. A stream already open
-/// is the ordinary answer for the second and every later delivery, so that
-/// refusal alone is not a failed delivery. The stream is named for the RULE whose
-/// delivery writes it: no recorded answer states the name AWS gives it, and
-/// naming it after the rule keeps every delivery of one rule in one stream, in
-/// the order the deliveries were made, where a reader of the group sees them.
-async fn deliver_log_event(
-    callback: &smithy_server_runtime::EmbeddedEmulator,
-    clients: &mut Clients,
-    region: &str,
-    arn: &str,
-    action: &str,
-    handover: &Handover<'_>,
-    body: &str,
-) -> crate::state::InvocationOutcome {
-    let Some(group) = crate::state::log_group_target::log_group_name(arn) else {
-        return crate::state::InvocationOutcome::NotAttempted(
-            "the target ARN names no log group".to_string(),
-        );
-    };
-    let reshaped = handover.target.reshapes();
-    let record = match crate::state::log_group_target::log_record(body, reshaped) {
-        Ok(record) => record,
-        // The text the target asked for is no log event, so the request this
-        // delivery would make is one CloudWatch Logs refuses as
-        // [`LOGS_INVALID_PARAMETER_CODE`]: the delivery was attempted and wrote
-        // nothing, which is a FAILED invocation rather than one nobody made.
-        Err(reason) => {
-            return crate::state::InvocationOutcome::Failed {
-                code: LOGS_INVALID_PARAMETER_CODE.to_string(),
-                message: reason,
-            };
-        }
-    };
-    let event = match ::aws_sdk_cloudwatchlogs::types::InputLogEvent::builder()
-        .timestamp(record.timestamp)
-        .message(&record.message)
-        .build()
-    {
-        Ok(event) => event,
-        Err(error) => {
-            return crate::state::InvocationOutcome::NotAttempted(error.to_string());
-        }
-    };
-    // One client for every call this delivery makes on the group: the handle is a
-    // copy over the shared in-process transport, for the reason the queue branch
-    // of [`TargetKind::invoke`] gives.
-    let client = clients.logs(callback, region).clone();
-    let stream = handover.rule;
-    let stream_arn = crate::state::log_group_target::log_stream_arn(arn, stream);
-    let grants = log_group_grants(&client, arn, &stream_arn, handover).await;
-    if !grants.write {
-        ::tracing::warn!(
-            log_group = %arn,
-            rule = %handover.rule,
-            "an EventBridge delivery was withheld: no resource policy in force over the log \
-             group allows this service to write to it"
-        );
-        let (code, message) = log_group_write_refusal(&stream_arn, action);
-        return crate::state::InvocationOutcome::Failed { code, message };
-    }
-    if grants.open {
-        let opened = client
-            .create_log_stream()
-            .log_group_name(group)
-            .log_stream_name(stream)
-            .send()
-            .await;
-        if let Err(error) = &opened {
-            let code = ::aws_smithy_types::error::metadata::ProvideErrorMetadata::code(error);
-            if code != Some(LOG_STREAM_ALREADY_OPEN_CODE) {
-                return outcome(opened);
-            }
-        }
-    }
-    let answered = client
-        .put_log_events()
-        .log_group_name(group)
-        .log_stream_name(stream)
-        .log_events(event)
-        .send()
-        .await;
-    let answer = match answered {
-        Ok(answer) => answer,
-        Err(error) => return outcome::<(), _>(Err(error)),
-    };
-    // A put is answered with "the rejected events" when CloudWatch Logs would not
-    // hold one of them (`PutLogEvents$rejectedLogEventsInfo`). This delivery
-    // carries ONE event, so a rejection naming it is a delivery that wrote
-    // nothing — reported as the failure it is rather than as the 200 the call
-    // came back with, under the condition CloudWatch Logs answers a put whose
-    // event it will not hold.
-    match answer
-        .rejected_log_events_info()
-        .is_some_and(the_only_event_was_rejected)
-    {
-        true => crate::state::InvocationOutcome::Failed {
-            code: LOGS_INVALID_PARAMETER_CODE.to_string(),
-            message: LOG_EVENT_REJECTED.to_string(),
-        },
-        false => crate::state::InvocationOutcome::Invoked,
-    }
-}
-
-/// Whether `rejected` names the ONE event this delivery put.
-///
-/// The members report runs by index — events BEFORE
-/// `tooOldLogEventEndIndex`/`expiredLogEventEndIndex` and from
-/// `tooNewLogEventStartIndex` on were not held — so for a batch of one they all
-/// speak about index zero.
-fn the_only_event_was_rejected(
-    rejected: &::aws_sdk_cloudwatchlogs::types::RejectedLogEventsInfo,
-) -> bool {
-    rejected
-        .too_old_log_event_end_index()
-        .is_some_and(|end| end > 0)
-        || rejected
-            .expired_log_event_end_index()
-            .is_some_and(|end| end > 0)
-        || rejected
-            .too_new_log_event_start_index()
-            .is_some_and(|start| start == 0)
-}
-
-/// The error code CloudWatch Logs answers a create of a stream the group already
-/// holds, which for a group a rule has delivered to before is the ordinary answer
-/// rather than a failure.
-const LOG_STREAM_ALREADY_OPEN_CODE: &str = "ResourceAlreadyExistsException";
-
-/// The error code CloudWatch Logs answers a request whose parameters it will not
-/// take (`InvalidParameterException`, "a parameter is specified incorrectly"):
-/// `smithy_query(query="shape", shape="InvalidParameterException",
-/// model_path="services/service-com-amazonaws-cloudwatchlogs-logs-20140328/smithy-model/com-amazonaws-cloudwatchlogs-logs-20140328.json")`.
-///
-/// It is the condition recorded for a log-group delivery that wrote no log event
-/// for a reason about the EVENT rather than about a permission: the text the
-/// target receives is no log record
-/// ([`crate::state::log_group_target::NOT_A_LOG_RECORD`]), so the put this
-/// delivery would make is one that service refuses, or the event's instant is
-/// outside the window the group holds ([`LOG_EVENT_REJECTED`]), which is what the
-/// put itself reported. No other code is invented for either: both are what
-/// CloudWatch Logs says of a log event it will not hold.
-const LOGS_INVALID_PARAMETER_CODE: &str = "InvalidParameterException";
-
-/// The detail recorded for an event CloudWatch Logs would not hold, which is a
-/// property of its INSTANT: "events older than 14 days or preceding the log
-/// group's retention period are rejected", as are events too far in the future.
-const LOG_EVENT_REJECTED: &str =
-    "The log event's timestamp is outside the window the log group accepts, so no log event \
-     was written.";
-
-/// What the documents in force over the log group `group_arn` names admit of the
-/// write this delivery makes: opening the stream, and putting the event.
-///
-/// The SAME rule the queue, topic and function branches follow
-/// ([`queue_delivery_refusal`]): EventBridge writes into a log group as its own
-/// service principal [`crate::state::SERVICE_PRINCIPAL`], which holds no
-/// identity-based policies, so the documents in force over the GROUP are the only
-/// ones over this delivery and what they state decides it
-/// ([`crate::state::log_group_target::documents_admit`]) — nothing is written
-/// without a grant of
-/// [`crate::state::log_group_target::PUT_LOG_EVENTS_ACTION`] to that principal on
-/// the group's streams, an explicit deny in ANY of those documents refuses the
-/// write whatever another grants, and a grant scoped by `aws:SourceArn` admits
-/// the deliveries of the rule it names and no other. A group carrying no policy,
-/// and one this account does not hold at all, are in the same position: no
-/// document admits the write, so nothing is written and nothing reaches the
-/// group's API.
-///
-/// The two calls the write is made of are decided SEPARATELY, because a document
-/// may grant one and withhold the other
-/// ([`crate::state::log_group_target::CREATE_LOG_STREAM_ACTION`] for the open),
-/// and because they then fail differently (see [`deliver_log_event`]). Each is
-/// decided on the group's STREAM
-/// ([`crate::state::log_group_target::log_stream_arn`]), which is the resource
-/// CloudWatch Logs names for the write, so a grant written over the group with
-/// everything under it and one written over its streams — the two forms a client
-/// writes for a logs delivery — both admit it.
-///
-/// The documents are read through the group's own `DescribeResourcePolicies`, so
-/// what decides a delivery is what a client's last `PutResourcePolicy` left: both
-/// the policy attached to THAT group and the account's own are in force over it.
-/// A read that does not ANSWER decides nothing here, so both calls are left to be
-/// made and what the group's own API answers is what the delivery reports — the
-/// reason [`queue_policy`] gives.
-async fn log_group_grants(
-    client: &::aws_sdk_cloudwatchlogs::Client,
-    group_arn: &str,
-    stream_arn: &str,
-    handover: &Handover<'_>,
-) -> LogGroupGrants {
-    let Some(documents) = log_group_policies(client, group_arn).await else {
-        return LogGroupGrants {
-            open: true,
-            write: true,
-        };
-    };
-    let admits = |action: &'static str| {
-        let attempt = crate::state::DeliveryAttempt {
-            rule: handover.rule,
-            target_id: &handover.target.id,
-            action,
-            resource: stream_arn,
-        };
-        crate::state::log_group_target::documents_admit(
-            &documents,
-            &attempt,
-            handover.rule_arn,
-        )
-    };
-    LogGroupGrants {
-        open: admits(crate::state::log_group_target::CREATE_LOG_STREAM_ACTION),
-        write: admits(crate::state::log_group_target::PUT_LOG_EVENTS_ACTION),
-    }
-}
-
-/// Which of the two calls a log-group delivery is made of the documents in force
-/// over that group admit.
-struct LogGroupGrants {
-    /// `logs:CreateLogStream` on the group's streams: the open of the stream the
-    /// event is written into.
-    open: bool,
-    /// `logs:PutLogEvents` on them: the write itself.
-    write: bool,
-}
-
-/// Every resource-policy document in force over the log group `group_arn` names:
-/// the one attached to that group and the account's own — `None` when the service
-/// did not answer either read at all, which is a delivery nothing is known about
-/// rather than one no document admits.
-async fn log_group_policies(
-    client: &::aws_sdk_cloudwatchlogs::Client,
-    group_arn: &str,
-) -> Option<Vec<String>> {
-    // The group's OWN policy, which is what a `PutResourcePolicy` naming a
-    // `resourceArn` leaves, and then the account's — "when not specified,
-    // defaults to ACCOUNT" (`DescribeResourcePolicies$policyScope`), which is
-    // what a put naming no resource leaves.
-    let attached = client
-        .describe_resource_policies()
-        .resource_arn(group_arn)
-        .send()
-        .await;
-    let account_wide = client.describe_resource_policies().send().await;
-    let mut documents: Vec<String> = Vec::new();
-    for answered in [attached, account_wide] {
-        match answered {
-            Ok(answer) => documents.extend(
-                answer
-                    .resource_policies()
-                    .iter()
-                    .filter_map(|policy| policy.policy_document().map(ToString::to_string)),
-            ),
-            Err(error) => {
-                ::tracing::warn!(
-                    log_group = %group_arn,
-                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                    "the resource policies in force over an EventBridge target log group could \
-                     not be read"
-                );
-                return None;
-            }
-        }
-    }
-    Some(documents)
-}
-
-/// The service name Amazon CloudWatch Logs' own error metadata carries.
-const LOGS_SERVICE_NAME: &str = "AWSLogs";
-
-/// The error code CloudWatch Logs answers a caller its resource policies do not
-/// permit, and the status that answer carries:
-/// `smithy_query(query="shape", shape="AccessDeniedException",
-/// model_path="services/service-com-amazonaws-cloudwatchlogs-logs-20140328/smithy-model/com-amazonaws-cloudwatchlogs-logs-20140328.json")`
-/// — "you don't have sufficient permissions to perform this action", `httpError`
-/// 400.
-const LOGS_ACCESS_DENIED_CODE: &str = "AccessDeniedException";
-const LOGS_ACCESS_DENIED_STATUS: u16 = 400;
-
-/// The condition and the sentence EventBridge reports for a log-group target it
-/// could not write to, because no document in force over that group granted this
-/// service the write.
-///
-/// What the delivery SEES is CloudWatch Logs' own refusal of the
-/// `logs:PutLogEvents`: the authorization sentence naming the principal the call
-/// was made as, the action and the resource, followed by the metadata block an
-/// AWS error carries. The condition names the PERMISSION
-/// ([`crate::state::NO_PERMISSIONS`]) because that is what the answer is about,
-/// as a topic's and a function's do.
-///
-/// The request id is MINTED here, for the reason
-/// [`crate::state::queue_access_refusal`] gives.
-fn log_group_write_refusal(stream_arn: &str, action: &str) -> (String, String) {
-    let request_id = ::service_common::query_error_envelope::new_request_id();
-    (
-        crate::state::NO_PERMISSIONS.to_string(),
-        format!(
-            "{} (Service: {LOGS_SERVICE_NAME}; Status Code: {LOGS_ACCESS_DENIED_STATUS}; \
-             Error Code: {LOGS_ACCESS_DENIED_CODE}; Request ID: {request_id}; Proxy: null)",
-            ::service_common::iam_authorization::not_authorized_by_resource_policy(
-                crate::state::SERVICE_PRINCIPAL,
-                action,
-                stream_arn,
             )
         ),
     )
