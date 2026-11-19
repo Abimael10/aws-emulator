@@ -787,14 +787,14 @@ fn active_key_groups(distribution: &Node) -> Vec<(String, Vec<String>)> {
 /// "A list of key groups, and the public keys in each key group, that CloudFront can use to
 /// verify the signatures of signed URLs and signed cookies": the keys a distribution
 /// reports for a group it trusts are the ones that GROUP's stored record names, and a
-/// trusted id the account holds no group for contributes none.
+/// configuration trusting an id the account holds no group for is refused rather than stored.
 #[tokio::test]
 async fn a_distribution_reports_the_public_keys_of_the_key_groups_it_trusts() {
     let router = emulator();
     let minted = mint_public_keys(&router, "key-group-trusted", 3).await;
 
-    // Two groups of different sizes, plus a trusted id no group holds: the reported sets
-    // differ per group, so none of them can come from the distribution's own request.
+    // Two groups of different sizes: the reported sets differ per group, so none of them can
+    // come from the distribution's own request.
     let rows = [
         Group {
             case: "a group of one key".to_string(),
@@ -822,11 +822,27 @@ async fn a_distribution_reports_the_public_keys_of_the_key_groups_it_trusts() {
         trusted.push(id.clone());
         expected.push((id, row.items.clone()));
     }
-    // An id no key group holds: the distribution still trusts it, and it contributes no
-    // public key.
+    // An id no key group holds: a behaviour may only trust a group the account HOLDS, so a
+    // create naming one is refused rather than stored — the distribution below therefore
+    // trusts the two groups that exist, and the refusal is asserted on its own.
     let absent = "f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c3e".to_string();
-    trusted.push(absent.clone());
-    expected.push((absent, Vec::new()));
+    let refused = create_distribution(
+        &router,
+        &distribution_trusting("key-group-absent-trusted", &[absent]),
+    )
+    .await;
+    assert_eq!(
+        refused.status, 400,
+        "case an absent trusted group: expected HTTP 400, got {} with {}",
+        refused.status, refused.raw
+    );
+    assert_eq!(
+        refused.error_code(),
+        "TrustedKeyGroupDoesNotExist",
+        "case an absent trusted group: expected TrustedKeyGroupDoesNotExist, got {:?} in {}",
+        refused.error_code(),
+        refused.raw
+    );
 
     let created = create_distribution(
         &router,

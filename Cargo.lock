@@ -11412,6 +11412,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rquickjs",
+ "rust_iso3166",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",

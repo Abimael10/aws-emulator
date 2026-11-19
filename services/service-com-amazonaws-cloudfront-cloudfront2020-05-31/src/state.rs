@@ -4331,3 +4331,11 @@ pub use anycast_entitlement::*;
 mod key_group_config;
 pub use key_group_config::*;
 
+/// The judgement a submitted DISTRIBUTION configuration's own MEMBERS are admitted by: the
+/// published per-list quotas its counts are bounded by, the domain each member's value has to
+/// be inside, and the references it resolves — made ONCE for every call that writes a whole
+/// `DistributionConfig`. A SUBMODULE for the same reason [`functions`] is one; `pub use` keeps
+/// every name reachable as `crate::state::<name>`.
+mod config_members;
+pub use config_members::*;
+

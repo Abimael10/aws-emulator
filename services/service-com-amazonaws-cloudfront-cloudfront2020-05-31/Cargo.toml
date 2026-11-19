@@ -141,6 +141,11 @@ base64 = "0.22"
 # viewer's address lies in it, rather than comparing the text by hand
 # (`service::edge::signed_access`).
 ipnet = "2"
+# The published `ISO 3166-1-alpha-2` table a `GeoRestriction` `Location` is read against
+# ("CloudFront and `MaxMind` both use `ISO 3166` country codes"), so the set of country codes a
+# geographic restriction may name is the standard's rather than a list restated in this crate
+# (`state::config_members`).
+rust_iso3166 = "0.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

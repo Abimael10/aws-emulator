@@ -355,6 +355,7 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionErr
                 message: Some(message),
             },
         ),
+        crate::state::CreateRefusal::ConfigMember(refusal) => return member_refusal(refusal),
         crate::state::CreateRefusal::DistributionAlreadyExists(message) => {
             CreateDistributionErrorModeled::DistributionAlreadyExists(DistributionAlreadyExists {
                 message: Some(message),
@@ -398,6 +399,13 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionErr
         }
     }
     .into()
+}
+
+/// Report a refusal one member of the submitted configuration earned as this operation's
+/// modelled error, through the one lift every distribution-writing operation makes
+/// (`crate::config_member_error`).
+fn member_refusal(refusal: crate::state::ConfigMemberRefusal) -> CreateDistributionError {
+    crate::config_member_error!(refusal, CreateDistributionErrorModeled).into()
 }
 
 /// The `CreateDistribution` operation.

@@ -25,6 +25,10 @@ pub enum CreateRefusal {
     /// A count in the submitted configuration over this service's maximum, which names
     /// the modelled error it is refused with (see [`ConfigLimit`]).
     ConfigLimit(ConfigLimit),
+    /// A member of the submitted configuration whose value is outside the domain CloudFront
+    /// documents for it, or a reference of it that resolves to nothing, carrying the modelled
+    /// error that member is refused with (see [`ConfigMemberRefusal`]).
+    ConfigMember(ConfigMemberRefusal),
     /// `DistributionAlreadyExists` — "The caller reference you attempted to create the
     /// distribution with is associated with another distribution."
     DistributionAlreadyExists(String),

@@ -46,6 +46,10 @@ use crate::distribution_lifecycle::{
     create_distribution, emulator, get_distribution, update_distribution, Answer, Node,
     API_VERSION,
 };
+// The key group surface's own calls: a behaviour may only trust a group the account HOLDS, so
+// a row that states `TrustedKeyGroups` names one created through them.
+use crate::key_group_lifecycle::{create_group, mint_public_keys};
+use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::S_S_L_SUPPORT_METHOD_VALUES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     CERTIFICATE_SOURCE_ACM, CERTIFICATE_SOURCE_IAM,
@@ -209,7 +213,11 @@ fn behavior_defaults(prefix: &str) -> Vec<(String, String)> {
 }
 
 /// The table: one row per shape of configuration the rule has to hold for.
-fn rows() -> Vec<Row> {
+///
+/// `key_group_id` is a key group THIS ACCOUNT HOLDS, created through `CreateKeyGroup` before
+/// the table is built: a behaviour may only trust a group that exists, so the row that states
+/// `TrustedKeyGroups` names a real one.
+fn rows(key_group_id: &'static str) -> Vec<Row> {
     let mut rows = Vec::new();
 
     // A custom origin and a default cache behaviour, and nothing else: every resolvable
@@ -460,7 +468,7 @@ fn rows() -> Vec<Row> {
                 "{MINIMAL_CUSTOM_ORIGIN}\
                  <DefaultCacheBehavior><TargetOriginId>primary</TargetOriginId>\
                  <TrustedKeyGroups><Enabled>true</Enabled><Quantity>1</Quantity>\
-                 <Items><KeyGroup>f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c3e</KeyGroup></Items>\
+                 <Items><KeyGroup>{key_group_id}</KeyGroup></Items>\
                  </TrustedKeyGroups>\
                  <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy></DefaultCacheBehavior>\
                  <CacheBehaviors><Quantity>2</Quantity><Items>\
@@ -486,10 +494,10 @@ fn rows() -> Vec<Row> {
         lists: vec![(
             "DefaultCacheBehavior/TrustedKeyGroups/Items",
             "KeyGroup",
-            vec!["f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c3e"],
+            vec![key_group_id],
         )],
         absent: vec!["DefaultCacheBehavior/ForwardedValues"],
-        active_key_groups: ("true", "1", vec!["f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c3e"]),
+        active_key_groups: ("true", "1", vec![key_group_id]),
     });
 
     // Every member the service would otherwise supply, named by the request: resolution
@@ -709,10 +717,39 @@ fn config_of<'a>(answer: &'a Answer, case: &str, context: &str) -> &'a Node {
     })
 }
 
+/// Create one key group naming one public key `CreatePublicKey` minted, and report the id
+/// CloudFront allocated it — as a `&'static str`, which is what the table's rows hold.
+///
+/// A cache behaviour may only trust a key group the account HOLDS, so a row that states
+/// `TrustedKeyGroups` names a group created here through the key group surface's own calls
+/// rather than an id written out by hand.
+async fn held_key_group(router: &MultiServiceRouter, name: &str) -> &'static str {
+    let keys = mint_public_keys(router, name, 1).await;
+    let body = format!(
+        "<KeyGroupConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
+         <Name>{name}</Name><Items><PublicKey>{}</PublicKey></Items></KeyGroupConfig>",
+        keys.first().expect("one public key was minted")
+    );
+    let answer = create_group(router, &body).await;
+    assert_eq!(
+        answer.status, 201,
+        "case {name}: expected HTTP 201 from CreateKeyGroup, got {} with {}",
+        answer.status, answer.raw
+    );
+    let id = answer.root().find_text("Id").unwrap_or_default().to_string();
+    assert!(
+        !id.is_empty(),
+        "case {name}: expected a minted key group id, got {}",
+        answer.raw
+    );
+    Box::leak(id.into_boxed_str())
+}
+
 #[tokio::test]
 async fn every_payload_reports_the_resolved_configuration() {
     let router = emulator();
-    for row in rows() {
+    let key_group_id = held_key_group(&router, "defaults-trusted-group").await;
+    for row in rows(key_group_id) {
         let case = row.case;
 
         let created = create_distribution(&router, &row.config).await;
@@ -1068,6 +1105,14 @@ async fn the_counts_a_configuration_states_are_bounded_by_the_published_quotas()
     // A stored configuration is walked on every payload that reports it, so the counts
     // driving that walk are bounded on the way in: AT each published quota a configuration
     // is accepted, one PAST it is refused with the error CloudFront models for that count.
+    let router = emulator();
+    // The key groups the two `TrustedKeyGroups` cases name: a behaviour may only trust a
+    // group the account holds, so the ids come from `CreateKeyGroup` — one more than the
+    // quota, which is what the case past it states.
+    let mut groups: Vec<String> = Vec::new();
+    for index in 0..=MAX_TRUSTED_KEY_GROUPS {
+        groups.push(held_key_group(&router, &format!("quota-group-{index}")).await.to_string());
+    }
     let cases: Vec<(String, String, Option<&str>)> = vec![
         (
             "cache-behaviors-at-the-quota".to_string(),
@@ -1091,16 +1136,15 @@ async fn the_counts_a_configuration_states_are_bounded_by_the_published_quotas()
         ),
         (
             "trusted-key-groups-at-the-quota".to_string(),
-            trusted_key_groups_xml(MAX_TRUSTED_KEY_GROUPS),
+            trusted_key_groups_xml(&groups[..MAX_TRUSTED_KEY_GROUPS]),
             None,
         ),
         (
             "trusted-key-groups-past-the-quota".to_string(),
-            trusted_key_groups_xml(MAX_TRUSTED_KEY_GROUPS + 1),
+            trusted_key_groups_xml(&groups),
             Some("TooManyKeyGroupsAssociatedToDistribution"),
         ),
     ];
-    let router = emulator();
     for (index, (case, members, refusal)) in cases.into_iter().enumerate() {
         let config = config_xml(&format!("quota-{index}"), &members);
         let answer = create_distribution(&router, &config).await;
@@ -1165,17 +1209,18 @@ fn trusted_signers_xml(count: usize) -> String {
     )
 }
 
-/// A configuration whose default cache behaviour trusts `count` key groups.
-fn trusted_key_groups_xml(count: usize) -> String {
+/// A configuration whose default cache behaviour trusts the key groups `ids` names.
+fn trusted_key_groups_xml(ids: &[String]) -> String {
     let mut items = String::new();
-    for index in 0..count {
-        items.push_str(&format!("<KeyGroup>key-group-{index}</KeyGroup>"));
+    for id in ids {
+        items.push_str(&format!("<KeyGroup>{id}</KeyGroup>"));
     }
     format!(
         "{MINIMAL_CUSTOM_ORIGIN}{}<Comment>quota</Comment><Enabled>true</Enabled>",
         minimal_behavior(&format!(
-            "<TrustedKeyGroups><Enabled>true</Enabled><Quantity>{count}</Quantity>\
-             <Items>{items}</Items></TrustedKeyGroups>"
+            "<TrustedKeyGroups><Enabled>true</Enabled><Quantity>{}</Quantity>\
+             <Items>{items}</Items></TrustedKeyGroups>",
+            ids.len()
         ))
     )
 }

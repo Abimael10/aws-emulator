@@ -618,8 +618,9 @@ pub fn names_a_certificate(
 
 /// The refusal a submitted configuration carries BY ITSELF, with nothing of the store or of
 /// another service read: the quantity agreements ([`config_quantity_mismatch`]), the ports its
-/// origins name ([`origin_port_refusal`]) and then the per-list quotas
-/// ([`config_limit_exceeded`]), in that order.
+/// origins name ([`origin_port_refusal`]), the per-list quotas ([`config_limit_exceeded`]) and
+/// then the domain every one of its own members has to be inside
+/// ([`config_member_refusal`]), in that order.
 ///
 /// The ONE reading of those, so the shared create path
 /// ([`ComAmazonawsCloudfrontCloudfront20200531State::create_distribution`]) and a handler
@@ -634,7 +635,10 @@ pub fn config_refusal_without_state(config: &DistributionConfig) -> Option<Creat
     if let Some(message) = origin_port_refusal(config) {
         return Some(CreateRefusal::InvalidArgument(message));
     }
-    config_limit_exceeded(config).map(CreateRefusal::ConfigLimit)
+    if let Some(limit) = config_limit_exceeded(config) {
+        return Some(CreateRefusal::ConfigLimit(limit));
+    }
+    config_member_refusal(config).map(CreateRefusal::ConfigMember)
 }
 
 /// The two ports every origin of CloudFront's reaches a backend on by DEFAULT, from

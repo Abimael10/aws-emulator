@@ -394,6 +394,13 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CopyDistributionError
                 message: Some(message),
             })
         }
+        // Unreachable from a copy for the same reason: the configuration being copied was
+        // admitted when it was stored, so every member of it is inside the domain documented
+        // for that member. Were it ever reached, the refusal is reported under the code the
+        // model declares for that member, exactly as the create and the update report it.
+        crate::state::CreateRefusal::ConfigMember(refusal) => {
+            return crate::config_member_error!(refusal, CopyDistributionErrorModeled).into()
+        }
     }
     .into()
 }

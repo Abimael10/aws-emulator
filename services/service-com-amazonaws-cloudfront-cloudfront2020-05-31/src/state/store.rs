@@ -1505,6 +1505,16 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             ));
         }
 
+        // A behaviour trusting a key group accepts the signatures the public keys THAT GROUP
+        // holds verify, so a configuration trusting a group this account does not hold is
+        // refused before any distribution is created that would gate its viewers on keys that
+        // are not there.
+        if absent_trusted_key_group(self, &config).is_some() {
+            return Err(CreateRefusal::ConfigMember(
+                ConfigMemberRefusal::TrustedKeyGroupDoesNotExist(trusted_key_group_does_not_exist()),
+            ));
+        }
+
         // An origin reaches a private bucket EITHER with the credentials of an origin
         // access control OR as an origin access identity, never both: a configuration whose
         // origin names both says nothing about which signs it, so it is refused before any

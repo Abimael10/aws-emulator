@@ -378,8 +378,16 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionWit
                 message: Some(message),
             })
         }
+        crate::state::CreateRefusal::ConfigMember(refusal) => return member_refusal(refusal),
     }
     .into()
+}
+
+/// Report a refusal one member of the submitted configuration earned as this operation's
+/// modelled error, through the one lift every distribution-writing operation makes
+/// (`crate::config_member_error`).
+fn member_refusal(refusal: crate::state::ConfigMemberRefusal) -> CreateDistributionWithTagsError {
+    crate::config_member_error!(refusal, CreateDistributionWithTagsErrorModeled).into()
 }
 
 /// The `CreateDistributionWithTags` operation.

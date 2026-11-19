@@ -352,6 +352,13 @@ fn current_record(
         })
 }
 
+/// Report a refusal one member of the submitted configuration earned as this operation's
+/// modelled error, through the one lift every distribution-writing operation makes
+/// (`crate::config_member_error`).
+fn member_refusal(refusal: crate::state::ConfigMemberRefusal) -> UpdateDistributionError {
+    crate::config_member_error!(refusal, UpdateDistributionErrorModeled).into()
+}
+
 /// The modelled refusal an `If-Match` that is not `etag` carries, or `Ok(())` when the
 /// request carries the version the record stands at.
 ///
@@ -472,6 +479,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
+        }
+
+        // Every member of the submitted configuration has to be inside the domain CloudFront
+        // documents for it, and every reference the configuration resolves against ITSELF has
+        // to resolve: the same judgement the create path makes
+        // ([`crate::state::config_member_refusal`]), because each rule is about the
+        // `DistributionConfig` rather than about the call that carries one — so an update
+        // cannot leave a distribution holding a configuration a create would have refused.
+        if let Some(refusal) = crate::state::config_member_refusal(&input.distribution_config) {
+            return Err(member_refusal(refusal));
         }
 
         // The same rule the create path applies: an alternate domain name is served only
@@ -622,6 +639,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::invalid_origin_access_control(),
                 )
                 .into());
+            }
+
+            // The same rule the create path applies: a behaviour trusting a key group accepts
+            // the signatures the public keys THAT GROUP holds verify, so an update cannot
+            // leave a distribution trusting a group this account does not hold either.
+            if crate::state::absent_trusted_key_group(&store, &input.distribution_config).is_some()
+            {
+                return Err(member_refusal(
+                    crate::state::ConfigMemberRefusal::TrustedKeyGroupDoesNotExist(
+                        crate::state::trusted_key_group_does_not_exist(),
+                    ),
+                ));
             }
 
             // A distribution's caller reference identifies it for its whole life, so an
