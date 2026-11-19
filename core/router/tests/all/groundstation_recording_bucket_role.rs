@@ -28,6 +28,13 @@
 //! bucket, whether it holds the role, what the role's trust policy admits, and whether the
 //! `bucketArn` names a bucket at all — crossed over both writers of the one resolution path
 //! (`CreateConfig` and `UpdateConfig`).
+//!
+//! The three front doors this suite reaches (`emulator`, `iam`, `create_bucket`,
+//! `groundstation` and the small readers beside them) are `pub(crate)`, so the sibling suite
+//! `all/groundstation_recording_bucket_location_read.rs` — which carries the rows where the
+//! location read is MADE and S3 withholds the location, and the trust documents that stop it
+//! being made — drives the same three services over one wiring rather than standing up a
+//! second copy of it.
 
 use std::sync::Arc;
 
@@ -40,10 +47,10 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::query_wire::{element, form_encode};
 
 /// The region every request below is signed for, and the region the bucket lands in.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The member of the request a bucket-resolution refusal blames.
-const BLAMED_PARAMETER: &str = "configData.s3RecordingConfig.bucketArn";
+pub(crate) const BLAMED_PARAMETER: &str = "configData.s3RecordingConfig.bucketArn";
 
 /// The one bucket the account in these tests holds.
 const HELD_BUCKET: &str = "aws-groundstation-downlink";
@@ -53,7 +60,7 @@ const ABSENT_BUCKET: &str = "aws-groundstation-absent";
 
 /// One emulator carrying Ground Station, IAM and S3 over ONE shared engine, exactly as the
 /// production router builds them.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -72,7 +79,11 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One awsQuery call to IAM, answered with the HTTP status and the XML body.
-async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+pub(crate) async fn iam(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -94,7 +105,11 @@ async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 }
 
 /// Create a role in IAM carrying `document` and hand back the ARN IAM minted for it.
-async fn role_with_trust(router: &MultiServiceRouter, name: &str, document: &str) -> String {
+pub(crate) async fn role_with_trust(
+    router: &MultiServiceRouter,
+    name: &str,
+    document: &str,
+) -> String {
     let (status, created) = iam(
         router,
         "CreateRole",
@@ -109,7 +124,7 @@ async fn role_with_trust(router: &MultiServiceRouter, name: &str, document: &str
 }
 
 /// A trust policy letting `principal` assume the role.
-fn trust_allowing(principal: &str) -> String {
+pub(crate) fn trust_allowing(principal: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -124,7 +139,7 @@ fn trust_allowing(principal: &str) -> String {
 /// `PUT /<bucket>` against the emulator's S3 front door — `CreateBucket`, path-style, with no
 /// `LocationConstraint`, so the bucket lands in the region the Ground Station calls are signed
 /// for.
-async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
+pub(crate) async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
     let request = http::Request::builder()
         .method("PUT")
         .uri(format!("https://s3.{REGION}.amazonaws.com/{bucket}"))
@@ -147,7 +162,7 @@ async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
 }
 
 /// One restJson1 call to Ground Station, answered with the HTTP status and the JSON body.
-async fn groundstation(
+pub(crate) async fn groundstation(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -185,7 +200,7 @@ async fn groundstation(
 }
 
 /// An `s3RecordingConfig` recording to `bucket_arn` through `role_arn`.
-fn recording_config(bucket_arn: &str, role_arn: &str) -> Value {
+pub(crate) fn recording_config(bucket_arn: &str, role_arn: &str) -> Value {
     json!({"s3RecordingConfig": {
         "bucketArn": bucket_arn,
         "roleArn": role_arn,
@@ -194,7 +209,7 @@ fn recording_config(bucket_arn: &str, role_arn: &str) -> Value {
 }
 
 /// The `message` of a Ground Station failure body.
-fn message_of(payload: &Value) -> String {
+pub(crate) fn message_of(payload: &Value) -> String {
     payload
         .get("message")
         .and_then(Value::as_str)
