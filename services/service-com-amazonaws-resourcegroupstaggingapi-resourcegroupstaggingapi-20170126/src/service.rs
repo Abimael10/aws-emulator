@@ -41,9 +41,15 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, OperationRoutingTable, Refusal, Refused,
+    Service,
 };
 use std::sync::Arc;
+
+/// The FRAMING one request arrives in — the `awsJson1_1` one the model names, or the Smithy
+/// RPC v2 CBOR one the same endpoint also serves — and therefore the one it is read and
+/// answered in; see the module's own header.
+mod request_framing;
 
 /// What this service states about the half of a constraint refusal the framework cannot
 /// state — the COLLECTION a clause about a collection member is about; see the module's own
@@ -56,7 +62,9 @@ mod submitted_collections;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, served so that each request is read and answered in the framing
+    /// the request itself names ([`request_framing`]).
+    entry: request_framing::ServedInTheFramingOfTheRequest<crate::ServiceDefinition<Eng>>,
     /// The same modelled operations the generated table holds, each served so that a
     /// constraint clause about a collection member states the collection the request
     /// carried ([`submitted_collections`]). Keyed by the routing key the protocol resolves
@@ -74,7 +82,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             quoting_submitted_collections:
                 submitted_collections::quoting_submitted_collections(&engine),
-            entry: crate::ServiceDefinition::new(engine),
+            entry: request_framing::ServedInTheFramingOfTheRequest::new(
+                crate::ServiceDefinition::new(engine),
+            ),
         }
     }
 }
@@ -82,8 +92,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
-        // table, and the default error renderers — lives in the generated entry.
-        // The router reads it through this one accessor. Do not edit the entry.
+        // table, and the default error renderers — lives in the generated entry,
+        // which is read through this one accessor and never edited. It is reached
+        // through the layer that serves each request in the framing the request
+        // itself names ([`request_framing`]), which restates nothing of the model.
         &self.entry
     }
 
@@ -110,11 +122,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // table names for this request, wrapped so that a constraint clause about a
         // collection member states the collection the request carried (see
         // [`submitted_collections`]). The routing DECISION stays the model's — the
-        // key is resolved by the service's own protocol — and a key this table does
-        // not hold declines here, leaving the generated table and the router's
+        // key is resolved by the protocol of the FRAMING this request named, the one the
+        // generated table is read with too ([`request_framing`]) — and a key this table
+        // does not hold declines here, leaving the generated table and the router's
         // routing-error path unchanged. The wrapper declares the wrapped
         // operation's own auth schemes, so nothing about signing changes.
-        let operation = self.entry.protocol().routing_key(req).ok()?;
+        let operation = self.entry.wire_protocol(req).protocol().routing_key(req).ok()?;
         self.quoting_submitted_collections.get(operation)
     }
 

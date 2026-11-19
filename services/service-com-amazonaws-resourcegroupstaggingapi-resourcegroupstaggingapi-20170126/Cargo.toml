@@ -61,6 +61,10 @@ service-common = { path = "../common" }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The CBOR implementation the framework's own codec is built on: the wire tests
+# write and read the bodies of this endpoint's Smithy RPC v2 CBOR framing with it.
+# Already in the lock, at the version the vendored codec uses.
+aws-smithy-cbor = "0.62.2"
 # Percent-encodes a tag key into the `tagKeys` query parameter Lambda's own
 # `UntagResource` binds it to, so a key carrying a URI delimiter survives the
 # query string. Already in the lock as a transitive dependency.

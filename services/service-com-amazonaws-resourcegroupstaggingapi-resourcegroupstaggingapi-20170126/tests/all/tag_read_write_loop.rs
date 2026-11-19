@@ -8,12 +8,22 @@
 //! router, `POST /` with `X-Amz-Target: ResourceGroupsTaggingAPI_20170126.<Op>`
 //! and an awsJson1_1 body — so what is asserted is what an SDK client sees.
 //!
+//! The last section drives that same loop over the OTHER framing the endpoint
+//! serves, Smithy RPC v2 CBOR, which names its operation in the request path and
+//! sends no `X-Amz-Target` at all: one store, read and written through either.
+//!
 //! The tables below span the class each rule generalises over (ARN form, filter
-//! shape, page size, token provenance); the ARNs the issue cited are one row.
+//! shape, page size, token provenance, request framing); the ARNs the issue cited
+//! are one row.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+// The CBOR implementation the framework's own codec is built on: the last section
+// writes its request bodies and reads its response bodies with it, so what is
+// asserted is what a client of that framing sends and reads.
+use aws_smithy_cbor::data::Type;
+use aws_smithy_cbor::{Decoder, Encoder};
 use service_com_amazonaws_resourcegroupstaggingapi_resourcegroupstaggingapi_20170126::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1108,4 +1118,731 @@ async fn the_operations_outside_this_slice_still_answer_not_implemented() {
             "case {operation}: expected HTTP 501, got {status} with {body}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The same loop over the OTHER framing this endpoint serves.
+//
+// RULE: a request is read, dispatched and answered in the framing THE REQUEST
+// names — the `awsJson1_1` framing the model names, which posts to `/` and names
+// its operation in `X-Amz-Target`, or Smithy RPC v2 CBOR, which names its
+// operation in the path `/service/{Service}/operation/{Operation}`, declares
+// itself with `smithy-protocol: rpc-v2-cbor`, carries its body as CBOR and sends
+// no `X-Amz-Target`. Both decode to the same modelled input and are served by the
+// same operation over the same store, so the two answer the same payload for the
+// same query, a write in either is visible through the other, and a read in
+// either changes nothing a later caller sees.
+//
+// The rows below differ along what that rule generalises over: which framing
+// carries the request, which operation it names, which members the input holds
+// (a nested filter, a list, a number, none at all), how the CBOR container
+// lengths are written, and which class of answer the call earns (a success, a
+// modelled refusal, an operation this endpoint does not have).
+// ---------------------------------------------------------------------------
+
+/// The `{Service}` label of this endpoint's RPC v2 CBOR paths: the local name of
+/// the model's service shape (`smithy_query(query="service_info")` -> service
+/// `ResourceGroupsTaggingAPI_20170126`), which is also the `X-Amz-Target` prefix
+/// of its awsJson framing.
+const SERVICE_LABEL: &str = "ResourceGroupsTaggingAPI_20170126";
+
+/// The header the RPC v2 CBOR specification requires on every request and
+/// response of that framing, and the value it carries.
+const SMITHY_PROTOCOL: (&str, &str) = ("smithy-protocol", "rpc-v2-cbor");
+
+/// The media type that framing carries its bodies under.
+const CBOR_MEDIA_TYPE: &str = "application/cbor";
+
+/// The framing one request is sent in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// The framing the model names: `POST /` with `X-Amz-Target` and a JSON body.
+    AwsJson,
+    /// Smithy RPC v2 CBOR: the operation in the path, the body as CBOR.
+    RpcV2Cbor,
+}
+
+/// How a CBOR request writes its container headers. Both forms are CBOR and both
+/// are what some client sends, so each framing row is sent in one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lengths {
+    /// Every map and array declares its entry count up front.
+    Declared,
+    /// Every map and array is opened and closed by a break, as the framework's
+    /// own serializer writes them.
+    Indefinite,
+}
+
+/// `value` as the CBOR item carrying the same members, with container lengths
+/// written as `lengths` says.
+///
+/// Encoded with the CBOR implementation the framework's own codec is built on, so
+/// the bytes a case sends are the bytes a client of that framing sends.
+fn cbor_bytes(value: &serde_json::Value, lengths: Lengths) -> Vec<u8> {
+    fn write(encoder: &mut Encoder, value: &serde_json::Value, lengths: Lengths) {
+        match value {
+            serde_json::Value::Null => {
+                encoder.null();
+            }
+            serde_json::Value::Bool(flag) => {
+                encoder.boolean(*flag);
+            }
+            serde_json::Value::Number(number) => match number.as_i64() {
+                Some(whole) => {
+                    encoder.long(whole);
+                }
+                None => {
+                    encoder.double(number.as_f64().unwrap_or_default());
+                }
+            },
+            serde_json::Value::String(text) => {
+                encoder.str(text);
+            }
+            serde_json::Value::Array(elements) => {
+                match lengths {
+                    Lengths::Declared => encoder.array(elements.len()),
+                    Lengths::Indefinite => encoder.begin_array(),
+                };
+                for element in elements {
+                    write(encoder, element, lengths);
+                }
+                if lengths == Lengths::Indefinite {
+                    encoder.end();
+                }
+            }
+            serde_json::Value::Object(members) => {
+                match lengths {
+                    Lengths::Declared => encoder.map(members.len()),
+                    Lengths::Indefinite => encoder.begin_map(),
+                };
+                for (name, held) in members {
+                    encoder.str(name);
+                    write(encoder, held, lengths);
+                }
+                if lengths == Lengths::Indefinite {
+                    encoder.end();
+                }
+            }
+        }
+    }
+    let mut encoder = Encoder::new(Vec::new());
+    write(&mut encoder, value, lengths);
+    encoder.into_writer()
+}
+
+/// One value a response body carries, whichever framing carries it: the two
+/// framings decode to the same shape, so every assertion below is written once.
+///
+/// A map's entries are held in KEY order rather than in the order the body wrote
+/// them, because the order two codecs write one structure's members in is each
+/// codec's own and is not part of the payload.
+#[derive(Debug, Clone, PartialEq)]
+enum Decoded {
+    Text(String),
+    Number(f64),
+    Flag(bool),
+    Bytes(Vec<u8>),
+    List(Vec<Decoded>),
+    Map(BTreeMap<String, Decoded>),
+    Null,
+}
+
+impl Decoded {
+    /// The value under `key`, for a map.
+    fn get(&self, key: &str) -> Option<&Decoded> {
+        match self {
+            Self::Map(entries) => entries.get(key),
+            _ => None,
+        }
+    }
+
+    /// This value's text, for a text member.
+    fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// The text under `key`, or the empty string when the body carries none
+    /// there — so an assertion reports what the body held rather than panicking
+    /// on its absence.
+    fn text_at(&self, key: &str) -> &str {
+        self.get(key).and_then(Decoded::text).unwrap_or_default()
+    }
+
+    /// The elements of the list this body carries at `member`, each as the one
+    /// string that names it: the `ResourceARN` of a resource-tag mapping, or the
+    /// element itself where the list is one of strings (`TagKeys`, `TagValues`).
+    fn listed_at(&self, member: &str) -> Vec<String> {
+        let Some(Decoded::List(elements)) = self.get(member) else {
+            return Vec::new();
+        };
+        elements
+            .iter()
+            .map(|element| match element {
+                Decoded::Text(text) => text.clone(),
+                Decoded::Map(_) => element.text_at("ResourceARN").to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// This body with the member `key` removed, for comparing two answers that
+    /// agree on everything but a per-call value.
+    fn without(&self, key: &str) -> Decoded {
+        match self {
+            Self::Map(entries) => Self::Map(
+                entries
+                    .iter()
+                    .filter(|(name, _)| name.as_str() != key)
+                    .map(|(name, held)| (name.clone(), held.clone()))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    /// The error code a refusal names, as a client branches on it: the `__type`
+    /// without its namespace.
+    fn refusal_code(&self) -> String {
+        let raw = self.text_at("__type");
+        raw.rsplit(['#', ':']).next().unwrap_or(raw).to_string()
+    }
+}
+
+/// A JSON response body as the shape above.
+fn decoded_json(body: &[u8]) -> Decoded {
+    fn convert(value: serde_json::Value) -> Decoded {
+        match value {
+            serde_json::Value::Null => Decoded::Null,
+            serde_json::Value::Bool(flag) => Decoded::Flag(flag),
+            serde_json::Value::Number(number) => {
+                Decoded::Number(number.as_f64().unwrap_or_default())
+            }
+            serde_json::Value::String(text) => Decoded::Text(text),
+            serde_json::Value::Array(elements) => {
+                Decoded::List(elements.into_iter().map(convert).collect())
+            }
+            serde_json::Value::Object(members) => Decoded::Map(
+                members
+                    .into_iter()
+                    .map(|(key, held)| (key, convert(held)))
+                    .collect(),
+            ),
+        }
+    }
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(value) => convert(value),
+        Err(_) => Decoded::Null,
+    }
+}
+
+/// A CBOR response body as the shape above, decoded with the CBOR implementation
+/// the framework's own codec is built on rather than scanned as text, so what is
+/// asserted is the WHOLE decoded value a client of that framing reads.
+fn decoded_cbor(body: &[u8]) -> Decoded {
+    fn read(decoder: &mut Decoder<'_>) -> Decoded {
+        let datatype = decoder
+            .datatype()
+            .unwrap_or_else(|error| panic!("the body ends where an item was expected: {error}"));
+        match datatype {
+            Type::String | Type::StringIndef => Decoded::Text(
+                decoder
+                    .string()
+                    .unwrap_or_else(|error| panic!("a text item does not read: {error}")),
+            ),
+            Type::Bytes | Type::BytesIndef => Decoded::Bytes(
+                decoder
+                    .blob()
+                    .unwrap_or_else(|error| panic!("a byte string does not read: {error}"))
+                    .into_inner(),
+            ),
+            Type::Bool => Decoded::Flag(
+                decoder
+                    .boolean()
+                    .unwrap_or_else(|error| panic!("a boolean does not read: {error}")),
+            ),
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::I8 | Type::I16 | Type::I32
+            | Type::I64 | Type::Int => Decoded::Number(
+                decoder
+                    .long()
+                    .unwrap_or_else(|error| panic!("a whole number does not read: {error}"))
+                    as f64,
+            ),
+            Type::F16 | Type::F32 | Type::F64 => Decoded::Number(
+                decoder
+                    .double()
+                    .unwrap_or_else(|error| panic!("a number does not read: {error}")),
+            ),
+            Type::Null => {
+                decoder.null().expect("a null reads");
+                Decoded::Null
+            }
+            Type::Array | Type::ArrayIndef => {
+                let declared = decoder
+                    .list()
+                    .unwrap_or_else(|error| panic!("an array header does not read: {error}"));
+                let mut elements = Vec::new();
+                while !at_end(decoder, declared, elements.len()) {
+                    elements.push(read(decoder));
+                }
+                end_container(decoder, declared);
+                Decoded::List(elements)
+            }
+            Type::Map | Type::MapIndef => {
+                let declared = decoder
+                    .map()
+                    .unwrap_or_else(|error| panic!("a map header does not read: {error}"));
+                let mut entries = BTreeMap::new();
+                while !at_end(decoder, declared, entries.len()) {
+                    let key = decoder
+                        .string()
+                        .unwrap_or_else(|error| panic!("a map key is not text: {error}"));
+                    entries.insert(key, read(decoder));
+                }
+                end_container(decoder, declared);
+                Decoded::Map(entries)
+            }
+            other => panic!("a response body carries no item of type {other:?}"),
+        }
+    }
+
+    /// Whether a container that declared `declared` entries (or none, for an
+    /// indefinite one) ends here, `read` entries in.
+    fn at_end(decoder: &mut Decoder<'_>, declared: Option<u64>, read: usize) -> bool {
+        match declared {
+            Some(entries) => read as u64 == entries,
+            None => matches!(
+                decoder
+                    .datatype()
+                    .unwrap_or_else(|error| panic!("a container ends mid-entry: {error}")),
+                Type::Break
+            ),
+        }
+    }
+
+    /// Consume the break that terminates an indefinite-length container.
+    fn end_container(decoder: &mut Decoder<'_>, declared: Option<u64>) {
+        if declared.is_none() {
+            decoder
+                .skip()
+                .unwrap_or_else(|error| panic!("the break of a container does not read: {error}"));
+        }
+    }
+
+    let mut decoder = Decoder::new(body);
+    read(&mut decoder)
+}
+
+/// One answer a call earns: the status, the framing markers the response carries,
+/// and the decoded body.
+#[derive(Debug, Clone, PartialEq)]
+struct Answer {
+    status: u16,
+    content_type: String,
+    smithy_protocol: String,
+    body: Decoded,
+}
+
+/// Call `operation` in `framing` with the input `body` names, and answer what the
+/// endpoint replied.
+///
+/// The awsJson request is the one the rest of this file sends; the CBOR one is
+/// the same input, path-routed, CBOR-encoded and carrying NO `X-Amz-Target` —
+/// which is what that framing sends, and the whole point of the case.
+async fn framed_call(
+    router: &MultiServiceRouter,
+    framing: Framing,
+    lengths: Lengths,
+    operation: &str,
+    body: serde_json::Value,
+) -> Answer {
+    // The SigV4 credential scope is the routing signal that names the `tagging`
+    // signing name this service claims, in either framing.
+    let authorization = "AWS4-HMAC-SHA256 \
+         Credential=AKIDEXAMPLE/20260101/us-east-1/tagging/aws4_request, \
+         SignedHeaders=host, Signature=0";
+    let request = match framing {
+        Framing::AwsJson => http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("{SERVICE_LABEL}.{operation}"))
+            .header("authorization", authorization)
+            .body(bytes::Bytes::from(body.to_string()))
+            .expect("build the awsJson request"),
+        Framing::RpcV2Cbor => http::Request::builder()
+            .method("POST")
+            .uri(format!("/service/{SERVICE_LABEL}/operation/{operation}"))
+            .header(SMITHY_PROTOCOL.0, SMITHY_PROTOCOL.1)
+            .header("content-type", CBOR_MEDIA_TYPE)
+            .header("accept", CBOR_MEDIA_TYPE)
+            .header("authorization", authorization)
+            .body(bytes::Bytes::from(cbor_bytes(&body, lengths)))
+            .expect("build the rpc-v2-cbor request"),
+    };
+
+    let response = router.dispatch(request).await;
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let content_type = header("content-type");
+    let smithy_protocol = header(SMITHY_PROTOCOL.0);
+    let body = match framing {
+        Framing::AwsJson => decoded_json(response.body()),
+        Framing::RpcV2Cbor if response.body().is_empty() => Decoded::Null,
+        Framing::RpcV2Cbor => decoded_cbor(response.body()),
+    };
+    Answer {
+        status: response.status().as_u16(),
+        content_type,
+        smithy_protocol,
+        body,
+    }
+}
+
+/// One query of the read loop, asked in both framings: the operation, the input,
+/// the output member whose elements the answer is checked against, those
+/// elements, whether the answer is one page of more than one, and how the CBOR
+/// request writes its container lengths.
+struct FramingCase {
+    case: &'static str,
+    operation: &'static str,
+    input: serde_json::Value,
+    member: &'static str,
+    expected: Vec<&'static str>,
+    truncated: bool,
+    lengths: Lengths,
+}
+
+#[tokio::test]
+async fn both_framings_of_this_endpoint_answer_one_query_the_same_way() {
+    let router = emulator();
+    let alpha = "arn:aws:s3:::alpha";
+    let beta = "arn:aws:codecommit:us-east-1:123456789012:beta";
+    tag(&router, &[alpha], &[("Env", "prod"), ("Team", "core")]).await;
+    tag(&router, &[beta], &[("Env", "dev")]).await;
+
+    let cases = vec![
+        // The query the recorded CBOR call asks: a nested filter structure.
+        FramingCase {
+            case: "GetResources by tag filter",
+            operation: "GetResources",
+            input: serde_json::json!({ "TagFilters": [{ "Key": "Env", "Values": ["prod"] }] }),
+            member: "ResourceTagMappingList",
+            expected: vec!["arn:aws:s3:::alpha"],
+            truncated: false,
+            lengths: Lengths::Declared,
+        },
+        // A list of strings, and the same query written with indefinite-length
+        // CBOR containers.
+        FramingCase {
+            case: "GetResources by ARN list, indefinite lengths",
+            operation: "GetResources",
+            input: serde_json::json!({ "ResourceARNList": [beta] }),
+            member: "ResourceTagMappingList",
+            expected: vec!["arn:aws:codecommit:us-east-1:123456789012:beta"],
+            truncated: false,
+            lengths: Lengths::Indefinite,
+        },
+        // A number member, which the two framings carry in different wire forms:
+        // a page size of one, so the answer is the first page of two and carries
+        // a token to ask for the next with.
+        FramingCase {
+            case: "GetResources with a page size",
+            operation: "GetResources",
+            input: serde_json::json!({ "ResourcesPerPage": 1 }),
+            member: "ResourceTagMappingList",
+            expected: vec!["arn:aws:codecommit:us-east-1:123456789012:beta"],
+            truncated: true,
+            lengths: Lengths::Declared,
+        },
+        // No member at all: an empty body, which each framing spells its own way.
+        FramingCase {
+            case: "GetResources with no member set",
+            operation: "GetResources",
+            input: serde_json::json!({}),
+            member: "ResourceTagMappingList",
+            expected: vec![
+                "arn:aws:codecommit:us-east-1:123456789012:beta",
+                "arn:aws:s3:::alpha",
+            ],
+            truncated: false,
+            lengths: Lengths::Indefinite,
+        },
+        FramingCase {
+            case: "GetTagKeys",
+            operation: "GetTagKeys",
+            input: serde_json::json!({}),
+            member: "TagKeys",
+            expected: vec!["Env", "Team"],
+            truncated: false,
+            lengths: Lengths::Declared,
+        },
+        FramingCase {
+            case: "GetTagValues of one key",
+            operation: "GetTagValues",
+            input: serde_json::json!({ "Key": "Env" }),
+            member: "TagValues",
+            expected: vec!["dev", "prod"],
+            truncated: false,
+            lengths: Lengths::Declared,
+        },
+    ];
+
+    for FramingCase {
+        case,
+        operation,
+        input,
+        member,
+        expected,
+        truncated,
+        lengths,
+    } in cases
+    {
+        let as_json = framed_call(
+            &router,
+            Framing::AwsJson,
+            lengths,
+            operation,
+            input.clone(),
+        )
+        .await;
+        let as_cbor = framed_call(&router, Framing::RpcV2Cbor, lengths, operation, input).await;
+
+        assert_eq!(
+            as_cbor.status, 200,
+            "case {case:?}: the CBOR framing must be served; got {} with {:?}",
+            as_cbor.status, as_cbor.body
+        );
+        assert_eq!(
+            as_cbor.smithy_protocol, SMITHY_PROTOCOL.1,
+            "case {case:?}: expected the response to name the framing {:?}, got {:?}",
+            SMITHY_PROTOCOL.1, as_cbor.smithy_protocol
+        );
+        assert_eq!(
+            as_cbor.content_type, CBOR_MEDIA_TYPE,
+            "case {case:?}: expected a {CBOR_MEDIA_TYPE} body, got {:?}",
+            as_cbor.content_type
+        );
+        assert_eq!(
+            as_json.status, 200,
+            "case {case:?}: the awsJson framing must be served; got {} with {:?}",
+            as_json.status, as_json.body
+        );
+
+        // The payload itself: each framing carries the resources the query
+        // selects, and the two carry the SAME answer.
+        for (framing, answer) in [("awsJson", &as_json), ("rpc-v2-cbor", &as_cbor)] {
+            let listed = answer.body.listed_at(member);
+            assert_eq!(
+                listed, expected,
+                "case {case:?} over {framing}: expected {member} {expected:?}, got {listed:?} \
+                 (whole body {:?})",
+                answer.body
+            );
+            let token = answer.body.text_at("PaginationToken");
+            assert_eq!(
+                !token.is_empty(),
+                truncated,
+                "case {case:?} over {framing}: expected a token to carry on from: {truncated}, \
+                 got {token:?}"
+            );
+        }
+        // A page's token is cut per call and carries the instant it was cut, so
+        // it is the one member of an answer the two framings do not share.
+        let (cbor_payload, json_payload) = (
+            as_cbor.body.without("PaginationToken"),
+            as_json.body.without("PaginationToken"),
+        );
+        assert_eq!(
+            cbor_payload, json_payload,
+            "case {case:?}: the two framings must decode to one payload; CBOR {cbor_payload:?} \
+             vs JSON {json_payload:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_store_is_read_and_written_through_either_framing() {
+    let router = emulator();
+    let alpha = "arn:aws:s3:::alpha";
+    let gamma = "arn:aws:ec2:us-east-1:123456789012:instance/gamma";
+    tag(&router, &[alpha], &[("Env", "prod")]).await;
+
+    let query = serde_json::json!({ "TagFilters": [{ "Key": "Env", "Values": ["prod"] }] });
+    let read = |framing| {
+        framed_call(
+            &router,
+            framing,
+            Lengths::Declared,
+            "GetResources",
+            query.clone(),
+        )
+    };
+
+    // The read the store answers before any CBOR call reaches it.
+    let before = read(Framing::AwsJson).await;
+    assert_eq!(
+        before.body.listed_at("ResourceTagMappingList"),
+        vec![alpha.to_string()],
+        "case the first read: expected the tagged resource, got {:?}",
+        before.body
+    );
+
+    // Reading twice over CBOR answers the same thing, and the awsJson read is
+    // unchanged afterwards: a read in either framing perturbs nothing.
+    for look in 1..=2 {
+        let as_cbor = read(Framing::RpcV2Cbor).await;
+        assert_eq!(
+            as_cbor.status, 200,
+            "case CBOR read {look}: expected HTTP 200, got {} with {:?}",
+            as_cbor.status, as_cbor.body
+        );
+        assert_eq!(
+            as_cbor.body, before.body,
+            "case CBOR read {look}: expected the same payload as the awsJson read, got {:?}",
+            as_cbor.body
+        );
+    }
+    let after = read(Framing::AwsJson).await;
+    assert_eq!(
+        after, before,
+        "case the read after the CBOR reads: the CBOR reads must not have changed the store; \
+         got {after:?}"
+    );
+
+    // A WRITE in the CBOR framing lands in that same store: the awsJson read
+    // finds it, and so does the CBOR one.
+    let written = framed_call(
+        &router,
+        Framing::RpcV2Cbor,
+        Lengths::Declared,
+        "TagResources",
+        serde_json::json!({ "ResourceARNList": [gamma], "Tags": { "Env": "prod" } }),
+    )
+    .await;
+    assert_eq!(
+        written.status, 200,
+        "case the CBOR write: expected HTTP 200, got {} with {:?}",
+        written.status, written.body
+    );
+    assert_eq!(
+        written.body.get("FailedResourcesMap"),
+        Some(&Decoded::Map(BTreeMap::new())),
+        "case the CBOR write: expected no failed resource, got {:?}",
+        written.body
+    );
+
+    let expected = vec![gamma.to_string(), alpha.to_string()];
+    for framing in [Framing::AwsJson, Framing::RpcV2Cbor] {
+        let reread = read(framing).await;
+        let listed = reread.body.listed_at("ResourceTagMappingList");
+        assert_eq!(
+            listed, expected,
+            "case the read after the CBOR write over {framing:?}: expected {expected:?}, got \
+             {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failure_of_a_cbor_framed_request_is_answered_in_that_framing() {
+    let router = emulator();
+    tag(&router, &["arn:aws:s3:::alpha"], &[("Env", "prod")]).await;
+
+    // A modelled refusal of the operation ("You can't specify both
+    // ResourceARNList and ResourceTypeFilters / TagFilters / ResourcesPerPage /
+    // TagsPerPage / PaginationToken"): InvalidParameterException is one of the
+    // errors GetResources declares (`smithy_query(query="operation",
+    // operation="GetResources")` -> errors InvalidParameterException 400).
+    let refused = serde_json::json!({
+        "ResourceARNList": ["arn:aws:s3:::alpha"],
+        "TagFilters": [{ "Key": "Env" }]
+    });
+    let as_json = framed_call(
+        &router,
+        Framing::AwsJson,
+        Lengths::Declared,
+        "GetResources",
+        refused.clone(),
+    )
+    .await;
+    let as_cbor = framed_call(
+        &router,
+        Framing::RpcV2Cbor,
+        Lengths::Declared,
+        "GetResources",
+        refused,
+    )
+    .await;
+    assert_eq!(
+        as_cbor.status, as_json.status,
+        "case the refused combination: expected the status of the awsJson answer ({}), got {} \
+         with {:?}",
+        as_json.status, as_cbor.status, as_cbor.body
+    );
+    assert_eq!(
+        as_cbor.status, 400,
+        "case the refused combination: expected HTTP 400, got {} with {:?}",
+        as_cbor.status, as_cbor.body
+    );
+    assert_eq!(
+        as_cbor.body.refusal_code(),
+        "InvalidParameterException",
+        "case the refused combination: expected the modelled error code, got {:?}",
+        as_cbor.body
+    );
+    assert_eq!(
+        as_cbor.body, as_json.body,
+        "case the refused combination: the two framings must state one refusal; CBOR {:?} vs \
+         JSON {:?}",
+        as_cbor.body, as_json.body
+    );
+    assert_eq!(
+        (
+            as_cbor.content_type.as_str(),
+            as_cbor.smithy_protocol.as_str()
+        ),
+        (CBOR_MEDIA_TYPE, SMITHY_PROTOCOL.1),
+        "case the refused combination: a refusal of a CBOR call is labelled as that framing, \
+         got {as_cbor:?}"
+    );
+
+    // An operation this endpoint does not have, named in that framing's path, is
+    // the framing's own not-found rather than a complaint about a header it does
+    // not use.
+    let unknown = framed_call(
+        &router,
+        Framing::RpcV2Cbor,
+        Lengths::Declared,
+        "GetNoSuchThing",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        unknown.status, 404,
+        "case an operation the endpoint does not have: expected HTTP 404, got {} with {:?}",
+        unknown.status, unknown.body
+    );
+    assert_eq!(
+        (
+            unknown.content_type.as_str(),
+            unknown.smithy_protocol.as_str()
+        ),
+        (CBOR_MEDIA_TYPE, SMITHY_PROTOCOL.1),
+        "case an operation the endpoint does not have: the answer is labelled as that framing, \
+         got {unknown:?}"
+    );
+    assert!(
+        !unknown.body.refusal_code().is_empty(),
+        "case an operation the endpoint does not have: the answer names no error, got {:?}",
+        unknown.body
+    );
 }
