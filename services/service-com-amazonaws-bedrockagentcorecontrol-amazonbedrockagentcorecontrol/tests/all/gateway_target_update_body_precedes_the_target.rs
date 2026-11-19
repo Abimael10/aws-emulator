@@ -6,19 +6,20 @@
 //! RULE under test: the GATEWAY the path label names is resolved first, so a
 //! `gatewayIdentifier` naming no gateway is the modelled `ResourceNotFoundException` (HTTP
 //! 404) whatever the body carries; a refusal this operation decides from the request body
-//! ALONE — a member its own response requires that the body leaves undefined — is then
-//! reported before the target the path names under that gateway is resolved, as the modelled
-//! `ValidationException` (HTTP 400) with the member's own sentence; and the target's own 404,
-//! like the gateway's status conflict, is reached only by a body this operation could
-//! otherwise render into its response.
+//! ALONE — a body that has to define `credentialProviderConfigurations` and does not — is
+//! then reported before the target the path names under that gateway is resolved, as the
+//! modelled `ValidationException` (HTTP 400) with the member's own sentence; and the
+//! target's own 404, like the gateway's status conflict, is reached by every body this
+//! operation could otherwise render into its response.
 //!
 //! The member in question, read off the model
 //! (`smithy_query(query="operation",operation="UpdateGatewayTarget")`):
 //! `credentialProviderConfigurations` is optional on `UpdateGatewayTargetRequest` and
-//! `@required`, with `@length` exactly one entry, on `UpdateGatewayTargetResponse`, and the
-//! update replaces the target's whole configuration — so a request that defines none leaves
-//! the modelled response nothing to report. The operation models both
-//! `ValidationException` (HTTP 400) and `ResourceNotFoundException` (HTTP 404).
+//! `@required`, with `@length` exactly one entry, on `UpdateGatewayTargetResponse`. Which
+//! bodies have to define it is the subject of `gateway_target_update_carried_credentials`:
+//! an `mcp` configuration, which the gateway itself calls, has to; an `http` or `inference`
+//! one does not and carries the stored target's configuration forward. The operation models
+//! both `ValidationException` (HTTP 400) and `ResourceNotFoundException` (HTTP 404).
 //!
 //! The rows differ along what the rule generalises over: whether the target the path names is
 //! there, is not there at all, or has had its deletion accepted; the gateway's own status
@@ -262,9 +263,9 @@ struct Row {
     message: &'static str,
 }
 
-/// RULE: a body that defines no `credentialProviderConfigurations` is the modelled 400 with
-/// the member's own sentence before the target the path names is resolved, while the gateway
-/// the path label names is resolved ahead of the body.
+/// RULE: a body that has to define `credentialProviderConfigurations` and does not is the
+/// modelled 400 with the member's own sentence before the target the path names is resolved,
+/// while the gateway the path label names is resolved ahead of the body.
 #[tokio::test]
 async fn the_undefined_member_is_reported_before_the_target_is_resolved() {
     let router = router();
@@ -317,6 +318,9 @@ async fn the_undefined_member_is_reported_before_the_target_is_resolved() {
             code: "ValidationException",
             message: NOT_DEFINED,
         },
+        // An HTTP passthrough body does not have to define the member, so this one is a
+        // body this operation could render into its response: it reaches the target the
+        // path names, and the absent target's own 404 is what it earns.
         Row {
             case: "another absent targetId, an HTTP passthrough body, and no providers",
             gateway: gateway_id.clone(),
@@ -326,9 +330,9 @@ async fn the_undefined_member_is_reported_before_the_target_is_resolved() {
                 "description": "a description the refusal must not store",
                 "targetConfiguration": passthrough_configuration(),
             }),
-            status: 400,
-            code: "ValidationException",
-            message: NOT_DEFINED,
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: TARGET_ABSENT,
         },
         Row {
             case: "an absent targetId, a Lambda no service resolves, and no providers",

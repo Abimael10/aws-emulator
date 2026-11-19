@@ -2018,6 +2018,11 @@ pub mod api_key_credential_providers;
 /// synchronization reports a target in. Re-exported, so a handler names
 /// `crate::state::…` for it exactly as it does for the target record itself.
 pub mod gateway_target_synchronization;
+/// The credential provider configuration a gateway target carries: what a
+/// request that defines none leaves the target with, and which target
+/// configurations have to be given one. Re-exported, so a handler names
+/// `crate::state::…` for it exactly as it does for the target record itself.
+pub mod gateway_target_credentials;
 /// The OAuth2 credential providers of this account's token vault: the record a
 /// create persists, the ARN it mints, the configuration each vendor's
 /// credentials are carried in and the secret the client secret lives in.
@@ -2046,6 +2051,7 @@ pub use consent_portals::*;
 pub use datasets::*;
 pub use gateway_rate_limits::*;
 pub use gateway_rules::*;
+pub use gateway_target_credentials::*;
 pub use gateway_target_synchronization::*;
 pub use listings::*;
 pub use oauth2_credential_providers::*;
@@ -4887,28 +4893,6 @@ fn s3_client(
         .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
         .build();
     ::aws_sdk_s3::Client::from_conf(config)
-}
-
-/// The credential a gateway target reports when the CREATE configured none: the
-/// gateway's own IAM role.
-///
-/// `credentialProviderConfigurations` is optional on `CreateGatewayTarget` and
-/// `@required` with at least one entry on every response that reports a target,
-/// so the stored target carries this one rather than an empty list the wire
-/// cannot render. `UpdateGatewayTarget` has no such fallback: it replaces the
-/// target's whole configuration, so a body that defines none is refused
-/// ([`member_not_defined`]) instead of being given a default the caller did not
-/// ask for.
-pub fn effective_credential_provider_configurations(
-    requested: Option<Vec<CredentialProviderConfiguration>>,
-) -> Vec<CredentialProviderConfiguration> {
-    match requested {
-        Some(configured) if !configured.is_empty() => configured,
-        _ => vec![CredentialProviderConfiguration {
-            credential_provider_type: CREDENTIAL_PROVIDER_GATEWAY_IAM_ROLE.to_string(),
-            credential_provider: None,
-        }],
-    }
 }
 
 /// The lifecycle configuration to store for a request: the caller's, with each

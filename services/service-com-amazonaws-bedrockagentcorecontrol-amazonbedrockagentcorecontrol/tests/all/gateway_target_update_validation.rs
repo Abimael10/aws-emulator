@@ -19,10 +19,13 @@
 //! (`smithy_query(query="operation",operation="UpdateGatewayTarget")` /
 //! `operation="CreateGatewayTarget"`): `credentialProviderConfigurations` is optional on
 //! `UpdateGatewayTarget`'s request and `@required` with exactly one entry on its response,
-//! and the update REPLACES the target's whole configuration — so a body that defines none
-//! leaves the response nothing to report; `name` is optional on `CreateGatewayTarget`'s
-//! request and `@required` on every response that reports a target. A body that DOES define
-//! the member is served, and nothing a refused request carried is written.
+//! and an `mcp` target configuration is one the gateway itself calls — so a body carrying
+//! one and defining no credential provider leaves the response nothing to report (which
+//! bodies have to define it at all is the subject of
+//! `gateway_target_update_carried_credentials`); `name` is optional on
+//! `CreateGatewayTarget`'s request and `@required` on every response that reports a target.
+//! A body that DOES define the member is served, and nothing a refused request carried is
+//! written.
 //!
 //! `CreateGatewayTarget` addresses no child of its own — the target it would mint does not
 //! exist yet — so the only resource it resolves is the gateway the path label names, which is

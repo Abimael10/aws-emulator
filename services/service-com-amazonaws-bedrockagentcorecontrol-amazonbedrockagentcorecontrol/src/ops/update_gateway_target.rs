@@ -220,17 +220,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it; the CHILD the path names under it is resolved only once the body
         // this operation can decide on its own has passed. So the refusal a
         // caller hears first is the one that is decidable without reaching for
-        // the child: a body that defines no `credentialProviderConfigurations`
-        // is the modelled 400 even when the `targetId` beside it names no
-        // target, and a `targetId` naming nothing is the modelled 404 only for a
-        // body this operation could otherwise render into its response.
+        // the child: a body that has to define `credentialProviderConfigurations`
+        // and does not is the modelled 400 even when the `targetId` beside it
+        // names no target, and a `targetId` naming nothing is the modelled 404
+        // for every body this operation could otherwise render into its
+        // response.
         //
         // Everything that can be decided from stored state alone is decided
         // here, and the store guard is DROPPED before the cross-service call
         // below: a lock is not held across an await, and the Lambda the new
         // configuration names is resolved only for a request that would
         // otherwise be written.
-        let credential_provider_configurations = {
+        let defined_credential_provider_configurations = {
             let mut store = state.lock();
             // A gateway whose deletion the clock has already made due is gone
             // before this call looks for it, and its targets with it.
@@ -242,24 +243,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
             // `credentialProviderConfigurations` is optional on the request and
-            // `@required` with exactly one entry on this operation's own response,
-            // and the update REPLACES the target's whole configuration, so a body
-            // that defines none leaves nothing to report and is refused rather
-            // than defaulted. The refusal needs nothing but the request, so it is
-            // reported ahead of resolving the target the request would
-            // reconfigure, and ahead of the gateway's own status.
-            let Some(configured) = input
-                .credential_provider_configurations
-                .clone()
-                .filter(|configured| !configured.is_empty())
-            else {
+            // `@required` with exactly one entry on this operation's own
+            // response, so what a body that defines none leaves the target with
+            // is decided by the configuration that body carries: a target the
+            // GATEWAY ITSELF calls has to be told what to authenticate to it as
+            // and is refused without it, while a target that authenticates
+            // nothing of its own keeps the configuration the stored target
+            // already carries (`crate::state::gateway_target_credentials`). The
+            // refusal needs nothing but the request, so it is reported ahead of
+            // resolving the target the request would reconfigure, and ahead of
+            // the gateway's own status.
+            let defined = crate::state::defined_credential_provider_configurations(
+                input.credential_provider_configurations.clone(),
+            );
+            if defined.is_none()
+                && crate::state::credential_provider_configurations_must_be_defined(
+                    &input.target_configuration,
+                )
+            {
                 return Err(UpdateGatewayTargetErrorModeled::ValidationException(
                     crate::state::member_not_defined(
                         crate::state::CREDENTIAL_PROVIDER_CONFIGURATIONS_PROSE,
                     ),
                 )
                 .into());
-            };
+            }
 
             // A target id naming no target OF THIS GATEWAY is the modelled 404:
             // an update reconfigures a stored target, it does not mint one. A
@@ -291,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            configured
+            defined
         };
 
         // The cross-service check `CreateGatewayTarget` makes, for the same
@@ -343,21 +351,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        // Every configurable member of the target is replaced by what this
-        // request carries, and a member the request omits is CLEARED: this is the
-        // target's whole configuration and not a patch of it, which is what the
-        // model documents for the one member it spells the rule out for
-        // (`certificateConfigurations`: "To remove a previously configured
-        // certificate authority, omit this field on update.").
+        // Every configurable member of the target the response can render
+        // without is replaced by what this request carries, and one the request
+        // omits is CLEARED: this is the target's whole configuration and not a
+        // patch of it, which is what the model documents for the one member it
+        // spells the rule out for (`certificateConfigurations`: "To remove a
+        // previously configured certificate authority, omit this field on
+        // update."). The two members the response `@require` — `name` and
+        // `credentialProviderConfigurations` — are the exception below: there is
+        // no cleared form of either that the wire could report.
         record.description = input.description;
         record.target_configuration = input.target_configuration;
         record.metadata_configuration = input.metadata_configuration;
         record.private_endpoint = input.private_endpoint;
         record.certificate_configurations = input.certificate_configurations;
-        // `credentialProviderConfigurations` is what the body defined, refused
-        // above when it defined none: the update replaces the stored list with
-        // it rather than falling back to a default.
-        record.credential_provider_configurations = credential_provider_configurations;
+        // `credentialProviderConfigurations` is what the body defined. A body
+        // that defined none — which only a configuration that authenticates
+        // nothing of its own reaches here — leaves the target with the
+        // configuration it already carries, so the member this operation's
+        // response requires reports the credential the target is really
+        // configured with rather than a default this call invented for it.
+        if let Some(configured) = defined_credential_provider_configurations {
+            record.credential_provider_configurations = configured;
+        }
         // `name` is optional on the request and `@required` on every response, so
         // a request naming none keeps the stored name rather than clearing a
         // member the wire cannot render without.
