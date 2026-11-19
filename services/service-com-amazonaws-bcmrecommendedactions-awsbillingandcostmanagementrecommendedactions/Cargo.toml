@@ -30,6 +30,11 @@ hex = { workspace = true }
 # wrapping schema a refusal of an unusable token reports.
 base64 = "0.22"
 
+# The shared service layer. Carries the requirement sentence a constraint
+# violation states (`validation_message::requirement`), so the words this
+# service's refusals use are the framework's and are not re-derived per crate.
+service-common = { path = "../common" }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 

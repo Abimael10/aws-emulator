@@ -8,10 +8,11 @@
 //! request:
 //!
 //! * A refused member is stated twice and the two statements carry different
-//!   halves of it. The summary envelope (`N validation error(s) detected: …`)
-//!   names the member's dotted path and the requirement it failed and does NOT
-//!   echo the value the request sent; that member's own `fieldList` entry, whose
-//!   `name` already carries the path, is where the rejected value is reported. A
+//!   halves of it, each identifying the member ONCE. The summary envelope
+//!   (`N validation error(s) detected: …`) names the member's dotted path and the
+//!   requirement it failed and does NOT echo the value the request sent; that
+//!   member's own `fieldList` entry reports that value and the same requirement and
+//!   names no path, because the entry's `name` member is what identifies it there. A
 //!   requirement over an enumerated value set lists that enum's members in the
 //!   order this service states that set in, which is a property of the service's
 //!   message and not the model's declaration order — so each enum carries its own
@@ -155,10 +156,10 @@ struct RefusedMember {
     sent: String,
 }
 
-/// The value a refusal REPORTS for a member that carried `sent`: the value as
-/// sent, or — past the length a refusal echoes — its first bytes with the rest
-/// counted, the elision the framework applies to a caller-chosen value
-/// (`MAX_ECHOED_VALUE` in `vendor/smithy-schema-server/src/constraints.rs`).
+/// The value a refusal REPORTS for a member that carried `sent`: the value as sent,
+/// or — past the length a refusal echoes — its first bytes with the rest counted,
+/// the elision the framework applies to a caller-chosen value (`MAX_ECHOED_VALUE` in
+/// `vendor/smithy-schema-server/src/constraints.rs`).
 fn reported(sent: &str) -> String {
     const MAX_ECHOED: usize = 256;
     if sent.len() <= MAX_ECHOED {
@@ -371,13 +372,12 @@ async fn an_enum_refusal_lists_the_value_set_in_the_order_the_service_states_it(
 
         for member in &refused {
             // The member's own entry states the same requirement and reports the
-            // value the request sent in that member.
+            // value the request sent in that member — and names no member path: the
+            // entry's own `name` is what identifies the member there.
             let stated = field_message(case, &body, member.path);
             let expected_entry = format!(
-                "Value '{}' at '{}' failed to satisfy constraint: Member must satisfy enum value \
-                 set: {}",
+                "Value '{}' failed to satisfy constraint: Member must satisfy enum value set: {}",
                 reported(&member.sent),
-                member.path,
                 member.value_set
             );
             assert_eq!(
@@ -386,7 +386,7 @@ async fn an_enum_refusal_lists_the_value_set_in_the_order_the_service_states_it(
                  {stated:?}",
                 member.path
             );
-            // The summary states the same violation and withholds that value. An
+            // The SUMMARY states the same violation and withholds that value. An
             // empty value has nothing to withhold, and a value past the length a
             // refusal echoes is reported elided, so the check runs on the span a
             // refusal carries in full.
@@ -398,6 +398,404 @@ async fn an_enum_refusal_lists_the_value_set_in_the_order_the_service_states_it(
                      got {message:?}"
                 );
             }
+        }
+    }
+}
+
+/// The modelled `@range` of `MaxResults` (`smithy_query(query="shape",
+/// shape="MaxResults")`: min 1, max 1000).
+const MAX_RESULTS_RANGE: (i32, i32) = (1, 1000);
+
+/// The modelled minimum `@length` of `FilterValues` (`smithy_query(query="shape",
+/// shape="ActionFilter,FilterValues")`: min 1).
+const FILTER_VALUES_MIN_LENGTH: i64 = 1;
+
+/// What a refusal reports for one member: the value the request SENT in it, or
+/// nothing at all for a member the request left out.
+enum Sent {
+    /// The member carried this value.
+    Value(String),
+    /// The member was absent, so there is no value to report.
+    Nothing,
+}
+
+/// One member a refusal states: the dotted path it names the member by, the
+/// requirement that member failed, and what the request sent in it.
+struct StatedMember {
+    path: String,
+    requirement: String,
+    sent: Sent,
+}
+
+impl StatedMember {
+    /// The clause the SUMMARY states about this member: its path and the
+    /// requirement, with the value the request sent withheld.
+    fn summary_clause(&self) -> String {
+        let value = match self.sent {
+            Sent::Value(_) => "Value",
+            // An absent member sent no value to withhold, so the fact that it
+            // arrived with none is stated in both halves.
+            Sent::Nothing => "Value null",
+        };
+        format!(
+            "{value} at '{}' failed to satisfy constraint: {}",
+            self.path, self.requirement
+        )
+    }
+
+    /// The message this member's own `fieldList` ENTRY states: the value the
+    /// request sent and the requirement, and no member path — the entry's `name`
+    /// carries that. A member the request left out sent no value, so its entry
+    /// keeps the `null` its absence is.
+    fn entry_message(&self) -> String {
+        let value = match &self.sent {
+            Sent::Value(sent) => format!("Value '{}'", reported(sent)),
+            Sent::Nothing => "Value null".to_string(),
+        };
+        format!(
+            "{value} failed to satisfy constraint: {}",
+            self.requirement
+        )
+    }
+}
+
+/// One refusal case: a request and every member its refusal states.
+struct StatedCase {
+    case: String,
+    request: Value,
+    refused: Vec<StatedMember>,
+}
+
+/// The requirement clause of an enumerated value set, over the set as this service
+/// lists it.
+fn enum_value_set(set: &str) -> String {
+    format!("Member must satisfy enum value set: {set}")
+}
+
+/// The dotted path of a member of the `position`-th (1-based) `ActionFilter`.
+fn filter_path(position: usize, member: &str) -> String {
+    format!("filter.actions.{position}.member.{member}")
+}
+
+/// The `fieldList` entries of a refusal, as `(name, message)` pairs.
+fn field_entries(case: &str, body: &Value) -> Vec<(String, String)> {
+    body.get("fieldList")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a fieldList array, got {body}"))
+        .iter()
+        .map(|entry| {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: a fieldList entry names no member in {body}")
+                });
+            let message = entry
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: entry {name:?} states no message in {body}")
+                });
+            (name.to_string(), message.to_string())
+        })
+        .collect()
+}
+
+/// Requests refused for a member, spanning every constraint class this input
+/// carries.
+///
+/// The rows differ along what the rule generalises over: the CONSTRAINT class (an
+/// enumerated value set, a numeric range, a list's length, a string's length, a
+/// required member that is absent), the bound crossed, the kind of member (a
+/// top-level scalar, a member nested in a structure in a list), the form of the
+/// rejected value (a short value, an empty one, one longer than a refusal echoes,
+/// one that spells a member-path clause of its own) and how many members one
+/// request refuses at once.
+fn stated_cases() -> Vec<StatedCase> {
+    let (min_results, max_results) = MAX_RESULTS_RANGE;
+    let long_key = "K".repeat(300);
+    let long_token = "x".repeat(NEXT_TOKEN_LENGTH.1 + 1);
+    let empty_values = json!({"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": []});
+    vec![
+        StatedCase {
+            case: "a key outside the published set".to_string(),
+            request: filters(vec![
+                json!({"key": "NOT_A_FILTER_KEY", "matchOption": "EQUALS", "values": ["BUDGETS"]}),
+            ]),
+            refused: vec![StatedMember {
+                path: filter_path(1, "key"),
+                requirement: enum_value_set(FILTER_NAME_SET),
+                sent: Sent::Value("NOT_A_FILTER_KEY".to_string()),
+            }],
+        },
+        StatedCase {
+            case: "a matchOption outside the published set".to_string(),
+            request: filters(vec![
+                json!({"key": "FEATURE", "matchOption": "CONTAINS", "values": ["BUDGETS"]}),
+            ]),
+            refused: vec![StatedMember {
+                path: filter_path(1, "matchOption"),
+                requirement: enum_value_set(MATCH_OPTION_SET),
+                sent: Sent::Value("CONTAINS".to_string()),
+            }],
+        },
+        StatedCase {
+            case: "an empty key".to_string(),
+            request: filters(vec![
+                json!({"key": "", "matchOption": "EQUALS", "values": ["BUDGETS"]}),
+            ]),
+            refused: vec![StatedMember {
+                path: filter_path(1, "key"),
+                requirement: enum_value_set(FILTER_NAME_SET),
+                sent: Sent::Value(String::new()),
+            }],
+        },
+        StatedCase {
+            // The VALUE, not the member, spells a path clause: the entry reports it
+            // as sent, so no row can pass by deleting whatever reads like a path
+            // from a clause built around caller input.
+            case: "a key whose value spells a member-path clause".to_string(),
+            request: filters(vec![json!({
+                "key": format!("x' at '{}", filter_path(1, "key")),
+                "matchOption": "EQUALS",
+                "values": ["BUDGETS"],
+            })]),
+            refused: vec![StatedMember {
+                path: filter_path(1, "key"),
+                requirement: enum_value_set(FILTER_NAME_SET),
+                sent: Sent::Value(format!("x' at '{}", filter_path(1, "key"))),
+            }],
+        },
+        StatedCase {
+            case: "a key longer than a refusal echoes".to_string(),
+            request: filters(vec![
+                json!({"key": long_key, "matchOption": "EQUALS", "values": ["BUDGETS"]}),
+            ]),
+            refused: vec![StatedMember {
+                path: filter_path(1, "key"),
+                requirement: enum_value_set(FILTER_NAME_SET),
+                sent: Sent::Value(long_key.clone()),
+            }],
+        },
+        StatedCase {
+            case: "a page size one below the published minimum".to_string(),
+            request: json!({"maxResults": min_results - 1}),
+            refused: vec![StatedMember {
+                path: "maxResults".to_string(),
+                requirement: format!(
+                    "Member must have value greater than or equal to {min_results}"
+                ),
+                sent: Sent::Value((min_results - 1).to_string()),
+            }],
+        },
+        StatedCase {
+            case: "a page size one past the published maximum".to_string(),
+            request: json!({"maxResults": max_results + 1}),
+            refused: vec![StatedMember {
+                path: "maxResults".to_string(),
+                requirement: format!("Member must have value less than or equal to {max_results}"),
+                sent: Sent::Value((max_results + 1).to_string()),
+            }],
+        },
+        StatedCase {
+            case: "an empty values list".to_string(),
+            request: filters(vec![empty_values.clone()]),
+            refused: vec![StatedMember {
+                path: filter_path(1, "values"),
+                requirement: format!(
+                    "Member must have length greater than or equal to {FILTER_VALUES_MIN_LENGTH}"
+                ),
+                // A collection is reported by the element count the framework
+                // renders for one, not by a value of its own.
+                sent: Sent::Value("0 items".to_string()),
+            }],
+        },
+        StatedCase {
+            case: "a token one character past the published maximum length".to_string(),
+            request: json!({"nextToken": long_token.clone()}),
+            refused: vec![StatedMember {
+                path: "nextToken".to_string(),
+                requirement: format!(
+                    "Member must have length less than or equal to {}",
+                    NEXT_TOKEN_LENGTH.1
+                ),
+                sent: Sent::Value(long_token.clone()),
+            }],
+        },
+        StatedCase {
+            case: "a filter with no key".to_string(),
+            request: filters(vec![json!({"matchOption": "EQUALS", "values": ["BUDGETS"]})]),
+            refused: vec![StatedMember {
+                path: filter_path(1, "key"),
+                requirement: "Member must not be null".to_string(),
+                sent: Sent::Nothing,
+            }],
+        },
+        StatedCase {
+            case: "the second filter has no matchOption".to_string(),
+            request: filters(vec![
+                json!({"key": "FEATURE", "matchOption": "EQUALS", "values": ["BUDGETS"]}),
+                json!({"key": "TYPE", "values": ["CREATE_BUDGET"]}),
+            ]),
+            refused: vec![StatedMember {
+                path: filter_path(2, "matchOption"),
+                requirement: "Member must not be null".to_string(),
+                sent: Sent::Nothing,
+            }],
+        },
+        StatedCase {
+            case: "both enum members of one filter are outside their sets".to_string(),
+            request: filters(vec![
+                json!({"key": "ACCOUNT", "matchOption": "CONTAINS", "values": ["BUDGETS"]}),
+            ]),
+            refused: vec![
+                StatedMember {
+                    path: filter_path(1, "key"),
+                    requirement: enum_value_set(FILTER_NAME_SET),
+                    sent: Sent::Value("ACCOUNT".to_string()),
+                },
+                StatedMember {
+                    path: filter_path(1, "matchOption"),
+                    requirement: enum_value_set(MATCH_OPTION_SET),
+                    sent: Sent::Value("CONTAINS".to_string()),
+                },
+            ],
+        },
+        StatedCase {
+            case: "a page size outside its range and a values list below its length".to_string(),
+            request: json!({
+                "maxResults": max_results + 1,
+                "filter": {"actions": [empty_values.clone()]},
+            }),
+            refused: vec![
+                StatedMember {
+                    path: "maxResults".to_string(),
+                    requirement: format!(
+                        "Member must have value less than or equal to {max_results}"
+                    ),
+                    sent: Sent::Value((max_results + 1).to_string()),
+                },
+                StatedMember {
+                    path: filter_path(1, "values"),
+                    requirement: format!(
+                        "Member must have length greater than or equal to \
+                         {FILTER_VALUES_MIN_LENGTH}"
+                    ),
+                    sent: Sent::Value("0 items".to_string()),
+                },
+            ],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_field_list_entry_states_the_value_and_the_requirement_and_no_member_path() {
+    let emulator = Emulator::new();
+
+    for StatedCase {
+        case,
+        request,
+        refused,
+    } in stated_cases()
+    {
+        let (status, body) = emulator.list(&request).await;
+        let message = refusal_message(&case, status, &body);
+
+        // The SUMMARY half: one clause per refused member, naming the member's
+        // dotted path and the requirement it failed. Compared as a set because the
+        // rule says nothing about which member a request is told about first.
+        let count = refused.len();
+        let prefix = if count == 1 {
+            "1 validation error detected: ".to_string()
+        } else {
+            format!("{count} validation errors detected: ")
+        };
+        assert!(
+            message.starts_with(&prefix),
+            "case {case:?}: expected a summary opening {prefix:?}, got {message:?}"
+        );
+        let stated: BTreeSet<String> = message[prefix.len()..]
+            .split("; ")
+            .map(str::to_string)
+            .collect();
+        let expected: BTreeSet<String> = refused
+            .iter()
+            .map(StatedMember::summary_clause)
+            .collect();
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected the summary to state {expected:?}, got {stated:?}"
+        );
+
+        // The ENTRY half: one entry per refused member, its `name` the path and its
+        // message the value that member sent plus the same requirement.
+        let entries = field_entries(&case, &body);
+        assert_eq!(
+            entries.len(),
+            count,
+            "case {case:?}: expected {count} fieldList entries, got {entries:?}"
+        );
+        for member in &refused {
+            let stated = entries
+                .iter()
+                .find(|(name, _)| name == &member.path)
+                .map(|(_, message)| message.clone())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: expected an entry naming {:?}, got {entries:?}",
+                        member.path
+                    )
+                });
+            let expected_entry = member.entry_message();
+            assert_eq!(
+                stated, expected_entry,
+                "case {case:?}: expected the entry for {:?} to state {expected_entry:?}, got \
+                 {stated:?}",
+                member.path
+            );
+            // The path is the entry's `name`, so the message states no path clause
+            // of its own and names the member nowhere — except where the VALUE the
+            // request sent spells one, which the entry reports as sent.
+            let sent_spells_a_path = match &member.sent {
+                Sent::Value(sent) => sent.contains(&member.path) || sent.contains(" at '"),
+                Sent::Nothing => false,
+            };
+            if !sent_spells_a_path {
+                assert!(
+                    !stated.contains(" at '") && !stated.contains(&member.path),
+                    "case {case:?}: the entry for {:?} must name no member path, got {stated:?}",
+                    member.path
+                );
+            }
+            // The value the request sent is reported HERE and withheld from the
+            // summary, which is the split between the two halves. An empty value has
+            // nothing to report, and a long one is reported elided, so the check
+            // runs on the span a refusal carries in full.
+            if let Sent::Value(sent) = &member.sent {
+                let echoed: String = reported(sent).chars().take(32).collect();
+                if !echoed.is_empty() {
+                    assert!(
+                        stated.contains(&echoed),
+                        "case {case:?}: the entry for {:?} must report the value {echoed:?} the \
+                         request sent, got {stated:?}",
+                        member.path
+                    );
+                    assert!(
+                        !message.contains(&echoed),
+                        "case {case:?}: the summary must withhold the value {echoed:?} of {:?}, \
+                         got {message:?}",
+                        member.path
+                    );
+                }
+            }
+            // And the two halves state the SAME requirement for the member, so a
+            // client reading either is told the same thing about it.
+            let requirement = format!("failed to satisfy constraint: {}", member.requirement);
+            assert!(
+                stated.ends_with(&requirement) && message.contains(&requirement),
+                "case {case:?}: expected both halves to state {requirement:?}, got entry \
+                 {stated:?} and summary {message:?}"
+            );
         }
     }
 }

@@ -50,10 +50,13 @@
 //!   [`cannot_parse_input`] as `cannotParse`, naming each member whose value could
 //!   not be read. Which of the two reasons a refusal states never depends on WHERE
 //!   the offending value was found, only on whether the service read it. The
-//!   wording of a member-level refusal is split between its two statements: the
-//!   summary envelope names the member and the requirement it failed, the member's
-//!   own `fieldList` entry adds the value the request sent (a member the request
-//!   left out sent none, so both statements say it arrived with no value), and a
+//!   wording of a member-level refusal is split between its two statements, each
+//!   identifying the refused member ONCE: the summary envelope names the member's
+//!   dotted path and the requirement it failed, the member's own `fieldList` entry
+//!   states the value the request sent in that member, the same requirement, and no
+//!   path at all — its `name` member is where that entry names the member (a member
+//!   the request left out sent no value, so both statements say it arrived with
+//!   none) — and a
 //!   requirement over an enumerated value set lists that enum's members in the
 //!   order this service states that set in
 //!   (`crate::state::FilterName::VALUE_SET_ORDER`), which is not the model's
@@ -234,18 +237,22 @@ const TOKEN_LEN: usize = TOKEN_FINGERPRINT_LEN + TOKEN_OFFSET_LEN;
 /// client can branch on the reason and report which member was rejected and why.
 ///
 /// Each violation is stated TWICE and the two statements carry different halves of
-/// it: the envelope's clause names the member path and the requirement it failed
-/// and does NOT echo the value the request sent, while the member's own `fieldList`
-/// entry — whose `name` already carries that path — is where the rejected value is
-/// reported. So a caller reading the summary is told what the service requires of
-/// each member, and a caller reading a member's entry is told what it sent.
+/// it, each identifying the refused member once: the envelope's clause names the
+/// member PATH and the requirement it failed and states no value at all
+/// ([`without_echoed_value`]), while the member's own `fieldList` entry states the
+/// value that member sent and that same requirement and names no path
+/// ([`field_clause`]) — the entry's `name` member already carries it. So a caller
+/// reading the summary is told where the request must change and what the service
+/// requires there, and a caller reading a member's entry is told what that member
+/// sent.
 pub fn field_validation_failed(violations: &[Violation]) -> ListRecommendedActionsErrorModeled {
-    // BOUNDED, like the boundary validator's own walk: every violation is rendered
-    // TWICE into the body (a clause in the message and a `fieldList` entry) and each
-    // clause interpolates the rejected value and the bound it failed, so an unbounded
-    // count turns a small request into an arbitrarily large refusal. The cap is the
-    // framework's (`MAX_VIOLATIONS`), and like the framework the envelope keeps
-    // counting what was RECORDED, so the two refusal paths read alike.
+    // BOUNDED, like the boundary validator's own walk: every violation is stated
+    // TWICE into the body (a clause in the message and a `fieldList` entry), each
+    // statement interpolating the requirement it failed and one of the member path /
+    // rejected value, so an unbounded count turns a small request into an
+    // arbitrarily large refusal. The cap is the framework's (`MAX_VIOLATIONS`), and
+    // like the framework the envelope keeps counting what was RECORDED, so the two
+    // refusal paths read alike.
     // Each violation as this service STATES it: the value set listed in this
     // service's order ([`as_stated`]).
     let stated: Vec<Violation> = violations
@@ -255,7 +262,8 @@ pub fn field_validation_failed(violations: &[Violation]) -> ListRecommendedActio
         .collect();
     // The SUMMARY clause names the member and the requirement it failed, and
     // withholds the value the request sent ([`without_echoed_value`]); the member's
-    // own entry below states that value, which is the half a caller reads there.
+    // own entry below states that value and the same requirement
+    // ([`field_clause`]), with no path of its own.
     let summarised: Vec<Violation> = stated.iter().map(without_echoed_value).collect();
     ListRecommendedActionsErrorModeled::ValidationException(ValidationException {
         message: constraints::envelope(&summarised)
@@ -266,7 +274,7 @@ pub fn field_validation_failed(violations: &[Violation]) -> ListRecommendedActio
                 .iter()
                 .map(|violation| ValidationExceptionField {
                     name: violation.path.clone(),
-                    message: violation.message(),
+                    message: field_clause(violation),
                 })
                 .collect(),
         ),
@@ -332,6 +340,44 @@ fn without_echoed_value(violation: &Violation) -> Violation {
         sensitive: true,
         ..violation.clone()
     }
+}
+
+/// The message a violation's own `fieldList` entry states: the clause the framework
+/// writes for that violation with the MEMBER PATH half dropped, so the entry reports
+/// the value the request sent and the requirement that value failed and states no
+/// path at all — the entry's `name` member is what identifies the member there, so a
+/// path in the message would state one entry's member twice.
+///
+/// The mirror of [`without_echoed_value`], which drops the other half for the
+/// summary: between them each statement identifies the refused member once and
+/// states one half of the violation — the summary where the request must change and
+/// what is required there, the entry what that member sent and the same requirement.
+/// Like it, this takes its words from the framework rather than respelling them
+/// here: the path half is REMOVED from the framework's own clause, so the rendering
+/// of the rejected value (including the elision a long one is cut to), the `null` an
+/// absent member is stated with and the punctuation around them stay single-homed,
+/// and the requirement sentence is the shared one every service states for that
+/// constraint ([`service_common::validation_message::requirement`]).
+///
+/// Both removals are anchored at the END of the clause, which is what keeps the cut
+/// independent of the value the request sent: a caller-chosen value that happens to
+/// spell a path clause of its own sits BEFORE the cut, never at it, so it is
+/// reported as sent. A clause the framework does not write in that frame at all is
+/// stated exactly as it was written, so the worst a change upstream can do is leave
+/// the path in rather than produce a malformed sentence.
+fn field_clause(violation: &Violation) -> String {
+    let stated = violation.message();
+    let requirement = format!(
+        " failed to satisfy constraint: {}",
+        service_common::validation_message::requirement(violation.kind.clone())
+    );
+    let Some(value) = stated
+        .strip_suffix(&requirement)
+        .and_then(|stated| stated.strip_suffix(&format!(" at '{}'", violation.path)))
+    else {
+        return stated;
+    };
+    format!("{value}{requirement}")
 }
 
 /// A 400 `ValidationException` for a request this service could not READ —
@@ -479,12 +525,11 @@ const FILTER_VALUES_MIN_LEN: i64 = 1;
 /// validator's own (`MAX_VIOLATIONS` in
 /// `vendor/smithy-schema-server/src/constraints.rs`).
 ///
-/// Every violation is rendered TWICE into the refusal body — a clause in the message
-/// and a `fieldList` entry — and each clause carries the rejected value and the value
-/// set it failed, so the COUNT is what turns a request-chosen list length into an
-/// arbitrarily large response. The walk below STOPS at the cap (a caller cannot act on
-/// thousands of clauses) and, like the framework, the envelope keeps counting what was
-/// recorded.
+/// Every violation is STATED TWICE into the refusal body — a clause in the message
+/// and a `fieldList` entry — each statement carrying the value set it failed, so the
+/// COUNT is what turns a request-chosen list length into an arbitrarily large
+/// response. The walk below STOPS at the cap (a caller cannot act on thousands of
+/// clauses) and, like the framework, the envelope keeps counting what was recorded.
 const MAX_VIOLATIONS: usize = 100;
 
 /// One validated `ActionFilter`: the field it reads, whether it keeps or excludes a

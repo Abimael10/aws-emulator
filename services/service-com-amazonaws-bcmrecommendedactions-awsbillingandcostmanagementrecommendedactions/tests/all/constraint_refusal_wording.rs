@@ -9,9 +9,9 @@
 //! stated twice and the two statements carry different halves of it. The summary
 //! (`N validation error(s) detected: …`) names the member's dotted path and the
 //! requirement it failed and states NO value at all — no clause of it carries the
-//! `Value '<sent>' at …` frame; the member's own `fieldList` entry, whose `name`
-//! already carries that path, is the one place the value the request sent is
-//! reported. The requirement's wording comes from the constraint and the bound the
+//! `Value '<sent>' at …` frame; the member's own `fieldList` entry is the one place
+//! the value the request sent is reported, and it names no path, because the entry's
+//! `name` member is what identifies the member there. The requirement's wording comes from the constraint and the bound the
 //! model publishes, so the same sentence covers a page size below its minimum, one
 //! above its maximum, a list shorter than its minimum length and a string outside
 //! its length — and a request that breaks two at once is summarised with one clause
@@ -149,9 +149,9 @@ fn field_list(case: &str, body: &Value) -> Vec<(String, String)> {
 }
 
 /// One member a refusal states: the dotted path it names the member by, the
-/// requirement that member failed, and the value a refusal REPORTS for it (the
-/// value as sent for a scalar, the element count for a list — the rendering the
-/// framework gives a collection).
+/// requirement that member failed, and the value a refusal REPORTS for it in that
+/// member's own entry (the value as sent for a scalar, the element count for a list
+/// — the rendering the framework gives a collection).
 struct RefusedMember {
     path: String,
     requirement: String,
@@ -407,9 +407,9 @@ async fn a_constraint_refusal_summarises_the_member_and_its_requirement_without_
                 member.path
             );
         }
-
         // The member's own entry: the same requirement, plus the value the request
-        // sent — the half of the refusal the summary withholds.
+        // sent — the half of the refusal the summary withholds — and no member path,
+        // which the entry's `name` carries instead.
         let fields = field_list(&case, &body);
         assert_eq!(
             fields.len(),
@@ -428,8 +428,8 @@ async fn a_constraint_refusal_summarises_the_member_and_its_requirement_without_
                     )
                 });
             let expected_entry = format!(
-                "Value '{}' at '{}' failed to satisfy constraint: {}",
-                member.reported, member.path, member.requirement
+                "Value '{}' failed to satisfy constraint: {}",
+                member.reported, member.requirement
             );
             assert_eq!(
                 stated, expected_entry,
@@ -480,18 +480,21 @@ async fn an_absent_required_member_is_stated_as_absent_and_not_as_a_withheld_val
     for (case, request, path) in cases {
         let (status, body) = emulator.list(&request).await;
         let message = refusal_message(&case, status, &body);
-        let clause =
-            format!("Value null at '{path}' failed to satisfy constraint: Member must not be null");
+        let requirement = "Member must not be null";
+        let clause = format!("Value null at '{path}' failed to satisfy constraint: {requirement}");
         let expected = format!("1 validation error detected: {clause}");
         assert_eq!(
             message, expected,
             "case {case:?}: expected message {expected:?}, got {message:?}"
         );
+        // The entry states the same absence and the same requirement, and names the
+        // member only in its `name`.
+        let entry = format!("Value null failed to satisfy constraint: {requirement}");
         let fields = field_list(&case, &body);
         assert_eq!(
             fields,
-            vec![(path.clone(), clause.clone())],
-            "case {case:?}: expected the entry for {path:?} to state {clause:?}, got {fields:?}"
+            vec![(path.clone(), entry.clone())],
+            "case {case:?}: expected the entry for {path:?} to state {entry:?}, got {fields:?}"
         );
     }
 }
