@@ -4,14 +4,14 @@
 //! wire.
 //!
 //! The rule: a boundary refusal of a value outside a member's modelled `@range` states the
-//! value the request submitted, the member it sat at and the bound that member's values
-//! have to respect — `Value '<submitted>' at '<member path>' failed to satisfy constraint:
-//! Member must have value {less,greater} than or equal to <bound>`. The value comes from the
-//! request and the bound from the member's declared range, so the sentence reads the same
-//! way at whichever end of the range and on whichever member. Everything else about the
-//! refusal is the
-//! framework's and unchanged: HTTP 400, `ValidationException`, the
-//! `N validation error(s) detected: ` envelope, and the member path including a list index.
+//! member it sat at and the bound that member's values have to respect, and no value at all
+//! — `Value at '<member path>' failed to satisfy constraint: Member must have value
+//! {less,greater} than or equal to <bound>`. The member path comes from the request and the
+//! bound from the member's declared range, so the sentence reads the same way at whichever
+//! end of the range and on whichever member, and the number the request submitted is nowhere
+//! in it. Everything else about the refusal is the framework's and unchanged: HTTP 400,
+//! `ValidationException`, the `N validation error(s) detected: ` envelope, and the member
+//! path including a list index.
 //!
 //! The suite is a TABLE over every `@range`-constrained member of this service's surface —
 //! `maxResults` on both listings (range 1..100) and a widget's `width` (2..6) and `height`
@@ -23,9 +23,10 @@
 //! 1..100, `WidgetWidth` 2..6, `WidgetHeight` 4..10; they are the only `@range` members the
 //! model declares.
 //!
-//! Two neighbouring tests pin the SCOPE of the rule: another constraint class states its
-//! value the same way, and a request that breaks a range AND a length states both
-//! clauses in their own voices under one envelope.
+//! Two neighbouring tests pin the SCOPE of the rule: the withheld value half belongs to the
+//! `@range` class alone — another constraint class still states the value it was given — and
+//! a request that breaks a range AND a length states both clauses in their own voices under
+//! one envelope.
 //!
 //! Every call goes through the real router, so what these tests assert is what an SDK client
 //! sees.
@@ -37,6 +38,8 @@ use super::scheduled_report_lifecycle::{source_dashboard, EXECUTION_ROLE_ARN};
 
 /// The `message` of an error body. Shared with the sibling sweep over the values a declared
 /// range refuses (`tests/all/refused_value_echo.rs`), so one clause format serves both.
+///
+/// The whole body is handed to the assertions' messages, so a mismatch names what was read.
 pub(crate) fn error_message(body: &Value) -> String {
     body.get("message")
         .and_then(Value::as_str)
@@ -49,11 +52,15 @@ pub(crate) fn one_error(clause: &str) -> String {
     format!("1 validation error detected: {clause}")
 }
 
-/// The clause a `@range` violation states: the value the request submitted, the member path
-/// it sat at and the bound its values have to respect.
-pub(crate) fn range_clause(submitted: i64, path: &str, requirement: &str) -> String {
-    format!("Value '{submitted}' at '{path}' failed to satisfy constraint: {requirement}")
+/// The clause a `@range` violation states: the member path it sat at and the bound its
+/// values have to respect, with no value half.
+pub(crate) fn range_clause(path: &str, requirement: &str) -> String {
+    format!("Value at '{path}' failed to satisfy constraint: {requirement}")
 }
+
+/// The half of a clause a `@range` refusal does NOT state, whatever value broke the bound:
+/// a quoted value between `Value` and `at`.
+pub(crate) const VALUE_HALF_OPENING: &str = "Value '";
 
 /// The requirement a value above `max` broke, as the framework words that class.
 pub(crate) fn at_most(max: i64) -> String {
@@ -94,7 +101,7 @@ struct RangeCase {
     path: &'static str,
     /// The bound clause, built from the member's modelled `@range`.
     requirement: String,
-    /// The number the request submitted there, which the clause states.
+    /// The number the request submitted there, which the clause does NOT state.
     submitted: i64,
 }
 
@@ -223,7 +230,7 @@ fn range_cases() -> Vec<RangeCase> {
 }
 
 #[tokio::test]
-async fn a_range_refusal_states_the_value_the_member_and_the_bound() {
+async fn a_range_refusal_states_the_member_and_the_bound_and_no_value() {
     let router = router();
 
     for case in range_cases() {
@@ -250,9 +257,15 @@ async fn a_range_refusal_states_the_value_the_member_and_the_bound() {
         let message = error_message(&body);
         assert_eq!(
             message,
-            one_error(&range_clause(submitted, path, &requirement)),
-            "case {label:?}: expected the clause to state the value, the member and the \
-             bound, got {message:?}"
+            one_error(&range_clause(path, &requirement)),
+            "case {label:?}: expected the clause to state the member and the bound, got \
+             {message:?}"
+        );
+        // The value half the clause does not carry: no number the request submitted is
+        // quoted back anywhere in the refusal.
+        assert!(
+            !body.to_string().contains(VALUE_HALF_OPENING),
+            "case {label:?}: the clause must quote no value for {submitted}, got {body}"
         );
     }
 }
@@ -385,9 +398,10 @@ async fn every_published_bound_is_still_served() {
 async fn another_constraint_class_states_the_value_it_was_given_too() {
     let router = router();
 
-    // The scope of the rule: every class states its value half the same way. `nextToken`
-    // targets `NextPageToken`, length 1..8192, so the empty token breaks the length minimum
-    // and is stated with the (empty) value it submitted.
+    // The scope of the rule: the withheld value half is the `@range` class's alone, and
+    // every other class still states the value it was given. `nextToken` targets
+    // `NextPageToken`, length 1..8192, so the empty token breaks the length minimum and is
+    // stated with the (empty) value it submitted.
     let (status, body) = call(&router, "ListDashboards", &json!({"nextToken": ""})).await;
     assert_eq!(
         status, 400,
@@ -410,8 +424,9 @@ async fn a_request_breaking_a_range_and_a_length_states_each_in_its_own_voice() 
     let router = router();
 
     // One request, two classes: the page size is past its maximum and the cursor is under
-    // its length minimum. Both clauses are stated under one envelope, each with the value
-    // it was given.
+    // its length minimum. Both clauses are stated under one envelope, each in its own
+    // voice — the range clause without a value, the length clause with the value it was
+    // given.
     let (status, body) = call(
         &router,
         "ListScheduledReports",
@@ -429,7 +444,7 @@ async fn a_request_breaking_a_range_and_a_length_states_each_in_its_own_voice() 
          clauses, got {message:?}"
     );
     for clause in [
-        range_clause(101, "maxResults", &at_most(100)),
+        range_clause("maxResults", &at_most(100)),
         "Value '' at 'nextToken' failed to satisfy constraint: \
          Member must have length greater than or equal to 1"
             .to_string(),

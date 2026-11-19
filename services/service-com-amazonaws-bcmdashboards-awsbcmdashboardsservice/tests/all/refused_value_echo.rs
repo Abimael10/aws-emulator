@@ -3,10 +3,10 @@
 //! What the VALUE half of a boundary constraint clause states, over the whole numeric
 //! domain a member's declared `@range` refuses.
 //!
-//! The rule: a refusal of a numeric value outside its member's modelled `@range` states
-//! that value — as the request spelled it, whatever its magnitude or sign — between `Value`
-//! and `at` in the standard clause, so a caller reads WHICH input was refused from the
-//! message.
+//! The rule: a refusal of a numeric value outside its member's modelled `@range` states the
+//! member it sat at and the bound it broke, and states no value — whatever the magnitude or
+//! sign of the number submitted, nothing is quoted between `Value` and `at`, so the clause a
+//! caller reads is about the bound rather than about the one number that missed it.
 //!
 //! This suite is the domain sweep behind the sibling table in
 //! `tests/all/range_refusal_wording.rs`, whose helpers it states the clause with: that table
@@ -14,10 +14,10 @@
 //! published bounds as still served. Here the member is held fixed and the SUBMITTED VALUE
 //! varies — exhaustively through the integers either side of each bound, then out to the
 //! extremes an `integer` member admits — at a top-level member of both listings and at a
-//! member nested under a list element. The bound check widens a value to compare it and the
-//! message renders it as text, so an extreme magnitude is where the two could disagree
-//! (a thousands separator, an exponent, a truncated or re-rounded number) while the
-//! neighbourhood of the bound still looked right.
+//! member nested under a list element. The bound check widens a value to compare it, so an
+//! extreme magnitude is where a rendering of it could reappear in the sentence (a thousands
+//! separator, an exponent, a truncated or re-rounded number) while the neighbourhood of the
+//! bound still looked right.
 //!
 //! Sources for the bounds: `smithy_query(query="closure",
 //! operation="ListDashboards,ListScheduledReports,CreateDashboard")` — `MaxResults` range
@@ -30,7 +30,8 @@ use serde_json::json;
 
 use super::dashboard_lifecycle::{call, error_code, router};
 use super::range_refusal_wording::{
-    at_least, at_most, error_message, one_error, range_clause, widget, WELL_FORMED_DASHBOARD_ARN,
+    at_least, at_most, error_message, one_error, range_clause, widget, VALUE_HALF_OPENING,
+    WELL_FORMED_DASHBOARD_ARN,
 };
 
 /// Every integer this sweep submits at a member whose range is `min..max`, paired with the
@@ -60,11 +61,11 @@ fn outside(min: i64, max: i64) -> Vec<(i64, String)> {
 }
 
 #[tokio::test]
-async fn a_page_size_outside_its_range_is_stated_with_the_number_submitted() {
+async fn a_page_size_outside_its_range_is_stated_without_the_number_submitted() {
     let router = router();
 
-    // The same member on both listings: the value half is about what the request submitted,
-    // not about which operation read it.
+    // The same member on both listings: the value half is withheld for the class, not for
+    // one operation's reading of it.
     for operation in ["ListDashboards", "ListScheduledReports"] {
         for (submitted, requirement) in outside(1, 100) {
             let (status, body) = call(&router, operation, &json!({"maxResults": submitted})).await;
@@ -82,16 +83,21 @@ async fn a_page_size_outside_its_range_is_stated_with_the_number_submitted() {
             let message = error_message(&body);
             assert_eq!(
                 message,
-                one_error(&range_clause(submitted, "maxResults", &requirement)),
+                one_error(&range_clause("maxResults", &requirement)),
                 "case {operation} maxResults {submitted}: expected the clause to state the \
-                 number submitted, got {message:?}"
+                 member and the bound alone, got {message:?}"
+            );
+            assert!(
+                !body.to_string().contains(VALUE_HALF_OPENING),
+                "case {operation} maxResults {submitted}: the refusal must quote no value, \
+                 got {body}"
             );
         }
     }
 }
 
 #[tokio::test]
-async fn a_nested_member_outside_its_range_states_its_number_too() {
+async fn a_nested_member_outside_its_range_withholds_its_number_too() {
     let router = router();
 
     // The rule holds wherever a `@range` member sits: a widget's `width` (2..6) and
@@ -127,12 +133,16 @@ async fn a_nested_member_outside_its_range_states_its_number_too() {
                 assert_eq!(
                     message,
                     one_error(&range_clause(
-                        submitted,
                         &format!("widgets.1.member.{member}"),
                         &requirement
                     )),
                     "case {operation} {member} {submitted}: expected the clause to state the \
-                     number submitted at the nested member, got {message:?}"
+                     nested member and the bound alone, got {message:?}"
+                );
+                assert!(
+                    !body.to_string().contains(VALUE_HALF_OPENING),
+                    "case {operation} {member} {submitted}: the refusal must quote no value, \
+                     got {body}"
                 );
             }
         }

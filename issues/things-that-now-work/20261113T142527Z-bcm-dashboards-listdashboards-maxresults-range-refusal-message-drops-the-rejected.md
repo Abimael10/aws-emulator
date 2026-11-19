@@ -14,6 +14,23 @@ Issue-Commit: 8519584554abb240da771f66a4fe7c47c54f612d
 ListDashboards
 
 ## Description
+SUPERSEDED — this report's recording of the sentence is the CONTRADICTED one, and the
+reconciliation it asked for was carried out under
+20261114T225916Z-bcm-dashboards-listdashboards-maxresults-range-refusal-message-interpolates-the-rejected.md:
+the integer `@range` clause states the member and the bound and NO value, and the other
+constraint classes keep the value half they submitted. The authoritative reading is the
+capture of the response body this service was observed to SERVE for a page size over its
+ceiling, which leaves the value position empty, corroborated by the same class being
+recorded the same way for the sibling services whose page sizes carry the same trait; an
+expectation written from the generic constraint template is not evidence about this class's
+sentence, and the two cannot both be served, because the sentence is one string that either
+carries the number or does not. So the value clause this report asks for is NOT to be
+restored: the decision, and what would be needed to revisit it (a capture of a served
+refusal that contradicts it), is recorded at the module head of
+services/service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice/src/service/validation.rs,
+and pinned by `tests/all/range_refusal_wording.rs` and `tests/all/refused_value_echo.rs`.
+Everything below is the report as filed.
+
 REOPENS 20261111T084409Z-bcm-dashboards-listdashboards-maxresults-range-refusal-message-interpolates.md: its fix left the call refused. That issue asked the @range formatter to STOP emitting the "Value '<submitted>' " clause, and the formatter now omits it; the behavioral check for this same refusal grades the message WITH that clause, so the refusal ListDashboards now returns for an out-of-range maxResults still does not match. This is not a new defect, it is the same refusal message re-diverging in the other direction, and the two recordings of this one message must be reconciled rather than flipped again.
 
 ONE root cause (Cause 1 of 1).
