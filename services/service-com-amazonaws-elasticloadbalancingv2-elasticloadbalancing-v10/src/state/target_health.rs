@@ -31,12 +31,15 @@
 //! on the way to its verdict. The checks come one `HealthCheckIntervalSeconds` apart
 //! ([`health_check_interval`]), the cadence the caller configured, so that verdict is reached
 //! no sooner than the threshold times that interval: a registration is never declared
-//! unhealthy faster than the schedule asked for could have decided it. What one check observes
-//! is decided in [`super::host_counts`], against the effective health-check port and the ports
-//! something behind the registration is listening on — the ones its scheduler declared
-//! ([`ServedPorts`]), and for an instance of this account the ones Amazon EC2 holds for it. A
-//! registration whose checks pass, and one no check observed anything about, keep the `healthy`
-//! the clock owes them.
+//! unhealthy faster than the schedule asked for could have decided it. WHY those checks failed
+//! is reported with the verdict ([`CheckFailure`]): a check the target answered with a status
+//! its group's `Matcher` does not accept is the model's own `Target.ResponseCodeMismatch`,
+//! while one nothing answered is worded as the family of load balancer performing it words it.
+//! What one check observes is decided in [`super::host_counts`], against the effective
+//! health-check port and the ports something behind the registration is listening on — the ones
+//! its scheduler declared ([`ServedPorts`]), and for an instance of this account the ones Amazon
+//! EC2 holds for it. A registration whose checks pass, and one no check observed anything about,
+//! keep the `healthy` the clock owes them.
 //!
 //! Every span is stored as the instant it comes due, never slept for; a read
 //! materialises what the clock already owes ([`TargetGroupRecord::settle_draining`]) and
@@ -217,6 +220,61 @@ const INITIAL_HEALTH_CHECKING: (&str, &str, &str) = (
     "Health checks in progress",
 );
 
+/// The `TargetHealthReasonEnum` value an `unhealthy` registration whose checks the target
+/// ANSWERED — with a status its group's `Matcher` does not count as a success — is reported
+/// under: "`Target.ResponseCodeMismatch` - The health checks did not return an expected HTTP
+/// code" (`TargetHealth$Reason`).
+///
+/// A different fact from the reasons beside it: those are a check nothing answered at all,
+/// while this one is a check that WAS answered and whose answer failed the group's own success
+/// criterion (`super::matcher_admits`).
+const RESPONSE_CODE_MISMATCH_REASON: &str = "Target.ResponseCodeMismatch";
+
+/// How that reason is DESCRIBED: the codes the checks were answered with, which is what the
+/// load balancer observed about the mismatch — the status the target really answered, never a
+/// constant.
+fn response_code_mismatch_description(status: u16) -> String {
+    format!("Health checks failed with these codes: [{status}]")
+}
+
+/// What one health check of a registration FOUND, as the load balancer performing it reports
+/// the finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Observed {
+    /// The check succeeded: something answered it, and its answer is one the target group's
+    /// own success criterion accepts.
+    Passed,
+    /// The check did not succeed, for the condition that held.
+    Failed(CheckFailure),
+}
+
+/// WHY one health check did not succeed, which is what decides the `TargetHealth$Reason` a
+/// registration whose verdict those checks reached is reported with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckFailure {
+    /// NOTHING answered the check — the condition the family of load balancer performing it
+    /// words as its own ([`unhealthy_for`]).
+    Unanswered,
+    /// The target ANSWERED, with the status carried here, and that status is not one its
+    /// group's `Matcher` counts as a success ([`RESPONSE_CODE_MISMATCH_REASON`]).
+    ResponseCode(u16),
+}
+
+impl Observed {
+    /// Whether the check succeeded, which is what a verdict is counted from.
+    fn passed(self) -> bool {
+        matches!(self, Observed::Passed)
+    }
+
+    /// The condition a check that did not succeed found, and `None` for one that did.
+    fn failure(self) -> Option<CheckFailure> {
+        match self {
+            Observed::Passed => None,
+            Observed::Failed(failure) => Some(failure),
+        }
+    }
+}
+
 /// How the family `family` of load balancer words an `unhealthy` verdict its checks reached.
 ///
 /// The verdict itself is the same fact for every family — the group's
@@ -232,6 +290,28 @@ fn unhealthy_for(family: super::LoadBalancerFamily) -> (&'static str, &'static s
         super::LoadBalancerFamily::Network | super::LoadBalancerFamily::Gateway => {
             UNHEALTHY_FAILED_CHECKS
         }
+    }
+}
+
+/// How an `unhealthy` verdict a family `family` of load balancer reached is REPORTED, given
+/// what its last failing check found.
+///
+/// A check the target ANSWERED is reported as the mismatch it is — the model's own reason for
+/// an answer the group's success criterion rejects, described by the status that answer carried
+/// — and a check nothing answered as the family's own wording of that condition
+/// ([`unhealthy_for`]), which is also what a verdict whose failures are no longer known is
+/// reported as.
+fn unhealthy_report(
+    family: super::LoadBalancerFamily,
+    failure: Option<CheckFailure>,
+) -> TargetHealth {
+    match failure {
+        Some(CheckFailure::ResponseCode(status)) => TargetHealth {
+            state: Some(UNHEALTHY_STATE.to_string()),
+            reason: Some(RESPONSE_CODE_MISMATCH_REASON.to_string()),
+            description: Some(response_code_mismatch_description(status)),
+        },
+        Some(CheckFailure::Unanswered) | None => reported(unhealthy_for(family)),
     }
 }
 
@@ -284,6 +364,14 @@ pub struct TargetProbe {
     /// the group's `HealthyThresholdCount`, `Some(false)` once as many failed as its
     /// `UnhealthyThresholdCount`, and `None` while neither threshold has been reached.
     verdict: Option<bool>,
+    /// What the last FAILING check of this registration found, and `None` while none has
+    /// failed: the condition an `unhealthy` verdict is reported with
+    /// ([`unhealthy_report`]), which is a fact of the checks rather than of the caller.
+    ///
+    /// Kept across a passing check, so a verdict the failures reached is reported with the
+    /// condition that reached it for as long as it stands; a later failing check replaces it,
+    /// because the reason reported is the one the checks last found.
+    failed_with: Option<CheckFailure>,
 }
 
 impl TargetProbe {
@@ -295,19 +383,27 @@ impl TargetProbe {
     /// configured interval makes due ([`TargetProbe::counted`]), so a look taken between two
     /// of them moves no verdict. It still decides that a registration nothing answers for is
     /// not reported healthy on its way to one.
-    pub fn saw(&mut self, observed: bool) {
-        self.last_observed = Some(observed);
+    pub fn saw(&mut self, observed: Observed) {
+        self.last_observed = Some(observed.passed());
+        if let Some(failure) = observed.failure() {
+            self.failed_with = Some(failure);
+        }
     }
 
-    /// Fold one check's observation into the verdict: `observed` is whether the check
-    /// passed, and the two thresholds are the target group's own.
+    /// Fold one check's observation into the verdict: `observed` is what the check found, and
+    /// the two thresholds are the target group's own.
     ///
     /// A threshold the group reports as less than one still takes one check, so a verdict is
     /// never reached by no check at all.
-    pub fn counted(&mut self, observed: bool, healthy_threshold: i32, unhealthy_threshold: i32) {
+    pub fn counted(
+        &mut self,
+        observed: Observed,
+        healthy_threshold: i32,
+        unhealthy_threshold: i32,
+    ) {
         self.saw(observed);
         let threshold = |configured: i32| configured.max(1).unsigned_abs();
-        if observed {
+        if observed.passed() {
             self.failures = 0;
             self.passes = self.passes.saturating_add(1);
             if self.passes >= threshold(healthy_threshold) {
@@ -341,6 +437,12 @@ impl TargetProbe {
     /// which is what [`Self::counted`] folds.
     pub fn is_failing(&self) -> bool {
         self.verdict.is_none() && self.last_observed == Some(false)
+    }
+
+    /// What the last FAILING check of this registration found, and `None` while none has
+    /// failed — the condition an `unhealthy` verdict is reported with.
+    pub fn failed_with(&self) -> Option<CheckFailure> {
+        self.failed_with
     }
 }
 
@@ -468,7 +570,7 @@ impl TargetGroupRecord {
     ///
     /// A key this group no longer holds is skipped: the look ran with no guard held, so a
     /// deregistration may have taken that registration out in the meantime.
-    pub fn observed_check(&mut self, key: &TargetKey, observed: Option<bool>, now: SystemTime) {
+    pub fn observed_check(&mut self, key: &TargetKey, observed: Option<Observed>, now: SystemTime) {
         let interval = health_check_interval(self);
         let (healthy_threshold, unhealthy_threshold) = (
             self.health_check.healthy_threshold,
@@ -645,12 +747,12 @@ impl TargetGroupRecord {
             return reported(INITIAL);
         }
         if target.probe.is_unhealthy() {
-            // The checks have run and this registration answered none of them: the load
-            // balancer considers a target unhealthy once the group's threshold of
-            // consecutive failures is reached, and `TargetHealth$Reason` words that for a
-            // check nothing answered — as the family of load balancer checking it words it
-            // ([`unhealthy_for`]).
-            return reported(unhealthy_for(self.family()));
+            // The checks have run and this registration did not pass them: the load balancer
+            // considers a target unhealthy once the group's threshold of consecutive failures
+            // is reached, and `TargetHealth$Reason` words the condition those checks found —
+            // an answer the group's success criterion rejects, or a check nothing answered, as
+            // the family of load balancer checking it words it ([`unhealthy_report`]).
+            return unhealthy_report(self.family(), target.probe.failed_with());
         }
         if target.probe.is_failing() {
             // A check has failed and the group's threshold of consecutive failures has not

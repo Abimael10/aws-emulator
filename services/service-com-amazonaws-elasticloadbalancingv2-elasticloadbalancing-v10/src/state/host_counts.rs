@@ -73,6 +73,17 @@
 //! whose own cadence has made a check due — an invocation is a run of the function, so a look
 //! taken between two checks makes none.
 //!
+//! A check that reached the registration is then judged by what it was ANSWERED with, where the
+//! group's own check speaks HTTP semantics: such a check requests `HealthCheckPath` and its
+//! answer is a success only if the status carries one of the `Matcher` codes
+//! ([`HealthCheckRequest`]), so a target answering that path outside them fails the check and
+//! reaches the model's own `Target.ResponseCodeMismatch`
+//! ([`super::target_health::CheckFailure`]). What answers is the target's OWN server, read
+//! through the one reading of it this crate has ([`super::target_servers`]) — the very server a
+//! `forward` of a client's request to that target is answered by. A server that holds none of
+//! the documents it serves answers out of what its image or package shipped, which this
+//! emulator models nothing of, so such an answer decides nothing either way.
+//!
 //! The verdict only MOVES once the target group's own thresholds are reached — "the number of
 //! consecutive health check failures required before considering a target unhealthy"
 //! (`CreateTargetGroup$UnhealthyThresholdCount`) and its healthy counterpart — which
@@ -125,11 +136,11 @@ use ::service_com_amazonaws_ec2_amazonec2::ops::types as ec2_types;
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 use ::smithy_server_runtime::EmbeddedEmulator;
 
-use super::target_health::{HEALTHY_STATE, INITIAL_STATE, UNHEALTHY_STATE};
+use super::target_health::{CheckFailure, Observed, HEALTHY_STATE, INITIAL_STATE, UNHEALTHY_STATE};
 use super::{
     load_balancer_type_code,
     ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState, GuardingGroups,
-    LoadBalancerRecord, RegisteredTarget, TargetGroupRecord, TargetKey,
+    LoadBalancerRecord, MatcherRecord, RegisteredTarget, TargetGroupRecord, TargetKey,
 };
 
 /// "The number of targets that are considered healthy" — the metric an Elastic Load
@@ -347,6 +358,9 @@ struct Checked {
     /// pass failed to resolve — the difference between a load balancer in no security group
     /// and one whose association is unknown ([`super::health_check_firewall::CheckSource`]).
     source_groups_resolved: bool,
+    /// The REQUEST this group's health check makes of the registration, for a group whose
+    /// check speaks HTTP semantics, and `None` for every other — see [`HealthCheckRequest`].
+    health_check_request: Option<HealthCheckRequest>,
     /// Whether the group's own cadence had made a check of this registration DUE at the
     /// instant the pass read it ([`super::TargetGroupRecord::observed_check`] folds the look
     /// against that same instant).
@@ -361,9 +375,36 @@ struct Checked {
     lambda: Option<crate::service::lambda_health_check::Probe>,
 }
 
-/// What one check observed about a registration: `Some(true)` for one something in this
-/// emulator stands behind, `Some(false)` for one nothing does, and `None` when nothing was
+/// The request ONE health check of an HTTP/HTTPS target group MAKES, and what makes its answer
+/// a success.
+///
+/// `HealthCheckPath` is "[HTTP/HTTPS health checks] The destination for health checks on the
+/// targets" and `Matcher` "[HTTP/HTTPS health checks] The HTTP or gRPC codes to use when
+/// checking for a successful response from a target", so such a check is a request for that
+/// path whose ANSWER is judged against those codes — which is what makes a target answering the
+/// path with a status outside them one the load balancer reports unhealthy rather than one it
+/// never asked.
+#[derive(Debug, Clone)]
+struct HealthCheckRequest {
+    /// The path the check requests.
+    path: String,
+    /// What makes the status it is answered with a success, judged through the ONE reading of
+    /// that member this crate has ([`super::matcher_admits`]), which is also what the
+    /// invocation a `lambda` group's check is judges its answer by. Held only for a matcher
+    /// that names an HTTP code at all ([`health_check_request`]).
+    matcher: MatcherRecord,
+}
+
+/// The method a health check requests the path with: a load balancer's HTTP health check sends
+/// a GET to the health-check path, and what answers it is the target's own server.
+const HEALTH_CHECK_METHOD: &str = "GET";
+
+/// What one check observed about REACHING a registration: `Some(true)` for one something in
+/// this emulator stands behind, `Some(false)` for one nothing does, and `None` when nothing was
 /// observed at all.
+///
+/// What the check then makes of an answer it GOT is [`observation`]'s, which folds this and the
+/// answer's own status into the finding the registration's probe is moved by.
 type Observation = Option<bool>;
 
 /// Run ONE check of exactly the registrations `registrations` names — each a
@@ -633,7 +674,7 @@ fn opened_pass<Eng: Send + Sync + 'static>(
 fn closed_pass<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &::engine::ServiceState<ElbState>,
-    observations: &[(String, TargetKey, Observation)],
+    observations: &[(String, TargetKey, Option<Observed>)],
     opened: &OpenPass,
 ) {
     let published = {
@@ -792,12 +833,36 @@ fn checked_registration(
         source_group_ids,
         source_interface_ids,
         source_groups_resolved,
+        health_check_request: health_check_request(group),
         check_due: now >= target.checks_due_at,
         // A `lambda` registration is checked by invoking the function rather than by
         // connecting to a port, and only while the group's health checks are on
         // ([`crate::service::lambda_health_check`]).
         lambda: crate::service::lambda_health_check::probe(group, target_group_arn, &target.id),
     }
+}
+
+/// The request an HTTP/HTTPS health check of `group` makes, and `None` for a group whose check
+/// makes none this reading can perform.
+///
+/// A group whose health check speaks no HTTP semantics requests no path at all (a TCP check
+/// opens a connection and has neither a path nor a response-code matcher,
+/// `TargetGroupRecord::health_check_is_http`); a `lambda` group's check is an INVOCATION of the
+/// function rather than a request to a port ([`crate::service::lambda_health_check`] performs
+/// it); and a check whose success criterion names no HTTP code at all — the gRPC code a
+/// `GRPC` protocol version is checked on — is not one an HTTP status answers. None of the three
+/// names a request whose answer this reading could judge.
+fn health_check_request(group: &TargetGroupRecord) -> Option<HealthCheckRequest> {
+    if group.is_lambda() || !group.health_check_is_http() {
+        return None;
+    }
+    let matcher = group.health_check.matcher.clone()?;
+    // A criterion naming no HTTP code at all is not one an HTTP status answers.
+    matcher.http_code.as_ref()?;
+    Some(HealthCheckRequest {
+        path: group.health_check.path.clone()?,
+        matcher,
+    })
 }
 
 /// What one check of each registration in `checked` observed, with the health check of every
@@ -812,15 +877,31 @@ async fn observe_all_due<Eng: Send + Sync + 'static>(
     engine: &Eng,
     callback: &EmbeddedEmulator,
     checked: &[Checked],
-) -> Vec<(String, TargetKey, Observation)> {
+) -> Vec<(String, TargetKey, Option<Observed>)> {
     let mut observations = observe_all(engine, checked);
     for (target, observed) in checked.iter().zip(observations.iter_mut()) {
         let Some(probe) = target.lambda.as_ref().filter(|_| target.check_due) else {
             continue;
         };
-        observed.2 = crate::service::lambda_health_check::observed(callback, probe).await;
+        // What that invocation decided, as the one reading of a `lambda` check decides it:
+        // whether the check SUCCEEDED, which is all such an answer says about the
+        // registration — the condition a failing one is reported under is then the family's
+        // own ([`super::target_health::CheckFailure`]).
+        observed.2 = crate::service::lambda_health_check::observed(callback, probe)
+            .await
+            .map(passed_or_unanswered);
     }
     observations
+}
+
+/// One check's finding, from whether that check SUCCEEDED: the condition a failing one is
+/// reported under is the family's own, for a check whose answer says no more than that.
+fn passed_or_unanswered(passed: bool) -> Observed {
+    if passed {
+        Observed::Passed
+    } else {
+        Observed::Failed(CheckFailure::Unanswered)
+    }
 }
 
 /// [`observe_all`] WITHOUT the due check of a `lambda` registration, for the pass that cannot
@@ -835,7 +916,7 @@ async fn observe_all_due<Eng: Send + Sync + 'static>(
 fn observe_all_connected<Eng: Send + Sync + 'static>(
     engine: &Eng,
     checked: &[Checked],
-) -> Vec<(String, TargetKey, Observation)> {
+) -> Vec<(String, TargetKey, Option<Observed>)> {
     observe_all(engine, checked)
         .into_iter()
         .zip(checked.iter())
@@ -855,7 +936,7 @@ fn observe_all_connected<Eng: Send + Sync + 'static>(
 fn observe_all<Eng: Send + Sync + 'static>(
     engine: &Eng,
     checked: &[Checked],
-) -> Vec<(String, TargetKey, Observation)> {
+) -> Vec<(String, TargetKey, Option<Observed>)> {
     if checked.is_empty() {
         return Vec::new();
     }
@@ -973,14 +1054,85 @@ fn observe_all<Eng: Send + Sync + 'static>(
     });
     checked
         .iter()
-        .map(|target| {
+        .zip(health_check_answers(engine, checked))
+        .map(|(target, answered)| {
             (
                 target.target_group_arn.clone(),
                 target.key.clone(),
-                observe(target, held.as_ref()),
+                observation(target, held.as_ref(), answered),
             )
         })
         .collect()
+}
+
+/// The status the server behind each registration of `checked` answered its group's
+/// health-check request with, one entry per registration, in that order.
+///
+/// `None` for a registration whose group's check requests no path ([`HealthCheckRequest`]), one
+/// whose check has no port to connect to, one this emulator holds no server behind on that port
+/// — which answers nothing — and one whose server does not hold the documents it serves, whose
+/// answer is a statement about nothing this emulator models
+/// ([`super::target_servers::TargetAnswer`]).
+///
+/// Read with NO guard of this store held, through the one reading of what stands behind a
+/// registration ([`super::target_servers`]) — the very server a `forward` of a client's request
+/// to that target is answered by, so the checks and the data plane cannot drift on what one
+/// target answers. A READ: asking a target's server for a document moves nothing of it.
+///
+/// Taken for EVERY look of the pass, not only for one the group's cadence has made due — unlike
+/// the invocation a `lambda` check is ([`observe_all_due`]), which runs the function and so is
+/// made on that cadence alone. Reading a store costs the target nothing, and a look taken
+/// between two checks has to see what those checks see: that is what keeps a registration whose
+/// checks are failing from being reported healthy on the way to its verdict
+/// ([`super::target_health::TargetProbe::saw`]).
+fn health_check_answers<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    checked: &[Checked],
+) -> Vec<Option<u16>> {
+    checked
+        .iter()
+        .map(|target| {
+            let request = target.health_check_request.as_ref()?;
+            let port = target.health_check_port?;
+            let answered = super::target_servers::answered(
+                engine,
+                &target.target_type,
+                &target.id,
+                port,
+                HEALTH_CHECK_METHOD,
+                &request.path,
+            )?;
+            answered
+                .holds_what_it_serves
+                .then_some(answered.answer.status)
+        })
+        .collect()
+}
+
+/// What one check of `target` found: whether it could reach the registration at all
+/// ([`observe`]) and, for one that reached it and was ANSWERED, whether the status of that
+/// answer is one the group's own `Matcher` counts as a success.
+///
+/// A check nothing answered is the condition the family of load balancer performing it words as
+/// its own, and a check answered outside the matcher is the model's own response-code mismatch
+/// ([`super::target_health::CheckFailure`]). A registration nothing could be observed about at
+/// all stays that way: nothing is failed on silence, and an answer this emulator cannot judge
+/// is silence too.
+fn observation(
+    target: &Checked,
+    held: Option<&Inventory>,
+    answered: Option<u16>,
+) -> Option<Observed> {
+    if !observe(target, held)? {
+        return Some(Observed::Failed(CheckFailure::Unanswered));
+    }
+    let judged = target.health_check_request.as_ref().zip(answered);
+    if let Some((request, status)) = judged {
+        if !super::matcher_admits(&request.matcher, status) {
+            return Some(Observed::Failed(CheckFailure::ResponseCode(status)));
+        }
+    }
+    Some(Observed::Passed)
 }
 
 /// The ports the GUEST of each instance registration of `checked` is LISTENING on, keyed by
@@ -1335,7 +1487,7 @@ fn instance_is_running(instance: &ec2::InstanceRecord) -> bool {
 /// ([`super::TargetGroupRecord::observed_check`]).
 fn fold_observations(
     store: &mut ElbState,
-    observations: &[(String, TargetKey, Observation)],
+    observations: &[(String, TargetKey, Option<Observed>)],
     now: SystemTime,
 ) {
     for (target_group_arn, key, observed) in observations {
@@ -1725,6 +1877,15 @@ mod tests {
                 registered(&mut group, &format!("10.0.1.{}", index + 10), start);
             }
             let keys: Vec<TargetKey> = group.targets.keys().cloned().collect();
+            // What the row's checks found, as a check reports it: these rows are about the
+            // COUNTS, which follow from whether a check passed and not from why one failed.
+            let observed: Option<Observed> = observed.map(|passed| {
+                if passed {
+                    Observed::Passed
+                } else {
+                    Observed::Failed(CheckFailure::Unanswered)
+                }
+            });
             let mut at = start;
             for _ in 0..checks {
                 at += PROBE_INTERVAL;
@@ -1940,6 +2101,7 @@ mod tests {
                 source_group_ids: Vec::new(),
                 source_interface_ids: Vec::new(),
                 source_groups_resolved: false,
+                health_check_request: None,
                 // This table is about what [`observe`] reads, which is every target type
                 // checked by a connection: a check of one of those is due or not without
                 // changing what it observes, and none of them is a `lambda` registration.
@@ -2055,6 +2217,7 @@ mod tests {
                 source_group_ids: Vec::new(),
                 source_interface_ids: Vec::new(),
                 source_groups_resolved: false,
+                health_check_request: None,
                 check_due: true,
                 lambda: None,
             };
@@ -2182,6 +2345,7 @@ mod tests {
                     // The load balancer's own record was read, which is where its groups
                     // come from.
                     source_groups_resolved: true,
+                    health_check_request: None,
                     check_due: true,
                     lambda: None,
                 };
@@ -2275,6 +2439,7 @@ mod tests {
                     source_group_ids: vec![load_balancer_group.clone()],
                     source_interface_ids: vec![load_balancer_interface.clone()],
                     source_groups_resolved: true,
+                    health_check_request: None,
                     check_due: true,
                     lambda: None,
                 };

@@ -18,9 +18,14 @@
 //! an Amazon ECS task runs, whose own service registers that task's address in this store and
 //! so cannot read this store back. Such a workload's server is recorded by the service that
 //! STARTED it, under the address and port it listens at
-//! ([`::service_common::served_http_addresses`]), and this hand-off reads it there: the answer
-//! is that workload's own, computed by its own service from what it holds, exactly as an
-//! instance's is computed by Amazon EC2.
+//! ([`::service_common::served_http_addresses`]), and the answer is that workload's own,
+//! computed by its own service from what it holds, exactly as an instance's is computed by
+//! Amazon EC2.
+//!
+//! WHICH server stands behind a registration and what it answers is read through the one
+//! reading of it this crate has ([`crate::state::target_servers`]), shared with the periodic
+//! HEALTH CHECK of that same registration — so the request a client is answered and the check
+//! that decides whether the load balancer sends it there read one target one way.
 //!
 //! The hand-off is made with no lock of this service's store held, exactly as a `lambda`
 //! target's invocation is ([`super::lambda_target`]), and it changes nothing: serving a
@@ -38,16 +43,7 @@
 //! holds, exactly as the sibling statuses this plane answers carry none
 //! ([`super::data_plane`]).
 
-use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
-use ::service_common::served_http_addresses::{AddressAnswer, ServedAddresses};
-
 use super::data_plane::{DataPlaneRequest, Served, TARGET_UNREACHABLE_STATUS};
-
-/// The `TargetType` whose registrations name an INSTANCE of the account, and the one whose
-/// registrations name an ADDRESS (`crate::ops::types::TARGET_TYPE_ENUM_VALUES` carries the
-/// whole catalog).
-const INSTANCE_TARGET_TYPE: &str = "instance";
-const IP_TARGET_TYPE: &str = "ip";
 
 /// The response header a load balancer's own cookie travels in — the target-group stickiness
 /// pin ([`super::target_group_selection`]) — beside whatever the target's own response set.
@@ -116,8 +112,17 @@ fn proxied<Eng: Send + Sync + 'static>(
     // How long the TARGET took, which the access-log record reports for a connection that was
     // made at all.
     let started = ::std::time::Instant::now();
-    let answered = published_workload(engine, forwarded, port, request)
-        .or_else(|| instance_guest(engine, forwarded, port, request));
+    // The ONE reading of what the server behind a registration answers, shared with the health
+    // check of that same registration (`crate::state::target_servers`).
+    let answered = crate::state::target_servers::answered(
+        engine,
+        &forwarded.target_type,
+        &forwarded.target_id,
+        port,
+        &request.method,
+        &request.path,
+    )
+    .map(|answered| answered.answer);
     let Some(answered) = answered else {
         ::tracing::warn!(
             target = %forwarded.target_id,
@@ -146,64 +151,5 @@ fn proxied<Eng: Send + Sync + 'static>(
     served.observed.target_status = Some(served.status);
     served.observed.target_elapsed = Some(started.elapsed());
     served
-}
-
-/// What a workload ANOTHER service started a server for answers — the server recorded at the
-/// address the registration names, on the port it receives traffic on
-/// ([`::service_common::served_http_addresses`]).
-///
-/// Only an `ip` registration names such an address: every other target type names a resource by
-/// its own id, which is no address a workload listens at. `None` when nothing is recorded there,
-/// which leaves the instance of this account holding the address to answer instead.
-fn published_workload<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    forwarded: &Forwarded,
-    port: i32,
-    request: &DataPlaneRequest,
-) -> Option<AddressAnswer> {
-    if forwarded.target_type != IP_TARGET_TYPE {
-        return None;
-    }
-    ServedAddresses::of(engine)?.serve(&forwarded.target_id, port, &request.method, &request.path)
-}
-
-/// What the GUEST of the instance the registration names answers, read out of Amazon EC2's own
-/// store under its own guard.
-///
-/// The address of an `ip` registration is resolved to the instance whose interface holds it, and
-/// an `instance` registration names that instance outright. `None` for a registration no
-/// instance of this account stands behind, one whose guest is not up, and one whose guest is
-/// listening on no such port.
-fn instance_guest<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    forwarded: &Forwarded,
-    port: i32,
-    request: &DataPlaneRequest,
-) -> Option<AddressAnswer> {
-    // Nothing of this emulator reports what the account's instances run, so there is no server
-    // behind the registration to connect to.
-    let state = ec2::service_state(engine)?;
-    let store = state.lock();
-    let instance_id = match forwarded.target_type.as_str() {
-        // "if the target type is instance, specify an instance ID"
-        // (`TargetDescription$Id`).
-        INSTANCE_TARGET_TYPE => Some(forwarded.target_id.clone()),
-        // "if the target type is ip, specify an IP address": the workload at that address
-        // is the one the interface holding it belongs to.
-        IP_TARGET_TYPE => store.instance_id_at_address(&forwarded.target_id),
-        // Every other target type is one this hand-off does not name a server for: a
-        // `lambda` target is invoked ([`super::lambda_target`]) and an `alb` one is passed
-        // on ([`super::data_plane`]), both before this.
-        _ => None,
-    }?;
-    // The request's own path, which is what a static server resolves under the directory it
-    // serves.
-    let answered =
-        store.serve_instance_guest_http(&instance_id, port, &request.method, &request.path)?;
-    Some(AddressAnswer {
-        status: answered.status,
-        content_type: answered.content_type,
-        body: answered.body,
-    })
 }
 

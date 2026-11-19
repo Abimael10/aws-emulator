@@ -413,6 +413,18 @@ impl ServesHttp for ContainerStaticServer {
             body: answered.body,
         })
     }
+
+    /// Whether the documents this server answers out of are ones this emulator holds: the files
+    /// the container's own program wrote into the directory the server serves.
+    ///
+    /// A server over a document root holding NONE of them serves what the image that ships the
+    /// server put there, and a container's own layer "sits over a filesystem the image provides
+    /// and this emulator holds none of" ([`super::container_filesystem`]) — so what such a
+    /// server answers says nothing about the container, and a reader that judges the container
+    /// by a status reads no verdict into it.
+    fn holds_what_it_serves(&self) -> bool {
+        !self.files.is_empty()
+    }
 }
 
 /// The server of the shared catalog whose master logs the startup notice below. The catalog

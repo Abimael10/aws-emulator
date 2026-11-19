@@ -55,6 +55,19 @@ pub trait ServesHttp: Send + Sync + 'static {
     /// answers nothing at all for that request — which the caller reports as a connection that
     /// could not be served rather than as a response.
     fn serve(&self, method: &str, path: &str) -> Option<AddressAnswer>;
+
+    /// Whether the documents this server answers out of are ones this emulator HOLDS.
+    ///
+    /// `true` by default: a server answers out of the documents the workload's own program
+    /// wrote, which is what the service that started it holds. A server over a directory
+    /// holding none of them is the exception — what it would serve there came with the image or
+    /// the package that shipped the server, which the service holding the workload models
+    /// nothing of — so a reader that judges the WORKLOAD by a status (a load balancer's health
+    /// check against its success criterion) learns nothing from that server's answer and must
+    /// not read one into it.
+    fn holds_what_it_serves(&self) -> bool {
+        true
+    }
 }
 
 /// The servers this emulator's workloads are listening with, by the `(address, port)` each is
@@ -160,11 +173,29 @@ impl ServedAddresses {
         method: &str,
         path: &str,
     ) -> Option<AddressAnswer> {
+        self.served(address, port, method, path)
+            .map(|(answered, _)| answered)
+    }
+
+    /// The same answer, beside whether the server that produced it answers out of documents
+    /// this emulator HOLDS ([`ServesHttp::holds_what_it_serves`]).
+    ///
+    /// Both are read off the SAME server, so a caller that judges a workload by a status cannot
+    /// read the status off one server and that question off another.
+    #[must_use]
+    pub fn served(
+        &self,
+        address: &str,
+        port: i32,
+        method: &str,
+        path: &str,
+    ) -> Option<(AddressAnswer, bool)> {
         let server = {
             let store = self.0.lock();
             Arc::clone(&store.answering.get(&key(address, port))?.server)
         };
-        server.serve(method, path)
+        let holds_what_it_serves = server.holds_what_it_serves();
+        Some((server.serve(method, path)?, holds_what_it_serves))
     }
 
     /// Forget the `(address, port)` `key` names, where it still holds the record `mark` was
@@ -363,5 +394,65 @@ mod tests {
             addresses.serve("10.0.3.4", 80, "GET", "/").is_none(),
             "case \"the successor withdrawn\": expected nothing listening"
         );
+    }
+
+    /// A server that holds NONE of the documents it serves: what it would answer came with
+    /// whatever shipped it, which no service of this emulator models.
+    #[derive(Debug)]
+    struct Shipped;
+
+    impl ServesHttp for Shipped {
+        fn serve(&self, _method: &str, _path: &str) -> Option<AddressAnswer> {
+            Some(AddressAnswer {
+                status: 404,
+                content_type: None,
+                body: Vec::new(),
+            })
+        }
+
+        fn holds_what_it_serves(&self) -> bool {
+            false
+        }
+    }
+
+    /// RULE: a reader is told whether the server that answered holds the documents it serves,
+    /// as that server itself says — and nothing at all about an address nothing listens at.
+    #[test]
+    fn an_answer_carries_whether_its_server_holds_what_it_serves() {
+        let engine = ::engine::InMemoryEngine::new();
+        let addresses = ServedAddresses::of(&engine).expect("the engine vends the records");
+        let _own = addresses.publish(
+            "10.0.4.1",
+            80,
+            Arc::new(Echoing {
+                name: "own",
+                answers: &["/"],
+            }),
+        );
+        let _shipped = addresses.publish("10.0.4.2", 80, Arc::new(Shipped));
+        let rows: &[(&str, &str, &str, Option<bool>)] = &[
+            (
+                "a server answering out of the documents the workload wrote",
+                "10.0.4.1",
+                "/",
+                Some(true),
+            ),
+            (
+                "a server holding none of what it serves",
+                "10.0.4.2",
+                "/anything",
+                Some(false),
+            ),
+            ("an address nothing listens at", "10.0.4.9", "/", None),
+        ];
+        for (case, address, path, expected) in rows {
+            let held = addresses
+                .served(address, 80, "GET", path)
+                .map(|(_, holds)| holds);
+            assert_eq!(
+                held, *expected,
+                "case {case:?}: expected {expected:?}, got {held:?}"
+            );
+        }
     }
 }

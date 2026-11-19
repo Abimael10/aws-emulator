@@ -98,7 +98,10 @@
 //! server behind it is answered the way a load balancer answers those two conditions —
 //! [`NO_HEALTHY_TARGET_STATUS`] when the group has no target to send the request to, and
 //! [`TARGET_UNREACHABLE_STATUS`] when it has one and the connection to it cannot be made
-//! (a target this emulator holds no instance for, or one running nothing on that port).
+//! (a target this emulator holds no instance for, or one running nothing on that port). A group
+//! whose targets the checks all found unhealthy HAS a target to send the request to: the load
+//! balancer fails open and sends it to one of them ([`sent_the_request`]), so the 503 above is
+//! the answer of a group that holds none at all.
 //!
 //! An `authenticate-oidc` or `authenticate-cognito` action IS performed, ahead of the
 //! action it guards: no request reaching this emulator carries a session an Application
@@ -199,9 +202,13 @@ const TRACE_ID_HEADER: &str = "x-amzn-trace-id";
 /// name, and its listeners are not yet serving traffic on it.
 const PROVISIONING_STATUS: u16 = 503;
 
-/// The status a `forward` to a target group with no healthy target earns: "if a target
-/// group contains no registered targets, or if a target group contains only unhealthy
-/// targets, the load balancer returns an HTTP 503".
+/// The status a `forward` to a target group with NO target to send the request to earns: "the
+/// target groups for the load balancer have no registered targets" is the condition a load
+/// balancer's own `HTTP 503: Service unavailable` names, and that status is the load balancer's
+/// own rather than anything a target produced.
+///
+/// A group that HOLDS targets is a different condition: one whose targets the checks all found
+/// unhealthy is still sent the request ([`fails_open_to`]).
 pub const NO_HEALTHY_TARGET_STATUS: u16 = 503;
 
 /// The status a `forward` whose target cannot be CONNECTED to earns: a load balancer that
@@ -233,6 +240,14 @@ const MAX_PASSED_ON_HOPS: usize = 4;
 
 /// The `TargetHealthStateEnum` value a target that can be sent requests reports.
 const HEALTHY_TARGET_STATE: &str = "healthy";
+
+/// The `TargetHealthStateEnum` value of a registration the checks found FAILING, which a load
+/// balancer whose group holds no healthy target still sends requests to ([`fails_open_to`]).
+///
+/// Named through the one place that state is decided (`crate::state::target_health`), so the
+/// read that REPORTS a target unhealthy and this plane's reading of what to do with one cannot
+/// drift.
+const UNHEALTHY_TARGET_STATE: &str = crate::state::target_health::UNHEALTHY_STATE;
 
 /// The `TargetHealthStateEnum` value a registration of a target group whose health checks
 /// are OFF reports: `unavailable`, "health checks are not enabled for this target group"
@@ -1932,11 +1947,7 @@ fn forward(
         .iter()
         .filter_map(|(arn, weight)| store.target_groups.get(arn).map(|group| (group, *weight)))
         .filter_map(|(group, weight)| {
-            group
-                .targets
-                .values()
-                .find(|target| receives_requests(group, target, now))
-                .map(|target| (group, target, weight))
+            sent_the_request(group, now).map(|target| (group, target, weight))
         })
         .collect();
     let weights: Vec<i32> = candidates
@@ -2046,6 +2057,45 @@ fn receives_requests(
         group.health_of(target, now).state.as_deref(),
         Some(HEALTHY_TARGET_STATE) | Some(HEALTH_CHECKS_DISABLED_STATE)
     )
+}
+
+/// WHICH registration of `group` one request a `forward` performs is sent to, and `None` for a
+/// group that has no target to send it to at all.
+///
+/// A target whose reported health says the load balancer may send it requests takes it
+/// ([`receives_requests`]). Failing that, the group's UNHEALTHY targets are sent it anyway: a
+/// load balancer whose target group holds only unhealthy targets routes requests across them
+/// rather than answering nothing, so a group whose checks all fail at once keeps serving
+/// instead of blackholing its traffic — the behaviour the target-group health-check
+/// documentation states, and the reason a client can tell "registered but failing" from
+/// "nothing registered" — which is the load balancer's own [`NO_HEALTHY_TARGET_STATUS`]
+/// ([`fails_open_to`]).
+///
+/// Every other state is one no request is sent to, healthy targets or not: a registration still
+/// coming up has no verdict yet, one draining is leaving the group, and one of a group nothing
+/// forwards to is not being checked at all. A group holding only those has no target for this
+/// request.
+fn sent_the_request(
+    group: &TargetGroupRecord,
+    now: SystemTime,
+) -> Option<&RegisteredTarget> {
+    group
+        .targets
+        .values()
+        .find(|target| receives_requests(group, target, now))
+        .or_else(|| {
+            group
+                .targets
+                .values()
+                .find(|target| fails_open_to(group, target, now))
+        })
+}
+
+/// Whether this registration is one the load balancer FAILS OPEN to: the checks reached the
+/// `unhealthy` verdict for it, and such a target is still sent requests where its group holds
+/// no target the load balancer may send them to.
+fn fails_open_to(group: &TargetGroupRecord, target: &RegisteredTarget, now: SystemTime) -> bool {
+    group.health_of(target, now).state.as_deref() == Some(UNHEALTHY_TARGET_STATE)
 }
 
 /// One rendered answer: the status, its headers and its body, as the wire carries them.

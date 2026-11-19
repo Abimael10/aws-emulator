@@ -121,6 +121,10 @@ pub mod host_counts;
 
 pub use host_counts::{check_registrations, drive_host_count_metrics, HostCountPublisher};
 
+/// What the SERVER behind one registered target answers, read once for the `forward` that
+/// hands a client's request to it and for the health check of the registration.
+pub mod target_servers;
+
 /// The load balancer's OWN network interfaces, which live in the inventory EC2 holds.
 pub mod service_interfaces;
 
