@@ -6,11 +6,11 @@
 //! limit definition identifies, and reports the limit as it now stands.
 //!
 //! The rate has to be within the account's range: at least the rate the
-//! category includes at no additional cost, at most the account's maximum. It
-//! also has to be a rate that CHANGES the limit — a request naming the rate the
-//! limit already holds sets nothing and is refused. A refused request stores
-//! nothing, so the limit a later read reports is the one that was already in
-//! force.
+//! category includes at no additional cost, at most the account's maximum.
+//! Every rate in that range is stored, the rate the limit already holds
+//! included — re-applying the rate a read just reported is an ordinary write.
+//! A refused request stores nothing, so the limit a later read reports is the
+//! one that was already in force.
 //!
 //! ## Shape of an operation
 //!
@@ -213,8 +213,8 @@ fn invalid_definition(failure: crate::state::LimitLookupFailure) -> UpdateProvis
 /// or submit a Service Quotas increase request" (this service's model). A rate
 /// below the rate the limit includes is a malformed parameter: the included
 /// rate is the bottom of the range this operation accepts, so nothing under it
-/// names a rate the account can hold. So is the rate the limit ALREADY holds:
-/// this operation sets a provisioned limit, and that request sets nothing.
+/// names a rate the account can hold. Nothing INSIDE the range reaches here:
+/// a rate the limit already holds is set like any other.
 fn refused(refusal: crate::state::RateRefusal) -> UpdateProvisionedLimitError {
     use crate::state::RateRefusal;
     let message = Some(refusal.message());
@@ -224,7 +224,7 @@ fn refused(refusal: crate::state::RateRefusal) -> UpdateProvisionedLimitError {
                 ServiceQuotaExceededException { message },
             )
         }
-        RateRefusal::BelowFreeRate { .. } | RateRefusal::SameAsProvisioned => {
+        RateRefusal::BelowFreeRate { .. } => {
             UpdateProvisionedLimitErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message,

@@ -4330,19 +4330,13 @@ impl LimitLookupFailure {
     }
 }
 
-/// The one sentence a request asking for the rate a limit already holds is
-/// refused with. Fixed text: the rate it is about is the rate the request
-/// carried, which the caller already has, so no value of the request or of the
-/// account is quoted back.
-pub const SAME_AS_PROVISIONED_LIMIT_MESSAGE: &str =
-    "Requested value is the same as the current provisioned limit";
-
 /// Why a requested rate is not one this account can provision for a limit.
+///
+/// Only a rate OUTSIDE the account's range for the limit is one of these: the
+/// range is what decides a request, so a rate inside it is stored whether or
+/// not it is the rate the limit already holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RateRefusal {
-    /// The requested rate is the one the limit already holds, so the request
-    /// asks for no change to make.
-    SameAsProvisioned,
     /// The requested rate is below the rate the limit includes, which is the
     /// lowest rate it can hold.
     BelowFreeRate { requested: i32, free_rate: i32 },
@@ -4362,14 +4356,6 @@ impl RateRefusal {
     #[must_use]
     pub fn message(&self) -> String {
         match self {
-            // A rate the limit already holds is reported in ONE sentence with
-            // no variable part: the rate it names is the rate the request
-            // carried and the rate the limit already reports, so the sentence
-            // states the fact alone and the caller reads the value off its own
-            // request.
-            Self::SameAsProvisioned => {
-                SAME_AS_PROVISIONED_LIMIT_MESSAGE.to_string()
-            }
             // The rate missing the floor states the rate that was asked for and
             // the floor it missed: the floor is the rate the limit includes at
             // no additional cost, which the limit reports as its
@@ -4514,28 +4500,28 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// Provision `requested` requests per second for `category` and return the
     /// limit as it now stands.
     ///
-    /// The requested rate has to CHANGE the limit: this operation "sets the
-    /// provisioned limit for a specific API category" (`UpdateProvisionedLimit`
-    /// in this service's model), so a request naming the rate the limit already
-    /// holds — the rate a read of that limit just reported — sets nothing, and
-    /// is refused ahead of every other test, the account's Service Quotas
-    /// ceiling included.
+    /// What decides the request is the account's RANGE for the limit, and
+    /// nothing else: the range runs from the rate the category includes up to
+    /// the account's Service Quotas ceiling for that limit
+    /// ([`Self::api_category_quota_ceiling`]) — "the value must be between the
+    /// default limit and your account-level maximum limit in Service Quotas"
+    /// (`UpdateProvisionedLimit` in this service's model) — and every rate
+    /// inside it is stored. That includes the rate the limit ALREADY reports as
+    /// in force, whether a previous call provisioned it or it is the rate the
+    /// category includes at no additional cost: this operation "sets the
+    /// provisioned limit for a specific API category" (the same doc), and
+    /// setting a rate to the value it already holds is an ordinary write, so a
+    /// client that reads a limit and applies the rate it reported gets that
+    /// rate back rather than a refusal.
     ///
-    /// Every OTHER rate in the account's range is stored: the range runs from
-    /// the rate the category includes up to the account's Service Quotas ceiling
-    /// for that limit ([`Self::api_category_quota_ceiling`]) — "the value must be
-    /// between the default limit and your account-level maximum limit in Service
-    /// Quotas" (the same doc) — and a rate OUTSIDE that range is refused. A
-    /// refused call stores nothing, so the limit a later read reports is the one
-    /// that was already in force.
+    /// A rate OUTSIDE the range is refused ([`RateRefusal`]), and a refused
+    /// call stores nothing, so the limit a later read reports is the one that
+    /// was already in force.
     pub fn set_api_category_limit(
         &mut self,
         category: &ApiCategory,
         requested: i32,
     ) -> Result<LimitType, RateRefusal> {
-        if requested == self.api_category_limit(category).provisioned_limit_value {
-            return Err(RateRefusal::SameAsProvisioned);
-        }
         if requested < category.free_rate {
             return Err(RateRefusal::BelowFreeRate {
                 requested,
